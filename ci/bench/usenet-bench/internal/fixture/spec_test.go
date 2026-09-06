@@ -251,7 +251,7 @@ func TestFixtureSetRequiresAClass(t *testing.T) {
 	}
 }
 
-func TestCheckedInMatrixClassesTheHeadlineAsStoredEncryptedRAR(t *testing.T) {
+func TestCheckedInMatrixClassesTheHeadlineAsStoredRARWithPAR2(t *testing.T) {
 	matrix, err := LoadMatrix("../../fixtures/matrix.json")
 	if err != nil {
 		t.Fatal(err)
@@ -266,26 +266,50 @@ func TestCheckedInMatrixClassesTheHeadlineAsStoredEncryptedRAR(t *testing.T) {
 			continue
 		}
 		headline++
-		if c.Compression != Store || c.ArchiveFormat == SevenZip || c.Payload != IncompressiblePayload || c.RepairProfile != CleanRepairProfile || c.FileCount != 1 {
-			t.Fatalf("headline fixture %s is not a stored, clean, single-movie RAR of incompressible media: %+v", c.ID, c)
+		if c.Compression != Store || c.ArchiveFormat == SevenZip || c.Payload != IncompressiblePayload || c.FileCount != 1 {
+			t.Fatalf("headline fixture %s is not a stored, single-movie RAR of incompressible media: %+v", c.ID, c)
+		}
+		switch c.RepairProfile {
+		case CleanRepairProfile, PAR2LightRepairProfile, PAR2HeavyWithheldProfile:
+		default:
+			t.Fatalf("headline fixture %s carries repair profile %q; only clean and PAR2 profiles are the common case", c.ID, c.RepairProfile)
 		}
 	}
 	if headline == 0 {
 		t.Fatal("checked-in matrix declares no headline fixtures")
 	}
-	// Every RARLAB writer era must have a headline lane with encrypted
-	// headers and one with data-only encryption, since encrypted stored RAR
-	// is what the headline class stands for.
+	// Every RARLAB writer era must have a clean headline lane in each posting
+	// form: most real posts are not encrypted, and the encrypted forms must
+	// still be measured beside the clear one rather than instead of it.
 	for _, era := range []string{"rarlab-3.93", "rarlab-4.20", "rarlab-5.00", "rarlab-6.24", "rarlab-7.23"} {
-		for _, encryption := range []Encryption{HeaderEncryption, DataEncryption} {
+		for _, encryption := range []Encryption{NoEncryption, HeaderEncryption, DataEncryption} {
 			found := false
 			for _, c := range cases {
-				if c.Class == HeadlineFixtureClass && c.GeneratorToolchain == era && c.Encryption == encryption {
+				if c.Class == HeadlineFixtureClass && c.GeneratorToolchain == era && c.RepairProfile == CleanRepairProfile && c.Encryption == encryption {
 					found = true
 				}
 			}
 			if !found {
-				t.Fatalf("no headline fixture for writer %s with %s encryption", era, encryption)
+				t.Fatalf("no clean headline fixture for writer %s with %s encryption", era, encryption)
+			}
+		}
+	}
+	// PAR2 repair is part of the common case, not a compatibility extra: the
+	// stored RAR from the 4.20, 5.00 and 7.23 writers must carry a headline
+	// lane for light damage and for a withheld volume, in each of the three
+	// postings.
+	for _, era := range []string{"rarlab-4.20", "rarlab-5.00", "rarlab-7.23"} {
+		for _, profile := range []RepairProfile{PAR2LightRepairProfile, PAR2HeavyWithheldProfile} {
+			for _, encryption := range []Encryption{NoEncryption, HeaderEncryption, DataEncryption} {
+				found := false
+				for _, c := range cases {
+					if c.Class == HeadlineFixtureClass && c.GeneratorToolchain == era && c.RepairProfile == profile && c.Encryption == encryption {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("no headline %s fixture for writer %s with %s encryption", profile, era, encryption)
+				}
 			}
 		}
 	}

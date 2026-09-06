@@ -68,10 +68,11 @@ const (
 // FixtureClass says what a fixture's result is for. It is carried from the
 // matrix through the manifest into every artifact so the summarizer can
 // aggregate the two kinds separately: a headline fixture stands for the bulk
-// of real posts (stored, encrypted multi-volume RAR of already-compressed
-// media), a breadth fixture proves a client handles a shape it will meet less
-// often. Pooling them equally would let compatibility breadth outvote the
-// common case in the published figure.
+// of real posts (a stored multi-volume RAR of already-compressed media, posted
+// clear or encrypted, and PAR2 repair over that same stored form), a breadth
+// fixture proves a client handles a shape it will meet less often. Pooling
+// them equally would let compatibility breadth outvote the common case in the
+// published figure.
 type FixtureClass string
 
 const (

@@ -126,8 +126,8 @@ summary:
 
 | Class | What it stands for | Sets |
 | --- | --- | --- |
-| `headline` | The common shape of a real post: a stored (`-m0`), encrypted, multi-volume RAR of already-compressed media. One set per source-locked RARLAB writer era (3.93, 4.20, 5.00, 6.24, 7.23), each with encrypted headers (`-hp`) and data-only encryption (`-p`); the 4.20 and 7.23 writers also keep the unencrypted stored form. | 5 sets, 12 fixtures |
-| `breadth` | Shapes a client meets less often and must still handle: release-style compression in both RAR families, a four-movie multi-input set, RAR5 quick-open records, the official 7-Zip 7z container, a stored Blu-ray-shaped topology in scattered NZB order, and the repair profiles. | 13 sets, 13 fixtures |
+| `headline` | The common shape of a real post: a stored (`-m0`), multi-volume RAR of already-compressed media. One clean set per source-locked RARLAB writer era (3.93, 4.20, 5.00, 6.24, 7.23), each posted clear, with encrypted headers (`-hp`) and with data-only encryption (`-p`), because most real posts are not encrypted and the encrypted forms are measured beside the clear one, never instead of it. PAR2 repair is part of the common case too: the stored form from the 4.20, 5.00 and 7.23 writers is posted in the same three forms with light damage (`par2-light`) and with an interior volume listed in the NZB but never posted (`par2-heavy-withheld`). | 8 sets, 33 fixtures |
+| `breadth` | Shapes a client meets less often and must still handle: release-style compression in both RAR families, a four-movie multi-input set, RAR5 quick-open records, the official 7-Zip 7z container, a stored Blu-ray-shaped topology in scattered NZB order, PAR2 over a solid compressed RAR5 and over 7z, and RAR recovery volumes. | 11 sets, 11 fixtures |
 
 The summarizer pools per-fixture results only within a class (see
 [Summarize](#7-summarize)); the headline aggregate is the figure for the common
@@ -159,8 +159,9 @@ Together they cover the RARLAB writer eras and their archive families across:
 | Encryption | none, data encryption, encrypted headers |
 | Input data | incompressible, moderately compressible |
 
-That yields 16 clean RAR fixtures: the 12 headline stored-and-encrypted
-lanes, and four breadth lanes — RAR 4.20 solid data-encrypted compression,
+That yields 19 clean RAR fixtures: the 15 headline stored lanes (five writer
+eras, each clear, header-encrypted and data-encrypted), and four breadth
+lanes — RAR 4.20 solid data-encrypted compression,
 RAR 7.23 solid header-encrypted compression over the compressible payload, a
 four-movie non-solid compressed set, and the quick-open set. `writer_era` is
 deliberately separate from `archive_format`: RAR 6 and 7 are writer releases,
@@ -212,11 +213,14 @@ Blu-ray image and not a claim about typical posts.
 
 ### Repair profiles
 
-Six repair fixtures add deterministic damage without duplicating the clean
-cases. Five are over stored archives (RAR5 PAR2 light, RAR5 PAR2 heavy with
-the volume withheld, RAR4 and RAR5 recovery volumes, 7z PAR2 light) and one,
-`repair-rar5-par2`, over a solid data-encrypted compressed RAR5 so a repair
-that has to run before a compressed extract is measured once:
+Seven repair sets add deterministic damage without duplicating the clean
+cases. Three are headline: PAR2 over the stored RAR from the 4.20, 5.00 and
+7.23 writers, each posted clear, with encrypted headers and with data
+encryption, under light damage and with the volume withheld, because a repair
+is part of what a real post costs. The other four are breadth: RAR4 and RAR5
+recovery volumes, 7z PAR2 light, and `repair-rar5-par2` over a solid
+data-encrypted compressed RAR5 so a repair that has to run before a
+compressed extract is measured once:
 
 | Profile | Posted repair material | Deliberate fault |
 | --- | --- | --- |
