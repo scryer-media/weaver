@@ -216,8 +216,11 @@ impl SpilloverDecision {
 /// Holds a ring buffer of `(timestamp, cumulative)` samples and smooths the
 /// window's raw rate with a 1 s half-life EMA, so the published value follows
 /// pipeline ticks without showing every short-lived burst. Not hot-path code:
-/// it is advanced once per 100 ms metrics tick under the tracker mutex.
-struct RateSeries {
+/// it is advanced once per 100 ms metrics tick under the tracker mutex, and
+/// once per active job phase on that same tick, so a job's displayed rate and
+/// the global gauge are one estimator over one window and can be compared.
+#[derive(Debug)]
+pub(crate) struct RateSeries {
     /// Ring buffer of (timestamp, cumulative value) samples.
     samples: Vec<(Instant, u64)>,
     /// Next write position in the ring buffer.
@@ -229,7 +232,7 @@ struct RateSeries {
 }
 
 impl RateSeries {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             samples: Vec::with_capacity(SPEED_WINDOW_SAMPLES),
             pos: 0,
@@ -238,8 +241,14 @@ impl RateSeries {
         }
     }
 
+    /// Whether any sample has been recorded since construction.
+    #[cfg(test)]
+    pub(crate) fn has_samples(&self) -> bool {
+        !self.samples.is_empty()
+    }
+
     /// Record a sample and recompute the smoothed rate.
-    fn update(&mut self, now: Instant, cumulative: u64) -> f64 {
+    pub(crate) fn update(&mut self, now: Instant, cumulative: u64) -> f64 {
         if self.samples.len() < SPEED_WINDOW_SAMPLES {
             self.samples.push((now, cumulative));
         } else {
@@ -434,6 +443,7 @@ pub struct PipelineMetrics {
     pub download_lanes_sequential_active: AtomicUsize,
     pub download_lanes_depth2_active: AtomicUsize,
     pub download_lanes_depth4_active: AtomicUsize,
+    pub download_lanes_depth8_active: AtomicUsize,
     pub download_lanes_idle_active: AtomicUsize,
     pub download_lanes_awaiting_work_active: AtomicUsize,
     pub download_lanes_binding_server_active: AtomicUsize,
@@ -494,11 +504,6 @@ pub struct PipelineMetrics {
     pub segments_failed_permanent: AtomicU64,
     pub parked_infrastructure_work: AtomicUsize,
     pub nntp_generation_recovery_requeues: AtomicU64,
-    pub nntp_capacity_probe_attempts_total: AtomicU64,
-    pub nntp_capacity_probe_successes_total: AtomicU64,
-    pub nntp_capacity_probe_rejections_total: AtomicU64,
-    pub nntp_capacity_probe_transport_failures_total: AtomicU64,
-    pub nntp_capacity_probe_stale_generation_total: AtomicU64,
     pub download_failures_article_not_found: AtomicU64,
     pub download_failures_capacity_unavailable: AtomicU64,
     pub download_failures_transient: AtomicU64,
@@ -594,6 +599,7 @@ impl PipelineMetrics {
             download_lanes_sequential_active: AtomicUsize::new(0),
             download_lanes_depth2_active: AtomicUsize::new(0),
             download_lanes_depth4_active: AtomicUsize::new(0),
+            download_lanes_depth8_active: AtomicUsize::new(0),
             download_lanes_idle_active: AtomicUsize::new(0),
             download_lanes_awaiting_work_active: AtomicUsize::new(0),
             download_lanes_binding_server_active: AtomicUsize::new(0),
@@ -648,11 +654,6 @@ impl PipelineMetrics {
             segments_failed_permanent: AtomicU64::new(0),
             parked_infrastructure_work: AtomicUsize::new(0),
             nntp_generation_recovery_requeues: AtomicU64::new(0),
-            nntp_capacity_probe_attempts_total: AtomicU64::new(0),
-            nntp_capacity_probe_successes_total: AtomicU64::new(0),
-            nntp_capacity_probe_rejections_total: AtomicU64::new(0),
-            nntp_capacity_probe_transport_failures_total: AtomicU64::new(0),
-            nntp_capacity_probe_stale_generation_total: AtomicU64::new(0),
             download_failures_article_not_found: AtomicU64::new(0),
             download_failures_capacity_unavailable: AtomicU64::new(0),
             download_failures_transient: AtomicU64::new(0),
@@ -910,6 +911,7 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             download_lanes_depth2_active: self.download_lanes_depth2_active.load(Ordering::Relaxed),
             download_lanes_depth4_active: self.download_lanes_depth4_active.load(Ordering::Relaxed),
+            download_lanes_depth8_active: self.download_lanes_depth8_active.load(Ordering::Relaxed),
             download_lanes_idle_active: self.download_lanes_idle_active.load(Ordering::Relaxed),
             download_lanes_awaiting_work_active: self
                 .download_lanes_awaiting_work_active
@@ -1038,21 +1040,6 @@ impl PipelineMetrics {
             nntp_generation_recovery_requeues: self
                 .nntp_generation_recovery_requeues
                 .load(Ordering::Relaxed),
-            nntp_capacity_probe_attempts_total: self
-                .nntp_capacity_probe_attempts_total
-                .load(Ordering::Relaxed),
-            nntp_capacity_probe_successes_total: self
-                .nntp_capacity_probe_successes_total
-                .load(Ordering::Relaxed),
-            nntp_capacity_probe_rejections_total: self
-                .nntp_capacity_probe_rejections_total
-                .load(Ordering::Relaxed),
-            nntp_capacity_probe_transport_failures_total: self
-                .nntp_capacity_probe_transport_failures_total
-                .load(Ordering::Relaxed),
-            nntp_capacity_probe_stale_generation_total: self
-                .nntp_capacity_probe_stale_generation_total
-                .load(Ordering::Relaxed),
             download_failures_article_not_found: self
                 .download_failures_article_not_found
                 .load(Ordering::Relaxed),
@@ -1094,6 +1081,13 @@ impl PipelineMetrics {
         let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
         let rates = self.speed_tracker.lock().unwrap().last();
         self.snapshot_with_speed(bytes_downloaded, rates)
+    }
+
+    /// Forget every rate sample, so a test can start the global window at a
+    /// known tick instead of at whatever moment the metrics were constructed.
+    #[cfg(test)]
+    pub(crate) fn reset_speed_tracker(&self) {
+        *self.speed_tracker.lock().unwrap() = SpeedTracker::new();
     }
 }
 
@@ -1159,6 +1153,7 @@ pub struct MetricsSnapshot {
     pub download_lanes_sequential_active: usize,
     pub download_lanes_depth2_active: usize,
     pub download_lanes_depth4_active: usize,
+    pub download_lanes_depth8_active: usize,
     pub download_lanes_idle_active: usize,
     pub download_lanes_awaiting_work_active: usize,
     pub download_lanes_binding_server_active: usize,
@@ -1214,16 +1209,6 @@ pub struct MetricsSnapshot {
     pub parked_infrastructure_work: usize,
     #[serde(default)]
     pub nntp_generation_recovery_requeues: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_attempts_total: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_successes_total: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_rejections_total: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_transport_failures_total: u64,
-    #[serde(default)]
-    pub nntp_capacity_probe_stale_generation_total: u64,
     pub download_failures_article_not_found: u64,
     pub download_failures_capacity_unavailable: u64,
     pub download_failures_transient: u64,

@@ -31,6 +31,7 @@ import { Sparkline } from "@/components/ui/sparkline";
 import { UploadModal } from "@/components/UploadModal";
 import { useSpeedHistory } from "@/lib/hooks/use-speed-history";
 import { LiveDataProvider, type DownloadBlockState } from "@/lib/context/live-data-context";
+import type { JobDownloadRate } from "@/lib/live-job-download-rates";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import type { JobData } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -61,9 +62,22 @@ interface GlobalQueueState {
   };
 }
 
+interface ProviderHoldoff {
+  label: string;
+  untilEpochMs: number;
+}
+
 interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
   globalState: GlobalQueueState["globalState"];
+  /** Only carried by the live subscription; the polled query omits it. */
+  providerHoldoffs?: ProviderHoldoff[];
+  /**
+   * Per-job download rates sampled with `currentDownloadSpeed`. Only carried
+   * by the live subscription; while polling, queue rows fall back to the rate
+   * on their queue item.
+   */
+  jobDownloadRates?: JobDownloadRate[];
 }
 
 const EMPTY_JOBS: JobData[] = [];
@@ -85,6 +99,8 @@ const DEFAULT_GLOBAL_STATE: GlobalQueueState["globalState"] = {
   downloadBlock: DEFAULT_DOWNLOAD_BLOCK,
 };
 const RECONNECT_TOAST_ID = "graphql-connection";
+const PROVIDER_HOLDOFF_TOAST_PREFIX = "provider-holdoff:";
+const PROVIDER_HOLDOFF_TOAST_MS = 15_000;
 
 const RoutedOutlet = memo(function RoutedOutlet() {
   return <Outlet />;
@@ -289,6 +305,7 @@ export function Layout() {
     () => ({
       jobs: EMPTY_JOBS,
       speed: metricsSnapshot?.metrics?.currentDownloadSpeed ?? 0,
+      jobDownloadRates: metricsSnapshot?.jobDownloadRates,
       isPaused: currentGlobalState.isPaused,
       downloadBlock: liveDownloadBlock,
       connection: liveConnection,
@@ -297,6 +314,7 @@ export function Layout() {
       currentGlobalState.isPaused,
       liveConnection,
       liveDownloadBlock,
+      metricsSnapshot?.jobDownloadRates,
       metricsSnapshot?.metrics?.currentDownloadSpeed,
     ],
   );
@@ -323,6 +341,38 @@ export function Layout() {
   useEffect(() => () => {
     toast.dismiss(RECONNECT_TOAST_ID);
   }, []);
+
+  // One warning per holdoff window per server: the deadline only changes
+  // when the provider rejects again after the previous window expired.
+  const providerHoldoffs = metricsSubscriptionData?.systemMetricsUpdates?.providerHoldoffs;
+  const announcedHoldoffsRef = useRef(new Map<string, number>());
+  useEffect(() => {
+    if (!providerHoldoffs) {
+      return;
+    }
+    const announced = announcedHoldoffsRef.current;
+    const active = new Set<string>();
+    for (const holdoff of providerHoldoffs) {
+      active.add(holdoff.label);
+      if (announced.get(holdoff.label) === holdoff.untilEpochMs) {
+        continue;
+      }
+      announced.set(holdoff.label, holdoff.untilEpochMs);
+      toast.warning(t("connection.serverOverLimitTitle", { server: holdoff.label }), {
+        id: `${PROVIDER_HOLDOFF_TOAST_PREFIX}${holdoff.label}`,
+        description: t("connection.serverOverLimitBody", {
+          time: new Date(holdoff.untilEpochMs).toLocaleTimeString(),
+        }),
+        duration: PROVIDER_HOLDOFF_TOAST_MS,
+        dismissible: true,
+      });
+    }
+    for (const label of announced.keys()) {
+      if (!active.has(label)) {
+        announced.delete(label);
+      }
+    }
+  }, [providerHoldoffs, t]);
 
   const lastTitleUpdate = useRef(0);
   useEffect(() => {
@@ -355,6 +405,7 @@ export function Layout() {
     <LiveDataProvider
       jobs={liveData.jobs}
       speed={liveData.speed}
+      jobDownloadRates={liveData.jobDownloadRates}
       isPaused={liveData.isPaused}
       downloadBlock={liveData.downloadBlock}
       connection={liveData.connection}

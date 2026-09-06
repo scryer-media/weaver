@@ -65,6 +65,25 @@ const (
 	Normal Compression = "normal"
 )
 
+// FixtureClass says what a fixture's result is for. It is carried from the
+// matrix through the manifest into every artifact so the summarizer can
+// aggregate the two kinds separately: a headline fixture stands for the bulk
+// of real posts (a stored multi-volume RAR of already-compressed media, posted
+// clear or encrypted, and PAR2 repair over that same stored form), a breadth
+// fixture proves a client handles a shape it will meet less often. Pooling
+// them equally would let compatibility breadth outvote the common case in the
+// published figure.
+type FixtureClass string
+
+const (
+	HeadlineFixtureClass FixtureClass = "headline"
+	BreadthFixtureClass  FixtureClass = "breadth"
+)
+
+func (c FixtureClass) Valid() bool {
+	return c == HeadlineFixtureClass || c == BreadthFixtureClass
+}
+
 type Encryption string
 
 const (
@@ -146,6 +165,10 @@ type Matrix struct {
 type FixtureSet struct {
 	ID        string `json:"id"`
 	WriterEra string `json:"writer_era"`
+	// Class is required: every set declares whether it is a headline or a
+	// breadth fixture, so the choice is reviewable in the matrix and cannot be
+	// made by the summarizer after the fact.
+	Class FixtureClass `json:"class"`
 	// GeneratorToolchain is the pinned RARLAB image used for this set. It
 	// always supplies the FFmpeg payload renderer, and for the RAR lanes it
 	// is also the archive writer.
@@ -176,6 +199,7 @@ type FixtureSet struct {
 type ArchiveCase struct {
 	ID                 string        `json:"id"`
 	SetID              string        `json:"set_id"`
+	Class              FixtureClass  `json:"class"`
 	WriterEra          string        `json:"writer_era"`
 	GeneratorToolchain string        `json:"generator_toolchain"`
 	ArchiveWriter      string        `json:"archive_writer"`
@@ -268,6 +292,7 @@ func (m Matrix) Expand() ([]ArchiveCase, error) {
 							cases = append(cases, ArchiveCase{
 								ID:                 id,
 								SetID:              set.ID,
+								Class:              set.Class,
 								WriterEra:          set.WriterEra,
 								GeneratorToolchain: set.GeneratorToolchain,
 								ArchiveWriter:      writer,
@@ -298,6 +323,9 @@ func (s FixtureSet) validate() error {
 	}
 	if strings.TrimSpace(s.WriterEra) == "" {
 		return fmt.Errorf("fixture set %q has an empty writer_era", s.ID)
+	}
+	if !s.Class.Valid() {
+		return fmt.Errorf("fixture set %q must declare class %q or %q, got %q", s.ID, HeadlineFixtureClass, BreadthFixtureClass, s.Class)
 	}
 	if strings.TrimSpace(s.GeneratorToolchain) == "" {
 		return fmt.Errorf("fixture set %q has an empty generator_toolchain", s.ID)

@@ -20,7 +20,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::args::{Cli, Command};
-use crate::logging::{LogColor, LogFormat};
+use crate::logging::{LocalTimer, LogColor, LogFormat};
 
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
@@ -95,6 +95,7 @@ async fn async_main() {
     let log_ring_buffer =
         weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity();
     let buffer_layer = tracing_subscriber::fmt::layer()
+        .with_timer(LocalTimer)
         .with_writer(LogBufferWriter(log_ring_buffer.clone()))
         .with_ansi(false);
     let env_log_file = std::env::var_os(LOG_FILE_ENV).map(PathBuf::from);
@@ -129,18 +130,28 @@ async fn async_main() {
     // the web log viewer parses it, so a JSON stdout must not reformat it.
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![Box::new(buffer_layer)];
     layers.push(match log_format {
-        LogFormat::Json => Box::new(tracing_subscriber::fmt::layer().json()),
-        LogFormat::Text => Box::new(tracing_subscriber::fmt::layer().with_ansi(stdout_ansi)),
+        LogFormat::Json => Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_timer(LocalTimer)
+                .json(),
+        ),
+        LogFormat::Text => Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_timer(LocalTimer)
+                .with_ansi(stdout_ansi),
+        ),
     });
     if let Some(writer) = log_file_writer {
         layers.push(match log_format {
             LogFormat::Json => Box::new(
                 tracing_subscriber::fmt::layer()
+                    .with_timer(LocalTimer)
                     .json()
                     .with_writer(LogFileMakeWriter(writer)),
             ),
             LogFormat::Text => Box::new(
                 tracing_subscriber::fmt::layer()
+                    .with_timer(LocalTimer)
                     .with_writer(LogFileMakeWriter(writer))
                     .with_ansi(false),
             ),

@@ -835,6 +835,25 @@ impl Pipeline {
         self.publish_active_stage_metrics();
     }
 
+    /// Whether the decode stage holds nothing at all for `job_id`: no decode
+    /// running and none queued behind the decode semaphore.
+    ///
+    /// This is deliberately narrower than
+    /// [`Self::job_has_pending_download_work_beyond_health_probe`] — it asks
+    /// only about the decode stage, and is the cheap gate that decides whether
+    /// a settling decode is worth re-running the download-drain sequence for.
+    fn job_decode_stage_drained(&self, job_id: JobId) -> bool {
+        self.active_decodes_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            == 0
+            && !self
+                .pending_decode
+                .iter()
+                .any(|work| work.segment_id.file_id.job_id == job_id)
+    }
+
     pub(in crate::pipeline) fn decode_retry_exclude_servers(
         existing_excludes: &[usize],
         source_server_idx: Option<usize>,
@@ -1168,6 +1187,28 @@ impl Pipeline {
         }
 
         self.pump_decode_queue();
+
+        // The download-result path already ran the drain sequence for this
+        // job — but it ran it with this decode still queued or in flight, so
+        // it necessarily refused to retire an in-flight health probe: an
+        // unsettled decode is pending download work.
+        //
+        // Nothing re-runs that sequence once the decode settles. A
+        // direct-routed article leaves `handle_decode_success` at its early
+        // return, the conventional file-complete seam schedules no drain, and
+        // the dispatch-idle and quiescent-flush hooks only fire when something
+        // else pokes the pipeline. A probe that outlived the job's last byte
+        // would then hold the completion checkpoint — and PAR2 recovery
+        // promotion with it — until its own soft timeout expired.
+        //
+        // So the last decode of a job re-runs the same sequence. Everything in
+        // it is idempotent (`DownloadFinished` is gated on
+        // `active_download_passes`), and its own `in_flight == 0 && no queued
+        // work` gate makes this a no-op for every decode that is not the last.
+        let job_id = segment_id.file_id.job_id;
+        if self.jobs.contains_key(&job_id) && self.job_decode_stage_drained(job_id) {
+            self.maybe_finish_download_pass(job_id);
+        }
     }
 
     /// Handle a decode failure by re-queuing the segment for re-download.

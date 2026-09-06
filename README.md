@@ -67,11 +67,12 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Etc/UTC
+      - TZ=Etc/UTC # log timestamps use this zone and carry its UTC offset
       - UMASK=022 # optional
       - WEAVER_HTTP_ALLOWED_HOSTS=weaver,weaver.example.me # permit the Compose service name and any reverse proxy names
       # First-run setup: pick one of the two blocks below.
       # - WEAVER_TRUSTED_CIDRS=192.168.0.0/16 # browsers in these networks get full access without a login
+      # - WEAVER_TRUSTED_PROXIES=172.20.0.5 # only with the line above, and only behind a reverse proxy: trust its forwarded client address
       # - WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin # creates the login on first start, then sign in normally
       # - WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/run/secrets/weaver-login # the password, read from a mounted file
     volumes:
@@ -104,6 +105,25 @@ configure `WEAVER_TRUSTED_CIDRS` with explicit client networks, for example
 `127.0.0.0/8,::1/128` for local access only. Matching clients receive full
 administrative browser access; agents and integrations must use persistent,
 scoped API keys instead.
+
+Behind a reverse proxy, every request reaches Weaver from the proxy, so a
+trusted network never matches the browser's own address. Name the proxy in
+`WEAVER_TRUSTED_PROXIES` — a comma-separated list of addresses or CIDRs, for
+example `172.20.0.5` or `10.8.0.0/16` — and Weaver judges trust on the client
+the proxy reports in `X-Forwarded-For` (or `X-Real-IP`, or `Forwarded`) rather
+than on the proxy itself. The list is empty by default, and that default is
+what makes forwarding headers unusable as a spoof: an address is believed only
+when it arrives from a proxy you named. Trusted hops are removed from the right
+of the chain, so a browser that sends its own `X-Forwarded-For` is still judged
+on the address your proxy recorded. Weaver's refusal page prints the address it
+judged, and says when forwarding headers were present but ignored.
+
+The list does not apply to the Docker userland proxy. Publishing a port with
+`-p` on a host where `userland-proxy` is enabled rewrites the source address to
+the bridge gateway and adds no headers, so every browser arrives as the same
+address and no trusted network can distinguish them. Use `--network host`, or
+set `"userland-proxy": false` in the Docker daemon configuration, or put a real
+reverse proxy in front and name it here.
 
 For an unattended first start, configure `WEAVER_BOOTSTRAP_LOGIN_USERNAME` and
 exactly one of `WEAVER_BOOTSTRAP_LOGIN_PASSWORD` or

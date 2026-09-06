@@ -44,8 +44,8 @@ impl Database {
                             )?;
                             tx.execute(
                                 "INSERT INTO servers
-                                    (id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der)
-                                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                                    (id, host, port, tls, username, password, connections, active, supports_pipelining, pipelining_depth, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der)
+                                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
                                  ON CONFLICT(id) DO UPDATE SET
                                     host = excluded.host,
                                     port = excluded.port,
@@ -55,6 +55,7 @@ impl Database {
                                     connections = excluded.connections,
                                     active = excluded.active,
                                     supports_pipelining = excluded.supports_pipelining,
+                                    pipelining_depth = excluded.pipelining_depth,
                                     priority = excluded.priority,
                                     backfill = excluded.backfill,
                                     retention_days = excluded.retention_days,

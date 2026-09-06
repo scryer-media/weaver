@@ -39,9 +39,9 @@ async fn spawn_scripted_server(steps: Vec<ScriptStep>) -> u16 {
             if let Some(prefix) = step.expect_prefix {
                 loop {
                     let line = read_command_line(&mut socket).await;
-                    // Runtime setup sends this optional compatibility command
-                    // before the validation probe. Individual scripts can
-                    // still assert it explicitly when it matters.
+                    // Setup no longer sends this by default, but a server the
+                    // process has learned to send it to still does. Tolerate
+                    // it so only the scripts that assert it model it.
                     if line.starts_with("MODE READER") && !prefix.starts_with("MODE READER") {
                         socket
                             .write_all(b"500 MODE READER unsupported\r\n")
@@ -658,7 +658,6 @@ async fn active_connection_reduction_waits_for_new_runtime_generation() {
         Some(weaver_server_core::NntpRuntimeActivation {
             generation: 1,
             configured_connections: 80,
-            effective_connections: 80,
         })
     );
 
@@ -681,7 +680,6 @@ async fn active_connection_reduction_waits_for_new_runtime_generation() {
         Some(weaver_server_core::NntpRuntimeActivation {
             generation: 2,
             configured_connections: 20,
-            effective_connections: 20,
         })
     );
 }

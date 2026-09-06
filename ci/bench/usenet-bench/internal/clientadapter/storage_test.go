@@ -73,24 +73,27 @@ func TestStorageValidationMatchesVolumesToTheProfile(t *testing.T) {
 }
 
 func TestDownloadMountsFollowTheStorageProfile(t *testing.T) {
-	cfg := Config{OutputDir: "/scratch/complete"}
-	mounts := downloadMounts(cfg, "/scratch/incomplete")
-	if mounts[0] != "type=bind,src=/scratch/incomplete,dst=/downloads/incomplete" ||
-		mounts[1] != "type=bind,src=/scratch/complete,dst=/downloads/complete" {
-		t.Fatalf("local runs must keep both directories on host binds: %v", mounts)
+	cfg := Config{OutputDir: "/scratch/downloads/complete"}
+	downloadsDir, incompleteDir := hostDownloadDirs(cfg)
+	if downloadsDir != "/scratch/downloads" || incompleteDir != "/scratch/downloads/incomplete" {
+		t.Fatalf("the intermediate directory must be the completion directory's sibling: %s %s", downloadsDir, incompleteDir)
+	}
+	mounts := downloadMounts(cfg, downloadsDir, incompleteDir)
+	if len(mounts) != 1 || mounts[0] != "type=bind,src=/scratch/downloads,dst=/downloads" {
+		t.Fatalf("local runs must bind ONE downloads directory so the final move is a rename: %v", mounts)
 	}
 
 	cfg.CompleteVolume = "nntpbench-run-0001-complete-abcdef12"
-	mounts = downloadMounts(cfg, "/scratch/incomplete")
+	mounts = downloadMounts(cfg, "/scratch/downloads", "/scratch/incomplete")
 	if mounts[0] != "type=bind,src=/scratch/incomplete,dst=/downloads/incomplete" {
 		t.Fatalf("nfs-complete must keep the intermediate directory local: %v", mounts)
 	}
 	if mounts[1] != "type=volume,src=nntpbench-run-0001-complete-abcdef12,dst=/downloads/complete" {
-		t.Fatalf("nfs-complete must place only the completion directory on the export: %v", mounts)
+		t.Fatalf("nfs-complete must place only the completion directory on the export, so the final move is the cross-device copy it exists to measure: %v", mounts)
 	}
 
 	cfg.IncompleteVolume = "nntpbench-run-0001-incomplete-abcdef12"
-	mounts = downloadMounts(cfg, "/scratch/incomplete")
+	mounts = downloadMounts(cfg, "/scratch/downloads", "/scratch/incomplete")
 	if mounts[0] != "type=volume,src=nntpbench-run-0001-incomplete-abcdef12,dst=/downloads/incomplete" {
 		t.Fatalf("nfs-all must place the intermediate directory on the export too: %v", mounts)
 	}

@@ -1,7 +1,5 @@
 use super::*;
-use crate::pipeline::download::transport::{
-    JobTransportClass, ServerPipelineProof, ServerPipelineState,
-};
+use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 mod completion;
@@ -92,7 +90,6 @@ struct DownloadPipelineBacklog {
 const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
 const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
-const SAB_BODY_PIPELINE_DEPTH: usize = 2;
 const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
 const HOT_LEASE_TARGET_RUNWAY_SECS: u64 = 2;
 const HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
@@ -213,8 +210,6 @@ impl Pipeline {
                 total_bytes = total,
                 configured_server_count = self.nntp.pool().server_count(),
                 tuner_max_connections = tuner_max,
-                effective_connection_capacity =
-                    self.effective_download_connection_capacity(tuner_max),
                 "NNTP download pass started"
             );
             self.phase_begin(job_id, JobPhase::Downloading, Some(total));
@@ -329,6 +324,9 @@ impl Pipeline {
 
     pub(crate) fn dispatch_downloads(&mut self) {
         let now = Instant::now();
+        // Whatever park asked for this pass is being served by it, including
+        // the passes the run loop starts at the top of a turn.
+        self.download_dispatch_wake = false;
         if self.global_paused || self.rate_limiter.should_wait() {
             self.hot_share_yield_signal.clear();
             if self.active_downloads == 0 {
@@ -338,6 +336,14 @@ impl Pipeline {
                     "dispatch blocked: paused/rate"
                 );
             }
+            self.publish_hot_dispatch_metrics(now);
+            return;
+        }
+        if self.nntp_handoff_draining {
+            // The previous pool's sockets are still open at the provider; a
+            // dial now competes with them for the same allowance. The drain
+            // completion dispatches (see `handle_nntp_handoff_drained`).
+            self.hot_share_yield_signal.clear();
             self.publish_hot_dispatch_metrics(now);
             return;
         }

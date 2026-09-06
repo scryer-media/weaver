@@ -1,7 +1,5 @@
 use super::*;
 
-const NNTP_ACTIVATION_OVERLAP_GRACE: Duration = Duration::from_secs(30);
-
 impl Pipeline {
     pub(crate) async fn handle_command(&mut self, cmd: SchedulerCommand) {
         match cmd {
@@ -545,10 +543,6 @@ impl Pipeline {
             } => {
                 let result = if let Ok(new_client) = client.downcast::<NntpClient>() {
                     let new_client = Arc::new(*new_client);
-                    new_client
-                        .pool()
-                        .begin_activation_overlap_grace(NNTP_ACTIVATION_OVERLAP_GRACE);
-                    let effective_connections = new_client.pool().effective_connection_capacity();
                     let old_client = std::mem::replace(&mut self.nntp, new_client);
                     // Server indices and retention windows may have changed:
                     // recompute retention and drop queued failure exclusions,
@@ -576,19 +570,29 @@ impl Pipeline {
                     self.owned_download_lane_pool
                         .resize(total_connections.max(1));
                     self.tuner.set_connection_limit(total_connections);
-                    tokio::spawn(async move { old_client.shutdown().await });
-                    self.dispatch_downloads();
+                    // Dispatch on the new pool only once the old one has let
+                    // go of its sockets. The provider counts both generations
+                    // against one allowance, so dialling into the overlap is
+                    // refused as "too many connections" and would hold the
+                    // new pool off for the whole window on a healthy server.
+                    // Old-generation lanes drain on their own: their refills
+                    // are answered with the generation error and they park.
+                    self.nntp_handoff_draining = true;
+                    let drained_tx = self.nntp_handoff_drained_tx.clone();
+                    let generation = self.pool_generation;
+                    tokio::spawn(async move {
+                        old_client.shutdown().await;
+                        let _ = drained_tx.send(generation).await;
+                    });
                     let activation = NntpRuntimeActivation {
                         generation: self.pool_generation,
                         configured_connections: total_connections,
-                        effective_connections,
                     };
                     self.shared_state.set_nntp_runtime_activation(activation);
                     self.publish_snapshot();
                     info!(
                         runtime_generation = activation.generation,
                         configured_connections = activation.configured_connections,
-                        effective_connections = activation.effective_connections,
                         recovery_requeues,
                         max_downloads = self.tuner.params().max_concurrent_downloads,
                         "NNTP runtime generation activated"
@@ -775,5 +779,33 @@ impl Pipeline {
             }
             SchedulerCommand::Shutdown => unreachable!("handled in select"),
         }
+    }
+}
+
+impl Pipeline {
+    /// The pool replaced by generation `generation` has drained its sockets,
+    /// so the new pool may dial without competing for the provider allowance.
+    ///
+    /// A drain that finishes after a further rebuild is stale: only the newest
+    /// generation's own drain re-opens dispatch, which keeps the overlap rule
+    /// intact across back-to-back settings saves.
+    pub(crate) fn handle_nntp_handoff_drained(&mut self, generation: u64) {
+        if generation != self.pool_generation {
+            debug!(
+                drained_generation = generation,
+                runtime_generation = self.pool_generation,
+                "ignoring a stale NNTP generation drain"
+            );
+            return;
+        }
+        if !self.nntp_handoff_draining {
+            return;
+        }
+        self.nntp_handoff_draining = false;
+        info!(
+            runtime_generation = generation,
+            "previous NNTP generation drained; dispatching on the new pool"
+        );
+        self.dispatch_downloads();
     }
 }

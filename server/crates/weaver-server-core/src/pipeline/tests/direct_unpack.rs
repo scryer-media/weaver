@@ -20,6 +20,13 @@ fn enable_direct_unpack(pipeline: &mut Pipeline) {
     });
 }
 
+/// Turn the feature off for one pipeline, the way an operator opt-out would.
+fn disable_direct_unpack(pipeline: &mut Pipeline) {
+    pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+        gate: DirectUnpackGate::Disabled,
+    });
+}
+
 /// A well-formed 32-byte signature header declaring the given end header.
 fn signature_header(next_header_offset: u64, next_header_size: u64) -> [u8; 32] {
     let mut header = [0u8; 32];
@@ -125,7 +132,9 @@ async fn reap_until_outcome(pipeline: &mut Pipeline, job_id: JobId, set_name: &s
 async fn a_disabled_gate_leaves_no_controller_state() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    // Deliberately not enabling the gate: this is the shipped posture.
+    // The operator opt-out: the gate is on by default, so the off posture has
+    // to be asked for explicitly.
+    disable_direct_unpack(&mut pipeline);
     let job_id = JobId(41001);
     let files = sevenz_fixture_bytes("generated_split_store_plain.7z");
     let spec = rar_job_spec("Silver Horizon Split", &files);
@@ -1167,7 +1176,7 @@ async fn a_job_without_a_single_7z_registers_no_arming_candidates() {
 
     // And with the gate off, not even a bare .7z registers.
     let dark_job = JobId(41321);
-    pipeline.direct_unpack = DirectUnpackRuntime::default();
+    disable_direct_unpack(&mut pipeline);
     let single = vec![("silver_horizon.7z".to_string(), vec![0u8; 4_096])];
     let spec = rar_job_spec("Silver Horizon", &single);
     insert_active_job(&mut pipeline, dark_job, spec).await;

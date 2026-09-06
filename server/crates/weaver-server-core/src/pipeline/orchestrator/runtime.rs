@@ -125,8 +125,8 @@ impl Pipeline {
         let (ip_replacement_trial_tx, ip_replacement_trial_rx) = mpsc::channel(16);
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
-        let (capacity_probe_result_tx, capacity_probe_result_rx) = mpsc::channel(64);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
+        let (nntp_handoff_drained_tx, nntp_handoff_drained_rx) = mpsc::channel(4);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
         let (rar_refresh_done_tx, rar_refresh_done_rx) = mpsc::channel(32);
         let (rar_capacity_retry_tx, rar_capacity_retry_rx) = mpsc::channel(32);
@@ -163,7 +163,6 @@ impl Pipeline {
         shared_state.set_nntp_runtime_activation(NntpRuntimeActivation {
             generation: 0,
             configured_connections: total_connections,
-            effective_connections: nntp.pool().effective_connection_capacity(),
         });
         let server_counters = Self::activate_server_counters(&metrics, &nntp);
         let owned_download_lane_pool =
@@ -205,9 +204,10 @@ impl Pipeline {
             hot_dispatch_expansion_window: HotExpansionWindow::default(),
             hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
             hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
-            job_transport_profiles: HashMap::new(),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
             deferred_lane_refills: std::collections::VecDeque::new(),
+            download_dispatch_wake: false,
+            nntp_handoff_draining: false,
             ip_replacement_trial_extra_connections,
             ip_rtt_ewma: HashMap::new(),
             ip_replacement_retired_ips: HashSet::new(),
@@ -325,10 +325,10 @@ impl Pipeline {
             pool_generation: 0,
             server_counters,
             job_stage_started_at: HashMap::new(),
-            capacity_probe_result_tx,
-            capacity_probe_result_rx,
             probe_result_tx,
             probe_result_rx,
+            nntp_handoff_drained_tx,
+            nntp_handoff_drained_rx,
             extract_done_tx,
             extract_done_rx,
             rar_refresh_done_tx,
@@ -557,93 +557,6 @@ impl Pipeline {
             })
             .collect::<Vec<_>>();
         metrics.server_metrics.activate(&stable_ids)
-    }
-
-    pub(in crate::pipeline) fn drive_capacity_probes_at(&self, now: tokio::time::Instant) {
-        let pool = self.nntp_pool();
-        for change in pool.take_capacity_changes() {
-            match change.probe_outcome {
-                Some(
-                    weaver_nntp::CapacityProbeOutcome::Succeeded
-                    | weaver_nntp::CapacityProbeOutcome::NoConfiguredPermit,
-                ) => info!(
-                    server = change.server.0,
-                    configured_connections = change.configured_connections,
-                    effective_connections = change.effective_connections,
-                    effective_delta = change.effective_delta,
-                    coalesced_rejections = change.coalesced_rejections,
-                    probe_outcome = ?change.probe_outcome,
-                    next_probe_at_epoch_ms = change.next_probe_at_epoch_ms,
-                    runtime_generation = self.pool_generation,
-                    "NNTP adaptive capacity changed"
-                ),
-                _ => warn!(
-                    server = change.server.0,
-                    configured_connections = change.configured_connections,
-                    effective_connections = change.effective_connections,
-                    effective_delta = change.effective_delta,
-                    coalesced_rejections = change.coalesced_rejections,
-                    probe_outcome = ?change.probe_outcome,
-                    next_probe_at_epoch_ms = change.next_probe_at_epoch_ms,
-                    runtime_generation = self.pool_generation,
-                    "NNTP adaptive capacity changed"
-                ),
-            }
-        }
-
-        let generation = self.pool_generation;
-        for server in pool.claim_due_capacity_probes(now) {
-            let pool = Arc::clone(&pool);
-            let result_tx = self.capacity_probe_result_tx.clone();
-            tokio::spawn(async move {
-                let outcome = pool.run_capacity_probe(server).await;
-                let _ = result_tx
-                    .send(CapacityProbeCompletion {
-                        generation,
-                        outcome,
-                    })
-                    .await;
-            });
-        }
-    }
-
-    fn handle_capacity_probe_completion(&mut self, completion: CapacityProbeCompletion) {
-        if completion.generation != self.pool_generation {
-            self.metrics
-                .nntp_capacity_probe_stale_generation_total
-                .fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
-        if !matches!(
-            completion.outcome,
-            weaver_nntp::CapacityProbeOutcome::NoConfiguredPermit
-        ) {
-            self.metrics
-                .nntp_capacity_probe_attempts_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        match completion.outcome {
-            weaver_nntp::CapacityProbeOutcome::Succeeded => {
-                self.metrics
-                    .nntp_capacity_probe_successes_total
-                    .fetch_add(1, Ordering::Relaxed);
-                self.dispatch_downloads();
-            }
-            weaver_nntp::CapacityProbeOutcome::Rejected => {
-                self.metrics
-                    .nntp_capacity_probe_rejections_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            weaver_nntp::CapacityProbeOutcome::TransportFailure => {
-                self.metrics
-                    .nntp_capacity_probe_transport_failures_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            weaver_nntp::CapacityProbeOutcome::AuthenticationFailure
-            | weaver_nntp::CapacityProbeOutcome::NoConfiguredPermit => {}
-        }
     }
 
     pub fn post_processing_executor(
@@ -944,8 +857,6 @@ impl Pipeline {
     pub async fn run(&mut self) {
         let mut metrics_snapshot_interval = tokio::time::interval(Self::METRICS_SNAPSHOT_INTERVAL);
         metrics_snapshot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut capacity_probe_interval = tokio::time::interval(Duration::from_secs(1));
-        capacity_probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut tune_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         tune_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut stalled_download_interval = tokio::time::interval(STALLED_DOWNLOAD_CHECK_INTERVAL);
@@ -1025,6 +936,9 @@ impl Pipeline {
             }
 
             self.drain_ready_lane_control_messages();
+            if self.take_download_dispatch_wake() {
+                self.dispatch_downloads();
+            }
 
             let mut processed_results = 0usize;
             while processed_results < Self::DOWNLOAD_RESULTS_PER_TURN {
@@ -1033,6 +947,15 @@ impl Pipeline {
                 };
                 self.process_released_download_done(result).await;
                 processed_results += 1;
+                // Ingesting a turn's worth of results is the longest stretch of
+                // a loop turn, and it is exactly when lanes finish their leases
+                // and park. Draining the control channel here and dispatching
+                // on the park hands the freed connection straight back out
+                // instead of holding it until the turn ends.
+                self.drain_ready_lane_control_messages();
+                if self.take_download_dispatch_wake() {
+                    self.dispatch_downloads();
+                }
             }
             if processed_results == 0 {
                 tokio::select! {
@@ -1084,8 +1007,8 @@ impl Pipeline {
                     Some(update) = self.probe_result_rx.recv() => {
                         self.handle_probe_update(update);
                     }
-                    Some(completion) = self.capacity_probe_result_rx.recv() => {
-                        self.handle_capacity_probe_completion(completion);
+                    Some(generation) = self.nntp_handoff_drained_rx.recv() => {
+                        self.handle_nntp_handoff_drained(generation);
                     }
                     Some(done) = self.extract_done_rx.recv() => {
                         self.handle_extraction_done(done).await;
@@ -1124,9 +1047,6 @@ impl Pipeline {
                     Some(retry) = self.retry_rx.recv() => {
                         self.receive_retry_work(retry);
                     }
-                    _ = capacity_probe_interval.tick() => {
-                        self.drive_capacity_probes_at(tokio::time::Instant::now());
-                    }
                     _ = metrics_snapshot_interval.tick() => {
                         self.sample_phase_progress();
                         self.shared_state.refresh_metrics_snapshot();
@@ -1144,6 +1064,7 @@ impl Pipeline {
                     _ = tune_interval.tick() => {
                         self.flush_quiescent_write_backlog().await;
                         self.refresh_download_pressure();
+                        self.publish_download_transport_health();
 
                         let snapshot = self.metrics.snapshot();
                         let not_found = snapshot.articles_not_found;

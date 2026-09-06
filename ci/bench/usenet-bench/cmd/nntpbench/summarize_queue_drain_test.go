@@ -11,7 +11,7 @@ import (
 func queueDrainTestArtifact(t *testing.T, copies int) (benchmark.QueueArtifact, map[string]benchmark.Run) {
 	t.Helper()
 	plan, err := benchmark.BuildPlan(benchmark.PlanOptions{
-		FixtureIDs:        []string{"direct-mkv-200mb"},
+		FixtureIDs:        []string{"direct-mkv"},
 		Clients:           []benchmark.Client{benchmark.Weaver},
 		ArchiveToolchains: []benchmark.ArchiveToolchain{benchmark.VanillaArchiveToolchain},
 		Transports:        []benchmark.Transport{benchmark.TLS},
@@ -81,7 +81,7 @@ func TestQueueDrainLaneReportsVerifiedDrainWallClock(t *testing.T) {
 	}
 	if lane.Client != benchmark.Weaver || lane.Copies != 10 || lane.Status != "passed" || lane.CopiesDidNotFinish != 0 ||
 		lane.QueueWallClockNanoseconds != (90*time.Second).Nanoseconds() || lane.VerifiedWallClockNanoseconds != (92*time.Second).Nanoseconds() ||
-		lane.TransportLabel != "tls-ca-verified" || lane.FixtureID != "direct-mkv-200mb" || lane.Profile != benchmark.ProfileEquivalentThroughput {
+		lane.TransportLabel != "tls-ca-verified" || lane.FixtureID != "direct-mkv" || lane.Profile != benchmark.ProfileEquivalentThroughput {
 		t.Fatalf("unexpected lane: %#v", lane)
 	}
 

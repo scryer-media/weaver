@@ -85,6 +85,7 @@ func TestArchiveArgsRejectTheWrongWriter(t *testing.T) {
 func TestMatrixRejectsSevenZipWithRARRecoveryVolumes(t *testing.T) {
 	matrix := Matrix{SchemaVersion: 2, Sets: []FixtureSet{{
 		ID:                 "sevenzip-recovery",
+		Class:              BreadthFixtureClass,
 		WriterEra:          "7-Zip",
 		GeneratorToolchain: "rarlab-7.23",
 		ArchiveWriter:      "sevenzip-26.02",
@@ -109,6 +110,7 @@ func TestMatrixRejectsSevenZipWithRARRecoveryVolumes(t *testing.T) {
 func TestMatrixAcceptsSevenZipWithPAR2(t *testing.T) {
 	matrix := Matrix{SchemaVersion: 2, Sets: []FixtureSet{{
 		ID:                 "sevenzip-par2",
+		Class:              BreadthFixtureClass,
 		WriterEra:          "7-Zip",
 		GeneratorToolchain: "rarlab-7.23",
 		ArchiveWriter:      "sevenzip-26.02",
@@ -140,6 +142,7 @@ func TestMatrixAcceptsSevenZipWithPAR2(t *testing.T) {
 func TestExpandDefaultsWriterAndOrder(t *testing.T) {
 	matrix := Matrix{SchemaVersion: 2, Sets: []FixtureSet{{
 		ID:                 "defaults",
+		Class:              BreadthFixtureClass,
 		WriterEra:          "RAR 7.23",
 		GeneratorToolchain: "rarlab-7.23",
 		ArchiveFormat:      RAR5,
@@ -181,7 +184,7 @@ func TestCheckedInMatrixAndCorpusAgree(t *testing.T) {
 	}
 	for _, id := range corpus.FixtureIDs {
 		// The direct MKV fixture is generated outside the matrix.
-		if id == "direct-mkv-200mb" {
+		if id == "direct-mkv" {
 			continue
 		}
 		if !known[id] {

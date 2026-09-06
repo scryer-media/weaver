@@ -82,7 +82,7 @@ func TestDefaultPlanCreatesStockThreeByThreeMatrixAndDockerRarparLanes(t *testin
 }
 
 func TestPlanPersistsNamedServerLink(t *testing.T) {
-	link, err := ResolveServerLinkProfile(Link10Gbit, 0, 0)
+	link, err := ResolveServerLinkProfile(Link10Gbit, 0, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

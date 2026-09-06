@@ -26,8 +26,8 @@ func TestProductImagesReachAPI(t *testing.T) {
 		image  string
 	}{
 		{benchmark.Weaver, "ghcr.io/scryer-media/weaver@sha256:7e693e201efbd4876fffc346872e17b1eb0eef0e6f761b6931d9207154cc9b71"},
-		{benchmark.SABnzbd, "lscr.io/linuxserver/sabnzbd@sha256:1a26f56dfc047b62d5ddc20bc92bdebfbe7c3cb58d2d3523958838a09182d77a"},
-		{benchmark.NZBGet, "lscr.io/linuxserver/nzbget@sha256:b22a2b8b366d1e68e6341435bdabd9ff859642cc2ff4a04243d0723521d69d2e"},
+		{benchmark.SABnzbd, "lscr.io/linuxserver/sabnzbd@sha256:64c4c2b6ed546237451cbfec33aa8bac1396865c1a266dd247c02b36ffe27c62"},
+		{benchmark.NZBGet, "lscr.io/linuxserver/nzbget@sha256:4cc4afc944e0239037b7b95c64deb8e39e49ca770b7e2f61476a04443d7fcab9"},
 	}
 	for _, testCase := range cases {
 		t.Run(string(testCase.client), func(t *testing.T) {

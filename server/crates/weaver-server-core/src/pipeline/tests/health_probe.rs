@@ -713,3 +713,178 @@ async fn a_retired_probe_still_lets_an_unrecoverable_job_fail() {
         "{error}"
     );
 }
+
+/// The decode that settles last must retire the probe, not just the download
+/// result that preceded it.
+///
+/// Live ordering, which the drain-time tests above never reproduce: the last
+/// article's download result is processed while its decode is still queued.
+/// The drain sequence therefore runs with an unsettled decode on the books —
+/// pending download work by definition — and correctly refuses to retire the
+/// probe. If nothing re-runs it when that decode lands, the job sits in
+/// `Checking` behind a probe with nothing left to say until the probe's own
+/// soft timeout fires, holding the completion checkpoint and PAR2 recovery
+/// promotion for the whole of it.
+#[tokio::test]
+async fn the_last_decode_to_settle_retires_the_probe() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30320);
+    let filename = "silver-horizon-tail.bin";
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Last Decode Retires Probe", filename, &[8, 8]),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment(&mut pipeline, file_id, 0, 0, b"horizon0", filename, None).await;
+
+    pipeline.activate_health_probes(job_id);
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(state.health_probing);
+        assert!(matches!(state.status, JobStatus::Checking));
+    }
+
+    let last_segment = SegmentId {
+        file_id,
+        segment_number: 1,
+    };
+    park_job_on_its_final_decode(&mut pipeline, last_segment, 8);
+
+    // The download-result path's own drain attempt. It cannot retire the probe
+    // yet, and that is correct — the article it just delivered is still
+    // decoding.
+    pipeline.maybe_finish_download_pass(job_id);
+    assert!(
+        pipeline.jobs.get(&job_id).unwrap().health_probing,
+        "an unsettled decode is pending download work: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    settle_queued_decode(&mut pipeline, file_id, 1, 8, b"horizon1", filename).await;
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(
+        !state.health_probing,
+        "the settling decode left nothing for the probe to say, so it must be \
+         retired instead of waited out: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert!(
+        matches!(state.status, JobStatus::Downloading),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert!(
+        pipeline.pending_completion_checks.contains(&job_id),
+        "retiring the probe must hand the job straight to the completion \
+         checkpoint"
+    );
+}
+
+/// A probe STAT queued behind a saturated server must be unblocked by the lane
+/// that parks *after* it started waiting.
+///
+/// When a probe is activated the download lanes are still working, so the
+/// sweep it runs before its first batch finds no idle permit to reclaim.
+/// Moments later those lanes run out of work and park — holding their cached
+/// connections, and the connection permits with them — while the STAT is
+/// already queued on the semaphore. A probe that looks only once stays there
+/// for the client's entire soft timeout and aborts its round as inconclusive,
+/// with the job's permits sitting unused the whole time.
+#[tokio::test(start_paused = true)]
+async fn a_waiting_probe_batch_reclaims_a_lane_that_parks_after_it_queued() {
+    const SOFT_TIMEOUT: Duration = Duration::from_secs(15);
+    const LANES_PARK_AFTER: Duration = Duration::from_millis(800);
+
+    // Every one of this server's connection permits is held by a lane.
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let lanes_park_at = tokio::time::Instant::now() + LANES_PARK_AFTER;
+    // An idle owned lane keeps its permit until something parks it, which is
+    // what a reclaim sweep does and nothing else does.
+    let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sweeps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let batch = {
+        let permits = std::sync::Arc::clone(&permits);
+        async move { tokio::time::timeout(SOFT_TIMEOUT, permits.acquire_owned()).await }
+    };
+    let reclaim = {
+        let permits = std::sync::Arc::clone(&permits);
+        let parked = std::sync::Arc::clone(&parked);
+        let sweeps = std::sync::Arc::clone(&sweeps);
+        move || {
+            sweeps.fetch_add(1, Ordering::Relaxed);
+            if tokio::time::Instant::now() >= lanes_park_at && !parked.swap(true, Ordering::Relaxed)
+            {
+                permits.add_permits(1);
+            }
+        }
+    };
+
+    let started = tokio::time::Instant::now();
+    let acquired = crate::pipeline::health::drive_probe_batch_with_permit_reclaim(
+        batch,
+        crate::pipeline::health::PROBE_PERMIT_RECLAIM_INTERVAL,
+        reclaim,
+    )
+    .await;
+    let waited = started.elapsed();
+
+    assert!(
+        acquired.is_ok(),
+        "the probe must get a permit from the lane that parked, not wait out \
+         the soft timeout"
+    );
+    assert!(
+        sweeps.load(Ordering::Relaxed) >= 2,
+        "the batch must keep looking while it waits, not sweep once and settle"
+    );
+    assert!(
+        waited < LANES_PARK_AFTER + crate::pipeline::health::PROBE_PERMIT_RECLAIM_INTERVAL * 2,
+        "the wait must end with the lane parking, not with the soft timeout: \
+         waited {waited:?}"
+    );
+}
+
+/// The reclaim loop must not paper over a probe that is genuinely starved.
+///
+/// With every permit held by a lane that keeps working, sweeping changes
+/// nothing and the batch has to end exactly as it did before the loop existed:
+/// on the client's own acquire deadline, which is what reports the round
+/// inconclusive without putting a blameless server into cooldown.
+#[tokio::test(start_paused = true)]
+async fn a_probe_batch_behind_lanes_that_never_park_still_ends_on_its_own_deadline() {
+    const SOFT_TIMEOUT: Duration = Duration::from_secs(15);
+
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let batch = {
+        let permits = std::sync::Arc::clone(&permits);
+        async move { tokio::time::timeout(SOFT_TIMEOUT, permits.acquire_owned()).await }
+    };
+
+    let started = tokio::time::Instant::now();
+    let acquired = crate::pipeline::health::drive_probe_batch_with_permit_reclaim(
+        batch,
+        crate::pipeline::health::PROBE_PERMIT_RECLAIM_INTERVAL,
+        || {},
+    )
+    .await;
+    let waited = started.elapsed();
+
+    assert!(acquired.is_err(), "a starved acquire must still time out");
+    assert!(
+        waited >= SOFT_TIMEOUT,
+        "the reclaim loop must not cut the acquire short: waited {waited:?}"
+    );
+    assert!(
+        waited < SOFT_TIMEOUT + crate::pipeline::health::PROBE_PERMIT_RECLAIM_INTERVAL * 2,
+        "nor extend it: waited {waited:?}"
+    );
+}

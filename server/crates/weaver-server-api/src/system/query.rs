@@ -269,8 +269,9 @@ impl SystemQuery {
         let fallback_pool = ctx
             .data_opt::<Option<Arc<NntpPool>>>()
             .and_then(Clone::clone);
+        let transport = handle.download_transport_health();
         match live_pool.or(fallback_pool) {
-            Some(pool) => Ok(collect_server_health(&pool, runtime_generation).await),
+            Some(pool) => Ok(collect_server_health(&pool, runtime_generation, &transport).await),
             None => Ok(Vec::new()),
         }
     }
@@ -474,13 +475,16 @@ fn filesystem_name(value: &weaver_server_core::runtime::system_profile::Filesyst
 /// emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
 /// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
 /// first entry is the primary and the rest are backups.
-async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<ServerHealth> {
+async fn collect_server_health(
+    pool: &NntpPool,
+    runtime_generation: u64,
+    transport: &[weaver_server_core::ServerTransportHealth],
+) -> Vec<ServerHealth> {
     struct ServerLoadSnapshot {
         host: String,
         port: u16,
         tier: String,
         active: usize,
-        effective: usize,
         configured: usize,
         penalty_until: Option<u64>,
     }
@@ -491,19 +495,18 @@ async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<
         .iter()
         .enumerate()
         .map(|(idx, cfg)| {
-            let (_, effective) = pool.server_load(idx);
+            let (_, max_connections) = pool.server_load(idx);
             let active = pool.active_connections(idx);
             let configured = pool
                 .configured_connections(weaver_nntp::ServerId(idx))
-                .unwrap_or(effective);
-            let penalty_until = pool.capacity_penalty_until_epoch_ms(weaver_nntp::ServerId(idx));
+                .unwrap_or(max_connections);
+            let penalty_until = pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(idx));
             let tier = if idx == 0 { "PRIMARY" } else { "BACKUP" };
             ServerLoadSnapshot {
                 host: cfg.host.clone(),
                 port: cfg.port,
                 tier: tier.to_string(),
                 active,
-                effective,
                 configured,
                 penalty_until,
             }
@@ -515,6 +518,7 @@ async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<
         .enumerate()
         .map(|(idx, snapshot)| {
             let srv = health.server(idx);
+            let body = transport.iter().find(|entry| entry.server_idx == idx);
             let state = match srv.state() {
                 weaver_nntp::ServerState::Healthy => "healthy",
                 weaver_nntp::ServerState::Degraded { .. } => "degraded",
@@ -528,12 +532,19 @@ async fn collect_server_health(pool: &NntpPool, runtime_generation: u64) -> Vec<
                 tier: snapshot.tier,
                 state: state.to_string(),
                 connections_active: snapshot.active as u32,
-                connections_max: snapshot.effective as u32,
+                connections_max: snapshot.configured as u32,
                 connections_configured: snapshot.configured as u32,
-                connections_effective: snapshot.effective as u32,
                 capacity_penalty_until_epoch_ms: snapshot.penalty_until,
                 runtime_generation,
                 latency_ms: health.latency_ms(idx),
+                body_latency_ms: body.and_then(|entry| entry.latency_ms),
+                body_transfer_ms: body.and_then(|entry| entry.transfer_ms),
+                body_latency_band: body.and_then(|entry| entry.latency_band.clone()),
+                // A server the lanes have not touched yet reads as sequential
+                // rather than as a hole in the card.
+                body_pipeline_depth: body.map_or(1, |entry| entry.pipeline_depth),
+                body_pipelining_pinned_sequential: body
+                    .is_some_and(|entry| entry.pinned_sequential),
                 success_count: srv.success_count,
                 failure_count: srv.failure_count,
                 consecutive_failures: srv.consecutive_failures,

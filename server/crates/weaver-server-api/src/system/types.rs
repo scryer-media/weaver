@@ -170,6 +170,7 @@ pub struct Metrics {
     pub download_lanes_sequential_active: u32,
     pub download_lanes_depth2_active: u32,
     pub download_lanes_depth4_active: u32,
+    pub download_lanes_depth8_active: u32,
     pub download_lanes_idle_active: u32,
     pub download_lanes_awaiting_work_active: u32,
     pub download_lanes_binding_server_active: u32,
@@ -333,6 +334,7 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_lanes_sequential_active: m.download_lanes_sequential_active as u32,
             download_lanes_depth2_active: m.download_lanes_depth2_active as u32,
             download_lanes_depth4_active: m.download_lanes_depth4_active as u32,
+            download_lanes_depth8_active: m.download_lanes_depth8_active as u32,
             download_lanes_idle_active: m.download_lanes_idle_active as u32,
             download_lanes_awaiting_work_active: m.download_lanes_awaiting_work_active as u32,
             download_lanes_binding_server_active: m.download_lanes_binding_server_active as u32,
@@ -401,6 +403,33 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
 pub struct SystemMetricsSnapshot {
     pub metrics: Metrics,
     pub global_state: GlobalQueueState,
+    /// Servers currently refusing new connections as over their limit.
+    pub provider_holdoffs: Vec<ProviderHoldoff>,
+    /// Download rate of every job currently transferring, sampled on the same
+    /// tick and pushed on the same cadence as `metrics.currentDownloadSpeed`.
+    /// A queue row that reads its rate from here cannot drift from the global
+    /// gauge the way the event-driven queue item, published at most once a
+    /// second, always did.
+    pub job_download_rates: Vec<JobDownloadRate>,
+}
+
+/// The download-phase rate of one job, from the same estimator and the same
+/// instant as the global speed gauge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct JobDownloadRate {
+    pub job_id: u64,
+    /// Bytes per second, rounded the way the global gauge rounds.
+    pub rate_bps: u64,
+}
+
+/// A server whose provider rejected a fresh connection; weaver stops opening
+/// new connections to it until the deadline while existing ones keep running.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct ProviderHoldoff {
+    /// `host:port` label.
+    pub label: String,
+    /// Epoch milliseconds after which fresh connects resume.
+    pub until_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
@@ -952,18 +981,29 @@ pub struct ServerHealth {
     pub state: String,
     /// Currently in-use connections (max - available permits).
     pub connections_active: u32,
-    /// Runtime effective maximum connections (legacy field).
+    /// Configured maximum connections (legacy field).
     pub connections_max: u32,
     /// Saved operator-configured maximum connections.
     pub connections_configured: u32,
-    /// Runtime maximum after provider capacity adaptation.
-    pub connections_effective: u32,
-    /// End of the current provider-capacity penalty, if one is active.
+    /// End of the current provider over-limit holdoff, if one is active.
     pub capacity_penalty_until_epoch_ms: Option<u64>,
     /// Active NNTP runtime generation.
     pub runtime_generation: u64,
     /// EWMA request latency in milliseconds.
     pub latency_ms: f64,
+    /// EWMA command-to-status-line wait for BODY fetches, in milliseconds.
+    /// Absent until the download lanes have taken an unbiased sample.
+    pub body_latency_ms: Option<f64>,
+    /// EWMA status-line-to-terminator wait for one article, in milliseconds:
+    /// what the article itself costs on the wire.
+    pub body_transfer_ms: Option<f64>,
+    /// "good", "moderate" or "slow" for `bodyLatencyMs`.
+    pub body_latency_band: Option<String>,
+    /// BODY pipelining depth the lanes currently run at; 1 is sequential.
+    pub body_pipeline_depth: u32,
+    /// Set once the server has twice failed to answer a pipelined batch
+    /// cleanly, which holds it sequential for the rest of the process.
+    pub body_pipelining_pinned_sequential: bool,
     pub success_count: u64,
     pub failure_count: u64,
     pub consecutive_failures: u32,

@@ -98,6 +98,12 @@ pub enum NntpError {
     #[error("access denied (502)")]
     AccessDenied,
 
+    /// A fresh connect was skipped because this server recently answered one
+    /// with "too many connections". Nothing was sent, so the server is not
+    /// implicated: the caller waits and retries after the deadline.
+    #[error("server is over its connection limit until {until_epoch_ms} (epoch ms)")]
+    ServerOverLimit { until_epoch_ms: u64 },
+
     /// The server requires TLS before proceeding (483).
     #[error("TLS required (483)")]
     TlsRequired,

@@ -47,7 +47,11 @@ func renderWeaver(cfg Config) productSpec {
 		"WEAVER_DATA_DIR=" + filepath.Join(cfg.ConfigDir, "data"),
 		"WEAVER_INTERMEDIATE_DIR=" + filepath.Join(cfg.ConfigDir, "incomplete"),
 		"WEAVER_COMPLETE_DIR=" + cfg.OutputDir,
-		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
+		// Weaver deletes the archive volumes once extraction succeeds; that is
+		// its shipping default and what SABnzbd and NZBGet do after unpack, so
+		// every client pays for the same delete. Rendered explicitly so the audit
+		// record shows it.
+		"WEAVER_CLEANUP_AFTER_EXTRACT=true",
 		// Direct unpack (in-stream extraction of stored archives) is Weaver's
 		// shipping default from the release these benches accompany. It is
 		// rendered explicitly in BOTH profiles so the pinned client binary
@@ -66,6 +70,10 @@ func renderWeaver(cfg Config) productSpec {
 		"WEAVER_SERVER_1_PASSWORD=" + cfg.NNTPPassword,
 		"WEAVER_SERVER_1_CONNECTIONS=" + strconv.Itoa(cfg.Connections),
 		"WEAVER_SERVER_1_ACTIVE=true",
+		// Seeded servers are never probed for CAPABILITIES; the benchmark
+		// server advertises PIPELINING, so the flag is seeded the way the
+		// probe would have set it (Weaver 0.10.3 or newer).
+		"WEAVER_SERVER_1_PIPELINING=true",
 		// A fresh native install trusts no peer until its first-run wizard is
 		// completed from the machine's own browser; loopback is offered the
 		// wizard, not a session. Pinning loopback as trusted from the
@@ -165,11 +173,14 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 		}
 	}
 	direct := "no"
-	directWrite := "no"
 	if directUnpack {
 		direct = "yes"
-		directWrite = "yes"
 	}
+	// DirectWrite (writing decoded articles straight into the destination
+	// file instead of per-article temp files) is NZBGet's shipping default and
+	// is independent of direct unpack, so it stays on in both profiles; the
+	// profiles differ only in DirectUnpack.
+	const directWrite = "yes"
 	content := strings.Join([]string{
 		"MainDir=" + cfg.ConfigDir,
 		"DestDir=" + cfg.OutputDir,
@@ -252,6 +263,7 @@ func renderAuditConfig(cfg Config, spec productSpec) []byte {
 		"server_link_scope=" + cfg.ServerLink.Scope,
 		"server_link_egress_bits_per_second=" + strconv.FormatUint(cfg.ServerLink.EgressBitsPerSecond, 10),
 		"server_link_burst_bytes=" + strconv.FormatUint(cfg.ServerLink.BurstBytes, 10),
+		"server_link_rtt_micros=" + strconv.FormatUint(cfg.ServerLink.RTTMicros, 10),
 		"storage_profile_id=" + cfg.StorageProfile.ID,
 		"storage_kind=" + string(cfg.StorageProfile.Kind),
 		"storage_nfs_link_id=" + cfg.StorageProfile.NFSLinkID,

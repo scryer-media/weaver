@@ -91,3 +91,47 @@ func TestNormalizeMessageID(t *testing.T) {
 		}
 	}
 }
+
+func TestCommandCensusBoundsVerbKeysOnNonNNTPStreams(t *testing.T) {
+	attestation := NewAttestation(AttestationConfig{})
+	census := NewCommandCensus(attestation)
+	// Ciphertext-like bytes: newlines land at random offsets, so every
+	// pseudo-line starts with a different random token.
+	payload := make([]byte, 0, 64*1024)
+	seed := uint32(0x9e3779b9)
+	for len(payload) < cap(payload) {
+		seed = seed*1664525 + 1013904223
+		payload = append(payload, byte(seed>>24))
+	}
+	census.Observe(payload)
+	census.Observe([]byte("\r\nBODY <ok@example>\r\nxfeature compress gzip\r\n"))
+	snapshot := attestation.Snapshot()
+	// A random pseudo-line occasionally starts with a short all-alphanumeric
+	// token that passes for a verb; that is fine as long as the key space
+	// stays small and every key is verb-shaped.
+	if len(snapshot.DownstreamCommands) > 12 {
+		t.Fatalf("verb key space not bounded: %d keys in %+v", len(snapshot.DownstreamCommands), snapshot.DownstreamCommands)
+	}
+	for verb := range snapshot.DownstreamCommands {
+		if !isCommandVerb(verb) {
+			t.Fatalf("non-verb key %q in %+v", verb, snapshot.DownstreamCommands)
+		}
+	}
+	if snapshot.DownstreamCommands["NONVERB"] == 0 {
+		t.Fatalf("random tokens were not tallied as NONVERB: %+v", snapshot.DownstreamCommands)
+	}
+	if snapshot.DownstreamCommands["BODY"] != 1 || snapshot.DownstreamCommands["XFEATURE"] != 1 || snapshot.ArticleRequests != 1 {
+		t.Fatalf("real commands after the garbage were lost: %+v", snapshot.DownstreamCommands)
+	}
+}
+
+func TestIsCommandVerb(t *testing.T) {
+	for verb, want := range map[string]bool{
+		"BODY": true, "AUTHINFO": true, "XZVER": true, "CAPABILITIES": true, "MODE": true,
+		"": false, "BO-DY": false, "\x16\x03": false, "TOOLONGFORANYNNTPVERB": false, "body": false,
+	} {
+		if got := isCommandVerb(verb); got != want {
+			t.Errorf("isCommandVerb(%q) = %v, want %v", verb, got, want)
+		}
+	}
+}

@@ -69,7 +69,7 @@ func TestQueueInputRejectsInvalidSubmissionMode(t *testing.T) {
 func TestQueueTransitionGroupsPlannedRepetitionsIntoOneLane(t *testing.T) {
 	for _, copies := range []int{20, 10} {
 		plan, err := BuildPlan(PlanOptions{
-			FixtureIDs:  []string{"direct-mkv-200mb"},
+			FixtureIDs:  []string{"direct-mkv"},
 			Clients:     []Client{Weaver, SABnzbd, NZBGet},
 			Transports:  []Transport{Plaintext, TLS},
 			Targets:     []ExecutionTarget{DockerLinux},
@@ -91,14 +91,14 @@ func TestQueueTransitionGroupsPlannedRepetitionsIntoOneLane(t *testing.T) {
 				t.Fatalf("%s contains %d jobs, want %d", suite.ID, got, copies)
 			}
 			for _, run := range suite.Runs {
-				if run.FixtureID != "direct-mkv-200mb" {
+				if run.FixtureID != "direct-mkv" {
 					t.Fatalf("%s includes fixture %s", suite.ID, run.FixtureID)
 				}
 			}
 		}
 	}
 	single, err := BuildPlan(PlanOptions{
-		FixtureIDs:  []string{"direct-mkv-200mb"},
+		FixtureIDs:  []string{"direct-mkv"},
 		Clients:     []Client{Weaver},
 		Transports:  []Transport{Plaintext},
 		Targets:     []ExecutionTarget{DockerLinux},
@@ -274,15 +274,15 @@ func TestSequentialQueueResultLeavesOutputForNeutralVerification(t *testing.T) {
 	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
 		t.Fatalf("sequential result that leaves output for neutral verification was rejected: %v", err)
 	}
-	// The run lasts two seconds, so 1 % would be 20 ms; the 100 ms absolute
+	// The run lasts two seconds, so 1 % would be 20 ms; the 250 ms absolute
 	// floor governs here.
-	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-100 * time.Millisecond)
-	result.Jobs[0].TerminalObservationUncertainty = (100 * time.Millisecond).Nanoseconds()
+	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-250 * time.Millisecond)
+	result.Jobs[0].TerminalObservationUncertainty = (250 * time.Millisecond).Nanoseconds()
 	if err := result.ValidateFor(suite, SubmissionModeSequential); err != nil {
 		t.Fatalf("sequential result at the observation uncertainty floor was rejected: %v", err)
 	}
-	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-100*time.Millisecond - time.Nanosecond)
-	result.Jobs[0].TerminalObservationUncertainty = (100*time.Millisecond + time.Nanosecond).Nanoseconds()
+	result.Jobs[0].TerminalObservationLowerBound = completedAt.Add(-250*time.Millisecond - time.Nanosecond)
+	result.Jobs[0].TerminalObservationUncertainty = (250*time.Millisecond + time.Nanosecond).Nanoseconds()
 	if err := result.ValidateFor(suite, SubmissionModeSequential); err == nil {
 		t.Fatal("sequential result above the observation uncertainty floor was accepted")
 	}
@@ -347,5 +347,19 @@ func TestQueueArtifactWriteFailurePropagates(t *testing.T) {
 	persistQueueArtifact(t.TempDir(), &artifact)
 	if artifact.Status != "failed" || !strings.Contains(artifact.Error, "write queue artifact") {
 		t.Fatalf("artifact write failure was not propagated: %#v", artifact)
+	}
+}
+
+func TestVerifyQueueTransitionOutputsToleratesHiddenClientMarker(t *testing.T) {
+	fixtureDir, outputDir, contents := writeQueueTransitionVerificationFixture(t)
+	for index := 0; index < 20; index++ {
+		writeQueueTransitionOutputCopy(t, outputDir, index, contents)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "copy-19", ".client-output-dir"), []byte("owned"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	verifications, failedIndex, err := verifyQueueTransitionOutputs(fixtureDir, outputDir, 20)
+	if err != nil || failedIndex != -1 || len(verifications) != 20 {
+		t.Fatalf("queue transition verification = (%d verifications, failed %d, %v), want a hidden marker to be ignored", len(verifications), failedIndex, err)
 	}
 }

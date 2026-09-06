@@ -54,6 +54,24 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	rttMicros, err := uintEnv("NNTP_RTT_MICROS", 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// A configured round trip is rendered by the container entrypoint with tc
+	// before this process starts; its report is the contract the control
+	// plane attests. Without one the process refuses to serve rather than
+	// present an unshaped path as a delayed one.
+	var linkShaping *nntpshaper.LinkShapingReport
+	if rttMicros > 0 {
+		linkShaping, err = nntpshaper.LoadLinkShapingReport(stringEnv("NNTP_LINK_REPORT_PATH", "/run/nntpshaper-link.json"), rttMicros)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if _, _, err := nntpshaper.TCLiveDelays(*linkShaping); err != nil {
+			log.Fatalf("verify configured round trip: %v", err)
+		}
+	}
 	executableSHA256, err := nntpshaper.CurrentExecutableSHA256()
 	if err != nil {
 		log.Fatal(err)
@@ -61,6 +79,9 @@ func main() {
 	attestation := nntpshaper.NewAttestation(nntpshaper.AttestationConfig{
 		EgressBitsPerSecond: bitsPerSecond,
 		BurstBytes:          burstBytes,
+		RTTMicros:           rttMicros,
+		LinkShaping:         linkShaping,
+		LiveDelays:          nntpshaper.TCLiveDelays,
 		Build: nntpshaper.BuildIdentity{
 			ExecutableSHA256: executableSHA256,
 			ImageIdentity:    stringEnv("NNTP_SHAPER_IMAGE_IDENTITY", ""),
@@ -86,7 +107,7 @@ func main() {
 			log.Fatalf("listen %s (%s): %v", config.label, config.listenAddress, err)
 		}
 		listeners = append(listeners, listener)
-		log.Printf("%s listener %s -> %s; aggregate egress=%d bits/s burst=%d bytes", config.label, listener.Addr(), config.upstream, bitsPerSecond, burstBytes)
+		log.Printf("%s listener %s -> %s; aggregate egress=%d bits/s burst=%d bytes rtt=%dus", config.label, listener.Addr(), config.upstream, bitsPerSecond, burstBytes, rttMicros)
 	}
 	controlListener, err := net.Listen("tcp", stringEnv("CONTROL_LISTEN_ADDR", ":8080"))
 	if err != nil {
@@ -178,8 +199,14 @@ func proxy(ctx context.Context, client net.Conn, config listenerConfig, limiter 
 	upstreamDone := make(chan struct{})
 	go func() {
 		// The client's command stream is relayed byte for byte; the census
-		// only reads a copy of what was forwarded.
-		_, _ = io.Copy(&censusWriter{upstream: upstream, census: nntpshaper.NewCommandCensus(attestation)}, client)
+		// only reads a copy of what was forwarded. The TLS listener relays
+		// ciphertext the shaper cannot read, so it carries no census: parsing
+		// it yielded random pseudo-commands, never an article count.
+		var census *nntpshaper.CommandCensus
+		if config.label != "tls" {
+			census = nntpshaper.NewCommandCensus(attestation)
+		}
+		_, _ = io.Copy(&censusWriter{upstream: upstream, census: census}, client)
 		closeWrite(upstream)
 		close(upstreamDone)
 	}()
@@ -219,7 +246,7 @@ type censusWriter struct {
 
 func (writer *censusWriter) Write(payload []byte) (int, error) {
 	written, err := writer.upstream.Write(payload)
-	if written > 0 {
+	if written > 0 && writer.census != nil {
 		writer.census.Observe(payload[:written])
 	}
 	return written, err

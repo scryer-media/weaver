@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
 )
 
 type summaryReport struct {
@@ -21,6 +22,66 @@ type summaryReport struct {
 	Candidate     benchmark.Client       `json:"candidate_client"`
 	MinimumBlocks int                    `json:"minimum_complete_blocks"`
 	Comparisons   []stratifiedComparison `json:"comparisons"`
+	// Aggregates pools the per-fixture comparisons by fixture class, one
+	// figure per class and non-fixture stratum. The headline aggregate is the
+	// number a reader may quote for the common case; the breadth aggregate
+	// is the compatibility figure. They are never pooled with each other.
+	Aggregates []classAggregate `json:"aggregates"`
+}
+
+// aggregateStratum is comparisonStratum with the fixture replaced by its
+// class: the key under which per-fixture results may be pooled.
+type aggregateStratum struct {
+	FixtureClass     fixture.FixtureClass       `json:"fixture_class"`
+	Profile          string                     `json:"profile"`
+	ExecutionTarget  benchmark.ExecutionTarget  `json:"execution_target"`
+	Transport        benchmark.Transport        `json:"transport"`
+	ArchiveToolchain benchmark.ArchiveToolchain `json:"archive_toolchain"`
+	ServerLinkID     string                     `json:"server_link_id"`
+	ServerEgressBPS  uint64                     `json:"server_egress_bits_per_second"`
+	ServerBurstBytes uint64                     `json:"server_burst_bytes"`
+	ServerRTTMicros  uint64                     `json:"server_rtt_micros"`
+	StorageProfileID string                     `json:"storage_profile_id"`
+	StorageNFSLinkID string                     `json:"storage_nfs_link_id"`
+	StorageLinkBPS   uint64                     `json:"storage_link_bits_per_second"`
+	StorageRTTMicros uint64                     `json:"storage_rtt_micros"`
+}
+
+func (s comparisonStratum) aggregateKey(class fixture.FixtureClass) aggregateStratum {
+	return aggregateStratum{
+		FixtureClass:     class,
+		Profile:          s.Profile,
+		ExecutionTarget:  s.ExecutionTarget,
+		Transport:        s.Transport,
+		ArchiveToolchain: s.ArchiveToolchain,
+		ServerLinkID:     s.ServerLinkID,
+		ServerEgressBPS:  s.ServerEgressBPS,
+		ServerBurstBytes: s.ServerBurstBytes,
+		ServerRTTMicros:  s.ServerRTTMicros,
+		StorageProfileID: s.StorageProfileID,
+		StorageNFSLinkID: s.StorageNFSLinkID,
+		StorageLinkBPS:   s.StorageLinkBPS,
+		StorageRTTMicros: s.StorageRTTMicros,
+	}
+}
+
+// classAggregate is one class's pooled figure. It is withheld, with the
+// fixtures named, whenever any fixture of the class had its own comparison
+// withheld: a client that could not finish a fixture of the class does not
+// get a class figure computed over the fixtures it did finish.
+type classAggregate struct {
+	Stratum           aggregateStratum               `json:"stratum"`
+	FixturesCompared  []string                       `json:"fixtures_compared"`
+	FixturesWithheld  []string                       `json:"fixtures_withheld,omitempty"`
+	Summary           *benchmark.CrossFixtureSummary `json:"summary,omitempty"`
+	AggregateWithheld string                         `json:"aggregate_withheld,omitempty"`
+}
+
+// aggregateAccount collects a class stratum's inputs while the per-fixture
+// comparisons are built.
+type aggregateAccount struct {
+	samples  map[string][]benchmark.PairedSample
+	withheld []string
 }
 
 // comparisonStratum is the pairing key. Transport is part of it; how each
@@ -38,6 +99,7 @@ type comparisonStratum struct {
 	ServerLinkID     string                     `json:"server_link_id"`
 	ServerEgressBPS  uint64                     `json:"server_egress_bits_per_second"`
 	ServerBurstBytes uint64                     `json:"server_burst_bytes"`
+	ServerRTTMicros  uint64                     `json:"server_rtt_micros"`
 	// StorageProfileID and its link join the stratum key. A local run and an
 	// NFS run measure different questions, so they are never pooled — the same
 	// rule that keeps transports and toolchains apart.
@@ -49,6 +111,9 @@ type comparisonStratum struct {
 
 type stratifiedComparison struct {
 	Stratum comparisonStratum `json:"stratum"`
+	// FixtureClass is the class the fixture's manifest declared, and the key
+	// under which this comparison is pooled in Aggregates.
+	FixtureClass fixture.FixtureClass `json:"fixture_class"`
 	// TransportPolicies records, per observed client, how it validated TLS in
 	// this stratum. Plaintext strata carry not_applicable. A client the plan
 	// excluded on this fixture has no observation and so no entry here; its
@@ -313,7 +378,7 @@ func summarize(args []string) error {
 // server link cannot prove, from the shaper's own before/after counters, that
 // the link was in force and carried the bytes the artifact claims.
 func validateSummaryShaperEvidence(artifact benchmark.QueueArtifact, link benchmark.ServerLinkProfile) error {
-	if link.EgressBitsPerSecond == 0 {
+	if !link.Shaped() {
 		return nil
 	}
 	if artifact.ShaperBefore == nil || artifact.ShaperAfter == nil {
@@ -495,6 +560,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 	cpuAccounts := make(map[summaryProductKey]*cpuAccount)
 	cpuCaveats := make(map[comparisonStratum]map[string]bool)
 	transfers := make(map[summaryProductKey]*transferAccount)
+	classes := make(map[string]fixture.FixtureClass)
 	// One summary describes one storage stratum. Local and NFS runs answer
 	// different questions, so a directory holding both is an operator mistake
 	// and is refused rather than silently split into two comparisons that look
@@ -558,6 +624,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 			ServerLinkID:     job.Run.ServerLink.ID,
 			ServerEgressBPS:  job.Run.ServerLink.EgressBitsPerSecond,
 			ServerBurstBytes: job.Run.ServerLink.BurstBytes,
+			ServerRTTMicros:  job.Run.ServerLink.RTTMicros,
 			StorageProfileID: job.Run.StorageProfile.ID,
 			StorageNFSLinkID: job.Run.StorageProfile.NFSLinkID,
 			StorageLinkBPS:   job.Run.StorageProfile.LinkBitsPerSecond,
@@ -566,6 +633,16 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 		if len(artifact.AdapterResult.RenderedConfigSHA256) != 64 {
 			return summaryReport{}, fmt.Errorf("sequential artifact %s lacks a rendered-config SHA-256", artifact.SuiteID)
 		}
+		// The class comes from the fixture manifest through the artifact; an
+		// artifact without one was run over a corpus that predates fixture
+		// classes and cannot be placed in either aggregate.
+		if !job.FixtureClass.Valid() {
+			return summaryReport{}, fmt.Errorf("sequential artifact %s carries fixture class %q for %s, want %q or %q; regenerate the corpus and rerun", artifact.SuiteID, job.FixtureClass, job.Run.FixtureID, fixture.HeadlineFixtureClass, fixture.BreadthFixtureClass)
+		}
+		if previous, ok := classes[job.Run.FixtureID]; ok && previous != job.FixtureClass {
+			return summaryReport{}, fmt.Errorf("fixture %s is recorded as both %q and %q across artifacts", job.Run.FixtureID, previous, job.FixtureClass)
+		}
+		classes[job.Run.FixtureID] = job.FixtureClass
 		productKey := summaryProductKey{Stratum: stratum, Client: job.Run.Client}
 		identity := summaryProductIdentity{
 			ClientIdentity:           artifact.AdapterResult.ClientIdentity,
@@ -664,14 +741,21 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 	}
 	sort.Slice(strata, func(left, right int) bool { return fmt.Sprint(strata[left]) < fmt.Sprint(strata[right]) })
 	report := summaryReport{
-		SchemaVersion: 5,
+		SchemaVersion: 6,
 		Metric:        benchmark.PrimaryMetric,
 		Baseline:      baseline,
 		Candidate:     candidate,
 		MinimumBlocks: minimumBlocks,
 		Comparisons:   make([]stratifiedComparison, 0, len(strata)),
 	}
+	aggregates := make(map[aggregateStratum]*aggregateAccount)
 	for _, stratum := range strata {
+		class := classes[stratum.FixtureID]
+		account := aggregates[stratum.aggregateKey(class)]
+		if account == nil {
+			account = &aggregateAccount{samples: make(map[string][]benchmark.PairedSample)}
+			aggregates[stratum.aggregateKey(class)] = account
+		}
 		blocks := groups[stratum]
 		repetitions := make([]int, 0, len(blocks))
 		for repetition := range blocks {
@@ -713,7 +797,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 			samples = append(samples, benchmark.PairedSample{Baseline: *block.baseline, Candidate: *block.candidate})
 		}
 		completion.PairedBlocks = len(samples)
-		comparison := stratifiedComparison{Stratum: stratum, Completion: completion}
+		comparison := stratifiedComparison{Stratum: stratum, FixtureClass: class, Completion: completion}
 		for _, client := range []benchmark.Client{baseline, candidate} {
 			if identity, ok := identities[summaryProductKey{Stratum: stratum, Client: client}]; ok {
 				comparison.TransportPolicies = append(comparison.TransportPolicies, clientTransportPolicy{Client: client, TLSValidation: identity.TLSValidation, TransportLabel: identity.TransportLabel})
@@ -738,6 +822,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 			comparison.ComparisonWithheld = fmt.Sprintf("%d paired blocks, want at least %d: %s did not finish %d of %d blocks (%d excluded by the plan), %s did not finish %d of %d (%d excluded by the plan)",
 				len(samples), minimumBlocks, baseline, completion.BaselineDidNotFinish, completion.BlocksObserved, completion.BaselineExcluded, candidate, completion.CandidateDidNotFinish, completion.BlocksObserved, completion.CandidateExcluded)
 			report.Comparisons = append(report.Comparisons, comparison)
+			account.withheld = append(account.withheld, stratum.FixtureID)
 			continue
 		}
 
@@ -747,11 +832,52 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 		}
 		comparison.Summary = &summary
 		report.Comparisons = append(report.Comparisons, comparison)
+		account.samples[stratum.FixtureID] = samples
 	}
 	if len(report.Comparisons) == 0 {
 		return summaryReport{}, fmt.Errorf("no strata contain either requested client")
 	}
+	classAggregates, err := buildClassAggregates(aggregates, seed, resamples)
+	if err != nil {
+		return summaryReport{}, err
+	}
+	report.Aggregates = classAggregates
 	return report, nil
+}
+
+// buildClassAggregates pools each class stratum's per-fixture samples into one
+// equal-weight figure, or withholds it naming the fixtures that had no
+// comparison of their own.
+func buildClassAggregates(accounts map[aggregateStratum]*aggregateAccount, seed int64, resamples int) ([]classAggregate, error) {
+	keys := make([]aggregateStratum, 0, len(accounts))
+	for key := range accounts {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(left, right int) bool { return fmt.Sprint(keys[left]) < fmt.Sprint(keys[right]) })
+	result := make([]classAggregate, 0, len(keys))
+	for _, key := range keys {
+		account := accounts[key]
+		aggregate := classAggregate{Stratum: key, FixturesCompared: make([]string, 0, len(account.samples))}
+		for fixtureID := range account.samples {
+			aggregate.FixturesCompared = append(aggregate.FixturesCompared, fixtureID)
+		}
+		sort.Strings(aggregate.FixturesCompared)
+		if len(account.withheld) > 0 {
+			sort.Strings(account.withheld)
+			aggregate.FixturesWithheld = account.withheld
+			aggregate.AggregateWithheld = fmt.Sprintf("%d of %d %s fixtures had their comparison withheld (%s); a class figure over the remaining fixtures would hide that result",
+				len(account.withheld), len(account.withheld)+len(account.samples), key.FixtureClass, strings.Join(account.withheld, ", "))
+			result = append(result, aggregate)
+			continue
+		}
+		summary, err := benchmark.SummarizeAcrossFixtures(account.samples, seed, resamples)
+		if err != nil {
+			return nil, fmt.Errorf("aggregate %s fixtures for %+v: %w", key.FixtureClass, key, err)
+		}
+		aggregate.Summary = &summary
+		result = append(result, aggregate)
+	}
+	return result, nil
 }
 
 // buildTransferEvidence reports each client's shaped downstream bytes and

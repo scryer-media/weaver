@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const attestationSchemaVersion = 3
+const attestationSchemaVersion = 4
 
 // BuildIdentity carries the immutable executable digest and optional build and
 // image metadata emitted with every control response.
@@ -29,22 +29,33 @@ type BuildIdentity struct {
 type AttestationConfig struct {
 	EgressBitsPerSecond uint64
 	BurstBytes          uint64
-	Build               BuildIdentity
-	StartedAt           time.Time
+	// RTTMicros is the fixed round trip the container entrypoint configured
+	// with tc; LinkShaping is its report and LiveDelays reads the qdiscs back
+	// for every snapshot. All three are nil/zero when no delay is configured.
+	RTTMicros   uint64
+	LinkShaping *LinkShapingReport
+	LiveDelays  LiveDelayProbe
+	Build       BuildIdentity
+	StartedAt   time.Time
 }
 
 // Snapshot is the versioned control-plane record for a shaper process.
 type Snapshot struct {
-	SchemaVersion                 int               `json:"schema_version"`
-	Status                        string            `json:"status"`
-	StartedAt                     time.Time         `json:"started_at"`
-	ConfiguredEgressBitsPerSecond uint64            `json:"configured_egress_bits_per_second"`
-	ConfiguredBurstBytes          uint64            `json:"configured_burst_bytes"`
-	DownstreamConnections         uint64            `json:"downstream_connections"`
-	ActiveDownstreamConnections   int64             `json:"active_downstream_connections"`
-	DownstreamBytes               uint64            `json:"downstream_bytes"`
-	DownstreamSourceConnections   map[string]uint64 `json:"downstream_source_connections"`
-	DownstreamSourceBytes         map[string]uint64 `json:"downstream_source_bytes"`
+	SchemaVersion                 int       `json:"schema_version"`
+	Status                        string    `json:"status"`
+	StartedAt                     time.Time `json:"started_at"`
+	ConfiguredEgressBitsPerSecond uint64    `json:"configured_egress_bits_per_second"`
+	ConfiguredBurstBytes          uint64    `json:"configured_burst_bytes"`
+	// ConfiguredRTTMicros and LinkShaping (attestation schema 4) carry the
+	// fixed round trip: the declared split and what tc reports right now.
+	// LinkShaping is absent when no round trip is configured.
+	ConfiguredRTTMicros         uint64             `json:"configured_rtt_micros"`
+	LinkShaping                 *LinkShapingReport `json:"link_shaping,omitempty"`
+	DownstreamConnections       uint64             `json:"downstream_connections"`
+	ActiveDownstreamConnections int64              `json:"active_downstream_connections"`
+	DownstreamBytes             uint64             `json:"downstream_bytes"`
+	DownstreamSourceConnections map[string]uint64  `json:"downstream_source_connections"`
+	DownstreamSourceBytes       map[string]uint64  `json:"downstream_source_bytes"`
 	// DownstreamCommands tallies every command line clients sent upstream, by
 	// verb, since the process started.
 	DownstreamCommands map[string]uint64 `json:"downstream_commands"`
@@ -235,12 +246,31 @@ func (a *Attestation) Snapshot() Snapshot {
 	if !leaseAcquiredAt.IsZero() {
 		leaseAcquiredAtPointer = &leaseAcquiredAt
 	}
+	status := "ok"
+	var linkShaping *LinkShapingReport
+	if a.config.LinkShaping != nil {
+		report := *a.config.LinkShaping
+		if a.config.LiveDelays == nil {
+			report.LiveError = "no live delay probe configured"
+		} else if egress, ingress, err := a.config.LiveDelays(report); err != nil {
+			report.LiveError = err.Error()
+		} else {
+			report.LiveEgressDelayMicros = egress
+			report.LiveIngressDelayMicros = ingress
+		}
+		if report.LiveError != "" {
+			status = "degraded"
+		}
+		linkShaping = &report
+	}
 	return Snapshot{
 		SchemaVersion:                 attestationSchemaVersion,
-		Status:                        "ok",
+		Status:                        status,
 		StartedAt:                     a.config.StartedAt,
 		ConfiguredEgressBitsPerSecond: a.config.EgressBitsPerSecond,
 		ConfiguredBurstBytes:          a.config.BurstBytes,
+		ConfiguredRTTMicros:           a.config.RTTMicros,
+		LinkShaping:                   linkShaping,
 		DownstreamConnections:         a.downstreamConnections.Load(),
 		ActiveDownstreamConnections:   a.activeDownstreamConnections.Load(),
 		DownstreamBytes:               a.downstreamBytes.Load(),

@@ -18,7 +18,7 @@
       "target": "docker-linux",
       "command": ["/scratch/nntp-bench-bin/clientadapter"],
       "environment": {
-        "CLIENT_IMAGE": "lscr.io/linuxserver/sabnzbd@sha256:1a26f56dfc047b62d5ddc20bc92bdebfbe7c3cb58d2d3523958838a09182d77a",
+        "CLIENT_IMAGE": "lscr.io/linuxserver/sabnzbd@sha256:64c4c2b6ed546237451cbfec33aa8bac1396865c1a266dd247c02b36ffe27c62",
         "CLIENT_NETWORK": "nntp-bench_benchmark",
         "CLIENT_PLATFORM": "linux/amd64"
       }
@@ -29,7 +29,7 @@
       "target": "docker-linux",
       "command": ["/scratch/nntp-bench-bin/clientadapter"],
       "environment": {
-        "CLIENT_IMAGE": "lscr.io/linuxserver/sabnzbd@sha256:1a26f56dfc047b62d5ddc20bc92bdebfbe7c3cb58d2d3523958838a09182d77a",
+        "CLIENT_IMAGE": "lscr.io/linuxserver/sabnzbd@sha256:64c4c2b6ed546237451cbfec33aa8bac1396865c1a266dd247c02b36ffe27c62",
         "CLIENT_NETWORK": "nntp-bench_benchmark",
         "CLIENT_PLATFORM": "linux/amd64",
         "CLIENT_RARPAR_BINARY": "/scratch/rarpar/rarpar-linux-amd64",
@@ -43,7 +43,7 @@
       "target": "docker-linux",
       "command": ["/scratch/nntp-bench-bin/clientadapter"],
       "environment": {
-        "CLIENT_IMAGE": "lscr.io/linuxserver/nzbget@sha256:b22a2b8b366d1e68e6341435bdabd9ff859642cc2ff4a04243d0723521d69d2e",
+        "CLIENT_IMAGE": "lscr.io/linuxserver/nzbget@sha256:4cc4afc944e0239037b7b95c64deb8e39e49ca770b7e2f61476a04443d7fcab9",
         "CLIENT_NETWORK": "nntp-bench_benchmark",
         "CLIENT_PLATFORM": "linux/amd64"
       }
@@ -54,7 +54,7 @@
       "target": "docker-linux",
       "command": ["/scratch/nntp-bench-bin/clientadapter"],
       "environment": {
-        "CLIENT_IMAGE": "lscr.io/linuxserver/nzbget@sha256:b22a2b8b366d1e68e6341435bdabd9ff859642cc2ff4a04243d0723521d69d2e",
+        "CLIENT_IMAGE": "lscr.io/linuxserver/nzbget@sha256:4cc4afc944e0239037b7b95c64deb8e39e49ca770b7e2f61476a04443d7fcab9",
         "CLIENT_NETWORK": "nntp-bench_benchmark",
         "CLIENT_PLATFORM": "linux/amd64",
         "CLIENT_RARPAR_BINARY": "/scratch/rarpar/rarpar-linux-amd64",

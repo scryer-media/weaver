@@ -1,6 +1,7 @@
 use super::*;
 
-const PHASE_EMA_HALF_LIFE_SECS: f64 = 3.0;
+use crate::operations::metrics::RateSeries;
+
 const PHASE_RATE_WARMUP: Duration = Duration::from_millis(250);
 const PHASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -8,9 +9,10 @@ const PHASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) struct JobPhaseRuntime {
     pub(super) counters: Arc<PhaseCounters>,
     pub(super) started_at_epoch_ms: f64,
-    pub(super) ema_bps: Option<f64>,
+    /// The same estimator the global speed gauge uses, advanced on the same
+    /// 100 ms tick, so a row's rate is comparable to the nav counter.
+    pub(super) rate: RateSeries,
     pub(super) first_sample_at: Option<Instant>,
-    pub(super) last_sample: Option<(Instant, u64)>,
 }
 
 /// The metric stage label for a user-visible job phase. Verification and
@@ -54,9 +56,8 @@ impl Pipeline {
         let runtime = JobPhaseRuntime {
             counters: Arc::clone(&counters),
             started_at_epoch_ms: crate::jobs::epoch_ms_now(),
-            ema_bps: None,
+            rate: RateSeries::new(),
             first_sample_at: None,
-            last_sample: None,
         };
         self.phase_progress.insert(key, runtime);
         self.phase_publish_state.remove(&job_id);
@@ -146,6 +147,17 @@ impl Pipeline {
         }
     }
 
+    /// Credit one landed article's wire bytes to its job's download rate.
+    ///
+    /// Called on the completion path right beside the global `bytes_downloaded`
+    /// counter it must stay in lockstep with: one map lookup, no lock, no
+    /// allocation. A job that has already been removed simply drops the credit.
+    pub(crate) fn note_job_wire_bytes(&mut self, segment_id: SegmentId, raw_size: u64) {
+        if let Some(state) = self.jobs.get_mut(&segment_id.file_id.job_id) {
+            state.downloaded_wire_bytes = state.downloaded_wire_bytes.saturating_add(raw_size);
+        }
+    }
+
     pub(crate) fn clear_job_phase_progress_runtime(&mut self, job_id: JobId) {
         self.phase_progress.retain(|(jid, _), _| *jid != job_id);
         self.phase_progress_snapshots.remove(&job_id);
@@ -161,11 +173,19 @@ impl Pipeline {
         for (job_id, phase) in keys {
             let download_active =
                 phase != JobPhase::Downloading || self.job_has_current_download_activity(job_id);
+            // The download phase deliberately reports two different byte
+            // counts. Progress is decoded bytes against the declared total, so
+            // the bar cannot overshoot 100%. The rate is wire bytes, the same
+            // counter the global speed gauge integrates: yEnc runs ~3% larger
+            // than its payload (uuencode ~38%), and a decoded-byte rate also
+            // trails the network by however deep the decode queue is, so a row
+            // built from it never agreed with the nav counter.
             let derived_download = if phase == JobPhase::Downloading {
                 self.jobs.get(&job_id).map(|state| {
                     (
                         Self::effective_downloaded_bytes(state),
                         state.spec.total_bytes,
+                        state.downloaded_wire_bytes,
                     )
                 })
             } else {
@@ -175,47 +195,35 @@ impl Pipeline {
             let Some(runtime) = self.phase_progress.get_mut(&(job_id, phase)) else {
                 continue;
             };
-            let (completed_bytes, total_bytes) = derived_download.unwrap_or_else(|| {
-                (
-                    runtime.counters.completed_bytes.load(Ordering::Relaxed),
-                    runtime.counters.total_bytes.load(Ordering::Relaxed),
-                )
-            });
+            let (completed_bytes, total_bytes, rate_bytes) =
+                derived_download.unwrap_or_else(|| {
+                    let completed = runtime.counters.completed_bytes.load(Ordering::Relaxed);
+                    (
+                        completed,
+                        runtime.counters.total_bytes.load(Ordering::Relaxed),
+                        completed,
+                    )
+                });
             if phase == JobPhase::Downloading && !download_active {
-                runtime.ema_bps = None;
+                runtime.rate = RateSeries::new();
                 runtime.first_sample_at = None;
-                runtime.last_sample = None;
                 continue;
             }
             if total_bytes == 0 {
-                runtime.last_sample = Some((now, completed_bytes));
+                runtime.rate.update(now, rate_bytes);
                 continue;
             }
 
             if runtime.first_sample_at.is_none() {
                 runtime.first_sample_at = Some(now);
             }
-            if let Some((last_at, last_completed)) = runtime.last_sample {
-                let dt = now.duration_since(last_at).as_secs_f64();
-                if dt > 0.0 {
-                    let delta = completed_bytes.saturating_sub(last_completed) as f64;
-                    let sample_bps = delta / dt;
-                    let alpha = 1.0 - 0.5f64.powf(dt / PHASE_EMA_HALF_LIFE_SECS);
-                    runtime.ema_bps = Some(match runtime.ema_bps {
-                        Some(current) => current + alpha * (sample_bps - current),
-                        None => sample_bps,
-                    });
-                }
-            }
-            runtime.last_sample = Some((now, completed_bytes));
+            let rate = runtime.rate.update(now, rate_bytes);
 
             let rate_warm = runtime
                 .first_sample_at
                 .is_some_and(|first| now.duration_since(first) >= PHASE_RATE_WARMUP);
-            let rate_bps = runtime
-                .ema_bps
-                .filter(|rate| rate_warm && rate.is_finite() && *rate > 0.0)
-                .map(|rate| rate.round().max(0.0) as u64);
+            // Same rounding as the global gauge: below 1 B/s reads as idle.
+            let rate_bps = (rate_warm && rate.is_finite() && rate >= 1.0).then_some(rate as u64);
             let effective_total = total_bytes.max(completed_bytes);
             let progress_percent = if effective_total == 0 {
                 0.0

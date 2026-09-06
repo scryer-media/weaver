@@ -281,15 +281,34 @@ fn queue_item_keeps_active_download_primary_over_every_lifecycle_overlay() {
         JobStatus::Repairing,
         JobStatus::QueuedExtract,
         JobStatus::Extracting,
-        JobStatus::Moving,
         JobStatus::QueuedPostProcessing,
-        JobStatus::PostProcessing,
         JobStatus::Complete,
     ] {
         let mut job = base_job(status);
         job.download_state = weaver_server_core::DownloadState::Downloading;
 
         assert_eq!(queue_item_from_job(&job).state, QueueItemState::Downloading);
+    }
+}
+
+#[test]
+fn queue_item_keeps_the_delivery_tail_primary_over_a_stale_download_projection() {
+    // The move is gated on the terminal delivery census, so a live
+    // download-activity signal at that point is scheduler residue. The row
+    // must name the work it is actually doing, matching its progress bar.
+    for (status, expected) in [
+        (JobStatus::Moving, QueueItemState::Finalizing),
+        (JobStatus::PostProcessing, QueueItemState::PostProcessing),
+    ] {
+        let mut job = base_job(status);
+        job.download_state = weaver_server_core::DownloadState::Downloading;
+
+        assert_eq!(queue_item_from_job(&job).state, expected);
+        // Compatibility counters keep reading the download lane as active.
+        assert_eq!(
+            queue_item_state_from_job_info_for_download_accounting(&job),
+            QueueItemState::Downloading
+        );
     }
 }
 

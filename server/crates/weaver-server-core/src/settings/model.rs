@@ -243,8 +243,8 @@ pub struct DirectUnpackOverrides {
     /// Begin extracting a 7z set while its parts are still downloading, instead
     /// of waiting for the whole set to land.
     ///
-    /// **Defaults to off.** Turning the default on is a release decision, not a
-    /// config default change.
+    /// **Defaults to on.** Set to `false` here, or export the environment
+    /// override, to fall back to extracting after the whole set has landed.
     pub enabled: Option<bool>,
 }
 
@@ -358,6 +358,7 @@ mod tests {
                 connections: 4,
                 active: false,
                 supports_pipelining: false,
+                pipelining_depth: None,
                 tls_name_mismatch_certificate_der: None,
                 priority: 0,
                 backfill: false,

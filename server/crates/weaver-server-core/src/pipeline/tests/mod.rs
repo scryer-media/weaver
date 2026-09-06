@@ -246,6 +246,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         working_dir,
         downloaded_bytes: 0,
         restored_download_floor_bytes: 0,
+        downloaded_wire_bytes: 0,
         failed_bytes: 0,
         probe_projected_failed_bytes: 0,
         par2_bytes: 0,
@@ -378,7 +379,7 @@ async fn new_direct_pipeline_with(
 /// Everything else here puts `intermediate` and `complete` under one `TempDir`,
 /// which puts them on one filesystem — and the whole class of question this
 /// exists for ("is the publish a rename or a byte copy?") is unobservable there.
-/// The cross-device probe at the end of `direct_store.rs` hands in two roots on
+/// The cross-device probe in `direct_store/scenarios/cross_device.rs` hands in two roots on
 /// genuinely different mounts.
 #[allow(clippy::too_many_arguments)]
 async fn new_direct_pipeline_at_roots(
@@ -1815,6 +1816,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
+            downloaded_wire_bytes: 0,
             failed_bytes: 0,
             probe_projected_failed_bytes: 0,
             par2_bytes,
@@ -2192,6 +2194,87 @@ async fn submit_decoded_segment_with_segments(
     // volumes would never become files and every assertion after the demoting
     // article would be reading a half-finished handback.
     settle_direct_demotion_work(pipeline).await;
+}
+
+/// [`submit_decoded_segment`] delivered the way the orchestrator delivers a
+/// **queued** decode: through [`Pipeline::handle_decode_done`], the seam that
+/// owns the decode-stage bookkeeping.
+///
+/// The other submit helpers enter at `handle_decode_success`, which is the
+/// *streamed* shape — decoded on the download lane, before its download result
+/// is finished with. An article that went to the decode queue instead settles
+/// here, a turn of the select loop after the download result that queued it,
+/// and that ordering is what decides whether a health probe is still waited on
+/// or retired.
+async fn settle_queued_decode(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    segment_number: u32,
+    file_offset: u64,
+    data: &[u8],
+    filename: &str,
+) {
+    let (file_size, total_segments) = {
+        let file = pipeline
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .expect("active test file assembly");
+        (file.total_bytes(), file.total_segments())
+    };
+    let checkpoint_plan = pipeline.par2_checkpoint_plan(file_id.job_id);
+    let yenc_layout = YencLayoutAssertions {
+        file_size,
+        part: Some(segment_number + 1),
+        total: Some(total_segments),
+        begin: Some(file_offset + 1),
+        end: Some(file_offset + data.len() as u64),
+    };
+    pipeline
+        .handle_decode_done(DecodeDone::Success {
+            result: DecodeResult {
+                encoding: SegmentEncoding::Yenc,
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number,
+                },
+                raw_size: data.len() as u64,
+                yenc_layout,
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: par2_rs::checksum::crc32(data),
+                expected_file_crc: None,
+                data: DecodedChunk::from(data.to_vec()),
+                yenc_name: filename.to_string(),
+                checkpoint_plan,
+                segments: vec![weaver_yenc::Segment {
+                    file_offset,
+                    len: data.len() as u64,
+                    crc32: par2_rs::checksum::crc32(data),
+                }],
+            },
+            source: SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
+            },
+        })
+        .await;
+    settle_direct_demotion_work(pipeline).await;
+}
+
+/// Put a job in the state the download-result path leaves behind when it has
+/// just processed the *last* article of a job whose decode is still queued:
+/// the pass is open, the queues are empty, and one decode is outstanding.
+fn park_job_on_its_final_decode(pipeline: &mut Pipeline, segment_id: SegmentId, raw_size: u64) {
+    let job_id = segment_id.file_id.job_id;
+    pipeline.active_download_passes.insert(job_id);
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.metrics.note_decode_task_started(raw_size);
+    pipeline.note_decode_started(segment_id);
 }
 
 /// Drives every outstanding demotion reconstruction ticket to its handler, the

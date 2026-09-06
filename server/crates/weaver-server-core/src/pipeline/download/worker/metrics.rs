@@ -158,6 +158,22 @@ impl Pipeline {
         self.publish_active_stage_metrics();
     }
 
+    /// Payload delivered and the wall time it took, with deliberate throttle
+    /// waits already excluded by the lane. Zero for anything but a decoded
+    /// article, so a failure cannot look like free bytes.
+    pub(in crate::pipeline::download) fn decoded_trace_throughput_sample(
+        trace: &weaver_nntp::client::DecodedBodyTrace,
+    ) -> (u64, Duration) {
+        let Ok(decoded) = trace.result.as_ref() else {
+            return (0, Duration::ZERO);
+        };
+        let elapsed = trace
+            .attempts
+            .last()
+            .map_or(Duration::ZERO, |attempt| attempt.elapsed);
+        (decoded.io.decoded_bytes_written, elapsed)
+    }
+
     pub(in crate::pipeline::download) fn download_data_from_decoded_trace(
         segment_id: SegmentId,
         trace: weaver_nntp::client::DecodedBodyTrace,

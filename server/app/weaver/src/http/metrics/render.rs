@@ -318,32 +318,6 @@ fn render_pipeline_totals(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         snapshot.nntp_generation_recovery_requeues,
     );
 
-    out.sample(
-        &f::PROBE_ATTEMPTS,
-        &[],
-        snapshot.nntp_capacity_probe_attempts_total,
-    );
-    out.sample(
-        &f::PROBE_SUCCESSES,
-        &[],
-        snapshot.nntp_capacity_probe_successes_total,
-    );
-    out.sample(
-        &f::PROBE_REJECTIONS,
-        &[],
-        snapshot.nntp_capacity_probe_rejections_total,
-    );
-    out.sample(
-        &f::PROBE_TRANSPORT_FAILURES,
-        &[],
-        snapshot.nntp_capacity_probe_transport_failures_total,
-    );
-    out.sample(
-        &f::PROBE_STALE_GENERATION,
-        &[],
-        snapshot.nntp_capacity_probe_stale_generation_total,
-    );
-
     for (kind, value) in [
         (
             "article_not_found",
@@ -577,6 +551,7 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         ("sequential", snapshot.download_lanes_sequential_active),
         ("pipeline_depth2", snapshot.download_lanes_depth2_active),
         ("pipeline_depth4", snapshot.download_lanes_depth4_active),
+        ("pipeline_depth8", snapshot.download_lanes_depth8_active),
     ] {
         out.sample(&f::LANES_ACTIVE_BY_MODE, &[("mode", mode)], value);
     }
@@ -924,7 +899,6 @@ fn render_servers(out: &mut Encoder, server_health: &[ServerHealthInfo], runtime
             id,
             srv.connections_configured,
         );
-        out.sample(&f::SERVER_CONNECTIONS_EFFECTIVE, id, srv.connections_max);
         out.sample(
             &f::SERVER_CAPACITY_PENALTY_MS,
             id,
@@ -935,7 +909,6 @@ fn render_servers(out: &mut Encoder, server_health: &[ServerHealthInfo], runtime
             id,
             srv.capacity_penalty_until_epoch_ms as f64 / 1000.0,
         );
-        out.sample(&f::SERVER_CAPACITY_REDUCTIONS, id, srv.capacity_reductions);
         out.sample(&f::SERVER_PREMATURE_DEATHS, id, srv.premature_deaths);
     }
 

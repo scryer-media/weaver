@@ -115,7 +115,11 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	link, err := benchmark.ResolveServerLinkProfile(required(getenv, "BENCH_SERVER_LINK_ID"), egress, burst)
+	rtt, err := parseUint(getenv("BENCH_SERVER_RTT_MICROS"), "BENCH_SERVER_RTT_MICROS")
+	if err != nil {
+		return Config{}, err
+	}
+	link, err := benchmark.ResolveServerLinkProfile(required(getenv, "BENCH_SERVER_LINK_ID"), egress, burst, rtt)
 	if err != nil {
 		return Config{}, err
 	}
@@ -131,7 +135,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	pollInterval, err := parseDurationDefault(getenv("CLIENT_POLL_INTERVAL"), 10*time.Millisecond, "CLIENT_POLL_INTERVAL")
+	pollInterval, err := parseDurationDefault(getenv("CLIENT_POLL_INTERVAL"), 100*time.Millisecond, "CLIENT_POLL_INTERVAL")
 	if err != nil {
 		return Config{}, err
 	}
@@ -381,7 +385,11 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		"WEAVER_DATA_DIR=/config/data",
 		"WEAVER_INTERMEDIATE_DIR=/downloads/incomplete",
 		"WEAVER_COMPLETE_DIR=/downloads/complete",
-		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
+		// Weaver deletes the archive volumes once extraction succeeds; that is
+		// its shipping default and what SABnzbd and NZBGet do after unpack, so
+		// every client pays for the same delete. Rendered explicitly so the audit
+		// record shows it.
+		"WEAVER_CLEANUP_AFTER_EXTRACT=true",
 		// Direct unpack (in-stream extraction of stored archives) is Weaver's
 		// shipping default from the release these benches accompany. It is
 		// rendered explicitly in BOTH profiles so the pinned image benches the
@@ -400,6 +408,13 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		"WEAVER_SERVER_1_PASSWORD=" + c.NNTPPassword,
 		"WEAVER_SERVER_1_CONNECTIONS=" + strconv.Itoa(c.Connections),
 		"WEAVER_SERVER_1_ACTIVE=true",
+		// A server added through Weaver's UI is probed for CAPABILITIES and
+		// records whether it advertises PIPELINING; an environment-seeded
+		// server is never probed and would stay sequential on every
+		// connection. The benchmark server advertises PIPELINING (see the
+		// server topology), so the flag is seeded the way the probe would
+		// have set it. Weaver 0.10.3 or newer; older images reject the field.
+		"WEAVER_SERVER_1_PIPELINING=true",
 		// Weaver's first-run access policy hands an anonymous browser session
 		// only to peers on its trusted-network list; without one, an install
 		// with no login serves a setup notice and refuses every GraphQL call.
@@ -488,6 +503,12 @@ func renderSABnzbd(c Config, directUnpack bool) ProductSpec {
 		"direct_unpack = " + direct,
 		"pre_check = 0",
 		"pause_on_post_processing = 0",
+		// SABnzbd 5 pipelines two BODY requests per connection for a server
+		// added through its UI but downgrades every server it finds in an
+		// ini older than config conversion 5 to one request per connection.
+		// Stamping the current conversion number keeps the rendered server
+		// exactly as a fresh install would create it.
+		"config_conversion_version = 5",
 		"",
 		"[servers]",
 		"[[benchmark]]",
@@ -496,6 +517,8 @@ func renderSABnzbd(c Config, directUnpack bool) ProductSpec {
 		"username = " + c.NNTPUsername,
 		"password = " + c.NNTPPassword,
 		"connections = " + strconv.Itoa(c.Connections),
+		// SABnzbd's own default for a newly added server (5.0 and later).
+		"pipelining_requests = 2",
 		"ssl = " + ssl,
 		// This is intentional and policy-labelled by the plan. SAB's local CA
 		// support is not reliable in this harness, so verified TLS is never
@@ -532,11 +555,14 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 		}
 	}
 	direct := "no"
-	directWrite := "no"
 	if directUnpack {
 		direct = "yes"
-		directWrite = "yes"
 	}
+	// DirectWrite (writing decoded articles straight into the destination
+	// file instead of per-article temp files) is NZBGet's shipping default and
+	// is independent of direct unpack, so it stays on in both profiles; the
+	// profiles differ only in DirectUnpack.
+	const directWrite = "yes"
 	unpack := "yes"
 	parRepair := "yes"
 	unrarCommand := "unrar"
@@ -623,6 +649,7 @@ func renderAuditConfig(c Config, spec ProductSpec) []byte {
 		"server_link_scope=" + c.ServerLink.Scope,
 		"server_link_egress_bits_per_second=" + strconv.FormatUint(c.ServerLink.EgressBitsPerSecond, 10),
 		"server_link_burst_bytes=" + strconv.FormatUint(c.ServerLink.BurstBytes, 10),
+		"server_link_rtt_micros=" + strconv.FormatUint(c.ServerLink.RTTMicros, 10),
 		"storage_profile_id=" + c.StorageProfile.ID,
 		"storage_kind=" + string(c.StorageProfile.Kind),
 		"storage_nfs_link_id=" + c.StorageProfile.NFSLinkID,

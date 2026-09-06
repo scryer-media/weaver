@@ -643,8 +643,70 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 				return "DIRECT_UNPACK_ASSERTION_ERROR", err.Error()
 			}
 		}
+		if err == nil && scenario.healthProbeAssertion() != nil {
+			if err := assertHealthProbeScenario(jobID, scenario.healthProbeAssertion()); err != nil {
+				log.Printf("  %s: health-probe runtime assertion failed after %s: %v", slug, status, err)
+				return "HEALTH_PROBE_ASSERTION_ERROR", err.Error()
+			}
+		}
 	}
 	return status, ""
+}
+
+// The lines the health probe emits for a job. Activation is logged once per
+// round; the completion line carries `inconclusive=true` when a confirmation
+// batch hit its transport deadline rather than an answer, and it is the only
+// per-job trace of that — the batch's own warning names no job.
+const (
+	healthProbeActivatedMessage = "health probe activated"
+	healthProbeCompleteMessage  = "health probe complete"
+)
+
+// assertHealthProbeScenario reads the probe's own log lines for the job. A job
+// whose probe timed out still completes with the right bytes, so this is the
+// only place a probe that sat on its soft timeout — every article it could
+// sample already sampled, the lanes it was waiting on long idle — shows up.
+func assertHealthProbeScenario(jobID int, assertion *ScenarioHealthProbeAssertion) error {
+	if assertion == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(localWeaverLogPath())
+	if err != nil {
+		return fmt.Errorf("read weaver log: %w", err)
+	}
+
+	wantJobID := strconv.Itoa(jobID)
+	activated := 0
+	completed := 0
+	inconclusive := 0
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := ansiEscape.ReplaceAllString(rawLine, "")
+		if directLogJobID(line) != wantJobID {
+			continue
+		}
+		switch {
+		case strings.Contains(line, healthProbeActivatedMessage):
+			activated++
+		case strings.Contains(line, healthProbeCompleteMessage):
+			completed++
+			if weaverLogField(line, "inconclusive") == "true" {
+				inconclusive++
+			}
+		}
+	}
+
+	if assertion.RequireActivated && activated == 0 {
+		return errors.New("the health probe never activated for this job; the fixture's damage did not cross the activation threshold")
+	}
+	if assertion.ForbidInconclusive && inconclusive > 0 {
+		return fmt.Errorf(
+			"%d of %d health probe round(s) ended inconclusive: a confirmation batch hit its "+
+				"transport deadline instead of getting an answer, which on the harness's own "+
+				"server means the probe sat waiting on a lane it should have been handed",
+			inconclusive, completed,
+		)
+	}
+	return nil
 }
 
 func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertion) error {

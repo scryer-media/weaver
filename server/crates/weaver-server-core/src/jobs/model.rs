@@ -554,6 +554,12 @@ pub struct JobState {
     pub working_dir: PathBuf,
     /// Bytes downloaded for this specific job.
     pub downloaded_bytes: u64,
+    /// Encoded bytes received off the wire for this job, credited when an
+    /// article lands and before it is decoded. Includes retries and articles
+    /// that failed to decode, so it is never a progress measure: it feeds only
+    /// the download-phase rate, which must integrate the same bytes as the
+    /// global speed gauge so a queue row and the nav counter agree.
+    pub downloaded_wire_bytes: u64,
     /// Conservative restored progress floor from persisted file-write checkpoints.
     /// This is only used for reporting after restart and must not affect scheduling.
     pub restored_download_floor_bytes: u64,

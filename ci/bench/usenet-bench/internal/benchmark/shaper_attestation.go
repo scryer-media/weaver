@@ -21,17 +21,110 @@ type ShaperBuildIdentity struct {
 	BuildTime        string `json:"build_time"`
 }
 
+// ShaperLinkShaping mirrors the shaper's link shaping report (attestation
+// schema 4): how the container rendered the plan's fixed round trip with tc
+// and, per snapshot, what tc reports for those qdiscs right now.
+type ShaperLinkShaping struct {
+	SchemaVersion          int    `json:"schema_version"`
+	Interface              string `json:"interface"`
+	IngressDevice          string `json:"ingress_device"`
+	EgressMechanism        string `json:"egress_mechanism"`
+	IngressMechanism       string `json:"ingress_mechanism"`
+	RTTMicros              uint64 `json:"rtt_micros"`
+	EgressDelayMicros      uint64 `json:"egress_delay_micros"`
+	IngressDelayMicros     uint64 `json:"ingress_delay_micros"`
+	NetemLimitPackets      uint64 `json:"netem_limit_packets"`
+	TCPWmem                string `json:"tcp_wmem"`
+	TCPRmem                string `json:"tcp_rmem"`
+	KernelRelease          string `json:"kernel_release"`
+	LiveEgressDelayMicros  uint64 `json:"live_egress_delay_micros"`
+	LiveIngressDelayMicros uint64 `json:"live_ingress_delay_micros"`
+	LiveError              string `json:"live_error,omitempty"`
+}
+
+const (
+	shaperLinkShapingSchemaVersion = 1
+	shaperEgressNetem              = "netem"
+	shaperIngressIFBNetem          = "ifb-netem"
+	shaperIngressNone              = "none"
+)
+
+// declared strips the per-snapshot live fields so two snapshots' contracts
+// can be compared for identity.
+func (l ShaperLinkShaping) declared() ShaperLinkShaping {
+	l.LiveEgressDelayMicros, l.LiveIngressDelayMicros, l.LiveError = 0, 0, ""
+	return l
+}
+
+// validateFor checks the report against the plan's round trip and the live
+// qdisc readings against the report. tc prints a delay with limited
+// precision, so the live comparison allows the larger of 1% and 100us.
+func (l ShaperLinkShaping) validateFor(link ServerLinkProfile) error {
+	if l.SchemaVersion != shaperLinkShapingSchemaVersion {
+		return fmt.Errorf("shaper link shaping report has schema %d, want %d", l.SchemaVersion, shaperLinkShapingSchemaVersion)
+	}
+	if l.RTTMicros != link.RTTMicros {
+		return fmt.Errorf("shaper link shaping report declares a %dus round trip, plan declares %dus", l.RTTMicros, link.RTTMicros)
+	}
+	if l.Interface == "" || l.EgressMechanism != shaperEgressNetem {
+		return fmt.Errorf("shaper link shaping report lacks a netem egress path")
+	}
+	switch l.IngressMechanism {
+	case shaperIngressIFBNetem:
+		if l.IngressDevice == "" || l.IngressDelayMicros == 0 {
+			return fmt.Errorf("shaper ifb ingress path lacks a device or a delay")
+		}
+	case shaperIngressNone:
+		if l.IngressDevice != "" || l.IngressDelayMicros != 0 {
+			return fmt.Errorf("shaper reports no ingress path but names a device or a delay")
+		}
+	default:
+		return fmt.Errorf("shaper reports unknown ingress mechanism %q", l.IngressMechanism)
+	}
+	if l.EgressDelayMicros == 0 || l.EgressDelayMicros+l.IngressDelayMicros != l.RTTMicros {
+		return fmt.Errorf("shaper egress %dus + ingress %dus does not make up the %dus round trip", l.EgressDelayMicros, l.IngressDelayMicros, l.RTTMicros)
+	}
+	if l.NetemLimitPackets == 0 {
+		return fmt.Errorf("shaper netem queue limit is unset")
+	}
+	if l.LiveError != "" {
+		return fmt.Errorf("shaper could not read its qdiscs back: %s", l.LiveError)
+	}
+	if !delayWithinTolerance(l.LiveEgressDelayMicros, l.EgressDelayMicros) {
+		return fmt.Errorf("tc reports a server-to-client delay of %dus, shaper declares %dus", l.LiveEgressDelayMicros, l.EgressDelayMicros)
+	}
+	if !delayWithinTolerance(l.LiveIngressDelayMicros, l.IngressDelayMicros) {
+		return fmt.Errorf("tc reports a client-to-server delay of %dus, shaper declares %dus", l.LiveIngressDelayMicros, l.IngressDelayMicros)
+	}
+	return nil
+}
+
+func delayWithinTolerance(observed, declared uint64) bool {
+	tolerance := declared / 100
+	if tolerance < 100 {
+		tolerance = 100
+	}
+	if observed > declared {
+		return observed-declared <= tolerance
+	}
+	return declared-observed <= tolerance
+}
+
 type ShaperSnapshot struct {
-	SchemaVersion                 int               `json:"schema_version"`
-	Status                        string            `json:"status"`
-	StartedAt                     time.Time         `json:"started_at"`
-	ConfiguredEgressBitsPerSecond uint64            `json:"configured_egress_bits_per_second"`
-	ConfiguredBurstBytes          uint64            `json:"configured_burst_bytes"`
-	DownstreamConnections         uint64            `json:"downstream_connections"`
-	ActiveDownstreamConnections   int64             `json:"active_downstream_connections"`
-	DownstreamBytes               uint64            `json:"downstream_bytes"`
-	DownstreamSourceConnections   map[string]uint64 `json:"downstream_source_connections"`
-	DownstreamSourceBytes         map[string]uint64 `json:"downstream_source_bytes"`
+	SchemaVersion                 int       `json:"schema_version"`
+	Status                        string    `json:"status"`
+	StartedAt                     time.Time `json:"started_at"`
+	ConfiguredEgressBitsPerSecond uint64    `json:"configured_egress_bits_per_second"`
+	ConfiguredBurstBytes          uint64    `json:"configured_burst_bytes"`
+	// The fixed round trip (attestation schema 4). A schema-2 or -3 shaper
+	// leaves both empty and can only serve a plan that declares none.
+	ConfiguredRTTMicros         uint64             `json:"configured_rtt_micros,omitempty"`
+	LinkShaping                 *ShaperLinkShaping `json:"link_shaping,omitempty"`
+	DownstreamConnections       uint64             `json:"downstream_connections"`
+	ActiveDownstreamConnections int64              `json:"active_downstream_connections"`
+	DownstreamBytes             uint64             `json:"downstream_bytes"`
+	DownstreamSourceConnections map[string]uint64  `json:"downstream_source_connections"`
+	DownstreamSourceBytes       map[string]uint64  `json:"downstream_source_bytes"`
 	// The command census (attestation schema 3). A schema-2 shaper leaves them
 	// zero and the artifact carries no census.
 	DownstreamCommands       map[string]uint64   `json:"downstream_commands,omitempty"`
@@ -209,11 +302,14 @@ func ShaperArticleCensusFor(before, after ShaperSnapshot) (*ShaperArticleCensus,
 }
 
 func (s ShaperSnapshot) ValidateFor(link ServerLinkProfile) error {
-	if (s.SchemaVersion != 2 && s.SchemaVersion != 3) || s.Status != "ok" || s.StartedAt.IsZero() {
+	if (s.SchemaVersion < 2 || s.SchemaVersion > 4) || s.Status != "ok" || s.StartedAt.IsZero() {
 		return fmt.Errorf("shaper attestation has unsupported schema, status, or start time")
 	}
 	if s.ConfiguredEgressBitsPerSecond != link.EgressBitsPerSecond || s.ConfiguredBurstBytes != link.BurstBytes {
 		return fmt.Errorf("shaper attestation rate/burst %d/%d does not match plan %d/%d", s.ConfiguredEgressBitsPerSecond, s.ConfiguredBurstBytes, link.EgressBitsPerSecond, link.BurstBytes)
+	}
+	if err := s.validateRoundTripFor(link); err != nil {
+		return err
 	}
 	if len(s.Build.ExecutableSHA256) != 64 || strings.Trim(s.Build.ExecutableSHA256, "0123456789abcdef") != "" {
 		return fmt.Errorf("shaper attestation lacks a lowercase executable SHA-256")
@@ -230,9 +326,38 @@ func (s ShaperSnapshot) ValidateFor(link ServerLinkProfile) error {
 	return nil
 }
 
+// validateRoundTripFor checks the plan's fixed round trip against what the
+// shaper attests. A pre-schema-4 shaper cannot add delay, so it is accepted
+// only for a plan that declares none; a schema-4 shaper must carry a report
+// whose declared split and live qdisc readings both match the plan.
+func (s ShaperSnapshot) validateRoundTripFor(link ServerLinkProfile) error {
+	if s.SchemaVersion < 4 {
+		if link.RTTMicros != 0 {
+			return fmt.Errorf("shaper attestation schema %d cannot render the plan's %dus round trip; rebuild the shaper image", s.SchemaVersion, link.RTTMicros)
+		}
+		return nil
+	}
+	if s.ConfiguredRTTMicros != link.RTTMicros {
+		return fmt.Errorf("shaper attestation round trip %dus does not match plan %dus", s.ConfiguredRTTMicros, link.RTTMicros)
+	}
+	if link.RTTMicros == 0 {
+		if s.LinkShaping != nil {
+			return fmt.Errorf("shaper reports a link shaping path for a plan that declares no round trip")
+		}
+		return nil
+	}
+	if s.LinkShaping == nil {
+		return fmt.Errorf("shaper attestation lacks the link shaping report for its %dus round trip", link.RTTMicros)
+	}
+	return s.LinkShaping.validateFor(link)
+}
+
 func ValidateShaperSnapshotPair(before, after ShaperSnapshot) (uint64, error) {
-	if before.SchemaVersion != after.SchemaVersion || !before.StartedAt.Equal(after.StartedAt) || before.ConfiguredEgressBitsPerSecond != after.ConfiguredEgressBitsPerSecond || before.ConfiguredBurstBytes != after.ConfiguredBurstBytes || before.Build != after.Build || before.ExecutionLeaseID != after.ExecutionLeaseID || before.ExecutionLeaseAcquiredAt == nil || after.ExecutionLeaseAcquiredAt == nil || !before.ExecutionLeaseAcquiredAt.Equal(*after.ExecutionLeaseAcquiredAt) {
+	if before.SchemaVersion != after.SchemaVersion || !before.StartedAt.Equal(after.StartedAt) || before.ConfiguredEgressBitsPerSecond != after.ConfiguredEgressBitsPerSecond || before.ConfiguredBurstBytes != after.ConfiguredBurstBytes || before.ConfiguredRTTMicros != after.ConfiguredRTTMicros || before.Build != after.Build || before.ExecutionLeaseID != after.ExecutionLeaseID || before.ExecutionLeaseAcquiredAt == nil || after.ExecutionLeaseAcquiredAt == nil || !before.ExecutionLeaseAcquiredAt.Equal(*after.ExecutionLeaseAcquiredAt) {
 		return 0, fmt.Errorf("shaper identity or configuration changed during the measured run")
+	}
+	if (before.LinkShaping == nil) != (after.LinkShaping == nil) || (before.LinkShaping != nil && before.LinkShaping.declared() != after.LinkShaping.declared()) {
+		return 0, fmt.Errorf("shaper link shaping changed during the measured run")
 	}
 	if after.DownstreamConnections < before.DownstreamConnections || after.DownstreamBytes < before.DownstreamBytes {
 		return 0, fmt.Errorf("shaper counters moved backwards during the measured run")

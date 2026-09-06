@@ -632,6 +632,18 @@ type JobDetailSnapshot {
 	jobEvents: [JobEvent!]!
 }
 
+"""
+The download-phase rate of one job, from the same estimator and the same
+instant as the global speed gauge.
+"""
+type JobDownloadRate {
+	jobId: Int!
+	"""
+	Bytes per second, rounded the way the global gauge rounds.
+	"""
+	rateBps: Int!
+}
+
 type JobEvent {
 	kind: EventKind!
 	jobId: Int!
@@ -807,6 +819,7 @@ type Metrics {
 	downloadLanesSequentialActive: Int!
 	downloadLanesDepth2Active: Int!
 	downloadLanesDepth4Active: Int!
+	downloadLanesDepth8Active: Int!
 	downloadLanesIdleActive: Int!
 	downloadLanesAwaitingWorkActive: Int!
 	downloadLanesBindingServerActive: Int!
@@ -1225,6 +1238,21 @@ input PostProcessingSettingsInput {
 	it. `null` is deliberately distinguishable and refused by the mutation.
 	"""
 	unacceptableExtensions: [String!]
+}
+
+"""
+A server whose provider rejected a fresh connection; weaver stops opening
+new connections to it until the deadline while existing ones keep running.
+"""
+type ProviderHoldoff {
+	"""
+	`host:port` label.
+	"""
+	label: String!
+	"""
+	Epoch milliseconds after which fresh connects resume.
+	"""
+	untilEpochMs: Int!
 }
 
 type QueryRoot {
@@ -2070,7 +2098,7 @@ type ServerHealth {
 	"""
 	connectionsActive: Int!
 	"""
-	Runtime effective maximum connections (legacy field).
+	Configured maximum connections (legacy field).
 	"""
 	connectionsMax: Int!
 	"""
@@ -2078,11 +2106,7 @@ type ServerHealth {
 	"""
 	connectionsConfigured: Int!
 	"""
-	Runtime maximum after provider capacity adaptation.
-	"""
-	connectionsEffective: Int!
-	"""
-	End of the current provider-capacity penalty, if one is active.
+	End of the current provider over-limit holdoff, if one is active.
 	"""
 	capacityPenaltyUntilEpochMs: Int
 	"""
@@ -2093,6 +2117,29 @@ type ServerHealth {
 	EWMA request latency in milliseconds.
 	"""
 	latencyMs: Float!
+	"""
+	EWMA command-to-status-line wait for BODY fetches, in milliseconds.
+	Absent until the download lanes have taken an unbiased sample.
+	"""
+	bodyLatencyMs: Float
+	"""
+	EWMA status-line-to-terminator wait for one article, in milliseconds:
+	what the article itself costs on the wire.
+	"""
+	bodyTransferMs: Float
+	"""
+	"good", "moderate" or "slow" for `bodyLatencyMs`.
+	"""
+	bodyLatencyBand: String
+	"""
+	BODY pipelining depth the lanes currently run at; 1 is sequential.
+	"""
+	bodyPipelineDepth: Int!
+	"""
+	Set once the server has twice failed to answer a pipelined batch
+	cleanly, which holds it sequential for the rest of the process.
+	"""
+	bodyPipeliningPinnedSequential: Boolean!
 	successCount: Int!
 	failureCount: Int!
 	consecutiveFailures: Int!
@@ -2317,6 +2364,18 @@ type SystemMemoryInfo {
 type SystemMetricsSnapshot {
 	metrics: Metrics!
 	globalState: GlobalQueueState!
+	"""
+	Servers currently refusing new connections as over their limit.
+	"""
+	providerHoldoffs: [ProviderHoldoff!]!
+	"""
+	Download rate of every job currently transferring, sampled on the same
+	tick and pushed on the same cadence as `metrics.currentDownloadSpeed`.
+	A queue row that reads its rate from here cannot drift from the global
+	gauge the way the event-driven queue item, published at most once a
+	second, always did.
+	"""
+	jobDownloadRates: [JobDownloadRate!]!
 }
 
 type SystemStatus {
@@ -2335,6 +2394,17 @@ type TestConnectionResult {
 	success: Boolean!
 	message: String!
 	latencyMs: Int
+	"""
+	Command-to-status-line round trip on the open session. `latencyMs` is
+	the whole connect (TCP, TLS, authentication); this is the distance the
+	download lanes have to work against.
+	"""
+	firstByteLatencyMs: Int
+	"""
+	"good", "moderate" or "slow" for `firstByteLatencyMs`. Descriptive: the
+	download depth is chosen automatically and needs no operator input.
+	"""
+	firstByteLatencyBand: String
 	supportsPipelining: Boolean!
 	adoptableTlsNameMismatchCertificate: AdoptableTlsNameMismatchCertificate
 	"""

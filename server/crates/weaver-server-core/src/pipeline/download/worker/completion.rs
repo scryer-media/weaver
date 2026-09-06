@@ -347,14 +347,6 @@ impl Pipeline {
                     .remove(&result.segment_id.file_id);
             }
         }
-        if result.origin.counts_for_hot_primary()
-            && let Ok(DownloadPayload::Decoded(decoded)) = &result.data
-        {
-            self.ensure_job_transport_profile(job_id);
-            if let Some(profile) = self.job_transport_profiles.get_mut(&job_id) {
-                profile.note_body_size(decoded.raw_size);
-            }
-        }
         self.publish_active_stage_metrics();
         if let Err(error) = self.release_bandwidth_reservation(result.segment_id) {
             error!(error = %error, segment = %result.segment_id, "failed to release ISP bandwidth reservation");
@@ -600,7 +592,7 @@ impl Pipeline {
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
 
-                // (Per-job byte tracking moved to handle_decode_done to use decoded size.)
+                self.note_job_wire_bytes(result.segment_id, raw_size_bytes);
 
                 self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                     segment_id: result.segment_id,
@@ -629,6 +621,7 @@ impl Pipeline {
                     self.metrics
                         .segments_downloaded
                         .fetch_add(1, Ordering::Relaxed);
+                    self.note_job_wire_bytes(result.segment_id, raw_size_bytes);
                     self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                         segment_id: result.segment_id,
                         raw_size,
@@ -656,6 +649,7 @@ impl Pipeline {
                 self.metrics
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
+                self.note_job_wire_bytes(result.segment_id, raw_size);
                 if crc_mismatch {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
                 }

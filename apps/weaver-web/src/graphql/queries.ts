@@ -744,10 +744,14 @@ export const SERVER_HEALTH_QUERY = gql`
       connectionsActive
       connectionsMax
       connectionsConfigured
-      connectionsEffective
       capacityPenaltyUntilEpochMs
       runtimeGeneration
       latencyMs
+      bodyLatencyMs
+      bodyTransferMs
+      bodyLatencyBand
+      bodyPipelineDepth
+      bodyPipeliningPinnedSequential
       successCount
       failureCount
       consecutiveFailures
@@ -913,6 +917,14 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
         downloadBlock {
           ...DownloadBlockFields
         }
+      }
+      providerHoldoffs {
+        label
+        untilEpochMs
+      }
+      jobDownloadRates {
+        jobId
+        rateBps
       }
     }
   }

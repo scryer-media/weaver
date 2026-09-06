@@ -15,8 +15,10 @@ func WriteServerLinkEnvironment(path string, profile ServerLinkProfile) error {
 	}
 	contents := "# nntpbench server link profile: " + profile.ID + "\n" +
 		"# scope: " + profile.Scope + "\n" +
+		"# rtt: " + profile.RTT().String() + "\n" +
 		"NNTP_EGRESS_BITS_PER_SECOND=" + strconv.FormatUint(profile.EgressBitsPerSecond, 10) + "\n" +
-		"NNTP_EGRESS_BURST_BYTES=" + strconv.FormatUint(profile.BurstBytes, 10) + "\n"
+		"NNTP_EGRESS_BURST_BYTES=" + strconv.FormatUint(profile.BurstBytes, 10) + "\n" +
+		"NNTP_RTT_MICROS=" + strconv.FormatUint(profile.RTTMicros, 10) + "\n"
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return fmt.Errorf("create server link environment %s: %w", path, err)

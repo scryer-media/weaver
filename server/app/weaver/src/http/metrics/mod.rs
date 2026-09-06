@@ -398,7 +398,6 @@ pub(super) struct ServerHealthInfo {
     pub(super) connections_max: usize,
     pub(super) connections_configured: usize,
     pub(super) capacity_penalty_until_epoch_ms: u64,
-    pub(super) capacity_reductions: u64,
     pub(super) premature_deaths: usize,
 }
 
@@ -416,7 +415,6 @@ struct ServerPreamble {
     connections_max: usize,
     connections_configured: usize,
     capacity_penalty_until_epoch_ms: u64,
-    capacity_reductions: u64,
 }
 
 /// Per-server facts read under the health lock. Every field is `Copy`: the
@@ -445,7 +443,7 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
         .enumerate()
         .map(|(idx, cfg)| {
             let server = weaver_nntp::ServerId(idx);
-            let (avail, effective) = pool.server_load(idx);
+            let (avail, configured) = pool.server_load(idx);
             ServerPreamble {
                 label: format!("{}:{}", cfg.host, cfg.port),
                 server_id: pool
@@ -459,12 +457,11 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
                 backfill: backfill_flags.get(idx).copied().unwrap_or(false),
                 connections_available: avail,
                 connections_active: pool.active_connections(idx),
-                connections_max: effective,
-                connections_configured: pool.configured_connections(server).unwrap_or(effective),
+                connections_max: configured,
+                connections_configured: pool.configured_connections(server).unwrap_or(configured),
                 capacity_penalty_until_epoch_ms: pool
-                    .capacity_penalty_until_epoch_ms(server)
+                    .over_limit_until_epoch_ms(server)
                     .unwrap_or(0),
-                capacity_reductions: pool.capacity_reductions(server).unwrap_or(0),
             }
         })
         .collect();
@@ -554,7 +551,6 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
             connections_max: pre.connections_max,
             connections_configured: pre.connections_configured,
             capacity_penalty_until_epoch_ms: pre.capacity_penalty_until_epoch_ms,
-            capacity_reductions: pre.capacity_reductions,
             premature_deaths: reading.premature_deaths,
         })
         .collect()

@@ -41,10 +41,14 @@ interface ServerHealthEntry {
   connectionsActive: number;
   connectionsMax: number;
   connectionsConfigured: number;
-  connectionsEffective: number;
   capacityPenaltyUntilEpochMs: number | null;
   runtimeGeneration: number;
   latencyMs: number;
+  bodyLatencyMs: number | null;
+  bodyTransferMs: number | null;
+  bodyLatencyBand: string | null;
+  bodyPipelineDepth: number;
+  bodyPipeliningPinnedSequential: boolean;
   successCount: number;
   failureCount: number;
   consecutiveFailures: number;
@@ -321,11 +325,18 @@ export function MetricsPage() {
                   const dotClass = SERVER_STATE_DOT_CLASS[server.state] ?? "bg-muted-foreground";
                   const active = server.connectionsActive > 0 && server.state !== "disabled";
                   const connPct =
-                    server.connectionsEffective > 0
-                      ? (server.connectionsActive / server.connectionsEffective) * 100
+                    server.connectionsConfigured > 0
+                      ? (server.connectionsActive / server.connectionsConfigured) * 100
                       : 0;
-                  const capacityReduced =
-                    server.connectionsEffective < server.connectionsConfigured;
+                  // The provider refused a new connection, so new ones pause
+                  // until this deadline. The connections already open keep
+                  // working, which is why the bar itself is unchanged. The
+                  // server clears the field once the deadline passes, so its
+                  // presence alone means the holdoff is still running.
+                  const overLimitUntil =
+                    server.capacityPenaltyUntilEpochMs !== null
+                      ? new Date(server.capacityPenaltyUntilEpochMs)
+                      : null;
                   const latencyClass =
                     server.latencyMs < 80
                       ? "text-status-completed"
@@ -333,6 +344,18 @@ export function MetricsPage() {
                         ? "text-status-paused"
                         : "text-status-failed";
                   const isPrimary = server.tier === "PRIMARY";
+                  const sequential =
+                    server.bodyPipeliningPinnedSequential || server.bodyPipelineDepth <= 1;
+                  const bodyBand = server.bodyLatencyBand
+                    ? t(`metrics.serverLatencyBand.${server.bodyLatencyBand}`)
+                    : null;
+                  // Latency and transfer are the two halves the depth is
+                  // derived from, so they are shown together or not at all.
+                  const bodyTiming =
+                    server.bodyLatencyMs != null && server.bodyTransferMs != null
+                      ? `${Math.round(server.bodyLatencyMs)}/${Math.round(server.bodyTransferMs)} ms`
+                      : null;
+                  const bodyDetail = [bodyBand, bodyTiming].filter(Boolean).join(" · ");
                   return (
                     <div
                       key={server.label}
@@ -368,12 +391,14 @@ export function MetricsPage() {
                         <div className="flex items-center justify-between text-[10.5px] text-muted-foreground">
                           <span>{t("metrics.serverConns")}</span>
                           <span className="font-semibold tabular-nums text-foreground">
-                            {server.connectionsActive} / {server.connectionsEffective}
+                            {server.connectionsActive} / {server.connectionsConfigured}
                           </span>
                         </div>
-                        {capacityReduced ? (
+                        {overLimitUntil ? (
                           <div className="mt-0.5 text-right text-[9px] tabular-nums text-status-paused">
-                            configured {server.connectionsConfigured}
+                            {t("metrics.serverOverLimitUntil", {
+                              time: overLimitUntil.toLocaleTimeString(),
+                            })}
                           </div>
                         ) : null}
                         <div className="mt-1.5 h-1.5 overflow-hidden rounded-pill bg-secondary">
@@ -390,6 +415,24 @@ export function MetricsPage() {
                         <div className={cn("text-[13px] font-semibold tabular-nums", latencyClass)}>
                           {Math.round(server.latencyMs)} ms
                         </div>
+                      </div>
+                      <div className="hidden w-28 shrink-0 text-right sm:block">
+                        <div className="text-[9px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">
+                          {t("metrics.serverBodyDepth")}
+                        </div>
+                        <div
+                          className={cn(
+                            "text-[13px] font-semibold tabular-nums",
+                            sequential ? "text-muted-foreground" : "text-status-completed",
+                          )}
+                        >
+                          {sequential ? t("metrics.serverBodyDepthSequential") : `x${server.bodyPipelineDepth}`}
+                        </div>
+                        {bodyDetail ? (
+                          <div className="mt-0.5 truncate text-[9px] tabular-nums text-muted-foreground">
+                            {bodyDetail}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   );

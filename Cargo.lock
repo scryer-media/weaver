@@ -2598,9 +2598,9 @@ checksum = "4b3f7cef34251886990511df1c61443aa928499d598a9473929ab5a90a527304"
 
 [[package]]
 name = "ipnet"
-version = "2.12.1"
+version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
+checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -5550,7 +5550,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -5605,14 +5605,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -5638,7 +5638,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "quick-xml",
  "serde",
@@ -5649,7 +5649,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "age",
@@ -5687,7 +5687,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -5752,7 +5752,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "cc",
  "crc-fast",

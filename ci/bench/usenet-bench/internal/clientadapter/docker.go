@@ -25,16 +25,16 @@ type runningContainer struct {
 }
 
 func startContainer(ctx context.Context, cfg Config, spec ProductSpec) (*runningContainer, error) {
-	incompleteDir := filepath.Join(cfg.ConfigDir, "incomplete")
+	downloadsDir, incompleteDir := hostDownloadDirs(cfg)
 	if err := os.MkdirAll(incompleteDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create incomplete directory: %w", err)
 	}
-	for _, path := range []string{cfg.ConfigDir, cfg.OutputDir, incompleteDir} {
+	for _, path := range []string{cfg.ConfigDir, cfg.OutputDir, downloadsDir, incompleteDir} {
 		if strings.Contains(path, ",") {
 			return nil, fmt.Errorf("Docker bind path must not contain a comma: %s", path)
 		}
 	}
-	downloadMounts := downloadMounts(cfg, incompleteDir)
+	downloadMounts := downloadMounts(cfg, downloadsDir, incompleteDir)
 	if spec.NeedsNZBMount && strings.Contains(cfg.NZBPath, ",") {
 		return nil, fmt.Errorf("Docker NZB bind path must not contain a comma: %s", cfg.NZBPath)
 	}
@@ -91,11 +91,34 @@ func (container *runningContainer) resolveEndpoint(ctx context.Context, containe
 	return nil
 }
 
+// hostDownloadDirs returns the host directory that stands in for the
+// container's /downloads and the intermediate directory inside it. The
+// completion directory is the run's OutputDir; the intermediate directory is
+// its sibling, so both live on one host filesystem.
+func hostDownloadDirs(cfg Config) (downloadsDir, incompleteDir string) {
+	downloadsDir = filepath.Dir(cfg.OutputDir)
+	return downloadsDir, filepath.Join(downloadsDir, "incomplete")
+}
+
 // downloadMounts places the client's intermediate and completion directories
-// on whatever the plan's storage profile declares. The client is given the
-// same two container paths either way, so no product ever sees a benchmark
-// switch: only the mount behind the path changes.
-func downloadMounts(cfg Config, incompleteDir string) []string {
+// according to the storage profile.
+//
+// Local storage is ONE bind of the host downloads directory at /downloads, so
+// /downloads/incomplete and /downloads/complete are two directories on the
+// same filesystem inside the container and every client's final move is a
+// rename, exactly as on a real single-disk install. Two separate binds would
+// be two mounts to the kernel: rename(2) fails with EXDEV and each client
+// falls back to a full copy of the extracted output, adding a write of the
+// whole payload that no user's machine performs.
+//
+// The NFS profiles are the opposite by design: the completion directory (and
+// for nfs-all the intermediate one too) is a volume on the export, so the
+// final move IS a copy across the network, which is the cost those profiles
+// exist to measure.
+func downloadMounts(cfg Config, downloadsDir, incompleteDir string) []string {
+	if cfg.IncompleteVolume == "" && cfg.CompleteVolume == "" {
+		return []string{mount(downloadsDir, "/downloads", false)}
+	}
 	incomplete := mount(incompleteDir, "/downloads/incomplete", false)
 	if cfg.IncompleteVolume != "" {
 		incomplete = volumeMount(cfg.IncompleteVolume, "/downloads/incomplete")

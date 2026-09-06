@@ -118,7 +118,6 @@ fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
                     let _ = reply.send(Ok(crate::NntpRuntimeActivation {
                         generation: 1,
                         configured_connections: 0,
-                        effective_connections: 0,
                     }));
                 }
                 SchedulerCommand::UpdateRuntimePaths {
@@ -157,6 +156,7 @@ fn sample_server(id: u32) -> crate::servers::ServerConfig {
         connections: 2,
         active: true,
         supports_pipelining: true,
+        pipelining_depth: None,
         tls_name_mismatch_certificate_der: None,
         priority: 0,
         backfill: false,

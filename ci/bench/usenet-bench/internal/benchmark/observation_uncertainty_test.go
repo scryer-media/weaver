@@ -10,9 +10,9 @@ func TestObservationUncertaintyAcceptable(t *testing.T) {
 		duration    int64
 		want        bool
 	}{
-		{"short run inside the absolute floor", 47_000_000, 3 * second, true},
-		{"short run at the floor", 100_000_000, 3 * second, true},
-		{"short run above the floor", 100_000_001, 3 * second, false},
+		{"short run inside the absolute floor", 137_000_000, 3 * second, true},
+		{"short run at the floor", 250_000_000, 3 * second, true},
+		{"short run above the floor", 250_000_001, 3 * second, false},
 		{"long run inside one percent", 900_000_000, 100 * second, true},
 		{"long run above one percent", 1_000_000_001, 100 * second, false},
 		{"zero-width window", 0, second, true},

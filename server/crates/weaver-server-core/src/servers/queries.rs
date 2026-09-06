@@ -1,6 +1,6 @@
 use crate::StateError;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::SqlRuntime;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::servers::{ServerConfig, ServerDownloadQuotaPeriod, record::ServerRecord};
 
 impl Database {
@@ -12,7 +12,7 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der
+                "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, pipelining_depth, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der
                    FROM servers ORDER BY priority, id",
                 &[],
             )
@@ -33,6 +33,9 @@ impl Database {
                         )?,
                         active: row.bool("active")?,
                         supports_pipelining: row.bool("supports_pipelining")?,
+                        pipelining_depth: row
+                            .opt_i64("pipelining_depth")?
+                            .and_then(|depth| u8::try_from(depth).ok()),
                         priority: u32_from_i64(row.i64("priority")?, "server priority")?,
                         backfill: row.bool("backfill")?,
                         retention_days: u32_from_i64(
@@ -100,6 +103,27 @@ impl Database {
             max.checked_add(1).ok_or_else(|| {
                 StateError::Database("no server IDs remain in the database range".to_string())
             })
+        })
+    }
+
+    /// Read just the proven BODY pipelining depth. The download runtime writes
+    /// this column behind the in-memory config, so an editor that wants to keep
+    /// it has to ask the database rather than the config it already holds.
+    pub fn server_pipelining_depth(&self, id: u32) -> Result<Option<u8>, StateError> {
+        let datastore = self.datastore();
+        let args = vec![SqlArg::I64(i64::from(id))];
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT pipelining_depth FROM servers WHERE id = {}",
+                &args,
+            )
+            .await?;
+            row.map(|row| row.opt_i64("pipelining_depth"))
+                .transpose()?
+                .flatten()
+                .map(|depth| u8_from_i64(depth, "server pipelining depth"))
+                .transpose()
         })
     }
 }

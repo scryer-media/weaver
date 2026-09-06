@@ -90,9 +90,9 @@ impl Pipeline {
             .min_by(|a, b| a.total_cmp(b))
             .or_else(|| {
                 self.download_lane_runtime
-                    .server_rtt
+                    .servers
                     .get(&key.server_idx)
-                    .and_then(|window| window.ewma())
+                    .and_then(|explorer| explorer.latency())
                     .map(|duration| duration.as_secs_f64() * 1000.0)
             })
     }

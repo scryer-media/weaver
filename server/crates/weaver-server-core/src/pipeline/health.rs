@@ -3,6 +3,49 @@ use super::*;
 const HEALTH_PROBE_REARM_MIN_BYTES: u64 = 128 * 1024 * 1024;
 const HEALTH_PROBE_REARM_PAYLOAD_DIVISOR: u64 = 200;
 
+/// How often an outstanding probe batch takes another look for a connection
+/// permit that has been parked on an idle download lane since it started
+/// waiting.
+///
+/// Short enough that a lane going idle unblocks the probe in the same breath,
+/// long enough that a batch which is simply doing its work — a STAT round trip
+/// is milliseconds — never triggers a sweep at all.
+pub(super) const PROBE_PERMIT_RECLAIM_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Drive a probe batch to completion, re-running `reclaim` every `interval`
+/// for as long as the batch is still outstanding.
+///
+/// A probe STAT queues behind the same per-server connection semaphore as the
+/// download lanes, and an owned lane that has run out of work keeps its
+/// connection — and its permit — cached until something parks it. Sweeping
+/// once before the batch is not enough: at activation the lanes are usually
+/// all still downloading, so that sweep finds nothing to reclaim, and the
+/// lanes fall idle a moment later with the STAT already queued behind the
+/// permits they are sitting on. Nobody sweeps again, and the batch waits out
+/// the client's entire soft timeout behind capacity nothing is using.
+///
+/// The batch future is polled to completion and never dropped, so this cannot
+/// abandon a connection mid-command, and a probe that really is capacity
+/// starved still ends exactly as it did before: the client's own acquire
+/// deadline expires, the batch comes back inconclusive, and no server is put
+/// into cooldown for what was our own queueing.
+pub(super) async fn drive_probe_batch_with_permit_reclaim<F>(
+    batch: F,
+    interval: Duration,
+    mut reclaim: impl FnMut(),
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::pin!(batch);
+    loop {
+        tokio::select! {
+            output = &mut batch => return output,
+            () = tokio::time::sleep(interval) => reclaim(),
+        }
+    }
+}
+
 impl Pipeline {
     fn health_tracked_bytes(total_bytes: u64, par2_bytes: u64) -> u64 {
         total_bytes.saturating_sub(par2_bytes)
@@ -702,13 +745,25 @@ impl Pipeline {
             for batch in probes.chunks(BATCH_SIZE) {
                 let msg_ids: Vec<&str> = batch.iter().map(|mid| mid.as_str()).collect();
 
-                for server_idx in 0..probe_server_count {
-                    if !nntp.has_available_permit(weaver_nntp::pool::ServerId(server_idx)) {
-                        owned_lane_release.release_idle_permit(server_idx);
+                let mut reclaim_idle_permits = || {
+                    for server_idx in 0..probe_server_count {
+                        if !nntp.has_available_permit(weaver_nntp::pool::ServerId(server_idx)) {
+                            owned_lane_release.release_idle_permit(server_idx);
+                        }
                     }
-                }
+                };
+                reclaim_idle_permits();
 
-                let results = nntp.confirm_exists_for_probe(&msg_ids).await;
+                // Keep looking while the batch is outstanding: the lanes that
+                // held every permit when the sweep above ran are exactly the
+                // ones about to finish and park with those permits still in
+                // hand.
+                let results = drive_probe_batch_with_permit_reclaim(
+                    nntp.confirm_exists_for_probe(&msg_ids),
+                    PROBE_PERMIT_RECLAIM_INTERVAL,
+                    &mut reclaim_idle_permits,
+                )
+                .await;
                 if results.inconclusive {
                     warn!("health probe: confirmation batch inconclusive, aborting probe");
                     let _ = probe_tx

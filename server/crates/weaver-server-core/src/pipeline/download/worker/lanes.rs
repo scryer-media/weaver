@@ -16,25 +16,31 @@ impl Pipeline {
             .insert(segment_id, estimate_bytes);
     }
 
-    pub(in crate::pipeline::download::worker) fn ensure_job_transport_profile(
-        &mut self,
-        job_id: JobId,
-    ) -> Option<&JobTransportProfile> {
-        if !self.job_transport_profiles.contains_key(&job_id) {
-            let profile = self
-                .jobs
-                .get(&job_id)
-                .map(|state| JobTransportProfile::classify(&state.spec))?;
-            self.job_transport_profiles.insert(job_id, profile);
+    /// The gauge that counts lanes running at this depth. Depths off the rung
+    /// ladder round down to the rung they behave like.
+    fn lane_depth_gauge(&self, mode: DownloadLaneMode) -> &std::sync::atomic::AtomicUsize {
+        match mode.depth() {
+            0 | 1 => &self.metrics.download_lanes_sequential_active,
+            2 | 3 => &self.metrics.download_lanes_depth2_active,
+            4..=7 => &self.metrics.download_lanes_depth4_active,
+            _ => &self.metrics.download_lanes_depth8_active,
         }
-        self.job_transport_profiles.get(&job_id)
+    }
+
+    /// Decrement a lane gauge without letting it wrap.
+    ///
+    /// The gauges are balanced by construction — every lane carries the mode it
+    /// was booked under and reports that mode back at each transition and at
+    /// park — but a gauge is a diagnostic, and a diagnostic that reads
+    /// `18446744073709551615` because one path lost a transition is worse than
+    /// one that reads zero.
+    fn release_lane_gauge(gauge: &std::sync::atomic::AtomicUsize) {
+        let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_sub(1))
+        });
     }
 
     pub(in crate::pipeline) fn note_download_lane_started(&mut self, mode: DownloadLaneMode) {
-        debug_assert_eq!(
-            DownloadLaneMode::PipelineDepth2.max_depth(),
-            SAB_BODY_PIPELINE_DEPTH
-        );
         debug!(mode = ?mode, "download lane started");
         self.metrics
             .download_lanes_active
@@ -42,20 +48,7 @@ impl Pipeline {
         self.metrics
             .download_lanes_issuing_active
             .fetch_add(1, Ordering::Relaxed);
-        match mode {
-            DownloadLaneMode::Sequential => self
-                .metrics
-                .download_lanes_sequential_active
-                .fetch_add(1, Ordering::Relaxed),
-            DownloadLaneMode::PipelineDepth2 => self
-                .metrics
-                .download_lanes_depth2_active
-                .fetch_add(1, Ordering::Relaxed),
-            DownloadLaneMode::PipelineDepth4 => self
-                .metrics
-                .download_lanes_depth4_active
-                .fetch_add(1, Ordering::Relaxed),
-        };
+        self.lane_depth_gauge(mode).fetch_add(1, Ordering::Relaxed);
     }
 
     pub(in crate::pipeline) fn note_download_lane_released(
@@ -63,26 +56,9 @@ impl Pipeline {
         mode: DownloadLaneMode,
         reason: LaneParkReason,
     ) {
-        self.metrics
-            .download_lanes_active
-            .fetch_sub(1, Ordering::Relaxed);
-        self.metrics
-            .download_lanes_issuing_active
-            .fetch_sub(1, Ordering::Relaxed);
-        match mode {
-            DownloadLaneMode::Sequential => self
-                .metrics
-                .download_lanes_sequential_active
-                .fetch_sub(1, Ordering::Relaxed),
-            DownloadLaneMode::PipelineDepth2 => self
-                .metrics
-                .download_lanes_depth2_active
-                .fetch_sub(1, Ordering::Relaxed),
-            DownloadLaneMode::PipelineDepth4 => self
-                .metrics
-                .download_lanes_depth4_active
-                .fetch_sub(1, Ordering::Relaxed),
-        };
+        Self::release_lane_gauge(&self.metrics.download_lanes_active);
+        Self::release_lane_gauge(&self.metrics.download_lanes_issuing_active);
+        Self::release_lane_gauge(self.lane_depth_gauge(mode));
         match reason {
             LaneParkReason::NoWork => self
                 .metrics
@@ -426,34 +402,53 @@ impl Pipeline {
             return;
         };
 
-        if let Some(rtt) = observation.rtt {
-            self.download_lane_runtime
-                .server_rtt
-                .entry(server_idx)
-                .or_default()
-                .note(rtt);
+        let now = Instant::now();
+        let pressure_clear = observation.pressure_clear;
+        // Seeding needs the persisted rung and the connection test's latency;
+        // both are cold-path lookups, so they only run for a server the lanes
+        // have not seen yet.
+        let seed = if self.download_lane_runtime.servers.contains_key(&server_idx) {
+            None
+        } else {
+            Some((
+                self.persisted_pipelining_depth(server_idx),
+                self.probe_latency(server_idx),
+            ))
+        };
+        let explorer = self
+            .download_lane_runtime
+            .servers
+            .entry(server_idx)
+            .or_insert_with(|| {
+                let (proven_depth, probe_latency) = seed.unwrap_or_default();
+                ServerPipelineExplorer::seeded(proven_depth, probe_latency)
+            });
+        explorer.note_supports_pipelining(observation.supports_pipelining);
+        if let Some(latency) = observation.latency {
+            explorer.note_latency(latency);
+        }
+        if let Some(transfer) = observation.transfer {
+            explorer.note_transfer(transfer);
         }
 
-        let proof = self
-            .download_lane_runtime
-            .server_proof
-            .entry(server_idx)
-            .or_default();
-        if observation.mode == DownloadLaneMode::Sequential {
-            proof.note_sequential_result(result.data.is_ok(), observation.supports_pipelining);
-        } else if observation.batch_complete {
-            let now = Instant::now();
-            let transition = proof.note_pipeline_batch(
+        let mut change = None;
+        if result.data.is_ok() {
+            change = explorer.note_response(
                 now,
-                observation.mode,
-                observation.batch_clean,
-                observation.batch_response_count,
+                observation.mode.depth(),
+                observation.payload_bytes,
+                observation.policy_elapsed,
+                pressure_clear,
             );
+        }
+
+        if observation.mode != DownloadLaneMode::Sequential && observation.batch_complete {
             if observation.batch_clean {
                 self.metrics
                     .download_pipeline_trial_success_total
                     .fetch_add(1, Ordering::Relaxed);
             } else {
+                change = explorer.note_unclean_batch(now).or(change);
                 self.metrics
                     .download_pipeline_trial_failure_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -463,20 +458,126 @@ impl Pipeline {
                     .download_pipeline_replay_items_total
                     .fetch_add(observation.unresolved_count, Ordering::Relaxed);
             }
-            if matches!(
-                transition,
-                Some(ServerPipelineState::PipelineProvenDepth2)
-                    | Some(ServerPipelineState::PipelineProvenDepth4)
-            ) {
+        }
+
+        let Some(change) = change else {
+            return;
+        };
+        let target = explorer.target_rung();
+        // A step up is still on trial, so it must not be written through: a
+        // restart would resume at a depth nothing has yet paid for. Every other
+        // outcome is a settled verdict, including the ones that lower the rung
+        // — a persisted depth that over-promises is the one worth correcting.
+        let persist_depth = if matches!(change, RungChange::Stepped { from, to } if to > from) {
+            None
+        } else {
+            explorer.take_persist_request()
+        };
+        match change {
+            RungChange::Stepped { from, to } => {
                 self.metrics
                     .download_pipeline_proof_pass_total
                     .fetch_add(1, Ordering::Relaxed);
-            } else if matches!(transition, Some(ServerPipelineState::PipelineBlocked)) {
+                info!(
+                    server = server_idx,
+                    from, to, target, "download pipeline depth stepped"
+                );
+            }
+            RungChange::Kept { depth } => {
+                self.metrics
+                    .download_pipeline_proof_pass_total
+                    .fetch_add(1, Ordering::Relaxed);
+                info!(server = server_idx, depth, "download pipeline depth kept");
+            }
+            RungChange::Reverted { from, to } => {
+                info!(
+                    server = server_idx,
+                    from, to, "download pipeline depth reverted; server held"
+                );
+            }
+            RungChange::Dropped { from, to } => {
                 self.metrics
                     .download_pipeline_cooldown_total
                     .fetch_add(1, Ordering::Relaxed);
+                info!(
+                    server = server_idx,
+                    from, to, "download pipeline batch was unclean; depth dropped"
+                );
+            }
+            RungChange::PinnedSequential => {
+                self.metrics
+                    .download_pipeline_cooldown_total
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    server = server_idx,
+                    "second unclean pipelined batch; server pinned to sequential BODY fetches"
+                );
             }
         }
+        if let Some(depth) = persist_depth {
+            self.persist_pipelining_depth(server_idx, depth);
+        }
+    }
+
+    /// Write a proven rung back to the servers table so the next start does not
+    /// have to rediscover it.
+    fn persist_pipelining_depth(&self, server_idx: usize, depth: u8) {
+        let Some(stable_id) = self
+            .nntp
+            .pool()
+            .stable_server_id(weaver_nntp::pool::ServerId(server_idx))
+        else {
+            return;
+        };
+        self.db_fire_and_forget(move |db| {
+            if let Err(error) = db.update_server_pipelining_depth(stable_id.0, Some(depth)) {
+                warn!(error = %error, server = stable_id.0, depth, "failed to persist proven pipelining depth");
+            }
+        });
+    }
+
+    /// Hand the control plane what the lanes have learned about each server's
+    /// BODY transport. Called on the tuning tick, never per response.
+    pub(in crate::pipeline) fn publish_download_transport_health(&self) {
+        let mut health: Vec<crate::ServerTransportHealth> = self
+            .download_lane_runtime
+            .servers
+            .iter()
+            .map(|(server_idx, explorer)| crate::ServerTransportHealth {
+                server_idx: *server_idx,
+                latency_ms: explorer
+                    .latency()
+                    .map(|latency| latency.as_secs_f64() * 1000.0),
+                transfer_ms: explorer
+                    .transfer()
+                    .map(|transfer| transfer.as_secs_f64() * 1000.0),
+                latency_band: explorer.latency_band().map(|band| band.label().to_string()),
+                pipeline_depth: u32::from(explorer.current_depth()),
+                pinned_sequential: explorer.pinned_sequential(),
+            })
+            .collect();
+        health.sort_unstable_by_key(|entry| entry.server_idx);
+        self.shared_state.set_download_transport_health(health);
+    }
+
+    /// The rung a previous run proved for this server, as loaded into the
+    /// pool's server configuration.
+    fn persisted_pipelining_depth(&self, server_idx: usize) -> Option<u8> {
+        self.nntp
+            .pool()
+            .server_configs()
+            .get(server_idx)
+            .and_then(|config| config.pipelining_depth)
+    }
+
+    /// First-byte latency the most recent connection test measured for this
+    /// server, if one ran since the process started.
+    fn probe_latency(&self, server_idx: usize) -> Option<Duration> {
+        let stable_id = self
+            .nntp
+            .pool()
+            .stable_server_id(weaver_nntp::pool::ServerId(server_idx))?;
+        self.shared_state.server_probe_latency(stable_id.0)
     }
 
     pub(in crate::pipeline::download::worker) fn should_use_owned_blocking_lane(
@@ -513,30 +614,15 @@ impl Pipeline {
         is_recovery: bool,
         pressure: DownloadPressure,
     ) -> DownloadLaneMode {
+        let _ = job_id;
         if is_recovery {
             return DownloadLaneMode::Sequential;
         }
-
-        let Some(profile) = self.ensure_job_transport_profile(job_id) else {
-            return DownloadLaneMode::Sequential;
-        };
-        let job_class = profile.class();
-        let median_body_bytes = profile.median_body_bytes();
         let pressure_clear = pressure.state == DownloadPressureState::Clear;
-        let now = Instant::now();
         self.download_lane_runtime
-            .server_proof
-            .iter()
-            .map(|(server_idx, proof)| {
-                self.choose_download_lane_mode_for_server(
-                    now,
-                    *server_idx,
-                    proof,
-                    job_class,
-                    median_body_bytes,
-                    pressure_clear,
-                )
-            })
+            .servers
+            .values()
+            .map(|explorer| explorer.choose_mode(pressure_clear))
             .max_by_key(|mode| mode.max_depth())
             .unwrap_or(DownloadLaneMode::Sequential)
     }
@@ -547,53 +633,19 @@ impl Pipeline {
         is_recovery: bool,
         pressure: DownloadPressure,
     ) -> Vec<(usize, DownloadLaneMode)> {
+        let _ = job_id;
         if is_recovery {
             return Vec::new();
         }
-        let Some(profile) = self.ensure_job_transport_profile(job_id) else {
-            return Vec::new();
-        };
-        let job_class = profile.class();
-        let median_body_bytes = profile.median_body_bytes();
         let pressure_clear = pressure.state == DownloadPressureState::Clear;
-        let now = Instant::now();
         self.download_lane_runtime
-            .server_proof
+            .servers
             .iter()
-            .map(|(server_idx, proof)| {
-                (
-                    *server_idx,
-                    self.choose_download_lane_mode_for_server(
-                        now,
-                        *server_idx,
-                        proof,
-                        job_class,
-                        median_body_bytes,
-                        pressure_clear,
-                    ),
-                )
-            })
+            .map(|(server_idx, explorer)| (*server_idx, explorer.choose_mode(pressure_clear)))
             .collect()
     }
 
-    pub(in crate::pipeline::download::worker) fn choose_download_lane_mode_for_server(
-        &self,
-        now: Instant,
-        server_idx: usize,
-        proof: &ServerPipelineProof,
-        job_class: JobTransportClass,
-        median_body_bytes: u64,
-        pressure_clear: bool,
-    ) -> DownloadLaneMode {
-        let rtt = self
-            .download_lane_runtime
-            .server_rtt
-            .get(&server_idx)
-            .and_then(|window| window.ewma());
-        proof.choose_mode(now, job_class, median_body_bytes, rtt, pressure_clear)
-    }
-
-    pub(in crate::pipeline::download::worker) fn note_download_lane_mode_changed(
+    pub(in crate::pipeline) fn note_download_lane_mode_changed(
         &mut self,
         previous: DownloadLaneMode,
         next: DownloadLaneMode,
@@ -612,34 +664,8 @@ impl Pipeline {
             );
         }
 
-        match previous {
-            DownloadLaneMode::Sequential => self
-                .metrics
-                .download_lanes_sequential_active
-                .fetch_sub(1, Ordering::Relaxed),
-            DownloadLaneMode::PipelineDepth2 => self
-                .metrics
-                .download_lanes_depth2_active
-                .fetch_sub(1, Ordering::Relaxed),
-            DownloadLaneMode::PipelineDepth4 => self
-                .metrics
-                .download_lanes_depth4_active
-                .fetch_sub(1, Ordering::Relaxed),
-        };
-        match next {
-            DownloadLaneMode::Sequential => self
-                .metrics
-                .download_lanes_sequential_active
-                .fetch_add(1, Ordering::Relaxed),
-            DownloadLaneMode::PipelineDepth2 => self
-                .metrics
-                .download_lanes_depth2_active
-                .fetch_add(1, Ordering::Relaxed),
-            DownloadLaneMode::PipelineDepth4 => self
-                .metrics
-                .download_lanes_depth4_active
-                .fetch_add(1, Ordering::Relaxed),
-        };
+        Self::release_lane_gauge(self.lane_depth_gauge(previous));
+        self.lane_depth_gauge(next).fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn handle_owned_download_lane_event(
@@ -709,7 +735,9 @@ impl Pipeline {
                 // backpressure, not completion of per-result ingest. Holding
                 // the ack through ingest serialized every lane behind this
                 // loop at batch boundaries and stalled all downloads at once.
-                let _ = ack.send(());
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
                 crate::runtime::perf_probe::record_value(
                     "download.owned_lane.batch.results",
                     results.len() as u64,
@@ -801,8 +829,26 @@ impl Pipeline {
         self.publish_hot_dispatch_metrics(Instant::now());
     }
 
+    /// Whether a lane park has left the run loop owing a dispatch pass, and
+    /// clears the debt. Consumed by the run loop and by `dispatch_downloads`
+    /// itself, so a pass that has already run cannot be asked for twice.
+    pub(crate) fn take_download_dispatch_wake(&mut self) -> bool {
+        std::mem::take(&mut self.download_dispatch_wake)
+    }
+
     pub(crate) fn handle_download_lane_parked(&mut self, parked: DownloadLaneParked) {
+        debug!(
+            job_id = parked.job_id.0,
+            mode = ?parked.mode,
+            reason = ?parked.reason,
+            completion_critical = parked.completion_critical,
+            released_connection = parked.release_connection_slot,
+            "download lane parked"
+        );
         if parked.release_connection_slot {
+            // The connection is back in the pool now, not at the next turn of
+            // the run loop.
+            self.download_dispatch_wake = true;
             self.note_download_lane_released(parked.mode, parked.reason);
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
             if let Some(kind) = parked.spillover_loan_kind {

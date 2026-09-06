@@ -63,14 +63,15 @@ The Docker-only smoke path, end to end:
 
 ```bash
 # 1. Two fixtures: one clean RAR5 case and one raw-MKV case for the queue benchmark.
-go run ./cmd/fixturegen --fixture rar5-7-headers-normal-solid-headers-compressible --output /scratch/fixtures
+go run ./cmd/fixturegen --fixture rar5-7-store-store-nonsolid-none-incompressible --output /scratch/fixtures
 go run ./cmd/fixturegen --direct-mkv --output /scratch/fixtures
 
 # 2. Build the pinned NNTP server image from the published module.
 go run ./cmd/nntpbench image build --version v0.1.0 --tag e2e-nntp:local \
   --provenance /scratch/runs/nntp-image-provenance.json
 
-# 3. Bring up server + shaper at a declared link rate; keep the test CA.
+# 3. Bring up server + shaper at a declared link rate; keep the test CA. (A
+#    provider-distance round trip is a separate small sweep, see "Fixed round trip".)
 openssl rand -hex 24 > /scratch/runs/nntp-password
 go run ./cmd/nntpbench server-env --server-link 1gbit --output /scratch/runs/server-1gbit.env
 NNTP_BENCH_PASSWORD_FILE=/scratch/runs/nntp-password docker compose -p nntp-bench \
@@ -80,13 +81,13 @@ NNTP_BENCH_PASSWORD_FILE=/scratch/runs/nntp-password docker compose -p nntp-benc
   cp nntp:/certs/ca.pem /scratch/runs/nntp-ca.pem
 
 # 4. Post the fixture over the private upstream network (never through the shaper).
-go run ./cmd/nntpbench seed --fixture-dir /scratch/fixtures/rar5-7-headers-normal-solid-headers-compressible \
+go run ./cmd/nntpbench seed --fixture-dir /scratch/fixtures/rar5-7-store-store-nonsolid-none-incompressible \
   --run-id smoke-1 --network nntp-bench_nntp_upstream --nntp-host nntp-upstream \
   --username fixture-user --password-file /scratch/runs/nntp-password
 
 # 5. Plan, 6. run, 7. summarize.
-go run ./cmd/nntpbench plan --fixtures rar5-7-headers-normal-solid-headers-compressible \
-  --archive-toolchains vanilla --profile stock --server-link 1gbit --repetitions 20 --seed 1 \
+go run ./cmd/nntpbench plan --fixtures rar5-7-store-store-nonsolid-none-incompressible \
+  --archive-toolchains vanilla --profile equivalent-throughput --server-link 1gbit --repetitions 20 --seed 1 \
   --targets docker-linux --output /scratch/runs/plan.json
 go build -o /scratch/bin/clientadapter ./cmd/clientadapter
 cp configs/adapters.example.json /scratch/runs/adapters.json   # set the adapter path + network name
@@ -120,9 +121,36 @@ lists every subcommand; `-h` on any of them prints its options.
 
 ## The fixture matrix
 
-The corpus is a compatibility and repair coverage set, not a model of what is
-posted to Usenet. Ordinary cases contain one 150 MiB synthetic video file split
-into 32 MiB archive volumes; one multi-input case contains four 48 MiB videos.
+Every set in `fixtures/matrix.json` declares a `class`, and the class travels
+from the matrix through each fixture's manifest into every run artifact and the
+summary:
+
+| Class | What it stands for | Sets |
+| --- | --- | --- |
+| `headline` | The common shape of a real post: a stored (`-m0`), multi-volume RAR of already-compressed media. One clean set per source-locked RARLAB writer era (3.93, 4.20, 5.00, 6.24, 7.23), each posted clear, with encrypted headers (`-hp`) and with data-only encryption (`-p`), because most real posts are not encrypted and the encrypted forms are measured beside the clear one, never instead of it. PAR2 repair is part of the common case too: the stored form from the 4.20, 5.00 and 7.23 writers is posted in the same three forms with light damage (`par2-light`) and with an interior volume listed in the NZB but never posted (`par2-heavy-withheld`). | 8 sets, 33 fixtures |
+| `breadth` | Shapes a client meets less often and must still handle: a four-movie stored set with RAR5 quick-open records, the official 7-Zip 7z container, a stored Blu-ray-shaped topology in scattered NZB order, PAR2 over 7z, and RAR recovery volumes. RAR compression is deliberately absent: already-compressed media is not recompressed in the wild, so a compressed lane would measure a shape nobody posts. | 7 sets, 7 fixtures |
+
+The summarizer pools per-fixture results only within a class (see
+[Summarize](#7-summarize)); the headline aggregate is the figure for the common
+case and the breadth aggregate is the compatibility figure. Fixture counts
+inside a class are coverage choices, not a model of what is posted to Usenet:
+the corpus does not claim a population distribution, and that is why the two
+classes are never pooled with each other. Every fixture posts at least 100 MiB
+of archive; the
+generator refuses to write a smaller one and the controller refuses to run it,
+because a smaller download finishes inside the clients' start-up and settle
+time and the comparison would measure process launch rather than the
+pipeline. Ordinary incompressible cases contain one 150 MiB synthetic video
+file split into 32 MiB archive volumes (the withheld-volume sets post one
+volume fewer than they list, which is what the floor's headroom is for); the
+multi-input cases contain four 40 MiB videos. Compressible cases contain one
+270 MiB raw-video file carrying
+four bits of deterministic per-sample noise (recorded in the manifest as
+`sample_noise_bits`), which the pinned writers compress to roughly 62 %
+(LZMA2) to 70 % (RAR -m5) of its size — so the compression lanes still
+compress, and the archive still clears the floor. The floor is enforced on the
+posted bytes, so a repair fixture's PAR2 volumes count and its withheld
+volume does not.
 Together they cover the RARLAB writer eras and their archive families across:
 
 | Axis | Values |
@@ -134,7 +162,12 @@ Together they cover the RARLAB writer eras and their archive families across:
 | Encryption | none, data encryption, encrypted headers |
 | Input data | incompressible, moderately compressible |
 
-That yields 18 clean RAR fixtures. `writer_era` is deliberately separate from
+That yields 16 clean RAR fixtures: the 15 headline stored lanes (five writer
+eras, each clear, header-encrypted and data-encrypted) and the four-movie
+quick-open set. Every RAR lane is stored: the generator still writes
+release-style `-m5` compression and the compressible payload, but the
+checked-in matrix uses neither, because already-compressed media is not
+recompressed in the wild. `writer_era` is deliberately separate from
 `archive_format`: RAR 6 and 7 are writer releases, not new on-disk formats.
 
 ### The 7z lane
@@ -142,8 +175,9 @@ That yields 18 clean RAR fixtures. `writer_era` is deliberately separate from
 `archive_format` also takes `7z`, written by the official 7-Zip console build
 (see [Pinned 7-Zip writer](#pinned-7-zip-writer)). A set that uses it names the
 writer with `archive_writer`; `generator_toolchain` still names the RARLAB
-image, which supplies the FFmpeg payload renderer for every lane. Three clean
-7z fixtures and two 7z repair fixtures are in the corpus:
+image, which supplies the FFmpeg payload renderer for every lane. Two clean
+7z fixtures (stored, and stored with encrypted headers) and one 7z repair
+fixture are in the corpus, all breadth:
 
 | Axis | 7z values |
 | --- | --- |
@@ -165,13 +199,12 @@ oracle.
 
 ### The Blu-ray disc topology
 
-Two `bluray-disc` fixtures exercise a disc-shaped topology in non-solid RAR5,
-one stored and one normally compressed: a 5 GiB `BDMV/STREAM/00000.m2ts`, eight
-96 MiB menu/extra streams, four small menu streams and 508 tiny metadata
-members, split into 50 MiB volumes and posted in `scattered` NZB order. The
-store and normal pair is the point: a stored disc archive is byte-identical to
-its members on the wire, a compressed one is not, and the two make that
-difference measurable on the same topology.
+One `bluray-disc` fixture exercises a disc-shaped topology in stored,
+non-solid RAR5: a 5 GiB `BDMV/STREAM/00000.m2ts`, eight 96 MiB menu/extra
+streams, four small menu streams and 508 tiny metadata members, split into
+50 MiB volumes and posted in `scattered` NZB order. It is stored because disc
+dumps are posted stored; the topology — one huge member beside hundreds of tiny
+ones, arriving out of order — is what it measures.
 
 `--bluray-large-file-bytes`, `--bluray-medium-file-bytes`,
 `--bluray-medium-file-count`, `--bluray-small-file-count` and
@@ -183,8 +216,14 @@ Blu-ray image and not a claim about typical posts.
 
 ### Repair profiles
 
-Nine repair fixtures add deterministic damage without duplicating the clean
-cases:
+Six repair sets add deterministic damage without duplicating the clean
+cases. Three are headline: PAR2 over the stored RAR from the 4.20, 5.00 and
+7.23 writers, each posted clear, with encrypted headers and with data
+encryption, under light damage and with the volume withheld, because a repair
+is part of what a real post costs. The other three are breadth: RAR4 and RAR5
+recovery volumes, and 7z PAR2 light. `par2-heavy` stays defined for a set
+that wants the volume missing from the NZB itself; the checked-in matrix uses
+the withheld form, which is what an incomplete post looks like on a server:
 
 | Profile | Posted repair material | Deliberate fault |
 | --- | --- | --- |
@@ -293,8 +332,8 @@ invocation.
 ```bash
 go run ./cmd/fixturegen --list
 
-# One benchmark-sized movie case (150 MiB payload by default).
-go run ./cmd/fixturegen --fixture rar5-7-headers-normal-solid-headers-compressible --output /scratch/fixtures
+# One benchmark-sized movie case (270 MiB compressible payload by default; incompressible cases use 150 MiB).
+go run ./cmd/fixturegen --fixture rar5-7-store-store-nonsolid-none-incompressible --output /scratch/fixtures
 
 # A 7z case, written by the pinned official 7-Zip build.
 go run ./cmd/fixturegen --fixture sevenzip-store-store-nonsolid-none-incompressible --output /scratch/fixtures
@@ -370,6 +409,105 @@ requires both values. The link profile is persisted in the plan, every run and
 every result. The server sits on a private upstream network; clients resolve
 `nntp` to the shaper on the benchmark network.
 
+The server advertises RFC 4644 `PIPELINING` in its `CAPABILITIES` reply, as
+commercial providers do (`NNTP_BENCH_PIPELINING=0` at `compose up` silences
+it, which is a diagnostic, never a published configuration). The keyword
+matters because the clients treat it differently: Weaver pipelines `BODY`
+requests only against a server that advertises it and picks the depth from
+the measured round trip, SABnzbd 5 sends the two requests per connection its
+own new-server default declares, and NZBGet sends one request per connection.
+A server that stays silent therefore benches every client one article per
+round trip and hides exactly the difference a shaped round trip exists to
+show. The Weaver adapters seed the server's pipelining flag from the
+environment (`WEAVER_SERVER_1_PIPELINING=true`, Weaver 0.10.3 or newer),
+because an environment-seeded server is never probed the way a server added
+through Weaver's UI is.
+
+#### Fixed round trip
+
+The rate cap alone is a link with no distance: a client that opens one
+connection per article, or waits for each reply before sending the next
+command, pays nothing for it on the loopback path. `--server-rtt` (on
+`server-env` and `plan` alike) declares a fixed client<->server round trip
+that the shaper container renders with `tc netem` on its benchmark-facing
+interface — half the round trip per direction, zero jitter — so a client's
+connection setup, TLS handshake, command pipelining and per-connection window
+all cost what they cost against a real provider. The value is a whole number
+of milliseconds between 1 ms and 5 s; 0 (the default) adds no delay and
+touches no qdisc, so a plan without the flag is byte-for-byte what it was
+apart from the new `rtt_micros` field.
+
+The round trip is not the headline. The published comparison is the full
+fixture matrix at 0 ms, where the link, the decoder, the archive and the
+repair are what differ between clients; a delayed link mostly measures how
+many requests each client keeps in flight per connection, and it costs a
+multiple of the loopback wall clock per run. So the round trip is a **small
+sweep over a few fixtures**: one raw-MKV, one clean RAR, one light PAR2
+repair and one heavy withheld PAR2 repair, at 50, 100 and 250 ms, TLS only,
+five repetitions each. The round trip is part of the stratum, so every
+point of the sweep is its own comparison, never pooled with the 0 ms matrix
+or with another round trip; read the sweep as a curve of the ratio against
+the round trip, alongside the 0 ms matrix as its origin. The 0 ms point of
+the same four fixtures comes from the headline matrix, not from a fourth
+sweep step. Each step restarts only the shaper (the server keeps its corpus
+and its CA) and writes its own plan and artifact root:
+
+```bash
+SWEEP_FIXTURES=direct-mkv,rar5-7-store-store-nonsolid-none-incompressible,\
+repair-rar5-7-store-par2-par2-light-store-nonsolid-none-incompressible,\
+repair-rar5-7-store-par2-par2-heavy-withheld-store-nonsolid-none-incompressible
+for rtt in 50ms 100ms 250ms; do
+  go run ./cmd/nntpbench server-env --server-link 1gbit --server-rtt $rtt \
+    --output /scratch/runs/server-1gbit-$rtt.env
+  NNTP_BENCH_PASSWORD_FILE=/scratch/runs/nntp-password docker compose -p nntp-bench \
+    --env-file /scratch/runs/server-1gbit-$rtt.env -f configs/server/compose-shaper.example.yml \
+    up -d nntp-shaper
+  go run ./cmd/nntpbench plan --fixtures $SWEEP_FIXTURES --transports tls \
+    --archive-toolchains vanilla --profile equivalent-throughput \
+    --server-link 1gbit --server-rtt $rtt --repetitions 5 --seed 20260802 \
+    --targets docker-linux --output /scratch/runs/plan-rtt-$rtt.json
+  go run ./cmd/nntpbench sequential --plan /scratch/runs/plan-rtt-$rtt.json \
+    --adapters /scratch/runs/adapters.json --target docker-linux \
+    --fixtures-root /scratch/fixtures --artifacts /scratch/runs/artifacts-rtt-$rtt \
+    --nntp-host nntp --shaper-control-url http://127.0.0.1:8080 \
+    --tls-ca-file /scratch/runs/nntp-ca.pem \
+    --username fixture-user --password-file /scratch/runs/nntp-password
+done
+```
+
+Restore the 0 ms shaper (`up -d nntp-shaper` with the plain link env file)
+before the next headline run; the controller refuses a plan whose declared
+round trip disagrees with the shaper's attestation, so a stale shaper fails
+loudly rather than quietly shifting a stratum.
+
+The env file carries `NNTP_RTT_MICROS`; the Compose service needs
+`cap_add: [NET_ADMIN]` (already in the example topology) so the entrypoint
+can program its own network namespace. The client-to-server half is delayed
+on an `ifb` mirror of the interface; where the host kernel has no `ifb`
+module (Docker Desktop, some minimal servers — `modprobe ifb` on a Linux bench
+host) the entrypoint carries the whole round trip on the server-to-client
+side instead, which keeps the sender-observed round trip exact but delivers
+the client's commands and handshakes undelayed. Which layout ran is recorded,
+not assumed: the shaper attests `link_shaping` (schema 4) with the interface,
+the ingress mechanism (`ifb-netem` or `none`), the declared per-direction
+split, the netem queue limit (sized from the rate and round trip so the
+bandwidth-delay product never overflows it) and, re-read from `tc` for every
+snapshot, the delays the qdiscs actually carry. The controller refuses a run
+whose report disagrees with the plan, whose live delays drifted, or whose
+shaper predates the schema; the summarizer applies the same checks to the
+persisted before/after snapshots, and the run environment carries
+`BENCH_SERVER_RTT_MICROS` so each adapter's rendered-config identity includes
+it.
+
+A delayed link also needs a send buffer that covers its bandwidth-delay
+product, or the shaper's own kernel — not the declared link — caps every
+connection at buffer / RTT. The example topology raises the shaper's
+namespace-scoped `net.ipv4.tcp_wmem` and `tcp_rmem` ceilings to 128 MiB for
+that reason, and the values in force are recorded in the attestation. The
+clients keep their kernel defaults, as a client machine in the field would;
+the per-connection ceiling that implies is one of the things the round trip
+is there to measure.
+
 For every shaped run the controller takes a random exclusive execution lease
 on the shaper and captures strict control-plane snapshots before and after the
 client: configured rate and burst, executable digest, lease identity, counter
@@ -392,7 +530,13 @@ Downstream bytes are what the shaper wrote into the client's sockets —
 application bytes, not wire bytes — so a client whose bytes exceed the NZB's
 article bytes either asked for articles twice (repeats > 0) or read past what
 it asked for (repeats = 0). A schema-2 shaper carries no census and the field
-is absent.
+is absent; a schema-2 or schema-3 shaper cannot render a round trip and is
+refused for any plan that declares one. The census reads only the plaintext
+listener: the TLS listener relays ciphertext the shaper cannot parse, so TLS
+strata carry a zero census and the transfer-evidence table cannot separate
+repeats from over-reading there. Verb keys are bounded to alphanumeric tokens
+(anything else tallies under `NONVERB`), so a long chain of runs cannot grow
+the snapshot without limit.
 
 By default the topology publishes the shaper only on `127.0.0.1`. For a remote
 native lane set `NNTP_PUBLIC_BIND_ADDR` to a specific LAN address, firewall it
@@ -409,7 +553,7 @@ never crosses the shaper:
 
 ```bash
 go run ./cmd/nntpbench seed \
-  --fixture-dir /scratch/fixtures/rar5-7-headers-normal-solid-headers-compressible \
+  --fixture-dir /scratch/fixtures/rar5-7-store-store-nonsolid-none-incompressible \
   --run-id 2026-08-02-a \
   --network nntp-bench_nntp_upstream --nntp-host nntp-upstream \
   --username "${NNTP_BENCH_USERNAME:-fixture-user}" --password-file "$NNTP_BENCH_PASSWORD_FILE"
@@ -427,8 +571,8 @@ Reposting an unchanged corpus every time is pure overhead. See
 
 ```bash
 go run ./cmd/nntpbench plan \
-  --fixtures rar5-7-headers-normal-solid-headers-compressible,rar4-store-store-nonsolid-none-incompressible \
-  --archive-toolchains vanilla --profile stock --server-link 10gbit \
+  --fixtures rar5-7-store-store-nonsolid-none-incompressible,rar4-store-store-nonsolid-none-incompressible \
+  --archive-toolchains vanilla --profile equivalent-throughput --server-link 10gbit \
   --repetitions 20 --seed 20260802 --output /scratch/runs/plan.json
 ```
 
@@ -444,13 +588,19 @@ profiles keep the full client-by-packaging matrix for every
 | SABnzbd | digest-pinned image, public API | native distributable, public API | native distributable, public API |
 | NZBGet | digest-pinned image, JSON-RPC | native executable, JSON-RPC | native executable, JSON-RPC |
 
-`--profile stock` and `--profile equivalent-throughput` are reported
-separately; neither is a fallback for the other. The profiles differ only for
-SABnzbd (`direct_unpack`) and NZBGet (`DirectWrite` + `DirectUnpack`); Weaver
-is rendered with `WEAVER_DIRECT_UNPACK=on` in both, because that is its
-shipping default and the benchmark measures the product as shipped, so the
-Weaver column is the same run configuration under either profile. One
-Weaver default is deliberately overridden in both renders:
+The published suite runs `--profile equivalent-throughput` only: SABnzbd
+and NZBGet are compared at their best, with direct unpack on, rather than at
+their shipping defaults. `--profile stock` remains a valid plan for a
+diagnostic and is reported separately when it is run; neither profile is a
+fallback for the other. The profiles differ only for
+SABnzbd (`direct_unpack`) and NZBGet (`DirectUnpack`); NZBGet's `DirectWrite`
+is its shipping default and independent of direct unpack, so it stays `yes`
+in both. Weaver is rendered with `WEAVER_DIRECT_UNPACK=on` and
+`WEAVER_CLEANUP_AFTER_EXTRACT=true` in both, because those are its shipping
+defaults and the benchmark measures the product as shipped (every client
+deletes its archive volumes after a successful unpack), so the Weaver column
+is the same run configuration under either profile. One Weaver default is
+deliberately overridden in both renders:
 `WEAVER_PROPAGATION_DELAY_SECS=0`. Weaver holds a post whose NZB is under
 five minutes old before downloading it; SABnzbd and NZBGet ship with that
 delay at zero, and every benchmark NZB is freshly posted by construction, so
@@ -464,7 +614,10 @@ carries all three targets and each host runs only its own.
 `--storage-profile` and `--nfs-link` add the storage stratum described in
 [Storage profiles](#storage-profiles-local-vs-throttled-nfs); the default is
 `local` and a default plan is byte-for-byte what it was apart from the new
-`storage_profile` field.
+`storage_profile` field. `--server-rtt` declares the fixed round trip the
+shaper adds (see [Fixed round trip](#fixed-round-trip)); it must match the
+`server-env` the shaper was started with, and the plan's `server_link`
+carries it as `rtt_micros`.
 
 `--exclude-client client:fixture-id:reason` (repeatable) leaves one client out
 of one fixture's blocks, with the reason persisted in the plan under
@@ -526,21 +679,26 @@ exactly like a client-reported failure, so a client that hangs on a fixture
 becomes a result rather than a stalled pass. The native lane reports the same
 condition as the run's error.
 
-`CLIENT_POLL_INTERVAL` / `NATIVE_POLL_INTERVAL` default to `10ms`. The width
-of the window in which the terminal state was observed — from the last poll
-that still saw the job running to the poll that saw it finished — is recorded
-in every artifact as `terminal_observation_uncertainty_nanoseconds`. A run is
-excluded when that window exceeds 1 % of its submission-to-terminal duration
-or 100 ms, whichever is larger. The absolute allowance exists because the
-window is set by how long the client's own status API takes to answer one
-poll, not by the fixture: on a 1 Gbit link a 150 MiB fixture finishes in about
-three seconds, and a 1 % bound alone would then reject every run of a client
-whose API answers in 40 ms while admitting one that answers in 10 ms — a
-selection bias against the slower API, not a precision gain.
+`CLIENT_POLL_INTERVAL` / `NATIVE_POLL_INTERVAL` default to `100ms`. Every
+client's own completion stamp is an integer second (SABnzbd's history
+`completed`, NZBGet's `HistoryTime`), so the controller's external poll is
+the one neutral clock, and at 100 ms it costs each client the same ten status
+calls a second — a load that is noise against a 100 MiB-plus download. The
+width of the window in which the terminal state was observed — from the last
+poll that still saw the job running to the poll that saw it finished — is
+recorded in every artifact as `terminal_observation_uncertainty_nanoseconds`.
+A run is excluded when that window exceeds 1 % of its submission-to-terminal
+duration or 250 ms, whichever is larger. The absolute allowance exists
+because the window is one poll interval plus how long the client's own status
+API takes to answer, not a property of the fixture: a 1 % bound alone would
+reject every short run of a client whose API answers in 40 ms while admitting
+one that answers in 10 ms — a selection bias against the slower API, not a
+precision gain — while a window wider than 250 ms marks a poll the controller
+missed and still fails the run.
 
 Two other modes exist and are labelled apart from the headline:
 
-- `queue-transition` — generate and seed `direct-mkv-200mb`, plan **only** that
+- `queue-transition` — generate and seed `direct-mkv`, plan **only** that
   fixture, and measure first-submission-to-last-verified-output wall clock
   across forced duplicates: the plan's `--repetitions` is the number of copies
   queued per client lane (at least 2; the original design point was 20). It
@@ -554,7 +712,7 @@ Independent output verification is also available on its own:
 
 ```bash
 go run ./cmd/nntpbench verify-output \
-  --fixture-dir /scratch/fixtures/rar5-7-headers-normal-solid-headers-compressible \
+  --fixture-dir /scratch/fixtures/rar5-7-store-store-nonsolid-none-incompressible \
   --output-dir /scratch/runs/run-0001/complete
 ```
 
@@ -606,10 +764,27 @@ run. A client the plan excluded on a fixture (`--exclude-client`) is counted
 the same way, as not finishing every block, with the plan's reason reported
 under `client_exclusions`. When the failures leave a stratum with fewer than
 the minimum paired blocks, that stratum keeps its counts and its comparison is
-withheld with a stated reason. A harness-side `failed` suite, a missing or unverified run, an
+withheld with a stated reason.
+
+Above the strata, `aggregates` pools the per-fixture comparisons by fixture
+class: one entry per class and non-fixture stratum (profile, target,
+transport, toolchain, server link, storage profile). Every fixture carries
+equal weight — its paired log ratios are averaged first and the fixture means
+second — so a fixture that ran more blocks does not count for more, and the
+bootstrap resamples blocks within each fixture with the fixture set held
+fixed, because the corpus is a declared set and not a sample. The `headline`
+aggregate is the figure for the common case and the `breadth` aggregate the
+compatibility figure; they are never pooled with each other. A class figure is
+withheld, naming the fixtures, whenever any fixture of the class had its own
+comparison withheld: a client that could not finish a fixture of the class
+does not get a class figure over the fixtures it did finish. An artifact whose
+job carries no `fixture_class` was run over a corpus that predates the classes
+and fails the summary closed.
+
+A harness-side `failed` suite, a missing or unverified run, an
 incomplete pair with no recorded failure, fewer than 20 paired blocks for any
 other reason, or terminal-observation uncertainty above its limit (1 % of the
-run or 100 ms, whichever is larger) still fails the summary closed.
+run or 250 ms, whichever is larger) still fails the summary closed.
 So does an artifact root that mixes storage profiles: a local run and an NFS
 run answer different questions and are summarized separately, never pooled.
 
@@ -796,6 +971,16 @@ hop. `local` is the default and the published headline.
 | `nfs-complete` | host disk | throttled NFS export |
 | `nfs-all` | throttled NFS export | throttled NFS export |
 
+Under `local` the Docker lane binds ONE host directory at `/downloads`, so
+`/downloads/incomplete` and `/downloads/complete` are two directories on the
+same filesystem and every client's final move is a rename, as on a real
+single-disk install. (Two separate binds would be two mounts: `rename(2)`
+fails with `EXDEV` and each client falls back to copying its whole extracted
+output, a write no user's machine performs.) The `nfs-*` profiles are the
+opposite by design: the completion directory is a volume on the export, so
+the final move is the copy across the network that those profiles exist to
+measure.
+
 An `nfs-*` profile must name its link with `--nfs-link`. The named links are
 fixed and never change silently:
 
@@ -830,7 +1015,7 @@ docker compose --env-file /scratch/runs/storage.env \
 GOOS=linux GOARCH=amd64 go build -o /scratch/bin/nntpbench-linux ./cmd/nntpbench
 
 go run ./cmd/nntpbench plan \
-  --fixtures rar5-7-headers-normal-solid-headers-compressible \
+  --fixtures rar5-7-store-store-nonsolid-none-incompressible \
   --targets docker-linux --storage-profile nfs-complete --nfs-link nas-1gbit \
   --repetitions 20 --seed 20260802 --output /scratch/runs/plan-nfs.json
 
@@ -1006,6 +1191,12 @@ Per run the artifact records:
   stratum, not an annotation: `local` and `nfs-*` results are never pooled, and
   an NFS artifact without a valid `storage_attestation` is refused by the
   summarizer.
+- `server_link` — the NNTP link the client downloaded over: the aggregate
+  egress rate and burst, and the fixed round trip (`rtt_micros`) the shaper
+  added. The round trip is part of the stratum: a 1 Gbit result at 0 and at
+  250 ms are different comparisons. A run with a round trip carries the
+  shaper's `link_shaping` report in both attestation snapshots, with the
+  delays re-read from `tc` at each.
 
 Every counter carries its scope, collector and collector version, so results
 compare like for like instead of treating an unavailable hardware counter as a

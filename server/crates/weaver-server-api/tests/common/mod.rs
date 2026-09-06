@@ -606,6 +606,7 @@ fn spawn_test_scheduler(
                         staging_dir: None,
                         category_bytes: None,
                         restored_download_floor_bytes: 0,
+                        downloaded_wire_bytes: 0,
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -685,14 +686,11 @@ fn spawn_test_scheduler(
                                 "invalid NNTP client type".to_owned(),
                             )
                         })
-                        .map(|client| {
+                        .map(|_client| {
                             nntp_generation = nntp_generation.wrapping_add(1);
                             weaver_server_core::NntpRuntimeActivation {
                                 generation: nntp_generation,
                                 configured_connections: total_connections,
-                                effective_connections: client
-                                    .pool()
-                                    .effective_connection_capacity(),
                             }
                         });
                     if let Ok(activation) = activation {
@@ -756,6 +754,7 @@ fn spawn_test_scheduler(
                         staging_dir: None,
                         category_bytes: None,
                         restored_download_floor_bytes: 0,
+                        downloaded_wire_bytes: 0,
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));

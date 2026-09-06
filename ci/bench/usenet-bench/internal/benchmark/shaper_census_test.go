@@ -52,7 +52,7 @@ func TestShaperArticleCensusForBracketsOneRun(t *testing.T) {
 func TestShaperSnapshotValidateAcceptsCensusSchema(t *testing.T) {
 	acquired := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
 	link := ServerLinkProfile{ID: "1gbit", EgressBitsPerSecond: 1_000_000_000, BurstBytes: 1 << 20}
-	for _, version := range []int{2, 3} {
+	for _, version := range []int{2, 3, 4} {
 		snapshot := ShaperSnapshot{SchemaVersion: version, Status: "ok", StartedAt: acquired,
 			ConfiguredEgressBitsPerSecond: link.EgressBitsPerSecond, ConfiguredBurstBytes: link.BurstBytes,
 			DownstreamSourceConnections: map[string]uint64{}, DownstreamSourceBytes: map[string]uint64{},
@@ -61,9 +61,9 @@ func TestShaperSnapshotValidateAcceptsCensusSchema(t *testing.T) {
 		if err := snapshot.ValidateFor(link); err != nil {
 			t.Errorf("schema %d: %v", version, err)
 		}
-		snapshot.SchemaVersion = 4
+		snapshot.SchemaVersion = 5
 		if err := snapshot.ValidateFor(link); err == nil {
-			t.Errorf("schema 4 accepted")
+			t.Errorf("schema 5 accepted")
 		}
 	}
 }

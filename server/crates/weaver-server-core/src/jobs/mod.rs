@@ -31,7 +31,7 @@ pub use error::SchedulerError;
 pub use handle::{
     AddJobOptions, DownloadBlockKind, DownloadBlockState, FINISHED_JOBS_RUNTIME_CAP, JobInfo,
     NntpRuntimeActivation, QueueMoveTarget, RestoreJobRequest, SchedulerCommand, SchedulerHandle,
-    SharedPipelineState,
+    ServerTransportHealth, SharedPipelineState,
 };
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
 pub use model::{

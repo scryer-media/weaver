@@ -32,6 +32,13 @@ func renderVideo(ctx context.Context, config Config, toolchain Toolchain, caseDi
 	if err := runCommand(ctx, config.DockerBinary, args...); err != nil {
 		return fixture.FileDigest{}, fmt.Errorf("render %s: %w", relative, err)
 	}
+	if kind == fixture.CompressiblePayload && !isTransportStream(relative) {
+		// See compressibleNoiseBits: the rendered pattern alone is ~96%
+		// redundant, so the sample noise is what gives the archive its size.
+		if err := addSampleNoiseToAVI(path, compressibleNoiseBits, stream); err != nil {
+			return fixture.FileDigest{}, err
+		}
+	}
 	if err := verifyVideo(ctx, config, toolchain, caseDir, relative); err != nil {
 		return fixture.FileDigest{}, err
 	}
@@ -93,7 +100,9 @@ func ffmpegRenderArgs(kind fixture.PayloadKind, targetBytes int64, stream uint64
 		)
 	case fixture.CompressiblePayload:
 		// Uncompressed YUV AVI is a valid video file whose visual structure is
-		// intentionally available to RAR's compression modes.
+		// intentionally available to RAR's compression modes. renderVideo then
+		// adds compressibleNoiseBits of per-sample noise so the archive is a
+		// controlled fraction of the payload rather than a few megabytes.
 		filter := fmt.Sprintf("testsrc2=size=320x180:rate=30,hue=h=%d:s=1", seed%360)
 		const bitrate = int64(22_272_000)
 		args = append(args,

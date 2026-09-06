@@ -132,6 +132,7 @@ func plan(args []string) error {
 	var repetitions int
 	var seed int64
 	var serverEgressBPS, serverBurstBytes uint64
+	var serverRTT time.Duration
 	var exclusions clientExclusionFlags
 	flags.StringVar(&fixturesCSV, "fixtures", "", "comma-separated generated fixture ids")
 	flags.Var(&exclusions, "exclude-client", "repeatable; client:fixture-id:reason — do not run this client on this fixture; the summary records every excluded block as that client not finishing, with the reason")
@@ -144,6 +145,7 @@ func plan(args []string) error {
 	flags.StringVar(&serverLink, "server-link", benchmark.LinkUnlimited, "NNTP server aggregate egress profile: unlimited, 1gbit, 10gbit, or custom")
 	flags.Uint64Var(&serverEgressBPS, "server-egress-bps", 0, "required custom server-link egress rate in bits per second")
 	flags.Uint64Var(&serverBurstBytes, "server-burst-bytes", 0, "required custom server-link aggregate burst in bytes")
+	flags.DurationVar(&serverRTT, "server-rtt", 0, "fixed round trip the shaper adds between client and server (whole milliseconds, e.g. 250ms or 500ms); 0 adds none")
 	flags.StringVar(&storageProfileID, "storage-profile", benchmark.StorageProfileLocal, "client storage profile: local, nfs-all, or nfs-complete")
 	flags.StringVar(&nfsLink, "nfs-link", "", "required NFS link profile for an nfs storage profile: nas-100mbit, nas-1gbit, or nas-2.5gbit")
 	flags.IntVar(&repetitions, "repetitions", 20, "measured randomized blocks per fixture/client/transport")
@@ -182,7 +184,7 @@ func plan(args []string) error {
 	if err != nil {
 		return err
 	}
-	link, err := benchmark.ResolveServerLinkProfile(serverLink, serverEgressBPS, serverBurstBytes)
+	link, err := benchmark.ResolveServerLinkProfile(serverLink, serverEgressBPS, serverBurstBytes, serverRTTMicros(serverRTT))
 	if err != nil {
 		return err
 	}
@@ -217,9 +219,11 @@ func serverEnv(args []string) error {
 	flags.SetOutput(os.Stderr)
 	var profile, output string
 	var egressBPS, burstBytes uint64
+	var rtt time.Duration
 	flags.StringVar(&profile, "server-link", benchmark.LinkUnlimited, "server aggregate egress profile: unlimited, 1gbit, 10gbit, or custom")
 	flags.Uint64Var(&egressBPS, "server-egress-bps", 0, "required custom egress rate in bits per second")
 	flags.Uint64Var(&burstBytes, "server-burst-bytes", 0, "required custom aggregate burst in bytes")
+	flags.DurationVar(&rtt, "server-rtt", 0, "fixed round trip the shaper adds between client and server (whole milliseconds, e.g. 250ms or 500ms); 0 adds none")
 	flags.StringVar(&output, "output", "", "new Compose-compatible environment file")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -227,11 +231,21 @@ func serverEnv(args []string) error {
 	if output == "" {
 		return fmt.Errorf("--output is required")
 	}
-	link, err := benchmark.ResolveServerLinkProfile(profile, egressBPS, burstBytes)
+	link, err := benchmark.ResolveServerLinkProfile(profile, egressBPS, burstBytes, serverRTTMicros(rtt))
 	if err != nil {
 		return err
 	}
 	return benchmark.WriteServerLinkEnvironment(output, link)
+}
+
+// serverRTTMicros converts the --server-rtt flag for the link resolver, which
+// rejects anything that is not zero or a whole millisecond in range. A
+// negative duration is folded to an out-of-range value so it is refused too.
+func serverRTTMicros(rtt time.Duration) uint64 {
+	if rtt < 0 {
+		return uint64(benchmark.MaxServerRTT/time.Microsecond) + 1
+	}
+	return uint64(rtt / time.Microsecond)
 }
 
 type preflightBinary struct {

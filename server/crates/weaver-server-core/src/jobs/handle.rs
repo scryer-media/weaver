@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod};
@@ -106,6 +107,14 @@ pub struct SharedPipelineState {
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
     nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
     nntp_runtime_activation: Arc<RwLock<Option<NntpRuntimeActivation>>>,
+    /// Per-server BODY transport state from the download lanes, indexed by
+    /// pool server index. Published on the tuning tick, not per response.
+    download_transport: Arc<RwLock<Vec<ServerTransportHealth>>>,
+    /// First-byte latency the last connection test measured, keyed by saved
+    /// server id. The download lanes read it once, to pick a starting depth
+    /// for a server they have never fetched from; every later depth decision
+    /// comes from their own measurements.
+    server_probe_latency: Arc<RwLock<HashMap<u32, Duration>>>,
     job_cancellations: JobCancellationRegistry,
     /// The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
     /// kept off the job-level broadcast: a download emits several of these
@@ -136,6 +145,8 @@ impl SharedPipelineState {
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
             nntp_runtime_activation: Arc::new(RwLock::new(None)),
+            download_transport: Arc::new(RwLock::new(Vec::new())),
+            server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
         }
@@ -158,6 +169,17 @@ impl SharedPipelineState {
 
     pub fn list_jobs(&self) -> Vec<JobInfo> {
         self.jobs.read().unwrap().clone()
+    }
+
+    /// Live download rate of every transferring job, read off the published
+    /// job list in place.
+    ///
+    /// Off the pipeline entirely: it takes the read side of the lock the
+    /// orchestrator already writes on its 100 ms tick and copies nothing but
+    /// `(job id, rate)` pairs, so a metrics subscriber sampling it every
+    /// 250 ms costs less than the job-list clone the queue readers make.
+    pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
+        job_download_rates(&self.jobs.read().unwrap())
     }
 
     pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
@@ -307,6 +329,48 @@ impl SharedPipelineState {
     pub fn nntp_runtime_activation(&self) -> Option<NntpRuntimeActivation> {
         *self.nntp_runtime_activation.read().unwrap()
     }
+
+    pub fn set_download_transport_health(&self, health: Vec<ServerTransportHealth>) {
+        *self.download_transport.write().unwrap() = health;
+    }
+
+    pub fn download_transport_health(&self) -> Vec<ServerTransportHealth> {
+        self.download_transport.read().unwrap().clone()
+    }
+
+    /// Record what a connection test measured, so a server the lanes have
+    /// never fetched from can start at a sensible pipelining depth.
+    pub fn note_server_probe_latency(&self, server_id: u32, latency: Duration) {
+        self.server_probe_latency
+            .write()
+            .unwrap()
+            .insert(server_id, latency);
+    }
+
+    pub fn server_probe_latency(&self, server_id: u32) -> Option<Duration> {
+        self.server_probe_latency
+            .read()
+            .unwrap()
+            .get(&server_id)
+            .copied()
+    }
+}
+
+/// What the download lanes have learned about one server's BODY transport.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerTransportHealth {
+    /// Pool server index this describes.
+    pub server_idx: usize,
+    /// Command-to-status-line wait.
+    pub latency_ms: Option<f64>,
+    /// Status-line-to-terminator wait for one article.
+    pub transfer_ms: Option<f64>,
+    /// "good", "moderate" or "slow"; absent until a latency is measured.
+    pub latency_band: Option<String>,
+    /// BODY pipelining depth in use, where 1 means sequential.
+    pub pipeline_depth: u32,
+    /// Set once a server has proved twice that it cannot pipeline cleanly.
+    pub pinned_sequential: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,7 +558,6 @@ pub enum CancellationOrigin {
 pub struct NntpRuntimeActivation {
     pub generation: u64,
     pub configured_connections: usize,
-    pub effective_connections: usize,
 }
 
 pub enum SchedulerCommand {
@@ -626,6 +689,22 @@ pub enum SchedulerCommand {
     },
     /// Shutdown the scheduler gracefully.
     Shutdown,
+}
+
+/// One `(job, bytes per second)` pair per job whose download phase currently
+/// reports a rate. The rate is the value `sample_phase_progress` published for
+/// that job on the metrics tick, so it is the same estimator and the same
+/// instant as the global speed gauge.
+pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
+    jobs.iter()
+        .filter_map(|job| {
+            job.phase_progress
+                .iter()
+                .find(|phase| phase.phase == crate::jobs::phase_progress::JobPhase::Downloading)
+                .and_then(|phase| phase.rate_bps)
+                .map(|rate_bps| (job.job_id, rate_bps))
+        })
+        .collect()
 }
 
 /// Summary info about a job (returned by queries).
@@ -933,6 +1012,12 @@ impl SchedulerHandle {
         self.state.list_jobs()
     }
 
+    /// Download rate of every transferring job (reads from shared state, no
+    /// channel round-trip). See [`SharedPipelineState::job_download_rates`].
+    pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
+        self.state.job_download_rates()
+    }
+
     /// Get current metrics (reads from shared state, no channel round-trip).
     pub fn get_metrics(&self) -> MetricsSnapshot {
         self.state.metrics_snapshot()
@@ -1007,6 +1092,16 @@ impl SchedulerHandle {
 
     pub fn get_download_block(&self) -> DownloadBlockState {
         self.state.download_block()
+    }
+
+    /// Per-server BODY transport state as last published by the download lanes.
+    pub fn download_transport_health(&self) -> Vec<ServerTransportHealth> {
+        self.state.download_transport_health()
+    }
+
+    /// Record a connection test's first-byte latency for the download lanes.
+    pub fn note_server_probe_latency(&self, server_id: u32, latency: Duration) {
+        self.state.note_server_probe_latency(server_id, latency);
     }
 
     /// Pause all download dispatch globally.
