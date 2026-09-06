@@ -135,14 +135,16 @@ The summarizer pools per-fixture results only within a class (see
 case and the breadth aggregate is the compatibility figure. Fixture counts
 inside a class are coverage choices, not a model of what is posted to Usenet:
 the corpus does not claim a population distribution, and that is why the two
-classes are never pooled with each other. Every fixture posts at least 300 MiB
+classes are never pooled with each other. Every fixture posts at least 100 MiB
 of archive; the
 generator refuses to write a smaller one and the controller refuses to run it,
 because a smaller download finishes inside the clients' start-up and settle
 time and the comparison would measure process launch rather than the
-pipeline. Ordinary incompressible cases contain one 320 MiB synthetic video
-file split into 32 MiB archive volumes; the multi-input cases contain four
-80 MiB videos. Compressible cases contain one 576 MiB raw-video file carrying
+pipeline. Ordinary incompressible cases contain one 150 MiB synthetic video
+file split into 32 MiB archive volumes (the withheld-volume sets post one
+volume fewer than they list, which is what the floor's headroom is for); the
+multi-input cases contain four 40 MiB videos. Compressible cases contain one
+270 MiB raw-video file carrying
 four bits of deterministic per-sample noise (recorded in the manifest as
 `sample_noise_bits`), which the pinned writers compress to roughly 62 %
 (LZMA2) to 70 % (RAR -m5) of its size — so the compression lanes still
@@ -330,7 +332,7 @@ invocation.
 ```bash
 go run ./cmd/fixturegen --list
 
-# One benchmark-sized movie case (576 MiB compressible payload by default; incompressible cases use 320 MiB).
+# One benchmark-sized movie case (270 MiB compressible payload by default; incompressible cases use 150 MiB).
 go run ./cmd/fixturegen --fixture rar5-7-store-store-nonsolid-none-incompressible --output /scratch/fixtures
 
 # A 7z case, written by the pinned official 7-Zip build.
@@ -627,7 +629,7 @@ condition as the run's error.
 client's own completion stamp is an integer second (SABnzbd's history
 `completed`, NZBGet's `HistoryTime`), so the controller's external poll is
 the one neutral clock, and at 100 ms it costs each client the same ten status
-calls a second — a load that is noise against a 300 MiB-plus download. The
+calls a second — a load that is noise against a 100 MiB-plus download. The
 width of the window in which the terminal state was observed — from the last
 poll that still saw the job running to the poll that saw it finished — is
 recorded in every artifact as `terminal_observation_uncertainty_nanoseconds`.

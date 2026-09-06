@@ -24,19 +24,20 @@ import (
 
 const (
 	// Every benchmark fixture must post at least fixture.MinimumPostedBytes
-	// (300 MiB) of archive; smaller downloads finish in the time the clients
+	// (100 MiB) of archive; smaller downloads finish in the time the clients
 	// spend starting up and settling, and the comparison then measures
 	// process launch rather than the pipeline. Ordinary fixtures contain one
-	// movie whose archive clears that floor on its own; the fixtures with
-	// four input movies use the per-movie size below so that their four
-	// archives together clear it.
-	defaultBytesPerFile            int64 = 320 << 20
-	defaultMultiVolumeBytesPerFile int64 = 80 << 20
+	// 150 MiB movie whose archive clears that floor on its own, including
+	// the withheld-volume sets that post one 32 MiB volume fewer; the
+	// fixtures with four input movies use the per-movie size below so that
+	// their four archives together clear it.
+	defaultBytesPerFile            int64 = 150 << 20
+	defaultMultiVolumeBytesPerFile int64 = 40 << 20
 	// A compressible payload shrinks to roughly 62% (LZMA2) to 70% (RAR -m5)
 	// of its size at compressibleNoiseBits, so it starts larger to post an
-	// archive that clears the floor with margin: 576 MiB posts about 360 MiB
-	// through 7-Zip and about 400 MiB through RAR.
-	defaultCompressibleBytesPerFile int64 = 576 << 20
+	// archive that clears the floor with margin: 270 MiB posts about 167 MiB
+	// through 7-Zip and about 190 MiB through RAR.
+	defaultCompressibleBytesPerFile int64 = 270 << 20
 	defaultBluRayLargeFile          int64 = 5 << 30
 	defaultBluRayMediumFile         int64 = 96 << 20
 	defaultBluRayMediumFileCount          = 8

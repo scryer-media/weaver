@@ -162,10 +162,10 @@ func applyRepairProfile(ctx context.Context, in repairInputs) (fixture.RepairDet
 func par2RepairParameters(profile fixture.RepairProfile) (redundancy, missingVolumes int) {
 	switch profile {
 	case fixture.PAR2HeavyRepairProfile, fixture.PAR2HeavyWithheldProfile:
-		// A 320 MiB movie split into 32 MiB volumes has ten volumes; 35%
-		// redundancy covers three of them, and heavy repair withholds or
-		// destroys exactly one complete volume. Light repair remains a byte
-		// flip.
+		// A 150 MiB movie split into 32 MiB volumes has five volumes; 35%
+		// redundancy covers one of them with margin, and heavy repair
+		// withholds or destroys exactly one complete volume. Light repair
+		// remains a byte flip.
 		return 35, 1
 	default:
 		return 10, 0

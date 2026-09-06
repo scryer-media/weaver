@@ -149,8 +149,10 @@ func LoadGeneratedManifest(path string) (GeneratedManifest, error) {
 // Below it a download finishes inside the clients' start-up and settle time
 // and the comparison measures process launch, not the pipeline. The generator
 // refuses to write a manifest under the floor and the controller refuses to
-// run one, so a corpus that predates the floor cannot produce a result.
-const MinimumPostedBytes int64 = 300 << 20
+// run one, so a corpus that predates the floor cannot produce a result. The
+// floor sits under the 150 MiB movie the defaults produce with room for the
+// withheld-volume sets, which post one 32 MiB volume less than they list.
+const MinimumPostedBytes int64 = 100 << 20
 
 // PostedBytes is the number of archive bytes the seeder actually posts:
 // ArchiveFiles only, since withheld files are listed in the NZB but never
