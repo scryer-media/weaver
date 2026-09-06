@@ -705,7 +705,7 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
         &rendered,
         "weaver_pipeline_download_lanes_active",
         "mode",
-        &["sequential", "pipeline_depth2", "pipeline_depth4"],
+        &["sequential", "pipeline_depth2", "pipeline_depth4", "pipeline_depth8"],
     );
     assert_label_set(
         &rendered,
