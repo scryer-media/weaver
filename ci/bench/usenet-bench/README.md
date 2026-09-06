@@ -120,9 +120,34 @@ lists every subcommand; `-h` on any of them prints its options.
 
 ## The fixture matrix
 
-The corpus is a compatibility and repair coverage set, not a model of what is
-posted to Usenet. Ordinary cases contain one 150 MiB synthetic video file split
-into 32 MiB archive volumes; one multi-input case contains four 48 MiB videos.
+Every set in `fixtures/matrix.json` declares a `class`, and the class travels
+from the matrix through each fixture's manifest into every run artifact and the
+summary:
+
+| Class | What it stands for | Sets |
+| --- | --- | --- |
+| `headline` | The common shape of a real post: a stored (`-m0`), encrypted, multi-volume RAR of already-compressed media. One set per source-locked RARLAB writer era (3.93, 4.20, 5.00, 6.24, 7.23), each with encrypted headers (`-hp`) and data-only encryption (`-p`); the 4.20 and 7.23 writers also keep the unencrypted stored form. | 5 sets, 12 fixtures |
+| `breadth` | Shapes a client meets less often and must still handle: release-style compression in both RAR families, a four-movie multi-input set, RAR5 quick-open records, the official 7-Zip 7z container, a stored Blu-ray-shaped topology in scattered NZB order, and the repair profiles. | 13 sets, 13 fixtures |
+
+The summarizer pools per-fixture results only within a class (see
+[Summarize](#7-summarize)); the headline aggregate is the figure for the common
+case and the breadth aggregate is the compatibility figure. Fixture counts
+inside a class are coverage choices, not a model of what is posted to Usenet:
+the corpus does not claim a population distribution, and that is why the two
+classes are never pooled with each other. Every fixture posts at least 300 MiB
+of archive; the
+generator refuses to write a smaller one and the controller refuses to run it,
+because a smaller download finishes inside the clients' start-up and settle
+time and the comparison would measure process launch rather than the
+pipeline. Ordinary incompressible cases contain one 320 MiB synthetic video
+file split into 32 MiB archive volumes; the multi-input cases contain four
+80 MiB videos. Compressible cases contain one 576 MiB raw-video file carrying
+four bits of deterministic per-sample noise (recorded in the manifest as
+`sample_noise_bits`), which the pinned writers compress to roughly 62 %
+(LZMA2) to 70 % (RAR -m5) of its size — so the compression lanes still
+compress, and the archive still clears the floor. The floor is enforced on the
+posted bytes, so a repair fixture's PAR2 volumes count and its withheld
+volume does not.
 Together they cover the RARLAB writer eras and their archive families across:
 
 | Axis | Values |
@@ -134,16 +159,21 @@ Together they cover the RARLAB writer eras and their archive families across:
 | Encryption | none, data encryption, encrypted headers |
 | Input data | incompressible, moderately compressible |
 
-That yields 18 clean RAR fixtures. `writer_era` is deliberately separate from
-`archive_format`: RAR 6 and 7 are writer releases, not new on-disk formats.
+That yields 16 clean RAR fixtures: the 12 headline stored-and-encrypted
+lanes, and four breadth lanes — RAR 4.20 solid data-encrypted compression,
+RAR 7.23 solid header-encrypted compression over the compressible payload, a
+four-movie non-solid compressed set, and the quick-open set. `writer_era` is
+deliberately separate from `archive_format`: RAR 6 and 7 are writer releases,
+not new on-disk formats.
 
 ### The 7z lane
 
 `archive_format` also takes `7z`, written by the official 7-Zip console build
 (see [Pinned 7-Zip writer](#pinned-7-zip-writer)). A set that uses it names the
 writer with `archive_writer`; `generator_toolchain` still names the RARLAB
-image, which supplies the FFmpeg payload renderer for every lane. Three clean
-7z fixtures and two 7z repair fixtures are in the corpus:
+image, which supplies the FFmpeg payload renderer for every lane. Two clean
+7z fixtures (stored, and stored with encrypted headers) and one 7z repair
+fixture are in the corpus, all breadth:
 
 | Axis | 7z values |
 | --- | --- |
@@ -165,13 +195,12 @@ oracle.
 
 ### The Blu-ray disc topology
 
-Two `bluray-disc` fixtures exercise a disc-shaped topology in non-solid RAR5,
-one stored and one normally compressed: a 5 GiB `BDMV/STREAM/00000.m2ts`, eight
-96 MiB menu/extra streams, four small menu streams and 508 tiny metadata
-members, split into 50 MiB volumes and posted in `scattered` NZB order. The
-store and normal pair is the point: a stored disc archive is byte-identical to
-its members on the wire, a compressed one is not, and the two make that
-difference measurable on the same topology.
+One `bluray-disc` fixture exercises a disc-shaped topology in stored,
+non-solid RAR5: a 5 GiB `BDMV/STREAM/00000.m2ts`, eight 96 MiB menu/extra
+streams, four small menu streams and 508 tiny metadata members, split into
+50 MiB volumes and posted in `scattered` NZB order. It is stored because disc
+dumps are posted stored; the topology — one huge member beside hundreds of tiny
+ones, arriving out of order — is what it measures.
 
 `--bluray-large-file-bytes`, `--bluray-medium-file-bytes`,
 `--bluray-medium-file-count`, `--bluray-small-file-count` and
@@ -183,8 +212,11 @@ Blu-ray image and not a claim about typical posts.
 
 ### Repair profiles
 
-Nine repair fixtures add deterministic damage without duplicating the clean
-cases:
+Six repair fixtures add deterministic damage without duplicating the clean
+cases. Five are over stored archives (RAR5 PAR2 light, RAR5 PAR2 heavy with
+the volume withheld, RAR4 and RAR5 recovery volumes, 7z PAR2 light) and one,
+`repair-rar5-par2`, over a solid data-encrypted compressed RAR5 so a repair
+that has to run before a compressed extract is measured once:
 
 | Profile | Posted repair material | Deliberate fault |
 | --- | --- | --- |
@@ -293,7 +325,7 @@ invocation.
 ```bash
 go run ./cmd/fixturegen --list
 
-# One benchmark-sized movie case (150 MiB payload by default).
+# One benchmark-sized movie case (576 MiB compressible payload by default; incompressible cases use 320 MiB).
 go run ./cmd/fixturegen --fixture rar5-7-headers-normal-solid-headers-compressible --output /scratch/fixtures
 
 # A 7z case, written by the pinned official 7-Zip build.
@@ -446,11 +478,14 @@ profiles keep the full client-by-packaging matrix for every
 
 `--profile stock` and `--profile equivalent-throughput` are reported
 separately; neither is a fallback for the other. The profiles differ only for
-SABnzbd (`direct_unpack`) and NZBGet (`DirectWrite` + `DirectUnpack`); Weaver
-is rendered with `WEAVER_DIRECT_UNPACK=on` in both, because that is its
-shipping default and the benchmark measures the product as shipped, so the
-Weaver column is the same run configuration under either profile. One
-Weaver default is deliberately overridden in both renders:
+SABnzbd (`direct_unpack`) and NZBGet (`DirectUnpack`); NZBGet's `DirectWrite`
+is its shipping default and independent of direct unpack, so it stays `yes`
+in both. Weaver is rendered with `WEAVER_DIRECT_UNPACK=on` and
+`WEAVER_CLEANUP_AFTER_EXTRACT=true` in both, because those are its shipping
+defaults and the benchmark measures the product as shipped (every client
+deletes its archive volumes after a successful unpack), so the Weaver column
+is the same run configuration under either profile. One Weaver default is
+deliberately overridden in both renders:
 `WEAVER_PROPAGATION_DELAY_SECS=0`. Weaver holds a post whose NZB is under
 five minutes old before downloading it; SABnzbd and NZBGet ship with that
 delay at zero, and every benchmark NZB is freshly posted by construction, so
@@ -526,21 +561,26 @@ exactly like a client-reported failure, so a client that hangs on a fixture
 becomes a result rather than a stalled pass. The native lane reports the same
 condition as the run's error.
 
-`CLIENT_POLL_INTERVAL` / `NATIVE_POLL_INTERVAL` default to `10ms`. The width
-of the window in which the terminal state was observed — from the last poll
-that still saw the job running to the poll that saw it finished — is recorded
-in every artifact as `terminal_observation_uncertainty_nanoseconds`. A run is
-excluded when that window exceeds 1 % of its submission-to-terminal duration
-or 100 ms, whichever is larger. The absolute allowance exists because the
-window is set by how long the client's own status API takes to answer one
-poll, not by the fixture: on a 1 Gbit link a 150 MiB fixture finishes in about
-three seconds, and a 1 % bound alone would then reject every run of a client
-whose API answers in 40 ms while admitting one that answers in 10 ms — a
-selection bias against the slower API, not a precision gain.
+`CLIENT_POLL_INTERVAL` / `NATIVE_POLL_INTERVAL` default to `100ms`. Every
+client's own completion stamp is an integer second (SABnzbd's history
+`completed`, NZBGet's `HistoryTime`), so the controller's external poll is
+the one neutral clock, and at 100 ms it costs each client the same ten status
+calls a second — a load that is noise against a 300 MiB-plus download. The
+width of the window in which the terminal state was observed — from the last
+poll that still saw the job running to the poll that saw it finished — is
+recorded in every artifact as `terminal_observation_uncertainty_nanoseconds`.
+A run is excluded when that window exceeds 1 % of its submission-to-terminal
+duration or 250 ms, whichever is larger. The absolute allowance exists
+because the window is one poll interval plus how long the client's own status
+API takes to answer, not a property of the fixture: a 1 % bound alone would
+reject every short run of a client whose API answers in 40 ms while admitting
+one that answers in 10 ms — a selection bias against the slower API, not a
+precision gain — while a window wider than 250 ms marks a poll the controller
+missed and still fails the run.
 
 Two other modes exist and are labelled apart from the headline:
 
-- `queue-transition` — generate and seed `direct-mkv-200mb`, plan **only** that
+- `queue-transition` — generate and seed `direct-mkv`, plan **only** that
   fixture, and measure first-submission-to-last-verified-output wall clock
   across forced duplicates: the plan's `--repetitions` is the number of copies
   queued per client lane (at least 2; the original design point was 20). It
@@ -606,10 +646,27 @@ run. A client the plan excluded on a fixture (`--exclude-client`) is counted
 the same way, as not finishing every block, with the plan's reason reported
 under `client_exclusions`. When the failures leave a stratum with fewer than
 the minimum paired blocks, that stratum keeps its counts and its comparison is
-withheld with a stated reason. A harness-side `failed` suite, a missing or unverified run, an
+withheld with a stated reason.
+
+Above the strata, `aggregates` pools the per-fixture comparisons by fixture
+class: one entry per class and non-fixture stratum (profile, target,
+transport, toolchain, server link, storage profile). Every fixture carries
+equal weight — its paired log ratios are averaged first and the fixture means
+second — so a fixture that ran more blocks does not count for more, and the
+bootstrap resamples blocks within each fixture with the fixture set held
+fixed, because the corpus is a declared set and not a sample. The `headline`
+aggregate is the figure for the common case and the `breadth` aggregate the
+compatibility figure; they are never pooled with each other. A class figure is
+withheld, naming the fixtures, whenever any fixture of the class had its own
+comparison withheld: a client that could not finish a fixture of the class
+does not get a class figure over the fixtures it did finish. An artifact whose
+job carries no `fixture_class` was run over a corpus that predates the classes
+and fails the summary closed.
+
+A harness-side `failed` suite, a missing or unverified run, an
 incomplete pair with no recorded failure, fewer than 20 paired blocks for any
 other reason, or terminal-observation uncertainty above its limit (1 % of the
-run or 100 ms, whichever is larger) still fails the summary closed.
+run or 250 ms, whichever is larger) still fails the summary closed.
 So does an artifact root that mixes storage profiles: a local run and an NFS
 run answer different questions and are summarized separately, never pooled.
 
@@ -795,6 +852,16 @@ hop. `local` is the default and the published headline.
 | `local` (default) | host disk | host disk |
 | `nfs-complete` | host disk | throttled NFS export |
 | `nfs-all` | throttled NFS export | throttled NFS export |
+
+Under `local` the Docker lane binds ONE host directory at `/downloads`, so
+`/downloads/incomplete` and `/downloads/complete` are two directories on the
+same filesystem and every client's final move is a rename, as on a real
+single-disk install. (Two separate binds would be two mounts: `rename(2)`
+fails with `EXDEV` and each client falls back to copying its whole extracted
+output, a write no user's machine performs.) The `nfs-*` profiles are the
+opposite by design: the completion directory is a volume on the export, so
+the final move is the copy across the network that those profiles exist to
+measure.
 
 An `nfs-*` profile must name its link with `--nfs-link`. The named links are
 fixed and never change silently:

@@ -149,11 +149,14 @@ func TestMediaDuration(t *testing.T) {
 }
 
 func TestUniformMovieSizeUsesMultiInputOverride(t *testing.T) {
-	config := Config{BytesPerFile: 150 << 20, MultiVolumeBytesPerFile: 48 << 20}
-	if got, want := uniformMovieBytes(fixture.ArchiveCase{FileCount: 1}, config), int64(150<<20); got != want {
+	config := Config{BytesPerFile: 320 << 20, MultiVolumeBytesPerFile: 80 << 20, CompressibleBytesPerFile: 576 << 20}
+	if got, want := uniformMovieBytes(fixture.ArchiveCase{FileCount: 1, Payload: fixture.IncompressiblePayload}, config), int64(320<<20); got != want {
 		t.Fatalf("ordinary movie bytes = %d, want %d", got, want)
 	}
-	if got, want := uniformMovieBytes(fixture.ArchiveCase{FileCount: 4}, config), int64(48<<20); got != want {
+	if got, want := uniformMovieBytes(fixture.ArchiveCase{FileCount: 1, Payload: fixture.CompressiblePayload}, config), int64(576<<20); got != want {
+		t.Fatalf("compressible movie bytes = %d, want %d", got, want)
+	}
+	if got, want := uniformMovieBytes(fixture.ArchiveCase{FileCount: 4, Payload: fixture.IncompressiblePayload}, config), int64(80<<20); got != want {
 		t.Fatalf("multi-input movie bytes = %d, want %d", got, want)
 	}
 }

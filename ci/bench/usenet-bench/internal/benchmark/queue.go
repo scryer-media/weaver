@@ -155,7 +155,11 @@ type QueueArtifact struct {
 }
 
 type QueueJobArtifact struct {
-	Run                              Run                   `json:"run"`
+	Run Run `json:"run"`
+	// FixtureClass is copied from the fixture manifest so a summary can tell a
+	// headline fixture from a breadth fixture without consulting the matrix
+	// that generated the corpus.
+	FixtureClass                     fixture.FixtureClass  `json:"fixture_class"`
 	Repair                           fixture.RepairDetails `json:"repair"`
 	AdapterResult                    QueueJobResult        `json:"adapter_result"`
 	Outcome                          string                `json:"outcome"`
@@ -342,7 +346,7 @@ func verifyQueueTransitionArtifact(suite queueSuite, result QueueAdapterResult, 
 	artifacts := make([]QueueJobArtifact, 0, len(suite.Runs))
 	for _, run := range suite.Runs {
 		job := jobsByRun[run.ID]
-		artifact := QueueJobArtifact{Run: run, Repair: manifests[run.ID].Repair, AdapterResult: job, Outcome: queueJobOutcome(job)}
+		artifact := QueueJobArtifact{Run: run, FixtureClass: manifests[run.ID].Case.Class, Repair: manifests[run.ID].Repair, AdapterResult: job, Outcome: queueJobOutcome(job)}
 		if job.TerminalStatus != "succeeded" {
 			artifact.Error = terminalFailureDescription(job)
 		}
@@ -432,7 +436,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 	defer func() {
 		persistQueueArtifact(filepath.Join(suiteDir, "queue.json"), &artifact)
 	}()
-	outputDir := filepath.Join(suiteDir, "complete")
+	outputDir := filepath.Join(suiteDir, "downloads", "complete")
 	configDir := filepath.Join(suiteDir, "config")
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		artifact.Error = fmt.Sprintf("create queue completion directory: %v", err)
@@ -463,6 +467,10 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 		manifest, manifestErr := fixture.LoadGeneratedManifest(filepath.Join(fixtureDir, "fixture-manifest.json"))
 		if manifestErr != nil {
 			artifact.Error = manifestErr.Error()
+			return artifact
+		}
+		if err := manifest.ValidatePostedSize(); err != nil {
+			artifact.Error = fmt.Sprintf("fixture %s: %v", run.FixtureID, err)
 			return artifact
 		}
 		nzbPath, err := fixtureNZBPath(fixtureDir, run.FixtureID)
@@ -605,6 +613,7 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 		adapterResult := jobsByRun[run.ID]
 		jobArtifact := QueueJobArtifact{
 			Run:           run,
+			FixtureClass:  manifests[run.ID].Case.Class,
 			Repair:        manifests[run.ID].Repair,
 			AdapterResult: adapterResult,
 			Outcome:       queueJobOutcome(adapterResult),
@@ -663,18 +672,19 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 
 // ObservationUncertaintyFloorNanos is the absolute allowance on the width of
 // the terminal-observation window. The relative bound alone assumes the
-// window shrinks with the run, but it cannot: it is set by how long the
-// client's own status API takes to answer one poll, which is a property of
-// the product, not of the fixture. On a fast link a 150 MiB fixture finishes
-// in about three seconds, and a status API that answers in 40 ms would then
-// disqualify every run of that client while a 10 ms API passed — a selection
-// bias against the slower API, not a precision gain. The floor admits both
-// equally; the uncertainty itself stays recorded in every artifact.
-const ObservationUncertaintyFloorNanos int64 = 100_000_000
+// window shrinks with the run, but it cannot: it is set by the poll interval
+// plus how long the client's own status API takes to answer one poll, which
+// are properties of the controller and the product, not of the fixture. With
+// the default 100 ms poll the window is one interval plus one API round trip
+// (SABnzbd's answers in about 40 ms, NZBGet's in about 20 ms), so the floor
+// is 250 ms: wide enough that no client is excluded for the speed of its own
+// API, and narrow enough that a window wider than that marks a poll the
+// controller missed. The uncertainty itself stays recorded in every artifact.
+const ObservationUncertaintyFloorNanos int64 = 250_000_000
 
 // ObservationUncertaintyRule states the acceptance rule for error messages
 // and documentation.
-const ObservationUncertaintyRule = "1% of the submission-to-terminal duration or 100 ms, whichever is larger"
+const ObservationUncertaintyRule = "1% of the submission-to-terminal duration or 250 ms, whichever is larger"
 
 // ObservationUncertaintyAcceptable reports whether a terminal-observation
 // window of the given width is admissible for a run of the given duration.

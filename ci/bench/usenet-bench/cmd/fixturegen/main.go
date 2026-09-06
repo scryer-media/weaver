@@ -33,7 +33,7 @@ func (values *repeatedFlag) Set(value string) error {
 func main() {
 	var config generator.Config
 	var fixtureIDs repeatedFlag
-	var bytesPerFile, multiVolumeBytesPerFile, bluRayLargeFile, bluRayMediumFile, bluRaySmallFile, directMKVBytes string
+	var bytesPerFile, multiVolumeBytesPerFile, compressibleBytesPerFile, bluRayLargeFile, bluRayMediumFile, bluRaySmallFile, directMKVBytes string
 	var list, directMKV bool
 
 	flag.StringVar(&config.MatrixPath, "matrix", "fixtures/matrix.json", "fixture matrix JSON path")
@@ -45,16 +45,17 @@ func main() {
 	flag.StringVar(&config.SevenZipDockerfilePath, "sevenzip-dockerfile", "docker/sevenzip/Dockerfile", "7-Zip writer image Dockerfile path")
 	flag.StringVar(&config.OutputDir, "output", "generated", "directory for generated fixtures (never overwritten)")
 	flag.StringVar(&config.DockerBinary, "docker", "docker", "Docker executable")
-	flag.StringVar(&bytesPerFile, "bytes-per-file", "150MiB", "target size for each ordinary movie file")
-	flag.StringVar(&multiVolumeBytesPerFile, "multi-volume-bytes-per-file", "48MiB", "target size for each movie in the multi-input fixture")
+	flag.StringVar(&bytesPerFile, "bytes-per-file", "320MiB", "target size for each ordinary incompressible movie file")
+	flag.StringVar(&multiVolumeBytesPerFile, "multi-volume-bytes-per-file", "80MiB", "target size for each movie in the multi-input fixtures")
+	flag.StringVar(&compressibleBytesPerFile, "compressible-bytes-per-file", "576MiB", "target size for each compressible movie file (its archive is roughly 62-70% of this)")
 	flag.StringVar(&bluRayLargeFile, "bluray-large-file-bytes", "5GiB", "large media-stream size for bluray-disc fixtures")
 	flag.StringVar(&bluRayMediumFile, "bluray-medium-file-bytes", "96MiB", "menu/extra media-stream size for bluray-disc fixtures")
 	flag.IntVar(&config.BluRayMediumFileCount, "bluray-medium-file-count", 8, "menu/extra media streams for bluray-disc fixtures")
 	flag.StringVar(&bluRaySmallFile, "bluray-small-file-bytes", "128KiB", "small metadata-file size for bluray-disc fixtures")
 	flag.IntVar(&config.BluRaySmallFileCount, "bluray-small-file-count", 512, "small metadata files for bluray-disc fixtures")
 	flag.IntVar(&config.Workers, "workers", 4, "independent fixtures to generate concurrently")
-	flag.BoolVar(&directMKV, "direct-mkv", false, "generate only the direct 200MiB MKV fixture without Docker")
-	flag.StringVar(&directMKVBytes, "direct-mkv-bytes", "200MiB", "payload size for --direct-mkv")
+	flag.BoolVar(&directMKV, "direct-mkv", false, "generate only the direct MKV fixture (no archive)")
+	flag.StringVar(&directMKVBytes, "direct-mkv-bytes", "320MiB", "payload size for --direct-mkv")
 	flag.Var(&fixtureIDs, "fixture", "one expanded fixture id to generate (repeatable; defaults to all)")
 	flag.BoolVar(&config.BuildImages, "build-images", true, "build the pinned RARLAB, PAR2 and 7-Zip writer images before generation")
 	flag.BoolVar(&list, "list", false, "print expanded fixture cases and exit")
@@ -96,6 +97,10 @@ func main() {
 	config.MultiVolumeBytesPerFile, err = parseBytes(multiVolumeBytesPerFile)
 	if err != nil {
 		fatal(fmt.Errorf("parse --multi-volume-bytes-per-file: %w", err))
+	}
+	config.CompressibleBytesPerFile, err = parseBytes(compressibleBytesPerFile)
+	if err != nil {
+		fatal(fmt.Errorf("parse --compressible-bytes-per-file: %w", err))
 	}
 	config.BluRayLargeFileBytes, err = parseBytes(bluRayLargeFile)
 	if err != nil {

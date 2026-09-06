@@ -217,7 +217,8 @@ func writeProductFiles(cfg Config, spec ProductSpec) error {
 		directories = append(directories, cfg.OutputDir)
 	}
 	if cfg.IncompleteVolume == "" {
-		directories = append(directories, filepath.Join(cfg.ConfigDir, "incomplete"))
+		_, incompleteDir := hostDownloadDirs(cfg)
+		directories = append(directories, incompleteDir)
 	}
 	if cfg.Client == benchmark.NZBGet {
 		// NZBGet requires its queue and working directories to exist at

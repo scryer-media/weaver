@@ -10,6 +10,7 @@ func TestExpandCoversEveryAxis(t *testing.T) {
 		SchemaVersion: 2,
 		Sets: []FixtureSet{{
 			ID:                 "modern-rar5",
+			Class:              BreadthFixtureClass,
 			WriterEra:          "RAR 5.x-7.x compatibility",
 			GeneratorToolchain: "rarlab-7.23",
 			ArchiveFormat:      RAR5,
@@ -85,6 +86,7 @@ func TestQuickOpenIsRejectedOutsideRAR5(t *testing.T) {
 	for _, format := range []ArchiveFormat{RAR4, SevenZip} {
 		set := FixtureSet{
 			ID: "quick-open-" + string(format), WriterEra: "era", GeneratorToolchain: "toolchain",
+			Class:         BreadthFixtureClass,
 			ArchiveFormat: format, Compressions: []Compression{Store}, Solid: []bool{false},
 			Encryptions: []Encryption{NoEncryption}, Payloads: []PayloadKind{IncompressiblePayload},
 			FileCount: 1, VolumeSize: "32m", QuickOpen: true,
@@ -98,6 +100,7 @@ func TestQuickOpenIsRejectedOutsideRAR5(t *testing.T) {
 func TestExpandCarriesQuickOpenOntoEveryCase(t *testing.T) {
 	matrix := Matrix{SchemaVersion: 2, Sets: []FixtureSet{{
 		ID: "rar5-7-quickopen", WriterEra: "RAR 7.23", GeneratorToolchain: "rarlab-7.23",
+		Class:         BreadthFixtureClass,
 		ArchiveFormat: RAR5, Compressions: []Compression{Store}, Solid: []bool{false},
 		Encryptions: []Encryption{NoEncryption}, Payloads: []PayloadKind{IncompressiblePayload},
 		FileCount: 4, VolumeSize: "32m", QuickOpen: true,
@@ -162,6 +165,7 @@ func TestLegacyRAR4ArgsUseTheLockedWriterDefault(t *testing.T) {
 func TestBluRayLayoutDoesNotRequireUniformFileCount(t *testing.T) {
 	matrix := Matrix{SchemaVersion: 2, Sets: []FixtureSet{{
 		ID:                 "modern-rar5-bluray",
+		Class:              BreadthFixtureClass,
 		WriterEra:          "RAR 5.x-7.x compatibility",
 		GeneratorToolchain: "rarlab-7.23",
 		ArchiveFormat:      RAR5,
@@ -187,6 +191,7 @@ func TestBluRayLayoutDoesNotRequireUniformFileCount(t *testing.T) {
 func TestRepairProfilesAreExplicitFixtureCases(t *testing.T) {
 	matrix := Matrix{SchemaVersion: 2, Sets: []FixtureSet{{
 		ID:                 "repair-rar5",
+		Class:              BreadthFixtureClass,
 		WriterEra:          "RAR 7.23",
 		GeneratorToolchain: "rarlab-7.23",
 		ArchiveFormat:      RAR5,
@@ -210,5 +215,78 @@ func TestRepairProfilesAreExplicitFixtureCases(t *testing.T) {
 	}
 	if cases[1].RepairProfile != RARRecoveryVolumeHeavyProfile {
 		t.Fatalf("second repair profile = %q", cases[1].RepairProfile)
+	}
+}
+
+func TestFixtureSetRequiresAClass(t *testing.T) {
+	matrix := Matrix{
+		SchemaVersion: 2,
+		Sets: []FixtureSet{{
+			ID:                 "unclassed",
+			WriterEra:          "RAR 7.23",
+			GeneratorToolchain: "rarlab-7.23",
+			ArchiveFormat:      RAR5,
+			Compressions:       []Compression{Store},
+			Solid:              []bool{false},
+			Encryptions:        []Encryption{HeaderEncryption},
+			Payloads:           []PayloadKind{IncompressiblePayload},
+			FileCount:          1,
+			VolumeSize:         "32m",
+		}},
+	}
+	if _, err := matrix.Expand(); err == nil || !strings.Contains(err.Error(), "class") {
+		t.Fatalf("matrix without a class expanded: %v", err)
+	}
+	matrix.Sets[0].Class = FixtureClass("popular")
+	if _, err := matrix.Expand(); err == nil {
+		t.Fatal("matrix with an unknown class expanded")
+	}
+	matrix.Sets[0].Class = HeadlineFixtureClass
+	cases, err := matrix.Expand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) != 1 || cases[0].Class != HeadlineFixtureClass {
+		t.Fatalf("expanded case did not carry the set's class: %+v", cases)
+	}
+}
+
+func TestCheckedInMatrixClassesTheHeadlineAsStoredEncryptedRAR(t *testing.T) {
+	matrix, err := LoadMatrix("../../fixtures/matrix.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases, err := matrix.Expand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	headline := 0
+	for _, c := range cases {
+		if c.Class != HeadlineFixtureClass {
+			continue
+		}
+		headline++
+		if c.Compression != Store || c.ArchiveFormat == SevenZip || c.Payload != IncompressiblePayload || c.RepairProfile != CleanRepairProfile || c.FileCount != 1 {
+			t.Fatalf("headline fixture %s is not a stored, clean, single-movie RAR of incompressible media: %+v", c.ID, c)
+		}
+	}
+	if headline == 0 {
+		t.Fatal("checked-in matrix declares no headline fixtures")
+	}
+	// Every RARLAB writer era must have a headline lane with encrypted
+	// headers and one with data-only encryption, since encrypted stored RAR
+	// is what the headline class stands for.
+	for _, era := range []string{"rarlab-3.93", "rarlab-4.20", "rarlab-5.00", "rarlab-6.24", "rarlab-7.23"} {
+		for _, encryption := range []Encryption{HeaderEncryption, DataEncryption} {
+			found := false
+			for _, c := range cases {
+				if c.Class == HeadlineFixtureClass && c.GeneratorToolchain == era && c.Encryption == encryption {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no headline fixture for writer %s with %s encryption", era, encryption)
+			}
+		}
 	}
 }

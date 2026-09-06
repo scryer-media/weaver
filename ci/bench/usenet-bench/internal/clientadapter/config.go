@@ -131,7 +131,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	pollInterval, err := parseDurationDefault(getenv("CLIENT_POLL_INTERVAL"), 10*time.Millisecond, "CLIENT_POLL_INTERVAL")
+	pollInterval, err := parseDurationDefault(getenv("CLIENT_POLL_INTERVAL"), 100*time.Millisecond, "CLIENT_POLL_INTERVAL")
 	if err != nil {
 		return Config{}, err
 	}
@@ -381,7 +381,11 @@ func renderWeaver(c Config, _ bool) ProductSpec {
 		"WEAVER_DATA_DIR=/config/data",
 		"WEAVER_INTERMEDIATE_DIR=/downloads/incomplete",
 		"WEAVER_COMPLETE_DIR=/downloads/complete",
-		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
+		// Weaver deletes the archive volumes once extraction succeeds; that is
+		// its shipping default and what SABnzbd and NZBGet do after unpack, so
+		// every client pays for the same delete. Rendered explicitly so the audit
+		// record shows it.
+		"WEAVER_CLEANUP_AFTER_EXTRACT=true",
 		// Direct unpack (in-stream extraction of stored archives) is Weaver's
 		// shipping default from the release these benches accompany. It is
 		// rendered explicitly in BOTH profiles so the pinned image benches the
@@ -532,11 +536,14 @@ func renderNZBGet(c Config, directUnpack bool) ProductSpec {
 		}
 	}
 	direct := "no"
-	directWrite := "no"
 	if directUnpack {
 		direct = "yes"
-		directWrite = "yes"
 	}
+	// DirectWrite (writing decoded articles straight into the destination
+	// file instead of per-article temp files) is NZBGet's shipping default and
+	// is independent of direct unpack, so it stays on in both profiles; the
+	// profiles differ only in DirectUnpack.
+	const directWrite = "yes"
 	unpack := "yes"
 	parRepair := "yes"
 	unrarCommand := "unrar"

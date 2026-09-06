@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
 )
 
 func TestBuildSummaryReportRequiresCompleteVerifiedPairs(t *testing.T) {
@@ -276,8 +277,8 @@ func TestBuildSummaryReportPairsContainerCPUTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.SchemaVersion != 5 {
-		t.Fatalf("schema version %d, want 4", report.SchemaVersion)
+	if report.SchemaVersion != 6 {
+		t.Fatalf("schema version %d, want 6", report.SchemaVersion)
 	}
 	cpu := report.Comparisons[0].CPUTime
 	if cpu.Metric != "cpu_time_nanoseconds" || cpu.ComparisonWithheld != "" || cpu.Summary == nil {
@@ -400,22 +401,20 @@ func TestBuildSummaryReportWithholdsCPUTimeWithoutResourceMetrics(t *testing.T) 
 }
 
 func summaryTestDidNotFinishArtifact(client benchmark.Client, repetition int) benchmark.QueueArtifact {
-	artifact := summaryTestArtifact(client, repetition, 0)
-	artifact.Status = "completed_with_dnf"
-	artifact.Error = "1 queue job(s) did not finish"
-	artifact.AdapterResult.Jobs[0].TerminalStatus = "failed"
-	artifact.AdapterResult.Jobs[0].TerminalError = "Failed"
-	artifact.Jobs[0].AdapterResult = artifact.AdapterResult.Jobs[0]
-	artifact.Jobs[0].Outcome = "dnf"
-	artifact.Jobs[0].Verification = nil
-	artifact.Jobs[0].Error = "client terminal failure: Failed"
-	return artifact
+	return summaryTestDidNotFinishArtifactFor(summaryTestArtifact(client, repetition, 0))
 }
 
 func summaryTestArtifact(client benchmark.Client, repetition int, measurement int64) benchmark.QueueArtifact {
+	return summaryTestFixtureArtifact("fixture-a", fixture.HeadlineFixtureClass, client, repetition, measurement)
+}
+
+// summaryTestFixtureArtifact is summaryTestArtifact over a named fixture of a
+// declared class, the way the controller copies the class out of the fixture
+// manifest into every job artifact.
+func summaryTestFixtureArtifact(fixtureID string, class fixture.FixtureClass, client benchmark.Client, repetition int, measurement int64) benchmark.QueueArtifact {
 	run := benchmark.Run{
-		ID:               fmt.Sprintf("run-%s-%d", client, repetition),
-		FixtureID:        "fixture-a",
+		ID:               fmt.Sprintf("run-%s-%s-%d", fixtureID, client, repetition),
+		FixtureID:        fixtureID,
 		Client:           client,
 		ArchiveToolchain: benchmark.VanillaArchiveToolchain,
 		ExecutionTarget:  benchmark.DockerLinux,
@@ -458,11 +457,121 @@ func summaryTestArtifact(client benchmark.Client, repetition int, measurement in
 		},
 		Jobs: []benchmark.QueueJobArtifact{{
 			Run:           run,
+			FixtureClass:  class,
 			Outcome:       "completed",
 			Verification:  &benchmark.OutputVerification{FixtureID: run.FixtureID},
 			AdapterResult: adapterJob,
 		}},
 	}
+}
+
+func TestBuildSummaryReportAggregatesByFixtureClass(t *testing.T) {
+	// Two headline fixtures at different ratios and one breadth fixture. The
+	// headline figure must be the equal-weight geometric mean of the two
+	// per-fixture ratios, and the breadth fixture must never join it.
+	var artifacts []benchmark.QueueArtifact
+	for repetition := 1; repetition <= 20; repetition++ {
+		artifacts = append(artifacts,
+			summaryTestFixtureArtifact("head-a", fixture.HeadlineFixtureClass, benchmark.Weaver, repetition, 50),
+			summaryTestFixtureArtifact("head-a", fixture.HeadlineFixtureClass, benchmark.SABnzbd, repetition, 100),
+			summaryTestFixtureArtifact("head-b", fixture.HeadlineFixtureClass, benchmark.Weaver, repetition, 200),
+			summaryTestFixtureArtifact("head-b", fixture.HeadlineFixtureClass, benchmark.SABnzbd, repetition, 100),
+			summaryTestFixtureArtifact("wide-c", fixture.BreadthFixtureClass, benchmark.Weaver, repetition, 10),
+			summaryTestFixtureArtifact("wide-c", fixture.BreadthFixtureClass, benchmark.SABnzbd, repetition, 100),
+		)
+	}
+	report, err := buildSummaryReport(artifacts, nil, benchmark.SABnzbd, benchmark.Weaver, 20, 17, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Comparisons) != 3 || len(report.Aggregates) != 2 {
+		t.Fatalf("unexpected report shape: %d comparisons, %d aggregates", len(report.Comparisons), len(report.Aggregates))
+	}
+	for _, comparison := range report.Comparisons {
+		want := fixture.HeadlineFixtureClass
+		if comparison.Stratum.FixtureID == "wide-c" {
+			want = fixture.BreadthFixtureClass
+		}
+		if comparison.FixtureClass != want {
+			t.Fatalf("comparison for %s carries class %q, want %q", comparison.Stratum.FixtureID, comparison.FixtureClass, want)
+		}
+	}
+	byClass := make(map[fixture.FixtureClass]classAggregate)
+	for _, aggregate := range report.Aggregates {
+		byClass[aggregate.Stratum.FixtureClass] = aggregate
+	}
+	headline := byClass[fixture.HeadlineFixtureClass]
+	if headline.Summary == nil || headline.AggregateWithheld != "" || !reflect.DeepEqual(headline.FixturesCompared, []string{"head-a", "head-b"}) {
+		t.Fatalf("unexpected headline aggregate: %#v", headline)
+	}
+	// 0.5 and 2.0 at equal weight pool to exactly 1.0.
+	if got := headline.Summary.GeometricMeanRatio; got < 1-1e-9 || got > 1+1e-9 {
+		t.Fatalf("headline geometric mean = %v, want 1.0", got)
+	}
+	if headline.Summary.FixtureCount != 2 || headline.Summary.PairedBlocks != 40 || headline.Stratum.Profile != benchmark.ProfileStock {
+		t.Fatalf("unexpected headline aggregate accounting: %#v", headline.Summary)
+	}
+	breadth := byClass[fixture.BreadthFixtureClass]
+	if breadth.Summary == nil || !reflect.DeepEqual(breadth.FixturesCompared, []string{"wide-c"}) || breadth.Summary.GeometricMeanRatio < 0.1-1e-9 || breadth.Summary.GeometricMeanRatio > 0.1+1e-9 {
+		t.Fatalf("unexpected breadth aggregate: %#v", breadth)
+	}
+
+	// A fixture whose own comparison is withheld withholds its class figure
+	// and is named; the other class is untouched.
+	for index := range artifacts {
+		if artifacts[index].Jobs[0].Run.FixtureID == "wide-c" && artifacts[index].Jobs[0].Run.Client == benchmark.Weaver {
+			artifacts[index] = summaryTestDidNotFinishArtifactFor(artifacts[index])
+		}
+	}
+	report, err = buildSummaryReport(artifacts, nil, benchmark.SABnzbd, benchmark.Weaver, 20, 17, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byClass = make(map[fixture.FixtureClass]classAggregate)
+	for _, aggregate := range report.Aggregates {
+		byClass[aggregate.Stratum.FixtureClass] = aggregate
+	}
+	breadth = byClass[fixture.BreadthFixtureClass]
+	if breadth.Summary != nil || !strings.Contains(breadth.AggregateWithheld, "wide-c") || !reflect.DeepEqual(breadth.FixturesWithheld, []string{"wide-c"}) || len(breadth.FixturesCompared) != 0 {
+		t.Fatalf("breadth aggregate was not withheld for a did-not-finish fixture: %#v", breadth)
+	}
+	if headline = byClass[fixture.HeadlineFixtureClass]; headline.Summary == nil {
+		t.Fatalf("headline aggregate was disturbed by a breadth failure: %#v", headline)
+	}
+}
+
+func TestBuildSummaryReportRejectsArtifactsWithoutFixtureClass(t *testing.T) {
+	var artifacts []benchmark.QueueArtifact
+	for repetition := 1; repetition <= 20; repetition++ {
+		artifacts = append(artifacts,
+			summaryTestArtifact(benchmark.Weaver, repetition, int64(100+repetition)),
+			summaryTestArtifact(benchmark.SABnzbd, repetition, int64(80+repetition)),
+		)
+	}
+	artifacts[3].Jobs[0].FixtureClass = ""
+	if _, err := buildSummaryReport(artifacts, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil || !strings.Contains(err.Error(), "fixture class") {
+		t.Fatalf("summary accepted an artifact without a fixture class: %v", err)
+	}
+	artifacts[3].Jobs[0].FixtureClass = fixture.BreadthFixtureClass
+	if _, err := buildSummaryReport(artifacts, nil, benchmark.Weaver, benchmark.SABnzbd, 20, 17, 1_000); err == nil || !strings.Contains(err.Error(), "both") {
+		t.Fatalf("summary accepted one fixture recorded under two classes: %v", err)
+	}
+}
+
+// summaryTestDidNotFinishArtifactFor turns a finished artifact into the
+// did-not-finish record of the same run.
+func summaryTestDidNotFinishArtifactFor(artifact benchmark.QueueArtifact) benchmark.QueueArtifact {
+	artifact.Status = "completed_with_dnf"
+	artifact.Error = "1 queue job(s) did not finish"
+	artifact.AdapterResult.Jobs[0].TerminalStatus = "failed"
+	artifact.AdapterResult.Jobs[0].TerminalError = "Failed"
+	artifact.AdapterResult.Jobs[0].SubmissionToTerminalNanoseconds = 0
+	artifact.AdapterResult.Jobs[0].TerminalObservationUncertainty = 0
+	artifact.Jobs[0].AdapterResult = artifact.AdapterResult.Jobs[0]
+	artifact.Jobs[0].Outcome = "dnf"
+	artifact.Jobs[0].Verification = nil
+	artifact.Jobs[0].Error = "client terminal failure: Failed"
+	return artifact
 }
 
 // summaryTestArtifactWithCPU is summaryTestArtifact with a measured CPU

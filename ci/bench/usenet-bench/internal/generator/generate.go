@@ -23,40 +23,51 @@ import (
 )
 
 const (
-	// Ordinary RAR fixtures contain one substantial movie. The one fixture
-	// with multiple input movies uses the separate 48 MiB size below.
-	defaultBytesPerFile            int64 = 150 << 20
-	defaultMultiVolumeBytesPerFile int64 = 48 << 20
-	defaultBluRayLargeFile         int64 = 5 << 30
-	defaultBluRayMediumFile        int64 = 96 << 20
-	defaultBluRayMediumFileCount         = 8
-	defaultBluRaySmallFile         int64 = 128 << 10
-	defaultBluRaySmallFileCount          = 512
-	defaultGenerationWorkers             = 4
+	// Every benchmark fixture must post at least fixture.MinimumPostedBytes
+	// (300 MiB) of archive; smaller downloads finish in the time the clients
+	// spend starting up and settling, and the comparison then measures
+	// process launch rather than the pipeline. Ordinary fixtures contain one
+	// movie whose archive clears that floor on its own; the fixtures with
+	// four input movies use the per-movie size below so that their four
+	// archives together clear it.
+	defaultBytesPerFile            int64 = 320 << 20
+	defaultMultiVolumeBytesPerFile int64 = 80 << 20
+	// A compressible payload shrinks to roughly 62% (LZMA2) to 70% (RAR -m5)
+	// of its size at compressibleNoiseBits, so it starts larger to post an
+	// archive that clears the floor with margin: 576 MiB posts about 360 MiB
+	// through 7-Zip and about 400 MiB through RAR.
+	defaultCompressibleBytesPerFile int64 = 576 << 20
+	defaultBluRayLargeFile          int64 = 5 << 30
+	defaultBluRayMediumFile         int64 = 96 << 20
+	defaultBluRayMediumFileCount          = 8
+	defaultBluRaySmallFile          int64 = 128 << 10
+	defaultBluRaySmallFileCount           = 512
+	defaultGenerationWorkers              = 4
 )
 
 var canonicalFileTime = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
 
 type Config struct {
-	MatrixPath              string
-	ToolchainsPath          string
-	DockerfilePath          string
-	PAR2ToolchainPath       string
-	PAR2DockerfilePath      string
-	SevenZipToolchainPath   string
-	SevenZipDockerfilePath  string
-	OutputDir               string
-	DockerBinary            string
-	BytesPerFile            int64
-	MultiVolumeBytesPerFile int64
-	BluRayLargeFileBytes    int64
-	BluRayMediumFileBytes   int64
-	BluRayMediumFileCount   int
-	BluRaySmallFileBytes    int64
-	BluRaySmallFileCount    int
-	Workers                 int
-	CaseIDs                 map[string]bool
-	BuildImages             bool
+	MatrixPath               string
+	ToolchainsPath           string
+	DockerfilePath           string
+	PAR2ToolchainPath        string
+	PAR2DockerfilePath       string
+	SevenZipToolchainPath    string
+	SevenZipDockerfilePath   string
+	OutputDir                string
+	DockerBinary             string
+	BytesPerFile             int64
+	MultiVolumeBytesPerFile  int64
+	CompressibleBytesPerFile int64
+	BluRayLargeFileBytes     int64
+	BluRayMediumFileBytes    int64
+	BluRayMediumFileCount    int
+	BluRaySmallFileBytes     int64
+	BluRaySmallFileCount     int
+	Workers                  int
+	CaseIDs                  map[string]bool
+	BuildImages              bool
 }
 
 func (c Config) withDefaults() Config {
@@ -93,6 +104,9 @@ func (c Config) withDefaults() Config {
 	if c.MultiVolumeBytesPerFile == 0 {
 		c.MultiVolumeBytesPerFile = defaultMultiVolumeBytesPerFile
 	}
+	if c.CompressibleBytesPerFile == 0 {
+		c.CompressibleBytesPerFile = defaultCompressibleBytesPerFile
+	}
 	if c.BluRayLargeFileBytes == 0 {
 		c.BluRayLargeFileBytes = defaultBluRayLargeFile
 	}
@@ -115,7 +129,7 @@ func (c Config) withDefaults() Config {
 }
 
 func (c Config) Validate() error {
-	if c.BytesPerFile <= 0 || c.MultiVolumeBytesPerFile <= 0 {
+	if c.BytesPerFile <= 0 || c.MultiVolumeBytesPerFile <= 0 || c.CompressibleBytesPerFile <= 0 {
 		return fmt.Errorf("movie sizes must be positive")
 	}
 	if c.BluRayLargeFileBytes <= 0 || c.BluRaySmallFileBytes <= 0 || c.BluRaySmallFileCount < 1 {
@@ -386,6 +400,9 @@ func generateCase(
 	); err != nil {
 		return fixture.GeneratedManifest{}, err
 	}
+	if err := manifest.ValidatePostedSize(); err != nil {
+		return fixture.GeneratedManifest{}, fmt.Errorf("fixture %q: %w", archiveCase.ID, err)
+	}
 	if err := writeManifest(filepath.Join(caseDir, "fixture-manifest.json"), manifest); err != nil {
 		return fixture.GeneratedManifest{}, err
 	}
@@ -455,15 +472,22 @@ func writeUniformPayloadFiles(ctx context.Context, caseDir string, archiveCase f
 		digests = append(digests, fixture.FileDigest{Path: filepath.ToSlash(name), Size: digest.Size, BLAKE3: digest.BLAKE3})
 		inputs = append(inputs, filepath.ToSlash(filepath.Join("input", name)))
 	}
-	return digests, inputs, fixture.PayloadRecipe{
+	recipe := fixture.PayloadRecipe{
 		Layout:              fixture.UniformPayloadLayout,
 		UniformBytesPerFile: bytesPerFile,
-	}, nil
+	}
+	if archiveCase.Payload == fixture.CompressiblePayload {
+		recipe.SampleNoiseBits = compressibleNoiseBits
+	}
+	return digests, inputs, recipe, nil
 }
 
 func uniformMovieBytes(archiveCase fixture.ArchiveCase, config Config) int64 {
 	if archiveCase.FileCount > 1 {
 		return config.MultiVolumeBytesPerFile
+	}
+	if archiveCase.Payload == fixture.CompressiblePayload {
+		return config.CompressibleBytesPerFile
 	}
 	return config.BytesPerFile
 }
@@ -688,8 +712,7 @@ func writeIncompressible(writer io.Writer, size int64, stream uint64) error {
 
 // writeModeratelyCompressible emits four fresh pseudorandom 32 KiB blocks and
 // repeats one. The resulting 20% redundancy is enough to exercise RAR
-// compression while keeping a 192 MiB fixture near the intended 150–200 MiB
-// on-wire scale.
+// compression while keeping the archive close to the payload size.
 func writeModeratelyCompressible(writer io.Writer, size int64, stream uint64) error {
 	const (
 		blockSize    = 32 << 10

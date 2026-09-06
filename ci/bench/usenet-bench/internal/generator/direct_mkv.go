@@ -12,8 +12,8 @@ import (
 const (
 	// DirectMKVFixtureID is deliberately not an archive: it exercises each
 	// client's direct-download path and is the queue-transition workload.
-	DirectMKVFixtureID = "direct-mkv-200mb"
-	directMKVPath      = "archive/direct-200mb.mkv"
+	DirectMKVFixtureID = "direct-mkv"
+	directMKVPath      = "archive/direct.mkv"
 )
 
 // GenerateDirectMKV creates one valid H.264/AAC Matroska direct-download
@@ -59,6 +59,7 @@ func GenerateDirectMKV(ctx context.Context, config Config, size int64) (fixture.
 		Case: fixture.ArchiveCase{
 			ID:                 DirectMKVFixtureID,
 			SetID:              "direct-media",
+			Class:              fixture.BreadthFixtureClass,
 			WriterEra:          "not-applicable",
 			GeneratorToolchain: toolchain.ID,
 			Payload:            fixture.IncompressiblePayload,
@@ -71,6 +72,9 @@ func GenerateDirectMKV(ctx context.Context, config Config, size int64) (fixture.
 		SourceArchiveFiles: []fixture.FileDigest{file},
 		ArchiveFiles:       []fixture.FileDigest{file},
 		Repair:             fixture.RepairDetails{Profile: fixture.CleanRepairProfile},
+	}
+	if err := manifest.ValidatePostedSize(); err != nil {
+		return fixture.GeneratedManifest{}, fmt.Errorf("fixture %q: %w", DirectMKVFixtureID, err)
 	}
 	if err := writeManifest(filepath.Join(caseDir, "fixture-manifest.json"), manifest); err != nil {
 		return fixture.GeneratedManifest{}, err

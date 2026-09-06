@@ -80,11 +80,16 @@ type CorruptionDetail struct {
 type PayloadRecipe struct {
 	Layout              PayloadLayout `json:"layout"`
 	UniformBytesPerFile int64         `json:"uniform_bytes_per_file,omitempty"`
-	LargeFileBytes      int64         `json:"large_file_bytes,omitempty"`
-	MediumFileCount     int           `json:"medium_file_count,omitempty"`
-	MediumFileBytes     int64         `json:"medium_file_bytes,omitempty"`
-	SmallFileCount      int           `json:"small_file_count,omitempty"`
-	SmallFileBytes      int64         `json:"small_file_bytes,omitempty"`
+	// SampleNoiseBits is the width of the deterministic per-sample noise added
+	// to a compressible video payload after rendering; zero for every other
+	// payload. It is what sets a compressible archive's size, so it is part
+	// of the recipe.
+	SampleNoiseBits uint  `json:"sample_noise_bits,omitempty"`
+	LargeFileBytes  int64 `json:"large_file_bytes,omitempty"`
+	MediumFileCount int   `json:"medium_file_count,omitempty"`
+	MediumFileBytes int64 `json:"medium_file_bytes,omitempty"`
+	SmallFileCount  int   `json:"small_file_count,omitempty"`
+	SmallFileBytes  int64 `json:"small_file_bytes,omitempty"`
 }
 
 // ToolchainID is stored separately so reports identify both the requested
@@ -138,6 +143,32 @@ func LoadGeneratedManifest(path string) (GeneratedManifest, error) {
 		return GeneratedManifest{}, fmt.Errorf("fixture manifest %s: %w", path, err)
 	}
 	return manifest, nil
+}
+
+// MinimumPostedBytes is the smallest archive a benchmark fixture may post.
+// Below it a download finishes inside the clients' start-up and settle time
+// and the comparison measures process launch, not the pipeline. The generator
+// refuses to write a manifest under the floor and the controller refuses to
+// run one, so a corpus that predates the floor cannot produce a result.
+const MinimumPostedBytes int64 = 300 << 20
+
+// PostedBytes is the number of archive bytes the seeder actually posts:
+// ArchiveFiles only, since withheld files are listed in the NZB but never
+// reach the server.
+func (m GeneratedManifest) PostedBytes() int64 {
+	var total int64
+	for _, file := range m.ArchiveFiles {
+		total += file.Size
+	}
+	return total
+}
+
+// ValidatePostedSize fails a fixture that posts fewer than MinimumPostedBytes.
+func (m GeneratedManifest) ValidatePostedSize() error {
+	if posted := m.PostedBytes(); posted < MinimumPostedBytes {
+		return fmt.Errorf("fixture posts %d bytes (%.1f MiB); every benchmark fixture must post at least %d MiB — regenerate the corpus with the current fixturegen defaults", posted, float64(posted)/(1<<20), MinimumPostedBytes>>20)
+	}
+	return nil
 }
 
 // PostedFiles is every file the seeder gives the poster: the posted archive

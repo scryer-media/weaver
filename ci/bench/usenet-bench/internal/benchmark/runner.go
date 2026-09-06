@@ -81,6 +81,7 @@ type RunConfig struct {
 type RunArtifact struct {
 	SchemaVersion         int                   `json:"schema_version"`
 	Run                   Run                   `json:"run"`
+	FixtureClass          fixture.FixtureClass  `json:"fixture_class"`
 	Repair                fixture.RepairDetails `json:"repair"`
 	Status                string                `json:"status"`
 	AdapterResult         *AdapterResult        `json:"adapter_result,omitempty"`
@@ -337,7 +338,11 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 	defer func() {
 		persistRunArtifact(filepath.Join(runDir, "run.json"), &artifact)
 	}()
-	outputDir := filepath.Join(runDir, "complete")
+	// The client's intermediate and completion directories are siblings under
+	// one downloads directory so that, on local storage, the adapter can bind
+	// that single directory into the container and the client's final move
+	// stays a same-filesystem rename (see clientadapter.downloadMounts).
+	outputDir := filepath.Join(runDir, "downloads", "complete")
 	configDir := filepath.Join(runDir, "config")
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		artifact.Error = fmt.Sprintf("create completion directory: %v", err)
@@ -353,6 +358,11 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 		artifact.Error = err.Error()
 		return artifact
 	}
+	if err := manifest.ValidatePostedSize(); err != nil {
+		artifact.Error = fmt.Sprintf("fixture %s: %v", run.FixtureID, err)
+		return artifact
+	}
+	artifact.FixtureClass = manifest.Case.Class
 	artifact.Repair = manifest.Repair
 	nzbPath, err := fixtureNZBPath(fixtureDir, run.FixtureID)
 	if err != nil {

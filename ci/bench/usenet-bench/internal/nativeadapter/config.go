@@ -96,7 +96,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	pollInterval, err := parseDurationDefault(getenv("NATIVE_POLL_INTERVAL"), 10*time.Millisecond, "NATIVE_POLL_INTERVAL")
+	pollInterval, err := parseDurationDefault(getenv("NATIVE_POLL_INTERVAL"), 100*time.Millisecond, "NATIVE_POLL_INTERVAL")
 	if err != nil {
 		return Config{}, err
 	}

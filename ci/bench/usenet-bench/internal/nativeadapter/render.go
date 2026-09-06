@@ -47,7 +47,11 @@ func renderWeaver(cfg Config) productSpec {
 		"WEAVER_DATA_DIR=" + filepath.Join(cfg.ConfigDir, "data"),
 		"WEAVER_INTERMEDIATE_DIR=" + filepath.Join(cfg.ConfigDir, "incomplete"),
 		"WEAVER_COMPLETE_DIR=" + cfg.OutputDir,
-		"WEAVER_CLEANUP_AFTER_EXTRACT=false",
+		// Weaver deletes the archive volumes once extraction succeeds; that is
+		// its shipping default and what SABnzbd and NZBGet do after unpack, so
+		// every client pays for the same delete. Rendered explicitly so the audit
+		// record shows it.
+		"WEAVER_CLEANUP_AFTER_EXTRACT=true",
 		// Direct unpack (in-stream extraction of stored archives) is Weaver's
 		// shipping default from the release these benches accompany. It is
 		// rendered explicitly in BOTH profiles so the pinned client binary
@@ -165,11 +169,14 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 		}
 	}
 	direct := "no"
-	directWrite := "no"
 	if directUnpack {
 		direct = "yes"
-		directWrite = "yes"
 	}
+	// DirectWrite (writing decoded articles straight into the destination
+	// file instead of per-article temp files) is NZBGet's shipping default and
+	// is independent of direct unpack, so it stays on in both profiles; the
+	// profiles differ only in DirectUnpack.
+	const directWrite = "yes"
 	content := strings.Join([]string{
 		"MainDir=" + cfg.ConfigDir,
 		"DestDir=" + cfg.OutputDir,
