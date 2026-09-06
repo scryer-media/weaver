@@ -36,6 +36,7 @@ const SERVER_FIELD_DOWNLOAD_QUOTA_WEEKLY_RESET_WEEKDAY: &str =
     "DOWNLOAD_QUOTA_WEEKLY_RESET_WEEKDAY";
 const SERVER_FIELD_DOWNLOAD_QUOTA_MONTHLY_RESET_DAY: &str = "DOWNLOAD_QUOTA_MONTHLY_RESET_DAY";
 const SERVER_FIELD_TLS_CA_CERT: &str = "TLS_CA_CERT";
+const SERVER_FIELD_PIPELINING: &str = "PIPELINING";
 
 #[derive(Debug, Clone, Default)]
 pub struct EnvSeedConfig {
@@ -117,6 +118,7 @@ struct PartialServerSeed {
     download_quota_weekly_reset_weekday: Option<IspBandwidthCapWeekday>,
     download_quota_monthly_reset_day: Option<u8>,
     tls_ca_cert: Option<PathBuf>,
+    pipelining: Option<bool>,
 }
 
 pub fn parse_env_seed<I, K, V>(vars: I) -> Result<EnvSeedConfig, EnvSeedError>
@@ -307,6 +309,9 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
             SERVER_FIELD_TLS_CA_CERT => {
                 partial.tls_ca_cert = normalize_optional_string(value).map(PathBuf::from);
             }
+            SERVER_FIELD_PIPELINING => {
+                partial.pipelining = Some(parse_bool_value(key, value)?);
+            }
             _ => {
                 return Err(EnvSeedError::new(format!(
                     "unknown {SERVER_PREFIX} field {field:?} in {key}"
@@ -350,7 +355,10 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
             password: partial.password,
             connections,
             active: partial.active.unwrap_or(true),
-            supports_pipelining: false,
+            // Seeded servers are never probed for CAPABILITIES, so the
+            // pipelining flag the connectivity check would set is taken from
+            // the environment instead; unset keeps the sequential default.
+            supports_pipelining: partial.pipelining.unwrap_or(false),
             pipelining_depth: None,
             priority: partial.priority.unwrap_or(0),
             backfill: partial.backfill.unwrap_or(false),
@@ -568,10 +576,14 @@ mod tests {
             ("WEAVER_SERVER_2_PASSWORD", " pass "),
             ("WEAVER_SERVER_2_PRIORITY", "1"),
             ("WEAVER_SERVER_2_TLS_CA_CERT", "/etc/ssl/custom.pem"),
+            ("WEAVER_SERVER_2_PIPELINING", "true"),
         ])
         .unwrap();
 
         assert_eq!(seed.servers.len(), 2);
+        assert!(!seed.servers[0].supports_pipelining);
+        assert!(seed.servers[1].supports_pipelining);
+        assert_eq!(seed.servers[1].pipelining_depth, None);
         assert_eq!(seed.servers[0].port, 119);
         assert!(!seed.servers[0].tls);
         assert_eq!(seed.servers[0].connections, 4);
