@@ -76,7 +76,10 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# `test-util` for the paused clock: the health-probe reclaim tests assert on
+# multi-second timeout budgets, which only a mocked clock can settle without
+# either sleeping for real or trading determinism for speed.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 # `compress` pulls in the 7z writer, which only the direct-unpack read-pattern
 # tests need: they build their codec-matrix archives in-process rather than

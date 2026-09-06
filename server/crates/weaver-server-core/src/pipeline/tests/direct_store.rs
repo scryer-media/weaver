@@ -18891,3 +18891,113 @@ async fn a_damage_demotion_puts_the_set_on_record_and_an_ordinary_one_does_not()
         "the set the mismatch was found in goes on record by name"
     );
 }
+
+/// The direct-store twin of `the_last_decode_to_settle_retires_the_probe`.
+///
+/// A routed source article leaves `handle_decode_success` at its early return,
+/// ahead of the reorder buffer and the conventional file-complete seam, so
+/// nothing further along that path can notice the job has drained. The last
+/// article of a fully routed set is exactly the article an in-flight probe
+/// ends up waiting behind: the download result that carried it ran the drain
+/// sequence while it was still decoding, and the route itself schedules
+/// nothing. Left there, the job holds its completion checkpoint — and with it
+/// PAR2 recovery promotion — until the probe's own soft timeout expires.
+#[tokio::test]
+async fn the_last_routed_article_retires_the_probe() {
+    let member_name = "Silver.Horizon.S01E09.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 167) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
+    let articles = 2usize;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(410099);
+
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, articles);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let last_file_index = volumes.len() as u32 - 1;
+    let last_segment_number = articles as u32 - 1;
+    let last_segment = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: last_file_index,
+        },
+        segment_number: last_segment_number,
+    };
+
+    // Every article but the set's last one routes as it is dispatched.
+    for file_index in 0..volumes.len() as u32 {
+        for segment_number in 0..articles as u32 {
+            let segment_id = SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number,
+            };
+            take_queued_segment(&mut pipeline, job_id, segment_id);
+            if segment_id == last_segment {
+                continue;
+            }
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                &volumes,
+                file_index,
+                segment_number,
+                articles,
+            )
+            .await;
+        }
+    }
+
+    pipeline.activate_health_probes(job_id);
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert!(state.health_probing);
+        assert!(matches!(state.status, JobStatus::Checking));
+    }
+
+    let (filename, bytes) = &volumes[last_file_index as usize];
+    let (start, end) = article_extent(bytes.len(), last_segment_number, articles);
+    park_job_on_its_final_decode(&mut pipeline, last_segment, (end - start) as u64);
+
+    pipeline.maybe_finish_download_pass(job_id);
+    assert!(
+        pipeline.jobs.get(&job_id).unwrap().health_probing,
+        "an unsettled decode is pending download work: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    settle_queued_decode(
+        &mut pipeline,
+        last_segment.file_id,
+        last_segment_number,
+        start as u64,
+        &bytes[start..end],
+        filename,
+    )
+    .await;
+
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists()),
+        "the set must still be routing, not writing volumes — otherwise this \
+         test is not covering the routed early return"
+    );
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(
+        !state.health_probing,
+        "the routed article that settled last must retire the probe: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert!(
+        matches!(state.status, JobStatus::Downloading),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert!(
+        pipeline.pending_completion_checks.contains(&job_id),
+        "retiring the probe must hand the job straight to the completion \
+         checkpoint"
+    );
+}
