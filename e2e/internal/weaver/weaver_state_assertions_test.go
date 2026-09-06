@@ -1205,3 +1205,68 @@ func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t 
 		})
 	}
 }
+
+func TestAssertHealthProbeScenarioReadsTheProbeLines(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertion := &ScenarioHealthProbeAssertion{RequireActivated: true, ForbidInconclusive: true}
+
+	for _, test := range []struct {
+		name    string
+		lines   []string
+		wantErr string
+	}{
+		{
+			name: "an activated probe that concluded passes",
+			lines: []string{
+				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
+				`job_id=91 probe_round=0 probes=18 health probe starting`,
+				`job_id=91 total=18 missed=6 miss_pct=33 inconclusive=false health probe complete`,
+			},
+		},
+		{
+			name: "a retired probe passes: the round ended without a verdict of its own",
+			lines: []string{
+				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
+				`job_id=91 retiring health probe — every segment already reached a terminal state`,
+			},
+		},
+		{
+			name: "another job's inconclusive round is not this job's",
+			lines: []string{
+				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
+				`job_id=92 total=0 missed=0 miss_pct=0 inconclusive=true health probe complete`,
+			},
+		},
+		{
+			name:    "a probe that never activated fails",
+			lines:   []string{`job_id=91 health check: 33.3% failed`},
+			wantErr: "never activated",
+		},
+		{
+			name: "an inconclusive round fails",
+			lines: []string{
+				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
+				`health probe: confirmation batch inconclusive, aborting probe`,
+				`job_id=91 total=0 missed=0 miss_pct=0 inconclusive=true health probe complete`,
+			},
+			wantErr: "ended inconclusive",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := assertHealthProbeScenario(91, assertion)
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("assertion failed: %v", err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}

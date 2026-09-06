@@ -79,6 +79,23 @@ type ScenarioRuntimeAssertions struct {
 	DirectStore         *ScenarioDirectStoreAssertion         `json:"directStore,omitempty"`
 	DirectUnpack        *ScenarioDirectUnpackAssertion        `json:"directUnpack,omitempty"`
 	QueueLiveness       *ScenarioQueueLivenessAssertion       `json:"queueLiveness,omitempty"`
+	HealthProbe         *ScenarioHealthProbeAssertion         `json:"healthProbe,omitempty"`
+}
+
+// ScenarioHealthProbeAssertion pins how the health probe behaved on a job that
+// still completed. A job can finish with the right bytes after the probe sat
+// on its soft timeout for every article it could not sample, so the outcome
+// alone never sees that stall; the probe's own log lines do.
+type ScenarioHealthProbeAssertion struct {
+	// RequireActivated demands the probe actually ran for this job — the
+	// fixture's damage must be enough to cross the activation threshold, or
+	// the rest of the assertion is vacuous.
+	RequireActivated bool `json:"requireActivated,omitempty"`
+	// ForbidInconclusive fails the job if any probe round ended inconclusive:
+	// a confirmation batch that hit its transport deadline instead of getting
+	// an answer, which on a healthy server is the probe waiting on a lane it
+	// should have been handed.
+	ForbidInconclusive bool `json:"forbidInconclusive,omitempty"`
 }
 
 type ScenarioFileIdentityRewriteAssertion struct {
@@ -167,6 +184,13 @@ func (s *Scenario) queueLivenessAssertion() *ScenarioQueueLivenessAssertion {
 		return nil
 	}
 	return s.RuntimeAssertions.QueueLiveness
+}
+
+func (s *Scenario) healthProbeAssertion() *ScenarioHealthProbeAssertion {
+	if s == nil || s.RuntimeAssertions == nil {
+		return nil
+	}
+	return s.RuntimeAssertions.HealthProbe
 }
 
 type runtimePortState struct {
@@ -1154,6 +1178,7 @@ var canonicalFixtureSlugs = []string{
 	"direct-store-multi-member",
 	"direct-store-multivolume",
 	"direct-store-par2-repair",
+	"direct-store-par2-withheld-volume",
 	"direct-store-post-repair-queue-liveness",
 	"direct-store-quick-open",
 	"direct-store-rar4",
@@ -4214,7 +4239,9 @@ func assertDirectStoreEngagement(weaverURL string) error {
 // Archive sets in the canonical corpus built to route direct end to end. Kept
 // as a count rather than a list because the counters report finalized sets in
 // aggregate; par2-multi-set-archives contributes two independent sets.
-const directStoreArchiveSetCount = 12
+// direct-store-par2-withheld-volume counts: a volume nobody posted is created
+// by the repair and the set finalizes direct around it.
+const directStoreArchiveSetCount = 13
 
 // Demotion reasons that mean direct-store REFUSED an archive it is designed not
 // to carry. Refusal is the correct outcome and says nothing about health.

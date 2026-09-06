@@ -1,0 +1,23 @@
+{
+  "slug": "direct-store-par2-withheld-volume",
+  "title": "Sable.Harbor.S01E13.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR5 store-method set with `-hp` header and data encryption and PAR2 recovery heavy enough to rebuild a whole volume. Every article of an interior volume is deleted after posting, so the NZB lists a volume every server answers 430 for. The health probe activates on the failed bytes and must settle promptly once the download drains — never by burning its soft timeout — and PAR2 creates the volume from nothing while the set keeps routing direct.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "sable.harbor.s01e13.mkv": "8429318e0853b5fce79ec271761be369cdfbcf548f4391d9e5dd6c4e940edfe9"
+  },
+  "password": "weaver-e2e-direct-password",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "deleteSubjectContains": [
+    "archive.part2.rar"
+  ],
+  "runtimeAssertions": {
+    "healthProbe": {
+      "requireActivated": true,
+      "forbidInconclusive": true
+    }
+  }
+}

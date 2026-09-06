@@ -192,7 +192,7 @@ zip/tar/gzip/DEFLATE/zstd/bzip2/brotli by Go.
 | zip | `zip-unencrypted`, `zip-encrypted`, `zip-corrupted` | stored members; ZipCrypto for the encrypted one |
 | tar | `tar-archive`, `tar-corrupted`, `tgz-archive`, `tar-gzip-archive`, `tbz2-archive`, `tar-bzip2-archive`, `targz-archive`, `targz-corrupted` | ustar padded to GNU tar's 10 KiB blocking factor |
 | stream codec | `gzip-single`, `gzip-corrupted`, `deflate-single`, `bzip2-single`, `zstd-single`, `brotli-single` | bare streams, no container |
-| direct store | 6 slugs | stored, non-solid RAR sets the direct-store router must carry |
+| direct store | 13 slugs | stored, non-solid RAR sets the direct-store router must carry: eight clean shapes, four hole-repair sets (`-p`, `-hp`, RAR4 `-p`, plain) damaged by deleting an interior volume's tail articles, and `direct-store-par2-withheld-volume`, whose interior volume is deleted whole after posting so the NZB lists a volume every server answers 430 for — the health probe must settle without burning its soft timeout and the repair creates the volume from nothing |
 | mixed | `mixed-archive` | a RAR beside a loose clip and an NFO |
 | uuencode | `uu-release`, `uu-mixed-yenc`, `uu-preamble-tail`, `uu-missing-middle` | the only fixtures nyuu cannot post — it is a yEnc poster with no encoding selector — so their article bodies ship pre-encoded and the seeder posts them itself. uuenview writes the encoding and splits it at line boundaries; uudeview decodes every one back before it is published. `uu-preamble-tail` carries the corpus's one deliberate deviation from oracle output: an unpadded final group, the broken-encoder probe |
 

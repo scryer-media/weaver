@@ -205,6 +205,34 @@ func DirectStoreRecipes() []Recipe {
 		members: []directStoreMember{{"umber.tideline.s01e12.mkv", 24 << 20, "umber-tideline"}},
 	}
 	recipes = append(recipes, hpRepair.recipe(directStorePar2))
+
+	// A volume nobody can fetch. The scenario deletes every article of an
+	// interior volume after posting, so the NZB still lists it and every
+	// server answers 430 for all of it. Nothing of that volume is ever routed:
+	// the health probe activates on the failed bytes while the rest of the
+	// set is still streaming, and PAR2 has to create the volume from nothing
+	// and write every slice of it while the set keeps routing direct. The
+	// parity is heavier than the hole-repair sets because it must cover a
+	// whole 8 MiB volume, not a few tail articles. Headers and data are
+	// encrypted because that is the shape the bench first saw stall: a probe
+	// that had already sampled every article it could still sat on its soft
+	// timeout after the last decode settled.
+	withheldVolume := directStore{
+		slug:   "direct-store-par2-withheld-volume",
+		notes:  "Four stored RAR5 volumes with `-hp` header and data encryption and PAR2 recovery at 50% over four recovery files, enough to rebuild a whole volume. The scenario deletes every article of an interior volume after posting, so the NZB lists a volume every server answers 430 for: the health probe must activate and settle without burning its soft timeout, and the repair must create the volume from nothing while the set stays direct.",
+		writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m", headerPassword: DirectStorePassword,
+		members: []directStoreMember{{"sable.harbor.s01e13.mkv", 24 << 20, "sable-harbor"}},
+	}
+	withheldVolumePar2 := func(ctx context.Context, env *Env) error {
+		volumes, err := env.Outputs()
+		if err != nil {
+			return err
+		}
+		return env.PAR2(ctx, PAR2Spec{
+			Base: "archive.par2", RedundancyPercent: 50, RecoveryFiles: 4, Sources: volumes,
+		})
+	}
+	recipes = append(recipes, withheldVolume.recipe(withheldVolumePar2))
 	return recipes
 }
 
