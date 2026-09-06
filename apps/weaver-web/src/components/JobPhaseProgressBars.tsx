@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { Progress } from "@/components/ui/progress";
 import { formatSpeed } from "@/components/SpeedDisplay";
+import { useLiveJobDownloadRate } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { JobPhase, JobPhaseProgressData } from "@/lib/job-types";
 import { useExtractionVisibility } from "@/lib/hooks/use-extraction-visibility";
@@ -41,11 +42,19 @@ function phaseLabelKey(phase: JobPhase): string {
 }
 
 export function JobPhaseProgressBars({
+  jobId,
   phaseProgress,
   status,
   progress,
   compact = false,
 }: {
+  /**
+   * Lets the download-phase rate come from the live metrics push, the same
+   * one the nav speed counter reads, instead of the queue item. Without it
+   * the label shows the queue item's rate, which lags that push by up to a
+   * second.
+   */
+  jobId?: number | null;
   phaseProgress?: JobPhaseProgressData[] | null;
   status?: string | null;
   /** Normalized job progress in the 0–1 range. */
@@ -53,6 +62,7 @@ export function JobPhaseProgressBars({
   compact?: boolean;
 }) {
   const t = useTranslate();
+  const liveDownloadRate = useLiveJobDownloadRate(jobId);
   const phases = useMemo(() => phaseProgress ?? [], [phaseProgress]);
   const extractionVisible = useExtractionVisibility(phases);
 
@@ -87,7 +97,11 @@ export function JobPhaseProgressBars({
       {visible.map((phase) => {
         const pct = clampPercent(phase.progressPercent);
         const label = t(phaseLabelKey(phase.phase));
-        const rate = phase.rateBps && phase.rateBps > 0 ? formatSpeed(phase.rateBps) : null;
+        const rateBps =
+          phase.phase === "DOWNLOADING" && liveDownloadRate !== undefined
+            ? liveDownloadRate
+            : phase.rateBps;
+        const rate = rateBps && rateBps > 0 ? formatSpeed(rateBps) : null;
         return (
           <div key={phase.phase} className="space-y-1">
             <div className="flex items-center justify-between gap-2 text-[10px] font-medium text-muted-foreground">

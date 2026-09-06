@@ -9,6 +9,12 @@ import {
 } from "react";
 import type { JobData } from "@/lib/job-types";
 import type { GraphqlConnectionStatus } from "@/graphql/client";
+import {
+  createLiveJobDownloadRatesStore,
+  type JobDownloadRate,
+  type LiveJobDownloadRate,
+  type LiveJobDownloadRatesStore,
+} from "@/lib/live-job-download-rates";
 
 export interface LiveConnectionState {
   status: GraphqlConnectionStatus;
@@ -91,6 +97,9 @@ function createLiveJobsStore(initialJobs: JobData[] = EMPTY_JOBS): LiveJobsStore
 }
 
 const LiveJobsStoreContext = createContext<LiveJobsStore>(createLiveJobsStore());
+const LiveJobDownloadRatesStoreContext = createContext<LiveJobDownloadRatesStore>(
+  createLiveJobDownloadRatesStore(),
+);
 const LiveJobsContext = createContext<JobData[]>(EMPTY_JOBS);
 const LiveSpeedContext = createContext(0);
 const LivePauseStateContext = createContext(false);
@@ -103,27 +112,43 @@ export function LiveDataProvider({
   isPaused,
   downloadBlock,
   connection,
+  jobDownloadRates,
   children,
-}: LiveData & { children: ReactNode }) {
+}: LiveData & {
+  /**
+   * Per-job download rates from the same push as `speed`. Leave undefined
+   * when the snapshot in hand did not carry them (polled fallback), so rows
+   * fall back to the rate on their queue item.
+   */
+  jobDownloadRates?: readonly JobDownloadRate[];
+  children: ReactNode;
+}) {
   const [jobsStore] = useState(() => createLiveJobsStore(jobs));
+  const [ratesStore] = useState(() => createLiveJobDownloadRatesStore());
 
   useLayoutEffect(() => {
     jobsStore.setJobs(jobs);
   }, [jobs, jobsStore]);
 
+  useLayoutEffect(() => {
+    ratesStore.setRates(jobDownloadRates);
+  }, [jobDownloadRates, ratesStore]);
+
   return (
     <LiveJobsStoreContext.Provider value={jobsStore}>
-      <LiveJobsContext.Provider value={jobs}>
-        <LiveSpeedContext.Provider value={speed}>
-          <LivePauseStateContext.Provider value={isPaused}>
-            <LiveDownloadBlockContext.Provider value={downloadBlock}>
-              <LiveConnectionContext.Provider value={connection}>
-                {children}
-              </LiveConnectionContext.Provider>
-            </LiveDownloadBlockContext.Provider>
-          </LivePauseStateContext.Provider>
-        </LiveSpeedContext.Provider>
-      </LiveJobsContext.Provider>
+      <LiveJobDownloadRatesStoreContext.Provider value={ratesStore}>
+        <LiveJobsContext.Provider value={jobs}>
+          <LiveSpeedContext.Provider value={speed}>
+            <LivePauseStateContext.Provider value={isPaused}>
+              <LiveDownloadBlockContext.Provider value={downloadBlock}>
+                <LiveConnectionContext.Provider value={connection}>
+                  {children}
+                </LiveConnectionContext.Provider>
+              </LiveDownloadBlockContext.Provider>
+            </LivePauseStateContext.Provider>
+          </LiveSpeedContext.Provider>
+        </LiveJobsContext.Provider>
+      </LiveJobDownloadRatesStoreContext.Provider>
     </LiveJobsStoreContext.Provider>
   );
 }
@@ -144,6 +169,20 @@ export function useLiveJob(jobId: number | null | undefined): JobData | null {
 
 export function useLiveSpeed(): number {
   return useContext(LiveSpeedContext);
+}
+
+/**
+ * The job's download rate from the same push, and the same server tick, as
+ * `useLiveSpeed`. Re-renders only when this job's figure changes.
+ */
+export function useLiveJobDownloadRate(jobId: number | null | undefined): LiveJobDownloadRate {
+  const ratesStore = useContext(LiveJobDownloadRatesStoreContext);
+
+  return useSyncExternalStore(
+    ratesStore.subscribe,
+    () => ratesStore.getRate(jobId),
+    () => undefined,
+  );
 }
 
 export function useLivePaused(): boolean {

@@ -31,6 +31,7 @@ import { Sparkline } from "@/components/ui/sparkline";
 import { UploadModal } from "@/components/UploadModal";
 import { useSpeedHistory } from "@/lib/hooks/use-speed-history";
 import { LiveDataProvider, type DownloadBlockState } from "@/lib/context/live-data-context";
+import type { JobDownloadRate } from "@/lib/live-job-download-rates";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import type { JobData } from "@/lib/job-types";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -71,6 +72,12 @@ interface LiveMetricsSnapshot {
   globalState: GlobalQueueState["globalState"];
   /** Only carried by the live subscription; the polled query omits it. */
   providerHoldoffs?: ProviderHoldoff[];
+  /**
+   * Per-job download rates sampled with `currentDownloadSpeed`. Only carried
+   * by the live subscription; while polling, queue rows fall back to the rate
+   * on their queue item.
+   */
+  jobDownloadRates?: JobDownloadRate[];
 }
 
 const EMPTY_JOBS: JobData[] = [];
@@ -298,6 +305,7 @@ export function Layout() {
     () => ({
       jobs: EMPTY_JOBS,
       speed: metricsSnapshot?.metrics?.currentDownloadSpeed ?? 0,
+      jobDownloadRates: metricsSnapshot?.jobDownloadRates,
       isPaused: currentGlobalState.isPaused,
       downloadBlock: liveDownloadBlock,
       connection: liveConnection,
@@ -306,6 +314,7 @@ export function Layout() {
       currentGlobalState.isPaused,
       liveConnection,
       liveDownloadBlock,
+      metricsSnapshot?.jobDownloadRates,
       metricsSnapshot?.metrics?.currentDownloadSpeed,
     ],
   );
@@ -396,6 +405,7 @@ export function Layout() {
     <LiveDataProvider
       jobs={liveData.jobs}
       speed={liveData.speed}
+      jobDownloadRates={liveData.jobDownloadRates}
       isPaused={liveData.isPaused}
       downloadBlock={liveData.downloadBlock}
       connection={liveData.connection}

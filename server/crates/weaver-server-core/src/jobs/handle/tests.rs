@@ -970,3 +970,76 @@ fn job_cancellation_callbacks_fire_before_scheduler_work_and_can_be_cleared() {
     );
     assert!(late_cancelled.load(Ordering::Acquire));
 }
+
+#[test]
+fn job_download_rates_report_only_transferring_download_phases() {
+    use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress};
+
+    fn phase(phase: JobPhase, rate_bps: Option<u64>) -> JobPhaseProgress {
+        JobPhaseProgress {
+            phase,
+            completed_bytes: 0,
+            total_bytes: 100,
+            progress_percent: 0.0,
+            rate_bps,
+            estimated_remaining_ms: None,
+            started_at_epoch_ms: 0.0,
+            updated_at_epoch_ms: 0.0,
+        }
+    }
+
+    fn info(job_id: u64, phase_progress: Vec<JobPhaseProgress>) -> JobInfo {
+        JobInfo {
+            job_id: JobId(job_id),
+            job_hash: None,
+            name: format!("job-{job_id}"),
+            status: JobStatus::Downloading,
+            download_state: crate::jobs::model::DownloadState::Downloading,
+            finalizing_download: false,
+            fetching_repair_data: false,
+            post_state: crate::jobs::model::PostState::Idle,
+            run_state: crate::jobs::model::RunState::Active,
+            progress: 0.0,
+            total_bytes: 100,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            phase_progress,
+            failed_bytes: 0,
+            health: 1000,
+            terminal_discards: Vec::new(),
+            total_files: 0,
+            completed_files: 0,
+            remaining_par_files: 0,
+            password: None,
+            category: None,
+            metadata: Vec::new(),
+            output_dir: None,
+            error: None,
+            download_wait_reason: None,
+            download_retry_at_epoch_ms: None,
+            created_at_epoch_ms: 0.0,
+        }
+    }
+
+    let jobs = vec![
+        info(1, vec![phase(JobPhase::Downloading, Some(61_000_000))]),
+        // Still inside the rate warm-up: no figure yet, so no entry.
+        info(2, vec![phase(JobPhase::Downloading, None)]),
+        // A repair rate is not a download rate.
+        info(3, vec![phase(JobPhase::Repairing, Some(5_000_000))]),
+        info(4, Vec::new()),
+        info(
+            5,
+            vec![
+                phase(JobPhase::Extracting, Some(9)),
+                phase(JobPhase::Downloading, Some(1_000)),
+            ],
+        ),
+    ];
+
+    assert_eq!(
+        job_download_rates(&jobs),
+        vec![(JobId(1), 61_000_000), (JobId(5), 1_000)]
+    );
+}

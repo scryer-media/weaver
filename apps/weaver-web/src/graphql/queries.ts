@@ -922,6 +922,10 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
         label
         untilEpochMs
       }
+      jobDownloadRates {
+        jobId
+        rateBps
+      }
     }
   }
   ${DOWNLOAD_BLOCK_FIELDS}

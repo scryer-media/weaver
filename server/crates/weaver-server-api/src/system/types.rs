@@ -405,6 +405,21 @@ pub struct SystemMetricsSnapshot {
     pub global_state: GlobalQueueState,
     /// Servers currently refusing new connections as over their limit.
     pub provider_holdoffs: Vec<ProviderHoldoff>,
+    /// Download rate of every job currently transferring, sampled on the same
+    /// tick and pushed on the same cadence as `metrics.currentDownloadSpeed`.
+    /// A queue row that reads its rate from here cannot drift from the global
+    /// gauge the way the event-driven queue item, published at most once a
+    /// second, always did.
+    pub job_download_rates: Vec<JobDownloadRate>,
+}
+
+/// The download-phase rate of one job, from the same estimator and the same
+/// instant as the global speed gauge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct JobDownloadRate {
+    pub job_id: u64,
+    /// Bytes per second, rounded the way the global gauge rounds.
+    pub rate_bps: u64,
 }
 
 /// A server whose provider rejected a fresh connection; weaver stops opening

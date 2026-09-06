@@ -505,10 +505,12 @@ const QueueCompactStatusDots = memo(function QueueCompactStatusDots({
 });
 
 const QueueProgressCell = memo(function QueueProgressCell({
+  jobId,
   phaseProgress,
   status,
   progress,
 }: {
+  jobId: JobData["id"];
   phaseProgress: JobData["phaseProgress"];
   status: JobData["status"];
   progress: JobData["progress"];
@@ -517,6 +519,7 @@ const QueueProgressCell = memo(function QueueProgressCell({
     <div className="flex justify-center">
       <div className="w-full max-w-[176px]">
         <JobPhaseProgressBars
+          jobId={jobId}
           phaseProgress={phaseProgress}
           status={status}
           progress={progress}
@@ -1419,6 +1422,7 @@ export function JobList() {
         ),
         cell: ({ row }) => (
           <QueueProgressCell
+            jobId={row.original.id}
             phaseProgress={row.original.phaseProgress}
             status={row.original.status}
             progress={row.original.progress}
@@ -2195,6 +2199,7 @@ export function JobList() {
                       <div className="hidden min-w-[130px] flex-1 max-xl:col-span-2 max-xl:col-start-2 max-xl:min-w-0 max-xl:pt-1 max-xl:block sm:block">
                         <JobPhaseProgressBars
                           compact
+                          jobId={job.id}
                           phaseProgress={job.phaseProgress}
                           progress={job.progress}
                           status={job.status}

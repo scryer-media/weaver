@@ -632,6 +632,18 @@ type JobDetailSnapshot {
 	jobEvents: [JobEvent!]!
 }
 
+"""
+The download-phase rate of one job, from the same estimator and the same
+instant as the global speed gauge.
+"""
+type JobDownloadRate {
+	jobId: Int!
+	"""
+	Bytes per second, rounded the way the global gauge rounds.
+	"""
+	rateBps: Int!
+}
+
 type JobEvent {
 	kind: EventKind!
 	jobId: Int!
@@ -2356,6 +2368,14 @@ type SystemMetricsSnapshot {
 	Servers currently refusing new connections as over their limit.
 	"""
 	providerHoldoffs: [ProviderHoldoff!]!
+	"""
+	Download rate of every job currently transferring, sampled on the same
+	tick and pushed on the same cadence as `metrics.currentDownloadSpeed`.
+	A queue row that reads its rate from here cannot drift from the global
+	gauge the way the event-driven queue item, published at most once a
+	second, always did.
+	"""
+	jobDownloadRates: [JobDownloadRate!]!
 }
 
 type SystemStatus {

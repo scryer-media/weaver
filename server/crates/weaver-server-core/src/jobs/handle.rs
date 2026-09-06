@@ -171,6 +171,17 @@ impl SharedPipelineState {
         self.jobs.read().unwrap().clone()
     }
 
+    /// Live download rate of every transferring job, read off the published
+    /// job list in place.
+    ///
+    /// Off the pipeline entirely: it takes the read side of the lock the
+    /// orchestrator already writes on its 100 ms tick and copies nothing but
+    /// `(job id, rate)` pairs, so a metrics subscriber sampling it every
+    /// 250 ms costs less than the job-list clone the queue readers make.
+    pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
+        job_download_rates(&self.jobs.read().unwrap())
+    }
+
     pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
         self.jobs
             .read()
@@ -680,6 +691,22 @@ pub enum SchedulerCommand {
     Shutdown,
 }
 
+/// One `(job, bytes per second)` pair per job whose download phase currently
+/// reports a rate. The rate is the value `sample_phase_progress` published for
+/// that job on the metrics tick, so it is the same estimator and the same
+/// instant as the global speed gauge.
+pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
+    jobs.iter()
+        .filter_map(|job| {
+            job.phase_progress
+                .iter()
+                .find(|phase| phase.phase == crate::jobs::phase_progress::JobPhase::Downloading)
+                .and_then(|phase| phase.rate_bps)
+                .map(|rate_bps| (job.job_id, rate_bps))
+        })
+        .collect()
+}
+
 /// Summary info about a job (returned by queries).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInfo {
@@ -983,6 +1010,12 @@ impl SchedulerHandle {
     /// List all jobs (reads from shared state, no channel round-trip).
     pub fn list_jobs(&self) -> Vec<JobInfo> {
         self.state.list_jobs()
+    }
+
+    /// Download rate of every transferring job (reads from shared state, no
+    /// channel round-trip). See [`SharedPipelineState::job_download_rates`].
+    pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
+        self.state.job_download_rates()
     }
 
     /// Get current metrics (reads from shared state, no channel round-trip).

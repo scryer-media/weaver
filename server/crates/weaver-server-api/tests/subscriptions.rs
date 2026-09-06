@@ -298,7 +298,7 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
     let h = TestHarness::new().await;
 
     let request = Request::new(
-        "subscription { systemMetricsUpdates { metrics { currentDownloadSpeed } globalState { isPaused } } }",
+        "subscription { systemMetricsUpdates { metrics { currentDownloadSpeed } globalState { isPaused } jobDownloadRates { jobId rateBps } } }",
     )
     .data(CallerScope::Read);
     let mut stream = h.schema.execute_stream(request);
@@ -313,6 +313,13 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
         !first_data["systemMetricsUpdates"]["globalState"]["isPaused"]
             .as_bool()
             .unwrap()
+    );
+    assert!(
+        first_data["systemMetricsUpdates"]["jobDownloadRates"]
+            .as_array()
+            .expect("job download rates ride the metrics snapshot")
+            .is_empty(),
+        "an idle queue reports no per-job rate"
     );
 
     h.metrics
