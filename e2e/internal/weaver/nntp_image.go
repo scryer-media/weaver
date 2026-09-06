@@ -17,7 +17,7 @@ const (
 	// harness builds its NNTP image from when E2E_NNTP_MODULE_VERSION is unset.
 	// It is fetched as a public Go module; nothing here depends on a checkout
 	// sitting anywhere on the machine.
-	weaverNNTPDefaultModuleVersion = "v0.1.0"
+	weaverNNTPDefaultModuleVersion = "v0.1.1"
 )
 
 // weaverNNTPModuleVersion is the pinned e2e-nntp module version in effect.
@@ -52,9 +52,11 @@ func ensureLocalWeaverNNTPImage() error {
 	force := envBool("E2E_FORCE_REBUILD_NNTP_IMAGE", false) ||
 		envBool("E2E_FORCE_REBUILD_E2E_INFRA_IMAGES", false)
 	// A pinned module version is reproducible, so an existing local image can
-	// be reused; a source-directory build is a developer override whose bytes
-	// can change between runs, so it is always rebuilt.
-	if !force && sourceDir == "" && dockerImageExists(image) {
+	// be reused — but only when it was built from that same version, or a pin
+	// bump would keep running the stale server; a source-directory build is a
+	// developer override whose bytes can change between runs, so it is always
+	// rebuilt.
+	if !force && sourceDir == "" && dockerImageVersion(image) == version {
 		setEnv(weaverNNTPPreparedEnv, "1")
 		log.Printf("reusing pinned Weaver NNTP image: %s (%s)", image, version)
 		return nil
@@ -70,6 +72,37 @@ func ensureLocalWeaverNNTPImage() error {
 	setEnv(weaverNNTPPreparedEnv, "1")
 	log.Printf("built current Weaver NNTP fixture image: %s", image)
 	return nil
+}
+
+// dockerImageVersion reads the OCI version label the e2e-nntp image builder
+// stamps on every image. A missing image or an unlabeled one reports "", which
+// never matches a pinned version and so forces a rebuild.
+func dockerImageVersion(image string) string {
+	if strings.TrimSpace(image) == "" {
+		return ""
+	}
+	cmd := exec.Command("docker", "image", "inspect", "--format", `{{index .Config.Labels "org.opencontainers.image.version"}}`, image)
+	cmd.Dir = e2eDir()
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// dockerImageID returns the content-addressed id of a local image, or "" when
+// it does not exist.
+func dockerImageID(image string) string {
+	if strings.TrimSpace(image) == "" {
+		return ""
+	}
+	cmd := exec.Command("docker", "image", "inspect", "--format", "{{.Id}}", image)
+	cmd.Dir = e2eDir()
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func weaverNNTPImageBuildCommand(image string) (*exec.Cmd, error) {

@@ -215,7 +215,7 @@ Docker path.
 | `E2E_WEAVER_REPO` | parent of `E2E_DIR` | Weaver source tree for `cargo build` and the local image build |
 | `E2E_PROJECT` | `e2e` | Compose project name for the current run |
 | `E2E_WEAVER_IMAGE` | `ghcr.io/scryer-media/weaver:latest` | Weaver image for shared-stack runs; unset builds `weaver-e2e-weaver:local` from `E2E_WEAVER_REPO` |
-| `E2E_NNTP_MODULE_VERSION` | `v0.1.0` | Published `e2e-nntp` module version the fake NNTP image is built from |
+| `E2E_NNTP_MODULE_VERSION` | `v0.1.1` | Published `e2e-nntp` module version the fake NNTP image is built from |
 | `E2E_NNTP_SOURCE_DIR` | unset | Developer override: build the fake NNTP image from this local module root instead. Never guessed; a missing directory is an error |
 | `E2E_NNTP_PIPELINING` / `E2E_NNTP2_PIPELINING` | `0` | Advertise RFC 4644 `PIPELINING` per fake server |
 | `E2E_FIXTURES` | `auto` | How missing fixtures are obtained before seeding: `auto` fetches from the published corpus then generates what is still missing; `fetch` never generates; `off` does nothing |

@@ -65,10 +65,16 @@ func nntpSeedImageTag(profile, role, fingerprint string) string {
 // nntpSeedCorpusFingerprint uses the ledger and the selected scenarios rather
 // than walking payload bytes. sources.json carries the generated payload
 // digests, making this check quick even when the corpus itself is large.
+//
+// The fake server the corpus is baked on top of is an input too: a seeded
+// image is a snapshot of one server build plus one corpus, so bumping the
+// e2e-nntp pin without moving the fingerprint would keep every phase running
+// the previous server from cache.
 func nntpSeedCorpusFingerprint(profile string, slugs []string) (string, error) {
 	hash := sha256.New()
-	writeNntpSeedFingerprintInput(hash, "format", []byte("nntp-seed-image-v2"))
+	writeNntpSeedFingerprintInput(hash, "format", []byte("nntp-seed-image-v3"))
 	writeNntpSeedFingerprintInput(hash, "profile", []byte(profile))
+	writeNntpSeedFingerprintInput(hash, "server", []byte(nntpSeedServerIdentity()))
 
 	for _, relative := range []string{
 		"test-corpus/sources.json",
@@ -98,6 +104,23 @@ func nntpSeedCorpusFingerprint(profile string, slugs []string) (string, error) {
 	}
 
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// nntpSeedServerIdentity names the fake-server build a seeded image is derived
+// from, independent of the seeded tags a parent phase may already have put in
+// E2E_NNTP_IMAGE. A pinned module version identifies itself; an explicit base
+// image override is named as given; a source-directory build is identified by
+// the image it produced, since its bytes are whatever the tree holds.
+func nntpSeedServerIdentity() string {
+	if sourceDir := strings.TrimSpace(os.Getenv("E2E_NNTP_SOURCE_DIR")); sourceDir != "" {
+		return "source-dir:" + sourceDir + ":" + dockerImageID(weaverNNTPDefaultImage)
+	}
+	if image := strings.TrimSpace(os.Getenv("E2E_NNTP_IMAGE")); image != "" &&
+		image != weaverNNTPDefaultImage &&
+		!strings.HasPrefix(image, nntpSeedImageRepository+":corpus-") {
+		return "image:" + image
+	}
+	return "module:" + weaverNNTPModuleVersion()
 }
 
 func writeNntpSeedFingerprintInput(writer io.Writer, label string, contents []byte) {
