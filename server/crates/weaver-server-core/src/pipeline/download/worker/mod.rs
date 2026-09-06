@@ -339,6 +339,14 @@ impl Pipeline {
             self.publish_hot_dispatch_metrics(now);
             return;
         }
+        if self.nntp_handoff_draining {
+            // The previous pool's sockets are still open at the provider; a
+            // dial now competes with them for the same allowance. The drain
+            // completion dispatches (see `handle_nntp_handoff_drained`).
+            self.hot_share_yield_signal.clear();
+            self.publish_hot_dispatch_metrics(now);
+            return;
+        }
         if let Err(error) = self.refresh_bandwidth_cap_window() {
             error!(error = %error, "failed to refresh ISP bandwidth cap state");
             self.hot_share_yield_signal.clear();

@@ -2784,6 +2784,12 @@ pub struct Pipeline {
     /// freed connection was handed back out. Setting this makes the park
     /// itself the wake, with no timer to poll.
     pub(super) download_dispatch_wake: bool,
+    /// A `RebuildNntp` has activated a new pool whose predecessor still holds
+    /// sockets at the provider. Fresh dials wait until the old generation has
+    /// drained: the provider counts both generations against one allowance,
+    /// so a dial now would be refused as over the limit and park the new pool
+    /// — a healthy server — for the whole holdoff window.
+    pub(super) nntp_handoff_draining: bool,
     /// User-enabled over-max burst budget for latent-IP replacement trials.
     pub(super) ip_replacement_trial_extra_connections: u8,
     /// Bounded per-server/per-IP BODY RTT EWMA state.
@@ -3036,6 +3042,10 @@ pub struct Pipeline {
     /// Channel for health probe results: (job_id, total_probes, missed_count).
     pub(super) probe_result_tx: mpsc::Sender<ProbeUpdate>,
     pub(super) probe_result_rx: mpsc::Receiver<ProbeUpdate>,
+    /// The generation whose predecessor pool finished draining; see
+    /// `nntp_handoff_draining`.
+    pub(super) nntp_handoff_drained_tx: mpsc::Sender<u64>,
+    pub(super) nntp_handoff_drained_rx: mpsc::Receiver<u64>,
     /// Channel for background extraction results.
     pub(super) extract_done_tx: mpsc::Sender<ExtractionDone>,
     pub(super) extract_done_rx: mpsc::Receiver<ExtractionDone>,

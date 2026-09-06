@@ -126,6 +126,7 @@ impl Pipeline {
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
+        let (nntp_handoff_drained_tx, nntp_handoff_drained_rx) = mpsc::channel(4);
         let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
         let (rar_refresh_done_tx, rar_refresh_done_rx) = mpsc::channel(32);
         let (rar_capacity_retry_tx, rar_capacity_retry_rx) = mpsc::channel(32);
@@ -206,6 +207,7 @@ impl Pipeline {
             download_lane_runtime: DownloadLaneRuntimeState::default(),
             deferred_lane_refills: std::collections::VecDeque::new(),
             download_dispatch_wake: false,
+            nntp_handoff_draining: false,
             ip_replacement_trial_extra_connections,
             ip_rtt_ewma: HashMap::new(),
             ip_replacement_retired_ips: HashSet::new(),
@@ -325,6 +327,8 @@ impl Pipeline {
             job_stage_started_at: HashMap::new(),
             probe_result_tx,
             probe_result_rx,
+            nntp_handoff_drained_tx,
+            nntp_handoff_drained_rx,
             extract_done_tx,
             extract_done_rx,
             rar_refresh_done_tx,
@@ -1002,6 +1006,9 @@ impl Pipeline {
                     }
                     Some(update) = self.probe_result_rx.recv() => {
                         self.handle_probe_update(update);
+                    }
+                    Some(generation) = self.nntp_handoff_drained_rx.recv() => {
+                        self.handle_nntp_handoff_drained(generation);
                     }
                     Some(done) = self.extract_done_rx.recv() => {
                         self.handle_extraction_done(done).await;
