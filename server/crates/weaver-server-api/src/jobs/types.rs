@@ -1537,6 +1537,24 @@ fn resolve_queue_item_state(
         return state;
     }
 
+    // The delivery tail runs strictly after the download lane settles: the
+    // final move is gated on the terminal delivery census, and post-processing
+    // follows it. The pipeline still force-projects `download_state =
+    // Downloading` whenever any download-side signal is live for the job, and
+    // that signal can outlive the gate (a hot dispatch slot still naming the
+    // last job in the queue, say) — scheduler residue, not work. Without this
+    // arm the row reads DOWNLOADING for the whole move while its progress bar
+    // reads "Moving". Download accounting keeps the overlap projection.
+    if include_finalization_states {
+        match info.post_state {
+            weaver_server_core::PostState::Finalizing => return QueueItemState::Finalizing,
+            weaver_server_core::PostState::PostProcessing => {
+                return QueueItemState::PostProcessing;
+            }
+            _ => {}
+        }
+    }
+
     match info.download_state {
         weaver_server_core::DownloadState::Downloading => return QueueItemState::Downloading,
         weaver_server_core::DownloadState::Checking => return QueueItemState::Verifying,
