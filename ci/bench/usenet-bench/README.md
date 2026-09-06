@@ -70,7 +70,8 @@ go run ./cmd/fixturegen --direct-mkv --output /scratch/fixtures
 go run ./cmd/nntpbench image build --version v0.1.0 --tag e2e-nntp:local \
   --provenance /scratch/runs/nntp-image-provenance.json
 
-# 3. Bring up server + shaper at a declared link rate; keep the test CA.
+# 3. Bring up server + shaper at a declared link rate (add --server-rtt 250ms
+#    to both server-env and plan for a provider-distance round trip); keep the test CA.
 openssl rand -hex 24 > /scratch/runs/nntp-password
 go run ./cmd/nntpbench server-env --server-link 1gbit --output /scratch/runs/server-1gbit.env
 NNTP_BENCH_PASSWORD_FILE=/scratch/runs/nntp-password docker compose -p nntp-bench \
@@ -406,6 +407,56 @@ requires both values. The link profile is persisted in the plan, every run and
 every result. The server sits on a private upstream network; clients resolve
 `nntp` to the shaper on the benchmark network.
 
+#### Fixed round trip
+
+The rate cap alone is a link with no distance: a client that opens one
+connection per article, or waits for each reply before sending the next
+command, pays nothing for it on the loopback path. `--server-rtt` (on
+`server-env` and `plan` alike) declares a fixed client<->server round trip
+that the shaper container renders with `tc netem` on its benchmark-facing
+interface — half the round trip per direction, zero jitter — so a client's
+connection setup, TLS handshake, command pipelining and per-connection window
+all cost what they cost against a real provider. The value is a whole number
+of milliseconds between 1 ms and 5 s; 0 (the default) adds no delay and
+touches no qdisc, so a plan without the flag is byte-for-byte what it was
+apart from the new `rtt_micros` field. The published suite runs each shaped
+link at 0, 250 ms and 500 ms, the range a home connection sees to a
+commercial provider; the round trip is part of the stratum, so those are
+three different comparisons, never pooled.
+
+```bash
+go run ./cmd/nntpbench server-env --server-link 1gbit --server-rtt 250ms \
+  --output /scratch/runs/server-1gbit-250ms.env
+```
+
+The env file carries `NNTP_RTT_MICROS`; the Compose service needs
+`cap_add: [NET_ADMIN]` (already in the example topology) so the entrypoint
+can program its own network namespace. The client-to-server half is delayed
+on an `ifb` mirror of the interface; where the host kernel has no `ifb`
+module (Docker Desktop, some minimal servers — `modprobe ifb` on a Linux bench
+host) the entrypoint carries the whole round trip on the server-to-client
+side instead, which keeps the sender-observed round trip exact but delivers
+the client's commands and handshakes undelayed. Which layout ran is recorded,
+not assumed: the shaper attests `link_shaping` (schema 4) with the interface,
+the ingress mechanism (`ifb-netem` or `none`), the declared per-direction
+split, the netem queue limit (sized from the rate and round trip so the
+bandwidth-delay product never overflows it) and, re-read from `tc` for every
+snapshot, the delays the qdiscs actually carry. The controller refuses a run
+whose report disagrees with the plan, whose live delays drifted, or whose
+shaper predates the schema; the summarizer applies the same checks to the
+persisted before/after snapshots, and the run environment carries
+`BENCH_SERVER_RTT_MICROS` so each adapter's rendered-config identity includes
+it.
+
+A delayed link also needs a send buffer that covers its bandwidth-delay
+product, or the shaper's own kernel — not the declared link — caps every
+connection at buffer / RTT. The example topology raises the shaper's
+namespace-scoped `net.ipv4.tcp_wmem` and `tcp_rmem` ceilings to 128 MiB for
+that reason, and the values in force are recorded in the attestation. The
+clients keep their kernel defaults, as a client machine in the field would;
+the per-connection ceiling that implies is one of the things the round trip
+is there to measure.
+
 For every shaped run the controller takes a random exclusive execution lease
 on the shaper and captures strict control-plane snapshots before and after the
 client: configured rate and burst, executable digest, lease identity, counter
@@ -428,7 +479,8 @@ Downstream bytes are what the shaper wrote into the client's sockets —
 application bytes, not wire bytes — so a client whose bytes exceed the NZB's
 article bytes either asked for articles twice (repeats > 0) or read past what
 it asked for (repeats = 0). A schema-2 shaper carries no census and the field
-is absent.
+is absent; a schema-2 or schema-3 shaper cannot render a round trip and is
+refused for any plan that declares one.
 
 By default the topology publishes the shaper only on `127.0.0.1`. For a remote
 native lane set `NNTP_PUBLIC_BIND_ADDR` to a specific LAN address, firewall it
@@ -506,7 +558,10 @@ carries all three targets and each host runs only its own.
 `--storage-profile` and `--nfs-link` add the storage stratum described in
 [Storage profiles](#storage-profiles-local-vs-throttled-nfs); the default is
 `local` and a default plan is byte-for-byte what it was apart from the new
-`storage_profile` field.
+`storage_profile` field. `--server-rtt` declares the fixed round trip the
+shaper adds (see [Fixed round trip](#fixed-round-trip)); it must match the
+`server-env` the shaper was started with, and the plan's `server_link`
+carries it as `rtt_micros`.
 
 `--exclude-client client:fixture-id:reason` (repeatable) leaves one client out
 of one fixture's blocks, with the reason persisted in the plan under
@@ -1080,6 +1135,12 @@ Per run the artifact records:
   stratum, not an annotation: `local` and `nfs-*` results are never pooled, and
   an NFS artifact without a valid `storage_attestation` is refused by the
   summarizer.
+- `server_link` — the NNTP link the client downloaded over: the aggregate
+  egress rate and burst, and the fixed round trip (`rtt_micros`) the shaper
+  added. The round trip is part of the stratum: a 1 Gbit result at 0 and at
+  250 ms are different comparisons. A run with a round trip carries the
+  shaper's `link_shaping` report in both attestation snapshots, with the
+  delays re-read from `tc` at each.
 
 Every counter carries its scope, collector and collector version, so results
 compare like for like instead of treating an unavailable hardware counter as a

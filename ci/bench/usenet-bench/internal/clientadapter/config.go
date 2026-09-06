@@ -115,7 +115,11 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	link, err := benchmark.ResolveServerLinkProfile(required(getenv, "BENCH_SERVER_LINK_ID"), egress, burst)
+	rtt, err := parseUint(getenv("BENCH_SERVER_RTT_MICROS"), "BENCH_SERVER_RTT_MICROS")
+	if err != nil {
+		return Config{}, err
+	}
+	link, err := benchmark.ResolveServerLinkProfile(required(getenv, "BENCH_SERVER_LINK_ID"), egress, burst, rtt)
 	if err != nil {
 		return Config{}, err
 	}
@@ -630,6 +634,7 @@ func renderAuditConfig(c Config, spec ProductSpec) []byte {
 		"server_link_scope=" + c.ServerLink.Scope,
 		"server_link_egress_bits_per_second=" + strconv.FormatUint(c.ServerLink.EgressBitsPerSecond, 10),
 		"server_link_burst_bytes=" + strconv.FormatUint(c.ServerLink.BurstBytes, 10),
+		"server_link_rtt_micros=" + strconv.FormatUint(c.ServerLink.RTTMicros, 10),
 		"storage_profile_id=" + c.StorageProfile.ID,
 		"storage_kind=" + string(c.StorageProfile.Kind),
 		"storage_nfs_link_id=" + c.StorageProfile.NFSLinkID,

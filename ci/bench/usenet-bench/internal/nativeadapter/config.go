@@ -81,7 +81,11 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	link, err := benchmark.ResolveServerLinkProfile(required(getenv, "BENCH_SERVER_LINK_ID"), egress, burst)
+	rtt, err := parseUint(getenv("BENCH_SERVER_RTT_MICROS"), "BENCH_SERVER_RTT_MICROS")
+	if err != nil {
+		return Config{}, err
+	}
+	link, err := benchmark.ResolveServerLinkProfile(required(getenv, "BENCH_SERVER_LINK_ID"), egress, burst, rtt)
 	if err != nil {
 		return Config{}, err
 	}

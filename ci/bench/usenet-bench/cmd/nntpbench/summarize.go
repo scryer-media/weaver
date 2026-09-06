@@ -40,6 +40,7 @@ type aggregateStratum struct {
 	ServerLinkID     string                     `json:"server_link_id"`
 	ServerEgressBPS  uint64                     `json:"server_egress_bits_per_second"`
 	ServerBurstBytes uint64                     `json:"server_burst_bytes"`
+	ServerRTTMicros  uint64                     `json:"server_rtt_micros"`
 	StorageProfileID string                     `json:"storage_profile_id"`
 	StorageNFSLinkID string                     `json:"storage_nfs_link_id"`
 	StorageLinkBPS   uint64                     `json:"storage_link_bits_per_second"`
@@ -56,6 +57,7 @@ func (s comparisonStratum) aggregateKey(class fixture.FixtureClass) aggregateStr
 		ServerLinkID:     s.ServerLinkID,
 		ServerEgressBPS:  s.ServerEgressBPS,
 		ServerBurstBytes: s.ServerBurstBytes,
+		ServerRTTMicros:  s.ServerRTTMicros,
 		StorageProfileID: s.StorageProfileID,
 		StorageNFSLinkID: s.StorageNFSLinkID,
 		StorageLinkBPS:   s.StorageLinkBPS,
@@ -97,6 +99,7 @@ type comparisonStratum struct {
 	ServerLinkID     string                     `json:"server_link_id"`
 	ServerEgressBPS  uint64                     `json:"server_egress_bits_per_second"`
 	ServerBurstBytes uint64                     `json:"server_burst_bytes"`
+	ServerRTTMicros  uint64                     `json:"server_rtt_micros"`
 	// StorageProfileID and its link join the stratum key. A local run and an
 	// NFS run measure different questions, so they are never pooled — the same
 	// rule that keeps transports and toolchains apart.
@@ -375,7 +378,7 @@ func summarize(args []string) error {
 // server link cannot prove, from the shaper's own before/after counters, that
 // the link was in force and carried the bytes the artifact claims.
 func validateSummaryShaperEvidence(artifact benchmark.QueueArtifact, link benchmark.ServerLinkProfile) error {
-	if link.EgressBitsPerSecond == 0 {
+	if !link.Shaped() {
 		return nil
 	}
 	if artifact.ShaperBefore == nil || artifact.ShaperAfter == nil {
@@ -621,6 +624,7 @@ func buildSummaryReport(artifacts []benchmark.QueueArtifact, exclusions []benchm
 			ServerLinkID:     job.Run.ServerLink.ID,
 			ServerEgressBPS:  job.Run.ServerLink.EgressBitsPerSecond,
 			ServerBurstBytes: job.Run.ServerLink.BurstBytes,
+			ServerRTTMicros:  job.Run.ServerLink.RTTMicros,
 			StorageProfileID: job.Run.StorageProfile.ID,
 			StorageNFSLinkID: job.Run.StorageProfile.NFSLinkID,
 			StorageLinkBPS:   job.Run.StorageProfile.LinkBitsPerSecond,

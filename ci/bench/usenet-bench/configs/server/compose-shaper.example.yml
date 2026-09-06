@@ -43,6 +43,21 @@ services:
       # unlimited; named profiles are serialized into every run artifact.
       NNTP_EGRESS_BITS_PER_SECOND: "${NNTP_EGRESS_BITS_PER_SECOND:?run nntpbench server-env first}"
       NNTP_EGRESS_BURST_BYTES: "${NNTP_EGRESS_BURST_BYTES:?run nntpbench server-env first}"
+      # The fixed client<->server round trip, rendered with tc netem on the
+      # benchmark-facing interface by the image entrypoint (half per
+      # direction). 0 adds no delay and touches no qdisc.
+      NNTP_RTT_MICROS: "${NNTP_RTT_MICROS:?run nntpbench server-env first}"
+    # tc needs NET_ADMIN inside the container's own network namespace only.
+    cap_add:
+      - NET_ADMIN
+    # A delayed link needs a send buffer that covers its bandwidth-delay
+    # product, or the shaper itself (not the declared link) caps every
+    # connection at buffer/RTT. These are the shaper's own namespace-scoped
+    # TCP autotuning bounds; the clients keep their kernel defaults, as
+    # a real client machine would. The values are recorded in the attestation.
+    sysctls:
+      net.ipv4.tcp_wmem: "4096 1048576 134217728"
+      net.ipv4.tcp_rmem: "4096 1048576 134217728"
     depends_on:
       nntp:
         condition: service_healthy

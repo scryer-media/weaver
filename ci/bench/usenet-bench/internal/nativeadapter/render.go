@@ -259,6 +259,7 @@ func renderAuditConfig(cfg Config, spec productSpec) []byte {
 		"server_link_scope=" + cfg.ServerLink.Scope,
 		"server_link_egress_bits_per_second=" + strconv.FormatUint(cfg.ServerLink.EgressBitsPerSecond, 10),
 		"server_link_burst_bytes=" + strconv.FormatUint(cfg.ServerLink.BurstBytes, 10),
+		"server_link_rtt_micros=" + strconv.FormatUint(cfg.ServerLink.RTTMicros, 10),
 		"storage_profile_id=" + cfg.StorageProfile.ID,
 		"storage_kind=" + string(cfg.StorageProfile.Kind),
 		"storage_nfs_link_id=" + cfg.StorageProfile.NFSLinkID,

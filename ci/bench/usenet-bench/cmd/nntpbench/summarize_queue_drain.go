@@ -35,6 +35,7 @@ type queueDrainLane struct {
 	FixtureID        string                     `json:"fixture_id"`
 	Copies           int                        `json:"copies"`
 	ServerLinkID     string                     `json:"server_link_id"`
+	ServerRTTMicros  uint64                     `json:"server_rtt_micros"`
 	StorageProfileID string                     `json:"storage_profile_id"`
 	ClientIdentity   string                     `json:"client_identity"`
 	ClientVersion    string                     `json:"client_version"`
@@ -143,6 +144,7 @@ func queueDrainLaneFor(artifact benchmark.QueueArtifact, plannedRuns map[string]
 		FixtureID:        first.FixtureID,
 		Copies:           len(artifact.Runs),
 		ServerLinkID:     first.ServerLink.ID,
+		ServerRTTMicros:  first.ServerLink.RTTMicros,
 		StorageProfileID: first.StorageProfile.ID,
 		ClientIdentity:   result.ClientIdentity,
 		ClientVersion:    result.ClientVersion,

@@ -259,7 +259,7 @@ func (c RunConfig) Validate() error {
 	if c.Profile != c.Plan.Profile {
 		return fmt.Errorf("run profile %q does not match persisted plan profile %q", c.Profile, c.Plan.Profile)
 	}
-	if c.Plan.ServerLink.EgressBitsPerSecond > 0 && c.ShaperControlURL == "" {
+	if c.Plan.ServerLink.Shaped() && c.ShaperControlURL == "" {
 		return fmt.Errorf("shaper control URL is required for shaped benchmark plans")
 	}
 	if c.ShaperControlURL != "" {
@@ -564,6 +564,7 @@ func adapterEnvironment(config RunConfig, run Run, fixtureDir, nzbPath, archiveP
 		"BENCH_SERVER_LINK_SCOPE=" + run.ServerLink.Scope,
 		"BENCH_SERVER_EGRESS_BITS_PER_SECOND=" + strconv.FormatUint(run.ServerLink.EgressBitsPerSecond, 10),
 		"BENCH_SERVER_EGRESS_BURST_BYTES=" + strconv.FormatUint(run.ServerLink.BurstBytes, 10),
+		"BENCH_SERVER_RTT_MICROS=" + strconv.FormatUint(run.ServerLink.RTTMicros, 10),
 		"BENCH_STORAGE_PROFILE=" + encodeStorageProfile(run.StorageProfile),
 	}
 }

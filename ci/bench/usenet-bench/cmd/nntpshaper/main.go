@@ -54,6 +54,24 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	rttMicros, err := uintEnv("NNTP_RTT_MICROS", 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// A configured round trip is rendered by the container entrypoint with tc
+	// before this process starts; its report is the contract the control
+	// plane attests. Without one the process refuses to serve rather than
+	// present an unshaped path as a delayed one.
+	var linkShaping *nntpshaper.LinkShapingReport
+	if rttMicros > 0 {
+		linkShaping, err = nntpshaper.LoadLinkShapingReport(stringEnv("NNTP_LINK_REPORT_PATH", "/run/nntpshaper-link.json"), rttMicros)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if _, _, err := nntpshaper.TCLiveDelays(*linkShaping); err != nil {
+			log.Fatalf("verify configured round trip: %v", err)
+		}
+	}
 	executableSHA256, err := nntpshaper.CurrentExecutableSHA256()
 	if err != nil {
 		log.Fatal(err)
@@ -61,6 +79,9 @@ func main() {
 	attestation := nntpshaper.NewAttestation(nntpshaper.AttestationConfig{
 		EgressBitsPerSecond: bitsPerSecond,
 		BurstBytes:          burstBytes,
+		RTTMicros:           rttMicros,
+		LinkShaping:         linkShaping,
+		LiveDelays:          nntpshaper.TCLiveDelays,
 		Build: nntpshaper.BuildIdentity{
 			ExecutableSHA256: executableSHA256,
 			ImageIdentity:    stringEnv("NNTP_SHAPER_IMAGE_IDENTITY", ""),
@@ -86,7 +107,7 @@ func main() {
 			log.Fatalf("listen %s (%s): %v", config.label, config.listenAddress, err)
 		}
 		listeners = append(listeners, listener)
-		log.Printf("%s listener %s -> %s; aggregate egress=%d bits/s burst=%d bytes", config.label, listener.Addr(), config.upstream, bitsPerSecond, burstBytes)
+		log.Printf("%s listener %s -> %s; aggregate egress=%d bits/s burst=%d bytes rtt=%dus", config.label, listener.Addr(), config.upstream, bitsPerSecond, burstBytes, rttMicros)
 	}
 	controlListener, err := net.Listen("tcp", stringEnv("CONTROL_LISTEN_ADDR", ":8080"))
 	if err != nil {
