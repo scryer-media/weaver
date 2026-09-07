@@ -927,7 +927,7 @@ impl NntpClient {
             if let Some(rejection) = self
                 .pool
                 .server_transfer_control(server)
-                .and_then(|control| control.quota_rejection_for(requested_body_bytes))
+                .and_then(|control| control.quota_rejection_for_dispatch(requested_body_bytes))
             {
                 retain_earliest_quota_rejection(&mut quota_blocked, rejection);
                 continue;
@@ -942,7 +942,8 @@ impl NntpClient {
 
     /// Return the current request-specific quota rejection for one server.
     /// Cached owned lanes use this to revalidate admission without touching
-    /// connection health or acquiring a new lane.
+    /// connection health or acquiring a new lane. It is a dispatch decision,
+    /// so a rejection latches the server's blocked signal.
     pub fn server_quota_rejection(
         &self,
         server: ServerId,
@@ -950,7 +951,7 @@ impl NntpClient {
     ) -> Option<QuotaRejection> {
         self.pool
             .server_transfer_control(server)
-            .and_then(|control| control.quota_rejection_for(requested_body_bytes))
+            .and_then(|control| control.quota_rejection_for_dispatch(requested_body_bytes))
     }
 
     /// True only when the active pool contains at least one normal fill server
@@ -2433,7 +2434,7 @@ impl NntpClient {
             if let Some(rejection) = self
                 .pool
                 .server_transfer_control(ServerId(idx))
-                .and_then(|control| control.quota_rejection_for(requested_body_bytes))
+                .and_then(|control| control.quota_rejection_for_dispatch(requested_body_bytes))
             {
                 retain_earliest_quota_rejection(&mut quota_blocked, rejection);
                 continue;
