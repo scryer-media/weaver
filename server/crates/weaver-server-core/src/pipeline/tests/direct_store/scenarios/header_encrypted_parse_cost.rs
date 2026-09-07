@@ -117,10 +117,16 @@ async fn a_header_encrypted_set_pays_for_its_key_once_however_many_articles_arri
 /// arrived — and the walk that ends the volume still runs.
 ///
 /// A stored volume's end-of-archive record sits past its whole payload, and
-/// the walk that stops there asks for the byte after it: the volume's own end.
-/// So every piece between the first and the last leaves the answer where it
-/// was, and the walk that settles the volume is the one over its complete
-/// image.
+/// the walk that stops there names the least the record could occupy: on a
+/// `-hp` volume that is exactly the record's own size, so the offset it asks
+/// the image to reach is the volume's own end. Every piece between the first
+/// and the last leaves that answer where it was; the piece that carries the
+/// record is the one that lets the walk read it. Reaching an offset means
+/// holding every byte *below* it — the byte at the volume's length does not
+/// exist, and a gate that waited for it would never walk this volume again
+/// unless its last article arrived to force the question (see
+/// `a_repaired_volume_tail_reroutes_into_a_header_encrypted_member`, where it
+/// never does).
 #[tokio::test]
 async fn a_walk_is_repeated_only_once_it_could_answer_differently() {
     let payload: Vec<u8> = (0..20_000u32).map(|index| (index % 251) as u8).collect();
@@ -149,34 +155,47 @@ async fn a_walk_is_repeated_only_once_it_could_answer_differently() {
          once with the key that proves"
     );
 
-    // Every remaining piece: the member's payload, which the walk seeks over,
-    // and finally the tail. None of it can move an answer that is waiting on
-    // the byte past the volume's end.
+    // Every piece but the last: the member's payload, which the walk seeks
+    // over. None of it can move an answer that is waiting on the volume's tail.
+    let offsets: Vec<usize> = (PIECE_BYTES..image.len()).step_by(PIECE_BYTES).collect();
+    let (last, middle) = offsets.split_last().expect("the volume has a tail piece");
     let mut pieces = 1;
-    for offset in (PIECE_BYTES..image.len()).step_by(PIECE_BYTES) {
-        let to = (offset + PIECE_BYTES).min(image.len());
+    for &offset in middle {
         router
-            .route(0, offset as u64, &image[offset..to])
-            .expect("the volume's remaining pieces route");
+            .route(0, offset as u64, &image[offset..offset + PIECE_BYTES])
+            .expect("the volume's middle pieces route");
         pieces += 1;
     }
     assert!(pieces > 30, "the volume arrives in enough pieces: {pieces}");
     assert_eq!(
         router.parse_walks(),
         after_first,
-        "a piece that cannot supply the byte the walk stopped at is not a \
-         reason to walk again"
+        "a piece that cannot bring the image to the offset the walk stopped at \
+         is not a reason to walk again"
+    );
+
+    // The tail piece carries the end-of-archive record, so the image now
+    // reaches the offset the walk asked for, and the walk runs and reads it.
+    router
+        .route(0, *last as u64, &image[*last..])
+        .expect("the volume's tail piece routes");
+    assert_eq!(
+        router.parse_walks(),
+        after_first + 1,
+        "the piece that brings the image to the offset the walk stopped at is \
+         walked"
     );
 
     // The last article is the other half of the rule: a complete source image
     // is a proof in itself, so that walk runs however the gate feels about it
-    // — and it is the walk that confirms the volume.
+    // — and on a set's last volume, whose end record carries no `more_volumes`
+    // to confirm it by, it is the walk that confirms the volume.
     router
         .note_volume_complete(0)
         .expect("the volume's articles are all in");
     assert_eq!(
         router.parse_walks(),
-        after_first + 1,
+        after_first + 2,
         "the complete image is always walked"
     );
     assert!(

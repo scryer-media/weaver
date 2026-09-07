@@ -345,3 +345,83 @@ async fn a_repaired_hole_completes_an_encrypted_part_and_passes_its_gate() {
         "the completed part must pass its packed gate and the member its own"
     );
 }
+
+/// The shape the tail-loss fixture takes: an interior volume's **last**
+/// articles never arrive, so the hole runs from inside the member's part to the
+/// end of the volume and swallows the end-of-archive record with it. The volume
+/// is never reported complete — nothing arrived to complete it — and the repair
+/// is what closes both the part and the volume.
+///
+/// Both the member bytes and the end record are repaired bytes here, so every
+/// one of them has to find a destination in the same drain: the record can only
+/// be filed once the walk over the repaired image confirms the volume, and that
+/// walk must run even though the volume's own article stream never delivered a
+/// last article.
+async fn a_repaired_volume_tail_reroutes(volumes: Vec<(String, Vec<u8>)>, payload: &[u8]) {
+    let mut router = encrypted_router(&volumes, REPAIR_PASSWORD);
+    let (_, parts) = cipher_and_part_offsets(payload, &volumes);
+    let (part_at, part_len) = parts[1];
+
+    // The lost tail: from an unaligned byte inside the interior volume's part
+    // through the volume's last byte.
+    let tail_at = part_at + part_len - 53;
+    let interior = &volumes[1].1;
+    let tail_len = interior.len() as u64 - tail_at;
+    for (index, (_, bytes)) in volumes.iter().enumerate() {
+        if index == 1 {
+            router
+                .route(1, 0, &interior[..tail_at as usize])
+                .expect("the articles below the lost tail route");
+            continue;
+        }
+        router
+            .route(index as u32, 0, bytes)
+            .expect("the intact volumes route");
+        router
+            .note_volume_complete(index as u32)
+            .expect("their articles are all in");
+    }
+    assert!(
+        !router.all_members_verified(),
+        "a member missing its tail must not verify before the repair"
+    );
+
+    let spans = route_repaired_span(&mut router, &volumes, 1, tail_at, tail_len)
+        .expect("a repaired volume tail must route back into the set");
+    assert!(
+        member_bytes_written(&spans) >= 53,
+        "the repaired member bytes must reach the partial"
+    );
+    close_stale_gaps(&mut router, payload);
+    assert!(
+        router.all_members_verified(),
+        "the completed part must pass its gate and the member its own"
+    );
+}
+
+#[tokio::test]
+async fn a_repaired_volume_tail_reroutes_into_an_encrypted_member() {
+    let payload: Vec<u8> = (0..900u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        REPAIR_MEMBER,
+        &payload,
+        3,
+        REPAIR_PASSWORD,
+        Some(REPAIR_PASSWORD),
+        true,
+    );
+    a_repaired_volume_tail_reroutes(volumes, &payload).await;
+}
+
+#[tokio::test]
+async fn a_repaired_volume_tail_reroutes_into_a_header_encrypted_member() {
+    let payload: Vec<u8> = (0..900u32).map(|index| (index % 251) as u8).collect();
+    let volumes = header_encrypted_store_set(
+        REPAIR_MEMBER,
+        &payload,
+        3,
+        REPAIR_PASSWORD,
+        HeaderCheck::For(REPAIR_PASSWORD),
+    );
+    a_repaired_volume_tail_reroutes(volumes, &payload).await;
+}

@@ -498,10 +498,10 @@ impl DirectSetRouter {
         {
             return Ok(());
         }
-        // The previous walk said which byte it ran out at. Until the image can
-        // serve that byte this walk would stop in the same place, having read
-        // the same headers and — on a `-hp` volume — derived the same archive
-        // key again. See [`VolumeStaging::parse_short_at`].
+        // The previous walk said which offset it ran out at. Until the image
+        // reaches that offset this walk would stop in the same place, having
+        // read the same headers and — on a `-hp` volume — derived the same
+        // archive key again. See [`VolumeStaging::parse_short_at`].
         //
         // Never on the volume's **last** article, whatever the gate says: a
         // complete source image is one of the two proofs that confirm a volume

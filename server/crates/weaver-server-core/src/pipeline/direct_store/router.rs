@@ -1653,16 +1653,30 @@ pub(super) fn restored_volume_is_confirmed(
 }
 
 impl VolumeStaging {
-    /// Whether a header walk starting from zero could read `offset` today:
-    /// either the byte is staged, or it was routed away — in which case the
-    /// walk's own answer may have moved and the gate must not hold it back.
-    fn parse_can_reach(&self, offset: u64) -> bool {
+    /// Whether the volume image now reaches `short_at`, the offset the last
+    /// header walk reported it could not read.
+    ///
+    /// `short_at` is the **first** offset the walk could not read, so what the
+    /// walk needs is every byte *below* it, and the byte to ask after is the
+    /// one at `short_at - 1`: either it is staged, or it was routed away — in
+    /// which case the walk's own answer may have moved and the gate must not
+    /// hold it back. Asking after the byte *at* `short_at` is off by one, and
+    /// not harmlessly so: the walk reports the least a header could occupy
+    /// from where it stopped, and a `-hp` end-of-archive record is exactly
+    /// that minimum, so its `short_at` is the volume's own length — an offset
+    /// no image ever holds a byte at. A volume whose end record arrived by
+    /// repair rather than by its last article would then never be re-walked,
+    /// never confirmed, and never able to file the record it was repaired for.
+    fn parse_can_reach(&self, short_at: u64) -> bool {
+        let Some(last_needed) = short_at.checked_sub(1) else {
+            return true;
+        };
         let staged = self
             .chunks
-            .range(..=offset)
+            .range(..=last_needed)
             .next_back()
-            .is_some_and(|(start, chunk)| offset < start.saturating_add(chunk.len()));
-        staged || self.routed.missing(offset, 1).is_empty()
+            .is_some_and(|(start, chunk)| last_needed < start.saturating_add(chunk.len()));
+        staged || self.routed.missing(last_needed, 1).is_empty()
     }
 
     /// Stores the parts of `[offset, offset + len)` that are neither routed nor
