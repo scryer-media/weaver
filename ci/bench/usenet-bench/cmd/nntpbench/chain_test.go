@@ -921,3 +921,29 @@ func TestRawChainTellsTheClientsTheUsernameTheStackListensFor(t *testing.T) {
 		t.Fatalf("overwrote the configured username with %q", named.Username)
 	}
 }
+
+// A chain runs every phase whatever happens, so the exit code is the only
+// thing a wrapper script can read. Exiting zero after measuring nothing
+// reported a session that never ran as a session that succeeded.
+func TestChainReportsPhasesThatMeasuredNothing(t *testing.T) {
+	clean := ChainResult{Phases: []ChainPhaseResult{
+		{Name: "P1", Verdict: chainVerdictClean},
+		{Name: "P2", Verdict: chainVerdictClientDidNotFinish},
+	}}
+	if err := chainHarnessFailure(clean); err != nil {
+		t.Fatalf("a finished session was reported as failed: %v", err)
+	}
+
+	// A client that did not finish is a result. A harness failure is not.
+	mixed := ChainResult{Phases: []ChainPhaseResult{
+		{Name: "P1", Verdict: chainVerdictClean},
+		{Name: "P2", Verdict: chainVerdictHarnessFailure, ExitCode: 1},
+	}}
+	err := chainHarnessFailure(mixed)
+	if err == nil {
+		t.Fatal("a phase that measured nothing exited clean")
+	}
+	if !strings.Contains(err.Error(), "P2") || strings.Contains(err.Error(), "P1") {
+		t.Fatalf("the error names the wrong phases: %v", err)
+	}
+}

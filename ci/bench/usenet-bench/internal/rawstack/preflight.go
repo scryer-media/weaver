@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/netcheck"
 )
 
 // Check statuses. A check is either satisfied or it names, in Reason, exactly
@@ -184,14 +186,9 @@ func portChecks(config Config) []Check {
 		}
 		address := net.JoinHostPort(config.Host, strconv.Itoa(port.value))
 		name := port.label + " port is free"
-		listener, err := net.Listen("tcp", address)
-		if err != nil {
+		if err := netcheck.Available(address); err != nil {
 			checks = append(checks, unsatisfied(name, address,
-				fmt.Sprintf("cannot bind the %s port: %v", port.label, err)))
-			continue
-		}
-		if err := listener.Close(); err != nil {
-			checks = append(checks, unsatisfied(name, address, fmt.Sprintf("release the probe on %s: %v", address, err)))
+				fmt.Sprintf("the %s port is not this stack's to use: %v", port.label, err)))
 			continue
 		}
 		checks = append(checks, satisfied(name, address))

@@ -17,6 +17,7 @@ import (
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/clientadapter"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/netcheck"
 )
 
 // Run executes a native product through its public control API. Sequential
@@ -280,12 +281,10 @@ func checkAPIPortFree(endpoint string) error {
 	if err != nil {
 		return err
 	}
-	address := net.JoinHostPort(host, strconv.Itoa(port))
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return fmt.Errorf("the client API address %s is already in use, so this run would measure whatever is listening there: %w", address, err)
+	if err := netcheck.Available(net.JoinHostPort(host, strconv.Itoa(port))); err != nil {
+		return fmt.Errorf("the client API address is not this run's to use: %w", err)
 	}
-	return listener.Close()
+	return nil
 }
 
 func startProcess(ctx context.Context, cfg Config, spec productSpec) (*nativeProcess, error) {

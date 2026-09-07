@@ -24,6 +24,7 @@ import (
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/nativeadapter"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/netcheck"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/nntp"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/rawstack"
 )
@@ -536,13 +537,10 @@ func apiPortCheck(client, endpoint string) preflightClientCheck {
 	}
 	address := net.JoinHostPort(host, strconv.Itoa(port))
 	check.Detail = address
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
+	if err := netcheck.Available(address); err != nil {
 		check.Status = "in use"
-		check.Reason = fmt.Sprintf("something is already listening on %s; the client would move to another port and the run would poll whatever answers here: %v", address, err)
-		return check
+		check.Reason = fmt.Sprintf("the client would move to another port and the run would poll whatever answers here: %v", err)
 	}
-	_ = listener.Close()
 	return check
 }
 

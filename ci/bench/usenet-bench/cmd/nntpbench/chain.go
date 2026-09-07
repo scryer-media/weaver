@@ -282,6 +282,14 @@ type ChainResult struct {
 	Completed     bool               `json:"completed"`
 }
 
+// Phase verdicts. A client that did not finish is a measured outcome; a
+// harness failure means the phase produced nothing to measure.
+const (
+	chainVerdictClean              = "clean"
+	chainVerdictClientDidNotFinish = "client-did-not-finish"
+	chainVerdictHarnessFailure     = "harness-failure"
+)
+
 func chain(args []string) error {
 	flags := flag.NewFlagSet("chain", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
@@ -412,7 +420,26 @@ func chain(args []string) error {
 		return err
 	}
 	log("CHAIN-DONE %s", resultPath)
-	return nil
+	return chainHarnessFailure(result)
+}
+
+// chainHarnessFailure reports the phases that measured nothing. A chain runs
+// every phase whatever happens -- a long session must not be abandoned because
+// one phase failed, and the record carries each verdict -- but exiting zero
+// after measuring nothing tells a wrapper script the session succeeded. A
+// client that did not finish is a recorded result and not this.
+func chainHarnessFailure(result ChainResult) error {
+	var failed []string
+	for _, phase := range result.Phases {
+		if phase.Verdict == chainVerdictHarnessFailure {
+			failed = append(failed, fmt.Sprintf("%s (rc=%d)", phase.Name, phase.ExitCode))
+		}
+	}
+	if len(failed) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d of %d phases measured nothing: %s",
+		len(failed), len(result.Phases), strings.Join(failed, ", "))
 }
 
 // loadChainConfig reads, validates and normalizes a session description. Every
@@ -1064,11 +1091,11 @@ func runChainPhase(config ChainConfig, phase ChainPhase, log func(string, ...any
 	}
 	switch code {
 	case 0:
-		result.Verdict = "clean"
+		result.Verdict = chainVerdictClean
 	case benchmark.ExitStatusClientDidNotFinish:
-		result.Verdict = "client-did-not-finish"
+		result.Verdict = chainVerdictClientDidNotFinish
 	default:
-		result.Verdict = "harness-failure"
+		result.Verdict = chainVerdictHarnessFailure
 	}
 	result.Suites = countChainSuites(phase.Artifacts)
 	log("%s-EXITED rc=%d %s suites=%d after %s", phase.Name, code, result.Verdict,

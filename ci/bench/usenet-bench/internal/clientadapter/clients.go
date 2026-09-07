@@ -121,9 +121,15 @@ type QueueTiming struct {
 // interval. It is intended for adapters that must preserve queue-acceptance
 // timing rather than infer it from a later poll.
 func (api *API) QueueWithTiming(ctx context.Context, nzbPath, archivePassword string) (QueueTiming, error) {
-	timing := QueueTiming{SubmissionStartedAt: time.Now()}
+	// Round(0) strips the monotonic reading, so a duration computed here and
+	// the same duration recomputed from these timestamps after they have been
+	// through JSON agree. They do not otherwise: darwin's wall clock is
+	// microsecond-granular while its monotonic clock is nanosecond-granular,
+	// so an in-process Sub and a post-serialization Sub differ by microseconds
+	// and every timing self-check downstream rejects the result.
+	timing := QueueTiming{SubmissionStartedAt: time.Now().Round(0)}
 	jobID, err := api.Queue(ctx, nzbPath, archivePassword)
-	timing.AcceptedAt = time.Now()
+	timing.AcceptedAt = time.Now().Round(0)
 	if err != nil {
 		return QueueTiming{}, err
 	}
@@ -145,7 +151,7 @@ func (api *API) WaitCompleteWithObservation(ctx context.Context, jobID string, i
 	lowerBound := acceptedAt
 	for {
 		observations, err := api.product.observe(ctx, []string{jobID})
-		observedAt := time.Now()
+		observedAt := time.Now().Round(0)
 		if err != nil {
 			return TerminalObservation{}, err
 		}
@@ -731,7 +737,7 @@ func waitForTerminal(ctx context.Context, interval time.Duration, check func(con
 			return time.Time{}, err
 		}
 		if complete {
-			return time.Now().UTC(), nil
+			return time.Now().Round(0).UTC(), nil
 		}
 		timer := time.NewTimer(interval)
 		select {
