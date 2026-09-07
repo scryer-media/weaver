@@ -1187,15 +1187,29 @@ async fn waiting_on_present_volumes_is_not_repair_ready_until_a_volume_is_truly_
     );
 
     // And the same missing-middle shape stops qualifying the moment any
-    // pipeline work reappears — `health_probing` here stands in for any of
-    // the pending-work arms.
-    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
-        state.health_probing = true;
-    }
+    // pipeline work reappears — a delayed retry here stands in for any of the
+    // pending-work arms. (A health probe is deliberately not one of them: it
+    // moves no byte, so it can never turn absence back into arrival.)
+    pipeline.pending_retries_by_job.insert(job_id, 1);
     assert!(
         !pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
         "absence while anything is en route is not absence"
     );
+    pipeline.pending_retries_by_job.remove(&job_id);
+    assert!(
+        pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
+        "and it qualifies again once that retry is gone"
+    );
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.health_probing = true;
+    }
+    assert!(
+        pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
+        "a probe in flight is not pending work and must not hold repair back"
+    );
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.health_probing = false;
+    }
 
     // AwaitingRepair qualifies with an empty waiting list — the livelocked
     // small-repair family sits exactly there — and it stays unconditional:

@@ -446,6 +446,21 @@ impl Pipeline {
         let lead_bytes = Self::released_download_result_lead_bytes(&result);
         self.process_download_done(result).await;
         self.finish_released_download_result_processing(job_id, lead_bytes);
+        // `process_download_done` ran the drain sequence for this job while
+        // *this* result was still booked as a pending released result — pending
+        // download work by definition — so every drain-conditional step in it
+        // was necessarily refused. That is why an in-flight health probe was
+        // never retired at drain: the last article of a job is very often one
+        // that failed, which produces no decode, and the decode seam is the
+        // only other place that re-runs the sequence.
+        //
+        // So it is re-run once this result's own accounting is closed. The
+        // sequence's `in_flight == 0 && nothing queued` gate makes this a no-op
+        // for every result that is not the job's last, and each step inside it
+        // is idempotent.
+        if self.jobs.contains_key(&job_id) {
+            self.maybe_finish_download_pass(job_id);
+        }
         self.maybe_service_deferred_lane_refills();
     }
 

@@ -153,11 +153,12 @@ impl Pipeline {
         if self.ip_replacement_trial_extra_connections == 0 || self.ip_replacement_burst_active {
             return;
         }
-        let normal_download_capacity =
-            self.normal_download_connection_capacity_limit(configured_download_capacity);
+        // A trial is only worth an extra connection when the ordinary budget is
+        // already fully committed — and never while recovery articles are on
+        // the wire, since those are what a repair is waiting on.
         if pressure.suppresses_spillover()
             || configured_download_capacity == 0
-            || self.active_download_connections != normal_download_capacity
+            || self.active_download_connections != configured_download_capacity
             || self.active_recovery > 0
             || !self.job_has_dispatchable_work(hot_job_id)
         {

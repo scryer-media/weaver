@@ -289,50 +289,30 @@ fn max_concurrent_extractions_honors_override() {
     assert_eq!(tuner.max_concurrent_extractions(), 1);
 }
 
+/// No bandwidth band holds a connection back for recovery work.
+///
+/// Recovery blocks ride the job's own lanes as completion-critical work, so a
+/// reserved slot could only ever be an idle connection while the work it was
+/// reserved for sat parked. Every band must leave the full configured budget
+/// available to ordinary downloads.
 #[test]
-fn recovery_slots_high_bandwidth() {
-    let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), TEST_CONNECTIONS);
-    assert_eq!(tuner.params().recovery_slots, 0); // starts at 0
+fn no_bandwidth_band_reserves_connections_for_recovery() {
+    for speed_mb_s in [5u64, 20, 60] {
+        let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), TEST_CONNECTIONS);
+        let mut m = empty_metrics();
+        m.current_download_speed = speed_mb_s * 1024 * 1024;
 
-    // Simulate high bandwidth (60 MB/s = 62914560 bytes/sec).
-    let mut m = empty_metrics();
-    m.current_download_speed = 60 * 1024 * 1024;
+        for _ in 0..10 {
+            tuner.adjust(&m);
+        }
 
-    // EMA needs a few iterations to ramp up past 50 MB/s threshold.
-    for _ in 0..10 {
-        tuner.adjust(&m);
+        assert_eq!(
+            tuner.params().max_concurrent_downloads,
+            TEST_CONNECTIONS,
+            "{speed_mb_s} MB/s must leave every configured connection to downloads"
+        );
+        assert!(tuner.bandwidth_ema() > 0.0);
     }
-    // 25% of 20 concurrent downloads = 5, max(5, 2) = 5.
-    assert!(tuner.params().recovery_slots >= 2);
-}
-
-#[test]
-fn recovery_slots_medium_bandwidth() {
-    let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), TEST_CONNECTIONS);
-
-    // Simulate medium bandwidth (20 MB/s).
-    let mut m = empty_metrics();
-    m.current_download_speed = 20 * 1024 * 1024;
-
-    for _ in 0..10 {
-        tuner.adjust(&m);
-    }
-    // Medium: max(20/8, 1) = max(2, 1) = 2.
-    assert!(tuner.params().recovery_slots >= 1);
-}
-
-#[test]
-fn recovery_slots_low_bandwidth() {
-    let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(8), TEST_CONNECTIONS);
-
-    // Simulate low bandwidth (5 MB/s).
-    let mut m = empty_metrics();
-    m.current_download_speed = 5 * 1024 * 1024;
-
-    for _ in 0..10 {
-        tuner.adjust(&m);
-    }
-    assert_eq!(tuner.params().recovery_slots, 0);
 }
 
 #[test]

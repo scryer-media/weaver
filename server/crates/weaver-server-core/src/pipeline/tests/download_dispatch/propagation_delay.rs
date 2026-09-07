@@ -597,7 +597,7 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
 }
 
 #[tokio::test]
-async fn ip_replacement_trial_starts_when_recovery_reserve_leaves_normal_capacity_full() {
+async fn ip_replacement_trial_starts_when_every_connection_is_busy() {
     let temp_dir = tempfile::tempdir().unwrap();
     let configured_download_capacity = 4;
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -612,14 +612,10 @@ async fn ip_replacement_trial_starts_when_recovery_reserve_leaves_normal_capacit
     .await;
     pipeline.ip_replacement_trial_extra_connections = 1;
 
-    let mut snapshot = pipeline.metrics.raw_snapshot();
-    snapshot.current_download_speed = 200 * 1024 * 1024;
-    assert!(pipeline.tuner.adjust(&snapshot));
-    let params = pipeline.tuner.params();
-    let normal_download_capacity = configured_download_capacity
-        .saturating_sub(params.recovery_slots.min(configured_download_capacity));
+    // Nothing is held back from the ordinary budget any more, so the trial's
+    // precondition is simply that every configured connection is busy.
+    let normal_download_capacity = configured_download_capacity;
     assert!(normal_download_capacity > 0);
-    assert!(normal_download_capacity < configured_download_capacity);
 
     let job_id = JobId(21005);
     insert_active_job(
