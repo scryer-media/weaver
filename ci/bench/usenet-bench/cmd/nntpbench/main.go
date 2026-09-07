@@ -21,6 +21,7 @@ import (
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/nntp"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/rawstack"
 )
 
 func main() {
@@ -304,19 +305,28 @@ type preflightResult struct {
 	HostOS      string                     `json:"host_os"`
 	HostMatches bool                       `json:"host_matches_target"`
 	Binaries    []preflightBinary          `json:"binaries"`
-	Ready       bool                       `json:"ready"`
+	// RawStack is present only when the host also serves the benchmark, which
+	// is what the native lanes do instead of running the Compose topology.
+	RawStack []rawstack.Check `json:"raw_stack,omitempty"`
+	Ready    bool             `json:"ready"`
 }
 
 func preflight(args []string) error {
 	flags := flag.NewFlagSet("preflight", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	var targetText, adapterPath, weaverPath, sabPath, nzbgetPath, dockerPath string
+	var chainPath, rawBinDir, rawDataDir, rawPasswordFile, rawHost string
 	flags.StringVar(&targetText, "target", "", "execution target: docker-linux, macos-native, or windows-native")
 	flags.StringVar(&adapterPath, "adapter", "", "path to clientadapter or nativeadapter executable")
 	flags.StringVar(&weaverPath, "weaver", "", "native Weaver executable path")
 	flags.StringVar(&sabPath, "sabnzbd", "", "native SABnzbd executable path")
 	flags.StringVar(&nzbgetPath, "nzbget", "", "native NZBGet executable path")
 	flags.StringVar(&dockerPath, "docker", "docker", "Docker executable for docker-linux")
+	flags.StringVar(&chainPath, "chain", "", "chain description to take the raw stack from, so a check cannot describe a different stack than the run")
+	flags.StringVar(&rawBinDir, "raw-bin-dir", "", "directory holding the staged e2e-nntp and nntpshaper executables")
+	flags.StringVar(&rawDataDir, "raw-data-dir", "", "seeded article store for a raw stack")
+	flags.StringVar(&rawPasswordFile, "raw-password-file", "", "NNTP password file for a raw stack")
+	flags.StringVar(&rawHost, "raw-host", "", "address a raw stack binds (default 127.0.0.1)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -350,9 +360,24 @@ func preflight(args []string) error {
 	if adapterPath != "" && descriptor.ID == benchmark.DockerLinux {
 		result.Binaries = append(result.Binaries, inspectExecutable("clientadapter", adapterPath))
 	}
+	rawConfig, wanted, err := preflightRawStack(chainPath, rawBinDir, rawDataDir, rawPasswordFile, rawHost)
+	if err != nil {
+		return err
+	}
+	if wanted {
+		if descriptor.ID == benchmark.DockerLinux {
+			return fmt.Errorf("a raw stack is not part of the %s target; it is what the native lanes run instead of the Compose topology", benchmark.DockerLinux)
+		}
+		_, result.RawStack = rawstack.Preflight(rawConfig)
+	}
 	result.Ready = result.HostMatches
 	for _, binary := range result.Binaries {
 		if binary.Status != "present" {
+			result.Ready = false
+		}
+	}
+	for _, check := range result.RawStack {
+		if check.Status != rawstack.CheckOK {
 			result.Ready = false
 		}
 	}
@@ -363,6 +388,49 @@ func preflight(args []string) error {
 		return fmt.Errorf("preflight is not ready for target %q", descriptor.ID)
 	}
 	return nil
+}
+
+// preflightRawStack settles the stack to check. Taking it from the chain
+// description is the form that cannot drift: a check against directories and
+// ports retyped on a command line can pass for a stack the session will never
+// run. The flags exist for the other case, staging a host before its session
+// is written.
+func preflightRawStack(chainPath, binDir, dataDir, passwordFile, host string) (rawstack.Config, bool, error) {
+	byFlag := binDir != "" || dataDir != "" || passwordFile != "" || host != ""
+	if chainPath == "" && !byFlag {
+		return rawstack.Config{}, false, nil
+	}
+	if chainPath != "" && byFlag {
+		return rawstack.Config{}, false, fmt.Errorf("--chain already declares the raw stack; drop the --raw-* flags rather than describing it twice")
+	}
+	if chainPath != "" {
+		config, err := loadChainConfig(chainPath)
+		if err != nil {
+			return rawstack.Config{}, false, err
+		}
+		if config.Stack != ChainStackRaw {
+			return rawstack.Config{}, false, fmt.Errorf("chain %s drives a %s stack, which has no local server side to check", chainPath, config.Stack)
+		}
+		settings, err := chainRawStackConfig(config)
+		if err != nil {
+			return rawstack.Config{}, false, err
+		}
+		return settings, true, nil
+	}
+	if binDir == "" || dataDir == "" {
+		return rawstack.Config{}, false, fmt.Errorf("--raw-bin-dir and --raw-data-dir are both required to check a raw stack")
+	}
+	// The certificate and log directories are made at startup, so a check does
+	// not need them to exist yet -- only to be named.
+	return rawstack.Config{
+		BinDir:       binDir,
+		DataDir:      dataDir,
+		CertDir:      filepath.Join(filepath.Dir(binDir), "certs"),
+		LogDir:       filepath.Join(filepath.Dir(binDir), "logs"),
+		Username:     "fixture-user",
+		PasswordFile: passwordFile,
+		Host:         host,
+	}, true, nil
 }
 
 func inspectExecutable(name, path string) preflightBinary {
@@ -620,7 +688,7 @@ Commands:
   pin            Pin a client image by digest in the adapter catalog and pre-pull it
   chain          Drive a whole declared session: shaper, phases and summaries
   summarize      Produce paired per-stratum statistics from verified sequential artifacts
-  preflight      Check target host and native/Docker executable prerequisites
+  preflight      Check a host: target, client executables, and a raw stack
   verify-output  Verify a client completion directory against fixture hashes
   delete-output  Empty a verified client completion directory
 

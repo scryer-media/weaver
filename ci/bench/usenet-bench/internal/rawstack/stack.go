@@ -9,6 +9,7 @@ package rawstack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -87,8 +88,21 @@ type Stack struct {
 
 // New validates a configuration and fills in its defaults. Everything it
 // checks is something that would otherwise surface as a run full of 430s or a
-// silently unshaped link.
+// silently unshaped link. It reports the first failure; Preflight reports them
+// all, from the same list of checks.
 func New(config Config) (*Stack, error) {
+	config = settle(config)
+	for _, check := range configChecks(config) {
+		if check.Status != CheckOK {
+			return nil, errors.New(check.Reason)
+		}
+	}
+	return &Stack{config: config}, nil
+}
+
+// settle fills in every value that has a default. It never touches the host,
+// so a report and a run start from exactly the same configuration.
+func settle(config Config) Config {
 	if config.Host == "" {
 		config.Host = "127.0.0.1"
 	}
@@ -110,58 +124,7 @@ func New(config Config) (*Stack, error) {
 	if config.ControlPort == 0 {
 		config.ControlPort = DefaultControlPort
 	}
-	if config.Username == "" {
-		return nil, fmt.Errorf("raw stack needs an NNTP username")
-	}
-	for _, directory := range []struct {
-		label string
-		path  string
-	}{{"binary", config.BinDir}, {"article", config.DataDir}, {"certificate", config.CertDir}, {"log", config.LogDir}} {
-		if directory.path == "" {
-			return nil, fmt.Errorf("raw stack needs a %s directory", directory.label)
-		}
-	}
-	for _, binary := range []string{serverBinary, shaperBinary} {
-		path := filepath.Join(config.BinDir, executableName(binary))
-		if _, err := os.Stat(path); err != nil {
-			return nil, fmt.Errorf("locate %s: %w", binary, err)
-		}
-	}
-	// An empty spool serves 430 to every article and produces a run that looks
-	// like a client failure. Catch it here, before the shaper is configured.
-	entries, err := os.ReadDir(config.DataDir)
-	if err != nil {
-		return nil, fmt.Errorf("read the article store: %w", err)
-	}
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("article store %s is empty; restore a seeded spool before running a raw stack", config.DataDir)
-	}
-	if config.PasswordFile == "" {
-		return nil, fmt.Errorf("raw stack needs a password file")
-	}
-	if _, err := os.Stat(config.PasswordFile); err != nil {
-		return nil, fmt.Errorf("locate the NNTP password file: %w", err)
-	}
-	ports := map[int]string{}
-	for _, port := range []struct {
-		label string
-		value int
-	}{
-		{"upstream plaintext", config.UpstreamPlaintextPort},
-		{"upstream TLS", config.UpstreamTLSPort},
-		{"plaintext", config.PlaintextPort},
-		{"TLS", config.TLSPort},
-		{"control", config.ControlPort},
-	} {
-		if port.value < 1 || port.value > 65535 {
-			return nil, fmt.Errorf("%s port %d is out of range", port.label, port.value)
-		}
-		if previous, taken := ports[port.value]; taken {
-			return nil, fmt.Errorf("%s and %s ports are both %d", previous, port.label, port.value)
-		}
-		ports[port.value] = port.label
-	}
-	return &Stack{config: config}, nil
+	return config
 }
 
 // CAFile is the certificate authority the server generated, which a

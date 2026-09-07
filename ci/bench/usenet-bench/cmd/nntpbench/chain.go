@@ -337,6 +337,9 @@ func chain(args []string) error {
 		return err
 	}
 	defer stack.stop(log)
+	if err := stack.preflight(log); err != nil {
+		return err
+	}
 	plans, err := buildChainPlans(phases, dryRun, log)
 	if err != nil {
 		return err
@@ -753,32 +756,29 @@ func chainRTTLabel(value string) string {
 // only ever asks for a link, so the two arrangements -- containers under
 // Compose, or local processes -- stay interchangeable from its point of view.
 type chainStack interface {
+	// preflight reports host conditions that only the host can answer, before
+	// anything is started or measured.
+	preflight(log func(string, ...any)) error
 	apply(config ChainConfig, phase ChainPhase, log func(string, ...any)) error
 	stop(log func(string, ...any))
 }
 
-// newChainStack builds the session's stack and, for a raw one, settles every
-// value the phases need to reach it: the ports, the host, the CA the server
-// will generate and the shaper's control plane. Deriving them here rather than
-// asking the operator to restate them in the config keeps the run arguments
-// and the running processes from ever describing different endpoints.
-func newChainStack(config *ChainConfig, log func(string, ...any)) (chainStack, error) {
-	if config.Stack != ChainStackRaw {
-		return dockerChainStack{}, nil
-	}
-	target, err := rawExecutionTarget()
-	if err != nil {
-		return nil, err
+// chainRawStackConfig is the one place a chain description becomes a raw stack
+// configuration. Preflight settles its check from here too, so a host that
+// passes a check is the host the session will actually run on.
+func chainRawStackConfig(config ChainConfig) (rawstack.Config, error) {
+	if config.Raw == nil {
+		return rawstack.Config{}, fmt.Errorf("chain %s declares no raw stack", config.Name)
 	}
 	timeout, err := chainDuration(config.Raw.StartTimeout, rawstack.DefaultStartTimeout)
 	if err != nil {
-		return nil, err
+		return rawstack.Config{}, err
 	}
 	pipelining := true
 	if config.Raw.Pipelining != nil {
 		pipelining = *config.Raw.Pipelining
 	}
-	stack, err := rawstack.New(rawstack.Config{
+	return rawstack.Config{
 		BinDir:                config.Raw.BinDir,
 		DataDir:               config.Raw.DataDir,
 		CertDir:               config.Raw.CertDir,
@@ -794,7 +794,27 @@ func newChainStack(config *ChainConfig, log func(string, ...any)) (chainStack, e
 		ControlPort:           config.Raw.ControlPort,
 		DelayQueueBytes:       config.Raw.DelayQueueBytes,
 		StartTimeout:          timeout,
-	})
+	}, nil
+}
+
+// newChainStack builds the session's stack and, for a raw one, settles every
+// value the phases need to reach it: the ports, the host, the CA the server
+// will generate and the shaper's control plane. Deriving them here rather than
+// asking the operator to restate them in the config keeps the run arguments
+// and the running processes from ever describing different endpoints.
+func newChainStack(config *ChainConfig, log func(string, ...any)) (chainStack, error) {
+	if config.Stack != ChainStackRaw {
+		return dockerChainStack{}, nil
+	}
+	target, err := rawExecutionTarget()
+	if err != nil {
+		return nil, err
+	}
+	settings, err := chainRawStackConfig(*config)
+	if err != nil {
+		return nil, err
+	}
+	stack, err := rawstack.New(settings)
 	if err != nil {
 		return nil, err
 	}
@@ -818,6 +838,10 @@ func defaultChainString(value, fallback string) string {
 
 type dockerChainStack struct{}
 
+// The Compose stack's own preconditions are checked against the containers it
+// runs, in checkChainRequirements; there is nothing further to ask the host.
+func (dockerChainStack) preflight(func(string, ...any)) error { return nil }
+
 func (dockerChainStack) apply(config ChainConfig, phase ChainPhase, log func(string, ...any)) error {
 	return applyChainShaper(config, phase, log)
 }
@@ -832,6 +856,22 @@ type rawChainStack struct {
 // apply starts the stack for the first link and replaces the shaper for every
 // later one. The server is never restarted: reopening the article store
 // between phases would charge one phase for another's cold cache.
+// preflight asks the host whether the stack's ports are actually free. It is
+// the one condition a configuration cannot settle, and an occupied port
+// otherwise surfaces as a failed start after the plans are already built.
+func (r *rawChainStack) preflight(log func(string, ...any)) error {
+	failed := rawstack.FailedChecks(r.stack.Preflight())
+	if len(failed) == 0 {
+		log("precondition ok: the raw stack's binaries, article store and ports are all available")
+		return nil
+	}
+	reasons := make([]string, 0, len(failed))
+	for _, check := range failed {
+		reasons = append(reasons, check.Reason)
+	}
+	return fmt.Errorf("the raw stack cannot start on this host:\n  %s", strings.Join(reasons, "\n  "))
+}
+
 func (r *rawChainStack) apply(config ChainConfig, phase ChainPhase, log func(string, ...any)) error {
 	profile, err := phase.linkProfile()
 	if err != nil {

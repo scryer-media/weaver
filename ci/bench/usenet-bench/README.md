@@ -1045,31 +1045,35 @@ meaningless without the manifests and NZBs that name its articles, and the
 manifest hashes are the cross-host equivalence check. Copy them together or
 neither.
 
-### Building and describing the stack
+### Staging the stack
 
-Both programs are pure Go and cross-compile without cgo. The shaper is in this
-module; the server is installed from its own module at a pinned version, which
-must be the version the Docker lane's `image build` pins — a raw run and a
-containerized one are only comparable if they served the same articles from the
-same server:
+The harness never installs anything — the same rule the native client lanes
+follow. Put the two executables somewhere and tell the chain which directory
+they are in; it looks for `e2e-nntp` and `nntpshaper` by those exact names,
+with `.exe` appended on Windows, and refuses to start if either is missing.
+
+Both are pure Go and cross-compile without cgo, so a bench host needs no Go
+toolchain: build on whatever machine has the checkout and copy the directory
+across, which is how the controller itself is already staged. The shaper is in
+this module; the server is another module, pinned at the version the Docker
+lane's `image build` pins — a raw run and a containerized one are only
+comparable if they served the same articles from the same server.
 
 ```bash
-# macOS host, from this directory.
-go build -o /scratch/bin/nntpshaper ./cmd/nntpshaper
+# For this Mac.
+go build -trimpath -o /scratch/bin/nntpshaper ./cmd/nntpshaper
 GOBIN=/scratch/bin go install github.com/scryer-media/e2e-nntp/cmd/e2e-nntp@v0.1.0
 
-# Windows, cross-built from anywhere. `go install` refuses a GOBIN when it is
-# cross-compiling, so the binaries land under GOPATH; copy them to the bin
-# directory the chain names.
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o nntpshaper.exe ./cmd/nntpshaper
+# For a Windows host, cross-built. `go install` refuses a GOBIN while it is
+# cross-compiling, so that one lands under GOPATH; copy it in beside the other.
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go build -trimpath -o /scratch/bin-windows/nntpshaper.exe ./cmd/nntpshaper
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
   go install github.com/scryer-media/e2e-nntp/cmd/e2e-nntp@v0.1.0
-# -> $(go env GOPATH)/bin/windows_amd64/e2e-nntp.exe
+cp "$(go env GOPATH)/bin/windows_amd64/e2e-nntp.exe" /scratch/bin-windows/
 ```
 
-The stack looks for `e2e-nntp` and `nntpshaper` in `raw.bin_dir` by those exact
-names, with `.exe` appended on Windows, and refuses to start if either is
-missing.
+### Describing the stack
 
 A chain runs the stack by naming it. `configs/chains/raw-native.example.json`
 is a complete native session:
@@ -1103,16 +1107,39 @@ the other's cold cache. Its link contract is immutable for the life of the
 process, which is what lets a run's before and after attestations prove the
 conditions never moved underneath it.
 
-A dry run brings none of it up but checks all of it — the binaries exist, the
-spool is not empty, the ports do not clash, every fixture has a manifest:
+### Checking a host
+
+`preflight` covers the raw stack as well as the clients. Point it at the chain
+that will run, so the stack it checks is the stack the session uses rather than
+a set of directories retyped on a command line:
+
+```bash
+go run ./cmd/nntpbench preflight --target macos-native \
+  --chain /scratch/runs/raw-native.json \
+  --adapter /scratch/bin/nativeadapter --weaver /path/to/weaver \
+  --nzbget /path/to/nzbget
+```
+
+It reports every condition at once — both executables, the article store and
+how many entries it holds, the password file, the port assignments, and whether
+each port is actually free — instead of stopping at the first, so a new host is
+fixed in one pass. Nothing is started, written or changed. To check a host
+before its session is written, name the directories directly with
+`--raw-bin-dir` and `--raw-data-dir`; giving both a chain and the flags is
+refused rather than silently resolved in favour of one.
+
+A chain re-runs the port probe itself, on a dry run and a real one, before any
+plan is built:
 
 ```bash
 go run ./cmd/nntpbench chain --config /scratch/runs/raw-native.json --dry-run
 ```
 
-An empty spool is worth catching there. It answers `430` to every article, and
-a run against it looks like a client that failed rather than a server with
-nothing to serve.
+Whether a port is free is the one condition a configuration can never settle,
+and on a developer's machine the control plane's 8080 is a popular port. An
+empty article store is worth catching there too: it answers `430` to every
+article, and a run against it looks like a client that failed rather than a
+server with nothing to serve.
 
 ### What a raw stack refuses
 
@@ -1152,7 +1179,9 @@ GOOS=windows GOARCH=amd64 go build -o nntpbench.exe ./cmd/nntpbench
 ```
 
 Run the non-mutating preflight first; it prints the expected local
-executables and fails if the OS or a binary is missing:
+executables and fails if the OS or a binary is missing. Add `--chain` when this
+host also serves the benchmark, and it covers the
+[raw stack](#raw-stack-the-server-side-without-docker) in the same report:
 
 ```bash
 go run ./cmd/nntpbench preflight --target macos-native \
