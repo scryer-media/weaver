@@ -229,7 +229,7 @@
     {
       "name": "C3-eqt-rtt10",
       "mode": "sequential",
-      "plan": "plan-C3-nfs-eqt-tls-nfsall-rtt10.json",
+      "plan": "plan-C3-nfs-eqt-tls-nfscomplete-rtt10.json",
       "fixtures_root": "../fixtures",
       "artifacts": "artifacts-C3-eqt-rtt10",
       "server_link": "1gbit",
@@ -242,7 +242,7 @@
         "profile": "equivalent-throughput",
         "repetitions": 3,
         "seed": 20260905,
-        "storage_profile": "nfs-all",
+        "storage_profile": "nfs-complete",
         "nfs_link": "nas-100mbit"
       },
       "nfs": {
@@ -408,32 +408,6 @@
         "nzbget"
       ],
       "minimum_blocks": 3
-    },
-    {
-      "name": "C3-eqt-rtt100",
-      "mode": "sequential",
-      "plan": "plan-C3-nfs-eqt-tls-nfsall-rtt100.json",
-      "fixtures_root": "../fixtures",
-      "artifacts": "artifacts-C3-eqt-rtt100",
-      "server_link": "1gbit",
-      "server_rtt": "100ms",
-      "plan_spec": {
-        "fixture_set": "nfs-breadth",
-        "transports": [
-          "tls"
-        ],
-        "profile": "equivalent-throughput",
-        "repetitions": 3,
-        "seed": 20260906,
-        "storage_profile": "nfs-all",
-        "nfs_link": "nas-100mbit"
-      },
-      "nfs": {
-        "container": "nfs-bench-nfs-1",
-        "network": "nfs-bench_benchmark_storage",
-        "helper_image": "weaver-nntp-bench-nfs:dev",
-        "verify_binary": "../bin/nntpbench"
-      }
     }
   ]
 }
