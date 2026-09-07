@@ -6,7 +6,89 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore}
 
 const NEXT_JOB_ID_SETTING_KEY: &str = "next_job_id";
 
+/// The bind-address portion of an authenticated network-policy update.
+/// Keeping `Unchanged` distinct from `Clear` lets the combined settings form
+/// leave a saved listener alone while still offering an explicit reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkBindAddressUpdate {
+    Unchanged,
+    Clear,
+    Set(String),
+}
+
+/// A complete atomic authenticated browser-network policy write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedNetworkAccessUpdate {
+    pub trusted_proxies_json: Option<String>,
+    /// `None` preserves an environment-pinned trusted-network setting.
+    pub trusted_networks_json: Option<String>,
+    /// `None` preserves an environment-pinned bind setting.
+    pub bind_address: NetworkBindAddressUpdate,
+}
+
 impl Database {
+    /// Persist the authenticated browser policy in one transaction. The live
+    /// runtime snapshot is intentionally updated by the caller only after this
+    /// returns successfully.
+    pub fn update_authenticated_network_access(
+        &self,
+        update: &AuthenticatedNetworkAccessUpdate,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let update = update.clone();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_authenticated_network_access", |tx| {
+                let update = update.clone();
+                Box::pin(async move {
+                    if let Some(networks) = update.trusted_networks_json {
+                        tx.execute(
+                            "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            &[
+                                SqlArg::Text(crate::security::SETTING_TRUSTED_NETWORKS.to_string()),
+                                SqlArg::Text(networks),
+                            ],
+                        ).await?;
+                    }
+                    if let Some(proxies) = update.trusted_proxies_json {
+                        tx.execute(
+                            "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            &[
+                                SqlArg::Text(crate::security::SETTING_TRUSTED_PROXIES.to_string()),
+                                SqlArg::Text(proxies),
+                            ],
+                        ).await?;
+                    }
+                    match update.bind_address {
+                        NetworkBindAddressUpdate::Unchanged => {}
+                        NetworkBindAddressUpdate::Clear => {
+                            tx.execute(
+                                "DELETE FROM settings WHERE key = {}",
+                                &[SqlArg::Text(crate::security::SETTING_HTTP_BIND_ADDRESS.to_string())],
+                            ).await?;
+                        }
+                        NetworkBindAddressUpdate::Set(address) => {
+                            tx.execute(
+                                "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                &[
+                                    SqlArg::Text(crate::security::SETTING_HTTP_BIND_ADDRESS.to_string()),
+                                    SqlArg::Text(address),
+                                ],
+                            ).await?;
+                        }
+                    }
+                    tx.execute(
+                        "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        &[
+                            SqlArg::Text(crate::security::SETTING_SECURITY_POLICY_REVISION.to_string()),
+                            SqlArg::Text(crate::security::AUTHENTICATED_POLICY_REVISION.to_string()),
+                        ],
+                    ).await?;
+                    Ok(())
+                })
+            }).await
+        })
+    }
+
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let key = key.to_string();

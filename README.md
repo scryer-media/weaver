@@ -67,14 +67,7 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Etc/UTC # log timestamps use this zone and carry its UTC offset
-      - UMASK=022 # optional
-      - WEAVER_HTTP_ALLOWED_HOSTS=weaver,weaver.example.me # permit the Compose service name and any reverse proxy names
-      # First-run setup: pick one of the two blocks below.
-      # - WEAVER_TRUSTED_CIDRS=192.168.0.0/16 # browsers in these networks get full access without a login
-      # - WEAVER_TRUSTED_PROXIES=172.20.0.5 # only with the line above, and only behind a reverse proxy: trust its forwarded client address
-      # - WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin # creates the login on first start, then sign in normally
-      # - WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/run/secrets/weaver-login # the password, read from a mounted file
+      - TZ=Etc/UTC
     volumes:
       - /path/to/weaver/config:/config # this is the critical volume with all your config data and encryption key
     ports:
@@ -82,11 +75,29 @@ services:
     restart: unless-stopped
 ```
 
-First-run setup for a container happens through the variables commented out
-above, because no browser reaches a container as "the machine itself" — a
-native install runs the setup wizard in the browser instead. Until one of them
-is set, the container's web page explains this rather than showing a wizard it
-could not accept.
+New installations require an administrator login. Weaver prints a one-time
+setup code once at startup; enter it in the browser wizard. The code is valid
+until setup succeeds or Weaver restarts and is never exposed by unauthenticated
+HTTP. Native launchers show the same code. For unattended setup, use bootstrap
+credentials:
+
+```yaml
+      - WEAVER_ACCESS_MODE=authenticated
+      - WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin
+      - WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/run/secrets/weaver-login
+```
+
+Mount the password as a Compose secret or another read-only file. Set exactly
+one of `WEAVER_BOOTSTRAP_LOGIN_PASSWORD` and
+`WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE`; invalid or incomplete bootstrap input
+fails startup. Existing credentials are retained. The new `WEAVER_ACCESS_MODE`
+accepts only `authenticated`; blank means unset and other nonempty values are
+errors. It is optional for new installations and explicitly migrates an existing
+installation to authenticated browser access.
+
+`WEAVER_TRUSTED_CIDRS` can restrict where a remembered browser login is
+accepted in authenticated mode. It never makes an unknown browser an
+administrator; a password login outside the list creates an ordinary session.
 
 Weaver binds to `127.0.0.1` by default, so a native install is never exposed by
 accident; the container image ships `WEAVER_HTTP_BIND_ADDRESS=0.0.0.0`, since a
@@ -99,36 +110,50 @@ where the ports you publish with `-p` — or `--network host` — are what actua
 decide exposure, so pin `WEAVER_HTTP_BIND_ADDRESS` at the deployment level
 instead. The variable always wins over the stored setting.
 
-Binding and browser trust are separate: binding to a LAN interface
-does not trust its clients. To deliberately allow loginless browser access,
-configure `WEAVER_TRUSTED_CIDRS` with explicit client networks, for example
-`127.0.0.0/8,::1/128` for local access only. Matching clients receive full
-administrative browser access; agents and integrations must use persistent,
-scoped API keys instead.
+Binding and browser authentication are separate: binding to a LAN interface
+does not trust its clients. Agents and integrations use persistent, scoped API
+keys instead of browser sessions.
 
-Behind a reverse proxy, every request reaches Weaver from the proxy, so a
-trusted network never matches the browser's own address. Name the proxy in
-`WEAVER_TRUSTED_PROXIES` — a comma-separated list of addresses or CIDRs, for
-example `172.20.0.5` or `10.8.0.0/16` — and Weaver judges trust on the client
-the proxy reports in `X-Forwarded-For` (or `X-Real-IP`, or `Forwarded`) rather
-than on the proxy itself. The list is empty by default, and that default is
-what makes forwarding headers unusable as a spoof: an address is believed only
-when it arrives from a proxy you named. Trusted hops are removed from the right
-of the chain, so a browser that sends its own `X-Forwarded-For` is still judged
-on the address your proxy recorded. Weaver's refusal page prints the address it
-judged, and says when forwarding headers were present but ignored.
-
-The list does not apply to the Docker userland proxy. Publishing a port with
-`-p` on a host where `userland-proxy` is enabled rewrites the source address to
-the bridge gateway and adds no headers, so every browser arrives as the same
-address and no trusted network can distinguish them. Use `--network host`, or
-set `"userland-proxy": false` in the Docker daemon configuration, or put a real
-reverse proxy in front and name it here.
+Behind a reverse proxy, list only its socket address or CIDR in **Settings →
+Security → Network access**, alongside the optional remembered-login CIDRs.
+`WEAVER_TRUSTED_PROXIES` remains available as a deployment override and makes
+that field read-only. Weaver accepts `X-Forwarded-For` only from that named
+peer and removes trusted hops right to left. Missing, malformed, oversized, or
+all-trusted chains are unresolved and cannot satisfy remembered-login network
+restrictions. Do not trust Docker gateways or broad private ranges as a proxy
+workaround. Configure the proxy to preserve `Origin` and append
+`X-Forwarded-For`; HTTPS is recommended for remote access.
 
 For an unattended first start, configure `WEAVER_BOOTSTRAP_LOGIN_USERNAME` and
 exactly one of `WEAVER_BOOTSTRAP_LOGIN_PASSWORD` or
 `WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE`. Bootstrap credentials are used only
 when no login is already stored; they never overwrite an existing login.
+
+Sessions are per browser. Remembered sessions last at most 30 days; ordinary
+cookies expire when the browser session ends, with the same 30-day server cap.
+Cookies are host-only, HttpOnly, SameSite, and Secure
+on HTTPS. Logout revokes the current session, and **Sign out all** revokes every
+browser session. Password changes, sign-out-all, the combined trusted-network,
+trusted-proxy and bind-address policy, API-key creation, backup operations, and
+execution-sensitive configuration require a password verification from the
+same browser session within 15 minutes.
+
+Existing installations retain legacy access behavior until explicitly
+migrated. Legacy trusted CIDRs retain their compatibility meaning and host
+defenses remain active. In authenticated mode, internal Docker names and valid
+external hosts work unless `WEAVER_HTTP_ALLOWED_HOSTS` explicitly restricts
+them.
+
+Existing bind, proxy, trusted-CIDR, cookie-security, strict-security, and host
+environment overrides remain supported. Migration preserves stored credentials
+and API keys; browsers sign in again to obtain individually revocable sessions.
+
+Native installs listen on `127.0.0.1` by default; the container image listens
+on `0.0.0.0`, with published ports controlling exposure. Listener changes can
+require restart; the interface reports saved versus active state and preserves
+drafts after rejected writes. For recovery, use `WEAVER_RESET_LOGIN=1`, finish
+authenticated setup with the startup code or bootstrap credentials, then
+remove the reset variable.
 
 RSS feeds may use local, private, link-local, or container-network addresses
 by default. Feed Basic Auth credentials are sent only to requests whose scheme,

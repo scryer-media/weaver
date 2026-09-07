@@ -173,8 +173,16 @@ fn read_bootstrap_password_file(path: &Path) -> Result<String, BootstrapLoginErr
     Ok(password)
 }
 
+pub(crate) const INSTALL_GENERATION_SETTING: &str = "auth.installation_generation";
+
 pub(crate) fn open_database(config_path: &Path) -> Result<Database, Box<dyn std::error::Error>> {
-    weaver_server_core::persistence::open_database(config_path)
+    let db = weaver_server_core::persistence::open_database(config_path)?;
+    if db.pre_migration_schema_version().is_none() {
+        // Record generation before deployment/bootstrap validation can fail.
+        // A retry of a new install must not become a legacy no-code wizard.
+        db.set_setting(INSTALL_GENERATION_SETTING, "authenticated-v1")?;
+    }
+    Ok(db)
 }
 
 pub(crate) fn finish_open_db_and_config(

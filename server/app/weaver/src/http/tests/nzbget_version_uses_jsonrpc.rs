@@ -3153,11 +3153,9 @@ async fn a_configured_no_login_instance_never_asks_an_outside_browser_to_set_up(
 }
 
 #[tokio::test]
-async fn a_credential_reset_reopens_setup_for_the_machines_own_browser() {
-    // WEAVER_RESET_LOGIN clears credentials but leaves the stored access mode:
-    // configured, credential-less, trusting nothing. The machine's own browser
-    // is the one thing that can repair that from the UI, so the configured
-    // state must not suppress setup for it.
+async fn configured_missing_credentials_does_not_offer_setup_without_explicit_reset() {
+    // Recovery is armed only by startup after WEAVER_RESET_LOGIN. A test that
+    // supplies just the configured, credential-less state must fail closed.
     let security = weaver_server_core::security::RuntimeSecurityConfig::default();
     security.apply_stored_trust(Some("login_required"), None);
     assert!(security.security_configured());
@@ -3170,8 +3168,8 @@ async fn a_credential_reset_reopens_setup_for_the_machines_own_browser() {
     ))
     .await;
 
-    assert_eq!(payload["setupRequired"], true);
-    assert!(payload.get("setup").is_some());
+    assert_eq!(payload["setupRequired"], false);
+    assert!(payload.get("setup").is_none());
 }
 
 #[tokio::test]

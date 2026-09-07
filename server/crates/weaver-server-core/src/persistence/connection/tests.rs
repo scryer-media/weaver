@@ -621,6 +621,8 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
     matches!(
         (table, column),
         ("servers", "tls")
+            | ("browser_sessions", "remembered")
+            | ("server_tls_diagnostics", "honors_client_cipher_order")
             | ("servers", "active")
             | ("servers", "supports_pipelining")
             | ("servers", "backfill")

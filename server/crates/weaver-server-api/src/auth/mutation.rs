@@ -2,7 +2,7 @@ use async_graphql::{Context, Object, Result};
 use tracing::info;
 
 use crate::auth::types::{ApiKey, ApiKeyScope, CreateApiKeyResult};
-use crate::auth::{AdminGuard, generate_api_key, hash_api_key};
+use crate::auth::{FreshAdminGuard, generate_api_key, hash_api_key};
 use weaver_server_core::Database;
 use weaver_server_core::auth::{ApiKeyAuthRow, ApiKeyCache};
 
@@ -12,7 +12,7 @@ pub(crate) struct AuthMutation;
 #[Object]
 impl AuthMutation {
     /// Create a new API key. Returns the raw key (shown only once).
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn create_api_key(
         &self,
         ctx: &Context<'_>,
@@ -58,7 +58,7 @@ impl AuthMutation {
         })
     }
     /// Delete an API key by ID.
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn delete_api_key(&self, ctx: &Context<'_>, id: i64) -> Result<Vec<ApiKey>> {
         let db = ctx.data::<Database>()?;
         let db = db.clone();
@@ -99,7 +99,7 @@ impl AuthMutation {
     /// deployment should be told their edit would not take effect, not left to
     /// discover it after a restart. An empty value clears the setting back to
     /// the loopback default.
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn set_http_bind_address(&self, ctx: &Context<'_>, address: String) -> Result<bool> {
         use weaver_server_core::security::{
             BindAddressSource, RuntimeSecurityConfig, SETTING_HTTP_BIND_ADDRESS, ip_is_loopback,
@@ -165,9 +165,102 @@ impl AuthMutation {
         Ok(true)
     }
 
+    /// Atomically update the authenticated browser policy and optional next
+    /// listener address. Legacy access-policy mutations remain available for
+    /// installations that have not migrated to authenticated browser access.
+    #[graphql(guard = "FreshAdminGuard")]
+    async fn update_network_access(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::auth::types::NetworkAccessInput,
+    ) -> Result<crate::auth::types::NetworkAccessStatus> {
+        use weaver_server_core::settings::persistence::{
+            AuthenticatedNetworkAccessUpdate, NetworkBindAddressUpdate,
+        };
+
+        let security = ctx.data::<weaver_server_core::security::RuntimeSecurityConfig>()?;
+        if !security.authenticated_access_mode() {
+            return Err(crate::auth::graphql_error(
+                "LEGACY_NETWORK_ACCESS",
+                "updateNetworkAccess requires authenticated browser access; use the legacy access-policy settings until migration is enabled",
+            ));
+        }
+        let update_guard = security
+            .network_policy_update_lock
+            .clone()
+            .lock_owned()
+            .await;
+        if !security.remembered_policy_valid() && input.trusted_proxies.is_none() {
+            return Err(crate::auth::graphql_error(
+                "INVALID_NETWORK_POLICY",
+                "Review and submit both trusted networks and trusted proxies to repair the stored policy",
+            ));
+        }
+        let bind_status = crate::schema::auth_query::http_bind_address_status(ctx).await?;
+        let request = ctx.data_opt::<crate::auth::types::NetworkRequestSecurityContext>();
+        // Validate both values before the transaction begins. A malformed bind
+        // cannot leave a newly saved trusted-network list behind.
+        let preview =
+            crate::auth::types::preview_network_access(&input, security, &bind_status, request)?;
+        let trusted_networks_json = (!security.trust_env_pinned)
+            .then(|| serde_json::to_string(&preview.trusted_networks))
+            .transpose()
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let trusted_proxies_json = (!security.proxies_env_pinned()
+            && input.trusted_proxies.is_some())
+        .then(|| serde_json::to_string(&preview.trusted_proxies))
+        .transpose()
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        let bind_address = if bind_status.editable {
+            match input.bind_address.as_deref() {
+                None => NetworkBindAddressUpdate::Unchanged,
+                Some(value) if value.trim().is_empty() => NetworkBindAddressUpdate::Clear,
+                Some(_) => NetworkBindAddressUpdate::Set(
+                    preview
+                        .bind_address
+                        .clone()
+                        .expect("validated non-empty bind address"),
+                ),
+            }
+        } else {
+            NetworkBindAddressUpdate::Unchanged
+        };
+        let parsed_networks = preview
+            .trusted_networks
+            .iter()
+            .filter_map(|entry| weaver_server_core::security::parse_ip_or_cidr(entry))
+            .collect();
+        let parsed_proxies = preview
+            .trusted_proxies
+            .iter()
+            .filter_map(|entry| weaver_server_core::security::parse_ip_or_cidr(entry))
+            .collect();
+        let db = ctx.data::<Database>()?.clone();
+        let live_security = security.clone();
+        tokio::task::spawn_blocking(move || {
+            let _update_guard = update_guard;
+            db.update_authenticated_network_access(&AuthenticatedNetworkAccessUpdate {
+                trusted_proxies_json,
+                trusted_networks_json,
+                bind_address,
+            })?;
+            // Keep commit and publication together even if the HTTP request is cancelled.
+            live_security.set_authenticated_network_policy(parsed_networks, parsed_proxies);
+            live_security.mark_security_configured();
+            Ok::<_, weaver_server_core::StateError>(())
+        })
+        .await
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+
+        // Publish after commit only. Failed writes leave every router clone
+        // on the prior policy and make a retry safe.
+        crate::schema::auth_query::network_access_status(ctx).await
+    }
+
     /// Change the browser-admission policy: mode plus trusted networks.
     /// Applies immediately — trust is live state, unlike the bind address.
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn set_access_policy(
         &self,
         ctx: &Context<'_>,
@@ -180,6 +273,12 @@ impl AuthMutation {
         };
 
         let security = ctx.data::<RuntimeSecurityConfig>()?;
+        if security.authenticated_access_mode() {
+            return Err(crate::auth::graphql_error(
+                "AUTHENTICATED_NETWORK_ACCESS",
+                "authenticated browser access does not support legacy access modes; use updateNetworkAccess to restrict remembered browser sessions",
+            ));
+        }
         if security.trust_env_pinned {
             return Err(async_graphql::Error::new(
                 "WEAVER_TRUSTED_CIDRS is set in this deployment's environment, which takes \
@@ -265,22 +364,35 @@ impl AuthMutation {
     }
 
     /// Enable login protection with a username and password.
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn enable_login(
         &self,
         ctx: &Context<'_>,
         username: String,
         password: String,
     ) -> Result<bool> {
+        if ctx
+            .data::<weaver_server_core::security::RuntimeSecurityConfig>()?
+            .authenticated_access_mode()
+        {
+            return Err(async_graphql::Error::new(
+                "login is already required; use changePassword to change credentials",
+            ));
+        }
         if username.is_empty() || password.is_empty() {
             return Err(async_graphql::Error::new(
                 "username and password must not be empty",
             ));
         }
-        let hash = tokio::task::spawn_blocking(move || crate::auth::hash_password(&password))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(async_graphql::Error::new)?;
+        let permit = weaver_server_core::auth::service::password_work_permit()
+            .map_err(|message| crate::auth::guards::graphql_error("AUTH_BUSY", message))?;
+        let hash = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::auth::hash_password(&password)
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(async_graphql::Error::new)?;
         let db = ctx.data::<Database>()?.clone();
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
         let username_for_db = username.clone();
@@ -299,8 +411,16 @@ impl AuthMutation {
         Ok(true)
     }
     /// Disable login protection.
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn disable_login(&self, ctx: &Context<'_>) -> Result<bool> {
+        if ctx
+            .data::<weaver_server_core::security::RuntimeSecurityConfig>()?
+            .authenticated_access_mode()
+        {
+            return Err(async_graphql::Error::new(
+                "authenticated browser access cannot be downgraded by disabling login",
+            ));
+        }
         let db = ctx.data::<Database>()?.clone();
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
         tokio::task::spawn_blocking(move || {
@@ -316,7 +436,7 @@ impl AuthMutation {
         Ok(true)
     }
     /// Change the login password. Requires the current password for verification.
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn change_password(
         &self,
         ctx: &Context<'_>,
@@ -334,24 +454,26 @@ impl AuthMutation {
             .ok_or_else(|| async_graphql::Error::new("login is not enabled"))?;
 
         let hash = creds.password_hash.clone();
-        let current = current_password.clone();
-        let valid =
-            tokio::task::spawn_blocking(move || crate::auth::verify_password(&current, &hash))
-                .await
-                .unwrap_or(false);
-        if !valid {
-            return Err(async_graphql::Error::new("current password is incorrect"));
-        }
-
-        let new_hash =
-            tokio::task::spawn_blocking(move || crate::auth::hash_password(&new_password))
-                .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                .map_err(async_graphql::Error::new)?;
+        let permit = weaver_server_core::auth::service::password_work_permit()
+            .map_err(|message| crate::auth::guards::graphql_error("AUTH_BUSY", message))?;
+        let new_hash = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if !crate::auth::verify_password(&current_password, &hash) {
+                return Err("current password is incorrect".to_string());
+            }
+            crate::auth::hash_password(&new_password)
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+        .map_err(async_graphql::Error::new)?;
         let username = creds.username.clone();
         let new_hash_for_db = new_hash.clone();
         let jwt_secret = tokio::task::spawn_blocking(move || {
-            db2.set_auth_credentials(&username, &new_hash_for_db)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            db2.change_auth_credentials_and_revoke_sessions(&username, &new_hash_for_db, now)?;
             db2.rotate_jwt_signing_secret()
         })
         .await
@@ -363,6 +485,21 @@ impl AuthMutation {
             jwt_secret,
         )));
         info!("login password changed");
+        Ok(true)
+    }
+
+    /// Revoke every durable browser session after a recent password check.
+    #[graphql(guard = "FreshAdminGuard")]
+    async fn sign_out_all(&self, ctx: &Context<'_>) -> Result<bool> {
+        let db = ctx.data::<Database>()?.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tokio::task::spawn_blocking(move || db.revoke_all_browser_sessions(now))
+            .await
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         Ok(true)
     }
 }

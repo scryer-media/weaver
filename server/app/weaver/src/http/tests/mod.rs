@@ -39,6 +39,8 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
             weaver_server_core::security::RuntimeSecurityConfig::default(),
         ))
         .layer(Extension(auth::LoginRateLimiter::default()))
+        .layer(Extension(ApiKeyCache::default()))
+        .layer(Extension(assets::BaseUrl(Arc::new("/".to_string()))))
         .layer(Extension(auth_cache))
 }
 
@@ -662,6 +664,7 @@ fn auth_status_test_router_from_peer(
         .layer(Extension(axum::extract::ConnectInfo(peer_addr)))
         .layer(Extension(db))
         .layer(Extension(security))
+        .layer(Extension(ApiKeyCache::default()))
         .layer(Extension(auth_cache))
 }
 

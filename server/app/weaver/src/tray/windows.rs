@@ -606,6 +606,9 @@ impl TrayState {
                 shared::app_origin(self.supervisor.port())
             ));
         }
+        if let Some(code) = self.supervisor.take_setup_code() {
+            show_setup_code(&code);
+        }
         Ok(())
     }
 
@@ -2642,6 +2645,50 @@ fn open_target(target: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn show_setup_code(code: &str) {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONINFORMATION, MB_OKCANCEL};
+    let title = wide("Finish Weaver setup");
+    let message = wide(&format!(
+        "Enter this one-time setup code in the browser wizard:\r\n\r\n{code}\r\n\r\nChoose OK to copy the code to the clipboard."
+    ));
+    // SAFETY: Both nul-terminated buffers remain live until the dialog closes.
+    let choice = unsafe {
+        MessageBoxW(
+            ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_ICONINFORMATION | MB_OKCANCEL,
+        )
+    };
+    if choice != IDOK {
+        return;
+    }
+    let copied = (|| -> std::io::Result<()> {
+        let root = std::env::var_os("SystemRoot")
+            .ok_or_else(|| std::io::Error::other("SystemRoot is unavailable"))?;
+        let mut child = Command::new(Path::new(&root).join("System32").join("clip.exe"))
+            .creation_flags(0x08000000)
+            .stdin(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(code.as_bytes())?;
+        }
+        if !child.wait()?.success() {
+            return Err(std::io::Error::other("clipboard copy failed"));
+        }
+        Ok(())
+    })();
+    if copied.is_err() {
+        show_error(
+            "Clipboard unavailable",
+            "The code could not be copied. Restart Weaver to display a new setup code.",
+        );
+    }
 }
 
 pub(super) fn show_error(title: &str, message: &str) {

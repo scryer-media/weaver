@@ -7,6 +7,7 @@ import {
   SET_ACCESS_POLICY_MUTATION,
   SET_HTTP_BIND_ADDRESS_MUTATION,
 } from "@/graphql/queries";
+import { refreshSessionCookie } from "@/graphql/client";
 
 type AccessMode = "login_required" | "login_except_local" | "no_login";
 
@@ -24,6 +25,9 @@ interface SetupResponse {
 export interface SetupEnvironment {
   bindEditable: boolean;
   deployment: string;
+  /** New installs use durable browser sessions and require a one-time code. */
+  authenticatedAccess?: boolean;
+  codeRequired?: boolean;
 }
 
 /// True for a deployment whose network exposure its runtime decides, not
@@ -260,6 +264,7 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [setupCode, setSetupCode] = useState("");
   const [bindWide, setBindWide] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -274,24 +279,32 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
   const containerized = isContainerDeployment(environment?.deployment);
   const bindPinned = environment ? !environment.bindEditable : false;
   const bindQuestionApplies = !containerized && !bindPinned;
+  const authenticatedAccess = environment?.authenticatedAccess === true;
+  const codeRequired = authenticatedAccess && environment?.codeRequired === true;
+  const selectedMode = authenticatedAccess ? "login_required" : mode;
 
-  const needsCredentials = mode === "login_required" || mode === "login_except_local";
+  const needsCredentials =
+    authenticatedAccess || mode === "login_required" || mode === "login_except_local";
   const credentialsValid =
     !needsCredentials ||
     (username.trim().length > 0 && password.length > 0 && password === confirm);
-  const canSubmit = mode !== null && credentialsValid && !submitting;
+  const canSubmit =
+    selectedMode !== null && credentialsValid && (!codeRequired || setupCode.trim().length > 0) && !submitting;
 
   const submit = async () => {
-    if (mode === null) {
+    if (selectedMode === null) {
       return;
     }
     setError(null);
     setSubmitting(true);
     try {
-      const body: Record<string, unknown> = { mode };
+      const body: Record<string, unknown> = { mode: selectedMode };
       if (needsCredentials) {
         body.username = username.trim();
         body.password = password;
+      }
+      if (codeRequired) {
+        body.setupCode = setupCode.trim();
       }
       if (bindWide && bindQuestionApplies) {
         body.bindAddress = "0.0.0.0";
@@ -307,6 +320,9 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
         setError(payload.error ?? `setup failed (${response.status})`);
         setSubmitting(false);
         return;
+      }
+      if (authenticatedAccess) {
+        await refreshSessionCookie();
       }
       if (payload.restartRequiredForBind) {
         setRestartSupported(Boolean(payload.restartSupported));
@@ -347,22 +363,26 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold">Set up Weaver</h1>
           <p className="text-sm text-muted-foreground">
-            Two decisions, changeable later in Settings → Security.
+            {authenticatedAccess
+              ? "Create the administrator account for this protected Weaver."
+              : "Two decisions, changeable later in Settings → Security."}
           </p>
         </div>
 
-        <fieldset className="space-y-3">
-          <legend className="text-sm font-medium">Who can open Weaver?</legend>
-          {MODES.map((candidate) => (
-            <ModeCard
-              key={candidate.id}
-              candidate={candidate}
-              groupName="access-mode"
-              checked={mode === candidate.id}
-              onSelect={() => setMode(candidate.id)}
-            />
-          ))}
-        </fieldset>
+        {!authenticatedAccess ? (
+          <fieldset className="space-y-3">
+            <legend className="text-sm font-medium">Who can open Weaver?</legend>
+            {MODES.map((candidate) => (
+              <ModeCard
+                key={candidate.id}
+                candidate={candidate}
+                groupName="access-mode"
+                checked={mode === candidate.id}
+                onSelect={() => setMode(candidate.id)}
+              />
+            ))}
+          </fieldset>
+        ) : null}
 
         {needsCredentials ? (
           <div className="grid gap-3 sm:grid-cols-3">
@@ -398,6 +418,22 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
             {password.length > 0 && confirm.length > 0 && password !== confirm ? (
               <p className="text-sm text-destructive sm:col-span-3">Passwords do not match.</p>
             ) : null}
+          </div>
+        ) : null}
+
+        {codeRequired ? (
+          <div className="space-y-2">
+            <Label htmlFor="setup-code">One-time setup code</Label>
+            <Input
+              id="setup-code"
+              type="password"
+              value={setupCode}
+              onChange={(event) => setSetupCode(event.target.value)}
+              autoComplete="off"
+            />
+            <p className="text-sm text-muted-foreground">
+              Enter the code shown when Weaver started. It is accepted only while setup is pending.
+            </p>
           </div>
         ) : null}
 

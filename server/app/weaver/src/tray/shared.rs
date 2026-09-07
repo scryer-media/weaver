@@ -10,10 +10,11 @@
     reason = "the Windows and macOS wrappers each use a subset of this module, and neither is compiled on other platforms"
 )]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -644,6 +645,30 @@ pub(crate) struct ServerSupervisor {
     profile_dir: PathBuf,
     port: u16,
     server: Option<Child>,
+    setup_code: Arc<Mutex<Option<String>>>,
+}
+
+const SETUP_CODE_PREFIX: &str = "Weaver one-time setup code: ";
+
+fn forward_server_stderr(stderr: impl Read, setup_code: Arc<Mutex<Option<String>>>) {
+    let mut captured = false;
+    for line in BufReader::new(stderr).lines() {
+        let Ok(line) = line else { break };
+        if let Some(code) = parse_setup_code_line(&line) {
+            if !captured {
+                *setup_code.lock().expect("setup code lock poisoned") = Some(code);
+                captured = true;
+            }
+            continue;
+        }
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+}
+
+fn parse_setup_code_line(line: &str) -> Option<String> {
+    let code = line.strip_prefix(SETUP_CODE_PREFIX)?;
+    (code.len() == 64 && code.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| code.to_string())
 }
 
 impl ServerSupervisor {
@@ -652,6 +677,7 @@ impl ServerSupervisor {
             profile_dir,
             port,
             server: None,
+            setup_code: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -665,6 +691,10 @@ impl ServerSupervisor {
 
     pub(crate) fn port(&self) -> u16 {
         self.port
+    }
+
+    pub(crate) fn take_setup_code(&self) -> Option<String> {
+        self.setup_code.lock().ok()?.take()
     }
 
     /// Create the profile the server is about to be pointed at. The server
@@ -717,13 +747,19 @@ impl ServerSupervisor {
             .arg("--log-file")
             .arg(&log_file)
             .args(["serve", "--port", &self.port.to_string()]);
+        command.stderr(Stdio::piped());
         configure_server_command(&mut command);
-        let child = command.spawn().map_err(|error| {
+        self.setup_code = Arc::new(Mutex::new(None));
+        let mut child = command.spawn().map_err(|error| {
             format!(
                 "failed to start Weaver from {}: {error}",
                 server_executable.display()
             )
         })?;
+        if let Some(stderr) = child.stderr.take() {
+            let setup_code = self.setup_code.clone();
+            thread::spawn(move || forward_server_stderr(stderr, setup_code));
+        }
         self.server = Some(child);
         Ok(())
     }
@@ -734,6 +770,7 @@ impl ServerSupervisor {
         let Some(mut child) = self.server.take() else {
             return Ok(());
         };
+        *self.setup_code.lock().expect("setup code lock poisoned") = None;
         if child
             .try_wait()
             .map_err(|error| format!("failed to check Weaver server status: {error}"))?
@@ -906,11 +943,25 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
-        decode_chunked, desktop_profile_dir_from, format_bytes, format_speed, http_origin,
-        is_weaver_document, opens_in_external_browser, parse_http_response,
-        popover_content_from_graphql, row_detail, set_cookie_value,
+        HttpResponse, PopoverContent, QueueRow, SETUP_CODE_PREFIX, SMOKE_BODY, SMOKE_RESPONSE,
+        app_origin, app_url, decode_chunked, desktop_profile_dir_from, format_bytes, format_speed,
+        http_origin, is_weaver_document, opens_in_external_browser, parse_http_response,
+        parse_setup_code_line, popover_content_from_graphql, row_detail, set_cookie_value,
     };
+
+    #[test]
+    fn setup_code_parser_accepts_only_the_exact_marker() {
+        let code = "a".repeat(64);
+        assert_eq!(
+            parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}{code}")),
+            Some(code)
+        );
+        assert_eq!(
+            parse_setup_code_line("Weaver one-time setup code: short"),
+            None
+        );
+        assert_eq!(parse_setup_code_line("unrelated setup code"), None);
+    }
 
     #[test]
     fn desktop_profile_is_isolated_from_legacy_portable_state() {

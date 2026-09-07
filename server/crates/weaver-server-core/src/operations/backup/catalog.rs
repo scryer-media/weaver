@@ -45,6 +45,9 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("categories", Export, Replace),
     table!("api_keys", Export, RequireEmpty),
     table!("auth_credentials", Export, Replace),
+    // Restoring configuration must never resurrect browser authority.
+    table!("browser_session_verifications", ResetOnRestore, Replace),
+    table!("browser_sessions", ResetOnRestore, Replace),
     table!("bandwidth_usage_minute_buckets", Export, RequireEmpty),
     table!("rss_feeds", Export, RequireEmpty),
     table!("rss_rules", Export, RequireEmpty),

@@ -21,6 +21,9 @@ pub const ENV_RSS_ALLOW_PRIVATE_NETWORK: &str = "WEAVER_RSS_ALLOW_PRIVATE_NETWOR
 pub const ENV_STRICT_SECURITY: &str = "WEAVER_STRICT_SECURITY";
 pub const ENV_TRUSTED_CIDRS: &str = "WEAVER_TRUSTED_CIDRS";
 pub const ENV_TRUSTED_PROXIES: &str = "WEAVER_TRUSTED_PROXIES";
+/// Pins browser access to authenticated sessions. The legacy CIDR bypass is
+/// retained only for installations that have not opted into this policy.
+pub const ENV_ACCESS_MODE: &str = "WEAVER_ACCESS_MODE";
 
 pub const DEFAULT_HTTP_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -59,9 +62,15 @@ impl BindAddressSource {
 
 /// Settings-table key holding the access mode the operator chose at setup.
 pub const SETTING_ACCESS_MODE: &str = "access_mode";
+/// Marks an install that has completed the authenticated browser-policy
+/// migration. Absence means the stored access mode retains legacy semantics.
+pub const SETTING_SECURITY_POLICY_REVISION: &str = "security_policy_revision";
+pub const AUTHENTICATED_POLICY_REVISION: &str = "authenticated-v1";
 /// Settings-table key holding the trusted-network list (JSON array of CIDRs)
 /// backing [`AccessMode::LoginExceptLocal`].
 pub const SETTING_TRUSTED_NETWORKS: &str = "trusted_networks";
+pub const SETTING_TRUSTED_PROXIES: &str = "trusted_proxies";
+type NetworkPolicySnapshot = (Vec<IpNet>, Vec<IpNet>);
 
 /// How browsers are admitted, chosen in the first-run wizard and editable in
 /// Settings → Security afterwards.
@@ -341,11 +350,19 @@ pub struct RuntimeSecurityConfig {
     pub nzb_decompressed_limit_bytes: u64,
     pub rss_allow_private_network: bool,
     pub strict_security: bool,
+    /// An explicit authenticated policy disables the legacy CIDR browser
+    /// administrator bypass. CIDRs may constrain remembered sessions, but do
+    /// not create authority on their own.
+    authenticated_access_mode: Arc<AtomicBool>,
+    remembered_policy_valid: Arc<AtomicBool>,
+    access_mode_env_pinned: bool,
     /// Behind a shared lock so a setup or policy change grants (or revokes)
     /// trust immediately in every clone spread through the router layers — a
     /// wizard that picks "no login" must be able to admit the very next
     /// request, not the next restart.
     trusted_cidrs: Arc<RwLock<Vec<IpNet>>>,
+    authenticated_network_policy: Arc<RwLock<Option<NetworkPolicySnapshot>>>,
+    pub network_policy_update_lock: Arc<tokio::sync::Mutex<()>>,
     /// True once the operator's browser-access policy is settled, shared across
     /// clones for the same reason the trust list is: the answer decides whether
     /// a credential-less visitor is shown the first-run wizard, and a wizard
@@ -377,13 +394,13 @@ pub struct RuntimeSecurityConfig {
 impl RuntimeSecurityConfig {
     pub fn from_env() -> Result<Self, SecurityConfigError> {
         let strict_security = parse_bool_env(ENV_STRICT_SECURITY, false)?;
+        let authenticated_access_mode = parse_authenticated_access_mode_env()?;
         let trusted_cidrs = parse_trusted_cidrs_env()?;
         let trust_env_pinned = !trusted_cidrs.is_empty();
-        if strict_security && trust_env_pinned {
-            return Err(SecurityConfigError::new(format!(
-                "{ENV_STRICT_SECURITY}=1 refuses non-empty {ENV_TRUSTED_CIDRS}"
-            )));
-        }
+        // Stored policy resolution happens after the database opens. Strict
+        // validation therefore belongs in `strict_security_violation`, where
+        // authenticated CIDR restrictions are distinguishable from the legacy
+        // browser-admin bypass.
 
         // Resolved against the environment alone here, because the database is
         // not open yet. `apply_stored_bind_address` settles it afterwards.
@@ -411,7 +428,12 @@ impl RuntimeSecurityConfig {
             )?,
             rss_allow_private_network: parse_bool_env(ENV_RSS_ALLOW_PRIVATE_NETWORK, true)?,
             strict_security,
+            authenticated_access_mode: Arc::new(AtomicBool::new(authenticated_access_mode)),
+            remembered_policy_valid: Arc::new(AtomicBool::new(true)),
+            access_mode_env_pinned: authenticated_access_mode,
             trusted_cidrs: Arc::new(RwLock::new(trusted_cidrs)),
+            authenticated_network_policy: Arc::new(RwLock::new(None)),
+            network_policy_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             trusted_proxies: parse_trusted_proxies_env()?,
             // An env-pinned deployment has already declared its policy, so it
             // is configured before the database is even open. Everything else
@@ -477,6 +499,20 @@ impl RuntimeSecurityConfig {
             self.mark_security_configured();
             return;
         }
+        if self.authenticated_access_mode() {
+            match parse_trusted_networks_json(stored_networks.unwrap_or("[]")) {
+                Ok(networks) => self.set_trusted_cidrs(networks),
+                Err(error) => {
+                    self.set_trusted_cidrs(Vec::new());
+                    self.remembered_policy_valid.store(false, Ordering::Relaxed);
+                    tracing::warn!(%error, "stored remembered-browser networks are invalid; password login is required");
+                }
+            }
+            if mode.is_some() {
+                self.mark_security_configured();
+            }
+            return;
+        }
         let mode = mode.and_then(AccessMode::parse_setting_value);
         // An unparsable stored mode leaves the install unconfigured on purpose:
         // trust already failed closed above, and re-asking is the only way the
@@ -507,17 +543,93 @@ impl RuntimeSecurityConfig {
     /// Replace the live trusted-network list, visible to every clone of this
     /// config immediately.
     pub fn set_trusted_cidrs(&self, networks: Vec<IpNet>) {
+        if let Some(policy) = self
+            .authenticated_network_policy
+            .write()
+            .expect("network policy lock poisoned")
+            .as_mut()
+        {
+            policy.0 = networks.clone();
+        }
         *self
             .trusted_cidrs
             .write()
             .expect("trusted-network lock poisoned") = networks;
+        self.remembered_policy_valid.store(true, Ordering::Relaxed);
+    }
+
+    pub fn remembered_policy_valid(&self) -> bool {
+        self.remembered_policy_valid.load(Ordering::Relaxed)
+    }
+
+    pub fn remembered_client_allowed(&self, peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
+        let (networks, proxies) = self.network_policy_snapshot();
+        self.remembered_policy_valid()
+            && self
+                .resolve_client_ip_with_proxies(peer, headers, &proxies)
+                .is_some_and(|ip| {
+                    networks.is_empty() || networks.iter().any(|network| network.contains(&ip))
+                })
     }
 
     pub fn trusted_cidrs(&self) -> Vec<IpNet> {
+        if let Some(policy) = self
+            .authenticated_network_policy
+            .read()
+            .expect("network policy lock poisoned")
+            .as_ref()
+        {
+            return policy.0.clone();
+        }
         self.trusted_cidrs
             .read()
             .expect("trusted-network lock poisoned")
             .clone()
+    }
+
+    pub fn trusted_proxies(&self) -> Vec<IpNet> {
+        self.network_policy_snapshot().1
+    }
+
+    pub fn proxies_env_pinned(&self) -> bool {
+        !self.trusted_proxies.is_empty()
+    }
+
+    pub fn network_policy_snapshot(&self) -> (Vec<IpNet>, Vec<IpNet>) {
+        self.authenticated_network_policy
+            .read()
+            .expect("network policy lock poisoned")
+            .clone()
+            .unwrap_or_else(|| {
+                (
+                    self.trusted_cidrs
+                        .read()
+                        .expect("trusted-network lock poisoned")
+                        .clone(),
+                    self.trusted_proxies.clone(),
+                )
+            })
+    }
+
+    pub fn set_authenticated_network_policy(&self, networks: Vec<IpNet>, proxies: Vec<IpNet>) {
+        *self
+            .authenticated_network_policy
+            .write()
+            .expect("network policy lock poisoned") = Some((networks, proxies));
+        self.remembered_policy_valid.store(true, Ordering::Relaxed);
+    }
+
+    pub fn apply_stored_proxies(&self, stored: Option<&str>) {
+        if !self.authenticated_access_mode() || self.proxies_env_pinned() {
+            return;
+        }
+        let parsed = stored.map(parse_trusted_networks_json).transpose();
+        let valid = parsed.is_ok() && self.remembered_policy_valid();
+        self.set_authenticated_network_policy(
+            self.trusted_cidrs(),
+            parsed.ok().flatten().unwrap_or_default(),
+        );
+        self.remembered_policy_valid.store(valid, Ordering::Relaxed);
     }
 
     /// Whether the operator's browser-access policy has been settled — by a
@@ -540,11 +652,34 @@ impl RuntimeSecurityConfig {
     }
 
     pub fn has_trusted_cidrs(&self) -> bool {
-        !self
-            .trusted_cidrs
-            .read()
-            .expect("trusted-network lock poisoned")
-            .is_empty()
+        !self.trusted_cidrs().is_empty()
+    }
+
+    /// Whether this process requires credentials for every browser
+    /// administrator session.
+    pub fn authenticated_access_mode(&self) -> bool {
+        self.authenticated_access_mode.load(Ordering::Relaxed)
+    }
+
+    /// Resolve the authenticated policy after the settings table is readable.
+    /// Environment has precedence; otherwise a missing legacy access setting
+    /// is a fresh authenticated install and an explicit revision preserves a
+    /// completed migration. Existing explicit access modes retain legacy
+    /// semantics until the operator migrates them.
+    pub fn apply_stored_access_policy_revision(
+        &self,
+        legacy_access_mode: Option<&str>,
+        policy_revision: Option<&str>,
+        existing_install: bool,
+    ) {
+        if self.access_mode_env_pinned {
+            return;
+        }
+        self.authenticated_access_mode.store(
+            (!existing_install && legacy_access_mode.is_none())
+                || policy_revision == Some(AUTHENTICATED_POLICY_REVISION),
+            Ordering::Relaxed,
+        );
     }
 
     /// Record that the configured address could not be bound and the process
@@ -555,10 +690,15 @@ impl RuntimeSecurityConfig {
     }
 
     pub fn exposes_admin_without_login(&self, login_enabled: bool) -> bool {
-        !login_enabled && !ip_is_loopback(self.http_bind_address)
+        !self.authenticated_access_mode()
+            && !login_enabled
+            && !ip_is_loopback(self.http_bind_address)
     }
 
     pub fn is_http_authority_allowed(&self, authority: &HttpAuthority) -> bool {
+        if self.authenticated_access_mode() && self.http_allowed_hosts.is_empty() {
+            return true;
+        }
         if authority.ip_literal || authority.host == "localhost" {
             return true;
         }
@@ -570,7 +710,7 @@ impl RuntimeSecurityConfig {
     }
 
     pub fn strict_security_violation(&self, login_enabled: bool) -> Option<String> {
-        if self.strict_security && self.has_trusted_cidrs() {
+        if self.strict_security && self.has_trusted_cidrs() && !self.authenticated_access_mode() {
             // Names the layer the trust actually came from, so the operator
             // debugs the thing they touched rather than a variable they never
             // set.
@@ -625,9 +765,7 @@ impl RuntimeSecurityConfig {
     }
 
     fn trusts_ip(&self, ip: IpAddr) -> bool {
-        self.trusted_cidrs
-            .read()
-            .expect("trusted-network lock poisoned")
+        self.trusted_cidrs()
             .iter()
             .any(|network| network.contains(&ip))
     }
@@ -636,7 +774,7 @@ impl RuntimeSecurityConfig {
     /// `WEAVER_TRUSTED_PROXIES`.
     pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
         let ip = canonical_ip(ip);
-        self.trusted_proxies
+        self.trusted_proxies()
             .iter()
             .any(|network| network.contains(&ip))
     }
@@ -657,15 +795,28 @@ impl RuntimeSecurityConfig {
         peer: Option<SocketAddr>,
         headers: &HeaderMap,
     ) -> Option<IpAddr> {
+        self.resolve_client_ip_with_proxies(peer, headers, &self.trusted_proxies())
+    }
+
+    pub fn resolve_client_ip_with_proxies(
+        &self,
+        peer: Option<SocketAddr>,
+        headers: &HeaderMap,
+        proxies: &[IpNet],
+    ) -> Option<IpAddr> {
+        let is_proxy = |ip| proxies.iter().any(|network| network.contains(&ip));
         let peer_ip = canonical_ip(peer?.ip());
-        if !self.is_trusted_proxy(peer_ip) {
+        if !is_proxy(peer_ip) {
             return Some(peer_ip);
         }
 
         let Ok(mut chain) = forwarded_for_chain(headers) else {
-            return Some(peer_ip);
+            return (!self.authenticated_access_mode()).then_some(peer_ip);
         };
         if chain.is_empty() {
+            if self.authenticated_access_mode() {
+                return None;
+            }
             // No `X-Forwarded-For` at all: honor the single-address headers
             // some proxies send instead. There is no chain to verify, but this
             // is only ever reached from a box the operator named, so believing
@@ -673,10 +824,14 @@ impl RuntimeSecurityConfig {
             return Some(single_forwarded_ip(headers).unwrap_or(peer_ip));
         }
         chain.push(peer_ip);
-        while chain.last().is_some_and(|hop| self.is_trusted_proxy(*hop)) {
+        while chain.last().is_some_and(|hop| is_proxy(*hop)) {
             chain.pop();
         }
-        Some(chain.last().copied().unwrap_or(peer_ip))
+        match chain.last().copied() {
+            Some(client) => Some(client),
+            None if self.authenticated_access_mode() => None,
+            None => Some(peer_ip),
+        }
     }
 
     /// Returns whether this request carried forwarding headers that were
@@ -717,7 +872,7 @@ fn forwarded_for_chain(headers: &HeaderMap) -> Result<Vec<IpAddr>, ()> {
         let value = value.to_str().map_err(|_| ())?;
         for token in value.split(',') {
             if token.trim().is_empty() {
-                continue;
+                return Err(());
             }
             if hops.len() == MAX_FORWARDED_HOPS {
                 return Err(());
@@ -802,7 +957,12 @@ impl Default for RuntimeSecurityConfig {
             nzb_decompressed_limit_bytes: DEFAULT_NZB_DECOMPRESSED_LIMIT_BYTES,
             rss_allow_private_network: true,
             strict_security: false,
+            authenticated_access_mode: Arc::new(AtomicBool::new(false)),
+            remembered_policy_valid: Arc::new(AtomicBool::new(true)),
+            access_mode_env_pinned: false,
             trusted_cidrs: Arc::new(RwLock::new(Vec::new())),
+            authenticated_network_policy: Arc::new(RwLock::new(None)),
+            network_policy_update_lock: Arc::new(tokio::sync::Mutex::new(())),
             trusted_proxies: Vec::new(),
             security_configured: Arc::new(AtomicBool::new(false)),
             trust_env_pinned: false,
@@ -870,6 +1030,22 @@ fn parse_http_allowed_hosts_env() -> Result<Vec<HttpAuthority>, SecurityConfigEr
             })
         })
         .collect()
+}
+
+fn parse_authenticated_access_mode_env() -> Result<bool, SecurityConfigError> {
+    let Ok(value) = env::var(ENV_ACCESS_MODE) else {
+        return Ok(false);
+    };
+    if value.trim().is_empty() {
+        return Ok(false);
+    }
+    if value == "authenticated" {
+        Ok(true)
+    } else {
+        Err(SecurityConfigError::new(format!(
+            "{ENV_ACCESS_MODE} must be exactly authenticated"
+        )))
+    }
 }
 
 fn parse_trusted_cidrs_env() -> Result<Vec<IpNet>, SecurityConfigError> {
@@ -1093,6 +1269,7 @@ mod tests {
             ENV_STRICT_SECURITY,
             ENV_TRUSTED_CIDRS,
             ENV_TRUSTED_PROXIES,
+            ENV_ACCESS_MODE,
         ] {
             unsafe { env::remove_var(name) };
         }
@@ -1360,7 +1537,30 @@ mod tests {
         );
         assert!(config.rss_allow_private_network);
         assert!(!config.strict_security);
+        assert!(!config.authenticated_access_mode());
         assert!(!config.security_configured());
+    }
+
+    #[test]
+    fn authenticated_access_mode_is_an_explicit_single_value_opt_in() {
+        let _guard = env_lock();
+        clear_env();
+        unsafe { env::set_var(ENV_ACCESS_MODE, "authenticated") };
+        assert!(
+            RuntimeSecurityConfig::from_env()
+                .unwrap()
+                .authenticated_access_mode()
+        );
+
+        unsafe { env::set_var(ENV_ACCESS_MODE, "") };
+        assert!(
+            !RuntimeSecurityConfig::from_env()
+                .unwrap()
+                .authenticated_access_mode()
+        );
+        unsafe { env::set_var(ENV_ACCESS_MODE, "login_required") };
+        assert!(RuntimeSecurityConfig::from_env().is_err());
+        clear_env();
     }
 
     #[test]
@@ -1552,14 +1752,22 @@ mod tests {
     }
 
     #[test]
-    fn strict_security_rejects_trusted_cidrs() {
+    fn strict_security_rejects_legacy_cidr_authority_after_policy_resolution() {
         let _guard = env_lock();
         clear_env();
         unsafe {
             env::set_var(ENV_STRICT_SECURITY, "1");
             env::set_var(ENV_TRUSTED_CIDRS, "127.0.0.0/8");
         }
-        assert!(RuntimeSecurityConfig::from_env().is_err());
+        let security = RuntimeSecurityConfig::from_env().unwrap();
+        security.apply_stored_access_policy_revision(Some("login_except_local"), None, true);
+        assert!(security.strict_security_violation(true).is_some());
+        security.apply_stored_access_policy_revision(
+            Some("login_required"),
+            Some(AUTHENTICATED_POLICY_REVISION),
+            true,
+        );
+        assert!(security.strict_security_violation(true).is_none());
         clear_env();
     }
 

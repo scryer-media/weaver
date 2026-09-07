@@ -169,12 +169,25 @@ function SetupGate({ children }: { children: React.ReactNode }) {
     const statusUrl = new URL("api/auth/status", document.baseURI).href;
     fetch(statusUrl, { credentials: "include" })
       .then((response) => (response.ok ? response.json() : { setupRequired: false }))
-      .then((payload: { setupRequired?: boolean; setup?: SetupEnvironment }) => {
+      .then(
+        (payload: {
+          setupRequired?: boolean;
+          authenticatedAccess?: boolean;
+          setup?: SetupEnvironment;
+        }) => {
         if (!cancelled) {
           setSetupRequired(Boolean(payload.setupRequired));
-          setSetupEnvironment(payload.setup ?? null);
+          setSetupEnvironment(
+            payload.setup
+              ? {
+                  ...payload.setup,
+                  authenticatedAccess: payload.authenticatedAccess === true,
+                }
+              : null,
+          );
         }
-      })
+        },
+      )
       .catch(() => {
         // Unreachable status endpoint: let the app render and surface its own
         // errors rather than trapping the user on a blank gate.

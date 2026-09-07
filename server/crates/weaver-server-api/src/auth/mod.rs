@@ -4,7 +4,7 @@ pub mod types;
 pub use crate::schema::auth_mutation as mutation;
 pub use crate::schema::auth_query as query;
 pub use guards::{
-    AdminGuard, ControlGuard, ReadGuard, graphql_error, internal_error,
+    AdminGuard, ControlGuard, FreshAdminGuard, ReadGuard, graphql_error, internal_error,
     require_admin_for_file_delete,
 };
 pub use types::CallerIdentity;

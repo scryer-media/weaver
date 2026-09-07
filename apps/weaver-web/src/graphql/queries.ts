@@ -1250,6 +1250,68 @@ export const SET_ACCESS_POLICY_MUTATION = gql`
   }
 `;
 
+export const NETWORK_ACCESS_QUERY = gql`
+  query NetworkAccess {
+    networkAccess {
+      authenticatedAccess
+      legacyCompatibility
+      trustedNetworks
+      trustedProxies
+      trustedNetworksSource
+      proxiesSource
+      editable
+      envPinned
+      proxiesEditable
+      proxiesEnvPinned
+      rememberedPolicyValid
+      currentClient {
+        available
+        peer
+        resolvedClient
+        forwardingHeadersIgnored
+        rememberedClientAllowed
+      }
+      bindAddress {
+        address
+        storedAddress
+        source
+        editable
+        exposedWithoutLogin
+        restartRequired
+        bindFallback
+      }
+    }
+  }
+`;
+
+export const UPDATE_NETWORK_ACCESS_MUTATION = gql`
+  mutation UpdateNetworkAccess($input: NetworkAccessInput!) {
+    updateNetworkAccess(input: $input) {
+      authenticatedAccess
+      trustedNetworks
+      trustedProxies
+      envPinned
+      bindAddress {
+        address
+        storedAddress
+        restartRequired
+      }
+    }
+  }
+`;
+
+export const PREVIEW_NETWORK_ACCESS_QUERY = gql`
+  query PreviewNetworkAccess($input: NetworkAccessInput!) {
+    previewNetworkAccess(input: $input) {
+      trustedNetworks
+      trustedProxies
+      bindAddress
+      restartRequired
+      currentClientAllowed
+    }
+  }
+`;
+
 // One probe for the upgrade wizard: whether an access mode was ever stored,
 // whether this deployment allows changing it, and what the bind question
 // should default to. Combined so an already-configured install pays a single

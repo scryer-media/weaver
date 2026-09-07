@@ -86,6 +86,22 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
     let request_security = Arc::new(security.clone());
     let login_limiter = super::auth::LoginRateLimiter::default();
+    let setup_challenge = if security.authenticated_access_mode()
+        && auth_cache.snapshot().is_none()
+        && db
+            .get_setting(weaver_server_core::auth::repository::SETUP_PENDING_SETTING_KEY)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("pending")
+    {
+        let (challenge, code) = super::setup_code::SetupChallenge::generate();
+        // Keep the code outside tracing and its browser-accessible log buffer.
+        eprintln!("Weaver one-time setup code: {code}");
+        Some(challenge)
+    } else {
+        None
+    };
     let backup_upload_limit =
         usize::try_from(security.backup_upload_limit_bytes).unwrap_or(usize::MAX);
     let backup_request_limit = backup_upload_limit
@@ -145,10 +161,20 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .route("/api/system/restart", post(super::system::restart_handler))
         .route("/api/auth/setup", post(super::auth::setup_handler))
         .route("/api/login", post(super::auth::login_handler))
+        .route(
+            "/api/auth/verify",
+            post(super::auth::verify_password_handler),
+        )
+        .route(
+            "/api/auth/signout-all",
+            post(super::auth::sign_out_all_handler),
+        )
         .route("/api/logout", post(super::auth::logout_handler))
+        .route("/api/auth/csrf", get(super::auth::csrf_handler))
         .route("/api/auth/status", get(super::auth::auth_status_handler))
         .route("/", get(super::assets::static_handler))
         .fallback(get(super::assets::static_handler))
+        .layer(middleware::from_fn(super::auth::enforce_browser_csrf))
         .layer(Extension(handle))
         .layer(Extension(schema))
         .layer(Extension(backup))
@@ -174,6 +200,11 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             async move { super::request_metrics::track_requests(http_metrics, req, next).await }
         }));
 
+    let inner = if let Some(challenge) = setup_challenge {
+        inner.layer(Extension(challenge))
+    } else {
+        inner
+    };
     if base_url.is_empty() {
         inner
     } else {

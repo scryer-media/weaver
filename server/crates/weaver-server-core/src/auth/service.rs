@@ -31,10 +31,38 @@ pub enum JwtSecretError {
     InvalidHex(#[from] hex::FromHexError),
 }
 
+/// Share a small CPU/memory budget across browser password operations.
+/// Move the permit into the blocking closure so cancellation cannot free it early.
+pub fn password_work_permit() -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+    static WORK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    WORK.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "password verification is busy; try again shortly")
+}
+
 pub fn generate_api_key() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("getrandom failed");
     format!("wvr_{}", hex::encode(bytes))
+}
+
+/// Generate an opaque browser credential. It deliberately has no API-key
+/// prefix, so browser cookies can never be mistaken for programmatic keys.
+pub fn generate_browser_session_secret() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("getrandom failed");
+    hex::encode(bytes)
+}
+
+/// Stable per-session CSRF value. Only a verifier is persisted; this value is
+/// regenerated from the server secret after a browser reload or process restart.
+pub fn derive_browser_csrf_token(session_token: &str, server_secret: &[u8; 32]) -> String {
+    hex::encode(sign_hs256(
+        server_secret,
+        format!("browser-csrf-v1:{session_token}").as_bytes(),
+    ))
 }
 
 pub fn hash_api_key(raw_key: &str) -> [u8; 32] {
@@ -138,6 +166,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+/// Compare a browser CSRF verifier using the existing MAC implementation's
+/// constant-time tag verification, without exposing a prefix comparison.
+pub fn verify_browser_csrf_token(token: &str, verifier: &str) -> bool {
+    let Ok(expected): Result<[u8; 32], _> = hex::decode(verifier).and_then(|bytes| {
+        bytes
+            .try_into()
+            .map_err(|_| hex::FromHexError::InvalidStringLength)
+    }) else {
+        return false;
+    };
+    let domain = b"weaver-browser-csrf-verifier-v1";
+    let expected_tag = sign_hs256(domain, &expected);
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(domain)
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(&hash_api_key(token));
+    mac.verify_slice(&expected_tag).is_ok()
 }
 
 pub const JWT_TTL_SECS: u64 = 30 * 24 * 60 * 60;
