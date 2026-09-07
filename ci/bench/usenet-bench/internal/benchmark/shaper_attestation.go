@@ -37,6 +37,10 @@ type ShaperLinkShaping struct {
 	TCPWmem                string `json:"tcp_wmem"`
 	TCPRmem                string `json:"tcp_rmem"`
 	KernelRelease          string `json:"kernel_release"`
+	HandshakeDelayMicros   uint64 `json:"handshake_delay_micros,omitempty"`
+	EgressQueueBytes       uint64 `json:"egress_queue_bytes,omitempty"`
+	IngressQueueBytes      uint64 `json:"ingress_queue_bytes,omitempty"`
+	Platform               string `json:"platform,omitempty"`
 	LiveEgressDelayMicros  uint64 `json:"live_egress_delay_micros"`
 	LiveIngressDelayMicros uint64 `json:"live_ingress_delay_micros"`
 	LiveError              string `json:"live_error,omitempty"`
@@ -47,6 +51,13 @@ const (
 	shaperEgressNetem              = "netem"
 	shaperIngressIFBNetem          = "ifb-netem"
 	shaperIngressNone              = "none"
+	// A host with no tc -- Windows, macOS -- has the shaper carry the round
+	// trip in the proxy itself. It is a different mechanism with a different
+	// fidelity, not a variant of netem: it cannot delay the client's own TCP
+	// handshake, only pay that round trip back before the greeting. Results
+	// from the two are never comparable, which the execution target already
+	// keeps apart, and the mechanism is recorded in every run artifact.
+	shaperDelayUserspace = "userspace-delay"
 )
 
 // declared strips the per-snapshot live fields so two snapshots' contracts
@@ -66,7 +77,35 @@ func (l ShaperLinkShaping) validateFor(link ServerLinkProfile) error {
 	if l.RTTMicros != link.RTTMicros {
 		return fmt.Errorf("shaper link shaping report declares a %dus round trip, plan declares %dus", l.RTTMicros, link.RTTMicros)
 	}
-	if l.Interface == "" || l.EgressMechanism != shaperEgressNetem {
+	switch l.EgressMechanism {
+	case shaperEgressNetem:
+		if err := l.validateNetem(); err != nil {
+			return err
+		}
+	case shaperDelayUserspace:
+		if err := l.validateUserspace(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("shaper reports unknown egress mechanism %q", l.EgressMechanism)
+	}
+	if l.EgressDelayMicros == 0 || l.EgressDelayMicros+l.IngressDelayMicros != l.RTTMicros {
+		return fmt.Errorf("shaper egress %dus + ingress %dus does not make up the %dus round trip", l.EgressDelayMicros, l.IngressDelayMicros, l.RTTMicros)
+	}
+	if l.LiveError != "" {
+		return fmt.Errorf("shaper could not read its qdiscs back: %s", l.LiveError)
+	}
+	if !delayWithinTolerance(l.LiveEgressDelayMicros, l.EgressDelayMicros) {
+		return fmt.Errorf("tc reports a server-to-client delay of %dus, shaper declares %dus", l.LiveEgressDelayMicros, l.EgressDelayMicros)
+	}
+	if !delayWithinTolerance(l.LiveIngressDelayMicros, l.IngressDelayMicros) {
+		return fmt.Errorf("tc reports a client-to-server delay of %dus, shaper declares %dus", l.LiveIngressDelayMicros, l.IngressDelayMicros)
+	}
+	return nil
+}
+
+func (l ShaperLinkShaping) validateNetem() error {
+	if l.Interface == "" {
 		return fmt.Errorf("shaper link shaping report lacks a netem egress path")
 	}
 	switch l.IngressMechanism {
@@ -81,20 +120,37 @@ func (l ShaperLinkShaping) validateFor(link ServerLinkProfile) error {
 	default:
 		return fmt.Errorf("shaper reports unknown ingress mechanism %q", l.IngressMechanism)
 	}
-	if l.EgressDelayMicros == 0 || l.EgressDelayMicros+l.IngressDelayMicros != l.RTTMicros {
-		return fmt.Errorf("shaper egress %dus + ingress %dus does not make up the %dus round trip", l.EgressDelayMicros, l.IngressDelayMicros, l.RTTMicros)
-	}
 	if l.NetemLimitPackets == 0 {
 		return fmt.Errorf("shaper netem queue limit is unset")
 	}
-	if l.LiveError != "" {
-		return fmt.Errorf("shaper could not read its qdiscs back: %s", l.LiveError)
+	if l.HandshakeDelayMicros != 0 || l.EgressQueueBytes != 0 || l.IngressQueueBytes != 0 || l.Platform != "" {
+		return fmt.Errorf("shaper netem report carries userspace delay fields")
 	}
-	if !delayWithinTolerance(l.LiveEgressDelayMicros, l.EgressDelayMicros) {
-		return fmt.Errorf("tc reports a server-to-client delay of %dus, shaper declares %dus", l.LiveEgressDelayMicros, l.EgressDelayMicros)
+	return nil
+}
+
+// validateUserspace holds the userspace mechanism to the only shape it can
+// have. Every netem field must be empty: a report naming an interface or a
+// qdisc limit was written for a mechanism the process does not run, and
+// accepting it would credit tc evidence to a delay tc never applied.
+func (l ShaperLinkShaping) validateUserspace() error {
+	if l.IngressMechanism != shaperDelayUserspace {
+		return fmt.Errorf("shaper reports a %q egress path with a %q ingress path", l.EgressMechanism, l.IngressMechanism)
 	}
-	if !delayWithinTolerance(l.LiveIngressDelayMicros, l.IngressDelayMicros) {
-		return fmt.Errorf("tc reports a client-to-server delay of %dus, shaper declares %dus", l.LiveIngressDelayMicros, l.IngressDelayMicros)
+	if l.Interface != "" || l.IngressDevice != "" || l.NetemLimitPackets != 0 || l.TCPWmem != "" || l.TCPRmem != "" || l.KernelRelease != "" {
+		return fmt.Errorf("shaper userspace delay report carries netem or kernel evidence")
+	}
+	if l.IngressDelayMicros == 0 {
+		return fmt.Errorf("shaper userspace delay has no client-to-server delay")
+	}
+	if l.HandshakeDelayMicros != l.RTTMicros {
+		return fmt.Errorf("shaper charges a %dus handshake for a %dus round trip", l.HandshakeDelayMicros, l.RTTMicros)
+	}
+	if l.EgressQueueBytes == 0 || l.IngressQueueBytes == 0 {
+		return fmt.Errorf("shaper userspace delay has an unset queue size (egress %d, ingress %d bytes)", l.EgressQueueBytes, l.IngressQueueBytes)
+	}
+	if l.Platform == "" {
+		return fmt.Errorf("shaper userspace delay names no platform")
 	}
 	return nil
 }

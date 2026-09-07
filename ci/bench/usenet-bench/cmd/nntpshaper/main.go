@@ -58,19 +58,49 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// A configured round trip is rendered by the container entrypoint with tc
-	// before this process starts; its report is the contract the control
-	// plane attests. Without one the process refuses to serve rather than
-	// present an unshaped path as a delayed one.
+	queueBytes, err := uintEnv("NNTP_DELAY_QUEUE_BYTES", 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// A configured round trip is rendered before this process serves anything,
+	// and its report is the contract the control plane attests. Without one the
+	// process refuses to serve rather than present an unshaped path as a
+	// delayed one. On Linux the container entrypoint renders it with tc and
+	// writes the report; on a host with no tc the proxy carries the delay
+	// itself and builds the report from its own configuration.
+	mechanism := stringEnv("NNTP_RTT_MECHANISM", nntpshaper.LinkEgressNetem)
 	var linkShaping *nntpshaper.LinkShapingReport
-	if rttMicros > 0 {
-		linkShaping, err = nntpshaper.LoadLinkShapingReport(stringEnv("NNTP_LINK_REPORT_PATH", "/run/nntpshaper-link.json"), rttMicros)
-		if err != nil {
-			log.Fatal(err)
+	var liveDelays nntpshaper.LiveDelayProbe
+	var userspaceLink *nntpshaper.UserspaceLink
+	switch mechanism {
+	case nntpshaper.LinkEgressNetem:
+		if rttMicros > 0 {
+			linkShaping, err = nntpshaper.LoadLinkShapingReport(stringEnv("NNTP_LINK_REPORT_PATH", "/run/nntpshaper-link.json"), rttMicros)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if _, _, err := nntpshaper.TCLiveDelays(*linkShaping); err != nil {
+				log.Fatalf("verify configured round trip: %v", err)
+			}
+			liveDelays = nntpshaper.TCLiveDelays
 		}
-		if _, _, err := nntpshaper.TCLiveDelays(*linkShaping); err != nil {
-			log.Fatalf("verify configured round trip: %v", err)
+	case nntpshaper.LinkDelayUserspace:
+		if rttMicros > 0 {
+			userspaceLink, err = nntpshaper.NewUserspaceLink(nntpshaper.UserspaceLinkConfig{
+				RTTMicros:           rttMicros,
+				EgressBitsPerSecond: bitsPerSecond,
+				EgressQueueBytes:    int(queueBytes),
+				IngressQueueBytes:   int(queueBytes),
+			})
+			if err != nil {
+				log.Fatal(err)
+			}
+			report := userspaceLink.Report()
+			linkShaping = &report
+			liveDelays = userspaceLink.LiveDelays
 		}
+	default:
+		log.Fatalf("unknown round-trip mechanism %q; want %q or %q", mechanism, nntpshaper.LinkEgressNetem, nntpshaper.LinkDelayUserspace)
 	}
 	executableSHA256, err := nntpshaper.CurrentExecutableSHA256()
 	if err != nil {
@@ -81,7 +111,7 @@ func main() {
 		BurstBytes:          burstBytes,
 		RTTMicros:           rttMicros,
 		LinkShaping:         linkShaping,
-		LiveDelays:          nntpshaper.TCLiveDelays,
+		LiveDelays:          liveDelays,
 		Build: nntpshaper.BuildIdentity{
 			ExecutableSHA256: executableSHA256,
 			ImageIdentity:    stringEnv("NNTP_SHAPER_IMAGE_IDENTITY", ""),
@@ -107,7 +137,7 @@ func main() {
 			log.Fatalf("listen %s (%s): %v", config.label, config.listenAddress, err)
 		}
 		listeners = append(listeners, listener)
-		log.Printf("%s listener %s -> %s; aggregate egress=%d bits/s burst=%d bytes rtt=%dus", config.label, listener.Addr(), config.upstream, bitsPerSecond, burstBytes, rttMicros)
+		log.Printf("%s listener %s -> %s; aggregate egress=%d bits/s burst=%d bytes rtt=%dus via %s", config.label, listener.Addr(), config.upstream, bitsPerSecond, burstBytes, rttMicros, mechanism)
 	}
 	controlListener, err := net.Listen("tcp", stringEnv("CONTROL_LISTEN_ADDR", ":8080"))
 	if err != nil {
@@ -129,7 +159,7 @@ func main() {
 		workers.Add(1)
 		go func(listener net.Listener, config listenerConfig) {
 			defer workers.Done()
-			serve(ctx, listener, config, limiter, attestation)
+			serve(ctx, listener, config, limiter, attestation, userspaceLink)
 		}(listener, configs[index])
 	}
 	<-ctx.Done()
@@ -166,7 +196,7 @@ func healthCheckWithClient(args []string, client *http.Client) error {
 	return nil
 }
 
-func serve(ctx context.Context, listener net.Listener, config listenerConfig, limiter *nntpshaper.AggregateLimiter, attestation *nntpshaper.Attestation) {
+func serve(ctx context.Context, listener net.Listener, config listenerConfig, limiter *nntpshaper.AggregateLimiter, attestation *nntpshaper.Attestation, link *nntpshaper.UserspaceLink) {
 	for {
 		client, err := listener.Accept()
 		if err != nil {
@@ -176,11 +206,11 @@ func serve(ctx context.Context, listener net.Listener, config listenerConfig, li
 			log.Printf("accept %s: %v", config.label, err)
 			continue
 		}
-		go proxy(ctx, client, config, limiter, attestation)
+		go proxy(ctx, client, config, limiter, attestation, link)
 	}
 }
 
-func proxy(ctx context.Context, client net.Conn, config listenerConfig, limiter *nntpshaper.AggregateLimiter, attestation *nntpshaper.Attestation) {
+func proxy(ctx context.Context, client net.Conn, config listenerConfig, limiter *nntpshaper.AggregateLimiter, attestation *nntpshaper.Attestation, link *nntpshaper.UserspaceLink) {
 	defer client.Close()
 	sourceIdentity := downstreamSource(client.RemoteAddr())
 	release, err := attestation.OpenDownstream(sourceIdentity)
@@ -189,6 +219,16 @@ func proxy(ctx context.Context, client net.Conn, config listenerConfig, limiter 
 		return
 	}
 	defer release()
+	// Charge the connection's round trip before the upstream is dialled. netem
+	// delays the SYN exchange, so a real client waits a round trip for connect
+	// and another half for the greeting; this proxy's listener answers the SYN
+	// locally, and without the charge every connection would come up a full
+	// round trip early.
+	if link != nil {
+		if err := sleepContext(ctx, link.HandshakeDelay()); err != nil {
+			return
+		}
+	}
 	upstream, err := (&net.Dialer{}).DialContext(ctx, "tcp", config.upstream)
 	if err != nil {
 		log.Printf("dial %s upstream %s for %s: %v", config.label, config.upstream, client.RemoteAddr(), err)
@@ -198,6 +238,7 @@ func proxy(ctx context.Context, client net.Conn, config listenerConfig, limiter 
 
 	upstreamDone := make(chan struct{})
 	go func() {
+		defer close(upstreamDone)
 		// The client's command stream is relayed byte for byte; the census
 		// only reads a copy of what was forwarded. The TLS listener relays
 		// ciphertext the shaper cannot read, so it carries no census: parsing
@@ -206,11 +247,13 @@ func proxy(ctx context.Context, client net.Conn, config listenerConfig, limiter 
 		if config.label != "tls" {
 			census = nntpshaper.NewCommandCensus(attestation)
 		}
-		_, _ = io.Copy(&censusWriter{upstream: upstream, census: census}, client)
+		writer := &censusWriter{upstream: upstream, census: census}
+		if err := copyUpstream(ctx, writer, client, link); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
+			log.Printf("proxy %s upstream %s: %v", config.label, client.RemoteAddr(), err)
+		}
 		closeWrite(upstream)
-		close(upstreamDone)
 	}()
-	if err := copyDownstream(ctx, client, upstream, limiter, attestation, sourceIdentity); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
+	if err := copyDownstream(ctx, client, upstream, limiter, attestation, sourceIdentity, link); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) {
 		log.Printf("proxy %s downstream %s: %v", config.label, client.RemoteAddr(), err)
 	}
 	_ = client.Close()
@@ -218,7 +261,67 @@ func proxy(ctx context.Context, client net.Conn, config listenerConfig, limiter 
 	<-upstreamDone
 }
 
-func copyDownstream(ctx context.Context, destination net.Conn, source net.Conn, limiter *nntpshaper.AggregateLimiter, attestation *nntpshaper.Attestation, sourceIdentity string) error {
+// copyDownstream relays server bytes to the client. The link's own order is
+// preserved: the limiter paces the bytes onto the wire first, and the delay
+// line then carries them for the propagation delay, exactly as serialization
+// precedes propagation on a real link.
+func copyDownstream(ctx context.Context, destination net.Conn, source net.Conn, limiter *nntpshaper.AggregateLimiter, attestation *nntpshaper.Attestation, sourceIdentity string, link *nntpshaper.UserspaceLink) error {
+	deliver := func(payload []byte) error {
+		return writeDownstream(destination, payload, attestation, sourceIdentity)
+	}
+	if link == nil {
+		return relay(ctx, source, limiter, deliver)
+	}
+	line, err := link.NewEgressLine()
+	if err != nil {
+		return err
+	}
+	return throughDelayLine(ctx, line, deliver, func() error { return relay(ctx, source, limiter, line.Write) })
+}
+
+// copyUpstream relays the client's command stream. It carries the other half
+// of the round trip and is never rate limited: the shaper models a server's
+// egress link, not the client's uplink.
+func copyUpstream(ctx context.Context, destination io.Writer, source net.Conn, link *nntpshaper.UserspaceLink) error {
+	deliver := func(payload []byte) error {
+		_, err := destination.Write(payload)
+		return err
+	}
+	if link == nil {
+		return relay(ctx, source, nil, deliver)
+	}
+	line, err := link.NewIngressLine()
+	if err != nil {
+		return err
+	}
+	return throughDelayLine(ctx, line, deliver, func() error { return relay(ctx, source, nil, line.Write) })
+}
+
+// throughDelayLine runs one direction's producer against its delay line and
+// drains the line before returning, so bytes already in flight when the source
+// reaches EOF are delivered rather than dropped.
+func throughDelayLine(ctx context.Context, line *nntpshaper.DelayLine, deliver func([]byte) error, produce func() error) error {
+	delivered := make(chan error, 1)
+	go func() { delivered <- line.Deliver(ctx, deliver) }()
+	produceErr := produce()
+	if produceErr != nil && !errors.Is(produceErr, io.EOF) {
+		line.Abort(produceErr)
+	} else {
+		line.CloseWrite()
+	}
+	deliverErr := <-delivered
+	if produceErr != nil && !errors.Is(produceErr, io.EOF) {
+		return produceErr
+	}
+	if deliverErr != nil {
+		return deliverErr
+	}
+	return produceErr
+}
+
+// relay reads one direction and hands each chunk to write, pacing first when a
+// limiter is supplied.
+func relay(ctx context.Context, source net.Conn, limiter *nntpshaper.AggregateLimiter, write func([]byte) error) error {
 	buffer := make([]byte, 32<<10)
 	for {
 		count, readErr := source.Read(buffer)
@@ -226,13 +329,28 @@ func copyDownstream(ctx context.Context, destination net.Conn, source net.Conn, 
 			if err := limiter.WaitN(ctx, count); err != nil {
 				return err
 			}
-			if err := writeDownstream(destination, buffer[:count], attestation, sourceIdentity); err != nil {
+			if err := write(buffer[:count]); err != nil {
 				return err
 			}
 		}
 		if readErr != nil {
 			return readErr
 		}
+	}
+}
+
+// sleepContext waits out a delay unless the process is shutting down.
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
