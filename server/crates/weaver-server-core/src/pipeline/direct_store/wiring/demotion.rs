@@ -105,7 +105,10 @@ impl Pipeline {
         // produced are the conventional extractor's to overwrite now.
         self.direct_tolerated_in_flight.remove(&job_id);
         self.direct_tolerated_results.remove(&job_id);
-        if reason == DemotionReason::HoldsScratchCeiling {
+        if matches!(
+            reason,
+            DemotionReason::HoldsScratchCeiling | DemotionReason::HoldsScratchDiskReserve
+        ) {
             debug!(
                 job_id = job_id.0,
                 set_name = %set_name,

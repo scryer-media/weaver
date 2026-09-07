@@ -176,6 +176,10 @@ pub(crate) struct DirectStoreRuntime {
     /// build a runtime by hand, where [`Self::gate`] falls back to the
     /// all-defaults resolution (gate off).
     settings: Option<DirectStoreSettings>,
+    /// The process-wide holds accountant every set this runtime admits charges
+    /// to. Built from the settings' limits; unbounded for a runtime built by
+    /// hand. See [`super::accountant`].
+    accountant: std::sync::Arc<super::accountant::HoldsAccountant>,
     /// Jobs whose spec has already been examined for candidate sets.
     examined: HashSet<JobId>,
     /// Jobs whose archive-password harvest has already been handed to their
@@ -281,8 +285,38 @@ impl DirectStoreRuntime {
     pub(crate) fn with_settings(settings: DirectStoreSettings) -> Self {
         Self {
             settings: Some(settings),
+            accountant: std::sync::Arc::new(super::accountant::HoldsAccountant::new(
+                settings.holds_limits(),
+            )),
             ..Self::default()
         }
+    }
+
+    /// The process-wide holds accountant.
+    #[cfg(test)]
+    pub(crate) fn holds_accountant(&self) -> &super::accountant::HoldsAccountant {
+        &self.accountant
+    }
+
+    /// Test hook: replace the shared limits, so a process-wide breach is
+    /// reachable with a few hundred bytes across two sets. Applies to the sets
+    /// admitted afterwards.
+    #[cfg(test)]
+    pub(crate) fn set_holds_limits(&mut self, limits: super::accountant::HoldsLimits) {
+        self.accountant = std::sync::Arc::new(super::accountant::HoldsAccountant::new(limits));
+    }
+
+    /// Test hook: [`Self::set_holds_limits`] with the free-space reading
+    /// behind the disk reserve replaced.
+    #[cfg(test)]
+    pub(crate) fn set_holds_limits_with_disk_probe(
+        &mut self,
+        limits: super::accountant::HoldsLimits,
+        probe: Box<dyn Fn(&std::path::Path) -> Option<u64> + Send + Sync>,
+    ) {
+        self.accountant = std::sync::Arc::new(super::accountant::HoldsAccountant::with_probe(
+            limits, probe,
+        ));
     }
 
     pub(crate) fn settings(&self) -> DirectStoreSettings {
@@ -356,6 +390,8 @@ impl DirectStoreRuntime {
     /// vacuous, and those are exactly the assertions the holds ceilings need
     /// after a restart.
     pub(crate) fn apply_ceilings(&self, set: &mut DirectSet) {
+        set.router
+            .set_holds_accountant(std::sync::Arc::clone(&self.accountant));
         set.router
             .set_holds_scratch_ceiling(self.settings().holds_scratch_ceiling_bytes);
         set.router.set_sparse_marking(self.sparse);

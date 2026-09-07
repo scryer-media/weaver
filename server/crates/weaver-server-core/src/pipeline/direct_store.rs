@@ -161,6 +161,7 @@
 
 use std::sync::OnceLock;
 
+pub(crate) mod accountant;
 pub(crate) mod barrier;
 pub(crate) mod par2_access;
 pub(crate) mod plan;
@@ -205,15 +206,102 @@ pub(crate) fn env_override() -> Option<bool> {
     *OVERRIDE.get_or_init(|| parse_enabled(std::env::var(DIRECT_STORE_ENV).ok().as_deref()))
 }
 
-/// The env scratch ceiling, if one is set and parses. Read once.
-fn env_scratch_ceiling() -> Option<u64> {
-    static CEILING: OnceLock<Option<u64>> = OnceLock::new();
-    *CEILING.get_or_init(|| {
-        std::env::var(DIRECT_STORE_SCRATCH_CEILING_ENV)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
+/// Env override for the process-wide resident-holds limit, in **bytes**.
+/// Same precedence rule as [`DIRECT_STORE_SCRATCH_CEILING_ENV`].
+pub(crate) const DIRECT_STORE_RESIDENT_LIMIT_ENV: &str =
+    "WEAVER_RAR_DIRECT_STORE_HOLDS_RESIDENT_LIMIT_BYTES";
+
+/// Env override for the process-wide holds-scratch total, in **bytes**.
+/// Same precedence rule as [`DIRECT_STORE_SCRATCH_CEILING_ENV`].
+pub(crate) const DIRECT_STORE_SCRATCH_TOTAL_ENV: &str =
+    "WEAVER_RAR_DIRECT_STORE_HOLDS_SCRATCH_TOTAL_BYTES";
+
+/// Env override for the free space the working directory's filesystem must
+/// keep under holds scratch, in **bytes**. Same precedence rule as
+/// [`DIRECT_STORE_SCRATCH_CEILING_ENV`]; zero disables the reserve.
+pub(crate) const DIRECT_STORE_DISK_RESERVE_ENV: &str =
+    "WEAVER_RAR_DIRECT_STORE_HOLDS_DISK_RESERVE_BYTES";
+
+/// Everything the environment can say about direct-store, read once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DirectStoreEnv {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) scratch_ceiling: Option<u64>,
+    pub(crate) resident_limit: Option<u64>,
+    pub(crate) scratch_total: Option<u64>,
+    pub(crate) disk_reserve: Option<u64>,
+}
+
+impl DirectStoreEnv {
+    /// Whether any override is exported — the tests that read the real
+    /// environment skip themselves when one is.
+    #[cfg(test)]
+    pub(crate) fn any_set(&self) -> bool {
+        self.enabled.is_some()
+            || self.scratch_ceiling.is_some()
+            || self.resident_limit.is_some()
+            || self.scratch_total.is_some()
+            || self.disk_reserve.is_some()
+    }
+}
+
+/// The process environment's direct-store overrides. Read once.
+pub(crate) fn env() -> DirectStoreEnv {
+    static ENV: OnceLock<DirectStoreEnv> = OnceLock::new();
+    *ENV.get_or_init(|| DirectStoreEnv {
+        enabled: env_override(),
+        scratch_ceiling: env_bytes(DIRECT_STORE_SCRATCH_CEILING_ENV),
+        resident_limit: env_bytes(DIRECT_STORE_RESIDENT_LIMIT_ENV),
+        scratch_total: env_bytes(DIRECT_STORE_SCRATCH_TOTAL_ENV),
+        disk_reserve: env_bytes(DIRECT_STORE_DISK_RESERVE_ENV),
     })
 }
+
+/// A byte-valued override, if it is set and parses.
+fn env_bytes(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+}
+
+/// What the host can tell the shared-limit defaults: the memory the process
+/// may use, and the size of the filesystem under the working directory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HostFacts {
+    pub(crate) total_memory_bytes: Option<u64>,
+    pub(crate) working_fs_total_bytes: Option<u64>,
+}
+
+impl HostFacts {
+    /// A host that says nothing: every derived default falls to its fallback.
+    pub(crate) const UNKNOWN: Self = Self {
+        total_memory_bytes: None,
+        working_fs_total_bytes: None,
+    };
+
+    /// Probes the real host. `working_dir` may not exist yet at startup, so
+    /// the nearest existing ancestor answers for its filesystem.
+    pub(crate) fn probe(working_dir: &std::path::Path) -> Self {
+        Self {
+            total_memory_bytes: crate::runtime::system_probe::detect_total_memory_bytes(),
+            working_fs_total_bytes: working_dir
+                .ancestors()
+                .find_map(crate::operations::disk::disk_space)
+                .map(|space| space.total_bytes),
+        }
+    }
+}
+
+/// The shared resident-holds limit a host earns: a sixteenth of the memory
+/// the process may use, between one set's budget and sixteen of them
+/// (64 MiB to 1 GiB), and four sets' worth when the host cannot say.
+pub(crate) fn default_resident_limit_bytes(total_memory_bytes: Option<u64>) -> u64 {
+    const FLOOR: u64 = router::DEFAULT_HOLDS_BUDGET_BYTES;
+    total_memory_bytes.map_or(4 * FLOOR, |total| (total / 16).clamp(FLOOR, 16 * FLOOR))
+}
+
+/// How many sets' worth of scratch the process-wide total allows by default.
+const HOLDS_SCRATCH_TOTAL_SETS: u64 = 4;
 
 /// `Some(true)` for the on words, `Some(false)` for the off words, `None` for
 /// absent or unrecognised.
@@ -241,50 +329,90 @@ pub(in crate::pipeline) fn parse_enabled(raw: Option<&str>) -> Option<bool> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectStoreSettings {
     pub(crate) gate: DirectStoreGate,
+    /// Per set. See [`router::HOLDS_SCRATCH_CEILING_BYTES`].
     pub(crate) holds_scratch_ceiling_bytes: u64,
+    /// Process-wide. See [`accountant::HoldsLimits::resident_bytes`].
+    pub(crate) holds_resident_limit_bytes: u64,
+    /// Process-wide. See [`accountant::HoldsLimits::scratch_bytes`].
+    pub(crate) holds_scratch_total_bytes: u64,
+    /// See [`accountant::HoldsLimits::disk_reserve_bytes`].
+    pub(crate) holds_disk_reserve_bytes: u64,
 }
 
 impl Default for DirectStoreSettings {
+    /// Nothing configured, on a host that says nothing.
     fn default() -> Self {
-        Self {
-            gate: DirectStoreGate::Enabled,
-            holds_scratch_ceiling_bytes: router::HOLDS_SCRATCH_CEILING_BYTES,
-        }
+        Self::resolve_parts(None, DirectStoreEnv::default(), HostFacts::UNKNOWN)
     }
 }
 
 impl DirectStoreSettings {
-    /// Resolves against a loaded config, with the environment winning.
+    /// Resolves against a loaded config, with the environment winning, on a
+    /// host that says nothing: the derived defaults fall to their fallbacks.
+    #[cfg(test)]
     pub(crate) fn resolve(config: &crate::settings::Config) -> Self {
-        Self::resolve_parts(
-            config.direct_store.as_ref().and_then(|cfg| cfg.enabled),
-            config
-                .direct_store
-                .as_ref()
-                .and_then(|cfg| cfg.holds_scratch_ceiling_bytes),
-            env_override(),
-            env_scratch_ceiling(),
-        )
+        Self::resolve_on(config, HostFacts::UNKNOWN)
     }
 
-    /// The precedence rule itself, with the environment passed in so it is
-    /// testable without mutating process state.
+    /// [`Self::resolve`] on a probed host, so the shared limits nothing
+    /// configured follow what the box has.
+    pub(crate) fn resolve_on(config: &crate::settings::Config, host: HostFacts) -> Self {
+        Self::resolve_parts(config.direct_store.as_ref(), env(), host)
+    }
+
+    /// The precedence rule itself — **environment, then config, then a
+    /// default the host may inform** — with the environment and the host
+    /// passed in so it is testable without mutating process state.
     pub(crate) fn resolve_parts(
-        config_enabled: Option<bool>,
-        config_ceiling: Option<u64>,
-        env_enabled: Option<bool>,
-        env_ceiling: Option<u64>,
+        config: Option<&crate::settings::DirectStoreOverrides>,
+        env: DirectStoreEnv,
+        host: HostFacts,
     ) -> Self {
-        let enabled = env_enabled.or(config_enabled).unwrap_or(true);
+        let pick = |from_env: Option<u64>, from_config: Option<u64>, default: u64| {
+            from_env.or(from_config).unwrap_or(default)
+        };
+        let enabled = env
+            .enabled
+            .or(config.and_then(|cfg| cfg.enabled))
+            .unwrap_or(true);
+        let holds_scratch_ceiling_bytes = pick(
+            env.scratch_ceiling,
+            config.and_then(|cfg| cfg.holds_scratch_ceiling_bytes),
+            router::HOLDS_SCRATCH_CEILING_BYTES,
+        );
         Self {
             gate: if enabled {
                 DirectStoreGate::Enabled
             } else {
                 DirectStoreGate::Disabled
             },
-            holds_scratch_ceiling_bytes: env_ceiling
-                .or(config_ceiling)
-                .unwrap_or(router::HOLDS_SCRATCH_CEILING_BYTES),
+            holds_scratch_ceiling_bytes,
+            holds_resident_limit_bytes: pick(
+                env.resident_limit,
+                config.and_then(|cfg| cfg.holds_resident_limit_bytes),
+                default_resident_limit_bytes(host.total_memory_bytes),
+            ),
+            holds_scratch_total_bytes: pick(
+                env.scratch_total,
+                config.and_then(|cfg| cfg.holds_scratch_total_bytes),
+                holds_scratch_ceiling_bytes.saturating_mul(HOLDS_SCRATCH_TOTAL_SETS),
+            ),
+            holds_disk_reserve_bytes: pick(
+                env.disk_reserve,
+                config.and_then(|cfg| cfg.holds_disk_reserve_bytes),
+                crate::pipeline::extraction::safety::default_disk_reserve_bytes(
+                    host.working_fs_total_bytes,
+                ),
+            ),
+        }
+    }
+
+    /// The process-wide ceilings, for the accountant.
+    pub(crate) fn holds_limits(&self) -> accountant::HoldsLimits {
+        accountant::HoldsLimits {
+            resident_bytes: self.holds_resident_limit_bytes,
+            scratch_bytes: self.holds_scratch_total_bytes,
+            disk_reserve_bytes: self.holds_disk_reserve_bytes,
         }
     }
 }

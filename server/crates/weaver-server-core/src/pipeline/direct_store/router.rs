@@ -66,20 +66,22 @@ pub(crate) mod crypt;
 
 /// Default RAM ceiling for holds across one set. A breach pages to the set's
 /// holds scratch; only a paging failure demotes.
+///
+/// Per set. The process-wide sum is bounded separately, by the
+/// [`super::accountant::HoldsAccountant`] every set charges to, whose limit
+/// follows the host's memory.
 pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The **explicit** scratch ceiling, counted against the disk acceptance target
 /// rather than derived from RAM the way the oracle's auto 4×-RAM rule is.
 ///
 /// **Per archive set, not per job or per process.** Each set owns one scratch
-/// file and one [`HoldsScratch`] carrying its own copy of this number, so a job
-/// with three sets can have three times this on disk at once, and a busy server
-/// that multiple. That is the same shape [`DEFAULT_HOLDS_BUDGET_BYTES`] has for
-/// RAM, and it is deliberate at this size: the ceiling exists to stop one
-/// pathological set from filling the disk, not to be a global disk quota — which
-/// would need a shared accountant across sets and jobs, and a policy for what a
-/// set does when another set is using the budget. If the aggregate ever needs
-/// bounding, that is the design, not a smaller constant.
+/// file and one [`HoldsScratch`] carrying its own copy of this number: the
+/// ceiling exists to stop one pathological set from filling the disk. The
+/// aggregate — every set's scratch together, and the free space the working
+/// directory's filesystem must keep — is bounded by the
+/// [`super::accountant::HoldsAccountant`] every set charges to, which a spill
+/// consults before it is written.
 ///
 /// This is the fallback when no per-set override applies. The environment
 /// override is resolved before a router is constructed, so every set still owns
@@ -239,6 +241,12 @@ pub(crate) enum DemotionReason {
     /// one is the *disk* claim direct-store makes against its own 1.05×
     /// acceptance target.
     HoldsScratchCeiling,
+    /// Paging would leave the working directory's filesystem with less than
+    /// the free space it must keep. Named apart from
+    /// [`Self::HoldsScratchCeiling`] because the disk, not this set's holds,
+    /// is what ran out — and the set that asked is simply the one that asked
+    /// last.
+    HoldsScratchDiskReserve,
     /// A confirming parse disagreed with the provisional one, or a volume was
     /// re-added with facts that are not an extension of what it stated before.
     ConflictingVolumeFacts,
@@ -510,9 +518,10 @@ impl DemotionReason {
             // Holds are staged, unrouted bytes: a budget or scratch failure
             // ends *routing* and says nothing about the layout or about the
             // bytes already placed.
-            Self::HoldsBudgetExceeded | Self::HoldsScratchFailed | Self::HoldsScratchCeiling => {
-                VolumeDemand::Virtual
-            }
+            Self::HoldsBudgetExceeded
+            | Self::HoldsScratchFailed
+            | Self::HoldsScratchCeiling
+            | Self::HoldsScratchDiskReserve => VolumeDemand::Virtual,
             // Two parses of one volume disagree. Nothing says which is true, so
             // no overlay built from either may be read as the archive.
             Self::ConflictingVolumeFacts => VolumeDemand::Real,
@@ -614,6 +623,7 @@ impl DemotionReason {
             Self::HoldsBudgetExceeded => "holds_budget",
             Self::HoldsScratchFailed => "holds_scratch_io",
             Self::HoldsScratchCeiling => "holds_scratch_ceiling",
+            Self::HoldsScratchDiskReserve => "holds_scratch_disk_reserve",
             Self::ConflictingVolumeFacts => "conflicting_volume_facts",
             Self::QuickOpenMismatch => "quick_open_mismatch",
             Self::UnconfirmedRestoredVolume => "unconfirmed_restored_volume",
@@ -2006,6 +2016,11 @@ pub(crate) struct DirectSetRouter {
     /// per volume — where the read is per span.
     member_order_stale: bool,
     holds_budget: u64,
+    /// The process-wide accountant every set of the pipeline charges its holds
+    /// to, and this set's standing charge against it. Unbounded until the
+    /// runtime installs its own — see [`super::accountant`].
+    accountant: std::sync::Arc<super::accountant::HoldsAccountant>,
+    charge: super::accountant::HoldsCharge,
     /// The paging destination. Opened on the first breach and never before, so
     /// a set that stays inside its RAM budget — which is nearly all of them —
     /// touches the filesystem for it exactly zero times.
@@ -2130,6 +2145,15 @@ impl std::fmt::Debug for DirectSetRouter {
     }
 }
 
+impl Drop for DirectSetRouter {
+    /// A set's bytes go with it. The accountant is charged with live holds,
+    /// and a router that is dropped — its job removed, its set cleared — has
+    /// none left.
+    fn drop(&mut self) {
+        self.accountant.release(&mut self.charge);
+    }
+}
+
 impl DirectSetRouter {
     pub(crate) fn new(plan: DirectSetPlan) -> Self {
         Self {
@@ -2147,6 +2171,8 @@ impl DirectSetRouter {
             member_order: Vec::new(),
             member_order_stale: false,
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
+            accountant: std::sync::Arc::new(super::accountant::HoldsAccountant::unbounded()),
+            charge: super::accountant::HoldsCharge::default(),
             crypt: KeyRing::new(),
             header_crypt: HeaderKeyRing::new(),
             migrated: Vec::new(),
@@ -2597,6 +2623,7 @@ impl DirectSetRouter {
     /// and demotion.
     pub(crate) fn discard_scratch(&mut self) {
         self.scratch.discard();
+        self.publish_holds();
     }
 
     /// Whether a reader still pins the set's scratch image. A pin outlives
@@ -2626,7 +2653,7 @@ impl DirectSetRouter {
         candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.0));
 
         for (_, volume_index, offset) in candidates {
-            if self.resident_bytes() <= self.holds_budget {
+            if !self.holds_over_budget() {
                 return Ok(());
             }
             let bytes = match self
@@ -2640,7 +2667,7 @@ impl DirectSetRouter {
             let resident_bytes = self.resident_bytes();
             let scratch_bytes = self.scratch.bytes();
             let chunk_bytes = bytes.len() as u64;
-            let scratch_offset = match self.scratch.append(&bytes) {
+            let scratch_offset = match self.spill_to_scratch(&bytes) {
                 Ok(offset) => offset,
                 // A ceiling breach is not automatically a full scratch: reclaim
                 // what placed holds left behind and try the append once more.
@@ -2682,7 +2709,7 @@ impl DirectSetRouter {
                         scratch_ceiling_bytes = self.scratch.ceiling,
                         "direct-store compacted holds scratch before retrying the spill"
                     );
-                    match self.scratch.append(&bytes) {
+                    match self.spill_to_scratch(&bytes) {
                         Ok(retry_scratch_offset) => {
                             tracing::debug!(
                                 set_name = %self.plan.set_name,
@@ -2723,10 +2750,13 @@ impl DirectSetRouter {
                 );
             }
         }
+        self.publish_holds();
         if self.resident_bytes() > self.holds_budget {
             // Everything pageable is paged and RAM is still over: the budget is
             // smaller than one staged run, which is a configuration the set
-            // cannot route inside.
+            // cannot route inside. The *shared* limit is not judged here: with
+            // nothing left to page, this set has done what it can, and the
+            // remainder is other sets' to page when they next route.
             return Err(DemotionReason::HoldsBudgetExceeded);
         }
         Ok(())
@@ -2804,6 +2834,7 @@ impl DirectSetRouter {
                 );
             }
         }
+        self.publish_holds();
         Ok(true)
     }
 
@@ -2817,6 +2848,46 @@ impl DirectSetRouter {
     /// here needs no cache invalidation.
     pub(crate) fn bind_identity_volume(&mut self, volume_index: u32, file_index: u32) -> bool {
         self.plan.bind_identity_volume(volume_index, file_index)
+    }
+
+    /// Installs the process-wide accountant this set charges its holds to.
+    /// Applied by the runtime to every set it admits, restore included; what
+    /// the set had charged elsewhere moves with it.
+    pub(crate) fn set_holds_accountant(
+        &mut self,
+        accountant: std::sync::Arc<super::accountant::HoldsAccountant>,
+    ) {
+        self.accountant.release(&mut self.charge);
+        self.accountant = accountant;
+        self.publish_holds();
+    }
+
+    /// Publishes this set's resident and scratch bytes to the accountant.
+    /// Called wherever staging changes size, so the process total is current
+    /// whenever a set consults it.
+    fn publish_holds(&mut self) {
+        let resident = self.resident_bytes();
+        let scratch = self.scratch.bytes();
+        self.accountant.publish(&mut self.charge, resident, scratch);
+    }
+
+    /// Whether this set must page: over its own budget, or holding anything
+    /// at all while the process is over the limit every set shares.
+    fn holds_over_budget(&mut self) -> bool {
+        self.publish_holds();
+        let resident = self.resident_bytes();
+        resident > self.holds_budget || (resident > 0 && self.accountant.resident_over_limit())
+    }
+
+    /// One spill: admitted by the accountant — the shared scratch total and
+    /// the disk reserve — then appended to this set's own scratch, under its
+    /// own ceiling. Published either way.
+    fn spill_to_scratch(&mut self, bytes: &[u8]) -> Result<u64, DemotionReason> {
+        self.accountant
+            .admit_scratch(bytes.len() as u64, &self.plan.working_dir)?;
+        let appended = self.scratch.append(bytes);
+        self.publish_holds();
+        appended
     }
 
     /// Lowers the holds ceiling so a test can breach it without staging tens of

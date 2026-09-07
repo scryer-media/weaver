@@ -1377,7 +1377,7 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
             &temp_dir,
             DirectStoreOverrides {
                 enabled: Some(true),
-                holds_scratch_ceiling_bytes: None,
+                ..Default::default()
             },
         )
         .await;
@@ -1419,7 +1419,7 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
         &temp_dir,
         DirectStoreOverrides {
             enabled: Some(false),
-            holds_scratch_ceiling_bytes: None,
+            ..Default::default()
         },
     )
     .await;

@@ -36,9 +36,10 @@ impl DirectSetRouter {
             spans.extend(self.drain_volume(volume)?);
         }
 
-        // A breach pages rather than demoting. Demotion is what is left when
-        // paging itself fails — a scratch I/O error, or the ceiling.
-        if self.resident_bytes() > self.holds_budget
+        // A breach — of this set's budget, or of the process-wide limit every
+        // set shares — pages rather than demoting. Demotion is what is left
+        // when paging itself fails — a scratch I/O error, or a ceiling.
+        if self.holds_over_budget()
             && let Err(reason) = self.page_holds_to_scratch()
         {
             return Err(self.fail(reason));
@@ -191,7 +192,7 @@ impl DirectSetRouter {
             return Err(self.fail(DemotionReason::RepairRerouteFailed));
         }
 
-        if self.resident_bytes() > self.holds_budget
+        if self.holds_over_budget()
             && let Err(reason) = self.page_holds_to_scratch()
         {
             return Err(self.fail(reason));

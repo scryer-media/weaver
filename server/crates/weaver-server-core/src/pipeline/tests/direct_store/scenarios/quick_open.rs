@@ -2537,6 +2537,283 @@ async fn direct_store_pages_held_bytes_to_scratch_instead_of_demoting() {
     );
 }
 
+/// Every set of a pipeline charges its holds to one accountant, and the limit
+/// it enforces is the process total: a set well inside its own budget still
+/// pages when the sets around it have spent the shared allowance. The set that
+/// pages is the one routing at the time; the one that was there first keeps
+/// its holds resident.
+#[tokio::test]
+async fn two_sets_share_one_resident_limit_and_the_one_routing_pages() {
+    use crate::pipeline::direct_store::accountant::HoldsLimits;
+
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 151) as u8).collect();
+    let first_volumes = single_member_store_set("Silver.Horizon.S01E15.mkv", &payload, 3);
+    let second_volumes = single_member_store_set("Silver.Horizon.S01E16.mkv", &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    // Each set could hold ten times its payload in RAM on its own budget; the
+    // process as a whole may hold one article's worth and a little more.
+    pipeline.direct_store.set_holds_budget(10_000);
+    pipeline.direct_store.set_holds_limits(HoldsLimits {
+        resident_bytes: 500,
+        scratch_bytes: u64::MAX,
+        disk_reserve_bytes: 0,
+    });
+    let first = JobId(41020);
+    let second = JobId(41021);
+    insert_active_job(
+        &mut pipeline,
+        first,
+        direct_store_job_spec("Silver Horizon", &first_volumes),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        second,
+        direct_store_job_spec("Silver Horizon II", &second_volumes),
+    )
+    .await;
+
+    // The first set's payload-before-header hold fits the shared limit, so it
+    // stays resident and is charged to the accountant as such.
+    submit_volume_article(&mut pipeline, first, &first_volumes, 0, 1).await;
+    let first_resident = pipeline
+        .direct_store
+        .set(first, 0)
+        .unwrap()
+        .router
+        .resident_staged_bytes();
+    assert!(first_resident > 0 && first_resident <= 500);
+    assert_eq!(
+        pipeline
+            .direct_store
+            .set(first, 0)
+            .unwrap()
+            .router
+            .scratch_bytes(),
+        0,
+        "inside both limits nothing pages"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().resident_bytes(),
+        first_resident,
+        "the accountant carries exactly what the set holds"
+    );
+
+    // The second set's identical hold would take the process over the limit.
+    // It is inside its own budget by a wide margin, and it pages anyway — its
+    // own holds, not the first set's.
+    submit_volume_article(&mut pipeline, second, &second_volumes, 0, 1).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(second));
+    assert!(
+        !shape.contains("Demoted"),
+        "a shared breach pages, never demotes, got {shape}"
+    );
+    let second_set = pipeline.direct_store.set(second, 0).unwrap();
+    assert!(
+        second_set.router.scratch_bytes() > 0,
+        "the set routing under a shared breach pages its holds"
+    );
+    assert_eq!(
+        second_set.router.resident_staged_bytes(),
+        0,
+        "and pages everything it can, since the breach is not its own to size"
+    );
+    assert_eq!(second_set.router.unaccounted_staged_bytes(), 0);
+    let first_set = pipeline.direct_store.set(first, 0).unwrap();
+    assert_eq!(
+        first_set.router.scratch_bytes(),
+        0,
+        "the set that was inside the limit first keeps its holds resident"
+    );
+    assert_eq!(first_set.router.resident_staged_bytes(), first_resident);
+    let accountant = pipeline.direct_store.holds_accountant();
+    assert_eq!(accountant.resident_bytes(), first_resident);
+    assert_eq!(
+        accountant.scratch_bytes(),
+        second_set.router.scratch_bytes(),
+        "scratch is charged to the accountant the moment it is written"
+    );
+
+    // Both sets finish, and the accountant has nothing left on its books: a
+    // routed hold is released, a committed set's scratch is discarded.
+    for (job_id, volumes) in [(first, &first_volumes), (second, &second_volumes)] {
+        for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+            if (file_index, segment_number) == (0, 1) {
+                continue;
+            }
+            submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
+        }
+        drain_rar_refreshes(&mut pipeline).await;
+        drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+        assert_eq!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        );
+    }
+    let accountant = pipeline.direct_store.holds_accountant();
+    assert_eq!(
+        accountant.resident_bytes(),
+        0,
+        "no set holds anything after commit"
+    );
+    assert_eq!(
+        accountant.scratch_bytes(),
+        0,
+        "no scratch survives a commit"
+    );
+}
+
+/// The shared scratch total is judged on every set's scratch together, and a
+/// spill that would exceed it demotes the set that asked — after that set has
+/// compacted its own scratch and found nothing to reclaim — while the sets
+/// already inside the total keep routing.
+#[tokio::test]
+async fn the_shared_scratch_total_demotes_the_set_that_asked_last() {
+    use crate::pipeline::direct_store::accountant::HoldsLimits;
+
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 163) as u8).collect();
+    let first_volumes = single_member_store_set("Silver.Horizon.S01E17.mkv", &payload, 3);
+    let second_volumes = single_member_store_set("Silver.Horizon.S01E18.mkv", &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    // Every hold pages; the process may hold one article's worth of scratch.
+    pipeline.direct_store.set_holds_budget(64);
+    pipeline.direct_store.set_holds_limits(HoldsLimits {
+        resident_bytes: u64::MAX,
+        scratch_bytes: 500,
+        disk_reserve_bytes: 0,
+    });
+    let first = JobId(41022);
+    let second = JobId(41023);
+    insert_active_job(
+        &mut pipeline,
+        first,
+        direct_store_job_spec("Silver Horizon", &first_volumes),
+    )
+    .await;
+    let second_working_dir = insert_active_job(
+        &mut pipeline,
+        second,
+        direct_store_job_spec("Silver Horizon II", &second_volumes),
+    )
+    .await;
+
+    submit_volume_article(&mut pipeline, first, &first_volumes, 0, 1).await;
+    let first_scratch = pipeline
+        .direct_store
+        .set(first, 0)
+        .unwrap()
+        .router
+        .scratch_bytes();
+    assert!(first_scratch > 0 && first_scratch <= 500);
+
+    submit_volume_article(&mut pipeline, second, &second_volumes, 0, 1).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(second));
+    assert!(
+        shape.contains("Demoted(HoldsScratchCeiling)"),
+        "the spill that would exceed the shared total demotes the set that asked, got {shape}"
+    );
+    assert!(
+        !format!("{:?}", pipeline.direct_store.sets_for(first)).contains("Demoted"),
+        "the set already inside the total is untouched"
+    );
+    assert!(
+        !second_working_dir
+            .join(".weaver-holds.silver.horizon.ii.f0")
+            .exists(),
+        "a refused spill leaves no scratch behind"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        first_scratch,
+        "the demoted set's charge is withdrawn; the first set's stands"
+    );
+
+    // The first set is unaffected end to end.
+    for (file_index, segment_number) in in_order_arrivals(first_volumes.len()) {
+        if (file_index, segment_number) == (0, 1) {
+            continue;
+        }
+        submit_volume_article(
+            &mut pipeline,
+            first,
+            &first_volumes,
+            file_index,
+            segment_number,
+        )
+        .await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, first, 64).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, first),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(pipeline.direct_store.holds_accountant().scratch_bytes(), 0);
+}
+
+/// A spill that would leave the working directory's filesystem with less than
+/// its reserve is refused before the write, and the refusal is named for what
+/// ran out — the disk — rather than for this set's scratch.
+#[tokio::test]
+async fn the_disk_reserve_refuses_a_spill_before_it_is_written() {
+    use crate::pipeline::direct_store::accountant::HoldsLimits;
+
+    let member_name = "Silver.Horizon.S01E19.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 167) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.direct_store.set_holds_budget(64);
+    // The filesystem reports 1200 bytes free and must keep 1000: a hold of
+    // several hundred bytes cannot be paged without eating the reserve.
+    pipeline.direct_store.set_holds_limits_with_disk_probe(
+        HoldsLimits {
+            resident_bytes: u64::MAX,
+            scratch_bytes: u64::MAX,
+            disk_reserve_bytes: 1000,
+        },
+        Box::new(|_| Some(1200)),
+    );
+    let job_id = JobId(41024);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(HoldsScratchDiskReserve)"),
+        "a spill into the reserve demotes under the disk's own name, got {shape}"
+    );
+    assert!(
+        !working_dir.join(".weaver-holds.silver.horizon.f0").exists(),
+        "the refusal happens before the scratch is created"
+    );
+    assert_eq!(pipeline.direct_store.holds_accountant().scratch_bytes(), 0);
+
+    // The job still completes the conventional way.
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) == (0, 1) {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+}
+
 /// A pass that reads a paged hold pins the scratch image, and the pin, not the
 /// set, decides how long the image lives. The set's commit unlinks the path;
 /// a provider still holding a pin reads the hold through the unlinked file,

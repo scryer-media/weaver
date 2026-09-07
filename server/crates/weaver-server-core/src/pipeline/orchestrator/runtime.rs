@@ -78,7 +78,10 @@ impl Pipeline {
                 // contract is that turning it off at *startup* sweeps and
                 // redownloads mid-flight direct work, not that it takes effect
                 // mid-job.
-                crate::pipeline::direct_store::DirectStoreSettings::resolve(&cfg),
+                crate::pipeline::direct_store::DirectStoreSettings::resolve_on(
+                    &cfg,
+                    crate::pipeline::direct_store::HostFacts::probe(&intermediate_dir),
+                ),
                 // Same contract, same reason: resolved once so a set admitted
                 // under an enabled gate cannot find it disabled mid-chase.
                 crate::pipeline::direct_unpack::DirectUnpackSettings::resolve(&cfg),
@@ -99,6 +102,9 @@ impl Pipeline {
             // `holds_scratch_ceiling` is otherwise unattributable.
             info!(
                 holds_scratch_ceiling_bytes = direct_store_settings.holds_scratch_ceiling_bytes,
+                holds_resident_limit_bytes = direct_store_settings.holds_resident_limit_bytes,
+                holds_scratch_total_bytes = direct_store_settings.holds_scratch_total_bytes,
+                holds_disk_reserve_bytes = direct_store_settings.holds_disk_reserve_bytes,
                 "RAR direct-store routing enabled"
             );
         }
