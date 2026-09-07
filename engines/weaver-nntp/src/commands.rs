@@ -50,8 +50,6 @@ pub enum Command {
     AuthInfoPass(String),
     /// Request STARTTLS upgrade.
     StartTls,
-    /// Switch to reader mode.
-    ModeReader,
     /// Quit the session.
     Quit,
     /// Request the server's current date and time (RFC 3977 DATE).
@@ -97,9 +95,6 @@ impl Command {
             }
             Command::StartTls => {
                 buf.extend_from_slice(b"STARTTLS");
-            }
-            Command::ModeReader => {
-                buf.extend_from_slice(b"MODE READER");
             }
             Command::Quit => {
                 buf.extend_from_slice(b"QUIT");
@@ -207,11 +202,6 @@ mod tests {
     #[test]
     fn encode_starttls() {
         assert_eq!(Command::StartTls.encode().as_ref(), b"STARTTLS\r\n");
-    }
-
-    #[test]
-    fn encode_mode_reader() {
-        assert_eq!(Command::ModeReader.encode().as_ref(), b"MODE READER\r\n");
     }
 
     #[test]

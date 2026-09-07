@@ -307,17 +307,33 @@ fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
     }
 }
 
-fn supports_blocking_tls_body_lane(config: &ServerConfig) -> bool {
+/// Whether an owned blocking BODY lane can serve this server.
+///
+/// Owned lanes are the download fast path and every server gets one, plaintext
+/// included: a single lane pool per server is what lets one warm connection
+/// serve BODY, PAR2 recovery and the existence probe alike, instead of the
+/// probe having to reclaim a permit and cold-dial its own socket.
+///
+/// The one arrangement still left out is STARTTLS, whose in-band upgrade the
+/// blocking transport does not implement.
+fn supports_blocking_body_lane(config: &ServerConfig) -> bool {
+    if config.starttls {
+        return false;
+    }
+    if !config.tls {
+        // Plain TCP needs no trust material and no backend selection.
+        return true;
+    }
     if config.tls_name_mismatch_certificate_der.is_some() {
-        return blocking_tls_lane_eligible(config, crate::tls::NntpTlsBackend::ManualRustls);
+        return blocking_lane_tls_eligible(config, crate::tls::NntpTlsBackend::ManualRustls);
     }
     match crate::tls::selected_blocking_tls_backend() {
-        Ok(backend) => blocking_tls_lane_eligible(config, backend),
+        Ok(backend) => blocking_lane_tls_eligible(config, backend),
         Err(_) => false,
     }
 }
 
-fn blocking_tls_lane_eligible(config: &ServerConfig, backend: crate::tls::NntpTlsBackend) -> bool {
+fn blocking_lane_tls_eligible(config: &ServerConfig, backend: crate::tls::NntpTlsBackend) -> bool {
     if !config.tls || config.starttls {
         return false;
     }
@@ -1003,7 +1019,7 @@ impl NntpClient {
         // A BODY lane fetches by message-id, which RFC 3977 answers with no
         // group selected, so the GROUP round trip is pure added latency on
         // every lane start. The candidate group is still offered to connect:
-        // a server that has proven it insists on one (see `crate::prologue`)
+        // a server that has proven it insists on one (see `crate::server_caps`)
         // takes it inside the session-setup write, and only such a server
         // walks the candidate list below.
         let initial_group = groups.first().map(String::as_str);
@@ -1085,7 +1101,15 @@ impl NntpClient {
         if order.is_empty() {
             return Err(NntpError::ServiceUnavailable);
         }
+        self.stat_many_in_order(message_ids, order).await
+    }
 
+    /// [`Self::stat_many`] over an already chosen, non-empty server order.
+    async fn stat_many_in_order(
+        &self,
+        message_ids: &[&str],
+        order: Vec<usize>,
+    ) -> Result<Vec<bool>> {
         let mut found = vec![false; message_ids.len()];
         let mut remaining: Vec<usize> = (0..message_ids.len()).collect();
         let mut had_success = false;
@@ -1146,53 +1170,103 @@ impl NntpClient {
     /// Confirm article existence for health probes.
     ///
     /// The fast path uses batched pipelined STAT checks. Any article that STAT
-    /// reports missing is re-checked with a non-pipelined HEAD before the
-    /// result is treated as authoritative. Transport or probe errors during
+    /// reports missing is re-checked with a HEAD before the result is treated
+    /// as authoritative — unless no usable server implements HEAD, in which
+    /// case the STAT verdict is the final one rather than an excuse to call
+    /// the whole batch inconclusive. Transport or probe errors during
     /// confirmation mark the entire batch inconclusive so callers can unwind
     /// without applying projected health damage.
     pub async fn confirm_exists_for_probe(&self, message_ids: &[&str]) -> ProbeBatchResult {
+        self.confirm_exists_for_probe_excluding(message_ids, &[])
+            .await
+            .unwrap_or_else(|| ProbeBatchResult {
+                exists: vec![false; message_ids.len()],
+                inconclusive: true,
+            })
+    }
+
+    /// [`Self::confirm_exists_for_probe`] that leaves the servers in
+    /// `exclude` out entirely.
+    ///
+    /// The caller has usually had those servers answer already, on a warm
+    /// connection it is holding — an owned download lane's — and asking them
+    /// again here would queue behind the very permits those lanes are sitting
+    /// on. Returns `None` when nothing usable is left once they are excluded,
+    /// which is not a fault: it means the batch has been put to every server
+    /// that could answer and the caller's verdict stands.
+    pub async fn confirm_exists_for_probe_excluding(
+        &self,
+        message_ids: &[&str],
+        exclude: &[usize],
+    ) -> Option<ProbeBatchResult> {
         if message_ids.is_empty() {
-            return ProbeBatchResult {
+            return Some(ProbeBatchResult {
                 exists: Vec::new(),
                 inconclusive: false,
-            };
+            });
         }
 
-        let mut exists = match self.stat_many(message_ids).await {
+        let order = self.build_server_order(exclude).await;
+        if order.is_empty() {
+            return None;
+        }
+
+        let mut exists = match self.stat_many_in_order(message_ids, order).await {
             Ok(results) => results,
             Err(_) => {
-                return ProbeBatchResult {
+                return Some(ProbeBatchResult {
                     exists: vec![false; message_ids.len()],
                     inconclusive: true,
-                };
+                });
             }
         };
 
         for (idx, message_id) in message_ids.iter().enumerate() {
-            if exists[idx] {
+            if exists[idx] || !self.any_server_supports_head_excluding(exclude) {
                 continue;
             }
 
-            match self.fetch_head(message_id).await {
+            match self
+                .fetch_with_failover_excluding(message_id, FetchKind::Head, exclude)
+                .await
+            {
                 Ok(_) => exists[idx] = true,
                 Err(
                     NntpError::ArticleNotFound
                     | NntpError::NoSuchArticle { .. }
                     | NntpError::NoArticleWithNumber,
                 ) => {}
+                // Every server asked has now refused HEAD itself, which is an
+                // answer about the command and not a fault: the STAT verdict
+                // stands and the remaining misses are not re-checked.
+                Err(NntpError::CommandNotRecognized)
+                    if !self.any_server_supports_head_excluding(exclude) => {}
                 Err(_) => {
-                    return ProbeBatchResult {
+                    return Some(ProbeBatchResult {
                         exists,
                         inconclusive: true,
-                    };
+                    });
                 }
             }
         }
 
-        ProbeBatchResult {
+        Some(ProbeBatchResult {
             exists,
             inconclusive: false,
-        }
+        })
+    }
+
+    /// Whether any configured server outside `exclude` still answers HEAD, as
+    /// far as this process has been able to tell.
+    fn any_server_supports_head_excluding(&self, exclude: &[usize]) -> bool {
+        self.pool
+            .server_configs()
+            .iter()
+            .enumerate()
+            .any(|(idx, config)| {
+                !exclude.contains(&idx)
+                    && crate::server_caps::supports_head(&config.host, config.port)
+            })
     }
 
     /// Fetch the body of an article by message-id, with multi-server failover.
@@ -2215,7 +2289,7 @@ impl NntpClient {
                 .pool
                 .blocking_connect_plan(server, &[])
                 .map_err(BlockingBodyLaneAcquireError::Other)?;
-            if !supports_blocking_tls_body_lane(&config) {
+            if !supports_blocking_body_lane(&config) {
                 continue;
             }
             let started = Instant::now();
@@ -2279,7 +2353,7 @@ impl NntpClient {
                 let Ok((config, _, _)) = self.pool.blocking_connect_plan(server, &[]) else {
                     return false;
                 };
-                supports_blocking_tls_body_lane(&config)
+                supports_blocking_body_lane(&config)
             })
     }
 
@@ -2476,12 +2550,15 @@ impl NntpClient {
         }
     }
 
+    /// Drop the connection that just failed, and only that one.
+    ///
+    /// One socket's fault says nothing about the server's other sockets: they
+    /// were opened at different times, may run over different addresses, and
+    /// are the warm capacity the next request is about to reuse. Throwing them
+    /// away turned a single refused command into a fleet-wide cold dial.
     async fn discard_connection_error(&self, server_idx: usize, conn: PooledConnection) {
         let age = conn.created_at().elapsed();
         conn.discard();
-        // Only this server's idle sockets are suspect; other providers keep
-        // their warm connections.
-        self.pool.drain_idle_for(server_idx).await;
         self.record_premature_death_if_needed(server_idx, age).await;
     }
 
@@ -3050,6 +3127,51 @@ impl NntpClient {
 
     /// Check a batch of articles on a specific server, retrying on transient
     /// errors and using pipelining when the server supports it.
+    /// Whether `server` still answers STAT, as far as this process has been
+    /// able to tell.
+    fn server_supports_stat(&self, server: ServerId) -> bool {
+        self.pool
+            .server_configs()
+            .get(server.0)
+            .is_none_or(|config| crate::server_caps::supports_stat(&config.host, config.port))
+    }
+
+    /// Existence by HEAD, for a server that has refused STAT outright.
+    ///
+    /// One connection serves the whole batch, so the fallback costs a round
+    /// trip per article but no extra dials. HEAD is a multi-line response and
+    /// is not pipelined here.
+    async fn head_many_from_server(
+        &self,
+        server: ServerId,
+        message_ids: &[&str],
+    ) -> Result<Vec<bool>> {
+        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut conn = self.acquire_before_deadline(server, deadline).await?;
+        let mut results = Vec::with_capacity(message_ids.len());
+        for message_id in message_ids {
+            match tokio::time::timeout_at(deadline, conn.head_by_id(message_id)).await {
+                Ok(Ok(_)) => results.push(true),
+                Ok(Err(
+                    NntpError::ArticleNotFound
+                    | NntpError::NoSuchArticle { .. }
+                    | NntpError::NoArticleWithNumber,
+                )) => results.push(false),
+                Ok(Err(error)) => {
+                    if is_connection_error(&error) {
+                        self.discard_connection_error(server.0, conn).await;
+                    }
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.discard_connection_error(server.0, conn).await;
+                    return Err(self.soft_timeout_error());
+                }
+            }
+        }
+        Ok(results)
+    }
+
     async fn stat_many_from_server(
         &self,
         server: ServerId,
@@ -3057,6 +3179,12 @@ impl NntpClient {
     ) -> Result<Vec<bool>> {
         if message_ids.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // A server that has already refused STAT is asked with HEAD directly,
+        // instead of spending a refusal per batch to relearn it.
+        if !self.server_supports_stat(server) {
+            return self.head_many_from_server(server, message_ids).await;
         }
 
         let deadline = TokioInstant::now() + self.soft_timeout;
@@ -3087,6 +3215,13 @@ impl NntpClient {
 
             match result {
                 Ok(results) => return Ok(results),
+                // The server has just told us it does not implement STAT. The
+                // socket is fine — the refusal is an answer — so it goes back
+                // to the pool and the batch is re-asked with HEAD.
+                Err(NntpError::CommandNotRecognized) if !self.server_supports_stat(server) => {
+                    drop(conn);
+                    return self.head_many_from_server(server, message_ids).await;
+                }
                 Err(e) if is_retryable_stat_error(&e) => {
                     if should_discard_stat_connection(&e) {
                         self.discard_connection_error(server.0, conn).await;

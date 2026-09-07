@@ -483,7 +483,11 @@ fn blocking_body_lane_candidate_honors_exclusions_and_capacity() {
     });
 
     assert!(client.has_blocking_body_lane_candidate(&[]));
-    assert!(!client.has_blocking_body_lane_candidate(&[0]));
+    assert!(
+        client.has_blocking_body_lane_candidate(&[0]),
+        "a plaintext server is as good an owned-lane host as a TLS one"
+    );
+    assert!(!client.has_blocking_body_lane_candidate(&[0, 1]));
 
     let saturated = NntpClient::new(NntpClientConfig {
         servers: vec![scripted_blocking_s2n_server(1, 0)],
@@ -540,11 +544,18 @@ fn blocking_body_lane_candidate_survives_the_over_limit_holdoff() {
 
 #[test]
 fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
-    // The fill server is not s2n-capable; the only s2n candidate is a
-    // backfill server, which must stay unreachable for ordinary work.
+    // The fill server negotiates STARTTLS, which an owned lane cannot do, so
+    // the only lane candidate is a backfill server — and that must stay
+    // unreachable for ordinary work.
     let client = NntpClient::new(NntpClientConfig {
         servers: vec![
-            scripted_server(1, 0),
+            ServerPoolConfig {
+                server: ServerConfig {
+                    starttls: true,
+                    ..scripted_server(1, 0).server
+                },
+                ..scripted_server(1, 0)
+            },
             ServerPoolConfig {
                 backfill: true,
                 ..scripted_blocking_s2n_server(2, 2)
@@ -2975,15 +2986,30 @@ fn lane_config(tls: bool, starttls: bool, pinned_ca: bool) -> ServerConfig {
     }
 }
 
+/// Owned lanes are the one download path, so a plaintext server gets one too:
+/// its lane is what serves BODY, PAR2 recovery and the existence probe from a
+/// single warm connection. Only STARTTLS is left out, because the blocking
+/// transport has no in-band upgrade.
+#[test]
+fn a_plaintext_server_gets_an_owned_lane_and_a_starttls_one_does_not() {
+    assert!(supports_blocking_body_lane(&lane_config(
+        false, false, false
+    )));
+    assert!(!supports_blocking_body_lane(&lane_config(true, true, true)));
+    assert!(!supports_blocking_body_lane(&lane_config(
+        false, true, false
+    )));
+}
+
 #[test]
 fn blocking_tls_lane_eligibility_rejects_plain_and_starttls() {
     use crate::tls::NntpTlsBackend;
 
-    assert!(!blocking_tls_lane_eligible(
+    assert!(!blocking_lane_tls_eligible(
         &lane_config(false, false, true),
         NntpTlsBackend::ManualRustls
     ));
-    assert!(!blocking_tls_lane_eligible(
+    assert!(!blocking_lane_tls_eligible(
         &lane_config(true, true, true),
         NntpTlsBackend::ManualRustls
     ));
@@ -2993,11 +3019,11 @@ fn blocking_tls_lane_eligibility_rejects_plain_and_starttls() {
 fn blocking_tls_lane_eligibility_rustls_works_without_pinned_ca() {
     use crate::tls::NntpTlsBackend;
 
-    assert!(blocking_tls_lane_eligible(
+    assert!(blocking_lane_tls_eligible(
         &lane_config(true, false, false),
         NntpTlsBackend::ManualRustls
     ));
-    assert!(blocking_tls_lane_eligible(
+    assert!(blocking_lane_tls_eligible(
         &lane_config(true, false, true),
         NntpTlsBackend::ManualRustls
     ));
@@ -3008,7 +3034,7 @@ fn adopted_name_mismatch_certificate_forces_the_rustls_body_lane() {
     let mut config = lane_config(true, false, false);
     config.tls_name_mismatch_certificate_der = Some(vec![0x30, 0x82, 0x01, 0x0a]);
 
-    assert!(supports_blocking_tls_body_lane(&config));
+    assert!(supports_blocking_body_lane(&config));
 }
 
 #[cfg(not(windows))]
@@ -3016,12 +3042,88 @@ fn adopted_name_mismatch_certificate_forces_the_rustls_body_lane() {
 fn blocking_tls_lane_eligibility_s2n_requires_pinned_ca() {
     use crate::tls::NntpTlsBackend;
 
-    assert!(!blocking_tls_lane_eligible(
+    assert!(!blocking_lane_tls_eligible(
         &lane_config(true, false, false),
         NntpTlsBackend::S2n
     ));
-    assert!(blocking_tls_lane_eligible(
+    assert!(blocking_lane_tls_eligible(
         &lane_config(true, false, true),
         NntpTlsBackend::S2n
     ));
+}
+
+/// A 501 is a syntax error in the one request, not a server without STAT.
+///
+/// One message-id the server cannot parse must not retire STAT for the
+/// process: every later probe would then run HEAD per article, one round trip
+/// each, against a server that pipelines STAT perfectly well.
+#[tokio::test]
+async fn a_501_to_one_stat_does_not_retire_stat_for_the_server() {
+    let port = spawn_scripted_server(vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("STAT "),
+            response: b"501 Syntax error\r\n",
+        },
+    ])
+    .await;
+
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_server(port, 0)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(5),
+    });
+
+    let err = client
+        .stat_many(&["<odd id@example.com>"])
+        .await
+        .expect_err("a 501 is a refusal of the request");
+    assert!(
+        !matches!(err, NntpError::CommandNotRecognized),
+        "a 501 must not be read as the command being missing: {err:?}"
+    );
+    assert!(
+        crate::server_caps::supports_stat("127.0.0.1", port),
+        "one unparseable id must not retire STAT for the server"
+    );
+}
+
+/// With every usable server excluded there is nobody left to ask, and that is
+/// an answer for the caller — not an inconclusive batch, and not a dial.
+#[tokio::test]
+async fn a_probe_with_every_server_excluded_has_nobody_to_ask() {
+    // The script would fail on any command; the point is that no connection
+    // is ever opened to it.
+    let port = spawn_scripted_server(vec![ScriptStep {
+        expect_prefix: None,
+        response: b"200 ready\r\n",
+    }])
+    .await;
+
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_server(port, 0)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(5),
+    });
+
+    let outcome = client
+        .confirm_exists_for_probe_excluding(&["<probe@silver.horizon>"], &[0])
+        .await;
+    assert!(
+        outcome.is_none(),
+        "excluding the only server leaves nothing to ask: {outcome:?}"
+    );
+    assert!(
+        client.has_available_permit(ServerId(0)),
+        "no connection may be opened on an excluded server"
+    );
 }
