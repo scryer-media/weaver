@@ -12,6 +12,67 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
+/// Split-7z parts sitting in the working directory that `numbered` (the
+/// volume numbers the assembly declares for `set_name`) does not account for.
+///
+/// The directory is enumerated once and each entry is matched against the
+/// exact `<set>.NNN` spelling, so the cost is bounded by what the directory
+/// holds. Probing candidate names by number instead would make the cost
+/// proportional to the largest declared volume number, and that number is
+/// parsed straight out of an NZB subject: a single part named
+/// `payload.7z.1000000000` would cost a billion metadata lookups on the
+/// orchestration task before this topology could be built.
+fn recovered_7z_parts_on_disk(
+    working_dir: &Path,
+    set_name: &str,
+    numbered: &HashSet<u32>,
+) -> Vec<(String, u32)> {
+    let entries = match std::fs::read_dir(working_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            debug!(
+                working_dir = %working_dir.display(),
+                set_name,
+                error = %error,
+                "7z split topology could not enumerate the working directory for recovered parts"
+            );
+            return Vec::new();
+        }
+    };
+    let prefix = format!("{set_name}.");
+    let mut recovered = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if suffix.len() < 3 || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Some(number) = suffix
+            .parse::<u32>()
+            .ok()
+            .and_then(|one_based| one_based.checked_sub(1))
+        else {
+            continue;
+        };
+        // `.7z.NNN` is the whole naming scheme; a spelling that would not
+        // round-trip (`.0002`) is not a part of this set.
+        if format!("{:03}", number + 1) != suffix || numbered.contains(&number) {
+            continue;
+        }
+        if !entry.path().is_file() {
+            continue;
+        }
+        recovered.push((name.to_owned(), number));
+    }
+    recovered.sort_unstable_by_key(|(_, number)| *number);
+    recovered
+}
+
 fn open_rar_volume_file(path: &Path) -> std::io::Result<Box<dyn unrar_rs::ReadSeek>> {
     #[cfg(test)]
     {
@@ -33,6 +94,47 @@ mod tests {
     use crate::pipeline::rar_state::RarSetState;
     use par2_rs::checksum;
     use std::io::Cursor;
+
+    #[test]
+    fn recovered_7z_parts_are_found_by_enumerating_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str| std::fs::write(dir.path().join(name), b"part").unwrap();
+        write("payload.7z.001");
+        write("payload.7z.002");
+        write("payload.7z.003");
+        write("payload.7z.007");
+        write("payload.7z.0002");
+        write("payload.7z.abc");
+        write("payload.7z");
+        write("other.7z.004");
+        std::fs::create_dir(dir.path().join("payload.7z.005")).unwrap();
+
+        // The declared set names part 3 and a part with a hostile number;
+        // the cost of the scan must not follow that number.
+        let numbered = HashSet::from([2, 999_999_999]);
+        let started = std::time::Instant::now();
+        let recovered = recovered_7z_parts_on_disk(dir.path(), "payload.7z", &numbered);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "recovery scan must be bounded by the directory, not the declared number"
+        );
+
+        assert_eq!(
+            recovered,
+            vec![
+                ("payload.7z.001".to_owned(), 0),
+                ("payload.7z.002".to_owned(), 1),
+                ("payload.7z.007".to_owned(), 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovered_7z_parts_tolerate_a_missing_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        assert!(recovered_7z_parts_on_disk(&missing, "payload.7z", &HashSet::new()).is_empty());
+    }
 
     fn build_many_volume_rar_set(volume_count: usize) -> Vec<(String, Vec<u8>)> {
         assert!(volume_count >= 2);
@@ -2631,34 +2733,11 @@ impl Pipeline {
                 // performs lives in the topology alone, so a rebuild from the
                 // assembly's files would silently lose it and the set would go
                 // back to waiting on a part that is sitting right there. The
-                // gaps in the numbering are checked, and then past the end
-                // until the run of names stops; `.7z.NNN` is the whole naming
-                // scheme, so the candidates are exact.
+                // directory is enumerated once, so the work is bounded by its
+                // entries and not by the largest declared volume number.
                 let recovered_parts: Vec<(String, u32)> = {
-                    let numbered: std::collections::HashSet<u32> =
-                        volume_map.values().copied().collect();
-                    let candidate = |number: u32| format!("{set_name}.{:03}", number + 1);
-                    let on_disk = |name: &str| state.working_dir.join(name).is_file();
-                    let mut recovered = Vec::new();
-                    for number in 0..max_number {
-                        if numbered.contains(&number) {
-                            continue;
-                        }
-                        let name = candidate(number);
-                        if on_disk(&name) {
-                            recovered.push((name, number));
-                        }
-                    }
-                    let mut number = max_number + 1;
-                    loop {
-                        let name = candidate(number);
-                        if !on_disk(&name) {
-                            break;
-                        }
-                        recovered.push((name, number));
-                        number += 1;
-                    }
-                    recovered
+                    let numbered: HashSet<u32> = volume_map.values().copied().collect();
+                    recovered_7z_parts_on_disk(&state.working_dir, &set_name, &numbered)
                 };
                 for (name, number) in &recovered_parts {
                     volume_map.insert(name.clone(), *number);
