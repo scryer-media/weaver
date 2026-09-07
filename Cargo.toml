@@ -129,7 +129,7 @@ par2-rs = { version = "0.10", default-features = false, features = ["native-cryp
 # without re-zeroing the RS scratch tables per byte, which cut .rev restores
 # from 3-4x the CPU of unrar to parity, and reopens the reconstructed last
 # volume for its padding trim instead of failing with EBADF.
-unrar-rs = { version = "0.10.2", default-features = false, features = ["crypto-aws-lc"] }
+unrar-rs = { version = "0.10.3", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

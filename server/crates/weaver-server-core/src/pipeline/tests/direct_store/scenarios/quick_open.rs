@@ -188,15 +188,24 @@ async fn an_honest_quick_open_cache_waits_for_a_hole_the_walk_cannot_cross() {
     // The last volume's tail — end record and cache — lands before its middle.
     submit_volume_article_of(&mut pipeline, job_id, &volumes, 1, 0, ARTICLES).await;
     submit_volume_article_of(&mut pipeline, job_id, &volumes, 1, 2, ARTICLES).await;
+    // The tail is staged, so the library *could* answer the whole layout from
+    // the cache — and the set never asks it to. The walk that stopped at the
+    // hole said which byte it needs, the tail is not that byte, and a parse
+    // that cannot reach it is not repeated (`VolumeStaging::parse_short_at`).
+    // The cross-check is what would have refused those cache-derived facts, so
+    // not paying for either walk is the same verdict reached earlier: what
+    // must not change is that nothing is adopted and nothing demotes, and both
+    // are asserted below.
     let walks_before_the_hole_filled = pipeline
         .direct_store
         .set(job_id, 0)
         .expect("the set is still routing")
         .router
         .quick_open_walks();
-    assert!(
-        walks_before_the_hole_filled >= 1,
-        "the staged tail let the library adopt the cache, so a walk must have run"
+    assert_eq!(
+        walks_before_the_hole_filled, 0,
+        "a parse that cannot reach the byte it stopped at is not repeated, so \
+         there is nothing for the cross-check to answer yet"
     );
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
@@ -214,6 +223,16 @@ async fn an_honest_quick_open_cache_waits_for_a_hole_the_walk_cannot_cross() {
     assert!(
         !shape.contains("Demoted"),
         "once the hole is filled the walk agrees with the cache, got {shape}"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .map(|set| set.router.quick_open_walks())
+            .unwrap_or_default()
+            >= 1,
+        "and the article that filled it is the one that pays for the \
+         cross-check"
     );
     for (name, payload) in [(split_name, &split_payload), (whole_name, &whole_payload)] {
         let routed = std::fs::read(payload_root(&temp_dir, job_id).join(name))

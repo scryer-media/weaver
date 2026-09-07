@@ -1582,6 +1582,21 @@ pub(super) struct VolumeStaging {
     /// Cleared as the range drains, so the mark lives exactly as long as the
     /// bytes it describes.
     repaired: ByteRanges,
+    /// The offset the last header walk over this volume ran out of bytes at,
+    /// as the walk itself reported it; `None` before the first walk and
+    /// whenever one stopped for a reason more bytes cannot change.
+    ///
+    /// **The re-parse gate.** A store volume's end-of-archive record sits past
+    /// every member's payload, so the confirming walk cannot succeed until the
+    /// volume's *last* article lands — and without this the router walked the
+    /// headers again for every article in between, each walk stopping at the
+    /// same byte. On a `-hp` set each of those walks also re-derived the
+    /// archive key.
+    ///
+    /// The number is a lower bound on what the walk needs: waiting for it can
+    /// still cost a walk that comes up short, and can never skip one that
+    /// would have succeeded.
+    parse_short_at: Option<u64>,
     /// Physical end of the last member extent the walk has reached.
     ///
     /// **The frontier of proven classification.** Below it the walk arrived
@@ -1638,6 +1653,18 @@ pub(super) fn restored_volume_is_confirmed(
 }
 
 impl VolumeStaging {
+    /// Whether a header walk starting from zero could read `offset` today:
+    /// either the byte is staged, or it was routed away — in which case the
+    /// walk's own answer may have moved and the gate must not hold it back.
+    fn parse_can_reach(&self, offset: u64) -> bool {
+        let staged = self
+            .chunks
+            .range(..=offset)
+            .next_back()
+            .is_some_and(|(start, chunk)| offset < start.saturating_add(chunk.len()));
+        staged || self.routed.missing(offset, 1).is_empty()
+    }
+
     /// Stores the parts of `[offset, offset + len)` that are neither routed nor
     /// already pending, and marks them pending. Returns the newly staged bytes.
     fn stage(&mut self, offset: u64, data: &[u8]) -> u64 {
@@ -2033,6 +2060,19 @@ pub(crate) struct DirectSetRouter {
     /// headers: it is only consulted when a header parse comes back
     /// `EncryptedArchive`.
     header_crypt: HeaderKeyRing,
+    /// The key derivations every header walk over this set's volumes shares.
+    ///
+    /// A `-hp` volume's archive key comes from (password, salt, KDF count),
+    /// and all three are properties of the volume rather than of the parse —
+    /// so a walk that derives its own throws the work away and the next
+    /// article's walk pays for it again. On a set whose volumes are staged
+    /// article by article that is one PBKDF2 run of up to 2^24 iterations per
+    /// article, per volume, for nothing.
+    ///
+    /// Held for the life of the router, which is the set: the cache is keyed
+    /// by password as well as by salt, so it is derived key material and its
+    /// lifetime is deliberately this unit of work and not the process.
+    kdf_cache: std::sync::Arc<unrar_rs::KdfCache>,
     /// Envelope spans produced by a member **migration** (the small-member
     /// tolerance), waiting to be handed to the caller.
     ///
@@ -2093,6 +2133,11 @@ pub(crate) struct DirectSetRouter {
     /// prove a cache the library never adopted does not cost a second parse.
     #[cfg(test)]
     quick_open_walks: u64,
+    /// How many header walks this set has run over a staged image, so a test
+    /// can prove the re-parse gate holds: the count is a property of the
+    /// volumes, not of how many articles they arrived in.
+    #[cfg(test)]
+    parse_walks: u64,
     /// Does the job that owns this set carry PAR2 at all?
     ///
     /// The one fact that turns a part-checksum mismatch from a verdict into a
@@ -2156,6 +2201,9 @@ impl Drop for DirectSetRouter {
 
 impl DirectSetRouter {
     pub(crate) fn new(plan: DirectSetPlan) -> Self {
+        // One cache for the whole set: the key rings verify and derive into
+        // it, and every header walk over every volume shares it.
+        let kdf_cache = std::sync::Arc::new(unrar_rs::KdfCache::new());
         Self {
             scratch: HoldsScratch::new(plan.holds_scratch_path(), HOLDS_SCRATCH_CEILING_BYTES),
             plan,
@@ -2173,8 +2221,9 @@ impl DirectSetRouter {
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
             accountant: std::sync::Arc::new(super::accountant::HoldsAccountant::unbounded()),
             charge: super::accountant::HoldsCharge::default(),
-            crypt: KeyRing::new(),
-            header_crypt: HeaderKeyRing::new(),
+            crypt: KeyRing::with_shared_kdf_cache(std::sync::Arc::clone(&kdf_cache)),
+            header_crypt: HeaderKeyRing::with_shared_kdf_cache(std::sync::Arc::clone(&kdf_cache)),
+            kdf_cache,
             migrated: Vec::new(),
             retired_destinations: Vec::new(),
             member_facts_revision: 0,
@@ -2185,6 +2234,8 @@ impl DirectSetRouter {
             blocks_held: 0,
             #[cfg(test)]
             quick_open_walks: 0,
+            #[cfg(test)]
+            parse_walks: 0,
             par2_available: false,
             damaged_volumes: std::collections::BTreeSet::new(),
             repair_rerouted: false,
@@ -2272,6 +2323,26 @@ impl DirectSetRouter {
     #[cfg(test)]
     pub(crate) fn quick_open_walks(&self) -> u64 {
         self.quick_open_walks
+    }
+
+    /// Header walks over a staged image run so far. Test-only; see the field.
+    #[cfg(test)]
+    pub(crate) fn parse_walks(&self) -> u64 {
+        self.parse_walks
+    }
+
+    /// Key derivations this set has actually paid for — RAR5 and RAR4 alike —
+    /// as opposed to the ones served from its cache.
+    ///
+    /// The cost this measures is not incidental: one RAR5 derivation is a
+    /// PBKDF2 run of up to 2^24 iterations, and a set that pays one per
+    /// arriving article spends more time on it than on everything else the
+    /// router does.
+    #[cfg(test)]
+    pub(crate) fn kdf_derivations(&self) -> u64 {
+        self.kdf_cache
+            .rar5_derivation_count()
+            .saturating_add(self.kdf_cache.rar4_derivation_count())
     }
 
     /// Whether the set would still take a job password.

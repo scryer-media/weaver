@@ -325,7 +325,11 @@ impl DirectSetRouter {
         let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
             return Ok(false);
         };
-        let facts = match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
+        let facts = match unrar_rs::RarArchive::parse_volume_facts_with_shared_kdf_cache(
+            image,
+            self.header_password(),
+            std::sync::Arc::clone(&self.kdf_cache),
+        ) {
             Ok(facts) => facts,
             // A restored `-hp` set. The archive key is never
             // persisted, so this run has to prove one of the job's candidates
@@ -339,7 +343,11 @@ impl DirectSetRouter {
                 let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
                     return Ok(false);
                 };
-                match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
+                match unrar_rs::RarArchive::parse_volume_facts_with_shared_kdf_cache(
+                    image,
+                    self.header_password(),
+                    std::sync::Arc::clone(&self.kdf_cache),
+                ) {
                     Ok(facts) => facts,
                     Err(_) => return Ok(false),
                 }
@@ -490,9 +498,34 @@ impl DirectSetRouter {
         {
             return Ok(());
         }
+        // The previous walk said which byte it ran out at. Until the image can
+        // serve that byte this walk would stop in the same place, having read
+        // the same headers and — on a `-hp` volume — derived the same archive
+        // key again. See [`VolumeStaging::parse_short_at`].
+        //
+        // Never on the volume's **last** article, whatever the gate says: a
+        // complete source image is one of the two proofs that confirm a volume
+        // (`reached_end` below), so the walk over it has to run even when it
+        // will stop exactly where the previous one did. Holding it back would
+        // leave the volume unconfirmed with no further article to reopen it,
+        // and its trailing region held for the life of the set.
+        if let Some(short_at) = staging.parse_short_at
+            && !staging.source_complete
+            && !staging.parse_can_reach(short_at)
+        {
+            return Ok(());
+        }
         let image = SparseImage::from_staged(&staging.chunks, self.scratch.handle());
-        let facts = match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
-            Ok(facts) => facts,
+        #[cfg(test)]
+        {
+            self.parse_walks = self.parse_walks.saturating_add(1);
+        }
+        let walk = match unrar_rs::RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+            image,
+            self.header_password(),
+            std::sync::Arc::clone(&self.kdf_cache),
+        ) {
+            Ok(walk) => walk,
             // The one parse failure that is a *fact* rather than a shortage of
             // bytes: the volume's headers are encrypted, so the
             // layout is withheld until a key exists. Every other failure is a
@@ -517,6 +550,12 @@ impl DirectSetRouter {
             }
             Err(_) => return self.judge_unparsed_prefix(volume_index),
         };
+        let facts = walk.facts;
+        // Recorded from the walk that just ran, over the image it just read:
+        // the gate above is only ever as old as the last answer.
+        if let Some(staging) = self.staging.get_mut(&volume_index) {
+            staging.parse_short_at = walk.short_at;
+        }
         if facts.members.is_empty() {
             return self.judge_unparsed_prefix(volume_index);
         }
@@ -1016,13 +1055,17 @@ impl DirectSetRouter {
         if unrar_rs::signature::read_signature(&mut image).ok()? != ArchiveFormat::Rar5 {
             return None;
         }
-        let parsed = unrar_rs::header::parse_all_headers_with_options(
+        let parsed = unrar_rs::header::parse_all_headers_with_kdf_cache_and_options(
             &mut image,
             // The archive-header password for a `-hp` set, `None` for every
             // other. Without it this walk cannot read a `-hp` volume's headers
             // at all, so a `-hp -qo` set would refuse every parse as
             // `QuickOpenMismatch` — fail-closed, but for the wrong reason.
             self.header_password(),
+            // The set's cache, so this second walk of the same volume — one
+            // per cross-checked parse — costs a lookup rather than the whole
+            // key derivation the first walk already paid for.
+            &self.kdf_cache,
             unrar_rs::header::HeaderParseOptions {
                 allow_quick_open: false,
             },
