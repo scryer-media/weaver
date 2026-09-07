@@ -723,6 +723,106 @@ fn holds_scratch_compaction_refuses_extents_it_cannot_pack_safely() {
     );
 }
 
+/// A provider that reads holds from the scratch on demand keeps offsets past
+/// the call that handed them out, and compaction is the one thing that moves
+/// a region. Under a pin it packs into a fresh image instead, so the pinned
+/// reader's offsets stay true for the image it holds while the router goes on
+/// with the packed copy at the same path.
+#[test]
+fn a_pinned_scratch_compacts_into_a_fresh_image_and_the_pin_keeps_the_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+    let packing_path = dir
+        .path()
+        .join(".weaver-holds.silver.horizon.f0.compacting");
+    let mut scratch = HoldsScratch::new(path.clone(), 64);
+
+    let first = scratch.append(b"aaaa").unwrap();
+    let placed = scratch.append(b"bbbbbb").unwrap();
+    let third = scratch.append(b"cccc").unwrap();
+
+    let pin = scratch.pin().expect("an image exists once a byte is paged");
+    assert!(scratch.is_pinned());
+
+    let new_offsets = scratch.compact(&[(first, 4), (third, 4)]).unwrap();
+    assert_eq!(new_offsets, vec![0, 4]);
+    assert_eq!(scratch.bytes(), 8);
+    assert_eq!(
+        scratch.read(4, 4).as_deref(),
+        Some(&b"cccc"[..]),
+        "the router reads the packed copy at the new offsets"
+    );
+    assert!(path.exists(), "the packed copy took over the scratch path");
+    assert!(
+        !packing_path.exists(),
+        "and the packing path did not linger"
+    );
+    assert!(
+        !scratch.is_pinned(),
+        "the fresh image starts unpinned: the pin is on the image it was taken against"
+    );
+
+    let mut moved = [0u8; 4];
+    pin.read_at(third, &mut moved).unwrap();
+    assert_eq!(
+        &moved, b"cccc",
+        "the pinned reader still reads the run at the offset it was handed"
+    );
+    let mut dead = [0u8; 6];
+    pin.read_at(placed, &mut dead).unwrap();
+    assert_eq!(
+        &dead, b"bbbbbb",
+        "the old image was left exactly as it was, dead regions included"
+    );
+
+    // Unpinned again, the next pack is in place and the offsets keep working.
+    drop(pin);
+    let fourth = scratch.append(b"dddd").unwrap();
+    let packed_again = scratch.compact(&[(4, 4), (fourth, 4)]).unwrap();
+    assert_eq!(packed_again, vec![0, 4]);
+    assert_eq!(scratch.read(0, 8).as_deref(), Some(&b"ccccdddd"[..]));
+}
+
+#[test]
+fn dropping_the_last_pin_unpins_the_scratch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut scratch = HoldsScratch::new(dir.path().join(".weaver-holds.silver.horizon.f0"), 64);
+    assert!(
+        scratch.pin().is_none(),
+        "there is no image to pin before anything is paged"
+    );
+    scratch.append(b"held").unwrap();
+
+    let first = scratch.pin().unwrap();
+    let second = scratch.pin().unwrap();
+    assert!(scratch.is_pinned());
+    drop(first);
+    assert!(scratch.is_pinned(), "one reader is still on the image");
+    drop(second);
+    assert!(!scratch.is_pinned());
+}
+
+/// A retained provider can outlive the set: finalization and demotion both
+/// discard the scratch, and a pin must keep its bytes readable through that.
+/// The handle does the keeping; the path is gone. Unix only, where an unlinked
+/// file stays readable through an open handle by contract.
+#[cfg(unix)]
+#[test]
+fn a_pin_reads_through_a_discard() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+    let mut scratch = HoldsScratch::new(path.clone(), 64);
+    let offset = scratch.append(b"held bytes").unwrap();
+    let pin = scratch.pin().unwrap();
+
+    scratch.discard();
+    assert!(!path.exists());
+
+    let mut out = [0u8; 10];
+    pin.read_at(offset, &mut out).unwrap();
+    assert_eq!(&out, b"held bytes");
+}
+
 #[test]
 fn a_scratch_that_never_appended_a_byte_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();

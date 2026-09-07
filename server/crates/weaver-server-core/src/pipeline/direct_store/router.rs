@@ -890,12 +890,12 @@ impl CrcRuns {
 
 /// One staged run, in RAM or paged out to the set's holds scratch.
 ///
-/// A scratch region is **write-once and append-only** for the life of the set,
-/// so an offset handed out here is valid until the set closes — which is what
-/// makes reading one back a single positioned read with no locking and no
-/// re-validation. Nothing is ever reclaimed or compacted: the file's high-water
-/// is bounded by the total bytes the set ever held, and a later pass revisits
-/// that if measurement says the bound is too loose in practice.
+/// A scratch region is **write-once**: an offset handed out here reads back
+/// with a single positioned read, no locking and no re-validation, for as long
+/// as the image it was taken from exists. The one thing that moves a region is
+/// compaction, which rewrites the router's own index in the same call — and
+/// which, while a reader holds a [`HoldsScratchPin`] on the image, relocates
+/// into a fresh file rather than rewriting the one the reader is on.
 #[derive(Debug, Clone)]
 enum StagedChunk {
     Memory(std::sync::Arc<[u8]>),
@@ -997,15 +997,18 @@ fn write_at(file: &std::fs::File, offset: u64, bytes: &[u8]) -> std::io::Result<
 
 /// The per-set holds scratch file.
 ///
-/// Append-only, write-once, with an in-memory index that lives in the staging
-/// map: a paged chunk *is* its `(offset, len)`. There is no free list and no
-/// compaction, deliberately — reclaiming space in a file whose regions are
-/// handed out as stable offsets means either rewriting them (which breaks the
-/// write-once property the lock-free read depends on) or a free-list allocator,
-/// and neither is worth building before measurement says the append-only bound
-/// hurts. The bound is stated rather than hidden: **scratch never exceeds the
-/// total bytes the set holds over its life**, and the ceiling below is what
-/// keeps that from being unbounded.
+/// Append-only and write-once per region, with an in-memory index that lives in
+/// the staging map: a paged chunk *is* its `(offset, len)`. There is no free
+/// list. Space that placed holds leave behind is reclaimed only by
+/// [`Self::compact`], and only when an append would otherwise breach the
+/// ceiling — the bound is stated rather than hidden: **scratch never exceeds
+/// the live holds plus what compaction has not yet reclaimed**, and the ceiling
+/// below is what keeps that from being unbounded.
+///
+/// A reader that keeps offsets past the call that handed them out takes a
+/// [`HoldsScratchPin`]. The pin is what makes those offsets safe to keep:
+/// compaction under a pin relocates into a fresh file and leaves the pinned
+/// image untouched, so the reader's offsets stay true for the image it holds.
 #[derive(Debug)]
 pub(crate) struct HoldsScratch {
     path: std::path::PathBuf,
@@ -1018,6 +1021,100 @@ pub(crate) struct HoldsScratch {
     /// it inherits the same rule: marked at creation, before a byte is written,
     /// and a marking failure demotes rather than proceeding.
     sparse: SparseMarking,
+    /// Live pins over the **current** image. Replaced, not reset, whenever the
+    /// image is: the pins of a relocated-away image keep decrementing their own
+    /// counter, and the fresh file starts unpinned.
+    pins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A reader's hold on one scratch image: the handle, and the promise that the
+/// offsets handed out against that image stay true while the pin lives.
+///
+/// The provider carries one of these inside every scratch-backed held run so
+/// that PAR2 can read holds on demand, positionally, instead of the router
+/// copying every hold into RAM at provider construction — which is what let a
+/// set's holds bypass the budget the scratch exists to enforce. Two things can
+/// happen to the image underneath a pin, and both are safe: compaction
+/// relocates into a fresh file and leaves this one alone, and `discard`
+/// unlinks the path while the handle keeps the bytes readable until the last
+/// pin drops.
+#[derive(Debug)]
+pub(crate) struct HoldsScratchPin {
+    file: std::sync::Arc<std::fs::File>,
+    pins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HoldsScratchPin {
+    /// Positioned read from the pinned image; a short file is an I/O error,
+    /// never a hole, because a region handed out was written in full.
+    pub(crate) fn read_at(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        read_at(&self.file, offset, out)
+    }
+}
+
+impl Drop for HoldsScratchPin {
+    fn drop(&mut self) {
+        self.pins.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The path a pinned compaction packs into before renaming over `path`. It
+/// keeps the holds-scratch prefix, so a copy a crash leaves behind is swept at
+/// restart exactly like the scratch itself.
+fn compacting_scratch_path(path: &std::path::Path) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.compacting"))
+}
+
+/// Creates (or truncates) a scratch file, read/write, marked sparse before a
+/// byte is written. On Windows it is opened share-delete: `discard` unlinks
+/// the scratch under live pins, and a pinned compaction renames its packed copy
+/// over the path, and neither is allowed against a handle opened without it.
+fn open_scratch_file(
+    path: &std::path::Path,
+    sparse: &SparseMarking,
+) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        options.share_mode(0x1 | 0x2 | 0x4);
+    }
+    let file = options.open(path)?;
+    if let Err(error) = super::sparse::SparseMarker::mark_sparse(sparse, &file) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Copies `len` bytes from `src` at `src_offset` to `dst` at `dst_offset`,
+/// front to back in bounded slices. `src` and `dst` may be the same file: an
+/// in-place pack only ever moves a region toward the front, and front-to-back
+/// order keeps the destination behind the not-yet-read source.
+fn copy_scratch_region(
+    src: &std::fs::File,
+    src_offset: u64,
+    dst: &std::fs::File,
+    dst_offset: u64,
+    len: u64,
+) -> Option<()> {
+    const COPY_SLICE_BYTES: u64 = 1024 * 1024;
+    let mut copied = 0u64;
+    while copied < len {
+        let take = COPY_SLICE_BYTES.min(len - copied);
+        let mut buffer = vec![0u8; take as usize];
+        read_at(src, src_offset.saturating_add(copied), &mut buffer).ok()?;
+        write_at(dst, dst_offset.saturating_add(copied), &buffer).ok()?;
+        copied += take;
+    }
+    Some(())
 }
 
 impl HoldsScratch {
@@ -1028,6 +1125,7 @@ impl HoldsScratch {
             len: 0,
             ceiling,
             sparse: SparseMarking::default(),
+            pins: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -1037,6 +1135,24 @@ impl HoldsScratch {
 
     fn handle(&self) -> Option<std::sync::Arc<std::fs::File>> {
         self.file.clone()
+    }
+
+    /// Pins the current image for a reader. `None` when nothing has been paged
+    /// yet — there is no image to pin, and no scratch-backed chunk to read.
+    pub(super) fn pin(&self) -> Option<std::sync::Arc<HoldsScratchPin>> {
+        let file = std::sync::Arc::clone(self.file.as_ref()?);
+        self.pins.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(std::sync::Arc::new(HoldsScratchPin {
+            file,
+            pins: std::sync::Arc::clone(&self.pins),
+        }))
+    }
+
+    /// Whether a reader holds the current image. Read on the router's own
+    /// thread, which is also the only thread that hands pins out, so the answer
+    /// cannot change between this and the compaction that acts on it.
+    pub(super) fn is_pinned(&self) -> bool {
+        self.pins.load(std::sync::atomic::Ordering::Acquire) > 0
     }
 
     /// Appends one run and returns its offset. `None` on a ceiling breach, which
@@ -1054,12 +1170,13 @@ impl HoldsScratch {
             // Marked sparse before the first `write_at`. A killed run's scratch
             // is swept at restart, so an existing file here is not state to
             // preserve — truncating it is what keeps the append cursor (`len`,
-            // reset to zero by `discard`) agreeing with the file.
-            let file = super::sparse::create_sparse(&self.path, &self.sparse)
-                .map_err(|_| DemotionReason::HoldsScratchFailed)?;
-            file.set_len(0)
+            // reset to zero by `discard`) agreeing with the file. A fresh image
+            // starts unpinned: whatever pins a discarded image still has are
+            // on their own counter.
+            let file = open_scratch_file(&self.path, &self.sparse)
                 .map_err(|_| DemotionReason::HoldsScratchFailed)?;
             self.file = Some(std::sync::Arc::new(file));
+            self.pins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             tracing::debug!(
                 scratch_path = %self.path.display(),
                 ceiling_bytes = self.ceiling,
@@ -1086,12 +1203,21 @@ impl HoldsScratch {
     /// source and never lands on a source that has not been read yet. Copying
     /// each extent front to back keeps that true inside an extent too.
     ///
+    /// While a [`HoldsScratchPin`] is alive the rewrite is **not** in place:
+    /// the live extents are packed into a fresh file that is renamed over the
+    /// path, the router carries on with that copy, and the pinned readers keep
+    /// the handle to the image their offsets were taken from. The old image's
+    /// space is returned when the last pin drops. This is what lets a provider
+    /// read holds from the scratch on demand rather than copying them out
+    /// first.
+    ///
     /// `None` means the file is now in an unknown state: the caller must
     /// demote rather than trust any offset, including the ones it already had.
     pub(super) fn compact(&mut self, live: &[(u64, u64)]) -> Option<Vec<u64>> {
-        const COPY_SLICE_BYTES: u64 = 1024 * 1024;
-
         let file = std::sync::Arc::clone(self.file.as_ref()?);
+        if self.is_pinned() {
+            return self.compact_relocating(&file, live);
+        }
         let mut new_offsets = Vec::with_capacity(live.len());
         let mut cursor = 0u64;
         for (offset, len) in live.iter().copied() {
@@ -1101,14 +1227,7 @@ impl HoldsScratch {
                 return None;
             }
             if cursor < offset {
-                let mut copied = 0u64;
-                while copied < len {
-                    let take = COPY_SLICE_BYTES.min(len - copied);
-                    let mut buffer = vec![0u8; take as usize];
-                    read_at(&file, offset.saturating_add(copied), &mut buffer).ok()?;
-                    write_at(&file, cursor.saturating_add(copied), &buffer).ok()?;
-                    copied += take;
-                }
+                copy_scratch_region(&file, offset, &file, cursor, len)?;
             }
             new_offsets.push(cursor);
             cursor = cursor.checked_add(len)?;
@@ -1116,6 +1235,51 @@ impl HoldsScratch {
         file.set_len(cursor).ok()?;
         self.len = cursor;
         Some(new_offsets)
+    }
+
+    /// [`Self::compact`] under a pin: pack into a fresh file, then take it over.
+    ///
+    /// The rename is what keeps everything outside this type unchanged — the
+    /// path is the path, `discard` deletes it, the restart sweep recognises it.
+    /// A failure at any step leaves the current image exactly as it was and
+    /// removes the half-written copy; the caller demotes on `None` as before.
+    fn compact_relocating(&mut self, old: &std::fs::File, live: &[(u64, u64)]) -> Option<Vec<u64>> {
+        let packing_path = compacting_scratch_path(&self.path);
+        let fresh = open_scratch_file(&packing_path, &self.sparse).ok()?;
+        let packed = (|| {
+            let mut new_offsets = Vec::with_capacity(live.len());
+            let mut cursor = 0u64;
+            for (offset, len) in live.iter().copied() {
+                if cursor > offset {
+                    return None;
+                }
+                copy_scratch_region(old, offset, &fresh, cursor, len)?;
+                new_offsets.push(cursor);
+                cursor = cursor.checked_add(len)?;
+            }
+            std::fs::rename(&packing_path, &self.path).ok()?;
+            Some((new_offsets, cursor))
+        })();
+        match packed {
+            Some((new_offsets, cursor)) => {
+                tracing::debug!(
+                    scratch_path = %self.path.display(),
+                    old_bytes = self.len,
+                    packed_bytes = cursor,
+                    pins = self.pins.load(std::sync::atomic::Ordering::Acquire),
+                    "direct-store relocated the holds scratch under a live reader"
+                );
+                self.file = Some(std::sync::Arc::new(fresh));
+                self.len = cursor;
+                self.pins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                Some(new_offsets)
+            }
+            None => {
+                drop(fresh);
+                let _ = std::fs::remove_file(&packing_path);
+                None
+            }
+        }
     }
 
     pub(super) fn read(&self, offset: u64, len: u64) -> Option<Vec<u8>> {

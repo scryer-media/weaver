@@ -2424,7 +2424,9 @@ fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
     covered.insert(140, total - 140);
     let mut fixture = provider_fixture(covered.clone());
     let held: Arc<[u8]> = Arc::from(&fixture.conventional[100..140]);
-    fixture.volume.held = Arc::new(vec![(100u64, held)]);
+    fixture.volume.held = Arc::new(vec![super::super::provider::HeldRun::memory(
+        100, held, 0, 40,
+    )]);
 
     assert_eq!(
         fixture.volume.readable_prefix(),
@@ -2462,6 +2464,57 @@ fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
     .expect("every article composes once the hold is in the coverage");
     assert_eq!(rebuilt[0].contiguous, fixture.conventional.len() as u64);
     assert_eq!(std::fs::read(&path).unwrap(), fixture.conventional);
+}
+
+/// A hold the budget paged out is served from the scratch image, positionally,
+/// when a read lands on it. The provider owns no copy: what the budget paged
+/// out stays out, whatever the size of the holds.
+#[test]
+fn a_virtual_volume_reads_a_paged_hold_from_the_scratch_on_demand() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let total = whole_volume_covered().end();
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 100);
+    covered.insert(140, total - 140);
+    let mut fixture = provider_fixture(covered);
+
+    // The router paged the hold behind an earlier region, so the run's scratch
+    // offset is not its physical offset and a read has to use the right one.
+    let mut scratch = super::super::router::HoldsScratch::new(
+        fixture._dir.path().join(".weaver-holds.silver.horizon.f0"),
+        1 << 20,
+    );
+    scratch
+        .append(b"an earlier hold that was placed since")
+        .unwrap();
+    let paged_at = scratch.append(&fixture.conventional[100..140]).unwrap();
+    let pin = scratch.pin().unwrap();
+    fixture.volume.held = Arc::new(vec![super::super::provider::HeldRun::scratch(
+        100, pin, paged_at, 40,
+    )]);
+
+    assert_eq!(
+        fixture.volume.readable_prefix(),
+        Some(fixture.conventional.len() as u64),
+        "a paged hold claims and sources its bytes exactly like a resident one"
+    );
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let mut reader = provider.open(0).expect("volume 0 is registered");
+    let mut read = Vec::new();
+    reader
+        .read_to_end(&mut read)
+        .expect("the whole volume reads");
+    assert_eq!(
+        read, fixture.conventional,
+        "the paged hold reads back exactly as posted, through the scratch"
+    );
+
+    // A read starting inside the run offsets into the scratch region.
+    reader.seek(SeekFrom::Start(120)).unwrap();
+    let mut tail = [0u8; 20];
+    reader.read_exact(&mut tail).unwrap();
+    assert_eq!(&tail, &fixture.conventional[120..140]);
 }
 
 #[test]

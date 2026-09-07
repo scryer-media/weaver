@@ -84,8 +84,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use unrar_rs::{ReadSeek, VolumeProvider, VolumeProviderError};
 
 use super::ByteRanges;
-use super::router::MemberExtent;
 use super::router::crypt::{MemberCipher, block_ceil, block_floor};
+use super::router::{HoldsScratchPin, MemberExtent};
 
 /// How much plaintext a chain-to-seed pass re-encrypts per iteration.
 ///
@@ -93,6 +93,81 @@ use super::router::crypt::{MemberCipher, block_ceil, block_floor};
 /// buffer a checkpoint miss costs — not the work, which is whatever the distance
 /// to the seed is.
 const CHAIN_CHUNK_BYTES: usize = 256 * 1024;
+
+/// One held run of a virtual volume: `len` posted bytes at physical `start`,
+/// read on demand from wherever the router is keeping them.
+///
+/// The provider never owns a copy of a hold. A run the router has in RAM is
+/// the router's own buffer, shared; a run the holds budget paged out is a pin
+/// on the scratch image and an offset into it, read positionally when a read
+/// lands on it. That is the whole difference between a provider whose RAM cost
+/// is the holds budget and one whose RAM cost is the size of the holds.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldRun {
+    pub(crate) start: u64,
+    pub(crate) len: u64,
+    source: HeldSource,
+}
+
+#[derive(Debug, Clone)]
+enum HeldSource {
+    /// `len` bytes at `offset` inside the router's own staged buffer.
+    Memory { bytes: Arc<[u8]>, offset: u64 },
+    /// `len` bytes at `offset` inside the pinned scratch image.
+    Scratch {
+        pin: Arc<HoldsScratchPin>,
+        offset: u64,
+    },
+}
+
+impl HeldRun {
+    pub(crate) fn memory(start: u64, bytes: Arc<[u8]>, offset: u64, len: u64) -> Self {
+        debug_assert!(offset.saturating_add(len) <= bytes.len() as u64);
+        Self {
+            start,
+            len,
+            source: HeldSource::Memory { bytes, offset },
+        }
+    }
+
+    pub(crate) fn scratch(start: u64, pin: Arc<HoldsScratchPin>, offset: u64, len: u64) -> Self {
+        Self {
+            start,
+            len,
+            source: HeldSource::Scratch { pin, offset },
+        }
+    }
+
+    /// One past the last physical offset this run answers for.
+    pub(crate) fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+
+    /// Reads from `offset` bytes into the run, as much as fits in `out` and
+    /// remains in the run. A scratch image that cannot deliver a region it
+    /// handed out is a real I/O failure, not a hole.
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
+        let take = usize::try_from(self.len.saturating_sub(offset))
+            .unwrap_or(usize::MAX)
+            .min(out.len());
+        if take == 0 {
+            return Ok(0);
+        }
+        match &self.source {
+            HeldSource::Memory {
+                bytes,
+                offset: base,
+            } => {
+                let from = (base + offset) as usize;
+                out[..take].copy_from_slice(&bytes[from..from + take]);
+            }
+            HeldSource::Scratch { pin, offset: base } => {
+                pin.read_at(base.saturating_add(offset), &mut out[..take])?;
+            }
+        }
+        Ok(take)
+    }
+}
 
 /// A read landed on a byte the set never placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,8 +245,8 @@ pub(crate) struct VirtualVolume {
     /// list says.
     pub(crate) envelope_covered: ByteRanges,
     /// The volume's holds: staged bytes no destination has taken yet, as
-    /// `(physical offset, bytes)` runs in ascending order, disjoint from
-    /// everything `covered` claims.
+    /// [`HeldRun`]s in ascending order, disjoint from everything `covered`
+    /// claims, each read on demand from the router's buffer or the scratch.
     ///
     /// Posted bytes verbatim, and a source in their own right. An encrypted
     /// member holds the cipher block on either side of a lost article — its
@@ -181,7 +256,7 @@ pub(crate) struct VirtualVolume {
     /// the offsets a repair needed as input. Shared rather than owned because
     /// a set's volumes are assembled per provider, and a provider is assembled
     /// per pass.
-    pub(crate) held: Arc<Vec<(u64, Arc<[u8]>)>>,
+    pub(crate) held: Arc<Vec<HeldRun>>,
     /// Logical length of the volume: what a `SeekFrom::End` means and where
     /// reads stop returning bytes.
     pub(crate) len: u64,
@@ -255,9 +330,9 @@ impl VirtualVolume {
         }
         // A hold is both claimed and sourced by the bytes it carries.
         let mut claimed = self.covered.clone();
-        for (start, bytes) in self.held.iter() {
-            sources.insert(*start, bytes.len() as u64);
-            claimed.insert(*start, bytes.len() as u64);
+        for run in self.held.iter() {
+            sources.insert(run.start, run.len);
+            claimed.insert(run.start, run.len);
         }
 
         let mut readable = Vec::new();
@@ -491,12 +566,8 @@ impl VirtualVolumeReader {
     fn run_end(&self, position: u64) -> Option<u64> {
         // A hold answers for itself: it is not in the coverage map, because
         // nothing placed it, and it needs no file, because it carries its bytes.
-        if let Some((_, start, bytes)) = self.held_at(position) {
-            return Some(
-                start
-                    .saturating_add(bytes.len() as u64)
-                    .min(self.volume.len),
-            );
+        if let Some((_, run)) = self.held_at(position) {
+            return Some(run.end().min(self.volume.len));
         }
         let covered_end = covered_run_end(&self.volume.covered, position)?;
 
@@ -531,22 +602,22 @@ impl VirtualVolumeReader {
         )
     }
 
-    /// The held run containing `position`, as `(index, start, bytes)`.
-    fn held_at(&self, position: u64) -> Option<(usize, u64, &Arc<[u8]>)> {
+    /// The held run containing `position`, with its index.
+    fn held_at(&self, position: u64) -> Option<(usize, &HeldRun)> {
         let index = self
             .volume
             .held
-            .partition_point(|(start, _)| *start <= position)
+            .partition_point(|run| run.start <= position)
             .checked_sub(1)?;
-        let (start, bytes) = &self.volume.held[index];
-        (position < start.saturating_add(bytes.len() as u64)).then_some((index, *start, bytes))
+        let run = &self.volume.held[index];
+        (position < run.end()).then_some((index, run))
     }
 
     fn source_at(&self, position: u64) -> Source {
-        if let Some((index, start, _)) = self.held_at(position) {
+        if let Some((index, run)) = self.held_at(position) {
             return Source::Held {
                 index,
-                offset: position - start,
+                offset: position - run.start,
             };
         }
         match self.extent_at(position) {
@@ -587,13 +658,7 @@ impl VirtualVolumeReader {
                 }
                 self.read_member_plain(member_id, offset, out)
             }
-            Source::Held { index, offset } => {
-                let bytes = &self.volume.held[index].1;
-                let from = (offset as usize).min(bytes.len());
-                let take = out.len().min(bytes.len() - from);
-                out[..take].copy_from_slice(&bytes[from..from + take]);
-                Ok(take)
-            }
+            Source::Held { index, offset } => self.volume.held[index].read_at(offset, out),
             Source::Envelope { offset } => {
                 if self.envelope_handle.is_none() {
                     let path = self.volume.envelope.clone();
