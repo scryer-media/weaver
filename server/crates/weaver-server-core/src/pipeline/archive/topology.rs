@@ -273,6 +273,117 @@ mod tests {
         assert_eq!(cached.plan.phase.as_str(), live.plan.phase.as_str());
     }
 
+    /// Five volumes of one split member that arrived out of order: the cached
+    /// snapshot holds 0-1 and 3-4 as the two halves of a broken chain, the
+    /// late-arriving volume 2 is on disk, and volumes 3-4 are the ones whose
+    /// facts have not landed yet — so a single rebuild pass both closes the
+    /// chain (adding 2) and then re-reads 3 and 4.
+    fn late_middle_volume_rebuild_input(temp_dir: &tempfile::TempDir) -> RarSetComputeInput {
+        let files = build_many_volume_rar_set(5);
+
+        // The snapshot the earlier rebuilds left behind: volume 2 had not
+        // finished downloading, so 3 and 4 were integrated across the hole.
+        let mut cached_archive =
+            unrar_rs::RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+        for volume in [1usize, 3, 4] {
+            cached_archive
+                .add_volume(volume, Box::new(Cursor::new(files[volume].1.clone())))
+                .unwrap();
+        }
+
+        let mut volume_map = HashMap::new();
+        let mut volume_paths = BTreeMap::new();
+        let mut facts = BTreeMap::new();
+        for (volume, (filename, bytes)) in files.iter().enumerate() {
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            volume_map.insert(filename.clone(), volume as u32);
+            volume_paths.insert(volume as u32, path);
+            // Volumes 3 and 4 are held by the snapshot but have no facts yet:
+            // that is exactly the pair the refresh branch re-reads in place.
+            if volume < 3 {
+                facts.insert(
+                    volume as u32,
+                    unrar_rs::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                        .expect("synthetic RAR volume facts should parse"),
+                );
+            }
+        }
+
+        RarSetComputeInput {
+            job_id: JobId(99),
+            set_name: "big".to_string(),
+            existing: RarSetState::default(),
+            volume_map,
+            volume_paths,
+            password_candidates: Vec::new(),
+            extracted: HashSet::new(),
+            failed: HashSet::new(),
+            facts,
+            verified_suspect_volumes: HashSet::new(),
+            worker_active: false,
+            cached_headers: Some(cached_archive.serialize_headers()),
+            extraction_generation: 0,
+            reason: RefreshReason::CoverageExpansion,
+        }
+    }
+
+    /// Re-reading a held volume in place drops that volume's segments from the
+    /// member chain, and the head half keeps the cleared `split_after` the
+    /// terminal continuation gave it — so the re-parsed tail can never
+    /// reattach and the member silently loses its trailing volumes. A rebuild
+    /// pass that both closes a chain and re-reads volumes above the closing
+    /// point hits exactly that, and the truncated span is what the extractor
+    /// then decodes: the RAR4 solid stream runs out of ciphertext mid-member.
+    #[test]
+    fn rar_plan_rebuild_keeps_the_whole_member_span_when_late_volumes_are_re_read() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = late_middle_volume_rebuild_input(&temp_dir);
+
+        // The fixture is only meaningful while the snapshot really is a broken
+        // chain that the pass has to close.
+        let cached = Pipeline::deserialize_rar_headers_with_password_candidates(
+            "big",
+            input.cached_headers.as_ref().unwrap(),
+            &[],
+            std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
+        )
+        .expect("fixture snapshot should deserialize")
+        .value;
+        assert_eq!(
+            cached
+                .metadata()
+                .members
+                .iter()
+                .map(|member| (member.volumes.first_volume, member.volumes.last_volume))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (3, 4)],
+            "fixture must start from a chain broken at the missing volume 2"
+        );
+
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("a complete volume set should rebuild the plan");
+
+        let rebuilt = Pipeline::deserialize_rar_headers_with_password_candidates(
+            "big",
+            &computed.headers,
+            &[],
+            std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
+        )
+        .expect("rebuilt snapshot should deserialize")
+        .value;
+        assert_eq!(
+            rebuilt
+                .metadata()
+                .members
+                .iter()
+                .map(|member| (member.volumes.first_volume, member.volumes.last_volume))
+                .collect::<Vec<_>>(),
+            vec![(0, 4)],
+            "the member must span every volume it is split across"
+        );
+    }
+
     #[test]
     fn rar_plan_rebuild_falls_back_to_volume_zero_without_usable_cached_headers() {
         for cached_headers in [None, Some(b"not-a-cached-header-snapshot".to_vec())] {
@@ -1192,6 +1303,32 @@ impl Pipeline {
                     }
                 }
             }
+        }
+
+        // Re-reading a volume the snapshot already holds is destructive to a
+        // split member chain: dropping that volume's segments leaves the head
+        // half carrying the cleared `split_after` its terminal continuation
+        // gave it, so the re-parsed tail cannot reattach and the member
+        // silently loses every volume above the re-read one. A pass that also
+        // closes a chain — the late middle volume of an out-of-order arrival —
+        // hits exactly that, and the truncated span is what the extractor
+        // decodes: a solid RAR4 stream then runs out of data mid-member. Build
+        // the whole chain once from live volumes instead of patching it.
+        if using_cached_headers
+            && volume_paths.keys().any(|volume| {
+                (force_refresh_all_volumes || !facts.contains_key(volume))
+                    && archive.has_volume(*volume as usize)
+            })
+            && volume_paths.contains_key(&0)
+        {
+            debug!(
+                set_name = %set_name_owned,
+                "cached RAR headers need a held volume re-read; rebuilding from live volumes"
+            );
+            let selection = open_from_volume_zero()?;
+            archive = selection.value;
+            rebuild_source = RarTopologyRebuildSource::VolumeZero;
+            using_cached_headers = false;
         }
 
         let (mut plan, mut headers, mut rebuild_source, mut used_cached_headers, mut integrated) =
