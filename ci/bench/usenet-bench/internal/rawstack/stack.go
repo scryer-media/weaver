@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
@@ -247,6 +248,7 @@ func (s *Stack) serverEnvironment() []string {
 	if s.config.Pipelining {
 		pipelining = "1"
 	}
+	dnsNames, ipAddresses := CertificateNames(s.config.Host)
 	return []string{
 		"NNTP_LISTEN_ADDR=" + net.JoinHostPort(s.config.Host, strconv.Itoa(s.config.UpstreamPlaintextPort)),
 		"NNTP_TLS_LISTEN_ADDR=" + net.JoinHostPort(s.config.Host, strconv.Itoa(s.config.UpstreamTLSPort)),
@@ -255,10 +257,52 @@ func (s *Stack) serverEnvironment() []string {
 		"NNTP_PASSWORD_FILE=" + s.config.PasswordFile,
 		"NNTP_GENERATE_TEST_TLS=1",
 		"NNTP_TLS_DIR=" + s.config.CertDir,
-		"NNTP_TLS_DNS_NAMES=localhost",
-		"NNTP_TLS_IP_ADDRESSES=127.0.0.1,::1",
+		"NNTP_TLS_DNS_NAMES=" + strings.Join(dnsNames, ","),
+		"NNTP_TLS_IP_ADDRESSES=" + strings.Join(ipAddresses, ","),
 		"NNTP_PIPELINING=" + pipelining,
 	}
+}
+
+// CertificateNames derives the generated certificate's subject alternative
+// names from the address clients are told to dial, so that the stack's own
+// rule — a verified-TLS client validates the same name it dialled — holds for
+// every client rather than only for some of them.
+//
+// It has to satisfy two kinds of verifier at once, and they read different
+// fields. A verifier that recognises the dialled string as an IP literal
+// matches it against the iPAddress SANs, which is what Weaver does. NZBGet
+// hands the literal to OpenSSL's name check instead, and that check never
+// consults iPAddress SANs: against a certificate naming only `localhost` it
+// fails a `127.0.0.1` dial with `certificate hostname mismatch`, and every
+// article of every TLS run fails to connect. Naming a loopback host in both
+// fields is what lets both verify the same certificate under this harness's
+// CA-verified TLS policy, instead of one of them having to turn verification
+// off and be relabelled `tls-unverified`.
+//
+// Dialling `localhost` instead would not do: the stack binds one explicit
+// address, and on a host that resolves `localhost` to ::1 first every
+// connection would pay a refused dial before falling back — a per-connection
+// cost inside the thing being measured.
+func CertificateNames(host string) (dnsNames, ipAddresses []string) {
+	dnsNames = []string{"localhost"}
+	ipAddresses = []string{"127.0.0.1", "::1"}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return dnsNames, ipAddresses
+	}
+	if net.ParseIP(host) != nil {
+		return appendUnique(dnsNames, host), appendUnique(ipAddresses, host)
+	}
+	return appendUnique(dnsNames, host), ipAddresses
+}
+
+func appendUnique(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 func (s *Stack) shaperEnvironment(profile benchmark.ServerLinkProfile) ([]string, error) {

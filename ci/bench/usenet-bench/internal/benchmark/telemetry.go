@@ -73,8 +73,10 @@ func UnavailableMeasurement(scope, collector, collectorVersion, reason string) C
 }
 
 func (m CounterMeasurement) validate(name string) error {
-	if m.Scope != "client_container" && m.Scope != "client_process" {
-		return fmt.Errorf("%s must use client_container or client_process scope", name)
+	switch m.Scope {
+	case "client_container", "client_process", "client_process_tree":
+	default:
+		return fmt.Errorf("%s must use client_container, client_process or client_process_tree scope", name)
 	}
 	if strings.TrimSpace(m.Collector) == "" || strings.TrimSpace(m.CollectorVersion) == "" {
 		return fmt.Errorf("%s requires collector and collector version", name)

@@ -8,6 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -37,9 +40,85 @@ func renderProduct(cfg Config) (productSpec, error) {
 		return productSpec{}, fmt.Errorf("unsupported client %q", cfg.Client)
 	}
 	spec.Rendered = renderAuditConfig(cfg, spec)
-	digest := sha256.Sum256(spec.Rendered)
+	digest := sha256.Sum256(canonicalizeSandboxPaths(cfg, spec.Rendered))
 	spec.ConfigSHA256 = hex.EncodeToString(digest[:])
 	return spec, nil
+}
+
+// sandboxPathPlaceholders lists the per-suite directories the audit rendering
+// mentions, each with the stable token that stands in for it while the
+// configuration digest is computed. Longest paths are replaced first so a
+// directory nested inside another still gets its own token.
+func sandboxPathPlaceholders(cfg Config) []struct {
+	path        string
+	placeholder string
+} {
+	entries := []struct {
+		path        string
+		placeholder string
+	}{
+		{cfg.ConfigDir, "{{suite_config_dir}}"},
+		{cfg.OutputDir, "{{suite_output_dir}}"},
+		{cfg.WorkingDir, "{{suite_working_dir}}"},
+		{cfg.ResultPath, "{{suite_result_path}}"},
+	}
+	kept := entries[:0]
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.path) == "" || seen[entry.path] {
+			continue
+		}
+		seen[entry.path] = true
+		kept = append(kept, entry)
+	}
+	sort.SliceStable(kept, func(left, right int) bool {
+		return len(kept[left].path) > len(kept[right].path)
+	})
+	return kept
+}
+
+// canonicalizeSandboxPaths replaces the per-suite sandbox directories with
+// stable tokens before the rendered configuration is hashed.
+//
+// rendered_config_sha256 is the summarizer's proof that every repetition of a
+// stratum ran the same product configuration; it refuses to publish a stratum
+// whose repetitions disagree. Container lanes mount the sandbox at fixed
+// in-container paths, so their rendering is already identical across
+// repetitions. The native lane gives every suite its own directory under the
+// artifacts tree, so the raw rendering differs on every repetition for nothing
+// but the suite number, and the check fires on configurations that are in fact
+// the same. Hashing the canonical form keeps the check's power -- any real
+// difference in options, endpoints, credentials or launch arguments still
+// moves the digest -- while ignoring where the sandbox happened to be placed.
+// The audit file written beside the run keeps the real paths.
+func canonicalizeSandboxPaths(cfg Config, rendered []byte) []byte {
+	text := string(rendered)
+	for _, entry := range sandboxPathPlaceholders(cfg) {
+		for _, spelling := range pathSpellings(entry.path) {
+			text = strings.ReplaceAll(text, spelling, entry.placeholder)
+		}
+	}
+	return []byte(text)
+}
+
+// pathSpellings lists the ways one path appears in the audit rendering: as the
+// operating system writes it, with its separators escaped the way
+// encoding/json writes them into launch_command, and with the separators
+// normalised to forward slashes for products that accept either. The escaped
+// spelling is replaced first because it is the longest.
+func pathSpellings(path string) []string {
+	spellings := make([]string, 0, 3)
+	for _, candidate := range []string{
+		strings.ReplaceAll(path, `\`, `\\`),
+		path,
+		strings.ReplaceAll(path, `\`, "/"),
+	} {
+		if candidate == "" || slices.Contains(spellings, candidate) {
+			continue
+		}
+		spellings = append(spellings, candidate)
+	}
+	return spellings
 }
 
 func renderWeaver(cfg Config) productSpec {
@@ -188,10 +267,13 @@ var (
 // over whatever the host happens to have on PATH. Rendering and preflight both
 // call this, so a check cannot pass for a binary the run will not run.
 func NZBGetUnpacker(program string, names []string) string {
+	return resolveNZBGetUnpacker(runtime.GOOS, program, names)
+}
+
+func resolveNZBGetUnpacker(goos, program string, names []string) string {
 	if directory := filepath.Dir(program); strings.TrimSpace(program) != "" {
 		for _, name := range names {
-			candidate := filepath.Join(directory, name)
-			if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			if candidate, ok := bundledUnpacker(goos, directory, name); ok {
 				return candidate
 			}
 		}
@@ -204,6 +286,29 @@ func NZBGetUnpacker(program string, names []string) string {
 	// Naming the canonical command keeps the rendered config well formed on a
 	// host that has neither; preflight is what reports the absence.
 	return names[0]
+}
+
+// bundledUnpacker is the beside-the-program check. Windows names an
+// executable by its extension and keeps no execute bit, so there the file
+// NZBGet ships is "unrar.exe" and the mode says nothing; everywhere else the
+// bare name with the execute bit is the program.
+func bundledUnpacker(goos, directory, name string) (string, bool) {
+	candidate := filepath.Join(directory, executableName(goos, name))
+	info, err := os.Stat(candidate)
+	if err != nil || info.IsDir() {
+		return "", false
+	}
+	if goos != "windows" && info.Mode()&0o111 == 0 {
+		return "", false
+	}
+	return candidate, true
+}
+
+func executableName(goos, name string) string {
+	if goos == "windows" && filepath.Ext(name) == "" {
+		return name + ".exe"
+	}
+	return name
 }
 
 func renderNZBGet(cfg Config, directUnpack bool) productSpec {

@@ -3,6 +3,7 @@ package clientadapter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -185,8 +186,25 @@ func TestWeaverAPIFailsFastOnFailedJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := api.WaitCompleteWithObservation(ctx, timing.JobID, time.Millisecond, timing.AcceptedAt); err == nil || !strings.Contains(err.Error(), "FAILED") {
+	terminal, err := api.WaitCompleteWithObservation(ctx, timing.JobID, time.Millisecond, timing.AcceptedAt)
+	if err == nil || !strings.Contains(err.Error(), "FAILED") {
 		t.Fatalf("failed job must surface its terminal status, got %v", err)
+	}
+	// The failure is typed so a lane that owns a did-not-finish artifact shape
+	// can record the job instead of abandoning the suite, and the observation
+	// comes back with it so the recorded timing is the measured one.
+	var failure *TerminalFailureError
+	if !errors.As(err, &failure) {
+		t.Fatalf("a client-reported failure must be distinguishable from a harness error, got %T", err)
+	}
+	if failure.JobID != timing.JobID || failure.Status != "FAILED" {
+		t.Fatalf("terminal failure = %+v, want job %s status FAILED", failure, timing.JobID)
+	}
+	if terminal.ObservedAt.IsZero() || terminal.LowerBound.IsZero() {
+		t.Fatalf("terminal observation for a failed job is empty: %+v", terminal)
+	}
+	if terminal.LowerBound.Before(timing.AcceptedAt) || terminal.ObservedAt.Before(terminal.LowerBound) {
+		t.Fatalf("terminal observation for a failed job is not ordered: %+v", terminal)
 	}
 }
 

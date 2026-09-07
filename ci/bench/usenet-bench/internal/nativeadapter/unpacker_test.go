@@ -72,6 +72,29 @@ func TestTheRenderedConfigNamesTheResolvedUnpackers(t *testing.T) {
 	}
 }
 
+// NZBGet's Windows install ships "unrar.exe" and "7za.exe" beside the
+// daemon, and Windows keeps no execute bit to test; resolved by extension
+// there, and never mistaken for a program anywhere else.
+func TestAWindowsBundleNamesItsUnpackersByExtension(t *testing.T) {
+	directory := t.TempDir()
+	program := filepath.Join(directory, "nzbget.exe")
+	bundled := filepath.Join(directory, "7za.exe")
+	for _, path := range []string{program, bundled} {
+		if err := os.WriteFile(path, []byte("MZ"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	// PATH holds nothing, so a hit can only be the beside-the-program check
+	// (a Windows host's PATH lookup would otherwise find 7za.exe itself).
+	t.Setenv("PATH", t.TempDir())
+	if resolved := resolveNZBGetUnpacker("windows", program, NZBGetSevenZipNames); resolved != bundled {
+		t.Fatalf("resolved %q on windows, want the bundled %q", resolved, bundled)
+	}
+	if resolved := resolveNZBGetUnpacker("linux", program, NZBGetSevenZipNames); resolved != NZBGetSevenZipCommand {
+		t.Fatalf("resolved %q on linux, want the canonical %q", resolved, NZBGetSevenZipCommand)
+	}
+}
+
 func containsLine(content, want string) bool {
 	for _, line := range splitLines(content) {
 		if line == want {

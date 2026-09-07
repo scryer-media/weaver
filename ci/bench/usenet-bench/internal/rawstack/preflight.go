@@ -1,11 +1,15 @@
 package rawstack
 
 import (
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/netcheck"
 )
@@ -73,8 +77,74 @@ func configChecks(config Config) []Check {
 	checks := []Check{usernameCheck(config)}
 	checks = append(checks, directoryChecks(config)...)
 	checks = append(checks, binaryChecks(config)...)
-	checks = append(checks, articleStoreCheck(config), passwordFileCheck(config))
+	checks = append(checks, articleStoreCheck(config), passwordFileCheck(config), certificateCheck(config))
 	return append(checks, portAssignmentChecks(config)...)
+}
+
+// certificateCheck catches a certificate directory left over from a stack
+// configured for a different host. The server generates its test material once
+// and reuses whatever is already in the directory, so a stale certificate is
+// never regenerated and never announced: it simply fails verification inside
+// every client, one article at a time, which reads as a client that cannot
+// connect rather than as a certificate that no longer matches. The condition
+// is decidable from the file, so it is decided here instead.
+func certificateCheck(config Config) Check {
+	path := filepath.Join(config.CertDir, "server.pem")
+	contents, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return satisfied("server certificate", "will be generated in "+config.CertDir)
+	}
+	if err != nil {
+		return unsatisfied("server certificate", path, fmt.Sprintf("read the server certificate: %v", err))
+	}
+	block, _ := pem.Decode(contents)
+	if block == nil {
+		return unsatisfied("server certificate", path, "the server certificate is not PEM; delete "+config.CertDir+" so the server regenerates it")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return unsatisfied("server certificate", path, fmt.Sprintf("parse the server certificate: %v; delete %s so the server regenerates it", err, config.CertDir))
+	}
+	dnsNames, ipAddresses := CertificateNames(config.Host)
+	var missing []string
+	for _, name := range dnsNames {
+		if !containsString(certificate.DNSNames, name) {
+			missing = append(missing, name)
+		}
+	}
+	for _, address := range ipAddresses {
+		if !containsIP(certificate.IPAddresses, address) {
+			missing = append(missing, address)
+		}
+	}
+	if len(missing) > 0 {
+		return unsatisfied("server certificate", path, fmt.Sprintf(
+			"the certificate in %s does not name %s, so a verifying client fails every TLS connection; delete the directory so the server regenerates it",
+			config.CertDir, strings.Join(missing, ", ")))
+	}
+	return satisfied("server certificate", path)
+}
+
+func containsString(values []string, value string) bool {
+	for _, existing := range values {
+		if existing == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containsIP(values []net.IP, value string) bool {
+	parsed := net.ParseIP(value)
+	if parsed == nil {
+		return false
+	}
+	for _, existing := range values {
+		if existing.Equal(parsed) {
+			return true
+		}
+	}
+	return false
 }
 
 func usernameCheck(config Config) Check {

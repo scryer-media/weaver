@@ -144,6 +144,21 @@ type TerminalObservation struct {
 	ObservedAt time.Time
 }
 
+// TerminalFailureError reports that the client itself moved a job to a failed
+// terminal state. It is not a harness error: the run happened, the client
+// answered, and the answer was failure. Lanes that own a did-not-finish
+// artifact shape should record the job as failed rather than abandoning the
+// suite, which is why the failure is a distinguishable type rather than a
+// formatted string.
+type TerminalFailureError struct {
+	JobID  string
+	Status string
+}
+
+func (err *TerminalFailureError) Error() string {
+	return fmt.Sprintf("client job %s terminal status %q", err.JobID, err.Status)
+}
+
 // WaitCompleteWithObservation polls the public API and retains the previous
 // confirmed non-terminal observation as the terminal lower bound. Callers can
 // therefore report uncertainty without substituting a nominal poll interval.
@@ -161,7 +176,11 @@ func (api *API) WaitCompleteWithObservation(ctx context.Context, jobID string, i
 			case jobComplete:
 				return TerminalObservation{LowerBound: lowerBound, ObservedAt: observedAt}, nil
 			case jobFailed:
-				return TerminalObservation{}, fmt.Errorf("client job %s terminal status %q", jobID, observation.status)
+				// The observation is returned alongside the error: the client
+				// reached a terminal state and the timing up to it is real, so
+				// a lane that can record a did-not-finish job has everything
+				// it needs to record one.
+				return TerminalObservation{LowerBound: lowerBound, ObservedAt: observedAt}, &TerminalFailureError{JobID: jobID, Status: observation.status}
 			case jobQueued, jobActive:
 				lowerBound = observedAt
 			}

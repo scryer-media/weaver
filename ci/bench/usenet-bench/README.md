@@ -502,6 +502,17 @@ persisted before/after snapshots, and the run environment carries
 `BENCH_SERVER_RTT_MICROS` so each adapter's rendered-config identity includes
 it.
 
+`rendered_config_sha256` is that identity, and the summarizer refuses to
+publish a stratum whose repetitions disagree on it. The audit file written
+beside each run holds the configuration verbatim, with the real paths; the
+digest is taken over a canonical form in which the suite's own sandbox
+directories are replaced by fixed tokens. Container lanes mount the sandbox at
+the same in-container paths every time, so the two forms coincide there. The
+native lanes give every suite its own directory under the artifacts tree, and
+without the canonical form no native phase with more than one repetition could
+ever be summarized: every repetition would differ, in the suite number and
+nothing else.
+
 A delayed link also needs a send buffer that covers its bandwidth-delay
 product, or the shaper's own kernel — not the declared link — caps every
 connection at buffer / RTT. The example topology raises the shaper's
@@ -680,7 +691,16 @@ that exceeds it is recorded with terminal status `timed_out` and the client's
 last reported status as the reason; the controller counts it as did-not-finish
 exactly like a client-reported failure, so a client that hangs on a fixture
 becomes a result rather than a stalled pass. The native lane reports the same
-condition as the run's error.
+condition as the run's error, because it holds no terminal observation for a
+job it gave up waiting on and has no honest timing to record.
+
+A client that reports its own failure is different: it was observed, and both
+lanes record it as a did-not-finish job with terminal status `failed` and the
+client's status as the reason. That matters beyond the verdict. `summarize`
+refuses an artifact root containing a suite whose status is `failed`, so a
+single product failure recorded as a harness failure would take every other
+suite in the phase down with it; recorded as did-not-finish, the phase still
+publishes and the failure stays visible in `queue.json`.
 
 `CLIENT_POLL_INTERVAL` / `NATIVE_POLL_INTERVAL` default to `100ms`. Every
 client's own completion stamp is an integer second (SABnzbd's history
@@ -803,8 +823,9 @@ per client, the counter's scope, collector and collector version and how many
 blocks had no measured counter, with the lane's recorded reasons; a block
 where either counter is unavailable is dropped from the CPU pairing only. The
 comparison is withheld when the two clients were measured at different scopes
-(a `client_process` counter and a `client_container` counter are different
-quantities), when a client's counter source changes inside one stratum, or
+(a `client_process` counter, a `client_process_tree` counter and a
+`client_container` counter are different quantities), when a client's counter
+source changes inside one stratum, or
 when fewer than two blocks pair; pairing fewer blocks than `--minimum-blocks`
 is stated under `caveats` rather than withheld. The NFS profiles' CPU
 accounting caveat is carried under `caveats` too.
@@ -1073,6 +1094,24 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
 cp "$(go env GOPATH)/bin/windows_amd64/e2e-nntp.exe" /scratch/bin-windows/
 ```
 
+The server generates its own test CA and server certificate into `cert_dir` the
+first time it starts, and reuses whatever is already there afterwards. The
+certificate names the host clients are told to dial in **both** of the fields a
+verifier can read: as a subject alternative IP address, and — when that host is
+an IP literal — as a DNS name as well. The second one is not redundant. A
+client that recognises the dialled string as an IP matches it against the
+iPAddress entries, which is what Weaver does; NZBGet hands the literal to
+OpenSSL's name check, and that check never looks at iPAddress entries, so a
+certificate naming only `localhost` fails every `127.0.0.1` connection it makes
+with `certificate hostname mismatch`. Both have to verify under the harness's
+[TLS policy](#tls-policy) — only SABnzbd is allowed to run unverified — so the
+certificate satisfies both rather than one client turning verification off.
+
+Because the material is reused rather than regenerated, a `cert_dir` left over
+from a stack configured for a different host would otherwise fail silently, one
+article at a time, looking like a client that cannot connect. `preflight`
+reports it as `server certificate` and names the directory to delete.
+
 ### Describing the stack
 
 A chain runs the stack by naming it. `configs/chains/raw-native.example.json`
@@ -1255,6 +1294,12 @@ Notes for the native catalogs:
   use `{{config_dir}}`, `{{nzb_path}}`, `{{output_dir}}`, `{{fixture_dir}}` and
   `{{api_port}}`. Commands must stay in the foreground so the launcher can
   collect CPU time and stop them cleanly.
+- SABnzbd's frozen Windows build decides it was started as a Windows service
+  whenever it finds itself in session 0 and then fails to reach the service
+  controller. Every process an OpenSSH session starts is in session 0, so the
+  Windows lane has to be launched from an interactive session (the console, or
+  `PsExec -i <session>` from ssh), not from the ssh shell itself. NZBGet and
+  Weaver do not care.
 - NZBGet pauses every activity when it rejects a single line of its
   configuration -- a setting a newer release renamed is enough -- and then goes
   on starting, serving its API and accepting NZBs. Readiness therefore asserts
@@ -1504,9 +1549,22 @@ Per run the artifact records:
   separately.
 - `cpu_time_nanoseconds` — Docker lane: the container cgroup CPU counter from
   fresh-container creation to terminal (cold startup included, the Go
-  controller excluded). Native lanes: the launched process's user + system time
-  (`client_process` scope), never promoted to a whole-tree value. Do not divide
-  this cold-scope counter by the narrower primary wall clock. Under the `nfs`
+  controller excluded). macOS lane: the launched process's user + system time
+  from its wait status (`client_process` scope; the BSD wait path folds in a
+  child the client waited for, such as its unpacker), never promoted to a
+  whole-tree value. Windows lane: the client is placed in a job object and the
+  counter is the sum of exact `QueryProcessCycleTime` counts over every
+  process that joined the job -- the unpackers included -- converted at the
+  processor's nominal clock (`client_process_tree` scope, collector
+  `windows-job-cycle-time`, collector version `nominal-<MHz>MHz`). Windows'
+  own user + kernel times are tick-sampled and charged a client paced by the
+  shaper's timer a fraction of what it used (31 ms against 1.4 billion cycles
+  for Weaver on the smoke fixture), so they are not recorded. Cycle time at
+  the nominal clock is exact as a ratio between clients on one host and
+  approximate as an absolute (boost runs above nominal). A member that exited
+  before its handle could be held makes the counter unavailable with a reason
+  rather than a smaller number. Do not divide this cold-scope counter by the
+  narrower primary wall clock. Under the `nfs`
   storage profiles this counter excludes NFS client kernel time, which the host
   kernel spends outside the client's cgroup; the caveat is recorded in every
   NFS attestation. `summarize` pairs this counter per stratum as `cpu_time`
