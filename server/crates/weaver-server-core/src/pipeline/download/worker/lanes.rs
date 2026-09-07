@@ -161,6 +161,17 @@ impl Pipeline {
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
+            // The failing-file set follows the same rule as the bytes: a lost
+            // recovery volume is not damage to the release.
+            let file_index = seg_id.file_id.file_index;
+            if state
+                .spec
+                .files
+                .get(file_index as usize)
+                .is_some_and(|file| file.role.counts_toward_health())
+            {
+                state.health_failing_files.insert(file_index);
+            }
         }
         self.skip_failed_uu_segment(seg_id);
         self.check_health(job_id);
@@ -271,6 +282,8 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = 0;
             state.probe_projected_failed_bytes = 0;
+            state.health_failing_files.clear();
+            state.early_recovery_requested_blocks = 0;
         }
         self.foreign_layout_watches
             .retain(|file_id, _| file_id.job_id != job_id);

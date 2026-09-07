@@ -1069,7 +1069,9 @@ async fn the_last_routed_article_retires_the_probe() {
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
         assert!(state.health_probing);
-        assert!(matches!(state.status, JobStatus::Checking));
+        // A probe rides alongside the download instead of standing in front of
+        // it, so it never moves the job out of Downloading.
+        assert!(matches!(state.status, JobStatus::Downloading));
     }
 
     let (filename, bytes) = &volumes[last_file_index as usize];
@@ -1107,8 +1109,8 @@ async fn the_last_routed_article_retires_the_probe() {
         debug_job_state(&pipeline, job_id)
     );
     assert!(
-        matches!(state.status, JobStatus::Downloading),
-        "{}",
+        !matches!(state.status, JobStatus::Checking),
+        "a retired probe must not leave the job parked in Checking: {}",
         debug_job_state(&pipeline, job_id)
     );
     assert!(

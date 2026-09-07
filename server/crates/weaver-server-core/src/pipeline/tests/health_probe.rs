@@ -132,7 +132,9 @@ async fn probe_activation_keeps_queues_live_and_completion_clears_health_probing
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
         assert!(state.health_probing);
-        assert!(matches!(state.status, JobStatus::Checking));
+        // A probe rides alongside the download instead of standing in front
+        // of it, so it never moves the job out of Downloading.
+        assert!(matches!(state.status, JobStatus::Downloading));
         assert_eq!(state.download_queue.len(), 3);
         assert_eq!(state.recovery_queue.len(), 0);
         assert!(state.held_segments.is_empty());
@@ -180,14 +182,18 @@ async fn critical_health_starts_probe_without_immediate_fail_fast() {
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
         assert!(state.health_probing);
-        assert!(matches!(state.status, JobStatus::Checking));
+        // A probe rides alongside the download instead of standing in front
+        // of it, so it never moves the job out of Downloading.
+        assert!(matches!(state.status, JobStatus::Downloading));
     }
 
     pipeline.check_health(job_id);
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert!(state.health_probing);
-    assert!(matches!(state.status, JobStatus::Checking));
+    // A probe rides alongside the download instead of standing in front
+    // of it, so it never moves the job out of Downloading.
+    assert!(matches!(state.status, JobStatus::Downloading));
 }
 
 #[tokio::test]
@@ -404,7 +410,9 @@ async fn clean_probe_waits_for_material_new_damage_before_rearming() {
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert!(state.health_probing);
-    assert!(matches!(state.status, JobStatus::Checking));
+    // A probe rides alongside the download instead of standing in front
+    // of it, so it never moves the job out of Downloading.
+    assert!(matches!(state.status, JobStatus::Downloading));
 }
 
 #[tokio::test]
@@ -500,7 +508,9 @@ async fn missed_probe_rearms_on_next_failed_byte() {
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert!(state.health_probing);
-    assert!(matches!(state.status, JobStatus::Checking));
+    // A probe rides alongside the download instead of standing in front
+    // of it, so it never moves the job out of Downloading.
+    assert!(matches!(state.status, JobStatus::Downloading));
 }
 
 /// A probe still in flight must not postpone PAR2 recovery promotion.
@@ -613,10 +623,13 @@ async fn health_probe_in_flight_does_not_delay_recovery_promotion() {
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
         assert!(state.health_probing);
-        assert!(matches!(state.status, JobStatus::Checking));
+        // A probe rides alongside the download instead of standing in front
+        // of it, so it never moves the job out of Downloading.
+        assert!(matches!(state.status, JobStatus::Downloading));
     }
 
-    // The probe holds the checkpoint shut while the job is still downloading.
+    // The checkpoint stays shut because the job still owes download work — not
+    // because a probe is in flight.
     pipeline.check_job_completion(job_id).await;
     assert!(
         !pipeline
@@ -634,7 +647,14 @@ async fn health_probe_in_flight_does_not_delay_recovery_promotion() {
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
         assert!(!state.health_probing);
-        assert!(matches!(state.status, JobStatus::Downloading));
+        // The drain hands the job on to PAR2 verification. Retiring the probe
+        // no longer pushes a status of its own back over that, because the
+        // probe never claimed the status in the first place.
+        assert!(
+            matches!(state.status, JobStatus::Verifying),
+            "{}",
+            debug_job_state(&pipeline, job_id)
+        );
     }
     assert!(pipeline.pending_completion_checks.contains(&job_id));
 
@@ -683,7 +703,9 @@ async fn a_retired_probe_still_lets_an_unrecoverable_job_fail() {
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
         assert!(state.health_probing);
-        assert!(matches!(state.status, JobStatus::Checking));
+        // A probe rides alongside the download instead of standing in front
+        // of it, so it never moves the job out of Downloading.
+        assert!(matches!(state.status, JobStatus::Downloading));
     }
 
     // Every article the job could try has reached a terminal state.
@@ -748,7 +770,9 @@ async fn the_last_decode_to_settle_retires_the_probe() {
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
         assert!(state.health_probing);
-        assert!(matches!(state.status, JobStatus::Checking));
+        // A probe rides alongside the download instead of standing in front
+        // of it, so it never moves the job out of Downloading.
+        assert!(matches!(state.status, JobStatus::Downloading));
     }
 
     let last_segment = SegmentId {
@@ -777,8 +801,8 @@ async fn the_last_decode_to_settle_retires_the_probe() {
         debug_job_state(&pipeline, job_id)
     );
     assert!(
-        matches!(state.status, JobStatus::Downloading),
-        "{}",
+        !matches!(state.status, JobStatus::Checking),
+        "a retired probe must not leave the job parked in Checking: {}",
         debug_job_state(&pipeline, job_id)
     );
     assert!(
@@ -886,5 +910,326 @@ async fn a_probe_batch_behind_lanes_that_never_park_still_ends_on_its_own_deadli
     assert!(
         waited < SOFT_TIMEOUT + crate::pipeline::health::PROBE_PERMIT_RECLAIM_INTERVAL * 2,
         "nor extend it: waited {waited:?}"
+    );
+}
+
+const PROBE_POLICY_PAYLOAD: &str = "silver.horizon.part01.rar";
+const PROBE_POLICY_INDEX: &str = "silver.horizon.par2";
+const PROBE_POLICY_VOLUME: &str = "silver.horizon.vol00+08.par2";
+
+/// A posting with a recovery set: one payload file in eight 64-byte articles,
+/// the set's index, and one recovery volume.
+///
+/// Returns the spec alongside the payload bytes and the index bytes, because
+/// both are needed to install a matching PAR2 runtime.
+fn probe_policy_par2_job(name: &str) -> (JobSpec, Vec<u8>, Vec<u8>) {
+    let payload: Vec<u8> = (0..512u32).map(|value| (value % 251) as u8).collect();
+    let index_bytes = build_test_par2_index(PROBE_POLICY_PAYLOAD, &payload, 64);
+    let spec = JobSpec {
+        name: name.to_string(),
+        password: None,
+        total_bytes: payload.len() as u64 + index_bytes.len() as u64 + 64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: PROBE_POLICY_PAYLOAD.to_string(),
+                role: FileRole::from_filename(PROBE_POLICY_PAYLOAD),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: (0..8u32)
+                    .map(|number| {
+                        segment_spec! {
+                            number: number,
+                            bytes: 64,
+                            message_id: format!("probe-policy-payload-{number}@example.com"),
+                        }
+                    })
+                    .collect(),
+            },
+            FileSpec {
+                filename: PROBE_POLICY_INDEX.to_string(),
+                role: FileRole::from_filename(PROBE_POLICY_INDEX),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: index_bytes.len() as u32,
+                    message_id: "probe-policy-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: PROBE_POLICY_VOLUME.to_string(),
+                role: FileRole::from_filename(PROBE_POLICY_VOLUME),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: 64,
+                    message_id: "probe-policy-volume@example.com".to_string(),
+                }],
+            },
+        ],
+    };
+    (spec, payload, index_bytes)
+}
+
+fn probe_policy_payload_segment(job_id: JobId, segment_number: u32) -> SegmentId {
+    SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number,
+    }
+}
+
+/// One withheld volume against a recovery set that covers it must not probe.
+///
+/// The probe exists to recognise a release nobody uploaded early enough to
+/// abandon it. A single file lost out of a posting whose PAR2 set already
+/// carries more blocks than the hole needs is not that: the answer is known,
+/// the repair is already scheduled, and the sample would spend round trips
+/// re-deriving a verdict the recovery set has settled. Take the coverage away
+/// and the same damage is worth asking about again.
+#[tokio::test]
+async fn par2_capacity_covering_the_damage_suppresses_the_probe() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30330);
+    let (spec, payload, _index_bytes) = probe_policy_par2_job("Covered Withheld Volume");
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    // Nothing has landed, so the dead-release shape gate is wide open and the
+    // recovery set's coverage is the only thing deciding this.
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(PROBE_POLICY_PAYLOAD, &payload, 64, 8),
+        &[
+            (1, PROBE_POLICY_INDEX, 0, false),
+            (2, PROBE_POLICY_VOLUME, 8, false),
+        ],
+    );
+
+    // One article of the payload is gone. Eight recovery blocks against a
+    // single lost 64-byte slice is coverage to spare.
+    assert!(pipeline.book_terminal_segment(
+        probe_policy_payload_segment(job_id, 0),
+        SegmentTerminalState::Missing
+    ));
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert_eq!(state.failed_bytes, 64);
+        assert!(
+            !state.health_probing,
+            "a hole the recovery set already covers is not worth sampling: {}",
+            debug_job_state(&pipeline, job_id)
+        );
+    }
+
+    // The same posting, the same single failing file, but a recovery set one
+    // block wide against four lost slices. The shortfall is real, so the round
+    // is worth running.
+    let short_job_id = JobId(30334);
+    let (short_spec, short_payload, _) = probe_policy_par2_job("Uncovered Withheld Volume");
+    insert_active_job(&mut pipeline, short_job_id, short_spec).await;
+    install_test_par2_runtime(
+        &mut pipeline,
+        short_job_id,
+        build_repairable_par2_set(PROBE_POLICY_PAYLOAD, &short_payload, 64, 1),
+        &[
+            (1, PROBE_POLICY_INDEX, 0, false),
+            (2, PROBE_POLICY_VOLUME, 1, false),
+        ],
+    );
+    for segment_number in 0..4u32 {
+        assert!(pipeline.book_terminal_segment(
+            probe_policy_payload_segment(short_job_id, segment_number),
+            SegmentTerminalState::Missing
+        ));
+    }
+    assert!(
+        pipeline.jobs.get(&short_job_id).unwrap().health_probing,
+        "damage past what the set can cover must still reach the probe: {}",
+        debug_job_state(&pipeline, short_job_id)
+    );
+}
+
+/// One file failing while the rest of the job lands is not a dead release.
+///
+/// This is the withheld-volume shape without a recovery set to settle it, and
+/// it is the case the 2% threshold on its own got wrong: a job that has
+/// delivered most of its bytes and lost one file is healthy enough that a
+/// sample tells nobody anything. A release that really is gone looks the other
+/// way round — the failures run far ahead of what has landed.
+#[tokio::test]
+async fn a_single_file_failing_while_the_job_lands_does_not_probe() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30331);
+    let spec = standalone_job_spec(
+        "Landing Job Loses One File",
+        &many_standalone_files("landing", 20),
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = 8 * 512;
+
+    assert!(pipeline.book_terminal_segment(
+        SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0
+            },
+            segment_number: 0,
+        },
+        SegmentTerminalState::Missing
+    ));
+    assert!(
+        !pipeline.jobs.get(&job_id).unwrap().health_probing,
+        "one file short of a job that is landing is not a dead release: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    // The same single file, now against a job that has delivered nothing.
+    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = 0;
+    pipeline.check_health(job_id);
+    assert!(
+        pipeline.jobs.get(&job_id).unwrap().health_probing,
+        "losses running ahead of the payload are exactly the probe's case: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+}
+
+/// Damage spread across files with no recovery data probes, and a round that
+/// comes back entirely missing abandons the job.
+#[tokio::test]
+async fn damage_across_files_without_recovery_probes_and_all_missing_aborts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30332);
+    let spec = standalone_job_spec("Dead Release", &many_standalone_files("dead", 20));
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for file_index in 0..2u32 {
+        assert!(pipeline.book_terminal_segment(
+            SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number: 0,
+            },
+            SegmentTerminalState::Missing
+        ));
+    }
+    assert!(
+        pipeline.jobs.get(&job_id).unwrap().health_probing,
+        "losses in more than one file are the dead-release shape: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+
+    pipeline.handle_probe_update(ProbeUpdate {
+        job_id,
+        probe_round: 0,
+        total: 10,
+        missed: 10,
+        done: true,
+        inconclusive: false,
+    });
+
+    let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
+        panic!(
+            "a job with no recovery data and nothing on the wire must abort: {}",
+            debug_job_state(&pipeline, job_id)
+        );
+    };
+    assert!(error.contains("all 10 samples missing"), "{error}");
+}
+
+/// The first booked failure promotes recovery, without a checkpoint.
+///
+/// Recovery blocks used to sit parked in the job's recovery queue until the
+/// completion checkpoint ran, which is after the whole payload has settled — so
+/// the articles a repair cannot start without were fetched strictly after every
+/// byte they were meant to overlap with. Damage is known the moment a segment
+/// is booked terminal, and so is the capacity of a loaded recovery set, so the
+/// promotion happens there instead and the blocks ride the same lanes as the
+/// payload.
+#[tokio::test]
+async fn booked_damage_promotes_recovery_before_any_checkpoint() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30333);
+    let (spec, payload, index_bytes) = probe_policy_par2_job("Early Recovery Promotion");
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, PROBE_POLICY_INDEX, &index_bytes).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.recovery_queue = DownloadQueue::new();
+        state.recovery_queue.push(DownloadWork {
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 2,
+                },
+                segment_number: 0,
+            },
+            message_id: MessageId::new("probe-policy-volume@example.com"),
+            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+            priority: 1000,
+            byte_estimate: 64,
+            retry_count: 0,
+            is_recovery: true,
+            completion_critical: false,
+            exclude_servers: Vec::new(),
+            avoid_server: None,
+        });
+    }
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(PROBE_POLICY_PAYLOAD, &payload, 64, 8),
+        &[
+            (1, PROBE_POLICY_INDEX, 0, false),
+            (2, PROBE_POLICY_VOLUME, 8, false),
+        ],
+    );
+    assert!(
+        !pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .download_queue
+            .has_recovery_work()
+    );
+
+    assert!(pipeline.book_terminal_segment(
+        probe_policy_payload_segment(job_id, 3),
+        SegmentTerminalState::Missing
+    ));
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(
+        state.download_queue.has_recovery_work(),
+        "booked damage against a loaded set promotes its recovery at once: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert_eq!(
+        state.recovery_queue.len(),
+        0,
+        "the parked block is the one that moved"
+    );
+    assert!(
+        pipeline.pending_completion_checks.is_empty(),
+        "and it did not need a checkpoint to get there"
+    );
+
+    // Idempotent: a second failure in the same file must not re-promote work
+    // that is already queued, or double-count the capacity it consumed.
+    let promoted_len = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
+    assert!(pipeline.book_terminal_segment(
+        probe_policy_payload_segment(job_id, 4),
+        SegmentTerminalState::Missing
+    ));
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        promoted_len
     );
 }

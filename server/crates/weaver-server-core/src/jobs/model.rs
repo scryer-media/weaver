@@ -585,6 +585,28 @@ pub struct JobState {
     pub health_probing: bool,
     /// Probe activation counter used to rotate sampled segments across rounds.
     pub health_probe_round: u32,
+    /// How many files had already lost a segment when the last probe round was
+    /// armed.
+    ///
+    /// A round is armed on a state change, not on every terminal segment: the
+    /// failed-byte watermark below, or a file that had not failed before. The
+    /// tenth dead article in a volume nobody posted tells the policy nothing
+    /// the first one did not.
+    pub health_probe_failing_files: usize,
+    /// Indexes of the health-counted files this job has lost at least one
+    /// segment of, kept on the booking edge alongside `failed_bytes`.
+    ///
+    /// The probe policy reads its file count on every terminal segment; a
+    /// count derived by walking the terminal-state ledger there would be a
+    /// scan of every failure per failure, quadratic on exactly the release
+    /// the probe exists to abandon quickly.
+    pub health_failing_files: std::collections::HashSet<u32>,
+    /// Recovery blocks early promotion has already asked the queues for.
+    ///
+    /// Promotion walks the parked and queued recovery work to select blocks,
+    /// so it runs only when the shortfall has grown past this figure, not on
+    /// every failure that leaves it unchanged.
+    pub early_recovery_requested_blocks: u32,
     /// Highest failed-byte watermark that has already been health-probed.
     pub last_health_probe_failed_bytes: u64,
     /// Minimum failed-byte watermark required before arming another probe round.

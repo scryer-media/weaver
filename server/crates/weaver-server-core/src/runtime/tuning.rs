@@ -21,9 +21,6 @@ pub struct TunedParameters {
     pub decode_thread_count: usize,
     pub repair_thread_count: usize,
     pub extract_thread_count: usize,
-    /// Max concurrent downloads for speculative PAR2 recovery blocks.
-    /// Dynamically set based on observed bandwidth. 0 = hold back entirely.
-    pub recovery_slots: usize,
 }
 
 /// The runtime tuner. Holds system profile and current parameters.
@@ -73,7 +70,6 @@ impl RuntimeTuner {
             decode_thread_count: cores,
             repair_thread_count: repair_threads,
             extract_thread_count: extract_threads,
-            recovery_slots: 0, // starts at 0 until bandwidth is observed
         };
 
         Self {
@@ -103,29 +99,18 @@ impl RuntimeTuner {
     /// Adjust parameters based on a metrics snapshot.
     /// Returns true if any parameter changed.
     pub fn adjust(&mut self, metrics: &MetricsSnapshot) -> bool {
-        let mut changed = false;
-
-        // --- Bandwidth tracking & recovery slot computation ---
+        // --- Bandwidth tracking ---
         // EMA with α=0.3 gives ~15-second effective window at 5s intervals.
+        //
+        // No connections are held back for recovery work. Recovery blocks are
+        // promoted into the job's own queue as completion-critical work and
+        // ride the same lanes as the payload, so a reserved slot could only
+        // ever be an idle connection: the reserve was subtracted from the
+        // ordinary lease budget while the work it was reserved for was still
+        // parked, waiting for a checkpoint that had not run yet.
         const ALPHA: f64 = 0.3;
         self.bandwidth_ema =
             ALPHA * metrics.current_download_speed as f64 + (1.0 - ALPHA) * self.bandwidth_ema;
-
-        let bandwidth_mbps = self.bandwidth_ema / (1024.0 * 1024.0);
-        let new_recovery_slots = if bandwidth_mbps > 50.0 {
-            // High bandwidth: 25% of connections for speculative recovery
-            (self.current.max_concurrent_downloads / 4).max(2)
-        } else if bandwidth_mbps > 10.0 {
-            // Medium bandwidth: trickle 1-2 connections
-            (self.current.max_concurrent_downloads / 8).max(1)
-        } else {
-            // Low/no bandwidth: don't waste on speculative downloads
-            0
-        };
-        if self.current.recovery_slots != new_recovery_slots {
-            self.current.recovery_slots = new_recovery_slots;
-            changed = true;
-        }
 
         // --- Byte-pressure / idle streaks ---
         if metrics.download_pressure_state == DownloadPressureState::Hard {
@@ -158,7 +143,7 @@ impl RuntimeTuner {
             }
         }
 
-        changed
+        false
     }
 
     /// Upper limit for max_concurrent_downloads based on system profile

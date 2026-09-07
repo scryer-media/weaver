@@ -1911,20 +1911,24 @@ impl Pipeline {
                 .any(|(file_id, buffer)| file_id.job_id == job_id && buffer.buffered_len() > 0)
     }
 
+    /// Everything the download stage still owes this job.
+    ///
+    /// A health probe is deliberately *not* on this list. A probe is an
+    /// estimate sampled alongside the download, never work the job owes: it
+    /// moves no payload byte and cannot change the outcome of a job whose
+    /// recovery set already covers the damage. Counting it here made the
+    /// completion checkpoint — and PAR2 recovery promotion behind it — wait out
+    /// a probe that had nothing left to say, on every job that lost an article
+    /// early.
     pub(crate) fn job_has_pending_download_pipeline_work(&self, job_id: JobId) -> bool {
-        self.jobs
-            .get(&job_id)
-            .is_some_and(|state| state.health_probing)
-            || self.job_has_pending_download_work_beyond_health_probe(job_id)
+        self.job_has_pending_download_work_beyond_health_probe(job_id)
     }
 
-    /// [`Self::job_has_pending_download_pipeline_work`] with the health probe
-    /// taken out: everything that is actually moving bytes.
-    ///
-    /// A probe is an estimate running alongside the download, not work the job
-    /// owes. Once this is false the job's segments have all reached a terminal
-    /// state and the probe has nothing left to tell anyone, which is what
-    /// [`Self::retire_health_probe_if_download_pipeline_drained`] acts on.
+    /// The same question, named for the one caller that has to be explicit
+    /// about excluding the probe:
+    /// [`Self::retire_health_probe_if_download_pipeline_drained`] asks whether
+    /// every segment has reached a terminal state, which is the moment the
+    /// probe's estimate is moot.
     pub(crate) fn job_has_pending_download_work_beyond_health_probe(&self, job_id: JobId) -> bool {
         let has_queued_work = self
             .jobs
