@@ -125,7 +125,11 @@ par2-rs = { version = "0.10", default-features = false, features = ["native-cryp
 # the `ExtractOptions` weaver still carries. 0.9 also poisons a solid archive
 # whose member failed mid-decode instead of reusing the misaligned dictionary,
 # and 0.9.1 restores `-hp` (header-encrypted) RAR5 sets from `.rev` volumes.
-unrar-rs = { version = "0.10.1", default-features = false, features = ["crypto-aws-lc"] }
+# 0.10.2 (with reedsolomon-rs 0.4.4) decodes RAR3 recovery volumes per column
+# without re-zeroing the RS scratch tables per byte, which cut .rev restores
+# from 3-4x the CPU of unrar to parity, and reopens the reconstructed last
+# volume for its padding trim instead of failing with EBADF.
+unrar-rs = { version = "0.10.2", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
