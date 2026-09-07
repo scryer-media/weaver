@@ -131,6 +131,14 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 		"direct_unpack = " + direct,
 		"pre_check = 0",
 		"pause_on_post_processing = 0",
+		// SABnzbd 5 pipelines two BODY requests per connection for a server
+		// added through its UI but downgrades every server it finds in an
+		// ini older than config conversion 5 to one request per connection.
+		// Stamping the current conversion number keeps the rendered server
+		// exactly as a fresh install would create it. Without it a native run
+		// fetches one article per round trip and is not the same measurement
+		// as the Docker lane's.
+		"config_conversion_version = 5",
 		"",
 		"[servers]",
 		"[[benchmark]]",
@@ -139,6 +147,8 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 		"username = " + cfg.NNTPUsername,
 		"password = " + cfg.NNTPPassword,
 		"connections = " + strconv.Itoa(cfg.Connections),
+		// SABnzbd's own default for a newly added server (5.0 and later).
+		"pipelining_requests = 2",
 		"ssl = " + ssl,
 		// Native SAB follows the same explicitly labelled local TLS policy as
 		// Docker. No result may claim CA verification for this product.
@@ -152,11 +162,16 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 	}
 }
 
-// nzbgetSevenZipCommand is the official 7-Zip console binary a native NZBGet
-// install resolves from PATH. The 7z corpus lane needs it, so it is stated
-// rather than left to NZBGet's built-in default: a host without it then fails
-// loudly instead of quietly skipping every 7z unpack.
-const nzbgetSevenZipCommand = "7z"
+// NZBGetSevenZipCommand and NZBGetUnrarCommand are the unpackers a native
+// NZBGet install resolves from PATH. The RAR and 7z corpus lanes need them, so
+// they are stated rather than left to NZBGet's built-in defaults, which vary
+// by package: a host without one then fails loudly instead of quietly skipping
+// every unpack. Neither ships with NZBGet, so on a bare install they are the
+// operator's to stage; preflight reports a host that is missing one.
+const (
+	NZBGetSevenZipCommand = "7z"
+	NZBGetUnrarCommand    = "unrar"
+)
 
 func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 	_, apiPort, _ := nativeAPIAddress(cfg.APIEndpoint)
@@ -201,7 +216,12 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 		"ParCheck=auto",
 		"ParRepair=yes",
 		"Unpack=yes",
-		"SevenZipCmd=" + nzbgetSevenZipCommand,
+		"UnrarCmd=" + NZBGetUnrarCommand,
+		"SevenZipCmd=" + NZBGetSevenZipCommand,
+		// A packaged install can ship post-processing extensions in its own
+		// script directory. Stating the empty list keeps whatever the host
+		// happens to have installed out of a measured run.
+		"Extensions=",
 		"Server1.Active=yes",
 		"Server1.Name=benchmark",
 		"Server1.Level=0",

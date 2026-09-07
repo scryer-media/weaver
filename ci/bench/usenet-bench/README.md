@@ -1217,7 +1217,11 @@ Notes for the native catalogs:
   paths throughout. The harness never installs a product implicitly — stage
   pinned installers, record their versions and hashes in the catalog, and use an
   isolated working directory (for example `C:\bench`). `preflight --adapters`
-  is what confirms the paths in a filled-in catalog actually resolve.
+  is what confirms the paths in a filled-in catalog actually resolve. It also
+  checks what a product needs from the host that installing it does not
+  provide: NZBGet shells out to `unrar` and `7z` by name and ships neither, and
+  a host missing one does not fail the run outright -- it skips the unpack and
+  fails output verification after a full download.
 - `NATIVE_LAUNCH_COMMAND` is a JSON argv array, never a shell string, and may
   use `{{config_dir}}`, `{{nzb_path}}`, `{{output_dir}}`, `{{fixture_dir}}` and
   `{{api_port}}`. Commands must stay in the foreground so the launcher can
@@ -1226,7 +1230,9 @@ Notes for the native catalogs:
   API (SABnzbd `version`, NZBGet `version`, Weaver GraphQL `version`); a
   mismatch fails the run before any NZB is submitted.
 - For native Weaver set `WEAVER_ENCRYPTION_KEY` in the adapter environment so
-  no Keychain prompt is waited on. Both lanes render `WEAVER_STARTUP_IOPS=50000`
+  no Keychain prompt is waited on; the example catalogs carry one, and
+  `preflight --adapters` fails a Weaver entry without it, because a run that
+  reaches the prompt hangs rather than failing. Both lanes render `WEAVER_STARTUP_IOPS=50000`
   so Weaver's startup disk probe never runs inside the measured process (an
   operator value already in the environment is preserved and recorded).
 - Both lanes also pin Weaver's trusted-network list (`WEAVER_TRUSTED_CIDRS`:

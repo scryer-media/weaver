@@ -3,11 +3,13 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/nativeadapter"
 )
 
 // A check aimed at retyped directories can pass for a stack no session will
@@ -145,7 +147,7 @@ func TestPreflightChecksTheClientTheCatalogWillLaunch(t *testing.T) {
 	}
 	path := writeAdapterCatalog(t, nativeAdapterEntry("weaver", adapter, string(launch)))
 
-	binaries, err := preflightCatalogBinaries(path, benchmark.MacOSNative)
+	binaries, _, err := preflightCatalogBinaries(path, benchmark.MacOSNative)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +168,7 @@ func TestPreflightNamesTheClientAProductPathIsMissingFor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	binaries, err := preflightCatalogBinaries(
+	binaries, _, err := preflightCatalogBinaries(
 		writeAdapterCatalog(t, nativeAdapterEntry("nzbget", adapter, string(launch))),
 		benchmark.MacOSNative)
 	if err != nil {
@@ -190,7 +192,7 @@ func TestPreflightReportsAnUnusableLaunchCommand(t *testing.T) {
 		"nothing at all": "",
 	} {
 		t.Run(name, func(t *testing.T) {
-			binaries, err := preflightCatalogBinaries(
+			binaries, _, err := preflightCatalogBinaries(
 				writeAdapterCatalog(t, nativeAdapterEntry("weaver", adapter, launch)),
 				benchmark.MacOSNative)
 			if err != nil {
@@ -222,7 +224,7 @@ func TestPreflightReportsOneSharedAdapterOnce(t *testing.T) {
 		nativeAdapterEntry("weaver", adapter, string(launch)),
 		nativeAdapterEntry("sabnzbd", adapter, string(launch)),
 	)
-	binaries, err := preflightCatalogBinaries(shared, benchmark.MacOSNative)
+	binaries, _, err := preflightCatalogBinaries(shared, benchmark.MacOSNative)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +241,7 @@ func TestPreflightReportsOneSharedAdapterOnce(t *testing.T) {
 		nativeAdapterEntry("weaver", adapter, string(launch)),
 		nativeAdapterEntry("sabnzbd", other, string(launch)),
 	)
-	binaries, err = preflightCatalogBinaries(split, benchmark.MacOSNative)
+	binaries, _, err = preflightCatalogBinaries(split, benchmark.MacOSNative)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +261,90 @@ func TestPreflightRefusesACatalogWithNothingForTheTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := writeAdapterCatalog(t, nativeAdapterEntry("weaver", adapter, string(launch)))
-	if _, err := preflightCatalogBinaries(path, benchmark.WindowsNative); err == nil {
+	if _, _, err := preflightCatalogBinaries(path, benchmark.WindowsNative); err == nil {
 		t.Fatal("accepted a macOS catalog as a Windows host check")
 	}
+}
+
+// A product needs more from a host than its own executable, and none of it
+// arrives with the install. Both gaps below surface late and badly: a missing
+// unpacker fails output verification after a full download, and a Weaver with
+// no key of its own blocks on a keychain prompt nobody is there to answer.
+func TestPreflightChecksWhatAClientNeedsBeyondItsExecutable(t *testing.T) {
+	adapter := filepath.Join(t.TempDir(), "nativeadapter")
+	if err := os.WriteFile(adapter, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := json.Marshal([]string{adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := writeAdapterCatalog(t,
+		nativeAdapterEntry("nzbget", adapter, string(launch)),
+		nativeAdapterEntry("weaver", adapter, string(launch)),
+		nativeAdapterEntry("sabnzbd", adapter, string(launch)),
+	)
+	_, clients, err := preflightCatalogBinaries(path, benchmark.MacOSNative)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// NZBGet shells out to both unpackers by name and ships neither.
+	for _, tool := range []string{nativeadapter.NZBGetUnrarCommand, nativeadapter.NZBGetSevenZipCommand} {
+		check := clientCheck(t, clients, "nzbget", tool)
+		if _, err := exec.LookPath(tool); err != nil {
+			if check.Status != "missing" {
+				t.Fatalf("%s is not on this host but the check says %+v", tool, check)
+			}
+		} else if check.Status != "present" {
+			t.Fatalf("%s resolves on this host but the check says %+v", tool, check)
+		}
+	}
+
+	// The example catalogs ship without a key, which is the case worth
+	// catching: the run does not fail, it hangs.
+	if check := clientCheck(t, clients, "weaver", "WEAVER_ENCRYPTION_KEY"); check.Status != "missing" {
+		t.Fatalf("a catalog with no encryption key passed: %+v", check)
+	}
+
+	// SABnzbd needs nothing from the host beyond its own executable; claiming
+	// otherwise would fail a host that is in fact ready.
+	for _, check := range clients {
+		if check.Client == "sabnzbd" {
+			t.Fatalf("invented a requirement for sabnzbd: %+v", check)
+		}
+	}
+}
+
+// A filled-in catalog has to be able to pass, or the check is just an
+// unconditional failure and preflight can never report a host as ready.
+func TestPreflightAcceptsAWeaverEntryCarryingItsOwnKey(t *testing.T) {
+	adapter := filepath.Join(t.TempDir(), "nativeadapter")
+	if err := os.WriteFile(adapter, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := json.Marshal([]string{adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := nativeAdapterEntry("weaver", adapter, string(launch))
+	entry["environment"].(map[string]string)["WEAVER_ENCRYPTION_KEY"] = "bench-key"
+	_, clients, err := preflightCatalogBinaries(writeAdapterCatalog(t, entry), benchmark.MacOSNative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check := clientCheck(t, clients, "weaver", "WEAVER_ENCRYPTION_KEY"); check.Status != "present" {
+		t.Fatalf("a catalog carrying a key was reported as %+v", check)
+	}
+}
+
+func clientCheck(t *testing.T, checks []preflightClientCheck, client, name string) preflightClientCheck {
+	t.Helper()
+	for _, check := range checks {
+		if check.Client == client && check.Name == name {
+			return check
+		}
+	}
+	t.Fatalf("no %s check named %q in %+v", client, name, checks)
+	return preflightClientCheck{}
 }

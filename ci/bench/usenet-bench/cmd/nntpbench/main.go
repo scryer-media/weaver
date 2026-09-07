@@ -20,6 +20,7 @@ import (
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/nativeadapter"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/nntp"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/rawstack"
 )
@@ -308,7 +309,21 @@ type preflightResult struct {
 	// RawStack is present only when the host also serves the benchmark, which
 	// is what the native lanes do instead of running the Compose topology.
 	RawStack []rawstack.Check `json:"raw_stack,omitempty"`
-	Ready    bool             `json:"ready"`
+	// Clients holds what a product needs from the host beyond its own
+	// executable. A bare install has none of it.
+	Clients []preflightClientCheck `json:"clients,omitempty"`
+	Ready   bool                   `json:"ready"`
+}
+
+// preflightClientCheck is a condition a never-configured product needs before
+// it can run a benchmark: a tool it shells out to, or a setting the catalog has
+// to carry because the harness will not render it.
+type preflightClientCheck struct {
+	Client string `json:"client"`
+	Name   string `json:"name"`
+	Detail string `json:"detail,omitempty"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
 }
 
 func preflight(args []string) error {
@@ -351,11 +366,12 @@ func preflight(args []string) error {
 		if adapterPath != "" || weaverPath != "" || sabPath != "" || nzbgetPath != "" {
 			return fmt.Errorf("--adapters already declares every executable the run launches; drop the per-client flags rather than naming them twice")
 		}
-		binaries, err := preflightCatalogBinaries(adaptersPath, descriptor.ID)
+		binaries, clients, err := preflightCatalogBinaries(adaptersPath, descriptor.ID)
 		if err != nil {
 			return err
 		}
 		result.Binaries = append(result.Binaries, binaries...)
+		result.Clients = clients
 		if descriptor.ID == benchmark.DockerLinux {
 			result.Binaries = append(result.Binaries, inspectExecutable("docker", dockerPath))
 		}
@@ -396,6 +412,11 @@ func preflight(args []string) error {
 			result.Ready = false
 		}
 	}
+	for _, check := range result.Clients {
+		if check.Status != "present" {
+			result.Ready = false
+		}
+	}
 	if err := printJSON(result); err != nil {
 		return err
 	}
@@ -410,10 +431,10 @@ func preflight(args []string) error {
 // needs is where they are -- and the catalog is where it is told. Checking the
 // paths retyped on a command line instead would pass for a client the run
 // never launches.
-func preflightCatalogBinaries(path string, target benchmark.ExecutionTarget) ([]preflightBinary, error) {
+func preflightCatalogBinaries(path string, target benchmark.ExecutionTarget) ([]preflightBinary, []preflightClientCheck, error) {
 	catalog, err := benchmark.LoadAdapterCatalog(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var matched []benchmark.Adapter
 	for _, adapter := range catalog.SortedAdapters() {
@@ -422,16 +443,59 @@ func preflightCatalogBinaries(path string, target benchmark.ExecutionTarget) ([]
 		}
 	}
 	if len(matched) == 0 {
-		return nil, fmt.Errorf("adapter catalog %s declares no adapter for target %q", path, target)
+		return nil, nil, fmt.Errorf("adapter catalog %s declares no adapter for target %q", path, target)
 	}
 	binaries := inspectAdapterExecutables(matched)
 	if target == benchmark.DockerLinux {
-		return binaries, nil
+		return binaries, nil, nil
 	}
+	var clients []preflightClientCheck
 	for _, adapter := range matched {
 		binaries = append(binaries, inspectNativeClient(adapter))
+		clients = append(clients, inspectClientRequirements(adapter)...)
 	}
-	return binaries, nil
+	return binaries, clients, nil
+}
+
+// inspectClientRequirements covers what a product needs from the host that
+// installing it does not provide. Each of these turns a bare install into a
+// run that fails, or worse hangs, well after the measurement has started.
+func inspectClientRequirements(adapter benchmark.Adapter) []preflightClientCheck {
+	name := string(adapter.Client)
+	switch adapter.Client {
+	case benchmark.NZBGet:
+		// NZBGet ships neither unpacker and shells out to both by name. A
+		// host without one does not fail: it skips the unpack and the run
+		// fails output verification instead.
+		var checks []preflightClientCheck
+		for tool, lane := range map[string]string{
+			nativeadapter.NZBGetUnrarCommand:    "every RAR fixture",
+			nativeadapter.NZBGetSevenZipCommand: "every 7z fixture",
+		} {
+			check := preflightClientCheck{Client: name, Name: tool, Detail: tool, Status: "present"}
+			resolved, err := exec.LookPath(tool)
+			if err != nil {
+				check.Status = "missing"
+				check.Reason = fmt.Sprintf("NZBGet shells out to %q to unpack %s and does not ship it: %v", tool, lane, err)
+			} else {
+				check.Detail = resolved
+			}
+			checks = append(checks, check)
+		}
+		sort.Slice(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
+		return checks
+	case benchmark.Weaver:
+		// Without a key of its own Weaver asks the OS keychain, and a run
+		// started from a script waits on a prompt nobody answers.
+		check := preflightClientCheck{Client: name, Name: "WEAVER_ENCRYPTION_KEY", Status: "present"}
+		if strings.TrimSpace(adapter.Environment["WEAVER_ENCRYPTION_KEY"]) == "" {
+			check.Status = "missing"
+			check.Reason = "the catalog entry carries no WEAVER_ENCRYPTION_KEY; a native Weaver then waits on a keychain prompt instead of starting"
+		}
+		return []preflightClientCheck{check}
+	default:
+		return nil
+	}
 }
 
 // inspectAdapterExecutables checks the adapter each entry runs. A catalog

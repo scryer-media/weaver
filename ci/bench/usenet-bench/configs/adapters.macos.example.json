@@ -5,18 +5,23 @@
       "client": "weaver",
       "archive_toolchain": "vanilla",
       "target": "macos-native",
-      "command": ["/scratch/nntp-bench-bin/nativeadapter"],
+      "command": [
+        "/scratch/nntp-bench-bin/nativeadapter"
+      ],
       "environment": {
         "NATIVE_CLIENT_VERSION": "REPLACE_WITH_WEAVER_VERSION",
         "NATIVE_API_ENDPOINT": "http://127.0.0.1:19090",
-        "NATIVE_LAUNCH_COMMAND": "[\"/absolute/path/to/weaver\",\"--config\",\"{{config_dir}}\",\"serve\",\"--port\",\"{{api_port}}\"]"
+        "NATIVE_LAUNCH_COMMAND": "[\"/absolute/path/to/weaver\",\"--config\",\"{{config_dir}}\",\"serve\",\"--port\",\"{{api_port}}\"]",
+        "WEAVER_ENCRYPTION_KEY": "nntpbench-native-lane-key"
       }
     },
     {
       "client": "sabnzbd",
       "archive_toolchain": "vanilla",
       "target": "macos-native",
-      "command": ["/scratch/nntp-bench-bin/nativeadapter"],
+      "command": [
+        "/scratch/nntp-bench-bin/nativeadapter"
+      ],
       "environment": {
         "NATIVE_CLIENT_VERSION": "5.0.4",
         "NATIVE_API_ENDPOINT": "http://127.0.0.1:18080",
@@ -27,7 +32,9 @@
       "client": "nzbget",
       "archive_toolchain": "vanilla",
       "target": "macos-native",
-      "command": ["/scratch/nntp-bench-bin/nativeadapter"],
+      "command": [
+        "/scratch/nntp-bench-bin/nativeadapter"
+      ],
       "environment": {
         "NATIVE_CLIENT_VERSION": "REPLACE_WITH_NZBGET_VERSION",
         "NATIVE_API_ENDPOINT": "http://127.0.0.1:16789",
