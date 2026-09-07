@@ -39,9 +39,7 @@ var hostResolvedSettings = map[benchmark.Client][]string{
 
 var nativeOnlySettings = map[benchmark.Client]map[string]string{
 	benchmark.SABnzbd: {},
-	benchmark.NZBGet: {
-		"DaemonMode": "a native run keeps the process in the foreground so the launcher can collect its CPU time",
-	},
+	benchmark.NZBGet:  {},
 }
 
 // behaviourSettings must carry the same value in both lanes: each one changes

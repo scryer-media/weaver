@@ -247,7 +247,6 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 		"ControlUsername=" + controlUsername,
 		"ControlPassword=" + apiKey,
 		"OutputMode=log",
-		"DaemonMode=no",
 		"DirectWrite=" + directWrite,
 		"DirectUnpack=" + direct,
 		"ParCheck=auto",

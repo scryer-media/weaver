@@ -372,7 +372,39 @@ func (api *nzbgetAPI) waitReady(ctx context.Context) (string, error) {
 	if err := json.Unmarshal(raw, &version); err != nil || strings.TrimSpace(version) == "" {
 		return "", fmt.Errorf("NZBGet version response was invalid")
 	}
+	if err := api.checkNotPaused(ctx); err != nil {
+		return "", err
+	}
 	return version, nil
+}
+
+// nzbgetPauseFlags are the switches that each stop NZBGet fetching anything.
+var nzbgetPauseFlags = []string{"DownloadPaused", "ServerPaused", "Download2Paused"}
+
+// checkNotPaused is what makes answering the API mean ready to download.
+// NZBGet pauses every activity when it rejects one line of its configuration
+// -- a setting a newer release renamed is enough -- and then goes on starting,
+// serving its API and accepting NZBs. Without this the run reads as healthy,
+// downloads nothing, and ends at its deadline having measured a pause.
+func (api *nzbgetAPI) checkNotPaused(ctx context.Context) error {
+	var raw json.RawMessage
+	if err := api.rpc(ctx, "status", nil, &raw); err != nil {
+		return fmt.Errorf("read NZBGet status: %w", err)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return fmt.Errorf("NZBGet status response was invalid")
+	}
+	var paused []string
+	for _, flag := range nzbgetPauseFlags {
+		if value, ok := status[flag].(bool); ok && value {
+			paused = append(paused, flag)
+		}
+	}
+	if len(paused) == 0 {
+		return nil
+	}
+	return fmt.Errorf("NZBGet is up but paused (%s); it pauses everything when it rejects a configuration line, so check its log for an \"Invalid option\" error rather than waiting for a download that will not start", strings.Join(paused, ", "))
 }
 
 func (api *nzbgetAPI) queue(ctx context.Context, nzbPath, archivePassword string, options queueOptions) (string, error) {

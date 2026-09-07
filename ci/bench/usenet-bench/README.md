@@ -1255,6 +1255,13 @@ Notes for the native catalogs:
   use `{{config_dir}}`, `{{nzb_path}}`, `{{output_dir}}`, `{{fixture_dir}}` and
   `{{api_port}}`. Commands must stay in the foreground so the launcher can
   collect CPU time and stop them cleanly.
+- NZBGet pauses every activity when it rejects a single line of its
+  configuration -- a setting a newer release renamed is enough -- and then goes
+  on starting, serving its API and accepting NZBs. Readiness therefore asserts
+  it is not paused as well as reachable, in both lanes, because otherwise a run
+  reads as healthy, downloads nothing and ends at its deadline having measured
+  a pause. When that check fires, its log carries the `Invalid option` line
+  that names the setting.
 - `NATIVE_CLIENT_VERSION` must equal what the product reports through its own
   API (SABnzbd `version`, NZBGet `version`, Weaver GraphQL `version`); a
   mismatch fails the run before any NZB is submitted.

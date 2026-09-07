@@ -194,6 +194,9 @@ func TestWeaverAPIFailsFastOnFailedJob(t *testing.T) {
 type fakeNZBGet struct {
 	groups  []map[string]any
 	history []map[string]any
+	// status is NZBGet's own status object; the zero value reports a client
+	// that is running and not paused, which is what readiness requires.
+	status map[string]any
 }
 
 func (fake *fakeNZBGet) handler(t *testing.T) http.Handler {
@@ -221,6 +224,12 @@ func (fake *fakeNZBGet) handler(t *testing.T) http.Handler {
 			result = fake.groups
 		case "history":
 			result = fake.history
+		case "status":
+			status := fake.status
+			if status == nil {
+				status = map[string]any{}
+			}
+			result = status
 		default:
 			t.Errorf("unexpected NZBGet RPC method %q", request.Method)
 			w.WriteHeader(http.StatusBadRequest)
@@ -266,5 +275,44 @@ func TestNZBGetHistoryRecordsAreAlwaysTerminal(t *testing.T) {
 	}
 	if _, err := api.WaitComplete(ctx, "1", time.Millisecond); err != nil {
 		t.Fatalf("clean success must complete: %v", err)
+	}
+}
+
+// A paused NZBGet answers every call it is asked and downloads nothing. It
+// reaches that state by rejecting one configuration line, so readiness has to
+// look for it rather than treating a live API as a client that will work.
+func TestAPausedNZBGetIsNotReady(t *testing.T) {
+	for _, flag := range nzbgetPauseFlags {
+		t.Run(flag, func(t *testing.T) {
+			fake := &fakeNZBGet{status: map[string]any{flag: true}}
+			server := httptest.NewServer(fake.handler(t))
+			defer server.Close()
+
+			api, err := NewAPI(benchmark.NZBGet, server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			version, err := api.WaitReady(context.Background())
+			if err == nil {
+				t.Fatalf("readiness accepted a paused NZBGet and reported version %q", version)
+			}
+			if !strings.Contains(err.Error(), flag) {
+				t.Fatalf("error does not name the flag that is set: %v", err)
+			}
+		})
+	}
+}
+
+func TestARunningNZBGetIsReady(t *testing.T) {
+	fake := &fakeNZBGet{status: map[string]any{"DownloadPaused": false, "ServerPaused": false}}
+	server := httptest.NewServer(fake.handler(t))
+	defer server.Close()
+
+	api, err := NewAPI(benchmark.NZBGet, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version, err := api.WaitReady(context.Background()); err != nil || version != "24.3" {
+		t.Fatalf("readiness = %q, %v", version, err)
 	}
 }
