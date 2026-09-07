@@ -533,6 +533,18 @@ benchmark host or network namespace with no other NNTP clients is a
 publication prerequisite; the lease and source counters enforce the boundary
 between cooperating runs and detect every differently sourced connection.
 
+Between two runs the boundary is a race the previous client can lose. The
+harness asks it to stop, but its sockets are closed by the operating system
+afterwards, and a frozen client's children are reaped later still; while it is
+alive it keeps redialling, and the first dial to land after the next lease
+exists would be counted against a run that has not started. The controller
+therefore hands the lease straight back when its opening snapshot is not quiet
+and takes it again, for up to 15 seconds, so waiting for another product's
+shutdown costs a moment rather than a suite -- and a suite recorded as a
+harness failure would make `summarize` refuse the whole artifact root. A
+shaper that is still carrying connections when the budget runs out fails the
+run, which is the condition the lease exists to catch.
+
 The shaper also keeps a census of the client's own command stream: every
 command line the client sent upstream, tallied by verb, and for
 `ARTICLE`/`BODY`/`HEAD`/`STAT` the message-ids it named. Acquiring the lease

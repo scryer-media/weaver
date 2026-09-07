@@ -251,17 +251,83 @@ func AcquireShaperExecutionLease(ctx context.Context, client *http.Client, contr
 	return mutateShaperExecutionLease(ctx, client, controlURL, leaseID, http.MethodPost)
 }
 
+// shaperQuietBudget bounds how long a run waits for the shaper to be free of
+// the previous run's connections, and how often it looks.
+const (
+	shaperQuietBudget   = 15 * time.Second
+	shaperQuietInterval = 250 * time.Millisecond
+)
+
+// AcquireShaperExecutionLeaseForRun takes the lease for one measured run and
+// will not hand back a lease the previous run's client is still connected to.
+//
+// A client process outlives the adapter that launched it by a moment: the
+// harness asks it to stop, but its sockets are closed by the operating system
+// afterwards, and a frozen client's children are reaped later still. The
+// previous run's release already waits for the shaper to reach zero active
+// downstream connections, so the shaper is quiet at that instant -- but a
+// client that is still alive keeps redialling, and the first dial to land
+// after a new lease exists is counted against the new run. Failing the suite
+// there is not a measurement of anything: it throws away a run that had not
+// started, and `summarize` refuses a whole artifact root that contains one, so
+// a race in another product's shutdown discards an entire measured phase. The
+// lease is therefore released and taken again until the shaper is quiet, and
+// only a shaper that stays busy for the whole budget fails the run.
+//
+// On success the lease is held and the caller owns releasing it. On failure no
+// lease is held.
+func AcquireShaperExecutionLeaseForRun(ctx context.Context, client *http.Client, controlURL, leaseID string, link ServerLinkProfile) (ShaperSnapshot, error) {
+	deadline := time.Now().Add(shaperQuietBudget)
+	for {
+		snapshot, err := AcquireShaperExecutionLease(ctx, client, controlURL, leaseID)
+		if err == nil {
+			if snapshot.ActiveDownstreamConnections == 0 {
+				validateErr := snapshot.ValidateFor(link)
+				if validateErr == nil {
+					return snapshot, nil
+				}
+				return ShaperSnapshot{}, handBackShaperExecutionLease(client, controlURL, leaseID, validateErr)
+			}
+			// Hand the lease back rather than measuring against it, so the
+			// stray connections drain instead of being attributed here. The
+			// shaper refuses a release while they are still open, so this is
+			// also what waits for them.
+			err = fmt.Errorf("shaper has %d active downstream connections outside the measured run", snapshot.ActiveDownstreamConnections)
+			if releaseErr := releaseShaperExecutionLeaseAfterRun(client, controlURL, leaseID); releaseErr != nil {
+				err = fmt.Errorf("%w (the lease could not be handed back: %v)", err, releaseErr)
+			}
+		}
+		if time.Now().After(deadline) {
+			return ShaperSnapshot{}, fmt.Errorf("shaper did not become quiet within %s: %w", shaperQuietBudget, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ShaperSnapshot{}, ctx.Err()
+		case <-time.After(shaperQuietInterval):
+		}
+	}
+}
+
+// handBackShaperExecutionLease releases a lease the run will not use, so a
+// fatal condition does not also strand the lease for every suite behind it.
+func handBackShaperExecutionLease(client *http.Client, controlURL, leaseID string, cause error) error {
+	if err := releaseShaperExecutionLeaseAfterRun(client, controlURL, leaseID); err != nil {
+		return fmt.Errorf("%w (the lease could not be handed back: %v)", cause, err)
+	}
+	return cause
+}
+
 func ReleaseShaperExecutionLease(ctx context.Context, client *http.Client, controlURL, leaseID string) error {
 	_, err := mutateShaperExecutionLease(ctx, client, controlURL, leaseID, http.MethodDelete)
 	return err
 }
 
-func releaseShaperExecutionLeaseAfterRun(controlURL, leaseID string) error {
+func releaseShaperExecutionLeaseAfterRun(client *http.Client, controlURL, leaseID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var lastErr error
 	for {
-		if err := ReleaseShaperExecutionLease(ctx, nil, controlURL, leaseID); err == nil {
+		if err := ReleaseShaperExecutionLease(ctx, client, controlURL, leaseID); err == nil {
 			return nil
 		} else {
 			lastErr = err
