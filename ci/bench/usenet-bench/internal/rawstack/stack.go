@@ -137,6 +137,11 @@ func (s *Stack) ControlURL() string {
 	return "http://" + net.JoinHostPort(s.config.Host, strconv.Itoa(s.config.ControlPort))
 }
 
+// Username is the account the server was started with, which is the account
+// every client has to present. It is settled here rather than by each caller
+// so a stack cannot be listening for one name while the clients send another.
+func (s *Stack) Username() string { return s.config.Username }
+
 func (s *Stack) Host() string          { return s.config.Host }
 func (s *Stack) PlaintextPort() string { return strconv.Itoa(s.config.PlaintextPort) }
 func (s *Stack) TLSPort() string       { return strconv.Itoa(s.config.TLSPort) }

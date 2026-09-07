@@ -340,7 +340,7 @@ func chain(args []string) error {
 	if err := stack.preflight(log); err != nil {
 		return err
 	}
-	plans, err := buildChainPlans(phases, dryRun, log)
+	plans, err := buildChainPlans(phases, config.Target, dryRun, log)
 	if err != nil {
 		return err
 	}
@@ -819,6 +819,7 @@ func newChainStack(config *ChainConfig, log func(string, ...any)) (chainStack, e
 		return nil, err
 	}
 	config.Target = defaultChainString(config.Target, string(target))
+	config.Username = defaultChainString(config.Username, stack.Username())
 	config.NNTPHost = defaultChainString(config.NNTPHost, stack.Host())
 	config.NNTPPort = defaultChainString(config.NNTPPort, stack.PlaintextPort())
 	config.NNTPTLSPort = defaultChainString(config.NNTPTLSPort, stack.TLSPort())
@@ -1372,7 +1373,10 @@ func checkChainArtifactRoots(phases []ChainPhase) error {
 // generated on one machine is byte-for-byte the plan generated on the next;
 // an existing plan is left exactly as it is, because it is the record of what
 // a past session measured.
-func buildChainPlans(phases []ChainPhase, dryRun bool, log func(string, ...any)) (map[string]benchmark.Plan, error) {
+// buildChainPlans builds every phase plan the chain will run. The target is
+// the chain's own, because a plan that does not carry it is a plan this chain
+// cannot run: the phase would start and be refused before its first suite.
+func buildChainPlans(phases []ChainPhase, target string, dryRun bool, log func(string, ...any)) (map[string]benchmark.Plan, error) {
 	built := make(map[string]benchmark.Plan)
 	for _, phase := range phases {
 		if phase.PlanSpec == nil {
@@ -1384,7 +1388,7 @@ func buildChainPlans(phases []ChainPhase, dryRun bool, log func(string, ...any))
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("phase %s: %w", phase.Name, err)
 		}
-		plan, err := buildChainPlan(phase)
+		plan, err := buildChainPlan(phase, target)
 		if err != nil {
 			return nil, fmt.Errorf("phase %s: %w", phase.Name, err)
 		}
@@ -1406,7 +1410,33 @@ func buildChainPlans(phases []ChainPhase, dryRun bool, log func(string, ...any))
 	return built, nil
 }
 
-func buildChainPlan(phase ChainPhase) (benchmark.Plan, error) {
+// chainPlanTargets settles which execution targets a phase plan carries. A
+// chain that names its target builds for it, so a native chain does not build
+// a Docker plan and then be refused by its own first phase. A spec may still
+// name targets outright -- a plan for several hosts is built once -- but it has
+// to include the one this chain runs, and saying so here beats discovering it
+// when the phase exits non-zero with nothing measured.
+func chainPlanTargets(specified []string, target string) ([]benchmark.ExecutionTarget, error) {
+	if len(specified) == 0 {
+		specified = []string{defaultChainString(target, "docker-linux")}
+	}
+	targets, err := parseExecutionTargets(strings.Join(specified, ","))
+	if err != nil {
+		return nil, err
+	}
+	if target == "" {
+		return targets, nil
+	}
+	for _, candidate := range targets {
+		if string(candidate) == target {
+			return targets, nil
+		}
+	}
+	return nil, fmt.Errorf("plan_spec.targets %s does not include %q, the target this chain runs",
+		strings.Join(specified, ","), target)
+}
+
+func buildChainPlan(phase ChainPhase, target string) (benchmark.Plan, error) {
 	spec := phase.PlanSpec
 	if spec.Profile == "" {
 		return benchmark.Plan{}, fmt.Errorf("plan_spec.profile is required; a stock and an equivalent-throughput plan are separate plans")
@@ -1438,7 +1468,7 @@ func buildChainPlan(phase ChainPhase) (benchmark.Plan, error) {
 	if err != nil {
 		return benchmark.Plan{}, err
 	}
-	targets, err := parseExecutionTargets(strings.Join(defaultChainList(spec.Targets, "docker-linux"), ","))
+	targets, err := chainPlanTargets(spec.Targets, target)
 	if err != nil {
 		return benchmark.Plan{}, err
 	}

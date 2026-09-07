@@ -6,10 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -266,7 +268,30 @@ type nativeProcess struct {
 	err     error
 }
 
+// checkAPIPortFree refuses to launch a client onto a port something else is
+// already listening on. The product does not necessarily refuse: SABnzbd
+// relocates to the next free port and rewrites its own ini, after which this
+// adapter polls the original port and reads whatever stranger answers there --
+// waiting on someone else's HTTP until the job timeout, or worse, mistaking
+// their responses for the client's. Nothing downstream can detect that, so it
+// has to be refused here, immediately before the launch that would cause it.
+func checkAPIPortFree(endpoint string) error {
+	host, port, err := nativeAPIAddress(endpoint)
+	if err != nil {
+		return err
+	}
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("the client API address %s is already in use, so this run would measure whatever is listening there: %w", address, err)
+	}
+	return listener.Close()
+}
+
 func startProcess(ctx context.Context, cfg Config, spec productSpec) (*nativeProcess, error) {
+	if err := checkAPIPortFree(cfg.APIEndpoint); err != nil {
+		return nil, err
+	}
 	logPath := filepath.Join(cfg.ConfigDir, "native-client.log")
 	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {

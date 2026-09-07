@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -307,12 +309,22 @@ func TestPreflightChecksWhatAClientNeedsBeyondItsExecutable(t *testing.T) {
 		t.Fatalf("a catalog with no encryption key passed: %+v", check)
 	}
 
-	// SABnzbd needs nothing from the host beyond its own executable; claiming
-	// otherwise would fail a host that is in fact ready.
+	// SABnzbd bundles its own unpackers and needs no key, so the address the
+	// adapter will poll is its only requirement; inventing another would fail
+	// a host that is in fact ready.
+	var sab []string
 	for _, check := range clients {
 		if check.Client == "sabnzbd" {
-			t.Fatalf("invented a requirement for sabnzbd: %+v", check)
+			sab = append(sab, check.Name)
 		}
+	}
+	if len(sab) != 1 || sab[0] != "API address" {
+		t.Fatalf("sabnzbd requirements are %v", sab)
+	}
+
+	// Every client is polled over HTTP, so every client has that check.
+	for _, client := range []string{"weaver", "nzbget", "sabnzbd"} {
+		clientCheck(t, clients, client, "API address")
 	}
 }
 
@@ -328,13 +340,64 @@ func TestPreflightAcceptsAWeaverEntryCarryingItsOwnKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := nativeAdapterEntry("weaver", adapter, string(launch))
-	entry["environment"].(map[string]string)["WEAVER_ENCRYPTION_KEY"] = "bench-key"
+	entry["environment"].(map[string]string)["WEAVER_ENCRYPTION_KEY"] = base64.StdEncoding.EncodeToString(make([]byte, 32))
 	_, clients, err := preflightCatalogBinaries(writeAdapterCatalog(t, entry), benchmark.MacOSNative)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if check := clientCheck(t, clients, "weaver", "WEAVER_ENCRYPTION_KEY"); check.Status != "present" {
 		t.Fatalf("a catalog carrying a key was reported as %+v", check)
+	}
+}
+
+// A key Weaver will not parse is as bad as no key: it exits while starting up
+// and the run reports only a client that never became ready. Both shapes of
+// bad key are worth naming, because neither is visible from the failure.
+func TestPreflightRefusesAWeaverKeyWeaverWouldReject(t *testing.T) {
+	adapter := filepath.Join(t.TempDir(), "nativeadapter")
+	if err := os.WriteFile(adapter, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := json.Marshal([]string{adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"nntpbench-native-lane-key",                         // not base64 at all
+		base64.StdEncoding.EncodeToString(make([]byte, 16)), // well-formed, wrong length
+	} {
+		entry := nativeAdapterEntry("weaver", adapter, string(launch))
+		entry["environment"].(map[string]string)["WEAVER_ENCRYPTION_KEY"] = key
+		_, clients, err := preflightCatalogBinaries(writeAdapterCatalog(t, entry), benchmark.MacOSNative)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if check := clientCheck(t, clients, "weaver", "WEAVER_ENCRYPTION_KEY"); check.Status != "unusable" {
+			t.Fatalf("key %q was accepted as %+v", key, check)
+		}
+	}
+}
+
+// The shipped catalogs are the first thing an operator copies, so a key that
+// does not parse ships a host that cannot run Weaver.
+func TestExampleCatalogsCarryAKeyWeaverAccepts(t *testing.T) {
+	for _, path := range []string{
+		filepath.Join("..", "..", "configs", "adapters.macos.example.json"),
+		filepath.Join("..", "..", "configs", "adapters.windows.example.json"),
+	} {
+		catalog, err := benchmark.LoadAdapterCatalog(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, adapter := range catalog.Adapters {
+			if adapter.Client != benchmark.Weaver {
+				continue
+			}
+			check := clientCheck(t, inspectClientRequirements(adapter), "weaver", "WEAVER_ENCRYPTION_KEY")
+			if check.Status != "present" {
+				t.Fatalf("%s: %+v", path, check)
+			}
+		}
 	}
 }
 
@@ -347,4 +410,29 @@ func clientCheck(t *testing.T, checks []preflightClientCheck, client, name strin
 	}
 	t.Fatalf("no %s check named %q in %+v", client, name, checks)
 	return preflightClientCheck{}
+}
+
+// A busy API port is the one condition no configuration settles, and the
+// product does not refuse it: SABnzbd relocates and rewrites its ini, leaving
+// the adapter polling whatever else answers there.
+func TestPreflightReportsAnAPIPortSomethingElseHolds(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	check := apiPortCheck("sabnzbd", "http://"+listener.Addr().String())
+	if check.Status != "in use" {
+		t.Fatalf("an occupied port was reported as %+v", check)
+	}
+
+	// The same address, once nothing holds it, has to pass.
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if check := apiPortCheck("sabnzbd", "http://"+address); check.Status != "present" {
+		t.Fatalf("a free port was reported as %+v", check)
+	}
 }

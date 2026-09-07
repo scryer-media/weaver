@@ -5,16 +5,19 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -457,17 +460,22 @@ func preflightCatalogBinaries(path string, target benchmark.ExecutionTarget) ([]
 	return binaries, clients, nil
 }
 
+// weaverEncryptionKeyBytes is the key length Weaver accepts; anything else
+// fails while it is starting up.
+const weaverEncryptionKeyBytes = 32
+
 // inspectClientRequirements covers what a product needs from the host that
 // installing it does not provide. Each of these turns a bare install into a
 // run that fails, or worse hangs, well after the measurement has started.
 func inspectClientRequirements(adapter benchmark.Adapter) []preflightClientCheck {
 	name := string(adapter.Client)
+	checks := []preflightClientCheck{apiPortCheck(name, adapter.Environment["NATIVE_API_ENDPOINT"])}
 	switch adapter.Client {
 	case benchmark.NZBGet:
 		// NZBGet ships neither unpacker and shells out to both by name. A
 		// host without one does not fail: it skips the unpack and the run
 		// fails output verification instead.
-		var checks []preflightClientCheck
+		var unpackers []preflightClientCheck
 		for tool, lane := range map[string]string{
 			nativeadapter.NZBGetUnrarCommand:    "every RAR fixture",
 			nativeadapter.NZBGetSevenZipCommand: "every 7z fixture",
@@ -480,22 +488,62 @@ func inspectClientRequirements(adapter benchmark.Adapter) []preflightClientCheck
 			} else {
 				check.Detail = resolved
 			}
-			checks = append(checks, check)
+			unpackers = append(unpackers, check)
 		}
-		sort.Slice(checks, func(i, j int) bool { return checks[i].Name < checks[j].Name })
-		return checks
+		sort.Slice(unpackers, func(i, j int) bool { return unpackers[i].Name < unpackers[j].Name })
+		return append(checks, unpackers...)
 	case benchmark.Weaver:
 		// Without a key of its own Weaver asks the OS keychain, and a run
-		// started from a script waits on a prompt nobody answers.
+		// started from a script waits on a prompt nobody answers. A key it
+		// will not parse is no better: it exits during startup, and the run
+		// reports a client that never became ready rather than a bad key.
 		check := preflightClientCheck{Client: name, Name: "WEAVER_ENCRYPTION_KEY", Status: "present"}
-		if strings.TrimSpace(adapter.Environment["WEAVER_ENCRYPTION_KEY"]) == "" {
+		key := strings.TrimSpace(adapter.Environment["WEAVER_ENCRYPTION_KEY"])
+		switch {
+		case key == "":
 			check.Status = "missing"
 			check.Reason = "the catalog entry carries no WEAVER_ENCRYPTION_KEY; a native Weaver then waits on a keychain prompt instead of starting"
+		default:
+			decoded, err := base64.StdEncoding.DecodeString(key)
+			switch {
+			case err != nil:
+				check.Status = "unusable"
+				check.Reason = fmt.Sprintf("WEAVER_ENCRYPTION_KEY is not standard base64, which is the only form Weaver accepts: %v", err)
+			case len(decoded) != weaverEncryptionKeyBytes:
+				check.Status = "unusable"
+				check.Reason = fmt.Sprintf("WEAVER_ENCRYPTION_KEY decodes to %d bytes; Weaver requires exactly %d", len(decoded), weaverEncryptionKeyBytes)
+			default:
+				check.Detail = fmt.Sprintf("%d-byte key", len(decoded))
+			}
 		}
-		return []preflightClientCheck{check}
+		return append(checks, check)
 	default:
-		return nil
+		return checks
 	}
+}
+
+// apiPortCheck is the one condition no configuration can settle: whether the
+// address the adapter will poll is free. A busy one is not a startup failure --
+// SABnzbd moves to the next port and rewrites its ini -- so the run goes on
+// polling a stranger. On a developer's machine these ports are popular.
+func apiPortCheck(client, endpoint string) preflightClientCheck {
+	check := preflightClientCheck{Client: client, Name: "API address", Status: "present"}
+	host, port, err := nativeadapter.APIAddress(endpoint)
+	if err != nil {
+		check.Status = "unusable"
+		check.Reason = err.Error()
+		return check
+	}
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	check.Detail = address
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		check.Status = "in use"
+		check.Reason = fmt.Sprintf("something is already listening on %s; the client would move to another port and the run would poll whatever answers here: %v", address, err)
+		return check
+	}
+	_ = listener.Close()
+	return check
 }
 
 // inspectAdapterExecutables checks the adapter each entry runs. A catalog

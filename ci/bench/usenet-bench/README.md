@@ -1141,6 +1141,14 @@ empty article store is worth catching there too: it answers `430` to every
 article, and a run against it looks like a client that failed rather than a
 server with nothing to serve.
 
+A raw chain settles what it can from the stack it is about to start, so the
+two cannot disagree: the plan is built for the chain's own execution target
+rather than the Docker default, and the clients are told the username the
+server is listening for. Naming either in the config still wins; naming a
+`plan_spec.targets` list that leaves out the target the chain runs is refused
+while the plan is being built, because the phase would otherwise start the
+stack and exit non-zero with nothing measured.
+
 ### What a raw stack refuses
 
 - **`compose_file`, and any container check.** `require.client_version`
@@ -1230,9 +1238,12 @@ Notes for the native catalogs:
   API (SABnzbd `version`, NZBGet `version`, Weaver GraphQL `version`); a
   mismatch fails the run before any NZB is submitted.
 - For native Weaver set `WEAVER_ENCRYPTION_KEY` in the adapter environment so
-  no Keychain prompt is waited on; the example catalogs carry one, and
-  `preflight --adapters` fails a Weaver entry without it, because a run that
-  reaches the prompt hangs rather than failing. Both lanes render `WEAVER_STARTUP_IOPS=50000`
+  no Keychain prompt is waited on. It is standard base64 of exactly 32 bytes,
+  and nothing else parses. The example catalogs carry one; `preflight
+  --adapters` fails a Weaver entry that has none, and fails one whose key
+  Weaver would reject. Neither failure is visible at run time: without a key
+  the run hangs on the prompt, and with a malformed one Weaver exits during
+  startup and the run reports only a client that never became ready. Both lanes render `WEAVER_STARTUP_IOPS=50000`
   so Weaver's startup disk probe never runs inside the measured process (an
   operator value already in the environment is preserved and recorded).
 - Both lanes also pin Weaver's trusted-network list (`WEAVER_TRUSTED_CIDRS`:

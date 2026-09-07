@@ -310,6 +310,11 @@ func parseStorageProfile(raw string) (benchmark.StorageProfile, error) {
 	return profile, nil
 }
 
+// APIAddress is the host and port an adapter will poll, taken from the
+// catalog's NATIVE_API_ENDPOINT. Preflight resolves it the same way the run
+// does so a check cannot pass for an address the run will not use.
+func APIAddress(endpoint string) (string, int, error) { return nativeAPIAddress(endpoint) }
+
 func nativeAPIAddress(endpoint string) (string, int, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil || parsed.Scheme != "http" || parsed.Host == "" {

@@ -458,11 +458,11 @@ func planSpecPhase() ChainPhase {
 // A plan built on one machine must be the plan built on the next, or two
 // sessions of the same series cannot be compared with each other.
 func TestBuildChainPlanIsDeterministic(t *testing.T) {
-	first, err := buildChainPlan(planSpecPhase())
+	first, err := buildChainPlan(planSpecPhase(), "")
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	second, err := buildChainPlan(planSpecPhase())
+	second, err := buildChainPlan(planSpecPhase(), "")
 	if err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
@@ -485,7 +485,7 @@ func TestBuildChainPlanTakesItsLinkFromThePhase(t *testing.T) {
 	phase := planSpecPhase()
 	phase.ServerLink = "10gbit"
 	phase.ServerRTT = ""
-	plan, err := buildChainPlan(phase)
+	plan, err := buildChainPlan(phase, "")
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -497,7 +497,7 @@ func TestBuildChainPlanTakesItsLinkFromThePhase(t *testing.T) {
 func TestBuildChainPlanAppliesFixtureExclusions(t *testing.T) {
 	phase := planSpecPhase()
 	phase.PlanSpec.ExcludeFixtures = []string{"bravo"}
-	plan, err := buildChainPlan(phase)
+	plan, err := buildChainPlan(phase, "")
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -521,7 +521,7 @@ func TestBuildChainPlanCarriesClientExclusionsWithTheirReasons(t *testing.T) {
 	phase.PlanSpec.ExcludeClients = []ChainClientExclusion{
 		{Client: "sabnzbd", FixtureID: "alpha", Reason: "does not read recovery volumes"},
 	}
-	plan, err := buildChainPlan(phase)
+	plan, err := buildChainPlan(phase, "")
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -541,17 +541,17 @@ func TestBuildChainPlanCarriesClientExclusionsWithTheirReasons(t *testing.T) {
 func TestBuildChainPlanRejectsAnIncompleteSpec(t *testing.T) {
 	noProfile := planSpecPhase()
 	noProfile.PlanSpec.Profile = ""
-	if _, err := buildChainPlan(noProfile); err == nil {
+	if _, err := buildChainPlan(noProfile, ""); err == nil {
 		t.Fatal("a spec without a profile was accepted")
 	}
 	noFixtures := planSpecPhase()
 	noFixtures.PlanSpec.Fixtures = nil
-	if _, err := buildChainPlan(noFixtures); err == nil {
+	if _, err := buildChainPlan(noFixtures, ""); err == nil {
 		t.Fatal("a spec naming neither fixtures nor a corpus was accepted")
 	}
 	badReason := planSpecPhase()
 	badReason.PlanSpec.ExcludeClients = []ChainClientExclusion{{Client: "sabnzbd", FixtureID: "alpha"}}
-	if _, err := buildChainPlan(badReason); err == nil {
+	if _, err := buildChainPlan(badReason, ""); err == nil {
 		t.Fatal("a client exclusion without a reason was accepted")
 	}
 }
@@ -567,7 +567,7 @@ func TestBuildChainPlansLeavesAnExistingPlanAlone(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	quiet := func(string, ...any) {}
-	if _, err := buildChainPlans([]ChainPhase{phase}, false, quiet); err != nil {
+	if _, err := buildChainPlans([]ChainPhase{phase}, "", false, quiet); err != nil {
 		t.Fatalf("build: %v", err)
 	}
 	after, err := os.ReadFile(phase.Plan)
@@ -584,7 +584,7 @@ func TestBuildChainPlansWritesNothingOnADryRun(t *testing.T) {
 	phase := planSpecPhase()
 	phase.Plan = filepath.Join(dir, "plan-B3.json")
 	quiet := func(string, ...any) {}
-	built, err := buildChainPlans([]ChainPhase{phase}, true, quiet)
+	built, err := buildChainPlans([]ChainPhase{phase}, "", true, quiet)
 	if err != nil {
 		t.Fatalf("dry run: %v", err)
 	}
@@ -594,7 +594,7 @@ func TestBuildChainPlansWritesNothingOnADryRun(t *testing.T) {
 	if _, err := os.Stat(phase.Plan); err == nil {
 		t.Fatal("a dry run wrote a plan to disk")
 	}
-	if _, err := buildChainPlans([]ChainPhase{phase}, false, quiet); err != nil {
+	if _, err := buildChainPlans([]ChainPhase{phase}, "", false, quiet); err != nil {
 		t.Fatalf("real run: %v", err)
 	}
 	if _, err := os.Stat(phase.Plan); err != nil {
@@ -636,7 +636,7 @@ func TestFixtureSetsAreSharedByThePhasesThatNameThem(t *testing.T) {
 	if len(resolved) != 3 || resolved[0] != "alpha" {
 		t.Fatalf("the named set did not reach the spec: %v", resolved)
 	}
-	plan, err := buildChainPlan(config.Phases[0])
+	plan, err := buildChainPlan(config.Phases[0], "")
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -827,5 +827,97 @@ func TestNewChainStackKeepsOperatorOverrides(t *testing.T) {
 	}
 	if config.NNTPPort != "9119" {
 		t.Fatalf("port %q; a stated port must reach the phases", config.NNTPPort)
+	}
+}
+
+// A chain that builds its own plan has to build one it can run. Defaulting to
+// docker-linux while running a native target produced a phase that exited
+// non-zero with nothing measured, and only after the stack had been started.
+func TestChainBuildsThePlanForTheTargetItRuns(t *testing.T) {
+	for _, target := range []string{string(benchmark.MacOSNative), string(benchmark.WindowsNative)} {
+		plan, err := buildChainPlan(planSpecPhase(), target)
+		if err != nil {
+			t.Fatalf("%s: %v", target, err)
+		}
+		if len(plan.ExecutionTargets) != 1 || string(plan.ExecutionTargets[0]) != target {
+			t.Fatalf("%s: plan carries %v", target, plan.ExecutionTargets)
+		}
+		for _, run := range plan.Runs {
+			if string(run.ExecutionTarget) != target {
+				t.Fatalf("%s: run %s is for %s", target, run.ID, run.ExecutionTarget)
+			}
+		}
+	}
+
+	// A chain that names no target of its own keeps the Docker default.
+	plan, err := buildChainPlan(planSpecPhase(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.ExecutionTargets) != 1 || plan.ExecutionTargets[0] != benchmark.DockerLinux {
+		t.Fatalf("default plan carries %v", plan.ExecutionTargets)
+	}
+}
+
+// A spec may name targets outright to build one plan for several hosts, but a
+// chain whose own target is not among them can never run the plan it just
+// wrote. Saying so here costs a line; finding out costs a started stack.
+func TestChainRefusesAPlanThatOmitsTheTargetItRuns(t *testing.T) {
+	phase := planSpecPhase()
+	phase.PlanSpec.Targets = []string{string(benchmark.DockerLinux)}
+	if _, err := buildChainPlan(phase, string(benchmark.MacOSNative)); err == nil {
+		t.Fatal("built a docker-only plan for a macOS chain")
+	}
+
+	// Naming several, one of which is the chain's, is the case that must work.
+	phase.PlanSpec.Targets = []string{string(benchmark.DockerLinux), string(benchmark.MacOSNative)}
+	plan, err := buildChainPlan(phase, string(benchmark.MacOSNative))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.ExecutionTargets) != 2 {
+		t.Fatalf("plan carries %v", plan.ExecutionTargets)
+	}
+}
+
+// The raw stack settles its own username, and the clients have to be told the
+// same one. Leaving the chain's copy empty started a server listening for
+// fixture-user while the phase was run with no username at all.
+func TestRawChainTellsTheClientsTheUsernameTheStackListensFor(t *testing.T) {
+	root := t.TempDir()
+	config := ChainConfig{
+		Stack:        ChainStackRaw,
+		Raw:          &ChainRawStack{BinDir: root, DataDir: root, CertDir: root},
+		PasswordFile: filepath.Join(root, "password"),
+		LogDir:       root,
+	}
+	for _, name := range []string{"e2e-nntp", "nntpshaper"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(config.PasswordFile, []byte("pass\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	quiet := func(string, ...any) {}
+	settings, err := chainRawStackConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newChainStack(&config, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if config.Username == "" || config.Username != settings.Username {
+		t.Fatalf("chain runs as %q, stack listens for %q", config.Username, settings.Username)
+	}
+
+	// An operator who names one still gets theirs.
+	named := config
+	named.Username = "operator"
+	if _, err := newChainStack(&named, quiet); err != nil {
+		t.Fatal(err)
+	}
+	if named.Username != "operator" {
+		t.Fatalf("overwrote the configured username with %q", named.Username)
 	}
 }
