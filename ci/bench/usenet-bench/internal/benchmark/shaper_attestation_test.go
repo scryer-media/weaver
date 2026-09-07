@@ -347,3 +347,27 @@ func TestValidateForKeepsNetemFreeOfUserspaceFields(t *testing.T) {
 		t.Fatal("a netem attestation carrying userspace fields was accepted")
 	}
 }
+
+func TestUserspaceResidencyToleranceIsAsymmetric(t *testing.T) {
+	link, err := ResolveServerLinkProfile("1gbit", 0, 0, 20_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A 10ms line cannot release a chunk early, so short readings are the
+	// delay not being applied; late ones are the host's scheduler, up to a
+	// bound well above any timer jitter.
+	for _, observed := range []uint64{10_000, 10_002, 12_000, 14_900} {
+		snapshot := userspaceRoundTripSnapshot(t, 20_000)
+		snapshot.LinkShaping.LiveEgressDelayMicros = observed
+		if err := snapshot.ValidateFor(link); err != nil {
+			t.Fatalf("a %dus floor against a 10000us line was rejected: %v", observed, err)
+		}
+	}
+	for _, observed := range []uint64{0, 5_000, 9_800, 16_000} {
+		snapshot := userspaceRoundTripSnapshot(t, 20_000)
+		snapshot.LinkShaping.LiveEgressDelayMicros = observed
+		if err := snapshot.ValidateFor(link); err == nil {
+			t.Fatalf("a %dus floor against a 10000us line was accepted", observed)
+		}
+	}
+}

@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/rawstack"
 )
 
 // ChainSchemaVersion is the only chain configuration schema this build reads.
@@ -53,10 +55,19 @@ type ChainConfig struct {
 	SchemaVersion int    `json:"schema_version"`
 	Name          string `json:"name"`
 
+	// Stack selects how the server side runs. "docker" drives the Compose
+	// stack and is the default. "raw" starts the NNTP server and the shaper as
+	// local processes, which is the only way to measure on a host that cannot
+	// have the containerized stack: Windows has no netem, and on an ARM Mac
+	// every container runs inside a Linux virtual machine whose scheduling and
+	// networking are the very things this benchmark measures.
+	Stack string         `json:"stack,omitempty"`
+	Raw   *ChainRawStack `json:"raw,omitempty"`
+
 	// ComposeFile and ComposeProject locate the NNTP server and shaper stack.
 	// The chain only ever recreates the shaper: recreating the server would
 	// discard the seeded article store every phase reads.
-	ComposeFile    string `json:"compose_file"`
+	ComposeFile    string `json:"compose_file,omitempty"`
 	ComposeProject string `json:"compose_project,omitempty"`
 	// PasswordFile is passed to Compose as NNTP_BENCH_PASSWORD_FILE and to each
 	// phase as --password-file.
@@ -72,6 +83,8 @@ type ChainConfig struct {
 	Adapters         string `json:"adapters"`
 	Target           string `json:"target,omitempty"`
 	NNTPHost         string `json:"nntp_host,omitempty"`
+	NNTPPort         string `json:"nntp_port,omitempty"`
+	NNTPTLSPort      string `json:"nntp_tls_port,omitempty"`
 	Username         string `json:"username,omitempty"`
 	CAFile           string `json:"ca_file,omitempty"`
 	ShaperControlURL string `json:"shaper_control_url,omitempty"`
@@ -99,6 +112,30 @@ type ChainConfig struct {
 
 	Require ChainRequirements `json:"require"`
 	Phases  []ChainPhase      `json:"phases"`
+}
+
+// ChainRawStack describes a server side made of local processes. Only the two
+// directories are required: the ports have defaults above 1024 so the stack
+// needs no privileges on any host, and the delay queue is derived from the
+// link unless the link is unlimited, which has no bandwidth-delay product to
+// derive from.
+type ChainRawStack struct {
+	BinDir  string `json:"bin_dir"`
+	DataDir string `json:"data_dir"`
+	CertDir string `json:"cert_dir,omitempty"`
+	Host    string `json:"host,omitempty"`
+	// Pipelining advertises RFC 4644 PIPELINING as commercial providers do.
+	// It defaults to on: a server that stays silent benches every client one
+	// article per round trip and hides the difference latency is there to show.
+	Pipelining *bool `json:"pipelining,omitempty"`
+
+	UpstreamPlaintextPort int    `json:"upstream_plaintext_port,omitempty"`
+	UpstreamTLSPort       int    `json:"upstream_tls_port,omitempty"`
+	PlaintextPort         int    `json:"plaintext_port,omitempty"`
+	TLSPort               int    `json:"tls_port,omitempty"`
+	ControlPort           int    `json:"control_port,omitempty"`
+	DelayQueueBytes       uint64 `json:"delay_queue_bytes,omitempty"`
+	StartTimeout          string `json:"start_timeout,omitempty"`
 }
 
 // ChainRequirements are host preconditions checked once, before the first
@@ -289,10 +326,17 @@ func chain(args []string) error {
 	defer release()
 
 	platform := runtime.GOOS + "/" + runtime.GOARCH
-	log("chain %s: %d phase(s) on %s", config.Name, len(phases), platform)
+	log("chain %s: %d phase(s) on a %s stack, %s", config.Name, len(phases), config.Stack, platform)
 	if err := checkChainRequirements(config, log); err != nil {
 		return err
 	}
+	// The stack is built before the dry run returns, so a raw session's
+	// binaries, article store and ports are checked without starting anything.
+	stack, err := newChainStack(&config, log)
+	if err != nil {
+		return err
+	}
+	defer stack.stop(log)
 	plans, err := buildChainPlans(phases, dryRun, log)
 	if err != nil {
 		return err
@@ -324,7 +368,7 @@ func chain(args []string) error {
 	applied := ""
 	for index, phase := range phases {
 		if key := phase.shaperKey(); key != applied {
-			if err := applyChainShaper(config, phase, log); err != nil {
+			if err := stack.apply(config, phase, log); err != nil {
 				return err
 			}
 			applied = key
@@ -355,7 +399,7 @@ func chain(args []string) error {
 	if config.RestoreServerLink != "" {
 		log("restoring the shaper to %s / %s", config.RestoreServerLink, chainRTTLabel(config.RestoreServerRTT))
 		restore := ChainPhase{Name: "restore", ServerLink: config.RestoreServerLink, ServerRTT: config.RestoreServerRTT}
-		if err := applyChainShaper(config, restore, log); err != nil {
+		if err := stack.apply(config, restore, log); err != nil {
 			log("WARNING: could not restore the shaper: %v", err)
 		}
 	}
@@ -397,6 +441,9 @@ func loadChainConfig(path string) (ChainConfig, error) {
 	if config.Name == "" {
 		config.Name = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	}
+	if config.Stack == "" {
+		config.Stack = ChainStackDocker
+	}
 	if config.ComposeProject == "" {
 		config.ComposeProject = "nntp-bench"
 	}
@@ -420,6 +467,14 @@ func loadChainConfig(path string) (ChainConfig, error) {
 		&config.ArtifactsDir, &config.LogDir, &config.ServerEnvDir,
 	} {
 		*field = resolveChainPath(base, *field)
+	}
+	if config.Stack == ChainStackRaw && config.Raw != nil {
+		if config.Raw.CertDir == "" {
+			config.Raw.CertDir = filepath.Join(base, "certs")
+		}
+		for _, field := range []*string{&config.Raw.BinDir, &config.Raw.DataDir, &config.Raw.CertDir} {
+			*field = resolveChainPath(base, *field)
+		}
 	}
 	for i := range config.Phases {
 		phase := &config.Phases[i]
@@ -480,8 +535,8 @@ func validateChainConfig(config ChainConfig) error {
 	if len(config.Phases) == 0 {
 		return fmt.Errorf("the chain config declares no phases")
 	}
-	if config.ComposeFile == "" {
-		return fmt.Errorf("compose_file is required")
+	if err := validateChainStack(config); err != nil {
+		return err
 	}
 	if config.Adapters == "" {
 		return fmt.Errorf("adapters is required")
@@ -526,6 +581,9 @@ func validateChainConfig(config ChainConfig) error {
 		if phase.NFS != nil && phase.NFS.Container == "" {
 			return fmt.Errorf("phase %s: nfs.container is required when nfs is set", phase.Name)
 		}
+		if phase.NFS != nil && config.Stack == ChainStackRaw {
+			return fmt.Errorf("phase %s: an NFS storage profile needs the throttled export container, which a raw stack does not run; native lanes are local-storage only", phase.Name)
+		}
 	}
 	if config.RestoreServerLink != "" {
 		restore := ChainPhase{ServerLink: config.RestoreServerLink, ServerRTT: config.RestoreServerRTT}
@@ -534,6 +592,70 @@ func validateChainConfig(config ChainConfig) error {
 		}
 	}
 	return nil
+}
+
+// Stack kinds.
+const (
+	ChainStackDocker = "docker"
+	ChainStackRaw    = "raw"
+)
+
+// validateChainStack holds each stack kind to the fields that mean something
+// for it. A raw stack carrying Compose settings, or a Docker requirement that
+// inspects containers, describes a host arrangement the session will not have.
+func validateChainStack(config ChainConfig) error {
+	switch config.Stack {
+	case ChainStackDocker:
+		if config.ComposeFile == "" {
+			return fmt.Errorf("compose_file is required for a docker stack")
+		}
+		if config.Raw != nil {
+			return fmt.Errorf("raw is set on a docker stack")
+		}
+		return nil
+	case ChainStackRaw:
+	default:
+		return fmt.Errorf("stack %q is not one of %s, %s", config.Stack, ChainStackDocker, ChainStackRaw)
+	}
+	if config.Raw == nil {
+		return fmt.Errorf("raw is required for a raw stack")
+	}
+	if config.ComposeFile != "" {
+		return fmt.Errorf("compose_file is set on a raw stack, which runs no containers")
+	}
+	if config.Raw.BinDir == "" || config.Raw.DataDir == "" {
+		return fmt.Errorf("raw needs bin_dir and data_dir")
+	}
+	if _, err := chainDuration(config.Raw.StartTimeout, rawstack.DefaultStartTimeout); err != nil {
+		return fmt.Errorf("raw.start_timeout: %w", err)
+	}
+	if config.Require.ClientVersion != nil {
+		return fmt.Errorf("require.client_version inspects a client's Docker image, which a raw stack does not have; pin the native client in the adapter catalog instead")
+	}
+	if config.Require.ServerPipeliningContainer != "" {
+		return fmt.Errorf("require.server_pipelining_container inspects a container a raw stack does not run; raw.pipelining sets it directly")
+	}
+	// Every execution target that is not docker-linux names an operating
+	// system, and there is no native Linux target to record a raw Linux run
+	// under. Recording one as docker-linux would file it beside results from a
+	// different packaging boundary.
+	if _, err := rawExecutionTarget(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// rawExecutionTarget is the execution target a raw stack's host records under.
+func rawExecutionTarget() (benchmark.ExecutionTarget, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return benchmark.MacOSNative, nil
+	case "windows":
+		return benchmark.WindowsNative, nil
+	default:
+		return "", fmt.Errorf("a raw stack has no execution target on %s; the benchmark records native runs as %s or %s only",
+			runtime.GOOS, benchmark.MacOSNative, benchmark.WindowsNative)
+	}
 }
 
 // selectChainPhases narrows a session to the named phases, preserving the
@@ -627,6 +749,123 @@ func chainRTTLabel(value string) string {
 // applyChainShaper writes the phase's link environment file, recreates the
 // shaper from it, and refreshes the CA the phases present to the server. The
 // server itself is never recreated: it holds the seeded article store.
+// chainStack is the server side a session measures through. The phase loop
+// only ever asks for a link, so the two arrangements -- containers under
+// Compose, or local processes -- stay interchangeable from its point of view.
+type chainStack interface {
+	apply(config ChainConfig, phase ChainPhase, log func(string, ...any)) error
+	stop(log func(string, ...any))
+}
+
+// newChainStack builds the session's stack and, for a raw one, settles every
+// value the phases need to reach it: the ports, the host, the CA the server
+// will generate and the shaper's control plane. Deriving them here rather than
+// asking the operator to restate them in the config keeps the run arguments
+// and the running processes from ever describing different endpoints.
+func newChainStack(config *ChainConfig, log func(string, ...any)) (chainStack, error) {
+	if config.Stack != ChainStackRaw {
+		return dockerChainStack{}, nil
+	}
+	target, err := rawExecutionTarget()
+	if err != nil {
+		return nil, err
+	}
+	timeout, err := chainDuration(config.Raw.StartTimeout, rawstack.DefaultStartTimeout)
+	if err != nil {
+		return nil, err
+	}
+	pipelining := true
+	if config.Raw.Pipelining != nil {
+		pipelining = *config.Raw.Pipelining
+	}
+	stack, err := rawstack.New(rawstack.Config{
+		BinDir:                config.Raw.BinDir,
+		DataDir:               config.Raw.DataDir,
+		CertDir:               config.Raw.CertDir,
+		LogDir:                config.LogDir,
+		Username:              defaultChainString(config.Username, "fixture-user"),
+		PasswordFile:          config.PasswordFile,
+		Pipelining:            pipelining,
+		Host:                  config.Raw.Host,
+		UpstreamPlaintextPort: config.Raw.UpstreamPlaintextPort,
+		UpstreamTLSPort:       config.Raw.UpstreamTLSPort,
+		PlaintextPort:         config.Raw.PlaintextPort,
+		TLSPort:               config.Raw.TLSPort,
+		ControlPort:           config.Raw.ControlPort,
+		DelayQueueBytes:       config.Raw.DelayQueueBytes,
+		StartTimeout:          timeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+	config.Target = defaultChainString(config.Target, string(target))
+	config.NNTPHost = defaultChainString(config.NNTPHost, stack.Host())
+	config.NNTPPort = defaultChainString(config.NNTPPort, stack.PlaintextPort())
+	config.NNTPTLSPort = defaultChainString(config.NNTPTLSPort, stack.TLSPort())
+	config.CAFile = defaultChainString(config.CAFile, stack.CAFile())
+	config.ShaperControlURL = defaultChainString(config.ShaperControlURL, stack.ControlURL())
+	log("raw stack: %s:%s plaintext, %s TLS, control %s, target %s",
+		config.NNTPHost, config.NNTPPort, config.NNTPTLSPort, config.ShaperControlURL, config.Target)
+	return &rawChainStack{stack: stack}, nil
+}
+
+func defaultChainString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+type dockerChainStack struct{}
+
+func (dockerChainStack) apply(config ChainConfig, phase ChainPhase, log func(string, ...any)) error {
+	return applyChainShaper(config, phase, log)
+}
+
+func (dockerChainStack) stop(func(string, ...any)) {}
+
+type rawChainStack struct {
+	stack   *rawstack.Stack
+	started bool
+}
+
+// apply starts the stack for the first link and replaces the shaper for every
+// later one. The server is never restarted: reopening the article store
+// between phases would charge one phase for another's cold cache.
+func (r *rawChainStack) apply(config ChainConfig, phase ChainPhase, log func(string, ...any)) error {
+	profile, err := phase.linkProfile()
+	if err != nil {
+		return err
+	}
+	// The link file is written for a raw session too. It is the record of the
+	// conditions a run was measured under, and it is what a later reader
+	// compares against, whether or not a container ever read it.
+	envPath := filepath.Join(config.ServerEnvDir, chainServerEnvName(phase))
+	if err := writeChainServerEnv(envPath, profile); err != nil {
+		return err
+	}
+	ctx := context.Background()
+	if !r.started {
+		log("raw stack -> link %s, rtt %s (%s)", profile.ID, chainRTTLabel(phase.ServerRTT), filepath.Base(envPath))
+		if err := r.stack.Start(ctx, profile); err != nil {
+			return err
+		}
+		r.started = true
+		return nil
+	}
+	log("shaper -> link %s, rtt %s (%s)", profile.ID, chainRTTLabel(phase.ServerRTT), filepath.Base(envPath))
+	return r.stack.Reshape(ctx, profile)
+}
+
+func (r *rawChainStack) stop(log func(string, ...any)) {
+	if !r.started {
+		return
+	}
+	if err := r.stack.Stop(); err != nil {
+		log("WARNING: could not stop the raw stack: %v", err)
+	}
+}
+
 func applyChainShaper(config ChainConfig, phase ChainPhase, log func(string, ...any)) error {
 	profile, err := phase.linkProfile()
 	if err != nil {
@@ -765,7 +1004,11 @@ func runChainPhase(config ChainConfig, phase ChainPhase, log func(string, ...any
 		ServerLink: phase.ServerLink, ServerRTT: chainRTTLabel(phase.ServerRTT),
 		Artifacts: phase.Artifacts, StartedAt: time.Now().UTC(),
 	}
-	removeStrayRunContainers(log)
+	// A raw session starts no containers, so there are none to clean up and
+	// nothing to ask a Docker daemon that may not be installed at all.
+	if config.Stack != ChainStackRaw {
+		removeStrayRunContainers(log)
+	}
 	releaseShaperLease(config.ShaperControlURL, log)
 
 	logPath := filepath.Join(config.LogDir, chainPhaseLogName(phase.Name))
@@ -808,6 +1051,8 @@ func chainPhaseArgs(config ChainConfig, phase ChainPhase) []string {
 	optional := map[string]string{
 		"--target":             config.Target,
 		"--nntp-host":          config.NNTPHost,
+		"--nntp-port":          config.NNTPPort,
+		"--nntp-tls-port":      config.NNTPTLSPort,
 		"--shaper-control-url": config.ShaperControlURL,
 		"--tls-ca-file":        config.CAFile,
 		"--username":           config.Username,

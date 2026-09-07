@@ -39,6 +39,7 @@ downloaded data and run artifacts are ignored by git and never committed.
   - [7. Summarize](#7-summarize)
 - [Driving a whole session](#driving-a-whole-session)
 - [Pre-seeded NNTP corpus image](#pre-seeded-nntp-corpus-image)
+- [Raw stack: the server side without Docker](#raw-stack-the-server-side-without-docker)
 - [Native macOS and Windows lanes](#native-macos-and-windows-lanes)
 - [Storage profiles (local vs throttled NFS)](#storage-profiles-local-vs-throttled-nfs)
 - [What is measured](#what-is-measured)
@@ -50,7 +51,7 @@ downloaded data and run artifacts are ignored by git and never committed.
 | Requirement | Why |
 | --- | --- |
 | Go 1.26+ | every tool here is `go run ./cmd/…`; the module has one dependency (`zeebo/blake3`) |
-| Docker with Compose v2 | the RARLAB, PAR2, Nyuu, NNTP-server and shaper images, and the Docker client lane |
+| Docker with Compose v2 | the RARLAB, PAR2, Nyuu, NNTP-server and shaper images, and the Docker client lane. Fixtures and the seeded corpus are always made on a Docker host; measuring on macOS or Windows does not need one (see [Raw stack](#raw-stack-the-server-side-without-docker)) |
 | `linux/amd64` emulation on arm64 hosts | the RARLAB and Nyuu images are `linux/amd64` on purpose (see below); Docker Desktop provides it, on plain Linux run `docker run --privileged --rm tonistiigi/binfmt --install amd64` |
 | ~10 GiB free disk | a full corpus with the `bluray-disc` fixture; smoke runs need far less |
 | Native product installs | only for the optional `macos-native` / `windows-native` lanes |
@@ -116,6 +117,7 @@ lists every subcommand; `-h` on any of them prints its options.
 | `configs/server/compose-shaper.example.yml` | The server + shaper topology |
 | `configs/server/compose-nfs.example.yml` | The throttled NFS export used by the `nfs-*` storage profiles |
 | `configs/server/compose-seeded.example.yml` | Overlay that starts the NNTP server from a pre-seeded corpus image |
+| `configs/chains/*.example.json` | Whole-session descriptions: `latency-series` on the Docker stack, `raw-native` on the raw one |
 | `docker/` | Dockerfiles for the pinned RARLAB writers, the official 7-Zip build, `par2cmdline-turbo`, Nyuu, the shaper and the throttled NFS server |
 | `fixtures/matrix.json`, `fixtures/corpus.json` | The declared fixture matrix and corpus description |
 | `internal/` | The Go packages behind the commands |
@@ -839,6 +841,13 @@ relative path in a chain description resolves against the description's own
 directory, so a chain, its plans and its corpus move between machines as one
 unit.
 
+A chain drives one of two server-side arrangements, named by `stack`. The
+default, `docker`, is the Compose topology above. `raw` runs the same server
+and shaper as local processes for the hosts that cannot have containers; see
+[Raw stack](#raw-stack-the-server-side-without-docker). The two are validated
+apart, so a description cannot ask for a Compose file on a raw stack or a
+container check on a stack that runs none.
+
 Each phase names its execution mode, its plan, its corpus and its artifact
 root, and declares the link conditions it must be measured under. The chain
 reconfigures the shaper only when a phase's conditions differ from the phase
@@ -861,7 +870,8 @@ silently keep the fixture it was meant to remove.
 Preconditions are checked once, before the first measurement:
 
 - every declared fixture root exists;
-- the NNTP service advertises `PIPELINING`;
+- the NNTP service advertises `PIPELINING` (on a raw stack `raw.pipelining`
+  sets it directly, so there is no container to inspect);
 - the pinned client image reports the version the session is for;
 - every fixture each plan names has a manifest, posts at least the corpus
   floor, and — for a phase that asks for a paired summary — declares a
@@ -966,11 +976,164 @@ the NNTP server, not to any client under test, so it is recorded in the seed
 provenance JSON (`preseeded`, the image tag and the fingerprint) rather than in
 a client-run stratum.
 
+## Raw stack: the server side without Docker
+
+Two of the hosts this benchmark has to run on cannot have the containerized
+server side. Windows has no `netem`, so the round trip cannot be injected at
+all. On an ARM Mac every container runs inside a Linux virtual machine whose
+scheduling and networking are exactly the things a download benchmark measures,
+so a result taken through it describes the VM as much as the client. The raw
+stack runs the same two programs — the `e2e-nntp` server and `nntpshaper` in
+front of it — as ordinary local processes, with no Docker, no Compose and no
+`tc`.
+
+Everything else is unchanged. The clients still reach only the shaper's front
+ports, so no run bypasses the link being modelled; the shaper still meters
+egress in userspace under an exclusive run lease; and the controller still
+takes a before and after attestation from the shaper's control plane.
+
+### The round trip is carried in userspace
+
+Bandwidth shaping was already a userspace leaky bucket, so it is identical on
+every host. The round trip is not: on Linux the container's entrypoint renders
+it with `tc netem`, which needs `NET_ADMIN` and a kernel that has it. With no
+`tc`, the proxy carries the delay itself. Each direction gets a delay line — a
+queue, not a sleep in the copy loop, so a burst of chunks costs one delay
+rather than one delay each — holding every chunk for half the round trip, and a
+connection is charged one whole round trip before the upstream is dialled.
+
+That handshake charge is there because a proxy cannot delay a TCP handshake by
+relaying bytes: `netem` delays the SYN exchange, a local listener does not, and
+without the charge every client would get its first byte one round trip early.
+A client that times TCP establishment separately from the greeting still sees a
+local connect; that is the one part of the round trip this mechanism does not
+reproduce, and it is why the mechanism is reported rather than assumed.
+
+Each direction's queue is sized from the bandwidth-delay product, and a queue
+too small to hold one BDP is refused at startup — a queue that caps the link
+below its declared rate would measure the queue, not the link. An unlimited
+link has no BDP to derive from, so pair it with `raw.delay_queue_bytes`.
+
+The mechanism is part of every attestation. A netem report and a userspace
+report are validated against different shapes and can never be confused for one
+another: a userspace report that named a shaped interface, or a netem report
+carrying a handshake delay, is refused at startup by the shaper and again by
+the controller. Live evidence is the minimum residency each direction actually
+held a chunk for, which is jitter-robust in the direction that matters — a
+chunk can be released late under load, never early. **Do not merge results
+taken under the two mechanisms into one comparison.** They are different link
+models; each is internally consistent, and a series should be measured under
+one of them throughout.
+
+### Seeding a raw host
+
+Posting needs Nyuu, which is a container, so a raw host never seeds its own
+spool. Seed once on a Docker host, then copy the article store across with the
+fixtures and NZBs it corresponds to:
+
+```bash
+# On the Docker host, with the seeded stack up (see "Pre-seeded NNTP corpus
+# image" above for making that repeatable).
+mkdir -p /scratch/export
+docker cp nntp-bench-nntp-1:/data/articles /scratch/export/
+rsync -a /scratch/export/articles/ mac-host:/scratch/spool/articles/
+rsync -a /scratch/fixtures/ mac-host:/scratch/fixtures/
+```
+
+The fixtures must be the same bytes on both hosts: the article store is
+meaningless without the manifests and NZBs that name its articles, and the
+manifest hashes are the cross-host equivalence check. Copy them together or
+neither.
+
+### Building and describing the stack
+
+Both programs are pure Go and cross-compile without cgo. The shaper is in this
+module; the server is installed from its own module at a pinned version, which
+must be the version the Docker lane's `image build` pins — a raw run and a
+containerized one are only comparable if they served the same articles from the
+same server:
+
+```bash
+# macOS host, from this directory.
+go build -o /scratch/bin/nntpshaper ./cmd/nntpshaper
+GOBIN=/scratch/bin go install github.com/scryer-media/e2e-nntp/cmd/e2e-nntp@v0.1.0
+
+# Windows, cross-built from anywhere. `go install` refuses a GOBIN when it is
+# cross-compiling, so the binaries land under GOPATH; copy them to the bin
+# directory the chain names.
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o nntpshaper.exe ./cmd/nntpshaper
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go install github.com/scryer-media/e2e-nntp/cmd/e2e-nntp@v0.1.0
+# -> $(go env GOPATH)/bin/windows_amd64/e2e-nntp.exe
+```
+
+The stack looks for `e2e-nntp` and `nntpshaper` in `raw.bin_dir` by those exact
+names, with `.exe` appended on Windows, and refuses to start if either is
+missing.
+
+A chain runs the stack by naming it. `configs/chains/raw-native.example.json`
+is a complete native session:
+
+```json
+{
+  "stack": "raw",
+  "raw": {
+    "bin_dir": "../bin",
+    "data_dir": "../spool/articles",
+    "pipelining": true
+  }
+}
+```
+
+Only the two directories are required. The stack fills in the rest, and the
+chain settles every endpoint from it — target, host, both ports, the CA file
+and the shaper control URL — so a raw description does not repeat what the
+stack already decides. Ports default to 11119/11563 upstream, 8119/8563 for the
+shaper's front, and 8080 for the control plane: all above 1024, so the stack
+needs no privileges on any host, and deliberately unlike the well-known NNTP
+ports so nothing else on the host mistakes them for a real news service.
+`raw.pipelining` advertises RFC 4644 PIPELINING as commercial providers do and
+defaults to on; a silent server benches every client one article per round trip
+and hides the difference latency is there to show.
+
+The server starts once per session and the shaper is replaced per phase, for
+the same reason the Docker chain only ever recreates the shaper: restarting the
+server would reopen the article store between phases and charge one phase for
+the other's cold cache. Its link contract is immutable for the life of the
+process, which is what lets a run's before and after attestations prove the
+conditions never moved underneath it.
+
+A dry run brings none of it up but checks all of it — the binaries exist, the
+spool is not empty, the ports do not clash, every fixture has a manifest:
+
+```bash
+go run ./cmd/nntpbench chain --config /scratch/runs/raw-native.json --dry-run
+```
+
+An empty spool is worth catching there. It answers `430` to every article, and
+a run against it looks like a client that failed rather than a server with
+nothing to serve.
+
+### What a raw stack refuses
+
+- **`compose_file`, and any container check.** `require.client_version`
+  inspects a client's Docker image and `require.server_pipelining_container`
+  inspects a container's environment; a raw stack has neither. Pin the native
+  client in the adapter catalog, and set `raw.pipelining` directly.
+- **NFS storage profiles.** The throttled export is a container. Native lanes
+  are local-storage only.
+- **Linux.** A raw stack has no execution target there. Every target that is
+  not `docker-linux` names an operating system, and there is no native Linux
+  target; recording a raw Linux run as `docker-linux` would file it beside
+  results from a different packaging boundary.
+
 ## Native macOS and Windows lanes
 
 The native lanes run the same sequential measurement with one fresh client
-process per run. Build the launcher, copy the OS catalog, and use a separate
-artifact root per operating system:
+process per run. The server side they measure against is either a Docker stack
+on another host or a [raw stack](#raw-stack-the-server-side-without-docker) on
+this one; the client side below is the same either way. Build the launcher,
+copy the OS catalog, and use a separate artifact root per operating system:
 
 ```bash
 # macOS (on the Mac host)
@@ -1023,7 +1186,8 @@ Notes for the native catalogs:
   startup with no wizard and no bootstrap login.
 - Copy the immutable plan and the generated fixture / NZB directories to each
   native host; do not regenerate the corpus per OS. The fixture manifest and
-  output hashes are the cross-host equivalence check.
+  output hashes are the cross-host equivalence check. A host running its own
+  raw stack needs the article store beside them, copied from the same seed.
 - Native Instruments / ETW traces are useful attribution artifacts, not a
   cross-product CPU metric; keep them apart from the benchmark JSON.
 
@@ -1308,6 +1472,10 @@ digest-pinned catalog shape.
 - That Docker / Linux, native macOS and native Windows telemetry can be pooled
   into one CPU or instruction ranking — target and collector scope stay
   first-class result dimensions.
+- That a round trip injected by `netem` and one carried by the shaper in
+  userspace are the same link. Both are attested and each is internally
+  consistent; the mechanism is recorded per run and results taken under the two
+  do not belong in one comparison.
 - Any client result without its fixture manifest, client version or image
   digest, effective configuration, plan and output-hash record.
 - That the client matrix is exhaustive; clients outside the catalog are simply

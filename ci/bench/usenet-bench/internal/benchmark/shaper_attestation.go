@@ -95,6 +95,12 @@ func (l ShaperLinkShaping) validateFor(link ServerLinkProfile) error {
 	if l.LiveError != "" {
 		return fmt.Errorf("shaper could not read its qdiscs back: %s", l.LiveError)
 	}
+	if l.EgressMechanism == shaperDelayUserspace {
+		if err := residencyWithinTolerance("server-to-client", l.LiveEgressDelayMicros, l.EgressDelayMicros); err != nil {
+			return err
+		}
+		return residencyWithinTolerance("client-to-server", l.LiveIngressDelayMicros, l.IngressDelayMicros)
+	}
 	if !delayWithinTolerance(l.LiveEgressDelayMicros, l.EgressDelayMicros) {
 		return fmt.Errorf("tc reports a server-to-client delay of %dus, shaper declares %dus", l.LiveEgressDelayMicros, l.EgressDelayMicros)
 	}
@@ -103,6 +109,37 @@ func (l ShaperLinkShaping) validateFor(link ServerLinkProfile) error {
 	}
 	return nil
 }
+
+// residencyWithinTolerance checks a userspace delay line's observed floor,
+// which is a different kind of reading from a qdisc's configured delay and
+// needs a different tolerance. A chunk can never leave early -- the line sleeps
+// until its release instant -- so anything short is the delay not being applied
+// and fails outright. Late is ordinary: a timer wakes when the host's scheduler
+// gets to it. The bound is loose enough for that jitter and tight enough that a
+// floor this far out over a whole run means the queue, not the link, is setting
+// the pace.
+func residencyWithinTolerance(direction string, observed, declared uint64) error {
+	if observed+clockSlopMicros < declared {
+		return fmt.Errorf("shaper delivered %s bytes after %dus, below the %dus it declares", direction, observed, declared)
+	}
+	late := uint64(0)
+	if observed > declared {
+		late = observed - declared
+	}
+	allowed := declared / 20
+	if allowed < maxResidencyOvershootMicros {
+		allowed = maxResidencyOvershootMicros
+	}
+	if late > allowed {
+		return fmt.Errorf("shaper's lowest observed %s delay is %dus, %dus above the %dus it declares", direction, observed, late, declared)
+	}
+	return nil
+}
+
+const (
+	clockSlopMicros             = 100
+	maxResidencyOvershootMicros = 5_000
+)
 
 func (l ShaperLinkShaping) validateNetem() error {
 	if l.Interface == "" {

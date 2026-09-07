@@ -189,12 +189,17 @@ func (l *DelayLine) Deliver(ctx context.Context, write func([]byte) error) error
 			case <-timer.C:
 			}
 		}
+		// Residency is taken at release, before the write: the line controls
+		// how long a chunk is held, and folding the destination socket's write
+		// cost into the measurement would report the sink's latency as the
+		// link's.
+		residency := time.Since(chunk.arrival)
 		writeErr := write(chunk.payload)
 		if writeErr != nil {
 			l.Abort(writeErr)
 			return writeErr
 		}
-		l.observer.observe(time.Since(chunk.arrival))
+		l.observer.observe(residency)
 		l.mu.Lock()
 		l.queued -= len(chunk.payload)
 		l.space.Broadcast()

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -651,5 +652,180 @@ func TestFixtureSetsRejectAnUndeclaredName(t *testing.T) {
 	_, err := loadChainConfig(writeChainConfigFile(t, raw))
 	if err == nil || !strings.Contains(err.Error(), "absent") {
 		t.Fatalf("expected the undeclared set to be named, got %v", err)
+	}
+}
+
+// rawChainConfig is a session whose server side is local processes. The
+// binaries and the article store have to exist for the stack to be built, so
+// the caller gets a config already anchored to a populated directory.
+func rawChainConfig(t *testing.T) map[string]any {
+	t.Helper()
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	dataDir := filepath.Join(root, "articles")
+	for _, directory := range []string{binDir, dataDir} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, binary := range []string{"e2e-nntp", "nntpshaper"} {
+		name := binary
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte("binary"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "alt.binaries.test"), []byte("article"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	password := filepath.Join(root, "password")
+	if err := os.WriteFile(password, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := minimalChainConfig()
+	delete(config, "compose_file")
+	config["stack"] = ChainStackRaw
+	config["password_file"] = password
+	config["raw"] = map[string]any{"bin_dir": binDir, "data_dir": dataDir}
+	return config
+}
+
+func TestLoadChainConfigDefaultsToADockerStack(t *testing.T) {
+	config, err := loadChainConfig(writeChainConfigFile(t, minimalChainConfig()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Stack != ChainStackDocker {
+		t.Fatalf("stack %q, want %q for a config that names none", config.Stack, ChainStackDocker)
+	}
+}
+
+func TestLoadChainConfigAnchorsRawStackPaths(t *testing.T) {
+	raw := rawChainConfig(t)
+	path := writeChainConfigFile(t, raw)
+	base := filepath.Dir(path)
+	// bin_dir and data_dir are absolute in the fixture; cert_dir is not set at
+	// all and defaults beside the config.
+	config, err := loadChainConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Raw.CertDir != filepath.Join(base, "certs") {
+		t.Fatalf("cert dir %q was not defaulted beside the config", config.Raw.CertDir)
+	}
+}
+
+func TestValidateChainStackKeepsTheTwoArrangementsApart(t *testing.T) {
+	cases := map[string]func(map[string]any){
+		"an unknown stack kind": func(c map[string]any) { c["stack"] = "podman" },
+		"a raw stack with no raw section": func(c map[string]any) {
+			delete(c, "raw")
+		},
+		"a raw stack that also names a compose file": func(c map[string]any) {
+			c["compose_file"] = "compose.yml"
+		},
+		"a raw stack with no binaries": func(c map[string]any) {
+			c["raw"] = map[string]any{"data_dir": c["raw"].(map[string]any)["data_dir"]}
+		},
+		// Both requirements shell out to docker inspect.
+		"a raw stack requiring a client image": func(c map[string]any) {
+			c["require"] = map[string]any{"client_version": map[string]any{"client": "weaver", "accept": []string{"0.11.0"}}}
+		},
+		"a raw stack requiring a pipelining container": func(c map[string]any) {
+			c["require"] = map[string]any{"server_pipelining_container": "nntp-bench-nntp-1"}
+		},
+		// The throttled export is a container, so a native lane is local only.
+		"a raw stack with an NFS phase": func(c map[string]any) {
+			phases := c["phases"].([]map[string]any)
+			phases[0]["nfs"] = map[string]any{"container": "nfs-bench-nfs-1"}
+		},
+		"an unparseable start timeout": func(c map[string]any) {
+			c["raw"].(map[string]any)["start_timeout"] = "soon"
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			config := rawChainConfig(t)
+			mutate(config)
+			if _, err := loadChainConfig(writeChainConfigFile(t, config)); err == nil {
+				t.Fatalf("accepted %s", name)
+			}
+		})
+	}
+	if _, err := loadChainConfig(writeChainConfigFile(t, rawChainConfig(t))); err != nil {
+		t.Fatalf("a plain raw session was rejected: %v", err)
+	}
+}
+
+func TestValidateChainStackRejectsARawSectionOnDocker(t *testing.T) {
+	config := minimalChainConfig()
+	config["raw"] = map[string]any{"bin_dir": "bin", "data_dir": "articles"}
+	if _, err := loadChainConfig(writeChainConfigFile(t, config)); err == nil {
+		t.Fatal("a docker session carrying raw stack settings was accepted")
+	}
+}
+
+func TestNewChainStackSettlesEveryEndpointFromTheStack(t *testing.T) {
+	if _, err := rawExecutionTarget(); err != nil {
+		t.Skipf("no native execution target on this host: %v", err)
+	}
+	config, err := loadChainConfig(writeChainConfigFile(t, rawChainConfig(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.LogDir = t.TempDir()
+	stack, err := newChainStack(&config, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stack.(*rawChainStack); !ok {
+		t.Fatalf("a raw session built a %T", stack)
+	}
+	// Nothing was started, but every endpoint a phase needs is now settled
+	// from the stack rather than restated by the operator.
+	if config.NNTPHost != "127.0.0.1" || config.NNTPPort != "8119" || config.NNTPTLSPort != "8563" {
+		t.Fatalf("endpoints %s:%s / %s", config.NNTPHost, config.NNTPPort, config.NNTPTLSPort)
+	}
+	if config.ShaperControlURL != "http://127.0.0.1:8080" {
+		t.Fatalf("control URL %q", config.ShaperControlURL)
+	}
+	if !strings.HasSuffix(config.CAFile, filepath.Join("certs", "ca.pem")) {
+		t.Fatalf("CA file %q", config.CAFile)
+	}
+	target, _ := rawExecutionTarget()
+	if config.Target != string(target) {
+		t.Fatalf("target %q, want %q on this host", config.Target, target)
+	}
+	// Those settled endpoints have to reach the phase itself.
+	args := strings.Join(chainPhaseArgs(config, config.Phases[0]), " ")
+	for _, want := range []string{"--nntp-port 8119", "--nntp-tls-port 8563", "--nntp-host 127.0.0.1", "--target " + string(target)} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("phase args %q do not carry %q", args, want)
+		}
+	}
+}
+
+func TestNewChainStackKeepsOperatorOverrides(t *testing.T) {
+	if _, err := rawExecutionTarget(); err != nil {
+		t.Skipf("no native execution target on this host: %v", err)
+	}
+	raw := rawChainConfig(t)
+	raw["nntp_host"] = "bench.local"
+	raw["raw"].(map[string]any)["plaintext_port"] = 9119
+	config, err := loadChainConfig(writeChainConfigFile(t, raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.LogDir = t.TempDir()
+	if _, err := newChainStack(&config, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if config.NNTPHost != "bench.local" {
+		t.Fatalf("host %q; a stated host must survive", config.NNTPHost)
+	}
+	if config.NNTPPort != "9119" {
+		t.Fatalf("port %q; a stated port must reach the phases", config.NNTPPort)
 	}
 }
