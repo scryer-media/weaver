@@ -1178,15 +1178,36 @@ GOOS=windows GOARCH=amd64 go build -o nativeadapter.exe ./cmd/nativeadapter
 GOOS=windows GOARCH=amd64 go build -o nntpbench.exe ./cmd/nntpbench
 ```
 
-Run the non-mutating preflight first; it prints the expected local
-executables and fails if the OS or a binary is missing. Add `--chain` when this
-host also serves the benchmark, and it covers the
-[raw stack](#raw-stack-the-server-side-without-docker) in the same report:
+The products are installed by hand — the harness never installs one — so all
+it needs is where they are, and the catalog is where it is told. Run the
+non-mutating preflight first and point it at that catalog: it resolves the
+launcher and the executable at the head of each `NATIVE_LAUNCH_COMMAND` and
+fails if the OS or any of them is missing, so a check cannot pass for a client
+the run will not launch. Add `--chain` when this host also serves the
+benchmark, and the [raw stack](#raw-stack-the-server-side-without-docker) is
+covered in the same report:
 
 ```bash
 go run ./cmd/nntpbench preflight --target macos-native \
-  --adapter /scratch/bin/nativeadapter --weaver /path/to/weaver --nzbget /path/to/nzbget
+  --adapters /scratch/runs/adapters.macos.json \
+  --chain /scratch/runs/raw-native.json
 ```
+
+An unedited catalog reports exactly what is left to stage:
+
+```
+missing  adapter   /scratch/nntp-bench-bin/nativeadapter
+missing  nzbget    /absolute/path/to/nzbget
+present  sabnzbd   /Applications/SABnzbd.app/Contents/MacOS/SABnzbd
+missing  weaver    /absolute/path/to/weaver
+```
+
+Naming the executables individually with `--adapter`, `--weaver`, `--sabnzbd`
+and `--nzbget` still works for a host with no catalog yet; giving both a
+catalog and the per-client flags is refused rather than silently resolved in
+favour of one. Preflight does not try to confirm a client's *version* — that
+needs the product running, so the adapter asserts it at the start of a run,
+before any NZB is submitted.
 
 Notes for the native catalogs:
 
@@ -1195,7 +1216,8 @@ Notes for the native catalogs:
   NZBGet paths as explicit replacements; the Windows catalog uses explicit
   paths throughout. The harness never installs a product implicitly — stage
   pinned installers, record their versions and hashes in the catalog, and use an
-  isolated working directory (for example `C:\bench`).
+  isolated working directory (for example `C:\bench`). `preflight --adapters`
+  is what confirms the paths in a filled-in catalog actually resolve.
 - `NATIVE_LAUNCH_COMMAND` is a JSON argv array, never a shell string, and may
   use `{{config_dir}}`, `{{nzb_path}}`, `{{output_dir}}`, `{{fixture_dir}}` and
   `{{api_port}}`. Commands must stay in the foreground so the launcher can

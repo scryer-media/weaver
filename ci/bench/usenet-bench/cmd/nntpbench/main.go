@@ -327,6 +327,8 @@ func preflight(args []string) error {
 	flags.StringVar(&rawDataDir, "raw-data-dir", "", "seeded article store for a raw stack")
 	flags.StringVar(&rawPasswordFile, "raw-password-file", "", "NNTP password file for a raw stack")
 	flags.StringVar(&rawHost, "raw-host", "", "address a raw stack binds (default 127.0.0.1)")
+	var adaptersPath string
+	flags.StringVar(&adaptersPath, "adapters", "", "adapter catalog to take the client executables from, so a check cannot name a client the run will not launch")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -344,9 +346,25 @@ func preflight(args []string) error {
 		HostOS:      runtime.GOOS,
 		HostMatches: runtime.GOOS == expectedHostOS,
 	}
-	if descriptor.ID == benchmark.DockerLinux {
+	switch {
+	case adaptersPath != "":
+		if adapterPath != "" || weaverPath != "" || sabPath != "" || nzbgetPath != "" {
+			return fmt.Errorf("--adapters already declares every executable the run launches; drop the per-client flags rather than naming them twice")
+		}
+		binaries, err := preflightCatalogBinaries(adaptersPath, descriptor.ID)
+		if err != nil {
+			return err
+		}
+		result.Binaries = append(result.Binaries, binaries...)
+		if descriptor.ID == benchmark.DockerLinux {
+			result.Binaries = append(result.Binaries, inspectExecutable("docker", dockerPath))
+		}
+	case descriptor.ID == benchmark.DockerLinux:
 		result.Binaries = append(result.Binaries, inspectExecutable("docker", dockerPath))
-	} else {
+		if adapterPath != "" {
+			result.Binaries = append(result.Binaries, inspectExecutable("clientadapter", adapterPath))
+		}
+	default:
 		if descriptor.ID == benchmark.MacOSNative && sabPath == "" {
 			sabPath = "/Applications/SABnzbd.app/Contents/MacOS/SABnzbd"
 		}
@@ -356,9 +374,6 @@ func preflight(args []string) error {
 			inspectExecutable("sabnzbd", sabPath),
 			inspectExecutable("nzbget", nzbgetPath),
 		)
-	}
-	if adapterPath != "" && descriptor.ID == benchmark.DockerLinux {
-		result.Binaries = append(result.Binaries, inspectExecutable("clientadapter", adapterPath))
 	}
 	rawConfig, wanted, err := preflightRawStack(chainPath, rawBinDir, rawDataDir, rawPasswordFile, rawHost)
 	if err != nil {
@@ -388,6 +403,89 @@ func preflight(args []string) error {
 		return fmt.Errorf("preflight is not ready for target %q", descriptor.ID)
 	}
 	return nil
+}
+
+// preflightCatalogBinaries checks the executables the catalog actually
+// launches. The products themselves are installed by hand, so all the harness
+// needs is where they are -- and the catalog is where it is told. Checking the
+// paths retyped on a command line instead would pass for a client the run
+// never launches.
+func preflightCatalogBinaries(path string, target benchmark.ExecutionTarget) ([]preflightBinary, error) {
+	catalog, err := benchmark.LoadAdapterCatalog(path)
+	if err != nil {
+		return nil, err
+	}
+	var matched []benchmark.Adapter
+	for _, adapter := range catalog.SortedAdapters() {
+		if adapter.Target == target {
+			matched = append(matched, adapter)
+		}
+	}
+	if len(matched) == 0 {
+		return nil, fmt.Errorf("adapter catalog %s declares no adapter for target %q", path, target)
+	}
+	binaries := inspectAdapterExecutables(matched)
+	if target == benchmark.DockerLinux {
+		return binaries, nil
+	}
+	for _, adapter := range matched {
+		binaries = append(binaries, inspectNativeClient(adapter))
+	}
+	return binaries, nil
+}
+
+// inspectAdapterExecutables checks the adapter each entry runs. A catalog
+// almost always points every client at the one staged launcher, so that case
+// is reported once rather than once per client; entries that name different
+// launchers are reported apart, because then they really are different files.
+func inspectAdapterExecutables(adapters []benchmark.Adapter) []preflightBinary {
+	shared := ""
+	for index, adapter := range adapters {
+		if len(adapter.Command) == 0 {
+			shared = ""
+			break
+		}
+		if index == 0 {
+			shared = adapter.Command[0]
+			continue
+		}
+		if adapter.Command[0] != shared {
+			shared = ""
+			break
+		}
+	}
+	if shared != "" {
+		return []preflightBinary{inspectExecutable("adapter", shared)}
+	}
+	binaries := make([]preflightBinary, 0, len(adapters))
+	for _, adapter := range adapters {
+		name := string(adapter.Client) + " adapter"
+		if len(adapter.Command) == 0 {
+			binaries = append(binaries, preflightBinary{Name: name, Status: "missing", Reason: "the catalog entry has no command"})
+			continue
+		}
+		binaries = append(binaries, inspectExecutable(name, adapter.Command[0]))
+	}
+	return binaries
+}
+
+// inspectNativeClient resolves the product a native adapter launches. The
+// executable is the first element of NATIVE_LAUNCH_COMMAND; the rest of the
+// argv is templated per run and cannot be checked ahead of one.
+func inspectNativeClient(adapter benchmark.Adapter) preflightBinary {
+	name := string(adapter.Client)
+	raw := adapter.Environment["NATIVE_LAUNCH_COMMAND"]
+	if strings.TrimSpace(raw) == "" {
+		return preflightBinary{Name: name, Status: "missing", Reason: "the catalog entry sets no NATIVE_LAUNCH_COMMAND"}
+	}
+	var argv []string
+	if err := json.Unmarshal([]byte(raw), &argv); err != nil {
+		return preflightBinary{Name: name, Status: "missing", Reason: fmt.Sprintf("NATIVE_LAUNCH_COMMAND is not a JSON argv array: %v", err)}
+	}
+	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
+		return preflightBinary{Name: name, Status: "missing", Reason: "NATIVE_LAUNCH_COMMAND names no program"}
+	}
+	return inspectExecutable(name, argv[0])
 }
 
 // preflightRawStack settles the stack to check. Taking it from the chain
