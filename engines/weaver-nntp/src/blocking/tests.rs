@@ -342,7 +342,7 @@ fn connect_with_backend(config: &ServerConfig, backend: NntpTlsBackend) -> Block
 
 /// A plain server that answers each AUTHINFO line as it arrives, then
 /// answers nothing until every pipelined line has arrived — so a client
-/// that pipelined AUTHINFO, or serialized MODE READER and GROUP, fails.
+/// that pipelined AUTHINFO, or serialized the rest of the setup, fails.
 fn spawn_blocking_pipelined_setup_server(
     auth: Vec<(&'static str, &'static [u8])>,
     expected: Vec<&'static str>,
@@ -373,7 +373,7 @@ fn spawn_blocking_pipelined_setup_server(
             let read = reader.read_line(&mut line);
             assert!(
                 matches!(read, Ok(n) if n > 0),
-                "client did not pipeline MODE READER and GROUP; received {lines:?}"
+                "client did not pipeline the setup commands; received {lines:?}"
             );
             lines.push(line);
         }
@@ -404,20 +404,203 @@ fn blocking_pipelined_setup_config(port: u16) -> ServerConfig {
     }
 }
 
-/// A server that has already proven it needs both prologue commands gets
-/// them in one write, after the serial AUTHINFO exchange.
+/// A plain server that answers probe commands from a fixed spool, recording
+/// every command line it received so a test can assert what was asked.
+///
+/// `stat_reply` and `head_reply` stand in for the status line a server sends
+/// for an article it does not hold, so a test can make either command look
+/// unimplemented.
+fn spawn_blocking_probe_server(
+    held: &'static [&'static str],
+    stat_reply: &'static [u8],
+    head_reply: &'static [u8],
+) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket.write_all(b"200 ready\r\n").unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let command = line.trim_end_matches(['\r', '\n']).to_string();
+            recorder.lock().unwrap().push(command.clone());
+            let upper = command.to_ascii_uppercase();
+            let response: Vec<u8> = if upper.starts_with("AUTHINFO USER") {
+                b"381 password\r\n".to_vec()
+            } else if upper.starts_with("AUTHINFO PASS") {
+                b"281 authenticated\r\n".to_vec()
+            } else if let Some(id) = upper.strip_prefix("STAT ") {
+                if held.contains(&id.trim()) {
+                    format!("223 0 {} article exists\r\n", id.trim()).into_bytes()
+                } else {
+                    stat_reply.to_vec()
+                }
+            } else if let Some(id) = upper.strip_prefix("HEAD ") {
+                if held.contains(&id.trim()) {
+                    format!(
+                        "221 0 {} headers follow\r\nSubject: probe\r\n.\r\n",
+                        id.trim()
+                    )
+                    .into_bytes()
+                } else {
+                    head_reply.to_vec()
+                }
+            } else if upper.starts_with("QUIT") {
+                let _ = socket.write_all(b"205 closing\r\n");
+                break;
+            } else {
+                b"500 command not recognized\r\n".to_vec()
+            };
+            if socket.write_all(&response).is_err() {
+                break;
+            }
+        }
+    });
+    (port, seen, handle)
+}
+
+fn probe_config(port: u16) -> ServerConfig {
+    let mut config = blocking_pipelined_setup_config(port);
+    config.username = None;
+    config.password = None;
+    config
+}
+
+/// The probe asks STAT for the whole batch and HEAD only for what STAT could
+/// not find, because a provider's STAT index can lag its spool.
 #[test]
-fn blocking_known_pipelining_servers_authenticate_then_get_mode_reader_and_group_in_one_write() {
+fn a_probe_batch_heads_only_the_articles_stat_missed() {
+    const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
+    let (port, seen, handle) =
+        spawn_blocking_probe_server(HELD, b"430 no such article\r\n", b"430 no such article\r\n");
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    let verdicts = conn
+        .probe_exists(&[
+            "<held@silver.horizon>".to_string(),
+            "<gone@silver.horizon>".to_string(),
+        ])
+        .unwrap();
+    drop(conn);
+    handle.join().unwrap();
+
+    assert_eq!(verdicts, vec![true, false]);
+    let seen = seen.lock().unwrap().clone();
+    let heads: Vec<&String> = seen
+        .iter()
+        .filter(|line| line.to_ascii_uppercase().starts_with("HEAD "))
+        .collect();
+    assert_eq!(
+        heads.len(),
+        1,
+        "only the STAT miss is worth a HEAD; saw {seen:?}"
+    );
+    assert!(heads[0].contains("gone@silver.horizon"));
+}
+
+/// A 500 to STAT means the server does not implement it. The batch is settled
+/// with HEAD instead, the fact is remembered, and the connection is untouched.
+#[test]
+fn a_server_without_stat_is_probed_with_head_and_stays_healthy() {
+    const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
+    let (port, seen, handle) = spawn_blocking_probe_server(
+        HELD,
+        b"500 command not recognized\r\n",
+        b"430 no such article\r\n",
+    );
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    let verdicts = conn
+        .probe_exists(&[
+            "<held@silver.horizon>".to_string(),
+            "<gone@silver.horizon>".to_string(),
+        ])
+        .unwrap();
+    assert_eq!(verdicts, vec![true, false]);
+    assert!(!conn.poisoned, "a missing command is not a broken socket");
+    assert!(!crate::server_caps::supports_stat(
+        &config.host,
+        config.port
+    ));
+
+    // The next batch skips STAT entirely.
+    let seen_before = seen.lock().unwrap().len();
+    let again = conn
+        .probe_exists(&["<held@silver.horizon>".to_string()])
+        .unwrap();
+    drop(conn);
+    handle.join().unwrap();
+
+    assert_eq!(again, vec![true]);
+    let asked: Vec<String> = seen.lock().unwrap()[seen_before..].to_vec();
+    assert!(
+        asked
+            .iter()
+            .all(|line| !line.to_ascii_uppercase().starts_with("STAT ")),
+        "a retired command must not be sent again; saw {asked:?}"
+    );
+    crate::server_caps::forget(&config.host, config.port);
+}
+
+/// Where HEAD is the missing command, STAT's verdict is the final one: the
+/// batch settles rather than reporting itself unanswerable.
+#[test]
+fn a_server_without_head_settles_on_the_stat_verdict() {
+    const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
+    let (port, _seen, handle) = spawn_blocking_probe_server(
+        HELD,
+        b"430 no such article\r\n",
+        b"500 command not recognized\r\n",
+    );
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    let verdicts = conn
+        .probe_exists(&[
+            "<held@silver.horizon>".to_string(),
+            "<gone@silver.horizon>".to_string(),
+        ])
+        .unwrap();
+    drop(conn);
+    handle.join().unwrap();
+
+    assert_eq!(verdicts, vec![true, false]);
+    assert!(!crate::server_caps::supports_head(
+        &config.host,
+        config.port
+    ));
+    crate::server_caps::forget(&config.host, config.port);
+}
+
+/// A server that has proven it needs a selected group gets the GROUP in the
+/// same write, after the serial AUTHINFO exchange. Nothing else joins it —
+/// MODE READER is never sent to anyone.
+#[test]
+fn blocking_known_pipelining_servers_authenticate_then_get_the_group_in_one_write() {
     let (port, handle) = spawn_blocking_pipelined_setup_server(
         vec![
             ("AUTHINFO USER user", b"381 password\r\n"),
             ("AUTHINFO PASS pass", b"281 welcome\r\n"),
         ],
-        vec!["MODE READER", "GROUP alt.test"],
-        b"200 reader\r\n211 1 1 1 alt.test\r\n",
+        vec!["GROUP alt.test"],
+        b"211 1 1 1 alt.test\r\n",
     );
-    crate::prologue::note_mode_reader_required("127.0.0.1", port);
-    crate::prologue::note_group_required("127.0.0.1", port);
+    crate::server_caps::note_group_required("127.0.0.1", port);
 
     let mut conn = BlockingNntpConnection::connect_with_ip_policy_for_group(
         &blocking_pipelined_setup_config(port),
@@ -432,11 +615,11 @@ fn blocking_known_pipelining_servers_authenticate_then_get_mode_reader_and_group
     conn.select_group("alt.test").unwrap();
     drop(conn);
     handle.join().unwrap();
-    crate::prologue::forget("127.0.0.1", port);
+    crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// The default prologue is authentication and nothing else, so the first
-/// line after the last AUTHINFO answer is the caller's own command.
+/// Session setup is authentication and nothing else, so the first line after
+/// the last AUTHINFO answer is the caller's own command.
 #[test]
 fn blocking_unproven_server_gets_no_mode_reader_and_no_group() {
     let (port, handle) = spawn_blocking_pipelined_setup_server(
@@ -467,13 +650,13 @@ fn blocking_unproven_server_gets_no_mode_reader_and_no_group() {
     assert_eq!(response.code.raw(), 430);
     drop(conn);
     handle.join().unwrap();
-    crate::prologue::forget("127.0.0.1", port);
+    crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// A refusal to the first post-setup command teaches the process, once,
-/// what this server wants before it will answer.
+/// A 500 to BODY is the server refusing that command and nothing more: the
+/// connection stays usable and no future connection changes its behaviour.
 #[test]
-fn blocking_refusal_after_setup_records_the_mode_reader_requirement() {
+fn blocking_500_after_setup_leaves_the_connection_alone() {
     let (port, handle) = spawn_blocking_pipelined_setup_server(
         vec![
             ("AUTHINFO USER user", b"381 password\r\n"),
@@ -490,23 +673,21 @@ fn blocking_refusal_after_setup_records_the_mode_reader_requirement() {
         None,
     )
     .unwrap();
-    assert!(!crate::prologue::prologue_for("127.0.0.1", port).mode_reader);
 
-    let _ = conn.send_command(&Command::Body(ArticleId::MessageId(
-        "<first@example.com>".to_string(),
-    )));
-
+    let response = conn
+        .send_command(&Command::Body(ArticleId::MessageId(
+            "<first@example.com>".to_string(),
+        )))
+        .unwrap();
+    assert_eq!(response.code.raw(), 500);
+    assert!(!conn.poisoned, "a refused command is not a broken socket");
     assert!(
-        crate::prologue::prologue_for("127.0.0.1", port).mode_reader,
-        "the refusal should have been recorded against the server"
-    );
-    assert!(
-        conn.poisoned,
-        "the probed connection is discarded so the retry opens a taught one"
+        !conn.needs_group_prologue(),
+        "a refused BODY says nothing about groups"
     );
     drop(conn);
     handle.join().unwrap();
-    crate::prologue::forget("127.0.0.1", port);
+    crate::server_caps::forget("127.0.0.1", port);
 }
 
 /// A 412 for a message-id fetch is the server insisting on a selected
@@ -542,7 +723,7 @@ fn blocking_412_after_setup_records_the_group_requirement() {
     assert!(conn.poisoned);
     drop(conn);
     handle.join().unwrap();
-    crate::prologue::forget("127.0.0.1", port);
+    crate::server_caps::forget("127.0.0.1", port);
 }
 
 #[test]

@@ -844,6 +844,80 @@ async fn par2_metadata_bootstrap_does_not_hold_payload_for_late_indexless_discov
     );
 }
 
+/// Recovery rides the same owned lanes as ordinary work.
+///
+/// Recovery used to be pushed onto the async pool and pinned to sequential
+/// mode: the work a job is *waiting on* to finish paid a cold dial and gave
+/// back the round trip pipelining exists to hide. A recovery lease is now an
+/// ordinary lease as far as lane selection and depth are concerned.
+#[tokio::test]
+async fn a_recovery_lease_takes_an_owned_lane_at_the_ordinary_depth() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40143);
+    // A plaintext server: an owned lane is no longer a TLS-only arrangement.
+    pipeline.nntp = std::sync::Arc::new(NntpClient::new(NntpClientConfig {
+        servers: vec![weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "plain.example.invalid".to_string(),
+                port: 119,
+                tls: false,
+                ..Default::default()
+            },
+            max_connections: 2,
+            ..Default::default()
+        }],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(1),
+    }));
+    let work = DownloadWork {
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 1,
+            },
+            segment_number: 1,
+        },
+        message_id: MessageId::new("recovery-lane@example.invalid"),
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+        priority: 0,
+        byte_estimate: 1024,
+        retry_count: 0,
+        is_recovery: true,
+        completion_critical: true,
+        exclude_servers: Vec::new(),
+        avoid_server: None,
+    };
+    let compatibility = DownloadBatchCompatibility::from_work(&work);
+    let lease = DownloadBatchLease {
+        job_id,
+        runtime_generation: pipeline.pool_generation,
+        lane_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
+        server_modes: Vec::new(),
+        compatibility,
+        effective_exclude_servers: Vec::new(),
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        pressure_clear: true,
+        works: vec![work],
+    };
+
+    assert!(
+        pipeline.should_use_owned_blocking_lane(&lease),
+        "a recovery lease must be eligible for a cached owned lane"
+    );
+
+    let pressure = pipeline.refresh_download_pressure();
+    let ordinary = pipeline.choose_download_lane_mode(job_id, false, pressure);
+    let pressure = pipeline.refresh_download_pressure();
+    let recovery = pipeline.choose_download_lane_mode(job_id, true, pressure);
+    assert_eq!(
+        recovery, ordinary,
+        "recovery must not be pinned to a shallower lane than ordinary work"
+    );
+}
+
 #[tokio::test]
 async fn recovery_async_handoff_keeps_owned_lane_caches() {
     let temp_dir = tempfile::tempdir().unwrap();

@@ -580,16 +580,18 @@ impl Pipeline {
         self.shared_state.server_probe_latency(stable_id.0)
     }
 
-    pub(in crate::pipeline::download::worker) fn should_use_owned_blocking_lane(
+    /// Whether this lease can run on an owned blocking lane.
+    ///
+    /// Every class of work does, recovery included. Holding PAR2 recovery back
+    /// on the async path made it the only consumer of a connection permit that
+    /// idle owned lanes were sitting on, so each recovery lease had to prise a
+    /// permit loose and open a fresh socket — greeting and authentication and,
+    /// on TLS, a handshake — for work that is by definition on the critical
+    /// path of finishing a job.
+    pub(in crate::pipeline) fn should_use_owned_blocking_lane(
         &self,
         lease: &DownloadBatchLease,
     ) -> bool {
-        if lease.compatibility.is_recovery {
-            return false;
-        }
-        if lease.works.iter().any(|work| work.is_recovery) {
-            return false;
-        }
         self.nntp
             .has_blocking_body_lane_candidate(&lease.effective_exclude_servers)
     }
@@ -608,16 +610,19 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline::download::worker) fn choose_download_lane_mode(
+    /// The depth a new lease is dispatched at.
+    ///
+    /// Recovery is no longer singled out for sequential mode. It rides the
+    /// same owned lanes as everything else now, and a lane whose depth is
+    /// pinned to one gives back the round trip the pipeline exists to hide —
+    /// on exactly the work a job is waiting on to finish.
+    pub(in crate::pipeline) fn choose_download_lane_mode(
         &mut self,
         job_id: JobId,
         is_recovery: bool,
         pressure: DownloadPressure,
     ) -> DownloadLaneMode {
-        let _ = job_id;
-        if is_recovery {
-            return DownloadLaneMode::Sequential;
-        }
+        let _ = (job_id, is_recovery);
         let pressure_clear = pressure.state == DownloadPressureState::Clear;
         self.download_lane_runtime
             .servers
@@ -633,10 +638,7 @@ impl Pipeline {
         is_recovery: bool,
         pressure: DownloadPressure,
     ) -> Vec<(usize, DownloadLaneMode)> {
-        let _ = job_id;
-        if is_recovery {
-            return Vec::new();
-        }
+        let _ = (job_id, is_recovery);
         let pressure_clear = pressure.state == DownloadPressureState::Clear;
         self.download_lane_runtime
             .servers
