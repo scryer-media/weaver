@@ -698,6 +698,13 @@ func assertHealthProbeScenario(jobID int, assertion *ScenarioHealthProbeAssertio
 	if assertion.RequireActivated && activated == 0 {
 		return errors.New("the health probe never activated for this job; the fixture's damage did not cross the activation threshold")
 	}
+	if assertion.ForbidActivated && activated > 0 {
+		return fmt.Errorf(
+			"the health probe activated %d time(s) for this job; the fixture's damage is a hole the "+
+				"recovery set covers, and sampling it is work the probe policy rules out",
+			activated,
+		)
+	}
 	if assertion.ForbidInconclusive && inconclusive > 0 {
 		return fmt.Errorf(
 			"%d of %d health probe round(s) ended inconclusive: a confirmation batch hit its "+

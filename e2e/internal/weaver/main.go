@@ -83,6 +83,10 @@ type ScenarioHealthProbeAssertion struct {
 	// fixture's damage must be enough to cross the activation threshold, or
 	// the rest of the assertion is vacuous.
 	RequireActivated bool `json:"requireActivated,omitempty"`
+	// ForbidActivated demands the probe stayed off for this job — the damage
+	// is a hole the recovery set already covers, or a single file failing
+	// while the rest of the posting lands, and sampling would add nothing.
+	ForbidActivated bool `json:"forbidActivated,omitempty"`
 	// ForbidInconclusive fails the job if any probe round ended inconclusive:
 	// a confirmation batch that hit its transport deadline instead of getting
 	// an answer, which on a healthy server is the probe waiting on a lane it
