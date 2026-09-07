@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
 )
 
 func shippedChainExamples(t *testing.T) []string {
@@ -73,6 +74,79 @@ func TestChainPhasePlanNamesAgreeWithTheirStorageProfile(t *testing.T) {
 			if !strings.Contains(strings.ToLower(phase.Plan), want) {
 				t.Errorf("%s: phase %s uses storage profile %q but its plan is named %q",
 					filepath.Base(path), phase.Name, profile, phase.Plan)
+			}
+		}
+	}
+}
+
+// recoveryVolumeProfileMarkers are the substrings a fixture id carries when its
+// repair profile posts .rev volumes. Taking them from the profile constants
+// means a renamed profile moves the check with it rather than quietly emptying
+// it.
+var recoveryVolumeProfileMarkers = []string{
+	string(fixture.RARRecoveryVolumeLightProfile),
+	string(fixture.RARRecoveryVolumeHeavyProfile),
+}
+
+func namesARecoveryVolumeFixture(id string) bool {
+	for _, marker := range recoveryVolumeProfileMarkers {
+		if strings.Contains(id, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// A client excluded from one .rev fixture is excluded for a capability it does
+// not have, and a capability cannot be absent for one fixture and present for
+// its sibling. So a phase that excludes a client from some of its .rev
+// fixtures and not the rest has missed one: the client is scheduled against a
+// run it cannot finish, and the failure lands as an ordinary did-not-finish
+// carrying none of the reason the exclusion would have put in the summary.
+func TestAClientExcludedFromOneRecoveryVolumeFixtureIsExcludedFromAll(t *testing.T) {
+	for _, path := range shippedChainExamples(t) {
+		config, err := loadChainConfig(path)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		for _, phase := range config.Phases {
+			if phase.PlanSpec == nil {
+				continue
+			}
+			// The run drops excluded fixtures with this same resolver, so the
+			// check sees the corpus the phase actually posts.
+			active, err := excludeFixtures(phase.PlanSpec.Fixtures, phase.PlanSpec.ExcludeFixtures)
+			if err != nil {
+				t.Fatalf("%s: phase %s: %v", filepath.Base(path), phase.Name, err)
+			}
+			var recoveryVolume []string
+			for _, id := range active {
+				if namesARecoveryVolumeFixture(id) {
+					recoveryVolume = append(recoveryVolume, id)
+				}
+			}
+			if len(recoveryVolume) == 0 {
+				continue
+			}
+			excluded := make(map[string]map[string]bool)
+			for _, exclusion := range phase.PlanSpec.ExcludeClients {
+				if !namesARecoveryVolumeFixture(exclusion.FixtureID) {
+					continue
+				}
+				if excluded[exclusion.Client] == nil {
+					excluded[exclusion.Client] = make(map[string]bool)
+				}
+				excluded[exclusion.Client][exclusion.FixtureID] = true
+			}
+			for client, covered := range excluded {
+				for _, id := range recoveryVolume {
+					if covered[id] {
+						continue
+					}
+					t.Errorf("%s: phase %s excludes %s from %d of its %d .rev fixtures but not from %s;"+
+						" a .rev exclusion is a capability the client lacks, so it holds for that fixture too",
+						filepath.Base(path), phase.Name, client, len(covered), len(recoveryVolume), id)
+				}
 			}
 		}
 	}

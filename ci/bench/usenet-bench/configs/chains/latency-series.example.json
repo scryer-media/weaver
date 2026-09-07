@@ -158,6 +158,11 @@
           },
           {
             "client": "sabnzbd",
+            "fixture_id": "repair-rar5-recovery-rar-recovery-volume-heavy-normal-solid-headers-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and this heavy profile deletes two archive volumes, so nothing else on disk can supply them; excluded on the same capability grounds as its three siblings, which were listed after the 2026-09-05 run while this one was missed"
+          },
+          {
+            "client": "sabnzbd",
             "fixture_id": "repair-rar5-store-recovery-rar-recovery-volume-heavy-store-nonsolid-none-incompressible",
             "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
           }
@@ -217,6 +222,11 @@
             "client": "sabnzbd",
             "fixture_id": "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
             "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-recovery-rar-recovery-volume-heavy-normal-solid-headers-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and this heavy profile deletes two archive volumes, so nothing else on disk can supply them; excluded on the same capability grounds as its three siblings, which were listed after the 2026-09-05 run while this one was missed"
           },
           {
             "client": "sabnzbd",
@@ -287,6 +297,11 @@
             "client": "sabnzbd",
             "fixture_id": "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
             "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-recovery-rar-recovery-volume-heavy-normal-solid-headers-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and this heavy profile deletes two archive volumes, so nothing else on disk can supply them; excluded on the same capability grounds as its three siblings, which were listed after the 2026-09-05 run while this one was missed"
           },
           {
             "client": "sabnzbd",
