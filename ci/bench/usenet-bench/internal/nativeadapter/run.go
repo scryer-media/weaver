@@ -6,15 +6,18 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/clientadapter"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/netcheck"
 )
 
 // Run executes a native product through its public control API. Sequential
@@ -266,7 +269,28 @@ type nativeProcess struct {
 	err     error
 }
 
+// checkAPIPortFree refuses to launch a client onto a port something else is
+// already listening on. The product does not necessarily refuse: SABnzbd
+// relocates to the next free port and rewrites its own ini, after which this
+// adapter polls the original port and reads whatever stranger answers there --
+// waiting on someone else's HTTP until the job timeout, or worse, mistaking
+// their responses for the client's. Nothing downstream can detect that, so it
+// has to be refused here, immediately before the launch that would cause it.
+func checkAPIPortFree(endpoint string) error {
+	host, port, err := nativeAPIAddress(endpoint)
+	if err != nil {
+		return err
+	}
+	if err := netcheck.Available(net.JoinHostPort(host, strconv.Itoa(port))); err != nil {
+		return fmt.Errorf("the client API address is not this run's to use: %w", err)
+	}
+	return nil
+}
+
 func startProcess(ctx context.Context, cfg Config, spec productSpec) (*nativeProcess, error) {
+	if err := checkAPIPortFree(cfg.APIEndpoint); err != nil {
+		return nil, err
+	}
 	logPath := filepath.Join(cfg.ConfigDir, "native-client.log")
 	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {

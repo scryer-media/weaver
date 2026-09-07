@@ -1,6 +1,7 @@
 package nativeadapter
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,7 +15,14 @@ func TestNativeNZBGetNamesItsSevenZipBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(spec.Content), "SevenZipCmd=7z") {
+	named := false
+	for _, name := range NZBGetSevenZipNames {
+		if strings.Contains(string(spec.Content), "SevenZipCmd="+name) || strings.Contains(string(spec.Content), string(filepath.Separator)+name+"\n") {
+			named = true
+			break
+		}
+	}
+	if !named {
 		t.Fatalf("native NZBGet config does not name a 7-Zip binary:\n%s", spec.Content)
 	}
 }

@@ -11,13 +11,17 @@ import (
 
 const linkShapingReportSchemaVersion = 1
 
-// Link shaping mechanisms as the container entrypoint records them. Egress is
-// always netem; ingress is netem on an ifb mirror when the host kernel offers
-// one, and otherwise absent, with the whole round trip carried by egress.
+// Link shaping mechanisms. On Linux the container entrypoint renders the round
+// trip with tc: egress is always netem, and ingress is netem on an ifb mirror
+// when the host kernel offers one, otherwise absent with the whole round trip
+// carried by egress. On a host with no tc -- Windows, macOS -- the proxy
+// carries the delay itself and both directions report the userspace mechanism.
+// The two never mix in one report and never aggregate into one result.
 const (
 	LinkEgressNetem     = "netem"
 	LinkIngressIFBNetem = "ifb-netem"
 	LinkIngressNone     = "none"
+	LinkDelayUserspace  = "userspace-delay"
 )
 
 // LinkShapingReport is what the shaper container's entrypoint wrote after it
@@ -38,6 +42,15 @@ type LinkShapingReport struct {
 	TCPWmem            string `json:"tcp_wmem"`
 	TCPRmem            string `json:"tcp_rmem"`
 	KernelRelease      string `json:"kernel_release"`
+	// The userspace mechanism adds these and leaves every netem-only field
+	// above empty. HandshakeDelayMicros is the whole round trip charged once
+	// when a connection opens, which is the TCP handshake a proxy cannot
+	// delay by relaying bytes. The queue sizes bound the bytes each direction
+	// holds in flight and are the userspace analogue of the netem packet limit.
+	HandshakeDelayMicros uint64 `json:"handshake_delay_micros,omitempty"`
+	EgressQueueBytes     uint64 `json:"egress_queue_bytes,omitempty"`
+	IngressQueueBytes    uint64 `json:"ingress_queue_bytes,omitempty"`
+	Platform             string `json:"platform,omitempty"`
 	// Live fields are filled per snapshot from `tc qdisc show`, never copied
 	// from the declared values, so a qdisc that was removed or replaced after
 	// startup shows up as a mismatch rather than a stale promise.
@@ -74,11 +87,30 @@ func (r LinkShapingReport) validateDeclared(rttMicros uint64) error {
 	if r.RTTMicros != rttMicros {
 		return fmt.Errorf("declares a %dus round trip, process configured for %dus", r.RTTMicros, rttMicros)
 	}
+	switch r.EgressMechanism {
+	case LinkEgressNetem:
+		if err := r.validateNetem(); err != nil {
+			return err
+		}
+	case LinkDelayUserspace:
+		if err := r.validateUserspace(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("egress mechanism %q, want %q or %q", r.EgressMechanism, LinkEgressNetem, LinkDelayUserspace)
+	}
+	if r.EgressDelayMicros == 0 || r.EgressDelayMicros+r.IngressDelayMicros != r.RTTMicros {
+		return fmt.Errorf("egress %dus + ingress %dus does not make up the %dus round trip", r.EgressDelayMicros, r.IngressDelayMicros, r.RTTMicros)
+	}
+	if r.LiveEgressDelayMicros != 0 || r.LiveIngressDelayMicros != 0 || r.LiveError != "" {
+		return fmt.Errorf("live fields must be empty in the entrypoint report")
+	}
+	return nil
+}
+
+func (r LinkShapingReport) validateNetem() error {
 	if r.Interface == "" {
 		return fmt.Errorf("names no shaped interface")
-	}
-	if r.EgressMechanism != LinkEgressNetem {
-		return fmt.Errorf("egress mechanism %q, want %q", r.EgressMechanism, LinkEgressNetem)
 	}
 	switch r.IngressMechanism {
 	case LinkIngressIFBNetem:
@@ -92,14 +124,40 @@ func (r LinkShapingReport) validateDeclared(rttMicros uint64) error {
 	default:
 		return fmt.Errorf("unknown ingress mechanism %q", r.IngressMechanism)
 	}
-	if r.EgressDelayMicros == 0 || r.EgressDelayMicros+r.IngressDelayMicros != r.RTTMicros {
-		return fmt.Errorf("egress %dus + ingress %dus does not make up the %dus round trip", r.EgressDelayMicros, r.IngressDelayMicros, r.RTTMicros)
-	}
 	if r.NetemLimitPackets == 0 {
 		return fmt.Errorf("netem queue limit is unset")
 	}
-	if r.LiveEgressDelayMicros != 0 || r.LiveIngressDelayMicros != 0 || r.LiveError != "" {
-		return fmt.Errorf("live fields must be empty in the entrypoint report")
+	if r.HandshakeDelayMicros != 0 || r.EgressQueueBytes != 0 || r.IngressQueueBytes != 0 || r.Platform != "" {
+		return fmt.Errorf("netem path carries userspace delay fields")
+	}
+	return nil
+}
+
+// validateUserspace holds the userspace mechanism to the shape only it can
+// have. Every netem field must be empty: a report that names an interface or a
+// qdisc limit was written for a mechanism this process does not run, and
+// serving it would present tc evidence for a delay tc never applied.
+func (r LinkShapingReport) validateUserspace() error {
+	if r.IngressMechanism != LinkDelayUserspace {
+		return fmt.Errorf("ingress mechanism %q, want %q", r.IngressMechanism, LinkDelayUserspace)
+	}
+	if r.Interface != "" || r.IngressDevice != "" {
+		return fmt.Errorf("userspace delay names a shaped device (%q/%q); it shapes no device", r.Interface, r.IngressDevice)
+	}
+	if r.NetemLimitPackets != 0 || r.TCPWmem != "" || r.TCPRmem != "" || r.KernelRelease != "" {
+		return fmt.Errorf("userspace delay carries netem or kernel fields")
+	}
+	if r.IngressDelayMicros == 0 {
+		return fmt.Errorf("userspace delay has no client-to-server delay")
+	}
+	if r.HandshakeDelayMicros != r.RTTMicros {
+		return fmt.Errorf("handshake delay %dus does not match the %dus round trip", r.HandshakeDelayMicros, r.RTTMicros)
+	}
+	if r.EgressQueueBytes == 0 || r.IngressQueueBytes == 0 {
+		return fmt.Errorf("userspace delay has an unset queue size (egress %d, ingress %d bytes)", r.EgressQueueBytes, r.IngressQueueBytes)
+	}
+	if r.Platform == "" {
+		return fmt.Errorf("userspace delay names no platform")
 	}
 	return nil
 }

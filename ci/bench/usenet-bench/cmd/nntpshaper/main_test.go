@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -109,3 +111,139 @@ func TestCensusWriterCountsOnlyForwardedBytes(t *testing.T) {
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+// fakeNNTP is the smallest upstream that behaves like a news server for
+// timing purposes: it greets on connect and answers each command line.
+func fakeNNTP(t *testing.T, bodyBytes int) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer connection.Close()
+				if _, err := connection.Write([]byte("200 ready\r\n")); err != nil {
+					return
+				}
+				reader := bufio.NewReader(connection)
+				for {
+					if _, err := reader.ReadString('\n'); err != nil {
+						return
+					}
+					body := append([]byte("222 body\r\n"), bytes.Repeat([]byte("a"), bodyBytes)...)
+					if _, err := connection.Write(body); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
+}
+
+func shapedTestProxy(t *testing.T, rttMicros uint64, bodyBytes int) net.Addr {
+	t.Helper()
+	upstream := fakeNNTP(t, bodyBytes)
+	link, err := nntpshaper.NewUserspaceLink(nntpshaper.UserspaceLinkConfig{
+		RTTMicros:           rttMicros,
+		EgressBitsPerSecond: 1_000_000_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	limiter, err := nntpshaper.NewAggregateLimiter(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestation := nntpshaper.NewAttestation(nntpshaper.AttestationConfig{RTTMicros: rttMicros, StartedAt: time.Now()})
+	if err := attestation.AcquireExecutionLease(strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	front, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); _ = front.Close() })
+	go serve(ctx, front, listenerConfig{upstream: upstream.Addr().String(), label: "plaintext"}, limiter, attestation, link)
+	return front.Addr()
+}
+
+func TestProxyChargesTheUserspaceRoundTrip(t *testing.T) {
+	const rtt = 60 * time.Millisecond
+	address := shapedTestProxy(t, uint64(rtt/time.Microsecond), 0)
+
+	start := time.Now()
+	client, err := net.Dial("tcp", address.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reader := bufio.NewReader(client)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	greeting := time.Since(start)
+	// A real client waits one round trip for the TCP handshake and another
+	// half for the greeting to propagate back.
+	if greeting < rtt*3/2-5*time.Millisecond {
+		t.Fatalf("greeting arrived after %s, want at least one and a half %s round trips", greeting, rtt)
+	}
+	if greeting > rtt*3/2+250*time.Millisecond {
+		t.Fatalf("greeting arrived after %s, far beyond one and a half %s round trips", greeting, rtt)
+	}
+
+	start = time.Now()
+	if _, err := client.Write([]byte("BODY <article@bench>\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	exchange := time.Since(start)
+	if exchange < rtt-5*time.Millisecond {
+		t.Fatalf("a command and its response took %s, want a whole %s round trip", exchange, rtt)
+	}
+	if exchange > rtt+250*time.Millisecond {
+		t.Fatalf("a command and its response took %s, far beyond one %s round trip", exchange, rtt)
+	}
+}
+
+func TestProxyDelaysWithoutSerializingThroughput(t *testing.T) {
+	const rtt = 60 * time.Millisecond
+	const body = 1 << 20
+	address := shapedTestProxy(t, uint64(rtt/time.Microsecond), body)
+
+	client, err := net.Dial("tcp", address.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reader := bufio.NewReader(client)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := client.Write([]byte("BODY <article@bench>\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(reader, make([]byte, body)); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	// A megabyte crosses the delay line in thirty-odd chunks. They ride the
+	// link together, so the body costs one round trip -- not one per chunk.
+	if elapsed > 3*rtt {
+		t.Fatalf("a %d byte body took %s across a %s link; the delay line is serializing the stream", body, elapsed, rtt)
+	}
+}

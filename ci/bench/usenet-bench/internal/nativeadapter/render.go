@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -131,6 +132,14 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 		"direct_unpack = " + direct,
 		"pre_check = 0",
 		"pause_on_post_processing = 0",
+		// SABnzbd 5 pipelines two BODY requests per connection for a server
+		// added through its UI but downgrades every server it finds in an
+		// ini older than config conversion 5 to one request per connection.
+		// Stamping the current conversion number keeps the rendered server
+		// exactly as a fresh install would create it. Without it a native run
+		// fetches one article per round trip and is not the same measurement
+		// as the Docker lane's.
+		"config_conversion_version = 5",
 		"",
 		"[servers]",
 		"[[benchmark]]",
@@ -139,6 +148,8 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 		"username = " + cfg.NNTPUsername,
 		"password = " + cfg.NNTPPassword,
 		"connections = " + strconv.Itoa(cfg.Connections),
+		// SABnzbd's own default for a newly added server (5.0 and later).
+		"pipelining_requests = 2",
 		"ssl = " + ssl,
 		// Native SAB follows the same explicitly labelled local TLS policy as
 		// Docker. No result may claim CA verification for this product.
@@ -152,14 +163,55 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 	}
 }
 
-// nzbgetSevenZipCommand is the official 7-Zip console binary a native NZBGet
-// install resolves from PATH. The 7z corpus lane needs it, so it is stated
-// rather than left to NZBGet's built-in default: a host without it then fails
-// loudly instead of quietly skipping every 7z unpack.
-const nzbgetSevenZipCommand = "7z"
+// NZBGetSevenZipCommand and NZBGetUnrarCommand are the canonical names of the
+// unpackers NZBGet shells out to. The RAR and 7z corpus lanes need them, so
+// they are stated rather than left to NZBGet's built-in defaults, which vary
+// by package: a host without one then fails loudly instead of quietly skipping
+// every unpack.
+const (
+	NZBGetSevenZipCommand = "7z"
+	NZBGetUnrarCommand    = "unrar"
+)
+
+// NZBGetSevenZipNames and NZBGetUnrarNames are the names the same unpacker is
+// installed under. 7-Zip in particular is "7z" from a package manager, "7za"
+// in NZBGet's own macOS bundle and "7zz" from upstream, and NZBGet runs
+// whichever the config names.
+var (
+	NZBGetSevenZipNames = []string{NZBGetSevenZipCommand, "7za", "7zz"}
+	NZBGetUnrarNames    = []string{NZBGetUnrarCommand}
+)
+
+// NZBGetUnpacker settles which unpacker a run will actually use. A packaged
+// install can ship its own next to the daemon -- NZBGet's macOS bundle ships
+// both -- and that copy is the one the product is built against, so it wins
+// over whatever the host happens to have on PATH. Rendering and preflight both
+// call this, so a check cannot pass for a binary the run will not run.
+func NZBGetUnpacker(program string, names []string) string {
+	if directory := filepath.Dir(program); strings.TrimSpace(program) != "" {
+		for _, name := range names {
+			candidate := filepath.Join(directory, name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+				return candidate
+			}
+		}
+	}
+	for _, name := range names {
+		if resolved, err := exec.LookPath(name); err == nil {
+			return resolved
+		}
+	}
+	// Naming the canonical command keeps the rendered config well formed on a
+	// host that has neither; preflight is what reports the absence.
+	return names[0]
+}
 
 func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 	_, apiPort, _ := nativeAPIAddress(cfg.APIEndpoint)
+	var program string
+	if len(cfg.LaunchCommand) > 0 {
+		program = cfg.LaunchCommand[0]
+	}
 	encryption := "no"
 	verification := "none"
 	certStore := ""
@@ -194,14 +246,18 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 		"ControlPort=" + strconv.Itoa(apiPort),
 		"ControlUsername=" + controlUsername,
 		"ControlPassword=" + apiKey,
-		"DaemonMode=no",
 		"OutputMode=log",
 		"DirectWrite=" + directWrite,
 		"DirectUnpack=" + direct,
 		"ParCheck=auto",
 		"ParRepair=yes",
 		"Unpack=yes",
-		"SevenZipCmd=" + nzbgetSevenZipCommand,
+		"UnrarCmd=" + NZBGetUnpacker(program, NZBGetUnrarNames),
+		"SevenZipCmd=" + NZBGetUnpacker(program, NZBGetSevenZipNames),
+		// A packaged install can ship post-processing extensions in its own
+		// script directory. Stating the empty list keeps whatever the host
+		// happens to have installed out of a measured run.
+		"Extensions=",
 		"Server1.Active=yes",
 		"Server1.Name=benchmark",
 		"Server1.Level=0",

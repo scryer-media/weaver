@@ -320,8 +320,8 @@ pub struct NntpConnection {
     state: ConnectionState,
     capabilities: Capabilities,
     host: String,
-    /// Kept alongside `host` so a prologue requirement learned on this
-    /// connection is recorded against the endpoint, not the resolved address.
+    /// Kept alongside `host` so a requirement learned on this connection is
+    /// recorded against the endpoint, not the resolved address.
     port: u16,
     remote_addr: SocketAddr,
     created_at: Instant,
@@ -350,10 +350,11 @@ pub struct NntpConnection {
     /// How long the last decoded article waited for its status line. The lane
     /// takes this to separate distance from transfer cost.
     last_response_line_wait: Duration,
-    /// Armed when session setup skipped a prologue command this server has
-    /// never been shown to need; the first response afterwards either clears
-    /// it or teaches the process what the server wants. See [`crate::prologue`].
-    prologue_probe: Option<crate::prologue::PrologueProbe>,
+    /// Armed when session setup declined to select a group this caller
+    /// offered, because the server has never been shown to need one. The first
+    /// response afterwards either clears it or teaches the process that this
+    /// server does insist. See [`crate::server_caps`].
+    group_probe_armed: bool,
 }
 
 impl NntpConnection {
@@ -455,7 +456,7 @@ impl NntpConnection {
             body_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
-            prologue_probe: None,
+            group_probe_armed: false,
         };
 
         // 2. Read greeting
@@ -475,29 +476,23 @@ impl NntpConnection {
         }
 
         // 4-5. Session setup: authentication and nothing else, unless this
-        // server has proven it needs more. Every command here runs before the
-        // lane's first BODY can be asked for, so each one costs a full round
-        // trip of the article's time to first byte — see [`crate::prologue`]
-        // for why MODE READER and GROUP are learned instead of assumed.
+        // server has proven it needs a selected group. Every command here runs
+        // before the lane's first BODY can be asked for, so each one costs a
+        // full round trip of the article's time to first byte — see
+        // [`crate::server_caps`] for why MODE READER is never sent and GROUP is
+        // learned instead of assumed.
         //
         // A server known to pipeline authenticates serially (AUTHINFO must
-        // not be pipelined, RFC 4643) and then takes whatever prologue it has
-        // asked for in one write, answered in order. A server of unknown or
-        // negative capability keeps the serial exchange throughout.
-        let prologue = crate::prologue::prologue_for(&config.host, config.port);
-        let requested_group = initial_group.filter(|_| prologue.group);
+        // not be pipelined, RFC 4643) and then takes the GROUP it asked for in
+        // one write, answered in order. A server of unknown or negative
+        // capability keeps the serial exchange throughout.
+        let requires_group =
+            crate::server_caps::requires_group_selection(&config.host, config.port);
+        let requested_group = initial_group.filter(|_| requires_group);
         if matches!(config.pipelining, PipeliningCapability::Known(true)) {
-            conn.pipelined_session_setup(config, requested_group, prologue.mode_reader)
+            conn.pipelined_session_setup(config, requested_group)
                 .await?;
         } else {
-            if prologue.mode_reader {
-                debug!("sending MODE READER");
-                let resp = conn.send_command(&Command::ModeReader).await?;
-                if resp.code.is_error() && resp.code.raw() != 500 {
-                    warn!(code = resp.code.raw(), "MODE READER failed");
-                }
-            }
-
             if let (Some(user), Some(pass)) = (&config.username, &config.password) {
                 conn.authenticate(user, pass).await?;
                 conn.credentials = Some((user.clone(), pass.clone()));
@@ -521,12 +516,9 @@ impl NntpConnection {
         }
 
         // Setup is over: from here the next status line is an answer to the
-        // caller's own command, and is the one that can still be about a
-        // prologue this connection chose not to send.
-        conn.prologue_probe = Some(crate::prologue::PrologueProbe {
-            skipped_mode_reader: !prologue.mode_reader,
-            skipped_group: initial_group.is_some() && !prologue.group,
-        });
+        // caller's own command, and is the one that can still be about the
+        // group this connection chose not to select.
+        conn.group_probe_armed = initial_group.is_some() && !requires_group;
 
         conn.state = ConnectionState::Ready;
         debug!("NNTP connection ready");
@@ -584,60 +576,37 @@ impl NntpConnection {
     /// Session setup for a server known to pipeline. AUTHINFO goes first and
     /// on its own: RFC 4643 forbids pipelining it, and a provider that
     /// enforces that answers the whole batch with 480s or drops the
-    /// connection. Whatever prologue this server has asked for then leaves in
-    /// one flush and is answered in order (RFC 4644) — usually nothing at all,
-    /// which is the point: the lane reaches its first BODY in four round
-    /// trips.
-    ///
-    /// MODE READER must not be pipelined ahead of the commands whose meaning
-    /// it changes (RFC 3977 §5.3), so it only ever shares this write with the
-    /// GROUP that follows it, never with a caller's BODY.
+    /// connection. A GROUP this server has proven it needs then leaves in one
+    /// flush and is answered in order (RFC 4644) — usually there is nothing at
+    /// all to send, which is the point: the lane reaches its first BODY in
+    /// four round trips.
     async fn pipelined_session_setup(
         &mut self,
         config: &ServerConfig,
         initial_group: Option<&str>,
-        mode_reader: bool,
     ) -> Result<()> {
         if let (Some(user), Some(pass)) = (&config.username, &config.password) {
             self.authenticate(user, pass).await?;
             self.credentials = Some((user.clone(), pass.clone()));
         }
 
-        if !mode_reader && initial_group.is_none() {
+        let Some(group) = initial_group else {
             return Ok(());
-        }
+        };
 
-        debug!(
-            mode_reader,
-            group = initial_group.is_some(),
-            "sending pipelined session prologue"
-        );
-        if mode_reader {
-            self.write_command_frame(&Command::ModeReader).await?;
-        }
-        if let Some(group) = initial_group {
-            self.write_command_frame(&Command::Group(group.to_string()))
-                .await?;
-        }
+        debug!(group, "selecting the group this server insists on");
+        self.write_command_frame(&Command::Group(group.to_string()))
+            .await?;
         self.flush_commands().await?;
 
-        if mode_reader {
-            let response = self.read_response().await?;
-            if response.code.is_error() && response.code.raw() != 500 {
-                warn!(code = response.code.raw(), "MODE READER failed");
-            }
-        }
-
-        if let Some(group) = initial_group {
-            let group_resp = self.read_response().await?;
-            if group_resp.code.is_error() {
-                debug!(
-                    code = group_resp.code.raw(),
-                    group, "pipelined GROUP not selected"
-                );
-            } else {
-                self.current_group = Some(group.to_string());
-            }
+        let group_resp = self.read_response().await?;
+        if group_resp.code.is_error() {
+            debug!(
+                code = group_resp.code.raw(),
+                group, "pipelined GROUP not selected"
+            );
+        } else {
+            self.current_group = Some(group.to_string());
         }
         Ok(())
     }
@@ -847,7 +816,7 @@ impl NntpConnection {
         match frame {
             NntpFrame::Line(line) => {
                 let response = parse_response(&line)?;
-                self.observe_prologue_probe(&response);
+                self.observe_group_requirement(&response);
                 Ok(response)
             }
             NntpFrame::MultiLineData(_) => Err(NntpError::MalformedResponse(
@@ -856,36 +825,29 @@ impl NntpConnection {
         }
     }
 
-    /// Learn, from the first response after session setup, whether this
-    /// server needed a prologue command the connection did not send.
+    /// Learn, from the first response after session setup, whether this server
+    /// insists on a selected group the connection did not select.
     ///
-    /// The connection is poisoned rather than repaired in place: the caller's
+    /// 412 is the only code that can mean this, and only on a connection that
+    /// was offered a group and declined to spend the round trip on it. The
+    /// connection is poisoned rather than repaired in place: the caller's
     /// command has already been refused, and a pipelined batch may have more
     /// refusals behind it. Discarding the socket lets the ordinary retry open
-    /// a fresh one, which now carries what the server asked for — so only the
-    /// first connection to such a server pays for the discovery.
-    fn observe_prologue_probe(&mut self, response: &Response) {
-        let Some(probe) = self.prologue_probe.take() else {
+    /// a fresh one, which now selects the group — so only the first connection
+    /// to such a server pays for the discovery.
+    fn observe_group_requirement(&mut self, response: &Response) {
+        if !std::mem::take(&mut self.group_probe_armed) {
             return;
-        };
-        let Some(requirement) = probe.requirement_for(response.code.raw()) else {
+        }
+        if response.code.raw() != 412 {
             return;
-        };
-        let first_time = match requirement {
-            crate::prologue::PrologueRequirement::ModeReader => {
-                crate::prologue::note_mode_reader_required(&self.host, self.port)
-            }
-            crate::prologue::PrologueRequirement::Group => {
-                crate::prologue::note_group_required(&self.host, self.port)
-            }
-        };
-        if first_time {
+        }
+        if crate::server_caps::note_group_required(&self.host, self.port) {
             warn!(
                 host = %self.host,
                 port = self.port,
-                code = response.code.raw(),
-                requirement = ?requirement,
-                "server needs an extended session prologue; later connections will send it"
+                "server refuses message-id fetches without a selected group; \
+                 later connections will select one"
             );
         }
         self.poisoned = true;
@@ -894,7 +856,7 @@ impl NntpConnection {
     /// Whether this server has proven it refuses message-id fetches without a
     /// selected group. Lanes skip the GROUP round trip unless it has.
     pub fn needs_group_prologue(&self) -> bool {
-        crate::prologue::prologue_for(&self.host, self.port).group
+        crate::server_caps::requires_group_selection(&self.host, self.port)
     }
 
     fn reset_multiline_decode_state(&mut self) {
@@ -1169,9 +1131,22 @@ impl NntpConnection {
     }
 
     /// Retrieve the headers of an article by message-id.
+    ///
+    /// A 500/501 here is the server saying it does not implement `HEAD` at
+    /// all. That is an answer, not a fault: it is recorded against the server
+    /// so later callers stop asking, and the connection stays healthy.
     pub async fn head_by_id(&mut self, message_id: &str) -> Result<MultiLineResponse> {
         let cmd = Command::Head(ArticleId::MessageId(message_id.to_string()));
-        self.send_multiline_command(&cmd).await
+        let result = self.send_multiline_command(&cmd).await;
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(reports_unsupported_command)
+            && crate::server_caps::note_head_unsupported(&self.host, self.port)
+        {
+            debug!(host = %self.host, port = self.port, "server does not implement HEAD");
+        }
+        result
     }
 
     /// Retrieve a complete article (headers + body) by message-id.
@@ -1186,9 +1161,25 @@ impl NntpConnection {
     pub async fn stat_by_id(&mut self, message_id: &str) -> Result<bool> {
         let cmd = Command::Stat(ArticleId::MessageId(message_id.to_string()));
         let resp = self.send_command(&cmd).await?;
+        self.classify_stat_response(&resp)
+    }
+
+    /// Turn one STAT status line into an existence verdict.
+    ///
+    /// A 500/501 is the server saying it does not implement STAT. That is an
+    /// answer about the command, not a fault on the socket: it is recorded so
+    /// the existence probe switches to HEAD, and the connection stays healthy
+    /// and pooled.
+    fn classify_stat_response(&mut self, resp: &Response) -> Result<bool> {
         match resp.code.raw() {
             223 => Ok(true),
             430 => Ok(false),
+            code if crate::server_caps::is_command_unsupported(code) => {
+                if crate::server_caps::note_stat_unsupported(&self.host, self.port) {
+                    debug!(host = %self.host, port = self.port, "server does not implement STAT");
+                }
+                Err(NntpError::CommandNotRecognized)
+            }
             _ => Err(NntpError::from_status(resp.code, &resp.message)),
         }
     }
@@ -1225,15 +1216,23 @@ impl NntpConnection {
 
         // Read all responses.
         let mut results = Vec::with_capacity(message_ids.len());
+        let mut refusal = None;
         for _ in message_ids {
             let resp = self.read_response().await?;
-            match resp.code.raw() {
-                223 => results.push(true),
-                430 => results.push(false),
-                _ => return Err(NntpError::from_status(resp.code, &resp.message)),
+            // Every response of the batch is still owed, so a refusal is
+            // remembered and returned only once the pipe is drained — leaving
+            // it half-read would strand the socket mid-batch.
+            match self.classify_stat_response(&resp) {
+                Ok(exists) => results.push(exists),
+                Err(error) => {
+                    let _ = refusal.get_or_insert(error);
+                }
             }
         }
-        Ok(results)
+        match refusal {
+            Some(error) => Err(error),
+            None => Ok(results),
+        }
     }
 
     /// Stream the body of an article directly to a writer.
@@ -1891,6 +1890,21 @@ impl NntpConnection {
 
     pub fn remote_ip(&self) -> IpAddr {
         self.remote_addr.ip()
+    }
+}
+
+/// Whether an error is the server refusing the command itself (500/501)
+/// rather than answering it.
+///
+/// 500 is mapped to its own variant; 501 arrives as an unexpected response,
+/// so both shapes have to be recognised here.
+pub(crate) fn reports_unsupported_command(error: &NntpError) -> bool {
+    match error {
+        NntpError::CommandNotRecognized => true,
+        NntpError::UnexpectedResponse { code, .. } => {
+            crate::server_caps::is_command_unsupported(code.raw())
+        }
+        _ => false,
     }
 }
 
