@@ -384,6 +384,111 @@ mod tests {
         );
     }
 
+    /// A rebuild input for the ordinary in-order arrival: the snapshot holds
+    /// volumes `0..held`, every volume below `present` has facts and a file,
+    /// and the volumes in `held..present` are the ones this pass integrates.
+    fn in_order_growth_rebuild_input(
+        temp_dir: &tempfile::TempDir,
+        volume_count: usize,
+        held: usize,
+        present: usize,
+    ) -> RarSetComputeInput {
+        let files = build_many_volume_rar_set(volume_count);
+        let mut cached_archive =
+            unrar_rs::RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+        for volume in 1..held {
+            cached_archive
+                .add_volume(volume, Box::new(Cursor::new(files[volume].1.clone())))
+                .unwrap();
+        }
+
+        let mut volume_map = HashMap::new();
+        let mut volume_paths = BTreeMap::new();
+        let mut facts = BTreeMap::new();
+        for volume in 0..present {
+            let (filename, bytes) = &files[volume];
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            volume_map.insert(filename.clone(), volume as u32);
+            volume_paths.insert(volume as u32, path);
+            facts.insert(
+                volume as u32,
+                unrar_rs::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                    .expect("synthetic RAR volume facts should parse"),
+            );
+        }
+
+        RarSetComputeInput {
+            job_id: JobId(96),
+            set_name: "show".to_string(),
+            existing: RarSetState::default(),
+            volume_map,
+            volume_paths,
+            password_candidates: Vec::new(),
+            extracted: HashSet::new(),
+            failed: HashSet::new(),
+            facts,
+            verified_suspect_volumes: HashSet::new(),
+            worker_active: false,
+            cached_headers: Some(cached_archive.serialize_headers()),
+            extraction_generation: 0,
+            reason: RefreshReason::CoverageExpansion,
+        }
+    }
+
+    /// The pass every in-order download runs on each volume completion: the
+    /// snapshot holds everything below the new volume, with facts for all of
+    /// it, and the member is still growing. The live-volume rebuild guard must
+    /// stay out of the way — the new volume is the only file this pass opens.
+    #[test]
+    fn in_order_volume_arrival_extends_cached_headers_and_opens_only_the_new_volume() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = in_order_growth_rebuild_input(&temp_dir, 6, 4, 5);
+        let new_volume_path = input.volume_paths[&4].clone();
+        // Only the live-volume fallback ever opens volume 0.
+        std::fs::remove_file(&input.volume_paths[&0]).unwrap();
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("in-order growth should extend the cached headers");
+
+        assert_eq!(computed.rebuild_source.as_str(), "cached-headers");
+        assert_eq!(rar_refresh_open_tracking::opened(), vec![new_volume_path]);
+        assert_eq!(computed.plan.topology.complete_volumes.len(), 5);
+    }
+
+    /// The pass that closes a member — its last volume just completed — is the
+    /// one whose cached snapshot lags a completed span. Before the live-volume
+    /// rebuild replaced it, that pass already re-read every held volume in
+    /// place, so the replacement must not parse more than that did: every
+    /// volume's headers are read exactly once. Volume 0 is parsed by the
+    /// rebuild's own open and then opened once more only to attach its reader.
+    #[test]
+    fn member_completion_pass_reads_each_volume_once_from_live_volumes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = in_order_growth_rebuild_input(&temp_dir, 6, 5, 6);
+        let expected_opens: Vec<_> = (0..6u32)
+            .map(|volume| input.volume_paths[&volume].clone())
+            .collect();
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("member completion should rebuild from live volumes");
+
+        assert_eq!(computed.rebuild_source.as_str(), "volume-0");
+        assert_eq!(rar_refresh_open_tracking::opened(), expected_opens);
+        assert_eq!(computed.plan.topology.complete_volumes.len(), 6);
+        assert_eq!(
+            computed
+                .plan
+                .ready_members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["big.bin"]
+        );
+    }
+
     #[test]
     fn rar_plan_rebuild_falls_back_to_volume_zero_without_usable_cached_headers() {
         for cached_headers in [None, Some(b"not-a-cached-header-snapshot".to_vec())] {
