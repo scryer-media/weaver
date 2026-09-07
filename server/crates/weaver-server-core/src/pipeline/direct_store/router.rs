@@ -2599,6 +2599,14 @@ impl DirectSetRouter {
         self.scratch.discard();
     }
 
+    /// Whether a reader still pins the set's scratch image. A pin outlives
+    /// [`Self::discard_scratch`]: the path is gone, the bytes are not, until
+    /// the last reader drops.
+    #[cfg(test)]
+    pub(crate) fn scratch_is_pinned(&self) -> bool {
+        self.scratch.is_pinned()
+    }
+
     /// Pages RAM-resident staged runs out to scratch until the holds budget is
     /// satisfied.
     ///

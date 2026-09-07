@@ -2537,6 +2537,135 @@ async fn direct_store_pages_held_bytes_to_scratch_instead_of_demoting() {
     );
 }
 
+/// A pass that reads a paged hold pins the scratch image, and the pin, not the
+/// set, decides how long the image lives. The set's commit unlinks the path;
+/// a provider still holding a pin reads the hold through the unlinked file,
+/// exactly as posted; and the last pin dropping is what gives the bytes back.
+/// Nothing the set does can strand a scratch image behind it, and nothing a
+/// reader does can lose the bytes it was handed.
+#[tokio::test]
+async fn a_pinned_scratch_outlives_its_set_and_no_longer_than_its_last_reader() {
+    use std::io::{Read as _, Seek as _};
+
+    let member_name = "Silver.Horizon.S01E14.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 157) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.direct_store.set_holds_budget(64);
+    let job_id = JobId(41019);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let scratch_path = working_dir.join(".weaver-holds.silver.horizon.f0");
+    // A completed job takes its working directory with it, which leaves no
+    // scratch behind either.
+    let holds_left = |dir: &std::path::Path| {
+        std::fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".weaver-holds.")
+                })
+                .count()
+        })
+    };
+
+    // Volume 0's payload before its header: held, and paged under the budget.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.router.scratch_bytes() > 0 && !set.router.scratch_is_pinned()),
+        "non-vacuity: the hold is on the scratch and nothing reads it yet; got {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
+    assert!(scratch_path.exists());
+
+    // The provider a PAR2 pass would build over the live set: it takes a pin
+    // on the image rather than a copy of the hold.
+    let (volume_index, _, provider) = pipeline
+        .direct_virtual_volume(NzbFileId {
+            job_id,
+            file_index: 0,
+        })
+        .expect("volume 0 is a live direct volume");
+    assert_eq!(volume_index, 0);
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.router.scratch_is_pinned()),
+        "a provider over a paged hold pins the scratch image"
+    );
+
+    // The set runs to its commit with the provider still alive.
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) == (0, 1) {
+            continue;
+        }
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "the job must complete; sets = {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
+    assert_eq!(
+        holds_left(&working_dir),
+        0,
+        "the commit unlinks the scratch path whether or not a reader pins it"
+    );
+
+    // The pinned image still answers, and answers as posted: the hold the
+    // budget paged out comes back through the unlinked file. The provider
+    // snapshotted its coverage when it was built, so the header article that
+    // had not arrived reads as the hole it was then; the hold is what it
+    // claims, and the hold is what it must serve.
+    let posted = &volumes[0].1;
+    let (hold_start, hold_end) = article_extent(posted.len(), 1, 2);
+    assert!(
+        hold_end - hold_start > 64,
+        "non-vacuity: the hold must be larger than the budget that paged it"
+    );
+    let mut reader = provider.open(0).expect("volume 0 is registered");
+    reader
+        .seek(std::io::SeekFrom::Start(hold_start as u64))
+        .unwrap();
+    let mut read_back = vec![0u8; hold_end - hold_start];
+    let volume_len = reader.len();
+    assert_eq!(
+        volume_len,
+        u64::try_from(hold_end).unwrap(),
+        "a volume whose only posted bytes are a hold is as long as that hold reaches"
+    );
+    reader.read_exact(&mut read_back).unwrap_or_else(|error| {
+        panic!(
+            "a pinned image reads through the discard: {error}; volume len {volume_len}, \
+             hold {hold_start}..{hold_end}"
+        )
+    });
+    assert_eq!(
+        read_back,
+        posted[hold_start..hold_end],
+        "every byte the provider serves after the commit is the byte that was posted"
+    );
+
+    drop(provider);
+    assert_eq!(holds_left(&working_dir), 0);
+}
+
 /// The paged holds are not merely stored — they route, and the set finishes
 /// byte-identically to a run that never breached its budget.
 #[tokio::test]
