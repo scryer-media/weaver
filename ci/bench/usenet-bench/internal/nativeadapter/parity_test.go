@@ -2,6 +2,7 @@ package nativeadapter
 
 import (
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -29,8 +30,8 @@ var dockerOnlySettings = map[benchmark.Client]map[string]string{
 
 // hostResolvedSettings must be set by both lanes, but their values name a file
 // on the host: the pinned image knows an absolute path, a native install
-// resolves the same tool from PATH. Both still have to state it rather than
-// inherit whatever the package defaults to.
+// resolves the same tool from the install's own bundle or from PATH. Both
+// still have to state it rather than inherit whatever the package defaults to.
 var hostResolvedSettings = map[benchmark.Client][]string{
 	benchmark.SABnzbd: {},
 	benchmark.NZBGet:  {"UnrarCmd", "SevenZipCmd"},
@@ -123,18 +124,23 @@ func TestNativeAndDockerLanesRenderTheSameClient(t *testing.T) {
 // was not told about.
 func TestNativeNZBGetStatesWhatABareInstallWouldLeaveToTheHost(t *testing.T) {
 	settings := parseSettings(t, renderNativeConfig(t, benchmark.NZBGet))
-	for name, want := range map[string]string{
-		"UnrarCmd":    NZBGetUnrarCommand,
-		"SevenZipCmd": NZBGetSevenZipCommand,
-		"Extensions":  "",
+	if value, ok := settings["Extensions"]; !ok || value != "" {
+		t.Errorf("Extensions = %q (set: %t), want it stated and empty", value, ok)
+	}
+	// The unpackers name a file on the host, so what a bare install needs
+	// stated is that the setting is there and names one of the binaries
+	// NZBGet can actually run -- not any particular path.
+	for name, names := range map[string][]string{
+		"UnrarCmd":    NZBGetUnrarNames,
+		"SevenZipCmd": NZBGetSevenZipNames,
 	} {
 		value, ok := settings[name]
 		if !ok {
 			t.Errorf("%s is left to the install's own default", name)
 			continue
 		}
-		if value != want {
-			t.Errorf("%s = %q, want %q", name, value, want)
+		if !slices.Contains(names, filepath.Base(value)) {
+			t.Errorf("%s = %q, which is none of %v", name, value, names)
 		}
 	}
 }

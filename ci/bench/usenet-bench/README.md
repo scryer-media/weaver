@@ -1205,10 +1205,26 @@ An unedited catalog reports exactly what is left to stage:
 
 ```
 missing  adapter   /scratch/nntp-bench-bin/nativeadapter
-missing  nzbget    /absolute/path/to/nzbget
+present  nzbget    /Applications/NZBGet.app/Contents/Resources/daemon/usr/local/bin/nzbget
 present  sabnzbd   /Applications/SABnzbd.app/Contents/MacOS/SABnzbd
 missing  weaver    /absolute/path/to/weaver
 ```
+
+Two statuses beyond `missing` exist because a path can resolve and still be the
+wrong program:
+
+- `misnamed` — the file on disk has a different name in a different case.
+  macOS matches paths case-insensitively, so a catalog entry that says
+  `.../MacOS/nzbget` resolves happily against a file called `NZBGet` and the
+  run launches something nobody named.
+- `launcher` — the path is an app bundle's `Contents/MacOS` entry and the same
+  bundle ships the program itself deeper in. That entry is a GUI launcher: it
+  starts the real program under *its own* configuration, ignores the argv it
+  was handed, and supervises it. Nothing lands on the benchmark's API port, and
+  had it landed, the measurement would have been of the host user's own
+  settings. Name the inner path, which the report gives. A bundle holding only
+  one executable is the program itself and is fine to launch, which is how
+  SABnzbd ships.
 
 Naming the executables individually with `--adapter`, `--weaver`, `--sabnzbd`
 and `--nzbget` still works for a host with no catalog yet; giving both a
@@ -1220,16 +1236,21 @@ before any NZB is submitted.
 Notes for the native catalogs:
 
 - `adapters.macos.example.json` uses the installed
-  `/Applications/SABnzbd.app/Contents/MacOS/SABnzbd` and leaves the Weaver and
-  NZBGet paths as explicit replacements; the Windows catalog uses explicit
-  paths throughout. The harness never installs a product implicitly — stage
+  `/Applications/SABnzbd.app/Contents/MacOS/SABnzbd` and the NZBGet daemon at
+  `/Applications/NZBGet.app/Contents/Resources/daemon/usr/local/bin/nzbget` —
+  *not* that bundle's `Contents/MacOS` launcher — and leaves the Weaver path as
+  an explicit replacement; the Windows catalog uses explicit paths throughout. The harness never installs a product implicitly — stage
   pinned installers, record their versions and hashes in the catalog, and use an
   isolated working directory (for example `C:\bench`). `preflight --adapters`
   is what confirms the paths in a filled-in catalog actually resolve. It also
   checks what a product needs from the host that installing it does not
-  provide: NZBGet shells out to `unrar` and `7z` by name and ships neither, and
-  a host missing one does not fail the run outright -- it skips the unpack and
-  fails output verification after a full download.
+  provide: NZBGet shells out to `unrar` and `7z`, and a host that supplies
+  neither does not fail the run outright -- it skips the unpack and fails
+  output verification after a full download. A packaged install may ship its
+  own beside the daemon (the macOS bundle ships `unrar` and `7za`), and that
+  copy wins over PATH because it is the one the product is built against;
+  preflight and the rendered config resolve through the same function, so the
+  check reports the binary the run will actually invoke.
 - `NATIVE_LAUNCH_COMMAND` is a JSON argv array, never a shell string, and may
   use `{{config_dir}}`, `{{nzb_path}}`, `{{output_dir}}`, `{{fixture_dir}}` and
   `{{api_port}}`. Commands must stay in the foreground so the launcher can

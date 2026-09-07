@@ -38,7 +38,7 @@
       "environment": {
         "NATIVE_CLIENT_VERSION": "REPLACE_WITH_NZBGET_VERSION",
         "NATIVE_API_ENDPOINT": "http://127.0.0.1:16789",
-        "NATIVE_LAUNCH_COMMAND": "[\"/absolute/path/to/nzbget\",\"-c\",\"{{config_dir}}/nzbget.conf\",\"-s\"]"
+        "NATIVE_LAUNCH_COMMAND": "[\"/Applications/NZBGet.app/Contents/Resources/daemon/usr/local/bin/nzbget\",\"-c\",\"{{config_dir}}/nzbget.conf\",\"-s\"]"
       }
     }
   ]

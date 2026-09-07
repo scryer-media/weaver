@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -385,8 +386,16 @@ func preflight(args []string) error {
 			result.Binaries = append(result.Binaries, inspectExecutable("clientadapter", adapterPath))
 		}
 	default:
-		if descriptor.ID == benchmark.MacOSNative && sabPath == "" {
-			sabPath = "/Applications/SABnzbd.app/Contents/MacOS/SABnzbd"
+		if descriptor.ID == benchmark.MacOSNative {
+			if sabPath == "" {
+				sabPath = "/Applications/SABnzbd.app/Contents/MacOS/SABnzbd"
+			}
+			if nzbgetPath == "" {
+				// Not Contents/MacOS: that entry is the bundle's GUI
+				// launcher, which starts this program under the host user's
+				// own configuration and ignores the one the run renders.
+				nzbgetPath = "/Applications/NZBGet.app/Contents/Resources/daemon/usr/local/bin/nzbget"
+			}
 		}
 		result.Binaries = append(result.Binaries,
 			inspectExecutable("nativeadapter", adapterPath),
@@ -473,21 +482,26 @@ func inspectClientRequirements(adapter benchmark.Adapter) []preflightClientCheck
 	checks := []preflightClientCheck{apiPortCheck(name, adapter.Environment["NATIVE_API_ENDPOINT"])}
 	switch adapter.Client {
 	case benchmark.NZBGet:
-		// NZBGet ships neither unpacker and shells out to both by name. A
-		// host without one does not fail: it skips the unpack and the run
-		// fails output verification instead.
+		// NZBGet shells out to both unpackers by name. A host where neither
+		// the bundle nor PATH supplies one does not fail: it skips the unpack
+		// and the run fails output verification instead. Resolving through
+		// the same function the config is rendered with is what keeps this
+		// check honest -- it reports the binary the run will invoke.
 		var unpackers []preflightClientCheck
-		for tool, lane := range map[string]string{
-			nativeadapter.NZBGetUnrarCommand:    "every RAR fixture",
-			nativeadapter.NZBGetSevenZipCommand: "every 7z fixture",
+		program := nativeLaunchProgram(adapter)
+		for _, unpacker := range []struct {
+			names []string
+			lane  string
+		}{
+			{nativeadapter.NZBGetUnrarNames, "every RAR fixture"},
+			{nativeadapter.NZBGetSevenZipNames, "every 7z fixture"},
 		} {
-			check := preflightClientCheck{Client: name, Name: tool, Detail: tool, Status: "present"}
-			resolved, err := exec.LookPath(tool)
-			if err != nil {
+			canonical := unpacker.names[0]
+			resolved := nativeadapter.NZBGetUnpacker(program, unpacker.names)
+			check := preflightClientCheck{Client: name, Name: canonical, Detail: resolved, Status: "present"}
+			if resolved == canonical {
 				check.Status = "missing"
-				check.Reason = fmt.Sprintf("NZBGet shells out to %q to unpack %s and does not ship it: %v", tool, lane, err)
-			} else {
-				check.Detail = resolved
+				check.Reason = fmt.Sprintf("NZBGet shells out to %s to unpack %s; this host has none of %s beside the program or on PATH", canonical, unpacker.lane, strings.Join(unpacker.names, ", "))
 			}
 			unpackers = append(unpackers, check)
 		}
@@ -580,6 +594,17 @@ func inspectAdapterExecutables(adapters []benchmark.Adapter) []preflightBinary {
 }
 
 // inspectNativeClient resolves the product a native adapter launches. The
+// nativeLaunchProgram is the program a native catalog entry launches, or the
+// empty string when the entry does not name one -- inspectNativeClient reports
+// that case, so this only has to stay quiet about it.
+func nativeLaunchProgram(adapter benchmark.Adapter) string {
+	var argv []string
+	if err := json.Unmarshal([]byte(adapter.Environment["NATIVE_LAUNCH_COMMAND"]), &argv); err != nil || len(argv) == 0 {
+		return ""
+	}
+	return argv[0]
+}
+
 // executable is the first element of NATIVE_LAUNCH_COMMAND; the rest of the
 // argv is templated per run and cannot be checked ahead of one.
 func inspectNativeClient(adapter benchmark.Adapter) preflightBinary {
@@ -655,8 +680,79 @@ func inspectExecutable(name, path string) preflightBinary {
 		return result
 	}
 	result.Path = resolved
+	if actual, ok := onDiskName(resolved); ok && actual != filepath.Base(resolved) {
+		// macOS resolves paths case-insensitively, so LookPath answers for a
+		// file whose name is not the one the catalog gave. The run then
+		// launches a program nobody named, and the first sign of it is a
+		// client that never becomes ready.
+		result.Status = "misnamed"
+		result.Reason = fmt.Sprintf("the file on disk is named %q, not %q; this host matches paths case-insensitively, so the catalog reached a different program than it names", actual, filepath.Base(resolved))
+		return result
+	}
+	if inner, ok := bundledLauncherTarget(resolved); ok {
+		// A program directly in <bundle>.app/Contents/MacOS is the bundle's
+		// launcher. When the bundle ships a second executable of the same
+		// name deeper in, the launcher starts that one under a configuration
+		// of its own and drops the argv it was given -- so the run measures
+		// whatever the host was already set up to do, or nothing at all.
+		result.Status = "launcher"
+		result.Reason = fmt.Sprintf("this is an app bundle launcher; the same bundle ships the program itself at %s, and the launcher starts it with its own configuration instead of the one the run renders. Name the inner path in the catalog", inner)
+		return result
+	}
 	result.Status = "present"
 	return result
+}
+
+// onDiskName reads back the name the filesystem holds for a path, which is the
+// only way to see a case difference on a filesystem that ignores one.
+func onDiskName(path string) (string, bool) {
+	base := filepath.Base(path)
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		return "", false
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Name(), base) {
+			return entry.Name(), true
+		}
+	}
+	return "", false
+}
+
+// bundledLauncherTarget reports the real program behind an app bundle launcher:
+// an executable of the same name that the bundle ships outside Contents/MacOS.
+// A bundle with only the one executable is the program itself and is fine to
+// launch, which is how SABnzbd ships.
+func bundledLauncherTarget(path string) (string, bool) {
+	directory := filepath.Dir(path)
+	if filepath.Base(directory) != "MacOS" {
+		return "", false
+	}
+	contents := filepath.Dir(directory)
+	if filepath.Base(contents) != "Contents" {
+		return "", false
+	}
+	bundle := filepath.Dir(contents)
+	if filepath.Ext(bundle) != ".app" {
+		return "", false
+	}
+	name := filepath.Base(path)
+	var found string
+	_ = filepath.WalkDir(bundle, func(candidate string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || found != "" {
+			return nil
+		}
+		if candidate == path || !strings.EqualFold(entry.Name(), name) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || info.Mode()&0o111 == 0 {
+			return nil
+		}
+		found = candidate
+		return fs.SkipAll
+	})
+	return found, found != ""
 }
 
 func verifyOutput(args []string) error {

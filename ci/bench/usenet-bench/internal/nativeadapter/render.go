@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -162,19 +163,55 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 	}
 }
 
-// NZBGetSevenZipCommand and NZBGetUnrarCommand are the unpackers a native
-// NZBGet install resolves from PATH. The RAR and 7z corpus lanes need them, so
+// NZBGetSevenZipCommand and NZBGetUnrarCommand are the canonical names of the
+// unpackers NZBGet shells out to. The RAR and 7z corpus lanes need them, so
 // they are stated rather than left to NZBGet's built-in defaults, which vary
 // by package: a host without one then fails loudly instead of quietly skipping
-// every unpack. Neither ships with NZBGet, so on a bare install they are the
-// operator's to stage; preflight reports a host that is missing one.
+// every unpack.
 const (
 	NZBGetSevenZipCommand = "7z"
 	NZBGetUnrarCommand    = "unrar"
 )
 
+// NZBGetSevenZipNames and NZBGetUnrarNames are the names the same unpacker is
+// installed under. 7-Zip in particular is "7z" from a package manager, "7za"
+// in NZBGet's own macOS bundle and "7zz" from upstream, and NZBGet runs
+// whichever the config names.
+var (
+	NZBGetSevenZipNames = []string{NZBGetSevenZipCommand, "7za", "7zz"}
+	NZBGetUnrarNames    = []string{NZBGetUnrarCommand}
+)
+
+// NZBGetUnpacker settles which unpacker a run will actually use. A packaged
+// install can ship its own next to the daemon -- NZBGet's macOS bundle ships
+// both -- and that copy is the one the product is built against, so it wins
+// over whatever the host happens to have on PATH. Rendering and preflight both
+// call this, so a check cannot pass for a binary the run will not run.
+func NZBGetUnpacker(program string, names []string) string {
+	if directory := filepath.Dir(program); strings.TrimSpace(program) != "" {
+		for _, name := range names {
+			candidate := filepath.Join(directory, name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+				return candidate
+			}
+		}
+	}
+	for _, name := range names {
+		if resolved, err := exec.LookPath(name); err == nil {
+			return resolved
+		}
+	}
+	// Naming the canonical command keeps the rendered config well formed on a
+	// host that has neither; preflight is what reports the absence.
+	return names[0]
+}
+
 func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 	_, apiPort, _ := nativeAPIAddress(cfg.APIEndpoint)
+	var program string
+	if len(cfg.LaunchCommand) > 0 {
+		program = cfg.LaunchCommand[0]
+	}
 	encryption := "no"
 	verification := "none"
 	certStore := ""
@@ -209,15 +246,15 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 		"ControlPort=" + strconv.Itoa(apiPort),
 		"ControlUsername=" + controlUsername,
 		"ControlPassword=" + apiKey,
-		"DaemonMode=no",
 		"OutputMode=log",
+		"DaemonMode=no",
 		"DirectWrite=" + directWrite,
 		"DirectUnpack=" + direct,
 		"ParCheck=auto",
 		"ParRepair=yes",
 		"Unpack=yes",
-		"UnrarCmd=" + NZBGetUnrarCommand,
-		"SevenZipCmd=" + NZBGetSevenZipCommand,
+		"UnrarCmd=" + NZBGetUnpacker(program, NZBGetUnrarNames),
+		"SevenZipCmd=" + NZBGetUnpacker(program, NZBGetSevenZipNames),
 		// A packaged install can ship post-processing extensions in its own
 		// script directory. Stating the empty list keeps whatever the host
 		// happens to have installed out of a measured run.
