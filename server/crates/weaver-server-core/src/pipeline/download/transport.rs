@@ -17,6 +17,22 @@ const MAX_TARGET_DEPTH: u32 = 8;
 /// measured there. Also bounds rung changes to one per window.
 const RUNG_WINDOW_RESPONSES: u64 = 32;
 
+/// Responses in each of the first [`RUNG_WARMUP_WINDOWS`] windows.
+///
+/// A server the lanes have never measured has no article transfer time and so
+/// no depth target at all, and thirty-two responses is a long time to wait for
+/// one: a job of a few hundred articles can be most of the way finished before
+/// the first window closes, which is the whole download running at the seeded
+/// rung. Eight is enough for a median body size and a wire rate — the two
+/// halves the depth model divides — while costing a fraction of the job.
+const RUNG_WARMUP_WINDOW_RESPONSES: u64 = 8;
+
+/// How many short windows a fresh explorer runs: one to measure the link and
+/// pick a rung, one to judge the rung it picked. After that the full window
+/// applies, because by then the depth is settled and the only question left is
+/// whether the link has changed.
+const RUNG_WARMUP_WINDOWS: u8 = 2;
+
 /// A rung is only kept when it beats the rung below it by this much; anything
 /// less is noise on a shared link.
 const RUNG_KEEP_THROUGHPUT_RATIO: f64 = 1.05;
@@ -207,14 +223,31 @@ pub(crate) struct ServerPipelineExplorer {
     baseline_throughput_bps: Option<f64>,
     /// Set while the current rung is a step up still on trial.
     on_trial: bool,
+    /// Set until the explorer has moved to — or found itself already sitting
+    /// on — the rung its own measurements ask for. The first move goes
+    /// straight there; every later one walks the ladder a rung at a time.
+    first_climb_pending: bool,
+    /// Short windows left before the full window length applies.
+    warmup_windows_left: u8,
+    /// Every response folded into this window, at the current rung or below.
     window_responses: u64,
-    window_bytes: u64,
-    window_elapsed: Duration,
+    /// Bytes and wire time of every response in the window, whatever rung it
+    /// was issued at. These feed the link model — body size and wire rate —
+    /// which describes the link rather than the depth, so a lane still
+    /// draining a shallower lease is a perfectly good sample for it.
+    window_model_bytes: u64,
     /// The window's wire time alone: the per-article transfer the lane
-    /// reported with each response, summed. `window_elapsed` also carries the
-    /// status-line waits, which is what the rung trials compare on but exactly
-    /// what the depth model must divide out.
+    /// reported with each response, summed. `window_rung_elapsed` also carries
+    /// the status-line waits, which is what the rung trials compare on but
+    /// exactly what the depth model must divide out.
     window_wire_elapsed: Duration,
+    /// Responses in the window issued at exactly the current rung, and their
+    /// bytes and wall clock. Only these may judge a rung against the one below
+    /// it: a shallower lane is slower by construction and would argue every
+    /// step up back out of existence.
+    window_rung_responses: u64,
+    window_rung_bytes: u64,
+    window_rung_elapsed: Duration,
     /// Ring of recent decoded body sizes; the depth formula takes its median.
     body_bytes: [u64; BODY_SIZE_SAMPLES],
     body_bytes_len: usize,
@@ -239,10 +272,14 @@ impl Default for ServerPipelineExplorer {
             baseline_depth: None,
             baseline_throughput_bps: None,
             on_trial: false,
+            first_climb_pending: true,
+            warmup_windows_left: RUNG_WARMUP_WINDOWS,
             window_responses: 0,
-            window_bytes: 0,
-            window_elapsed: Duration::ZERO,
+            window_model_bytes: 0,
             window_wire_elapsed: Duration::ZERO,
+            window_rung_responses: 0,
+            window_rung_bytes: 0,
+            window_rung_elapsed: Duration::ZERO,
             body_bytes: [0; BODY_SIZE_SAMPLES],
             body_bytes_len: 0,
             body_bytes_next: 0,
@@ -255,11 +292,34 @@ impl Default for ServerPipelineExplorer {
 }
 
 impl ServerPipelineExplorer {
-    /// Start from what the last run proved, or from the band of the connection
-    /// test's first-byte latency, or from the shallowest pipelined rung.
-    pub(crate) fn seeded(proven_depth: Option<u8>, probe_latency: Option<Duration>) -> Self {
+    /// Start from what the last run proved, or from what the round trip and a
+    /// known article transfer time say the link needs, or from the band of the
+    /// connection test's first-byte latency, or from the shallowest pipelined
+    /// rung.
+    ///
+    /// The order is deliberate. A rung a previous run proved on this server is
+    /// evidence and outranks any estimate. The bandwidth-delay estimate is the
+    /// real answer whenever both of its halves are known — an article transfer
+    /// time carried over from a pool that has already run, say — and the
+    /// latency band is only the coarse stand-in for when they are not: it says
+    /// 2 for everything nearer than 400 ms, which on a 100 ms link carrying
+    /// ordinary articles is a quarter of the depth the link can use.
+    pub(crate) fn seeded(
+        proven_depth: Option<u8>,
+        probe_latency: Option<Duration>,
+        article_transfer: Option<Duration>,
+    ) -> Self {
+        let modelled = probe_latency
+            .zip(article_transfer)
+            .map(|(latency, transfer)| {
+                rung_at_or_above(
+                    bandwidth_delay_depth(latency, transfer)
+                        .clamp(MIN_TARGET_DEPTH, MAX_TARGET_DEPTH) as u8,
+                )
+            });
         let start = proven_depth
             .map(rung_at_or_above)
+            .or(modelled)
             .or_else(|| {
                 probe_latency.map(|latency| LatencyBand::from_latency(latency).starting_depth())
             })
@@ -267,6 +327,7 @@ impl ServerPipelineExplorer {
         Self {
             current_depth: start.clamp(2, 8),
             latency: probe_latency,
+            transfer: article_transfer,
             persisted_depth: proven_depth,
             ..Self::default()
         }
@@ -302,11 +363,11 @@ impl ServerPipelineExplorer {
         self.pinned_sequential
     }
 
-    pub(super) fn note_latency(&mut self, sample: Duration) {
+    pub(in crate::pipeline) fn note_latency(&mut self, sample: Duration) {
         self.latency = Some(blend(self.latency, sample));
     }
 
-    pub(super) fn note_transfer(&mut self, sample: Duration) {
+    pub(in crate::pipeline) fn note_transfer(&mut self, sample: Duration) {
         self.transfer = Some(blend(self.transfer, sample));
     }
 
@@ -405,12 +466,25 @@ impl ServerPipelineExplorer {
         }
         // Pressure forces sequential and distorts throughput; such a sample
         // says nothing about the rung under test.
-        if !pressure_clear || observed_depth != self.current_depth {
+        if !pressure_clear {
+            return None;
+        }
+        // A response from a *deeper* batch than the explorer is running now
+        // was issued against a rung that has since been left behind, and
+        // nothing it measured describes the rung under test.
+        //
+        // A *shallower* one is kept. It cannot judge the rung — see
+        // `window_rung_responses` — but its body size and wire time describe
+        // the link, and throwing it away is what left a freshly started server
+        // measuring nothing at all: every lane's first lease is booked before
+        // the explorer has a depth, so every response it produces is shallower
+        // than the rung the explorer later moved to, and the window that was
+        // supposed to pick a depth never filled.
+        if observed_depth > self.current_depth {
             return None;
         }
         self.window_responses = self.window_responses.saturating_add(1);
-        self.window_bytes = self.window_bytes.saturating_add(payload_bytes);
-        self.window_elapsed = self.window_elapsed.saturating_add(policy_elapsed);
+        self.window_model_bytes = self.window_model_bytes.saturating_add(payload_bytes);
         // `transfer` is the lane's status-line-to-terminator time, refreshed
         // just before this call; a lane that has not measured one yet has
         // nothing queued ahead of it, so its whole elapsed is wire time.
@@ -418,7 +492,12 @@ impl ServerPipelineExplorer {
             .window_wire_elapsed
             .saturating_add(self.transfer.unwrap_or(policy_elapsed));
         self.note_body_bytes(payload_bytes);
-        if self.window_responses < RUNG_WINDOW_RESPONSES {
+        if observed_depth == self.current_depth {
+            self.window_rung_responses = self.window_rung_responses.saturating_add(1);
+            self.window_rung_bytes = self.window_rung_bytes.saturating_add(payload_bytes);
+            self.window_rung_elapsed = self.window_rung_elapsed.saturating_add(policy_elapsed);
+        }
+        if self.window_responses < self.window_target_responses() {
             return None;
         }
 
@@ -432,7 +511,25 @@ impl ServerPipelineExplorer {
         {
             self.modelled_transfer = Some(blend(self.modelled_transfer, modelled));
         }
+        // A rung is judged only on a window at least half of which was
+        // issued at that rung. A window is allowed to fill from shallower
+        // leases so that the link model is never starved, but the trial
+        // comparison then rests on however many rung responses were mixed
+        // in — and one or two of them deciding a `Reverted`, which holds the
+        // server down for `RUNG_HOLD`, is a verdict on noise. Below the bar
+        // the window still feeds the model and the judgment waits for the
+        // next one, by which time the shallower leases have drained.
+        let rung_was_measured =
+            self.window_rung_responses.saturating_mul(2) >= self.window_target_responses();
         self.reset_window();
+        self.warmup_windows_left = self.warmup_windows_left.saturating_sub(1);
+
+        if !rung_was_measured {
+            // Most of this window came from leases still draining at a
+            // shallower depth. The link model above is worth having either
+            // way; the rung comparison has too little in it to compare.
+            return None;
+        }
 
         if self.on_trial {
             let baseline = self.baseline_throughput_bps.unwrap_or(0.0);
@@ -464,16 +561,42 @@ impl ServerPipelineExplorer {
 
         let target = self.target_rung();
         if target == self.current_depth {
+            // Nothing to move toward. If that is because the measured link
+            // already agrees with the rung, rather than because there is no
+            // measurement yet, the first climb is over.
+            if self.physical_target_depth().is_some() {
+                self.first_climb_pending = false;
+            }
             return None;
         }
         let from = self.current_depth;
-        let to = self.step_toward(target);
+        // The first move goes straight to the rung the bandwidth-delay
+        // estimate asks for. Walking there a rung at a time costs a window per
+        // rung plus a window to judge each one, and a download can be over
+        // before the ladder arrives — which is the same as never pipelining at
+        // all. Every later move is a single step, because by then the depth is
+        // settled and a change means the link itself moved.
+        let to = if self.first_climb_pending {
+            target
+        } else {
+            self.step_toward(target)
+        };
+        self.first_climb_pending = false;
         if to == from {
             return None;
         }
         self.current_depth = to;
         self.on_trial = to > from;
         Some(RungChange::Stepped { from, to })
+    }
+
+    /// Responses this window closes on.
+    fn window_target_responses(&self) -> u64 {
+        if self.warmup_windows_left > 0 {
+            RUNG_WARMUP_WINDOW_RESPONSES
+        } else {
+            RUNG_WINDOW_RESPONSES
+        }
     }
 
     /// An unclean pipelined batch: one rung off, and hands off this server for
@@ -520,11 +643,11 @@ impl ServerPipelineExplorer {
     }
 
     fn window_throughput_bps(&self) -> f64 {
-        let seconds = self.window_elapsed.as_secs_f64();
+        let seconds = self.window_rung_elapsed.as_secs_f64();
         if seconds <= 0.0 {
             return 0.0;
         }
-        self.window_bytes as f64 / seconds
+        self.window_rung_bytes as f64 / seconds
     }
 
     /// Bytes per second of wire time: the rate the depth model divides by.
@@ -533,14 +656,16 @@ impl ServerPipelineExplorer {
         if seconds <= 0.0 {
             return 0.0;
         }
-        self.window_bytes as f64 / seconds
+        self.window_model_bytes as f64 / seconds
     }
 
     fn reset_window(&mut self) {
         self.window_responses = 0;
-        self.window_bytes = 0;
-        self.window_elapsed = Duration::ZERO;
+        self.window_model_bytes = 0;
         self.window_wire_elapsed = Duration::ZERO;
+        self.window_rung_responses = 0;
+        self.window_rung_bytes = 0;
+        self.window_rung_elapsed = Duration::ZERO;
     }
 }
 
@@ -555,7 +680,13 @@ fn blend(current: Option<Duration>, sample: Duration) -> Duration {
 
 #[derive(Debug, Default)]
 pub(crate) struct DownloadLaneRuntimeState {
-    pub(super) servers: HashMap<usize, ServerPipelineExplorer>,
+    pub(in crate::pipeline) servers: HashMap<usize, ServerPipelineExplorer>,
+    /// Durable identity of each explorer's pool position, recorded when the
+    /// explorer is created. A pool rebuild renumbers the positions, so the
+    /// mapping has to be the one that was true while the measurements were
+    /// taken — looking it up afterwards resolves against the new pool and
+    /// silently throws every measurement away.
+    pub(in crate::pipeline) stable_ids: HashMap<usize, u32>,
 }
 
 #[cfg(test)]
@@ -673,7 +804,8 @@ mod tests {
         assert_eq!(explorer.median_body_bytes(), Some(750_000));
     }
 
-    /// Feed one full window at the explorer's current rung.
+    /// Feed exactly one window at the explorer's current rung, whichever
+    /// length that window is.
     fn run_window(
         explorer: &mut ServerPipelineExplorer,
         now: Instant,
@@ -682,7 +814,7 @@ mod tests {
     ) -> Option<RungChange> {
         let depth = explorer.current_depth();
         let mut change = None;
-        for _ in 0..RUNG_WINDOW_RESPONSES {
+        for _ in 0..explorer.window_target_responses() {
             change = explorer
                 .note_response(now, depth, bytes_per_response, elapsed_per_response, true)
                 .or(change);
@@ -738,18 +870,54 @@ mod tests {
         );
     }
 
+    /// The first decision goes straight to the rung the measured link asks
+    /// for.
+    ///
+    /// This test used to assert a single rung of movement — `2 -> 4` on a link
+    /// whose target is 8 — which is the behaviour that left a short download
+    /// running most of its articles at the seeded depth: each further rung
+    /// cost a window to step and another to judge. The ladder's caution is
+    /// still there, in the trial that follows and in every later change; what
+    /// moved is only how the explorer arrives at its first rung.
     #[test]
-    fn first_window_sets_a_baseline_then_steps_one_rung_toward_the_target() {
+    fn the_first_window_moves_straight_to_the_bandwidth_delay_rung() {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
         assert_eq!(explorer.current_depth(), 2);
+        assert_eq!(explorer.target_rung(), 8);
 
         let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
-        assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 4 }));
-        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 8 }));
+        assert_eq!(explorer.current_depth(), 8);
         assert_eq!(
             explorer.choose_mode(true),
-            DownloadLaneMode::Pipelined { depth: 4 }
+            DownloadLaneMode::Pipelined { depth: 8 }
+        );
+    }
+
+    /// Later changes still walk the ladder a rung at a time.
+    #[test]
+    fn a_later_change_steps_one_rung_at_a_time() {
+        let mut explorer = explorer(300, 200);
+        let now = Instant::now();
+        // Articles as long as two thirds of the round trip: the link wants 4,
+        // which is where the first decision puts it.
+        assert_eq!(explorer.target_rung(), 4);
+        assert_eq!(
+            run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
+            Some(RungChange::Stepped { from: 2, to: 4 })
+        );
+        // Keep the rung, then let the articles shrink so the target moves out
+        // to 8. The climb is over, so the explorer steps rather than jumps.
+        assert_eq!(
+            run_window(&mut explorer, now, 200_000, Duration::from_millis(100)),
+            Some(RungChange::Kept { depth: 4 })
+        );
+        explorer.modelled_transfer = Some(Duration::from_millis(20));
+        assert_eq!(explorer.target_rung(), 8);
+        assert_eq!(
+            run_window(&mut explorer, now, 300_000, Duration::from_millis(100)),
+            Some(RungChange::Stepped { from: 4, to: 8 })
         );
     }
 
@@ -758,12 +926,12 @@ mod tests {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
-        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(explorer.current_depth(), 8);
 
         // Twice the bytes in the same time: comfortably past the 1.05 bar.
         let change = run_window(&mut explorer, now, 200_000, Duration::from_millis(100));
-        assert_eq!(change, Some(RungChange::Kept { depth: 4 }));
-        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(change, Some(RungChange::Kept { depth: 8 }));
+        assert_eq!(explorer.current_depth(), 8);
     }
 
     #[test]
@@ -771,10 +939,10 @@ mod tests {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
-        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(explorer.current_depth(), 8);
 
         let change = run_window(&mut explorer, now, 101_000, Duration::from_millis(100));
-        assert_eq!(change, Some(RungChange::Reverted { from: 4, to: 2 }));
+        assert_eq!(change, Some(RungChange::Reverted { from: 8, to: 2 }));
         assert_eq!(explorer.current_depth(), 2);
 
         // Inside the hold the explorer leaves the server alone.
@@ -782,7 +950,8 @@ mod tests {
         assert_eq!(change, None);
         assert_eq!(explorer.current_depth(), 2);
 
-        // Past the hold it is free to try again.
+        // Past the hold it is free to try again — a rung at a time now, since
+        // the first climb is behind it.
         let later = now + RUNG_HOLD + Duration::from_secs(1);
         let change = run_window(&mut explorer, later, 100_000, Duration::from_millis(100));
         assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 4 }));
@@ -793,13 +962,13 @@ mod tests {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
-        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(explorer.current_depth(), 8);
 
         assert_eq!(
             explorer.note_unclean_batch(now),
-            Some(RungChange::Dropped { from: 4, to: 2 })
+            Some(RungChange::Dropped { from: 8, to: 4 })
         );
-        assert_eq!(explorer.current_depth(), 2);
+        assert_eq!(explorer.current_depth(), 4);
 
         assert_eq!(
             explorer.note_unclean_batch(now + Duration::from_secs(60)),
@@ -852,51 +1021,149 @@ mod tests {
         assert_eq!(explorer.target_rung(), 8);
 
         let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
-        assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 4 }));
+        assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 8 }));
 
         // One short of a window buys nothing more.
-        for _ in 0..RUNG_WINDOW_RESPONSES - 1 {
+        let short_of_a_window = explorer.window_target_responses() - 1;
+        for _ in 0..short_of_a_window {
             assert_eq!(
-                explorer.note_response(now, 4, 400_000, Duration::from_millis(100), true),
+                explorer.note_response(now, 8, 400_000, Duration::from_millis(100), true),
                 None
             );
         }
-        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(explorer.current_depth(), 8);
     }
 
     #[test]
     fn a_seeded_explorer_starts_at_the_proven_rung_or_the_probe_band() {
         assert_eq!(
-            ServerPipelineExplorer::seeded(Some(8), None).current_depth(),
+            ServerPipelineExplorer::seeded(Some(8), None, None).current_depth(),
             8
         );
         assert_eq!(
-            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(900))).current_depth(),
+            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(900)), None)
+                .current_depth(),
             8
         );
         assert_eq!(
-            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(500))).current_depth(),
+            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(500)), None)
+                .current_depth(),
             4
         );
         assert_eq!(
-            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(50))).current_depth(),
+            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(50)), None)
+                .current_depth(),
             2
         );
         assert_eq!(
-            ServerPipelineExplorer::seeded(None, None).current_depth(),
+            ServerPipelineExplorer::seeded(None, None, None).current_depth(),
             2
         );
         // A proven depth off the ladder rounds up to a rung that is actually run.
         assert_eq!(
-            ServerPipelineExplorer::seeded(Some(3), None).current_depth(),
+            ServerPipelineExplorer::seeded(Some(3), None, None).current_depth(),
             4
         );
         // A proven rung outranks the probe band; the probe only fills the gap.
         assert_eq!(
-            ServerPipelineExplorer::seeded(Some(2), Some(Duration::from_millis(900)))
+            ServerPipelineExplorer::seeded(Some(2), Some(Duration::from_millis(900)), None)
                 .current_depth(),
             2
         );
+    }
+
+    /// A carried-over article transfer time turns the seed into the real
+    /// bandwidth-delay answer, which the coarse band cannot reach: 100 ms is
+    /// deep inside the "good" band, and the band would start such a link two
+    /// deep when it can use eight.
+    #[test]
+    fn a_seeded_explorer_prefers_the_bandwidth_delay_rung_over_the_band() {
+        let seeded = ServerPipelineExplorer::seeded(
+            None,
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(25)),
+        );
+        assert_eq!(seeded.current_depth(), 8);
+        assert_eq!(seeded.physical_target_depth(), Some(5));
+
+        // Articles that cost as much as the round trip need no depth, and the
+        // band would have said the same thing for the wrong reason.
+        assert_eq!(
+            ServerPipelineExplorer::seeded(
+                None,
+                Some(Duration::from_millis(100)),
+                Some(Duration::from_millis(100)),
+            )
+            .current_depth(),
+            2
+        );
+
+        // A rung a previous run proved still outranks the estimate.
+        assert_eq!(
+            ServerPipelineExplorer::seeded(
+                Some(2),
+                Some(Duration::from_millis(100)),
+                Some(Duration::from_millis(25)),
+            )
+            .current_depth(),
+            2
+        );
+    }
+
+    /// The first leases every lane takes are booked before any response has
+    /// come back, so they run at whatever depth the seed chose. Discarding
+    /// their responses — which is what an exact-depth match does the moment the
+    /// explorer moves — left the window that is supposed to pick a depth
+    /// unable to fill from the lanes still draining those leases.
+    #[test]
+    fn responses_from_a_shallower_lease_still_fill_the_window() {
+        let mut deep = ServerPipelineExplorer::seeded(Some(8), None, None);
+        deep.note_supports_pipelining(true);
+        deep.note_latency(Duration::from_millis(100));
+        deep.note_transfer(Duration::from_millis(25));
+        let now = Instant::now();
+
+        // Every response comes from a lease booked two deep while the explorer
+        // is already running eight.
+        for _ in 0..deep.window_target_responses() {
+            assert_eq!(
+                deep.note_response(now, 2, 750_000, Duration::from_millis(125), true),
+                None,
+                "a shallower lease may fill the window but may not judge the rung"
+            );
+        }
+        // The link model is built from them all the same.
+        assert_eq!(
+            deep.modelled_article_transfer(),
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(deep.current_depth(), 8);
+
+        // A batch from a rung the explorer has already left behind is still
+        // thrown away entirely.
+        let mut shallow = explorer(300, 50);
+        for _ in 0..RUNG_WINDOW_RESPONSES * 2 {
+            assert_eq!(
+                shallow.note_response(now, 8, 100_000, Duration::from_millis(100), true),
+                None
+            );
+        }
+        assert_eq!(shallow.current_depth(), 2);
+    }
+
+    /// The opening windows are short on purpose: a server with no measurement
+    /// has no depth target at all, and a download of a few hundred articles
+    /// would otherwise spend most of itself waiting for the first window.
+    #[test]
+    fn the_opening_windows_are_short_and_then_the_full_window_applies() {
+        let mut explorer = explorer(300, 50);
+        assert_eq!(explorer.window_target_responses(), 8);
+        let now = Instant::now();
+
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(explorer.window_target_responses(), 8);
+        run_window(&mut explorer, now, 200_000, Duration::from_millis(100));
+        assert_eq!(explorer.window_target_responses(), RUNG_WINDOW_RESPONSES);
     }
 
     /// The persisted column must only ever hold a rung the explorer settled
@@ -910,25 +1177,27 @@ mod tests {
         assert_eq!(explorer.take_persist_request(), None);
 
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
-        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(explorer.current_depth(), 8);
         // The step up is on trial; the caller must not write it through yet,
-        // but the value it would write is the one under test.
+        // but the value it would write is the one under test. One window that
+        // keeps the rung is enough — a proven depth is worth saving as soon as
+        // it is proven, not several windows later.
         run_window(&mut explorer, now, 200_000, Duration::from_millis(100));
-        assert_eq!(explorer.take_persist_request(), Some(4));
+        assert_eq!(explorer.take_persist_request(), Some(8));
         assert_eq!(explorer.take_persist_request(), None);
 
         // Losing the rung offers the lower value, so a restart cannot resume
         // at a depth this server has since failed.
         explorer.note_unclean_batch(now);
-        assert_eq!(explorer.current_depth(), 2);
-        assert_eq!(explorer.take_persist_request(), Some(2));
+        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(explorer.take_persist_request(), Some(4));
     }
 
     /// A server seeded deep from a previous run keeps that rung: the explorer
     /// has nothing to walk toward until it has measured the link itself.
     #[test]
     fn a_seeded_rung_is_held_until_the_explorer_has_its_own_measurements() {
-        let mut explorer = ServerPipelineExplorer::seeded(Some(8), None);
+        let mut explorer = ServerPipelineExplorer::seeded(Some(8), None, None);
         explorer.note_supports_pipelining(true);
         let now = Instant::now();
         assert_eq!(
@@ -962,7 +1231,7 @@ mod tests {
     /// trial: it becomes the baseline immediately rather than being re-judged.
     #[test]
     fn a_step_down_toward_a_shallower_target_is_not_put_on_trial() {
-        let mut explorer = ServerPipelineExplorer::seeded(Some(8), None);
+        let mut explorer = ServerPipelineExplorer::seeded(Some(8), None, None);
         explorer.note_supports_pipelining(true);
         let now = Instant::now();
         // Big articles on a near server: one request in flight covers the wait.
@@ -970,15 +1239,19 @@ mod tests {
         explorer.note_transfer(Duration::from_millis(400));
         assert_eq!(explorer.target_rung(), 2);
 
+        // The first decision goes to the target in one move — down as well as
+        // up. This used to walk 8 -> 4 -> 2 over two windows.
         assert_eq!(
             run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
-            Some(RungChange::Stepped { from: 8, to: 4 })
+            Some(RungChange::Stepped { from: 8, to: 2 })
         );
+        assert_eq!(explorer.current_depth(), 2);
         // Worse throughput at the shallower rung does not bounce it back up:
-        // the target, not the comparison, is what moved it.
+        // the target, not the comparison, is what moved it, so there is no
+        // trial to lose.
         assert_eq!(
             run_window(&mut explorer, now, 10_000, Duration::from_millis(100)),
-            Some(RungChange::Stepped { from: 4, to: 2 })
+            None
         );
         assert_eq!(explorer.current_depth(), 2);
     }

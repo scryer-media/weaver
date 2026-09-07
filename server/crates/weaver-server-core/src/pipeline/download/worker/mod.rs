@@ -95,6 +95,12 @@ const HOT_LEASE_TARGET_RUNWAY_SECS: u64 = 2;
 const HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
 const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_FETCH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// How long the servers must stay below their connection cap, with work
+/// queued, before that is reported. Short enough to catch a lane that never
+/// opens, long enough that ordinary refill gaps between batches say nothing.
+const DOWNLOAD_LANES_UNDER_CAP_WINDOW: Duration = Duration::from_secs(5);
+const DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 // Short debounce before the first spillover lane opens: this is slowness
 // DETECTION, not easing. A hot job hitting a brief refill hiccup should not
 // spray a lane onto another job for the few hundred milliseconds it takes to
@@ -712,6 +718,7 @@ impl Pipeline {
         if active_connections_before_dispatch == 0 && self.active_download_connections == 0 {
             self.log_download_dispatch_liveness_stall(now, pressure, max, eligible_count);
         }
+        self.log_download_lanes_under_cap(now, max);
 
         self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();

@@ -86,6 +86,12 @@ pub struct NntpPool {
     /// Per-server deadline (unix epoch ms, `0` = none) before which fresh
     /// connects are skipped because the provider refused the last one.
     over_limit_until: Vec<AtomicU64>,
+    /// Per-server epoch-ms floor for the next blocking-connect warning, and the
+    /// failures suppressed since the last one was emitted. A server that cannot
+    /// be connected to fails on every dispatch pass, so an unthrottled warning
+    /// would be a log flood; a silent one is what made the condition invisible.
+    blocking_connect_warn_after: Vec<AtomicU64>,
+    blocking_connect_failures_since_warning: Vec<AtomicU64>,
     retired_ips: Arc<SyncMutex<HashSet<(usize, IpAddr)>>>,
     connect_cursors: Vec<AtomicUsize>,
 }
@@ -112,6 +118,11 @@ impl BlockingConnectionPermit {
 /// connect with "too many connections". Existing sessions keep running; only
 /// new sockets wait, which is what the provider is actually asking for.
 pub const OVER_LIMIT_HOLDOFF: Duration = Duration::from_secs(10 * 60);
+
+/// How often one server's blocking-lane connect failures may be warned about.
+/// Every dispatch pass retries, so the failures arrive as fast as the scheduler
+/// runs; the warning stands for all of them and carries the count.
+const BLOCKING_CONNECT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 fn unix_epoch_ms() -> u64 {
     SystemTime::now()
@@ -192,6 +203,8 @@ impl NntpPool {
         let mut retention_days = Vec::with_capacity(server_count);
         let mut max_connections = Vec::with_capacity(server_count);
         let mut over_limit_until = Vec::with_capacity(server_count);
+        let mut blocking_connect_warn_after = Vec::with_capacity(server_count);
+        let mut blocking_connect_failures_since_warning = Vec::with_capacity(server_count);
         let mut connect_cursors = Vec::with_capacity(server_count);
 
         // A config where every server is backfill has no fill tier to
@@ -216,6 +229,8 @@ impl NntpPool {
             retention_days.push(spc.retention_days);
             max_connections.push(spc.max_connections);
             over_limit_until.push(AtomicU64::new(0));
+            blocking_connect_warn_after.push(AtomicU64::new(0));
+            blocking_connect_failures_since_warning.push(AtomicU64::new(0));
             connect_cursors.push(AtomicUsize::new(0));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
@@ -251,6 +266,8 @@ impl NntpPool {
             retention_days,
             max_connections,
             over_limit_until,
+            blocking_connect_warn_after,
+            blocking_connect_failures_since_warning,
             retired_ips: Arc::new(SyncMutex::new(HashSet::new())),
             connect_cursors,
         }
@@ -655,6 +672,42 @@ impl NntpPool {
             return None;
         }
         (deadline > unix_epoch_ms()).then_some(deadline)
+    }
+
+    /// Records one blocking-lane connect failure and answers whether this one
+    /// should be warned about.
+    ///
+    /// `Some(n)` means "warn, and say that `n` failures have gone unreported
+    /// since the last warning" — `n` counts this one, so the first failure of a
+    /// window reports `1`. `None` means the window is still open and the
+    /// failure has only been counted.
+    pub fn note_blocking_connect_warning(&self, server: ServerId) -> Option<u64> {
+        let idx = server.0;
+        let counter = self.blocking_connect_failures_since_warning.get(idx)?;
+        let suppressed = counter.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        let slot = self.blocking_connect_warn_after.get(idx)?;
+        let now = unix_epoch_ms();
+        let next = now.saturating_add(
+            BLOCKING_CONNECT_WARN_INTERVAL
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
+        slot.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current <= now).then_some(next)
+        })
+        .ok()?;
+        counter.store(0, Ordering::Release);
+        Some(suppressed)
+    }
+
+    /// `host:port` of one configured server, for a log line that has to say
+    /// which one it is talking about.
+    pub fn server_address(&self, server: ServerId) -> String {
+        self.configs
+            .get(server.0)
+            .map(|config| format!("{}:{}", config.host, config.port))
+            .unwrap_or_default()
     }
 
     /// Whether fresh connects to this server are currently held off. One
@@ -1637,6 +1690,32 @@ mod tests {
             pool.acquire(ServerId(0)).await,
             Err(NntpError::ServerOverLimit { .. })
         ));
+    }
+
+    #[test]
+    fn blocking_connect_warnings_report_once_a_window_and_carry_the_count() {
+        let mut config = test_pool_config(4);
+        config.servers.push(test_pool_config(4).servers.remove(0));
+        let pool = NntpPool::new(config);
+
+        // The first failure of a window reports itself.
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(0)), Some(1));
+        // The rest are counted and stay quiet: a server that refuses one
+        // connect refuses the next dispatch pass's too.
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(0)), None);
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(0)), None);
+        // Each server has its own window.
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(1)), Some(1));
+
+        // Rewind the window rather than sleeping a minute; the throttle is a
+        // wall-clock comparison, so this is the state it reaches on its own.
+        pool.blocking_connect_warn_after[0].store(unix_epoch_ms() - 1, Ordering::Release);
+        assert_eq!(
+            pool.note_blocking_connect_warning(ServerId(0)),
+            Some(3),
+            "the next warning stands for the two it suppressed and itself"
+        );
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(0)), None);
     }
 
     #[test]

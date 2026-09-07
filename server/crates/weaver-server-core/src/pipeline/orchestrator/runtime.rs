@@ -369,6 +369,10 @@ impl Pipeline {
             propagation_ready_at: HashMap::new(),
             propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
+            last_owned_lane_acquire_failure_log_at: None,
+            last_owned_lane_acquire_failure_at: None,
+            download_lanes_under_cap_since: None,
+            last_download_lanes_under_cap_log_at: None,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
@@ -459,6 +463,10 @@ impl Pipeline {
         };
         let _ = pipeline.refresh_bandwidth_cap_window();
         pipeline.refresh_download_pressure();
+        // The very first lease a lane takes must already know the depth its
+        // server can run at; discovering it from the first response means the
+        // whole opening of every download is sequential.
+        pipeline.seed_download_lane_explorers();
         Ok(pipeline)
     }
 

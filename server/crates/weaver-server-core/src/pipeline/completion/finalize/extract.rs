@@ -25,6 +25,24 @@ impl<R: std::io::Read> std::io::Read for FilesystemXzDecoder<R> {
     }
 }
 
+/// Bytes an extracted member buffers before touching the filesystem.
+///
+/// Archive entry readers hand back whatever their decoder produces, and some
+/// of them produce very little: a 7z AES entry yields one cipher block group —
+/// 512 bytes — per read, and `std::io::copy` turns each of those into its own
+/// write. A 158 MB member is then three hundred thousand write calls into the
+/// filesystem. A quarter of a megabyte of buffer removes essentially all of
+/// them, and costs one allocation per member.
+const EXTRACT_WRITE_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Wrap an extraction output so a decoder's small reads do not become small
+/// writes. The buffer must be flushed explicitly: `BufWriter` flushes on drop
+/// but has nowhere to report a failure, and a member is only extracted once
+/// its last bytes have actually reached the file.
+fn buffered_extraction_output<W: Write>(writer: W) -> std::io::BufWriter<W> {
+    std::io::BufWriter::with_capacity(EXTRACT_WRITE_BUFFER_BYTES, writer)
+}
+
 struct CountingWriter<W> {
     inner: W,
     attempt: Arc<PhaseAttemptCounters>,
@@ -385,8 +403,10 @@ where
             .create_file(&safe_path, budget_ref)
             .map_err(std::io::Error::other)?;
         let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase_counters)));
-        let mut file = CountingWriter::new(file, Arc::clone(&attempt));
-        let bytes_written = match std::io::copy(reader, &mut file) {
+        let mut file = buffered_extraction_output(CountingWriter::new(file, Arc::clone(&attempt)));
+        let copied = std::io::copy(reader, &mut file);
+        let copied = copied.and_then(|bytes| file.flush().map(|()| bytes));
+        let bytes_written = match copied {
             Ok(bytes) => {
                 attempt.commit();
                 bytes
@@ -399,7 +419,7 @@ where
         // The stamp is metadata, not payload: a filesystem that refuses it
         // has still received every byte, so the member stays extracted.
         if let Some(times) = sevenz_entry_times(entry)
-            && let Err(error) = file.get_ref().set_times(times.file_times())
+            && let Err(error) = file.get_ref().get_ref().set_times(times.file_times())
         {
             tracing::debug!(
                 job_id = job_id.0,
@@ -618,12 +638,15 @@ fn extract_zip(
         let attempt = phase_counters
             .as_ref()
             .map(|counters| Arc::new(PhaseAttemptCounters::new(Arc::clone(counters))));
-        let mut outfile: Box<dyn Write> = if let Some(attempt) = attempt.as_ref() {
+        let outfile: Box<dyn Write> = if let Some(attempt) = attempt.as_ref() {
             Box::new(CountingWriter::new(outfile, Arc::clone(attempt)))
         } else {
             Box::new(outfile)
         };
-        let bytes_written = match std::io::copy(&mut entry, &mut outfile) {
+        let mut outfile = buffered_extraction_output(outfile);
+        let copied = std::io::copy(&mut entry, &mut outfile);
+        let copied = copied.and_then(|bytes| outfile.flush().map(|()| bytes));
+        let bytes_written = match copied {
             Ok(bytes) => {
                 if let Some(attempt) = &attempt {
                     attempt.commit();
@@ -768,8 +791,10 @@ fn extract_tar_from_reader<R: std::io::Read>(
             root.create_dir(&safe_path, budget)?;
             0
         } else {
-            let mut output = root.create_file(&safe_path, budget)?;
-            std::io::copy(&mut entry, &mut output)
+            let mut output = buffered_extraction_output(root.create_file(&safe_path, budget)?);
+            let copied = std::io::copy(&mut entry, &mut output);
+            copied
+                .and_then(|bytes| output.flush().map(|()| bytes))
                 .map_err(|e| format!("failed to extract tar entry {name}: {e}"))?
         };
         if bytes_written > 0 {
@@ -819,8 +844,10 @@ fn extract_gz(
         member: output_name.to_string(),
     });
 
-    let mut outfile = root.create_file(&safe_path, budget)?;
-    let bytes_written = std::io::copy(&mut gz, &mut outfile)
+    let mut outfile = buffered_extraction_output(root.create_file(&safe_path, budget)?);
+    let copied = std::io::copy(&mut gz, &mut outfile);
+    let bytes_written = copied
+        .and_then(|bytes| outfile.flush().map(|()| bytes))
         .map_err(|e| format!("failed to decompress gz: {e}"))?;
 
     let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
@@ -879,8 +906,10 @@ fn extract_single_stream_to_file<R: std::io::Read>(
         member: output_name.to_string(),
     });
 
-    let mut outfile = root.create_file(&safe_path, budget)?;
-    let bytes_written = std::io::copy(&mut reader, &mut outfile)
+    let mut outfile = buffered_extraction_output(root.create_file(&safe_path, budget)?);
+    let copied = std::io::copy(&mut reader, &mut outfile);
+    let bytes_written = copied
+        .and_then(|bytes| outfile.flush().map(|()| bytes))
         .map_err(|e| format!("failed to decompress {format_name}: {e}"))?;
 
     let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
@@ -1132,12 +1161,15 @@ fn extract_split(
         counters.total_bytes.fetch_add(total, Ordering::Relaxed);
         Arc::new(PhaseAttemptCounters::new(Arc::clone(counters)))
     });
-    let mut outfile: Box<dyn Write> = if let Some(attempt) = attempt.as_ref() {
+    let outfile: Box<dyn Write> = if let Some(attempt) = attempt.as_ref() {
         Box::new(CountingWriter::new(outfile, Arc::clone(attempt)))
     } else {
         Box::new(outfile)
     };
-    let bytes_written = match std::io::copy(&mut reader, &mut outfile) {
+    let mut outfile = buffered_extraction_output(outfile);
+    let copied = std::io::copy(&mut reader, &mut outfile);
+    let copied = copied.and_then(|bytes| outfile.flush().map(|()| bytes));
+    let bytes_written = match copied {
         Ok(bytes) => {
             if let Some(attempt) = &attempt {
                 attempt.commit();

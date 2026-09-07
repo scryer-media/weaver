@@ -19,5 +19,7 @@ fn posted_job_spec(name: &str, posted_at: Option<u64>) -> JobSpec {
 
 mod emits_download_pipeline_drained;
 mod gapless_lanes;
+mod lane_depth_seeding;
+mod lane_failure_visibility;
 mod owned_download_lane_pool;
 mod propagation_delay;

@@ -1334,6 +1334,70 @@ fn a_rewrite_widens_to_whole_articles_so_the_volume_composition_stays_exact() {
     );
 }
 
+#[test]
+fn an_encrypted_sets_read_back_carries_the_posted_bytes_on_both_sides_of_a_span() {
+    use super::super::reconstruct::{PartialArticle, VolumeReconstruction};
+    use super::super::repair::{DamagedDirectVolume, read_repaired_spans};
+
+    // A repaired volume on disk, and one rewrite span with posted bytes on
+    // either side of it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+    let image: Vec<u8> = (0..400u32).map(|index| (index % 251) as u8).collect();
+    std::fs::write(&path, &image).unwrap();
+    let volume = DamagedDirectVolume {
+        volume_index: 0,
+        par2_file_id: par2_rs::FileId::from_bytes([9u8; 16]),
+        len: image.len() as u64,
+        path: path.clone(),
+        // `(start, end)`, so the span is 120 bytes at 100.
+        rewrite: vec![(100, 220)],
+        reconstruction: VolumeReconstruction {
+            volume_index: 0,
+            path,
+            len: image.len() as u64,
+            assembly_complete: true,
+            covered: ByteRanges::new(),
+            crcs: CrcRuns::default(),
+            partial_article: PartialArticle::CarryThrough,
+        },
+    };
+
+    // A plaintext set asks for neither edge: its spans decrypt nothing, so the
+    // bytes around them buy it nothing and reading them would be pure I/O.
+    let plain = read_repaired_spans(&volume, false).expect("the read-back succeeds");
+    assert_eq!(plain.len(), 1);
+    assert!(plain[0].lead_in.is_none() && plain[0].lead_out.is_none());
+
+    // An encrypted set asks for both. The span's first byte and its last both
+    // sit inside a cipher block whose other half is not in the span, and the
+    // drain can decrypt neither block without it — the low half comes from the
+    // article below, the high half from the article above, and both were routed
+    // and dropped from staging long before the repair ran.
+    let encrypted = read_repaired_spans(&volume, true).expect("the read-back succeeds");
+    let span = &encrypted[0];
+    assert_eq!(
+        span.lead_in
+            .as_ref()
+            .map(|(offset, bytes)| (*offset, bytes.to_vec())),
+        Some((68, image[68..100].to_vec())),
+        "the CBC predecessor of the span's first block, and that block's own \
+         lower half"
+    );
+    assert_eq!(
+        span.lead_out
+            .as_ref()
+            .map(|(offset, bytes)| (*offset, bytes.to_vec())),
+        Some((220, image[220..236].to_vec())),
+        "and the upper half of the block the span's last byte lands in"
+    );
+    assert_eq!(
+        span.len, 120,
+        "neither edge is part of the span: they did not change, so they must \
+         not rewrite the volume composition"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Sparse marking
 // ---------------------------------------------------------------------------

@@ -58,6 +58,23 @@ impl OwnedLaneProbeHandle {
     /// has the same shape as the client's own probe, and `servers_settled`
     /// names the servers whose lanes answered conclusively, so the caller can
     /// tell which servers a miss has already been put to.
+    ///
+    /// # Every lane at once
+    ///
+    /// The servers are asked **concurrently**, and the reason is what this
+    /// probe is usually waiting for. A missing article is only missing once
+    /// every configured server has said so, and each answer is one pipelined
+    /// STAT batch — one round trip — plus, for a lane that took a lease
+    /// between its idle marker being read and the request arriving, up to
+    /// [`LANE_PROBE_PICKUP_TIMEOUT`] of waiting for a pickup that never comes.
+    /// Asked one after another those add up: the verdict costs the *sum* over
+    /// servers where the wire only requires the *maximum*, and the recovery
+    /// that verdict releases waits out the difference.
+    ///
+    /// The cost of asking at once is that each server is asked about the whole
+    /// batch rather than only what the servers before it could not find. That
+    /// is bytes in a single write, not round trips, and it buys back an answer
+    /// that no longer scales with the number of providers configured.
     async fn probe(&self, message_ids: &[String]) -> Option<LaneProbeOutcome> {
         if message_ids.is_empty() {
             return Some(LaneProbeOutcome {
@@ -69,76 +86,52 @@ impl OwnedLaneProbeHandle {
             });
         }
 
-        let mut exists = vec![false; message_ids.len()];
-        let mut servers_asked: Vec<usize> = Vec::new();
-        let mut servers_settled: Vec<usize> = Vec::new();
-        let mut answered = false;
-        let mut inconclusive = false;
-        let request: Arc<[String]> = Arc::from(message_ids.to_vec());
-
+        // One lane per server: a second lane on a server already being asked
+        // can say nothing the first will not.
+        let mut candidates: Vec<(usize, OwnedLaneWorkerHandle)> = Vec::new();
         for worker in self.idle_workers() {
             let server_idx = worker.idle_server.load(Ordering::Acquire);
-            if server_idx == 0 || servers_asked.contains(&(server_idx - 1)) {
-                continue;
-            }
-            // Everything still unaccounted for goes to this server. A lane
-            // that has already been asked about an id cannot say more.
-            let outstanding: Vec<usize> = exists
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, found)| (!found).then_some(idx))
-                .collect();
-            if outstanding.is_empty() {
-                break;
-            }
-
-            let (picked_up_tx, picked_up_rx) = oneshot::channel();
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let batch: Arc<[String]> = if outstanding.len() == message_ids.len() {
-                Arc::clone(&request)
-            } else {
-                Arc::from(
-                    outstanding
-                        .iter()
-                        .map(|idx| message_ids[*idx].clone())
-                        .collect::<Vec<_>>(),
-                )
-            };
-            if worker
-                .sender
-                .send(OwnedLanePoolCommand::Probe {
-                    message_ids: batch,
-                    picked_up: picked_up_tx,
-                    reply: reply_tx,
-                })
-                .is_err()
+            if server_idx == 0
+                || candidates
+                    .iter()
+                    .any(|(server, _)| *server == server_idx - 1)
             {
                 continue;
             }
-            // A worker that does not pick up in time is busy on a lease it
-            // took after the idle marker was read; dropping `picked_up_rx`
-            // here tells it to leave the request unanswered when it gets
-            // there, so no socket does work nobody is waiting for.
-            if !matches!(
-                tokio::time::timeout(LANE_PROBE_PICKUP_TIMEOUT, picked_up_rx).await,
-                Ok(Ok(()))
-            ) {
-                continue;
-            }
-            let Ok(Some(answer)) = reply_rx.await else {
+            candidates.push((server_idx - 1, worker));
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let request: Arc<[String]> = Arc::from(message_ids.to_vec());
+        // A `JoinSet` rather than detached tasks: dropping it aborts whatever
+        // is still outstanding, which is what tells a worker that has not
+        // picked the request up to leave it alone — the same contract the
+        // dropped pickup receiver carries.
+        let mut asking = tokio::task::JoinSet::new();
+        for (server, worker) in candidates {
+            let batch = Arc::clone(&request);
+            asking.spawn(async move { (server, Self::ask_lane(worker, batch).await) });
+        }
+
+        let mut exists = vec![false; message_ids.len()];
+        let mut servers_settled: Vec<usize> = Vec::new();
+        let mut answered = false;
+        let mut inconclusive = false;
+        while let Some(joined) = asking.join_next().await {
+            let Ok((server, Some(answer))) = joined else {
                 continue;
             };
-
             answered = true;
-            servers_asked.push(server_idx - 1);
             if answer.inconclusive {
                 inconclusive = true;
                 continue;
             }
-            servers_settled.push(server_idx - 1);
-            for (slot, found) in outstanding.iter().zip(answer.exists) {
-                if found {
-                    exists[*slot] = true;
+            servers_settled.push(server);
+            for (slot, found) in answer.exists.iter().enumerate() {
+                if *found && let Some(known) = exists.get_mut(slot) {
+                    *known = true;
                 }
             }
         }
@@ -150,6 +143,37 @@ impl OwnedLaneProbeHandle {
             },
             servers_settled,
         })
+    }
+
+    /// Puts one batch to one lane and waits for its verdict.
+    ///
+    /// `None` covers every way a lane can decline to answer — a worker that
+    /// has gone away, one that did not pick the request up inside
+    /// [`LANE_PROBE_PICKUP_TIMEOUT`] because it took a lease, and one that
+    /// dropped the request — none of which is a verdict about the articles.
+    /// The timeout bounds the pickup alone: once a lane has taken the batch,
+    /// its STAT and HEAD round trips take as long as the wire takes.
+    async fn ask_lane(
+        worker: OwnedLaneWorkerHandle,
+        message_ids: Arc<[String]>,
+    ) -> Option<weaver_nntp::client::ProbeBatchResult> {
+        let (picked_up_tx, picked_up_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        worker
+            .sender
+            .send(OwnedLanePoolCommand::Probe {
+                message_ids,
+                picked_up: picked_up_tx,
+                reply: reply_tx,
+            })
+            .ok()?;
+        if !matches!(
+            tokio::time::timeout(LANE_PROBE_PICKUP_TIMEOUT, picked_up_rx).await,
+            Ok(Ok(()))
+        ) {
+            return None;
+        }
+        reply_rx.await.ok().flatten()
     }
 
     fn idle_workers(&self) -> Vec<OwnedLaneWorkerHandle> {
@@ -1212,6 +1236,81 @@ mod tests {
         }
     }
 
+    /// Every configured server's lane holds the same batch at the same time.
+    ///
+    /// A missing article is only missing once every server has said so, so a
+    /// probe asked one lane at a time costs the sum of the answers where the
+    /// wire only requires the longest of them — and the recovery that verdict
+    /// releases waits out the difference. Each fake lane here refuses to answer
+    /// conclusively until the other is holding the batch too, which only a
+    /// probe that asked them together can satisfy.
+    #[tokio::test]
+    async fn every_idle_lane_holds_the_batch_at_once() {
+        const LANES: usize = 2;
+        let holding = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        let mut lanes = Vec::new();
+        for server in 0..LANES {
+            let (sender, receiver) = std_mpsc::channel();
+            workers.push(OwnedLaneWorkerHandle {
+                sender,
+                idle_server: Arc::new(AtomicUsize::new(server + 1)),
+            });
+            let holding = Arc::clone(&holding);
+            lanes.push(std::thread::spawn(move || {
+                let Ok(OwnedLanePoolCommand::Probe {
+                    message_ids,
+                    picked_up,
+                    reply,
+                }) = receiver.recv()
+                else {
+                    return;
+                };
+                let _ = picked_up.send(());
+                holding.fetch_add(1, Ordering::SeqCst);
+                // Bounded rather than a barrier: a probe that asks in
+                // sequence must fail this test, not hang it.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let together = loop {
+                    if holding.load(Ordering::SeqCst) == LANES {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                let _ = reply.send(Some(weaver_nntp::client::ProbeBatchResult {
+                    exists: vec![false; message_ids.len()],
+                    inconclusive: !together,
+                }));
+            }));
+        }
+
+        let probe = OwnedLaneProbeHandle {
+            workers: Arc::new(std::sync::Mutex::new(workers)),
+        };
+        let outcome = probe
+            .probe(&["<withheld@silver.horizon>".to_string()])
+            .await
+            .expect("both lanes answered");
+        for lane in lanes {
+            lane.join().expect("the fake lanes finish");
+        }
+
+        assert!(
+            !outcome.result.inconclusive,
+            "each lane must have been holding the batch while the other was: \
+             asked in sequence, the first one times out waiting for the second"
+        );
+        assert_eq!(
+            outcome.servers_settled.len(),
+            LANES,
+            "and both servers' verdicts count towards the answer"
+        );
+        assert_eq!(outcome.result.exists, vec![false]);
+    }
+
     /// Two leases are on the ring at a lease boundary, so a response has to
     /// carry its own lease's identity, not whichever lease the lane happens to
     /// be filling from when it lands.
@@ -1483,6 +1582,7 @@ mod tests {
         // one, and a 430 must not reach it.
         let mut explorer = crate::pipeline::download::transport::ServerPipelineExplorer::seeded(
             Some(observation.mode.depth()),
+            None,
             None,
         );
         assert_eq!(explorer.current_depth(), 4);

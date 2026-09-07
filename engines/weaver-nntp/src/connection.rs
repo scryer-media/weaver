@@ -1235,6 +1235,69 @@ impl NntpConnection {
         }
     }
 
+    /// Check multiple articles for existence using pipelined `HEAD`.
+    ///
+    /// The shape of [`Self::stat_pipeline`], for a server that has refused
+    /// STAT and for re-checking what STAT reported missing: every HEAD goes
+    /// out in one write and the responses are read back in order, so a batch
+    /// costs one round trip rather than one per article. A 221 carries the
+    /// headers, which have to be drained before the next status line can be
+    /// read; only their arrival matters here, so they are read and dropped.
+    ///
+    /// Returns a `Vec<bool>` aligned with the input: true = 221, false = 430.
+    /// A server that does not implement HEAD at all is recorded as such and
+    /// the batch fails with `CommandNotRecognized` — after the pipe has been
+    /// drained, so the connection is left clean.
+    pub async fn head_pipeline(&mut self, message_ids: &[&str]) -> Result<Vec<bool>> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.last_used = Instant::now();
+        let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
+
+        for msg_id in message_ids {
+            let cmd = Command::Head(ArticleId::MessageId(msg_id.to_string()));
+            let encoded = cmd.encode();
+            transport.write_all(&encoded).await.map_err(|e| {
+                self.poisoned = true;
+                NntpError::Io(e)
+            })?;
+        }
+        transport.flush().await.map_err(|e| {
+            self.poisoned = true;
+            NntpError::Io(e)
+        })?;
+
+        let mut results = Vec::with_capacity(message_ids.len());
+        let mut refusal = None;
+        for _ in message_ids {
+            let resp = self.read_response().await?;
+            match resp.code.raw() {
+                221 => {
+                    self.read_multiline_data().await?;
+                    results.push(true);
+                }
+                430 | 423 => results.push(false),
+                code if crate::server_caps::is_command_unsupported(code) => {
+                    if crate::server_caps::note_head_unsupported(&self.host, self.port) {
+                        debug!(host = %self.host, port = self.port, "server does not implement HEAD");
+                    }
+                    results.push(false);
+                    let _ = refusal.get_or_insert(NntpError::CommandNotRecognized);
+                }
+                _ => {
+                    results.push(false);
+                    let _ = refusal.get_or_insert(NntpError::from_status(resp.code, &resp.message));
+                }
+            }
+        }
+        match refusal {
+            Some(error) => Err(error),
+            None => Ok(results),
+        }
+    }
+
     /// Stream the body of an article directly to a writer.
     ///
     /// Reads the multi-line data and writes it to the provided writer.

@@ -243,6 +243,70 @@ async fn spawn_probe_confirmation_server(head_response: &'static [u8]) -> u16 {
     port
 }
 
+/// A server on which STAT finds nothing, and which insists that the HEAD
+/// re-check arrive as one pipelined batch: the second HEAD has to be on the
+/// wire before the first is answered. Answers the first id as present and the
+/// second as missing.
+async fn spawn_pipelined_head_recheck_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"200 ready\r\n").await.unwrap();
+        socket.flush().await.unwrap();
+
+        while let Some(line) = try_read_command_line(&mut socket).await {
+            if line.starts_with("MODE READER") {
+                socket
+                    .write_all(b"500 MODE READER unsupported\r\n")
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                continue;
+            }
+            if line.starts_with("CAPABILITIES") {
+                socket
+                    .write_all(
+                        b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+                    )
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                continue;
+            }
+            if line.starts_with("STAT ") {
+                socket.write_all(b"430 No such article\r\n").await.unwrap();
+                socket.flush().await.unwrap();
+                continue;
+            }
+            if line.starts_with("HEAD <first@example.com>") {
+                let second = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    read_command_line(&mut socket),
+                )
+                .await
+                .expect("the HEAD re-check must send every miss before reading an answer");
+                assert!(
+                    second.starts_with("HEAD <second@example.com>"),
+                    "unexpected second command: {second:?}"
+                );
+                socket
+                    .write_all(
+                        b"221 0 <first@example.com> Headers follow\r\nSubject: still here\r\n.\r\n430 No such article\r\n",
+                    )
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                continue;
+            }
+            panic!("unexpected command line: {line:?}");
+        }
+    });
+
+    port
+}
+
 fn scripted_server(port: u16, group: usize) -> ServerPoolConfig {
     ServerPoolConfig {
         server: ServerConfig {
@@ -3125,5 +3189,32 @@ async fn a_probe_with_every_server_excluded_has_nobody_to_ask() {
     assert!(
         client.has_available_permit(ServerId(0)),
         "no connection may be opened on an excluded server"
+    );
+}
+
+/// The HEAD re-check of STAT's misses is one pipelined batch, not one
+/// failover fetch per article: N misses cost one round trip per server, and a
+/// missing article is exactly the case where every server has to be asked.
+#[tokio::test]
+async fn the_head_recheck_of_stat_misses_is_one_pipelined_batch() {
+    let port = spawn_pipelined_head_recheck_server().await;
+
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_server(port, 0)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(5),
+    });
+
+    let result = client
+        .confirm_exists_for_probe(&["<first@example.com>", "<second@example.com>"])
+        .await;
+    assert_eq!(
+        result,
+        ProbeBatchResult {
+            exists: vec![true, false],
+            inconclusive: false,
+        },
+        "the batch's answers land on the ids they were asked about"
     );
 }

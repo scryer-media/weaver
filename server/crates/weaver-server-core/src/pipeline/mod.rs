@@ -3187,6 +3187,18 @@ pub struct Pipeline {
     pub(super) propagation_delay_forced: Option<Duration>,
     /// Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
+    /// Last time we warned that an owned blocking lane could not be acquired.
+    pub(super) last_owned_lane_acquire_failure_log_at: Option<Instant>,
+    /// Last time an owned blocking lane failed to be acquired at all, warned
+    /// about or not. The under-cap report below is gated on it: lanes below
+    /// their cap are only a fault when a lane actually failed to open.
+    pub(super) last_owned_lane_acquire_failure_at: Option<Instant>,
+    /// When the servers were first seen below their configured connection cap
+    /// while work was queued, and the last time that was reported. Cleared as
+    /// soon as a pass finds the lanes filled, so only a *sustained* underfill
+    /// is ever logged.
+    pub(super) download_lanes_under_cap_since: Option<Instant>,
+    pub(super) last_download_lanes_under_cap_log_at: Option<Instant>,
     /// Current in-memory decoded backlog retained for sequential write ordering.
     pub(super) write_buffered_bytes: usize,
     /// Current in-memory decoded segment count retained for sequential write ordering.

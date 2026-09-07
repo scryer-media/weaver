@@ -312,7 +312,7 @@ impl DirectStoreRuntime {
     pub(crate) fn set_holds_limits_with_disk_probe(
         &mut self,
         limits: super::accountant::HoldsLimits,
-        probe: Box<dyn Fn(&std::path::Path) -> Option<u64> + Send + Sync>,
+        probe: super::accountant::DiskProbe,
     ) {
         self.accountant = std::sync::Arc::new(super::accountant::HoldsAccountant::with_probe(
             limits, probe,

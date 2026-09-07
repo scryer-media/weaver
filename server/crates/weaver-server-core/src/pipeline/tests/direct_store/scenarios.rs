@@ -10,6 +10,7 @@ mod cross_device;
 mod cross_device_probe;
 mod quick_open;
 mod rar4_rar3_file_encryption;
+mod repaired_encrypted_spans;
 mod restart;
 mod waiting_for_targeted_recovery;
 

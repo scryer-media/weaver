@@ -191,6 +191,18 @@ pub(crate) struct RepairedSpan {
     /// article-shaped composition over a range that is not article-shaped — the
     /// one thing [`widen_to_articles`] exists to prevent.
     pub(crate) lead_in: Option<super::router::RepairedChunk>,
+    /// Up to [`CIPHER_LEAD_OUT_BYTES`] posted bytes immediately **above** the
+    /// span, the mirror of `lead_in` and staged the same unrepaired way.
+    ///
+    /// A span's last byte lands anywhere in a cipher block, and the drain can
+    /// only decrypt that block once it holds all sixteen of its bytes. The ones
+    /// below come with the span; the ones above belong to the next article,
+    /// which was routed and dropped from staging long before the repair ran. So
+    /// without them the block resolves for nobody: the repaired bytes inside it
+    /// hold, and the "every repaired byte finds a destination" rule turns that
+    /// into a whole-set demotion after the recovery has already been
+    /// downloaded.
+    pub(crate) lead_out: Option<super::router::RepairedChunk>,
 }
 
 /// What the repaired volumes came out as.
@@ -393,6 +405,14 @@ pub(crate) fn widen_to_articles(
 /// The bytes come off the **materialized** volume, so they are the posted ones.
 const CIPHER_LEAD_IN_BYTES: u64 = 32;
 
+/// How many posted bytes are read back **above** a repaired span, for the same
+/// reason [`CIPHER_LEAD_IN_BYTES`] reads them below.
+///
+/// One block is exactly enough: the span's last byte sits at most 15 bytes short
+/// of its block's end, and nothing above that block is needed — CBC decryption
+/// looks backwards, so the block's own predecessor is inside the span.
+const CIPHER_LEAD_OUT_BYTES: u64 = 16;
+
 /// Materializes the damaged volumes and repairs them. Blocking: call it on the
 /// blocking pool.
 ///
@@ -589,9 +609,22 @@ pub(crate) fn read_repaired_spans(
                     }
                     false => None,
                 };
+                let lead_out = match cipher_lead_in && end < volume.len {
+                    true => {
+                        let to = end.saturating_add(CIPHER_LEAD_OUT_BYTES).min(volume.len);
+                        read_span_chunked(&volume.path, end, to - end)
+                            .map_err(|error| DirectRepairFailure::ReadBackFailed {
+                                volume_index: volume.volume_index,
+                                error: error.to_string(),
+                            })?
+                            .and_then(|lead| lead.chunks.into_iter().next())
+                    }
+                    false => None,
+                };
                 spans.push(RepairedSpan {
                     volume_index: volume.volume_index,
                     lead_in,
+                    lead_out,
                     ..span
                 });
             }
@@ -649,6 +682,7 @@ fn read_span_chunked(
         len,
         crc32,
         lead_in: None,
+        lead_out: None,
     }))
 }
 

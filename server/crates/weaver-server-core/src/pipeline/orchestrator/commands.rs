@@ -557,6 +557,11 @@ impl Pipeline {
                     // totals carry across the rebuild.
                     self.server_counters =
                         Self::activate_server_counters(&self.metrics, &self.nntp);
+                    // Depth explorers are keyed by pool position, so they are
+                    // rebuilt against the new layout. A server that survived
+                    // the rebuild keeps what it had measured, matched by
+                    // stable id rather than by position.
+                    self.seed_download_lane_explorers();
                     let recovery_requeues = self.wake_all_infrastructure_retries();
                     self.clear_retention_exclude_cache();
                     for state in self.jobs.values_mut() {

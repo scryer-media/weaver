@@ -498,17 +498,16 @@ mod tests {
         let files = build_many_volume_rar_set(volume_count);
         let mut cached_archive =
             unrar_rs::RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
-        for volume in 1..held {
+        for (volume, (_, bytes)) in files.iter().enumerate().take(held).skip(1) {
             cached_archive
-                .add_volume(volume, Box::new(Cursor::new(files[volume].1.clone())))
+                .add_volume(volume, Box::new(Cursor::new(bytes.clone())))
                 .unwrap();
         }
 
         let mut volume_map = HashMap::new();
         let mut volume_paths = BTreeMap::new();
         let mut facts = BTreeMap::new();
-        for volume in 0..present {
-            let (filename, bytes) = &files[volume];
+        for (volume, (filename, bytes)) in files.iter().enumerate().take(present) {
             let path = temp_dir.path().join(filename);
             std::fs::write(&path, bytes).unwrap();
             volume_map.insert(filename.clone(), volume as u32);

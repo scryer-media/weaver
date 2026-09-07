@@ -75,7 +75,7 @@ pub(crate) struct HoldsCharge {
 /// filesystem cannot say, which the accountant treats as no reserve to
 /// enforce rather than as an empty disk: a probe failure must not demote a
 /// set that was routing fine.
-type DiskProbe = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
+pub(crate) type DiskProbe = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 
 #[derive(Debug)]
 struct DiskEstimate {

@@ -114,6 +114,20 @@ impl BlockingBodyLaneAcquireError {
     pub fn should_requeue_owned_work(&self) -> bool {
         self.is_capacity_admission() || matches!(self, Self::SelectionContended)
     }
+
+    /// A short, stable label for metrics and logs. Distinguishing the kinds is
+    /// the whole point of the counters: local capacity and selection contention
+    /// are self-clearing, provider capacity is the provider refusing sockets,
+    /// and `other` is a transport failure that deserves attention.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ProviderCapacity(_) => "provider_capacity",
+            Self::LocalCapacity => "local_capacity",
+            Self::NoEligibleServer => "no_eligible_server",
+            Self::SelectionContended => "selection_contended",
+            Self::Other(_) => "other",
+        }
+    }
 }
 
 impl std::fmt::Display for BlockingBodyLaneAcquireError {
@@ -1212,7 +1226,7 @@ impl NntpClient {
             return None;
         }
 
-        let mut exists = match self.stat_many_in_order(message_ids, order).await {
+        let mut exists = match self.stat_many_in_order(message_ids, order.clone()).await {
             Ok(results) => results,
             Err(_) => {
                 return Some(ProbeBatchResult {
@@ -1222,26 +1236,45 @@ impl NntpClient {
             }
         };
 
-        for (idx, message_id) in message_ids.iter().enumerate() {
-            if exists[idx] || !self.any_server_supports_head_excluding(exclude) {
+        // What STAT reported missing is re-checked with HEAD before the
+        // verdict stands — as one pipelined batch per server, narrowing to
+        // what the servers before it could not find, the same walk STAT took.
+        // Asking per article through the failover fetch made a verdict on N
+        // misses cost N round trips per server, and a missing article is
+        // exactly the case where every server has to be asked.
+        let mut remaining: Vec<usize> = exists
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, found)| (!found).then_some(idx))
+            .collect();
+        for idx in order {
+            if remaining.is_empty() {
+                break;
+            }
+            let Some(config) = self.pool.server_configs().get(idx) else {
+                continue;
+            };
+            // A server that has refused HEAD is an answer about the command,
+            // not a fault: its STAT verdict stands for what it was asked.
+            if !crate::server_caps::supports_head(&config.host, config.port) {
                 continue;
             }
-
-            match self
-                .fetch_with_failover_excluding(message_id, FetchKind::Head, exclude)
-                .await
-            {
-                Ok(_) => exists[idx] = true,
-                Err(
-                    NntpError::ArticleNotFound
-                    | NntpError::NoSuchArticle { .. }
-                    | NntpError::NoArticleWithNumber,
-                ) => {}
-                // Every server asked has now refused HEAD itself, which is an
-                // answer about the command and not a fault: the STAT verdict
-                // stands and the remaining misses are not re-checked.
-                Err(NntpError::CommandNotRecognized)
-                    if !self.any_server_supports_head_excluding(exclude) => {}
+            let batch: Vec<&str> = remaining.iter().map(|&i| message_ids[i]).collect();
+            match self.head_many_from_server(ServerId(idx), &batch).await {
+                Ok(results) => {
+                    let mut next_remaining = Vec::with_capacity(remaining.len());
+                    for (original_idx, found) in remaining.iter().copied().zip(results) {
+                        if found {
+                            exists[original_idx] = true;
+                        } else {
+                            next_remaining.push(original_idx);
+                        }
+                    }
+                    remaining = next_remaining;
+                }
+                // The refusal just happened on this batch; it has been recorded
+                // against the server and the next one is asked instead.
+                Err(NntpError::CommandNotRecognized) => {}
                 Err(_) => {
                     return Some(ProbeBatchResult {
                         exists,
@@ -1255,19 +1288,6 @@ impl NntpClient {
             exists,
             inconclusive: false,
         })
-    }
-
-    /// Whether any configured server outside `exclude` still answers HEAD, as
-    /// far as this process has been able to tell.
-    fn any_server_supports_head_excluding(&self, exclude: &[usize]) -> bool {
-        self.pool
-            .server_configs()
-            .iter()
-            .enumerate()
-            .any(|(idx, config)| {
-                !exclude.contains(&idx)
-                    && crate::server_caps::supports_head(&config.host, config.port)
-            })
     }
 
     /// Fetch the body of an article by message-id, with multi-server failover.
@@ -2308,12 +2328,28 @@ impl NntpClient {
                 Ok(lane) => return Ok(lane),
                 Err(error) => {
                     self.record_blocking_connect_failure(server.0, &error);
+                    // Debug for every failure, and one WARN per server per
+                    // window carrying how many it stands for. A lane that
+                    // cannot connect is invisible otherwise: the work is
+                    // requeued or handed to an async lane, so the download
+                    // keeps running — slowly, on a fraction of its lanes, with
+                    // nothing above debug to say why.
                     debug!(
                         server = server.0,
                         error = %error,
                         elapsed_ms = started.elapsed().as_millis(),
                         "blocking BODY lane connect failed"
                     );
+                    if let Some(suppressed) = self.pool.note_blocking_connect_warning(server) {
+                        warn!(
+                            server = server.0,
+                            address = %self.pool.server_address(server),
+                            error = %error,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            failures_since_last_warning = suppressed,
+                            "blocking BODY lane connect failed"
+                        );
+                    }
                     match BlockingBodyLaneAcquireError::from_connect_error(error) {
                         BlockingBodyLaneAcquireError::ProviderCapacity(error) => {
                             provider_capacity_error = Some(error);
@@ -3137,40 +3173,87 @@ impl NntpClient {
             .is_none_or(|config| crate::server_caps::supports_stat(&config.host, config.port))
     }
 
-    /// Existence by HEAD, for a server that has refused STAT outright.
+    /// Existence by HEAD, for a server that has refused STAT outright and for
+    /// re-checking what STAT reported missing.
     ///
-    /// One connection serves the whole batch, so the fallback costs a round
-    /// trip per article but no extra dials. HEAD is a multi-line response and
-    /// is not pipelined here.
+    /// One connection serves the whole batch. On a server that pipelines it is
+    /// one write and one round trip, exactly as a STAT batch is; otherwise a
+    /// round trip per article, but still no extra dials. Transient faults are
+    /// retried on the same server the way a STAT batch is, so a re-check is
+    /// not turned inconclusive by one dropped socket.
     async fn head_many_from_server(
         &self,
         server: ServerId,
         message_ids: &[&str],
     ) -> Result<Vec<bool>> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let deadline = TokioInstant::now() + self.soft_timeout;
-        let mut conn = self.acquire_before_deadline(server, deadline).await?;
-        let mut results = Vec::with_capacity(message_ids.len());
-        for message_id in message_ids {
-            match tokio::time::timeout_at(deadline, conn.head_by_id(message_id)).await {
-                Ok(Ok(_)) => results.push(true),
-                Ok(Err(
-                    NntpError::ArticleNotFound
-                    | NntpError::NoSuchArticle { .. }
-                    | NntpError::NoArticleWithNumber,
-                )) => results.push(false),
-                Ok(Err(error)) => {
+        let mut attempts = 0u32;
+
+        loop {
+            let mut conn = self.acquire_before_deadline(server, deadline).await?;
+            let result = match tokio::time::timeout_at(deadline, async {
+                if conn.capabilities().supports_pipelining() {
+                    conn.head_pipeline(message_ids).await
+                } else {
+                    let mut results = Vec::with_capacity(message_ids.len());
+                    for message_id in message_ids {
+                        match conn.head_by_id(message_id).await {
+                            Ok(_) => results.push(true),
+                            Err(
+                                NntpError::ArticleNotFound
+                                | NntpError::NoSuchArticle { .. }
+                                | NntpError::NoArticleWithNumber,
+                            ) => results.push(false),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(results)
+                }
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.discard_connection_error(server.0, conn).await;
+                    return Err(self.soft_timeout_error());
+                }
+            };
+
+            match result {
+                Ok(results) => return Ok(results),
+                Err(error) if is_retryable_stat_error(&error) => {
+                    if should_discard_stat_connection(&error) {
+                        self.discard_connection_error(server.0, conn).await;
+                    }
+                    if attempts < self.max_retries_per_server {
+                        attempts += 1;
+                        self.sleep_before_deadline(
+                            Duration::from_millis(200 * attempts as u64),
+                            deadline,
+                        )
+                        .await?;
+                        debug!(
+                            server = server.0,
+                            attempt = attempts,
+                            error = %error,
+                            batch_size = message_ids.len(),
+                            "retryable error during HEAD batch, retrying on same server"
+                        );
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => {
                     if is_connection_error(&error) {
                         self.discard_connection_error(server.0, conn).await;
                     }
                     return Err(error);
                 }
-                Err(_) => {
-                    self.discard_connection_error(server.0, conn).await;
-                    return Err(self.soft_timeout_error());
-                }
             }
         }
-        Ok(results)
     }
 
     async fn stat_many_from_server(

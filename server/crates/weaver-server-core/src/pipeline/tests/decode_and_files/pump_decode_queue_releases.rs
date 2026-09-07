@@ -934,10 +934,14 @@ async fn replayed_article_mid_download_still_completes_the_file() {
 async fn replayed_article_mid_download_condemns_the_streamed_hash_but_completes_cleanly() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    // The fixture is a RAR volume so the STREAMING hash arm sees it — but a
-    // routed article never feeds that arm at all, and with the gate at its
-    // default-on the set would route. This test is about the conventional
-    // streaming hash, so the gate is pinned off.
+    // A routed article never reaches the running-hash seam at all, and with
+    // the gate at its default-on this set would route, so the gate is pinned
+    // off. The job carries no recovery set, so the running state here is the
+    // deferred CRC-metadata arm rather than a streamed MD5 — the whole-file
+    // hash is only kept where a recovery set could consume it. What the test
+    // is about is unchanged: a replayed article condemns whatever running
+    // state describes the file, because the rewrite it performed cannot be
+    // proven byte-identical to what was already accounted for.
     pipeline
         .direct_store
         .set_gate(crate::pipeline::direct_store::DirectStoreGate::Disabled);
@@ -965,19 +969,21 @@ async fn replayed_article_mid_download_condemns_the_streamed_hash_but_completes_
     .await;
     assert_eq!(
         pipeline
-            .file_hash_states
+            .deferred_file_hash_ranges
             .get(&file_id)
-            .map(|state| state.bytes_fed()),
-        Some(4)
+            .and_then(|ranges| ranges.get(&0))
+            .map(|range| range.len),
+        Some(4),
+        "the first arrival accounts for its range without hashing the bytes"
     );
 
     // The same article again, landing behind the file's write cursor. The
     // arrival rewrote the range on disk, and nothing at the commit seam can
-    // prove it wrote the same bytes the stream already digested — CRC
-    // equality is not byte identity — so the streamed state is condemned to
-    // the completion-time re-read, which digests the disk as the rewrite
-    // left it. The duplicate's bytes are still not fed to the running hash:
-    // the poison replaces the stream, it does not double-feed it.
+    // prove it wrote the same bytes the running state already accounted for —
+    // CRC equality is not byte identity — so that state is condemned to the
+    // completion-time re-read, which digests the disk as the rewrite left it.
+    // The duplicate's bytes are still not fed to the running hash: the poison
+    // replaces the stream, it does not double-feed it.
     submit_decoded_segment(
         &mut pipeline,
         file_id,
@@ -990,7 +996,7 @@ async fn replayed_article_mid_download_condemns_the_streamed_hash_but_completes_
     .await;
     assert!(
         pipeline.file_hash_reread_required.contains(&file_id),
-        "a duplicate rewrite must condemn the streamed hash state to a re-read"
+        "a duplicate rewrite must condemn the running hash state to a re-read"
     );
     assert_eq!(
         pipeline
@@ -1143,9 +1149,10 @@ async fn late_metadata_conflicting_duplicate_cannot_quick_verify_against_stale_b
 async fn mismatched_out_of_order_offset_is_rejected_before_hash_state_changes() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    // Pinned off for the same reason as the replayed-article test above: the
-    // RAR-volume fixture exists to reach the streaming hash arm, which a
-    // routed article bypasses by design.
+    // Pinned off for the same reason as the replayed-article test above: a
+    // routed article bypasses the running-hash seam by design. With no
+    // recovery set in the job the running state is the deferred CRC-metadata
+    // arm, which is what a mismatched offset must not be allowed to poison.
     pipeline
         .direct_store
         .set_gate(crate::pipeline::direct_store::DirectStoreGate::Disabled);
@@ -1185,7 +1192,15 @@ async fn mismatched_out_of_order_offset_is_rejected_before_hash_state_changes() 
     )
     .await;
     assert!(!pipeline.file_hash_reread_required.contains(&file_id));
-    assert!(pipeline.file_hash_states.contains_key(&file_id));
+    // The rejected segment left the accounting exactly as the accepted one did:
+    // one range, at the offset that arrival really covered.
+    assert_eq!(
+        pipeline
+            .deferred_file_hash_ranges
+            .get(&file_id)
+            .map(|ranges| ranges.keys().copied().collect::<Vec<_>>()),
+        Some(vec![0])
+    );
     assert_eq!(
         pipeline.decode_retries.get(&SegmentId {
             file_id,
@@ -2671,4 +2686,55 @@ async fn reprocess_job_rebuilds_complete_history_from_streamed_persisted_nzb() {
         ]
     );
     assert!(state.download_queue.is_empty());
+}
+
+/// A job with no recovery set has nothing to compare a whole-file MD5
+/// against, whatever the file's role.
+///
+/// The deferral used to be restricted to standalone and unclassified files, so
+/// every split archive volume in a job with no recovery set was hashed in full
+/// on the orchestrator task for a value nothing would ever read. The file path
+/// handed to the finalizer does not exist: a read-back fallback would fail, so
+/// a checksum coming back at all is the proof that none happened.
+#[tokio::test]
+async fn a_split_archive_volume_without_a_recovery_set_defers_its_md5() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20081);
+    let filename = "silver.horizon.7z.001";
+    let payload = b"abcdefgh";
+    let mut spec = standalone_job_spec(
+        "Split Volume Without Recovery",
+        &[(filename.to_string(), payload.len() as u32)],
+    );
+    spec.files[0].role = FileRole::SevenZipSplit { number: 0 };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    pipeline.note_file_hash_chunk(file_id, 0, payload, par2_rs::checksum::crc32(payload), true);
+    assert!(
+        !pipeline
+            .file_hash_states
+            .get(&file_id)
+            .expect("the chunk advanced the hash state")
+            .tracks_md5(),
+        "a split volume in a job with no recovery set must not stream an MD5"
+    );
+
+    let checksum = pipeline
+        .finalize_completed_file_hash(
+            file_id,
+            filename,
+            temp_dir.path().join("missing-volume.7z.001"),
+            payload.len() as u64,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(checksum.md5, None);
+    assert_eq!(checksum.crc32, par2_rs::checksum::crc32(payload));
+    assert!(checksum.all_parts_crc_verified);
 }

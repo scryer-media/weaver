@@ -141,6 +141,74 @@ impl Pipeline {
         }
     }
 
+    /// Reports lanes that are not being filled: work is queued, dispatch is
+    /// running, and yet a server has been carrying fewer connections than it is
+    /// configured for throughout the window.
+    ///
+    /// The liveness stall above only fires when there are **no** active
+    /// downloads at all, so the shape that hides here is the partial one — a
+    /// job running on two of its eight lanes because the other six fail to
+    /// open, which is indistinguishable from a slow server in every metric the
+    /// job exposes.
+    ///
+    /// Lanes sit below their cap for many ordinary reasons — a bandwidth cap,
+    /// byte pressure, a hot job whose spillover is blocked, the tail of a job
+    /// with fewer articles left than lanes — so an underfill alone says
+    /// nothing. It is reported only when a lane actually failed to open inside
+    /// the window, which is the one cause this line exists to name.
+    pub(in crate::pipeline) fn log_download_lanes_under_cap(
+        &mut self,
+        now: Instant,
+        max_connections: usize,
+    ) {
+        let queue_depth = self
+            .jobs
+            .values()
+            .map(|state| state.download_queue.len() + state.recovery_queue.len())
+            .sum::<usize>();
+        // Nothing to fill the lanes with, or the lanes are full: either way
+        // this is not the condition, and the window restarts from here.
+        if queue_depth == 0 || self.active_download_connections >= max_connections {
+            self.download_lanes_under_cap_since = None;
+            return;
+        }
+        let since = *self.download_lanes_under_cap_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < DOWNLOAD_LANES_UNDER_CAP_WINDOW {
+            return;
+        }
+        if !self
+            .last_owned_lane_acquire_failure_at
+            .is_some_and(|failed_at| failed_at >= since)
+        {
+            return;
+        }
+        if self
+            .last_download_lanes_under_cap_log_at
+            .is_some_and(|last| {
+                now.saturating_duration_since(last) < DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL
+            })
+        {
+            return;
+        }
+        self.last_download_lanes_under_cap_log_at = Some(now);
+        let pool = self.nntp.pool();
+        let per_server: Vec<(usize, usize, usize)> = (0..pool.server_count())
+            .map(|idx| {
+                let (available, configured) = pool.server_load(idx);
+                (idx, configured.saturating_sub(available), configured)
+            })
+            .collect();
+        info!(
+            queue_depth,
+            active_connections = self.active_download_connections,
+            active_downloads = self.active_downloads,
+            max_connections,
+            under_cap_for_ms = now.saturating_duration_since(since).as_millis() as u64,
+            per_server_active_of_configured = ?per_server,
+            "download lanes have stayed below their connection cap with work queued"
+        );
+    }
+
     /// Update shared atomic queue depth metrics from per-job queues.
     pub(crate) fn update_queue_metrics(&self) {
         let (total, recovery) = self.jobs.values().fold((0usize, 0usize), |(t, r), s| {

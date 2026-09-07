@@ -543,29 +543,32 @@ impl Pipeline {
         let Some(file) = state.assembly.file(file_id) else {
             return true;
         };
-        if !matches!(
+        // Past this point the job does have a recovery set. A RAR volume is
+        // adjudicated by that set's slice grid rather than by a hash over the
+        // volume, so the stream buys nothing for it.
+        !matches!(
             self.classified_role_for_file(file_id.job_id, file),
             weaver_model::files::FileRole::RarVolume { .. }
-        ) {
-            return true;
-        }
-        self.par2_set(file_id.job_id).is_none()
+        )
     }
 
+    /// Whether the completed-file MD5 has no consumer, so neither the streamed
+    /// hash nor a read-back has to produce one.
+    ///
+    /// The consumer is PAR2: committed-file evidence binds a finished file to a
+    /// recovery-set description by hash identity. A job with no recovery set
+    /// has nobody to compare a whole-file MD5 against, and that is true
+    /// whatever the file's role — the role only ever stood in for "is this
+    /// likely to end up in front of PAR2", which the recovery set itself
+    /// answers directly. Restricting it to standalone files meant every split
+    /// archive volume in a job with no recovery set was hashed in full on the
+    /// orchestrator task for a value nothing would read.
+    ///
+    /// A recovery set discovered *after* a file settled is handled where it
+    /// always was: this predicate is re-evaluated at finalize, and a set that
+    /// has appeared by then sends the file down the read-back path instead.
     fn can_defer_completed_file_md5(&self, file_id: NzbFileId) -> bool {
-        if self.par2_set(file_id.job_id).is_some() {
-            return false;
-        }
-        let Some(state) = self.jobs.get(&file_id.job_id) else {
-            return false;
-        };
-        let Some(file) = state.assembly.file(file_id) else {
-            return false;
-        };
-        matches!(
-            self.classified_role_for_file(file_id.job_id, file),
-            weaver_model::files::FileRole::Standalone | weaver_model::files::FileRole::Unknown
-        )
+        self.par2_set(file_id.job_id).is_none()
     }
 
     pub(crate) fn note_expected_file_crc(
@@ -751,7 +754,17 @@ impl Pipeline {
                     // ever compare observed values against expectations.
                     let file_crc_matched = expected_file_crc
                         .is_some_and(|expected_file_crc| streamed.crc32 == expected_file_crc);
-                    if file_crc_matched && self.can_defer_completed_file_md5(file_id) {
+                    // A poster who supplied an aggregate `=yend crc32` has to
+                    // be satisfied; one who supplied none leaves the
+                    // per-article CRC32s as the alignment, and they have
+                    // already adjudicated every byte. Demanding the poster's
+                    // value here would send the many multipart posts that omit
+                    // it into a whole-file read-back to produce a hash this
+                    // job has no recovery set to compare against — strictly
+                    // worse than the streamed hash it replaced.
+                    let file_crc_agrees = expected_file_crc
+                        .is_none_or(|expected_file_crc| streamed.crc32 == expected_file_crc);
+                    if file_crc_agrees && self.can_defer_completed_file_md5(file_id) {
                         crate::runtime::perf_probe::record(
                             "download.file_hash.md5.deferred_no_par2_expected_crc",
                             std::time::Duration::from_nanos(1),
