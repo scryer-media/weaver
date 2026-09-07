@@ -182,3 +182,82 @@ async fn split_files_register_topology_when_completed() {
         crate::jobs::assembly::ExtractionReadiness::Ready
     ));
 }
+
+/// A split suffix is a declaration the post makes, and the topology keeps it
+/// as declared: a hole the recovery data later fills must restore the true
+/// count, so the count is never clamped to the parts in hand. What the
+/// declaration must never buy is work proportional to itself. Every consumer
+/// of `expected_volume_count` and of a member's volume range walks it only
+/// until the first missing volume, and nothing materializes the range, so a
+/// suffix in the hundreds of millions costs the same as one in the tens.
+#[tokio::test]
+async fn sevenz_split_suffix_far_past_the_named_parts_is_cheap_to_hold() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30078);
+    // The second suffix declares a billion volumes; the post names two.
+    let files = [
+        ("payload.7z.001".to_string(), b"split-a".to_vec()),
+        ("payload.7z.999999999".to_string(), b"split-b".to_vec()),
+    ];
+    let spec = JobSpec {
+        name: "Inflated Split Suffix".to_string(),
+        password: None,
+        total_bytes: files.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
+        category: None,
+        metadata: vec![],
+        files: files
+            .iter()
+            .enumerate()
+            .map(|(index, (filename, bytes))| FileSpec {
+                filename: filename.clone(),
+                role: FileRole::from_filename(filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: bytes.len() as u32,
+                    message_id: format!("split-inflated-{index}@example.com"),
+                }],
+            })
+            .collect(),
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+
+    let started = std::time::Instant::now();
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    let topology = state
+        .assembly
+        .archive_topology_for("payload.7z")
+        .expect("7z split topology should be registered");
+    assert_eq!(
+        topology.archive_type,
+        crate::jobs::assembly::ArchiveType::SevenZip
+    );
+    assert_eq!(topology.expected_volume_count, Some(999_999_999));
+    assert_eq!(topology.volume_map.len(), 2);
+    assert!(
+        topology
+            .members
+            .iter()
+            .all(|member| member.last_volume == 999_999_998),
+        "members: {:?}",
+        topology.members
+    );
+    // Volume 1 is the first hole, so the set is not extractable, and the
+    // completion check sees the same hole. Both answers come from the first
+    // missing volume, not from a walk to the declared count.
+    assert!(!matches!(
+        state.assembly.set_extraction_readiness("payload.7z"),
+        crate::jobs::assembly::ExtractionReadiness::Ready
+    ));
+    assert!(pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "holding a declared count must not cost work proportional to it"
+    );
+}

@@ -2752,7 +2752,7 @@ impl Pipeline {
                     );
                 }
 
-                let expected = max_number + 1;
+                let expected = max_number.saturating_add(1);
                 let topology = ArchiveTopology {
                     archive_type: ArchiveType::SevenZip,
                     volume_map,
@@ -2900,7 +2900,7 @@ impl Pipeline {
                     }
                 }
 
-                let expected = max_number + 1;
+                let expected = max_number.saturating_add(1);
                 let topology = ArchiveTopology {
                     archive_type: ArchiveType::Split,
                     volume_map,

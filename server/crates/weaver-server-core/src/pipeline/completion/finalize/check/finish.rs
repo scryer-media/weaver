@@ -1145,7 +1145,9 @@ impl Pipeline {
         topology.complete_volumes.insert(number);
         let expected = topology
             .expected_volume_count
-            .map_or(number + 1, |expected| expected.max(number + 1));
+            .map_or(number.saturating_add(1), |expected| {
+                expected.max(number.saturating_add(1))
+            });
         topology.expected_volume_count = Some(expected);
         for member in &mut topology.members {
             member.last_volume = member.last_volume.max(number);
