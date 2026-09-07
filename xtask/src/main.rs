@@ -2178,9 +2178,9 @@ fn run_weaver_rust_prep_validation(ctx: &TaskContext, prefix: &'static str) -> R
     run_streaming(&mut fmt, prefix)?;
     prefixed_ok(prefix, "cargo fmt passed");
 
-    prefixed_step(prefix, "Updating Cargo.lock (cargo update)");
+    prefixed_step(prefix, "Updating workspace packages in Cargo.lock");
     let mut update = ctx.command_in("cargo", &ctx.repo_root);
-    update.arg("update");
+    update.args(["update", "--workspace"]);
     run_streaming(&mut update, prefix)?;
     prefixed_ok(prefix, "Cargo.lock updated");
 
