@@ -2750,8 +2750,7 @@ impl DirectSetRouter {
                 );
             }
         }
-        self.publish_holds();
-        if self.resident_bytes() > self.holds_budget {
+        if self.publish_holds() > self.holds_budget {
             // Everything pageable is paged and RAM is still over: the budget is
             // smaller than one staged run, which is a configuration the set
             // cannot route inside. The *shared* limit is not judged here: with
@@ -2865,17 +2864,21 @@ impl DirectSetRouter {
     /// Publishes this set's resident and scratch bytes to the accountant.
     /// Called wherever staging changes size, so the process total is current
     /// whenever a set consults it.
-    fn publish_holds(&mut self) {
+    ///
+    /// Returns the resident figure it published, so the caller that needs it
+    /// next does not walk the staging map a second time: the article path
+    /// pays exactly the one fold it paid before the accountant existed.
+    fn publish_holds(&mut self) -> u64 {
         let resident = self.resident_bytes();
         let scratch = self.scratch.bytes();
         self.accountant.publish(&mut self.charge, resident, scratch);
+        resident
     }
 
     /// Whether this set must page: over its own budget, or holding anything
     /// at all while the process is over the limit every set shares.
     fn holds_over_budget(&mut self) -> bool {
-        self.publish_holds();
-        let resident = self.resident_bytes();
+        let resident = self.publish_holds();
         resident > self.holds_budget || (resident > 0 && self.accountant.resident_over_limit())
     }
 
