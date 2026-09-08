@@ -144,7 +144,20 @@ impl ServersMutation {
         let normalized = NormalizedServerInput::from_input(input, Some(&existing))
             .map_err(async_graphql::Error::new)?;
 
-        let probe = validate_server_before_save(&normalized, route.as_ref()).await?;
+        let routing_changed = routing.as_ref().is_some_and(|routing| {
+            proxy_runtime.as_ref().is_some_and(|runtime| {
+                *routing != runtime.policy(weaver_server_core::proxies::Consumer::Server(id))
+            })
+        });
+        // Applying a route policy must not depend on the new routes being
+        // reachable: removing direct access during an outage must still persist
+        // and revoke existing direct streams. Endpoint/authentication changes
+        // and activation retain their ordinary connection validation.
+        let probe = if routing_changed && normalized.same_connection_as(&existing) {
+            None
+        } else {
+            validate_server_before_save(&normalized, route.as_ref()).await?
+        };
         let mut server = normalized.as_runtime_server_config(id);
         server.supports_pipelining = probe
             .as_ref()
@@ -472,6 +485,17 @@ impl NormalizedServerInput {
             tls_ca_cert: normalize_optional_string(input.tls_ca_cert).map(PathBuf::from),
             tls_name_mismatch_certificate_der,
         })
+    }
+
+    fn same_connection_as(&self, server: &weaver_server_core::servers::ServerConfig) -> bool {
+        self.active == server.active
+            && self.host == server.host
+            && self.port == server.port
+            && self.tls == server.tls
+            && self.username == server.username
+            && self.password == server.password
+            && self.tls_ca_cert == server.tls_ca_cert
+            && self.tls_name_mismatch_certificate_der == server.tls_name_mismatch_certificate_der
     }
 
     fn as_runtime_server_config(&self, id: u32) -> weaver_server_core::servers::ServerConfig {

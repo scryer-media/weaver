@@ -63,6 +63,7 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 	behaviorReleaseFlow("rate-limits", 7*time.Minute),
 	behaviorReleaseFlow("bandwidth-and-server-quotas", 8*time.Minute),
 	behaviorReleaseFlow("provider-connection-cap", 8*time.Minute),
+	proxyRoutingReleaseFlow(),
 	encryptionKeyReleaseFlow(),
 	behaviorReleaseFlow("duplicate-and-queue-policy", 7*time.Minute),
 	{
@@ -440,6 +441,11 @@ func assignWeaverReleaseNetworkSubnets(
 		phase.ComposeOverride = filepath.Join(phase.RootDir, "network.compose.override.yml")
 		if err := composeutil.WriteNetworkOverride(phase.ComposeOverride, phase.NetworkSubnet); err != nil {
 			return err
+		}
+		if phase.Flow == "proxy-routing" {
+			if err := writeProxyRoutingNetwork(phase); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
