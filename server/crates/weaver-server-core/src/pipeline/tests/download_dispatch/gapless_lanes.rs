@@ -561,3 +561,77 @@ async fn a_requested_yield_still_parks_when_no_critical_work_is_servable() {
         "the payload the refill had taken goes back to the queue whole"
     );
 }
+
+/// Changing down is the hot job's privilege. A critical lane belongs to no
+/// job's share while it carries critical work; the moment it would carry
+/// ordinary payload it is a payload lane of that job, and a job that is not
+/// hot gets its payload lanes from the dispatch pass's spillover rules, never
+/// by keeping a connection it was handed for something else.
+#[tokio::test]
+async fn a_critical_lane_of_a_job_that_is_not_hot_parks_instead_of_changing_down() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let hot_job_id = JobId(41014);
+    let other_job_id = JobId(41015);
+    insert_active_job(
+        &mut pipeline,
+        hot_job_id,
+        standalone_job_spec("Hot Job Payload", &many_standalone_files("hot-payload", 4)),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        other_job_id,
+        standalone_job_spec(
+            "Other Job Critical Lane",
+            &many_standalone_files("other-critical", 4),
+        ),
+    )
+    .await;
+
+    // The other job's critical heap has drained; only its payload is queued.
+    let mut critical = split_queue_classes(&mut pipeline, other_job_id, 0);
+    critical.completion_critical = true;
+    pipeline.hot_dispatch_job = Some(hot_job_id);
+    pipeline.active_download_connections = 1;
+    pipeline.active_completion_critical_connections = 1;
+    *pipeline
+        .active_completion_critical_connections_by_job
+        .entry(other_job_id)
+        .or_default() = 1;
+    let queued_before = pipeline
+        .jobs
+        .get(&other_job_id)
+        .unwrap()
+        .download_queue
+        .len();
+
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(refill_request(
+        other_job_id,
+        critical,
+        response_tx,
+    ));
+
+    let response = response_rx.await.unwrap();
+    assert!(
+        response.lease.is_none(),
+        "a job that is not hot must not keep a payload lane the dispatch pass never lent it"
+    );
+    assert_eq!(response.park_reason, LaneParkReason::NoWork);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&other_job_id)
+            .unwrap()
+            .download_queue
+            .len(),
+        queued_before,
+        "its payload stays queued for the spillover rules to place"
+    );
+    assert_eq!(
+        pipeline.hot_dispatch_job,
+        Some(hot_job_id),
+        "and the hot job keeps the period"
+    );
+}

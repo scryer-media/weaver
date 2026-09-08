@@ -471,12 +471,19 @@ impl Pipeline {
                 // The other direction of the same rule: a lane whose critical
                 // class has drained carries ordinary payload rather than
                 // parking and leaving the next pass to dial a connection for
-                // work that is queued right now. The exception is an
-                // outstanding yield, where this connection is already owed to
-                // critical demand the dispatcher will place itself.
+                // work that is queued right now. Two exceptions. An
+                // outstanding yield means this connection is already owed to
+                // critical demand the dispatcher will place itself. And only
+                // the hot job's lanes may change down: critical work has no
+                // owner, but ordinary payload does, and a critical lane that
+                // kept carrying another job's payload would be a spillover
+                // lane the dispatch pass never lent — one that skipped every
+                // reclaim and best-mode rule an ordinary lane of that job is
+                // held to on the same refill.
                 if popped.is_none()
                     && compatibility.completion_critical
                     && !self.hot_share_yield_signal.is_requested()
+                    && self.hot_dispatch_job == Some(job_id)
                 {
                     popped = self.pop_refill_work_servable_by_lane(
                         job_id,
