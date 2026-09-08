@@ -1,7 +1,6 @@
 # Direct-unpack repair follow-up audit
 
-The local nzbfast grounding review compared Weaver `ec9d0f3e` with nzbfast
-`6d5b07927568362cddfcaba0f16ce2b5a5d53cdc`. It exposed two gaps not exercised by
+The grounding review of Weaver `ec9d0f3e` exposed two gaps not exercised by
 the original 52-scenario matrix. This follow-up fixes those gaps on
 `bugfix/direct-unpack-repair-guards`, based on the audited Weaver revision.
 

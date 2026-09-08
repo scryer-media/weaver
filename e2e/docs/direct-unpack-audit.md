@@ -6,7 +6,7 @@ The earlier helper-level tests did not establish that real download completion
 would admit repair. The new [native e2e matrix](direct-unpack.md) exercises
 that scheduler and proves extraction overlaps downloading.
 
-The later [nzbfast grounding follow-up](direct-unpack-repair-audit.md) found and
+The later [repair grounding follow-up](direct-unpack-repair-audit.md) found and
 fixed two additional repair/read and split-boundary defects. Its validation
 extends the matrix to 54 scenarios; the results below describe the earlier run.
 
