@@ -365,6 +365,8 @@ pub(crate) struct DirectUnpackRuntime {
     /// every byte their decoder had already consumed was vouched for by the
     /// recovery set. Released when the repair reports success.
     parked_through_repair: HashSet<(JobId, String)>,
+    /// New chases cannot join after the repair vouching snapshot was taken.
+    repairing_jobs: HashSet<JobId>,
     /// Chases that have been woken with an abort and are awaiting a join. Kept
     /// apart from `armed` so an abort can be signalled synchronously from the
     /// paths that end a download, and joined later from the run loop.
@@ -588,6 +590,9 @@ impl Pipeline {
         total_len: Option<u64>,
         format: ChaseFormat,
     ) {
+        if self.direct_unpack.repairing_jobs.contains(&job_id) {
+            return;
+        }
         // A paused worker still owns this staging path until it is joined and
         // cleaned up. Reusing it sooner would race both its writes and cleanup.
         if self
@@ -1602,6 +1607,7 @@ impl Pipeline {
     /// drain path, where leaving a blocking thread parked would hold the
     /// process open.
     pub(in crate::pipeline) async fn direct_unpack_shutdown(&mut self, reason: &str) {
+        self.direct_unpack.repairing_jobs.clear();
         let jobs: Vec<JobId> = self
             .direct_unpack
             .armed
@@ -2181,6 +2187,7 @@ impl Pipeline {
         job_id: JobId,
         verification: Option<&par2_rs::VerificationResult>,
     ) {
+        self.direct_unpack.repairing_jobs.insert(job_id);
         if self.direct_unpack.armed.is_empty() && self.direct_unpack.outcomes.is_empty() {
             return;
         }
@@ -2194,6 +2201,11 @@ impl Pipeline {
             .collect();
 
         for set_name in sets {
+            if let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) {
+                // Freeze publication of in-flight reads before inspecting any
+                // consumed prefix. Rejected reads retry after repair handback.
+                armed.coverage.pause_for_repair();
+            }
             if self.direct_unpack_set_is_vouched(job_id, &set_name, verification) {
                 info!(
                     job_id = job_id.0,
@@ -2294,6 +2306,13 @@ impl Pipeline {
                     Some(index),
                 );
             };
+            if let Some(len) = self.direct_unpack_known_part_len(job_id, path)
+                && self
+                    .resolve_par2_file_binding(file_id)
+                    .is_some_and(|binding| binding.described_length != len)
+            {
+                return refuse("repair changes this part's settled length", Some(index));
+            }
             let in_stream_prefix = self.in_stream_intact_prefix(file_id);
             // The analysis verified this exact file complete by full MD5, so the
             // repair will not touch it and every byte of it is vouched.
@@ -2490,6 +2509,7 @@ impl Pipeline {
         job_id: JobId,
         reason: &str,
     ) {
+        self.direct_unpack.repairing_jobs.remove(&job_id);
         if self.direct_unpack.parked_through_repair.is_empty() {
             return;
         }
@@ -2521,6 +2541,7 @@ impl Pipeline {
     /// vouched for everything already consumed, so the frontier opens to the
     /// whole file and the decoder finishes at disk speed.
     pub(in crate::pipeline) fn release_direct_unpack_after_repair(&mut self, job_id: JobId) {
+        self.direct_unpack.repairing_jobs.remove(&job_id);
         if self.direct_unpack.parked_through_repair.is_empty() {
             return;
         }
@@ -2536,8 +2557,12 @@ impl Pipeline {
             self.direct_unpack
                 .parked_through_repair
                 .remove(&(job_id, set_name.clone()));
-            let Ok(paths) = self.archive_set_part_paths(job_id, &set_name) else {
-                continue;
+            let paths = match self.archive_set_part_paths(job_id, &set_name) {
+                Ok(paths) => paths,
+                Err(_) => {
+                    self.taint_direct_unpack_set(job_id, &set_name);
+                    continue;
+                }
             };
             let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) else {
                 // A finished chase has nothing to release: it was vouched for,
@@ -2558,6 +2583,11 @@ impl Pipeline {
                         break;
                     }
                 }
+            }
+            coverage.resume_after_repair();
+            if coverage.abort_reason().is_some() {
+                armed.budget.cancel();
+                continue;
             }
             info!(
                 job_id = job_id.0,
@@ -2634,6 +2664,7 @@ impl Pipeline {
                 continue;
             };
             let coverage = Arc::clone(&armed.coverage);
+            coverage.pause_for_repair();
             for (index, path) in paths.iter().enumerate() {
                 match std::fs::metadata(path) {
                     Ok(meta) => coverage.release_after_repair(index, meta.len()),
@@ -2645,6 +2676,11 @@ impl Pipeline {
                         break;
                     }
                 }
+            }
+            coverage.resume_after_repair();
+            if coverage.abort_reason().is_some() {
+                armed.budget.cancel();
+                continue;
             }
             info!(
                 job_id = job_id.0,
@@ -2702,6 +2738,7 @@ impl Pipeline {
         self.direct_unpack
             .parked_through_repair
             .retain(|(parked_job, _)| *parked_job != job_id);
+        self.direct_unpack.repairing_jobs.remove(&job_id);
         self.direct_unpack.download_settled.remove(&job_id);
     }
 }

@@ -40,8 +40,8 @@ struct Part {
     /// old one, so a handle from before a repair reads the file that was moved
     /// aside; when the count moves on, the path is opened again.
     opened_rewritten: u64,
-    /// Cached part length. A declared length never changes, so one lookup is
-    /// enough and the mapping walk stays off the shared lock.
+    /// Cached boundary length. Coverage aborts if repair changes a boundary
+    /// already used by this mapping walk.
     len: Option<u64>,
 }
 
@@ -54,12 +54,15 @@ pub struct GatedSplitReader {
     /// Sequential formats discover EOF from completed parts, without an
     /// archive-wide length declaration or a seek to the tail.
     sequential: bool,
-    /// Cached archive total. Set once on the coverage and never changed, so one
-    /// successful read of it is good for the reader's lifetime — which keeps
-    /// every subsequent read and seek off the shared lock. An abort still
-    /// reaches the reader through `part_len` and `readable_at`, both of which
-    /// are consulted on the way to any actual byte.
+    /// Cached signature-derived total. Coverage rejects contradictions; reads
+    /// still check for abort and repair pauses, including at cached EOF.
     total_len: Option<u64>,
+    /// Tests stop a disk read before it publishes consumption.
+    #[cfg(test)]
+    read_barrier: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
 }
 
 impl GatedSplitReader {
@@ -100,6 +103,8 @@ impl GatedSplitReader {
             position: 0,
             sequential: false,
             total_len: None,
+            #[cfg(test)]
+            read_barrier: None,
         })
     }
 
@@ -153,7 +158,7 @@ impl GatedSplitReader {
 
         for index in 0..self.parts.len() {
             let local = position - start;
-            // A length already learned is final, so the walk can skip the lock.
+            // Coverage rejects changes to a boundary already used here.
             let resolved = match self.parts[index].len {
                 Some(len) if local >= len => PositionInPart::Beyond { len },
                 _ => self.coverage.resolve_position(index, local)?,
@@ -221,45 +226,63 @@ impl Read for GatedSplitReader {
             return Ok(0);
         }
 
-        let total = if self.sequential {
-            u64::MAX
-        } else {
-            self.total_len()?
-        };
-        if self.position >= total {
-            return Ok(0);
+        loop {
+            let total = if self.sequential {
+                u64::MAX
+            } else {
+                self.total_len()?
+            };
+            if self.position >= total {
+                self.coverage.wait_for_read()?;
+                return Ok(0);
+            }
+
+            // Parks inside `locate` until the download has carried the target part
+            // past this offset, or the part ends and the walk moves on.
+            let Some((index, local, available, rewritten)) = self.locate(self.position)? else {
+                self.coverage.wait_for_read()?;
+                return Ok(0);
+            };
+
+            // `locate` only ever reports `Inside` with at least one byte behind the
+            // watermark; a part that ends at this offset comes back as `Beyond` and
+            // the walk moves on. A short part is caught in `resolve_position`.
+            debug_assert!(available > 0, "locate returned an empty readable window");
+
+            let remaining = total - self.position;
+            let wanted = buf
+                .len()
+                .min(available.min(remaining).try_into().unwrap_or(usize::MAX));
+
+            let result = (|| {
+                let file = self.file_for(index, rewritten)?;
+                file.seek(SeekFrom::Start(local))?;
+                file.read(&mut buf[..wanted])
+            })();
+            #[cfg(test)]
+            if let Some((entered, resume)) = self.read_barrier.take() {
+                entered.send(()).expect("read barrier observer");
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("read barrier release");
+            }
+            let read = result.as_ref().copied().unwrap_or(0);
+            if !self
+                .coverage
+                .commit_read(index, local, read as u64, rewritten)?
+            {
+                continue;
+            }
+            let read = result?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("part {index} ended at {local} inside committed archive coverage"),
+                ));
+            }
+            self.position += read as u64;
+            return Ok(read);
         }
-
-        // Parks inside `locate` until the download has carried the target part
-        // past this offset, or the part ends and the walk moves on.
-        let Some((index, local, available, rewritten)) = self.locate(self.position)? else {
-            return Ok(0);
-        };
-
-        // `locate` only ever reports `Inside` with at least one byte behind the
-        // watermark; a part that ends at this offset comes back as `Beyond` and
-        // the walk moves on. A short part is caught in `resolve_position`.
-        debug_assert!(available > 0, "locate returned an empty readable window");
-
-        let remaining = total - self.position;
-        let wanted = buf
-            .len()
-            .min(available.min(remaining).try_into().unwrap_or(usize::MAX));
-
-        let file = self.file_for(index, rewritten)?;
-        file.seek(SeekFrom::Start(local))?;
-        let read = file.read(&mut buf[..wanted])?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("part {index} ended at {local} inside committed archive coverage"),
-            ));
-        }
-        self.position += read as u64;
-        // What the decoder has actually taken, as opposed to what it could
-        // have. Repair only has to leave *these* bytes alone.
-        self.coverage.note_consumed(index, local + read as u64);
-        Ok(read)
     }
 }
 
@@ -297,3 +320,7 @@ impl Seek for GatedSplitReader {
         Ok(self.position)
     }
 }
+
+#[cfg(test)]
+#[path = "reader_repair_tests.rs"]
+mod repair_tests;

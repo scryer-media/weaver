@@ -13,6 +13,8 @@ use crate::pipeline::direct_unpack::settings::{DirectUnpackGate, DirectUnpackSet
 use crate::pipeline::direct_unpack::start_header::MAGIC;
 use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
 
+mod repair_guards;
+
 /// Turn the feature on for one pipeline, the way config would.
 fn enable_direct_unpack(pipeline: &mut Pipeline) {
     pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {

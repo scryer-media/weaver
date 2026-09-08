@@ -127,7 +127,11 @@ struct CoverageState {
     /// it, unverified bytes stop being served, so damage in a part the chase
     /// has not reached yet is parked rather than raced.
     gated: bool,
+    /// Freeze consumption before taking the repair vouching snapshot.
+    repair_paused: bool,
     parts: Vec<PartProgress>,
+    /// Part boundaries already used to map the concatenated stream.
+    mapped_lengths: Vec<Option<u64>>,
     /// Committed out-of-order ranges. ZIP needs its directory before its payload.
     ranges: Vec<std::collections::BTreeMap<u64, u64>>,
     /// Authoritative archive length, derived from the signature header.
@@ -156,7 +160,9 @@ impl SetCoverage {
         Self {
             state: Mutex::new(CoverageState {
                 gated: false,
+                repair_paused: false,
                 parts: vec![PartProgress::default(); part_count],
+                mapped_lengths: vec![None; part_count],
                 ranges: vec![std::collections::BTreeMap::new(); part_count],
                 total_len: None,
                 aborted: None,
@@ -338,11 +344,64 @@ impl SetCoverage {
         self.advanced.notify_all();
     }
 
-    /// Record how far the decoder has actually read into a part.
-    ///
-    /// Monotone. Called from the chase's own thread after each read, never from
-    /// the download path, so the lock it takes is uncontended in the common
-    /// case and absent entirely when nothing is being chased.
+    /// Freeze both new reads and publication of reads already in flight.
+    pub fn pause_for_repair(&self) {
+        self.lock().repair_paused = true;
+    }
+
+    /// Resume only after every repaired part has been reconciled.
+    pub fn resume_after_repair(&self) {
+        self.lock().repair_paused = false;
+        self.advanced.notify_all();
+    }
+
+    /// Cancellation must also reach readers at cached part boundaries or EOF.
+    pub fn wait_for_read(&self) -> io::Result<()> {
+        let mut state = self.lock();
+        loop {
+            if let Some(reason) = &state.aborted {
+                return Err(io::Error::other(reason.clone()));
+            }
+            if !state.repair_paused {
+                return Ok(());
+            }
+            state = self.park(state);
+        }
+    }
+
+    /// Publish a disk read only if its coverage and file generation still hold.
+    /// A rejected read has not reached the decoder and must be retried from its
+    /// original position. The mutex orders this publication against repair's
+    /// pause and consumed-prefix snapshot without holding a lock over disk I/O.
+    pub fn commit_read(
+        &self,
+        index: usize,
+        offset: u64,
+        read: u64,
+        rewritten: u64,
+    ) -> io::Result<bool> {
+        let mut state = self.lock();
+        if let Some(reason) = &state.aborted {
+            return Err(io::Error::other(reason.clone()));
+        }
+        let part = Self::part_at(&state, index)?;
+        let end = Self::range_end(&state, index, offset);
+        if state.repair_paused
+            || part.rewritten != rewritten
+            || offset >= end
+            || read > end - offset
+        {
+            return Ok(false);
+        }
+        if read > 0 {
+            let part = &mut state.parts[index];
+            part.consumed_high_water = part.consumed_high_water.max(offset + read);
+        }
+        Ok(true)
+    }
+
+    /// Record synthetic consumption in controller fixtures.
+    #[cfg(test)]
     pub fn note_consumed(&self, index: usize, offset: u64) {
         let mut state = self.lock();
         let Some(part) = state.parts.get_mut(index) else {
@@ -454,6 +513,17 @@ impl SetCoverage {
     /// speed over data the recovery set has vouched for.
     pub fn release_after_repair(&self, index: usize, len: u64) {
         let mut state = self.lock();
+        if let Some(Some(mapped)) = state.mapped_lengths.get(index)
+            && *mapped != len
+        {
+            let reason = format!(
+                "repair changed part {index} length from {mapped} to {len} after its boundary was used"
+            );
+            Self::abort_locked(&mut state, reason);
+            drop(state);
+            self.advanced.notify_all();
+            return;
+        }
         let Some(part) = state.parts.get_mut(index) else {
             debug_assert!(false, "part index {index} out of range");
             return;
@@ -624,7 +694,11 @@ impl SetCoverage {
             if let Some(reason) = &state.aborted {
                 return Err(io::Error::other(reason.clone()));
             }
-            let part = Self::part_at(&state, index)?;
+            if state.repair_paused {
+                state = self.park(state);
+                continue;
+            }
+            let part = *Self::part_at(&state, index)?;
 
             let servable = Self::range_end(&state, index, offset);
             if offset < servable {
@@ -635,6 +709,7 @@ impl SetCoverage {
             }
             if let Some(len) = part.len {
                 if offset >= len {
+                    state.mapped_lengths[index] = Some(len);
                     return Ok(PositionInPart::Beyond { len });
                 }
                 // Inside the declared length but past the watermark: the bytes
@@ -648,6 +723,7 @@ impl SetCoverage {
             } else if part.complete && !part.held_back(state.gated) {
                 // A complete part's length is its watermark, so this offset is
                 // past the end of it.
+                state.mapped_lengths[index] = Some(part.watermark);
                 return Ok(PositionInPart::Beyond {
                     len: part.watermark,
                 });
