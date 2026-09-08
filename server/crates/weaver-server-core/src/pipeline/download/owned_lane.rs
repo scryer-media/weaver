@@ -515,13 +515,20 @@ impl OwnedDownloadLanePool {
         self.reset_calls.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn reset(&self) {
+    /// Fence queued runs before workers can take another retired-client lease.
+    /// The actor returns these unstarted leases without charging article retries.
+    pub(crate) fn reset(&self) -> Vec<DownloadBatchLease> {
         #[cfg(test)]
         self.reset_calls.fetch_add(1, Ordering::Relaxed);
-        let shared = lock_pool(&self.shared);
+        let mut shared = lock_pool(&self.shared);
         for worker in &shared.workers {
             let _ = worker.sender.send(OwnedLanePoolCommand::Reset);
         }
+        shared
+            .queued_runs
+            .drain(..)
+            .map(|run| run.initial_lease)
+            .collect()
     }
 
     // The Err variant hands the lease back to the caller for the async
@@ -2260,6 +2267,48 @@ mod routing_tests {
         assert!(shared.workers[0].idle.is_some());
     }
 
+    #[test]
+    fn reset_returns_queued_leases_before_a_worker_can_take_old_work() {
+        let nntp = test_client();
+        let (sender, commands) = std_mpsc::channel();
+        let mut shared = shared_with(vec![None]);
+        shared.workers[0].sender = sender;
+        for segment_number in 0..3 {
+            let mut run = test_run(&nntp, Vec::new());
+            run.initial_lease.works[0].segment_id.segment_number = segment_number;
+            shared.queued_runs.push_back(run);
+        }
+        let pool = OwnedDownloadLanePool {
+            shared: Arc::new(std::sync::Mutex::new(shared)),
+            reset_calls: AtomicUsize::new(0),
+        };
+
+        let returned = pool.reset();
+
+        assert_eq!(returned.len(), 3);
+        for (index, lease) in returned.iter().enumerate() {
+            assert_eq!(lease.job_id, JobId(7));
+            assert_eq!(lease.works.len(), 1);
+            assert_eq!(lease.works[0].segment_id.segment_number, index as u32);
+        }
+        assert_eq!(
+            Arc::strong_count(&nntp),
+            1,
+            "queued runs release the old client"
+        );
+        assert!(
+            lock_pool(&pool.shared)
+                .take_queued_run_or_publish_idle(0, None)
+                .is_none(),
+            "finishing a lease must reach the pending reset without another old run"
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(OwnedLanePoolCommand::Reset)
+        ));
+        assert!(pool.reset().is_empty(), "leases are returned only once");
+    }
+
     /// Only workers with nothing to lose are warmed: a worker already holding
     /// a connection has nothing to gain, and a busy one is not there to ask.
     #[test]
@@ -2329,9 +2378,38 @@ mod routing_tests {
 mod probe_tests {
     use super::*;
 
-    /// Marks every worker of `pool` busy, so a test decides the idle state
-    /// itself instead of racing the worker threads' own first publish.
-    fn quiesce(pool: &OwnedDownloadLanePool) {
+    /// Waits for every worker's first idle publish before taking control of
+    /// its idle state. A probe reply is a barrier without changing that state.
+    async fn quiesce(pool: &OwnedDownloadLanePool) {
+        let senders: Vec<_> = lock_pool(&pool.shared)
+            .workers
+            .iter()
+            .map(|worker| worker.sender.clone())
+            .collect();
+        for sender in senders {
+            let (picked_up, picked_up_rx) = oneshot::channel();
+            let (reply, reply_rx) = oneshot::channel();
+            assert!(
+                sender
+                    .send(OwnedLanePoolCommand::Probe {
+                        message_ids: Arc::from([]),
+                        picked_up,
+                        reply,
+                    })
+                    .is_ok()
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                picked_up_rx.await.expect("worker picked up startup probe");
+                assert!(
+                    reply_rx
+                        .await
+                        .expect("worker answered startup probe")
+                        .is_none()
+                );
+            })
+            .await
+            .expect("worker reached its idle command loop");
+        }
         let mut shared = lock_pool(&pool.shared);
         for index in 0..shared.workers.len() {
             shared.mark_busy(index);
@@ -2348,7 +2426,7 @@ mod probe_tests {
     async fn a_worker_without_a_cached_lane_declines_the_probe() {
         let pool = OwnedDownloadLanePool::new(1);
         let handle = pool.probe_handle();
-        quiesce(&pool);
+        quiesce(&pool).await;
         // Idle, but holding nothing: the state a worker is in before its
         // first lease, and after a park that dropped the socket.
         set_idle(&pool, 0, None);
@@ -2367,7 +2445,7 @@ mod probe_tests {
     async fn a_busy_worker_is_not_asked() {
         let pool = OwnedDownloadLanePool::new(2);
         let handle = pool.probe_handle();
-        quiesce(&pool);
+        quiesce(&pool).await;
 
         assert!(handle.idle_workers().is_empty());
         assert!(
@@ -2393,19 +2471,19 @@ mod probe_tests {
         assert!(outcome.servers_settled.is_empty());
     }
 
-    #[test]
-    fn the_probe_handle_tracks_pool_resizes() {
+    #[tokio::test]
+    async fn the_probe_handle_tracks_pool_resizes() {
         let mut pool = OwnedDownloadLanePool::new(1);
         let handle = pool.probe_handle();
         pool.resize(4);
-        quiesce(&pool);
+        quiesce(&pool).await;
         set_idle(&pool, 3, Some(test_idle_lane(0)));
 
         assert_eq!(handle.idle_workers().len(), 1);
 
         pool.resize(2);
         assert_eq!(lock_pool(&handle.shared).workers.len(), 2);
-        quiesce(&pool);
+        quiesce(&pool).await;
         assert!(handle.idle_workers().is_empty());
     }
 }

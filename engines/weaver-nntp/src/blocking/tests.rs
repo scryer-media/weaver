@@ -712,9 +712,14 @@ fn blocking_412_after_setup_records_the_group_requirement() {
     .unwrap();
     assert!(!conn.needs_group_prologue());
 
-    let _ = conn.send_command(&Command::Body(ArticleId::MessageId(
-        "<first@example.com>".to_string(),
-    )));
+    let response = conn
+        .send_command(&Command::Body(ArticleId::MessageId(
+            "<first@example.com>".to_string(),
+        )))
+        .unwrap();
+    let error = NntpError::from_status(response.code, &response.message);
+    assert!(matches!(error, NntpError::NoGroupSelected));
+    assert!(is_transient(&error), "discovery must allow a grouped retry");
 
     assert!(
         conn.needs_group_prologue(),

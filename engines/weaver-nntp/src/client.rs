@@ -2592,6 +2592,8 @@ impl NntpClient {
                 | NntpError::ServerOverLimit { .. }
                 | NntpError::PoolExhausted
                 | NntpError::PoolShutdown
+                // Learning session setup is not a server health failure.
+                | NntpError::NoGroupSelected
                 // Local capacity: we never reached the server, so this must
                 // not walk it toward Degraded/Disabled.
                 | NntpError::AcquireTimeout(_)
@@ -3479,6 +3481,8 @@ fn is_transient(err: &NntpError) -> bool {
             | NntpError::TruncatedMultilineBody
             | NntpError::ServerDisconnectedMidBody
             | NntpError::MalformedMultilineTerminator
+            // The next connection can select the group learned from this 412.
+            | NntpError::NoGroupSelected
             | NntpError::ServiceUnavailable
             | NntpError::TooManyConnections
             | NntpError::ServerOverLimit { .. }

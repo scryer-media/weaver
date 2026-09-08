@@ -622,6 +622,23 @@ fn extraction_keeps_up_with_a_drip_fed_download() {
         extract_members(reader, password)
     });
 
+    // Establish the blocked-reader state before publishing any bytes. Thread
+    // scheduling can otherwise let the writer finish the entire download
+    // before extraction starts, making the park assertion a scheduler race.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while coverage.park_count() == 0 && !worker.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            coverage.abort("test timed out waiting for the reader to park");
+            let _ = worker.join();
+            panic!("extraction did not park on the empty download");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        coverage.park_count() > 0,
+        "extraction must wait for download bytes"
+    );
+
     // Feed the set in 64 KiB commits, appending to each part file and moving
     // its watermark, the way the download path will.
     const COMMIT: usize = 64 * 1024;

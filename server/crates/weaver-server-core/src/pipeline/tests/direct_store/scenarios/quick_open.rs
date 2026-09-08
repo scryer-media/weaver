@@ -1782,6 +1782,216 @@ async fn a_duplicate_article_after_finalization_leaves_the_finished_output_alone
 }
 
 #[tokio::test]
+async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
+    let volumes = demotion_fixture_volumes("Silver.Horizon.S01E28.mkv");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41062);
+    let other_job_id = JobId(41063);
+    let ordinary_name = "ordinary.bin";
+    let ordinary_bytes = b"ordinary";
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let ordinary_spec = standalone_job_spec(
+        "Ordinary",
+        &[(ordinary_name.to_string(), ordinary_bytes.len() as u32)],
+    );
+    spec.total_bytes += ordinary_spec.total_bytes;
+    spec.files.extend(ordinary_spec.files.clone());
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let other_spec = standalone_job_spec(
+        "Ordinary competitor",
+        &[
+            (ordinary_name.to_string(), ordinary_bytes.len() as u32),
+            ("pending.bin".to_string(), 1),
+        ],
+    );
+    let other_dir = insert_active_job(&mut pipeline, other_job_id, other_spec).await;
+
+    for (file_index, segment_number) in [(0, 0), (0, 1), (1, 0)] {
+        take_queued_segment(
+            &mut pipeline,
+            job_id,
+            SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number,
+            },
+        );
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    pipeline
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
+        .await;
+
+    let protected_file = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let same_job_file = NzbFileId {
+        job_id,
+        file_index: 3,
+    };
+    let other_job_file = NzbFileId {
+        job_id: other_job_id,
+        file_index: 0,
+    };
+    let (tail_start, tail_end) = article_extent(volumes[1].1.len(), 1, 2);
+    let tail = &volumes[1].1[tail_start..tail_end];
+    let expected_crc = checksum::crc32(&volumes[1].1);
+    pipeline
+        .expected_file_crcs
+        .insert(protected_file, expected_crc);
+
+    // Model articles parked by the decode seam, without the submit helper's
+    // automatic ticket processing. The actor still owns an outstanding ticket
+    // even if its detached worker has already finished writing.
+    for (file_id, segment_number, offset, bytes, name) in [
+        (
+            protected_file,
+            1,
+            tail_start as u64,
+            tail,
+            volumes[1].0.as_str(),
+        ),
+        (
+            same_job_file,
+            0,
+            0,
+            ordinary_bytes.as_slice(),
+            ordinary_name,
+        ),
+        (
+            other_job_file,
+            0,
+            0,
+            ordinary_bytes.as_slice(),
+            ordinary_name,
+        ),
+    ] {
+        pipeline
+            .jobs
+            .get_mut(&file_id.job_id)
+            .unwrap()
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .record_placement(segment_number, offset, bytes.len() as u32);
+        let buffered = BufferedDecodedSegment {
+            encoding: SegmentEncoding::Yenc,
+            segment_id: SegmentId {
+                file_id,
+                segment_number,
+            },
+            decoded_size: bytes.len() as u32,
+            data: DecodedChunk::from(bytes.to_vec()),
+            part_crc: checksum::crc32(bytes),
+            part_crc_verified: true,
+            yenc_name: name.to_string(),
+            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+            segments: Vec::new(),
+        };
+        pipeline
+            .write_buffers
+            .entry(file_id)
+            .or_insert_with(|| WriteReorderBuffer::new(4))
+            .insert(offset, buffered);
+        pipeline.note_write_buffered(bytes.len(), 1);
+    }
+    // All wire work is dispatched; only the reconstruction ticket and parked
+    // decoded articles remain. Volume 2 is supplied after the handback below.
+    for id in [job_id, other_job_id] {
+        pipeline
+            .jobs
+            .get_mut(&id)
+            .unwrap()
+            .download_queue
+            .drain_all();
+    }
+    assert!(pipeline.demotion_sweep_owns_file(protected_file));
+    let received_before = pipeline.jobs[&job_id]
+        .assembly
+        .file(protected_file)
+        .unwrap()
+        .received_bytes();
+
+    pipeline.flush_quiescent_write_backlog().await;
+
+    assert_eq!(
+        pipeline.write_buffers[&protected_file].buffered_len(),
+        1,
+        "the idle flush must leave reconstruction-owned articles parked"
+    );
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(protected_file)
+            .unwrap()
+            .received_bytes(),
+        received_before,
+        "the idle flush must not advance the protected assembly"
+    );
+    assert!(!matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Failed { .. }
+    ));
+    assert_eq!(pipeline.write_buffered_bytes, tail.len());
+    assert_eq!(pipeline.write_buffered_segments, 1);
+    assert_eq!(
+        std::fs::read(working_dir.join(ordinary_name)).unwrap(),
+        ordinary_bytes
+    );
+    assert_eq!(
+        std::fs::read(other_dir.join(ordinary_name)).unwrap(),
+        ordinary_bytes
+    );
+    assert!(!pipeline.write_buffers.contains_key(&same_job_file));
+    assert!(!pipeline.write_buffers.contains_key(&other_job_file));
+
+    // A second idle turn with only the protected article is also a no-op.
+    pipeline.flush_quiescent_write_backlog().await;
+    assert_eq!(pipeline.write_buffered_bytes, tail.len());
+    assert_eq!(pipeline.write_buffered_segments, 1);
+    settle_direct_demotion_work(&mut pipeline).await;
+
+    assert!(!pipeline.demotion_sweep_owns_file(protected_file));
+    assert!(
+        pipeline.pending_completion_checks.contains(&job_id),
+        "handback must schedule the job for continued completion"
+    );
+    let reconstructed = std::fs::read(working_dir.join(&volumes[1].0)).unwrap();
+    assert_eq!(reconstructed, volumes[1].1);
+    assert_eq!(checksum::crc32(&reconstructed), expected_crc);
+    assert!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(protected_file)
+            .unwrap()
+            .is_complete()
+    );
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+    assert_eq!(pipeline.write_buffered_segments, 0);
+    assert!(!pipeline.write_buffers.contains_key(&protected_file));
+
+    for segment_number in 0..2 {
+        submit_volume_article(&mut pipeline, job_id, &volumes, 2, segment_number).await;
+    }
+    assert!(!matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Failed { .. }
+    ));
+    assert!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: 2
+            })
+            .unwrap()
+            .is_complete()
+    );
+}
+
+#[tokio::test]
 async fn a_demotion_returns_before_its_reconstruction_sweep_finishes() {
     let member_name = "Silver.Horizon.S01E24.mkv";
     let volumes = demotion_fixture_volumes(member_name);

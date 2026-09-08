@@ -1099,10 +1099,11 @@ impl Pipeline {
                 {
                     return None;
                 }
-                let has_buffered_segments = self
-                    .write_buffers
-                    .keys()
-                    .any(|file_id| file_id.job_id == *job_id);
+                let has_buffered_segments = self.write_buffers.iter().any(|(file_id, buffer)| {
+                    file_id.job_id == *job_id
+                        && buffer.buffered_len() > 0
+                        && !self.demotion_sweep_owns_file(*file_id)
+                });
                 has_buffered_segments.then_some(*job_id)
             })
             .collect();
@@ -1110,9 +1111,16 @@ impl Pipeline {
         for job_id in stalled_jobs {
             let file_ids: Vec<NzbFileId> = self
                 .write_buffers
-                .keys()
-                .copied()
-                .filter(|file_id| file_id.job_id == job_id)
+                .iter()
+                // Quiescence does not transfer ownership from a reconstruction
+                // ticket. Its handback must seed the volume before these bytes
+                // can be committed and the whole-file CRC can be checked.
+                .filter(|(file_id, buffer)| {
+                    file_id.job_id == job_id
+                        && buffer.buffered_len() > 0
+                        && !self.demotion_sweep_owns_file(**file_id)
+                })
+                .map(|(file_id, _)| *file_id)
                 .collect();
 
             if file_ids.is_empty() {

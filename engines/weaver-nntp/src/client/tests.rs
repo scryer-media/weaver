@@ -641,8 +641,40 @@ fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
     assert!(!client.has_blocking_body_lane_candidate(&[0, 1]));
 }
 
+#[tokio::test]
+async fn group_requirement_discovery_retries_the_decoded_batch_item() {
+    let client = multi_server_client(1);
+    let mut attempts = Vec::new();
+    let mut last_error = None;
+    let disposition = client
+        .classify_decoded_batch_item(
+            0,
+            None,
+            "<group-required@example.com>",
+            DecodedBatchItem {
+                elapsed: Duration::ZERO,
+                result: Err(DecodedBodyError::Nntp(NntpError::NoGroupSelected)),
+            },
+            &mut attempts,
+            &mut last_error,
+        )
+        .await;
+
+    assert!(matches!(disposition, DecodedBatchDisposition::Retry));
+    assert_eq!(attempts[0].outcome, FetchAttemptOutcome::TransientFailure);
+    assert!(matches!(
+        last_error,
+        Some(DecodedBodyError::Nntp(NntpError::NoGroupSelected))
+    ));
+    assert_eq!(
+        client.pool().health().lock().await.server(0).failure_count,
+        0
+    );
+}
+
 #[test]
 fn transient_errors() {
+    assert!(is_transient(&NntpError::NoGroupSelected));
     assert!(is_transient(&NntpError::Timeout));
     assert!(is_transient(&NntpError::ConnectionClosed));
     assert!(is_transient(&NntpError::TruncatedMultilineBody));
