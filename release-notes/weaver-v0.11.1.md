@@ -1,9 +1,5 @@
 # Weaver 0.11.1 release notes
 
-> Draft — these notes describe the net change from `weaver-v0.11.0` to
-> `weaver-v0.11.1`. They are release-candidate notes only; the release has not
-> been published.
-
 ## Highlights
 
 Weaver 0.11.1 makes direct-store recovery substantially more predictable
