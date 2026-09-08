@@ -547,7 +547,21 @@ impl Pipeline {
         // one is gated on `has_crc_failures`, which nothing has produced yet
         // because extraction is being held), and the job would sit with its
         // damage on record and no verdict coming.
-        let known_archive_damage = self.archive_extraction_held_for_known_damage(job_id);
+        // A CRC-rejected chase has already been tainted, so it no longer
+        // appears in `direct_unpack_gated_sets`. Keep the measured mismatch
+        // authoritative even after that worker has gone away.
+        let known_file_crc_damage = self.par2_runtime(job_id).is_some_and(|runtime| {
+            runtime
+                .completed_checksums
+                .iter()
+                .any(|(file_id, checksum)| {
+                    self.expected_file_crcs
+                        .get(file_id)
+                        .is_some_and(|expected| *expected != checksum.crc32)
+                })
+        });
+        let known_archive_damage =
+            self.archive_extraction_held_for_known_damage(job_id) || known_file_crc_damage;
         let authoritative_par2_verification_owed = rar_par2_repair_ready
             || known_archive_damage
             || has_crc_failures

@@ -3084,15 +3084,38 @@ impl Pipeline {
                                 return;
                             }
                         }
-                        crate::pipeline::release_cached_write_handle(file_path);
-                        self.fail_job(
-                            job_id,
-                            format!(
-                                "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
-                                file_checksum.crc32
-                            ),
-                        );
-                        return;
+                        if self.par2_can_recover_file_crc(file_id, total_bytes, expected_crc) {
+                            self.taint_direct_unpack_for_file(job_id, filename);
+                            let file_index = file_id.file_index;
+                            if let Err(error) = self
+                                .db_blocking(move |db| db.mark_file_incomplete(job_id, file_index))
+                                .await
+                            {
+                                crate::pipeline::release_cached_write_handle(file_path);
+                                self.fail_job(
+                                    job_id,
+                                    format!("failed to persist CRC damage: {error}"),
+                                );
+                                return;
+                            }
+                            warn!(
+                                job_id = job_id.0,
+                                file_id = %file_id,
+                                expected_crc = format_args!("{expected_crc:08x}"),
+                                actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                "whole-file CRC mismatch; matching PAR2 metadata requires repair before acceptance"
+                            );
+                        } else {
+                            crate::pipeline::release_cached_write_handle(file_path);
+                            self.fail_job(
+                                job_id,
+                                format!(
+                                    "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
+                                    file_checksum.crc32
+                                ),
+                            );
+                            return;
+                        }
                     }
                     self.ensure_par2_runtime(job_id)
                         .completed_checksums
@@ -3153,7 +3176,9 @@ impl Pipeline {
                         total_bytes,
                     });
 
-                    {
+                    // A CRC-rejected source must not become a durable completed
+                    // file before PAR2 accepts it. A restart must revisit it.
+                    if expected_file_crc.is_none_or(|expected| expected == file_checksum.crc32) {
                         let file_index = file_id.file_index;
                         let fname = filename.to_string();
                         if let Err(e) = self
@@ -3174,7 +3199,9 @@ impl Pipeline {
                     self.pending_file_progress.remove(&file_id);
                     self.persisted_file_progress.remove(&file_id);
                     self.file_hash_states.remove(&file_id);
-                    self.expected_file_crcs.remove(&file_id);
+                    if expected_file_crc.is_none_or(|expected| expected == file_checksum.crc32) {
+                        self.expected_file_crcs.remove(&file_id);
+                    }
                     self.file_hash_reread_required.remove(&file_id);
                     self.unverified_segments.remove(&file_id);
                     self.file_crc_recoveries.remove(&file_id);

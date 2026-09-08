@@ -56,6 +56,80 @@ async fn pausing_a_chase_waiting_for_memory_does_not_wait_for_another_download()
 }
 
 #[tokio::test]
+async fn crc_mismatch_defers_only_to_matching_recovery_metadata() {
+    for metadata in ["matching", "conflicting", "no_ifsc", "absent"] {
+        let temp = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+        let job = JobId(43124);
+        let name = "payload.bin.gz";
+        let original = vec![17; ARTICLE + 31]; // Also exercise PAR2 tail padding.
+        let expected_crc = par2_rs::checksum::crc32(&original);
+        let mut damaged = original.clone();
+        damaged[ARTICLE] ^= 1;
+        insert_stream(&mut pipeline, job, &[(name.to_string(), damaged.clone())]).await;
+        if metadata != "absent" {
+            let mut par2 = build_repairable_par2_set_for_files(
+                &[(name, original.as_slice())],
+                ARTICLE as u64,
+                2,
+            );
+            if metadata == "no_ifsc" {
+                par2.slice_checksums.clear();
+            }
+            install_test_par2_runtime(&mut pipeline, job, par2, &[]);
+        }
+        let id = NzbFileId {
+            job_id: job,
+            file_index: 0,
+        };
+        let declared_crc = expected_crc ^ u32::from(metadata == "conflicting");
+        assert_eq!(
+            pipeline.par2_can_recover_file_crc(id, damaged.len() as u64, declared_crc),
+            metadata == "matching",
+        );
+        assert!(!pipeline.par2_can_recover_file_crc(id, damaged.len() as u64 + 1, declared_crc));
+        for (number, part) in damaged.chunks(ARTICLE).enumerate() {
+            submit_decoded_segment_with_part_crc_verified(
+                &mut pipeline,
+                id,
+                number as u32,
+                (number * ARTICLE) as u64,
+                part,
+                name,
+                Some(declared_crc),
+                true,
+            )
+            .await;
+        }
+        pipeline
+            .direct_unpack_shutdown("CRC recovery test cleanup")
+            .await;
+        let failed = matches!(
+            job_status_for_assert(&pipeline, job),
+            Some(JobStatus::Failed { .. })
+        );
+        assert_eq!(failed, metadata != "matching", "{metadata}");
+        assert!(
+            !pipeline.par2_verified.contains(&job),
+            "downloaded damage is not verified"
+        );
+        if metadata == "matching" {
+            let checksum = pipeline.par2_runtime(job).unwrap().completed_checksums[&id];
+            assert_eq!(checksum.crc32, par2_rs::checksum::crc32(&damaged));
+            assert_ne!(checksum.crc32, expected_crc);
+            assert_eq!(pipeline.expected_file_crcs.get(&id), Some(&expected_crc));
+            assert!(
+                pipeline
+                    .db
+                    .load_complete_file_hashes(job)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn truncated_compression_streams_fail_without_repair_data() {
     for kind in [
         SimpleArchiveKind::Deflate,
