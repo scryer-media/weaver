@@ -981,23 +981,13 @@ impl Pipeline {
     ///
     /// Once PAR2 has repaired and re-verified a protected output, that
     /// verification is authoritative. Missing article state remains diagnostic
-    /// history; it cannot independently fail the repaired file. Both reference
-    /// implementations draw the line in exactly this place — NZBGet conjoins its
-    /// health test with `psSkipped`, so a successful par status removes article
-    /// state from the decision outright, and SABnzbd derives its whole par
-    /// verdict from the repair's own re-verification and never re-consults the
-    /// articles afterwards.
+    /// history; it cannot independently fail the repaired file.
     ///
     /// # Nothing here fails the job
     ///
     /// The invariant is about the *pass*, not about one file: once a PAR2
     /// verification has succeeded, no article-completeness state may fail the
-    /// job — protected or unprotected. Both oracles are absolute about this.
-    /// NZBGet's `FAILURE/HEALTH` requires `(psNone || psSkipped)`, so a
-    /// successful par status takes health out of the verdict entirely
-    /// (`DownloadInfo.cpp` `MakeTextStatus`); SABnzbd never sets `fail_msg`
-    /// from missing articles at all — every one of its failure messages comes
-    /// from unpack, repair, encryption or an unwanted extension.
+    /// job — protected or unprotected.
     ///
     /// The concrete case that forced this: a 1.09 GB job whose payload PAR2
     /// repaired and re-verified, failed because a 738 KB `.nfo` — which no

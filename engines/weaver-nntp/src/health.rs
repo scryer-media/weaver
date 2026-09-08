@@ -51,8 +51,7 @@ pub enum DisableReason {
     /// The consecutive-failure machine cannot catch a server that fails a
     /// steady fraction of attempts: any success resets the run, so a primary
     /// stalling 10% of BODY fetches stays "Healthy" forever while a clean
-    /// backup idles. The ratio window is the cumulative complement (compare
-    /// SABnzbd's `bad_cons / threads` block).
+    /// backup idles. The ratio window catches failures spread across attempts.
     FailureRatio,
 }
 

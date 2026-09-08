@@ -404,7 +404,7 @@ fn is_clearly_named(stem: &str) -> bool {
 }
 
 /// Returns `true` if the path is inside a DVD/Bluray structure that should
-/// never be renamed. SABnzbd skips deobfuscation for these.
+/// never be renamed.
 pub fn is_protected_media_structure(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
     s.contains("/VIDEO_TS/")
@@ -631,7 +631,7 @@ mod tests {
         assert!(!is_obfuscated("2fpJZyw12WSJz8JunjkxpZcw0XIZKKMP.7z.015"));
     }
 
-    // ── SABnzbd parity tests ────────────────────────────────────────────
+    // ── Clear naming and mixed-token heuristics ────────────────────────
 
     #[test]
     fn clear_naming_not_obfuscated() {

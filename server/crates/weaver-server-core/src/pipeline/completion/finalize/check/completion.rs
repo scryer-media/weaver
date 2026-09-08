@@ -255,9 +255,7 @@ impl Pipeline {
         // re-ran a full authoritative pass over a gigabyte every two seconds,
         // forever.
         //
-        // Both oracles stop counting at the same place. NZBGet's health
-        // failure requires par to have been *skipped*; SABnzbd's verdict is the
-        // PAR result alone. A file PAR2 *does* describe still counts, because
+        // A file PAR2 *does* describe still counts, because
         // for that one a verdict and a repair are genuinely still possible.
         let has_incomplete_data_files = if self.par2_verified.contains(&job_id) {
             self.incomplete_par2_protected_data_file_count(job_id) > 0

@@ -27,11 +27,6 @@ impl Pipeline {
     /// completion first produced the contradictory sequence this replaces —
     /// `RepairComplete`, then the job failing a moment later, with nothing on
     /// the event stream to say the repair had not held.
-    ///
-    /// This mirrors what both reference implementations announce: SABnzbd runs
-    /// an explicit "verifying repaired files" phase before it accepts a repair,
-    /// and NZBGet reaches `psRepaired` only from a `Process(true)` that came
-    /// back successful, having passed through `ptVerifyingRepaired` first.
     pub(in crate::pipeline) async fn finish_par2_repair(
         &mut self,
         job_id: JobId,
@@ -355,10 +350,7 @@ impl Pipeline {
     /// Remove what the repair left behind, now that the repair has been
     /// accepted.
     ///
-    /// Mirrors NZBGet's `DeleteLeftovers()`, which it reaches only from the
-    /// branch where `Process(true)` came back successful, and SABnzbd's
-    /// `deletables` after a finished repair. The gating is the whole point: on
-    /// any failure these files are the evidence, and this is not reached.
+    /// On any failure these files remain as evidence, and cleanup is not reached.
     ///
     /// Only entries that *appeared during* the repair are candidates, and only
     /// when they are neither an NZB entry under any of its names nor a file the

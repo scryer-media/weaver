@@ -2153,9 +2153,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
         Some(JobStatus::Complete)
     );
     // Two: the pre-repair authoritative pass, then the post-repair pass that
-    // re-reads what the repair installed. Every repair path runs the second
-    // one now — it is the phase SABnzbd shows as "verifying repaired files"
-    // and NZBGet as `ptVerifyingRepaired`.
+    // re-reads what the repair installed. Every repair path runs both passes.
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
         2
@@ -2545,9 +2543,7 @@ async fn restored_repairing_payload_uses_single_repairer_analyze_and_execute_pas
         Some(JobStatus::Complete)
     );
     // Two: the pre-repair authoritative pass, then the post-repair pass that
-    // re-reads what the repair installed. Every repair path runs the second
-    // one now — it is the phase SABnzbd shows as "verifying repaired files"
-    // and NZBGet as `ptVerifyingRepaired`.
+    // re-reads what the repair installed. Every repair path runs both passes.
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
         2
@@ -2813,9 +2809,7 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
         Some(JobStatus::Downloading)
     );
     // Two: the pre-repair authoritative pass, then the post-repair pass that
-    // re-reads what the repair installed. Every repair path runs the second
-    // one now — it is the phase SABnzbd shows as "verifying repaired files"
-    // and NZBGet as `ptVerifyingRepaired`.
+    // re-reads what the repair installed. Every repair path runs both passes.
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
         2

@@ -70,9 +70,7 @@ pub struct ServerTransferSnapshot {
 /// Kept as a deadline (`started + limit + excluded wait`) rather than as an
 /// elapsed-time subtraction, so a check is one clock read and a compare, and
 /// the read loop can share that clock read between the budget check and the
-/// read timeout it derives next. SABnzbd keeps the same shape: a deadline per
-/// response, moved when the response makes progress, not re-read per socket
-/// read.
+/// read timeout it derives next.
 #[derive(Debug)]
 pub(crate) struct ActiveTransferBudget {
     limit: Duration,

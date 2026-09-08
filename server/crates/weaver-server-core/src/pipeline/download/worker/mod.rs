@@ -430,8 +430,7 @@ impl Pipeline {
 
         // Prefer higher submitted priority first. Within the top runnable band,
         // keep the already-active job hot when possible; otherwise choose FIFO
-        // submission order. This matches NZBGet/SAB-style hot reuse more closely
-        // than same-band round-robin.
+        // submission order.
         let mut eligible = self
             .job_order
             .iter()

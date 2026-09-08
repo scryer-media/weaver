@@ -751,9 +751,8 @@ impl Pipeline {
                     // had already proven Damaged (the yEnc aggregate CRC it was
                     // gated on is the poster's own declaration, not independent
                     // evidence). Files land in the deferral paths below instead
-                    // and are adjudicated by the dual-CRC slice verdicts, like
-                    // SABnzbd's quick-check and NZBGet's ParQuick, which only
-                    // ever compare observed values against expectations.
+                    // and are adjudicated by the dual-CRC slice verdicts, which
+                    // compare observed values against expectations.
                     let file_crc_matched = expected_file_crc
                         .is_some_and(|expected_file_crc| streamed.crc32 == expected_file_crc);
                     // A poster who supplied an aggregate `=yend crc32` has to
@@ -1229,8 +1228,8 @@ impl Pipeline {
     /// Handle a decode failure by re-queuing the segment for re-download.
     ///
     /// yEnc decode failures (CRC/size mismatch, malformed data) indicate the
-    /// article body was corrupted — either in transit or on the server. Following
-    /// NZBGet's approach, we re-download the segment (which may hit a different
+    /// article body was corrupted — either in transit or on the server. We
+    /// re-download the segment (which may hit a different
     /// server via the connection pool's failover logic). After `MAX_SEGMENT_RETRIES`
     /// decode failures for the same segment, mark it as permanently failed and
     /// update health.
