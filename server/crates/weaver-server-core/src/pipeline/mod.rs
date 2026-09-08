@@ -304,13 +304,19 @@ impl DownloadBatchCompatibility {
     ///   effective exclude set, and each result reports the batch's excludes
     ///   back into the segment's failure ledger. Mixing them would book one
     ///   article's exclusions against another's, so these stay equal.
-    /// * `is_recovery` — recovery never rides an owned blocking lane (see
-    ///   `should_use_owned_blocking_lane`) and is accounted separately.
-    /// * `completion_critical` — the class a lane is counted under at start
-    ///   (`active_completion_critical_connections*`) and released under at
-    ///   park. A lane may not change class without changing that protocol, so
-    ///   the split is kept; the critical phase of every dispatch pass takes
-    ///   the connection instead, and item-2 wakes that pass on the park.
+    /// * `is_recovery` — the in-flight recovery count is added per batch and
+    ///   released per work item, so a batch that mixed the two would book one
+    ///   article's bytes against the other's ledger.
+    /// * `completion_critical` — the class the *batch* is sized and counted
+    ///   under.
+    ///
+    /// Neither of those makes the class of the *lane* immutable. A lane whose
+    /// job has completion-critical work queued changes class between batches
+    /// instead of parking: `try_lease_refill_download_batch` looks at the
+    /// critical heap first and re-opens the lease around that work's own
+    /// compatibility, and the refill grant rebooks the connection from the
+    /// class it held to the class it is being given. What stays fixed is one
+    /// *batch*'s class, which is all this rule decides.
     ///
     /// `priority` is deliberately **not** asked: it only orders the queue.
     /// Gating a refill on it pinned each lane inside one direct-store volume

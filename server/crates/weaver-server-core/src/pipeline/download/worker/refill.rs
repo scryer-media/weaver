@@ -45,6 +45,11 @@ impl Pipeline {
         }
         let now = Instant::now();
         let mut park_reason = LaneParkReason::NoWork;
+        // Set when the dispatch pass has asked non-critical lanes to give
+        // their connections back. The lane still gets its refill; what the
+        // flag decides is whether a refill that came back non-critical is
+        // handed over or rolled back into a yield.
+        let mut yield_unless_critical = false;
         let mut allow_refill = !self.global_paused && !self.rate_limiter.should_wait();
         if !allow_refill {
             self.hot_share_yield_signal.clear();
@@ -143,8 +148,12 @@ impl Pipeline {
                     if !batch_class.completion_critical
                         && self.hot_share_yield_signal.is_requested() =>
                 {
-                    allow_refill = false;
-                    park_reason = LaneParkReason::HotShareYield;
+                    // …but only after this lane has been offered the critical
+                    // work itself. A connection that can serve it is worth
+                    // more here than the same connection redialled by the next
+                    // pass, so the refill runs and is judged on the class it
+                    // came back with.
+                    yield_unless_critical = true;
                 }
                 // A completion-critical lane has no cap and the hot job's own
                 // regular lane is never reclaimed for capacity reasons — hot
@@ -217,6 +226,21 @@ impl Pipeline {
         } else {
             None
         };
+        // The yield was asked for so that completion-critical demand could have
+        // this connection. If the refill found critical work for the lane
+        // itself, the demand is served here and there is nothing to yield; if
+        // it came back with ordinary payload, that payload goes back to the
+        // queue and the connection is returned as asked.
+        if yield_unless_critical
+            && !lease
+                .as_ref()
+                .is_some_and(|lease| lease.compatibility.completion_critical)
+        {
+            if let Some(lease) = lease.take() {
+                self.rollback_download_batch_lease(lease);
+            }
+            park_reason = LaneParkReason::HotShareYield;
+        }
         if let Some(lease) = lease.as_mut() {
             lease.spillover_loan_kind = spillover_loan_kind;
         }
@@ -258,12 +282,10 @@ impl Pipeline {
         };
 
         // Stage two of the refill may re-open the lease around another work
-        // item's compatibility, so the class booked here is the lease's, not
-        // the request's. Both agree by construction — the class and the
-        // recovery flag a lane is counted under never change while it runs —
-        // and reading it from the lease is what keeps that true if they ever
-        // diverge.
-        let batch_class = DownloadBatchClass::from(&lease.compatibility);
+        // item's compatibility, and the critical-first path deliberately
+        // does — so the class booked here is the lease's, not the request's,
+        // and the difference between the two is a class change to settle.
+        let granted_class = DownloadBatchClass::from(&lease.compatibility);
         let activation_items = Self::activation_items(&lease);
         let next_mode = Self::actual_download_lane_mode(
             lease.lane_mode,
@@ -280,9 +302,10 @@ impl Pipeline {
                 self.metrics
                     .download_lane_refill_granted_total
                     .fetch_add(1, Ordering::Relaxed);
+                self.rebook_download_lane_class(job_id, batch_class, granted_class);
                 self.activate_download_batch(
                     job_id,
-                    batch_class,
+                    granted_class,
                     next_mode,
                     work_count,
                     &activation_items,

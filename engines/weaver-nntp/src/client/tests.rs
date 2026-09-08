@@ -1336,7 +1336,9 @@ async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_movi
     );
     assert!(client.server_quota_rejection(ServerId(0), 40).is_none());
     assert!(client.server_quota_rejection(ServerId(1), 41).is_none());
-    let blocking_large = client.blocking_body_server_selection_with_estimate(&[], 41);
+    let blocking_large = client
+        .try_blocking_body_server_selection_with_estimate(&[], 41)
+        .expect("the health state is uncontended in this test");
     assert_eq!(blocking_large.eligible, vec![ServerId(1)]);
     assert_eq!(
         blocking_large.quota_blocked.unwrap().stable_server_id,
@@ -1762,7 +1764,9 @@ async fn outage_disabled_fill_server_keeps_backfill_locked_with_peers_excluded()
         order.is_empty(),
         "a consecutive-failure disable is an outage, not a config error: {order:?}"
     );
-    let selection = client.blocking_body_server_selection(&[1], 0);
+    let selection = client
+        .try_blocking_body_server_selection(&[1], 0)
+        .expect("the health state is uncontended in this test");
     assert!(
         selection.eligible.is_empty(),
         "owned lane must not spill an outage onto backfill: {:?}",
@@ -1799,7 +1803,9 @@ async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
 
     client.pool.health().lock().await.record_failure(0, true);
 
-    let selection = client.blocking_body_server_selection(&[1], 0);
+    let selection = client
+        .try_blocking_body_server_selection(&[1], 0)
+        .expect("the health state is uncontended in this test");
     assert_eq!(
         selection.eligible,
         vec![ServerId(2)],
@@ -1813,7 +1819,9 @@ async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
         .lock()
         .await
         .record_cooldown(0, CooldownReason::Transport);
-    let selection = cooling.blocking_body_server_selection(&[1], 0);
+    let selection = cooling
+        .try_blocking_body_server_selection(&[1], 0)
+        .expect("the health state is uncontended in this test");
     assert!(
         selection.eligible.is_empty(),
         "owned lane must not spill a cooldown onto backfill: {:?}",
@@ -1837,6 +1845,43 @@ fn selection_contention_is_requeued_but_is_not_capacity_admission() {
     assert!(!BlockingBodyLaneAcquireError::NoEligibleServer.should_requeue_owned_work());
     assert!(
         !BlockingBodyLaneAcquireError::Other(NntpError::PoolShutdown).should_requeue_owned_work()
+    );
+}
+
+/// The dispatcher asks this question before it decides between an owned lane
+/// and the async path, and a momentary lock collision is not an answer about
+/// servers. Collapsing it into "no candidate" sent the batch to the async
+/// path — which then dialled its own connection while the owned lane sat on a
+/// warm one.
+#[tokio::test]
+async fn candidacy_separates_contention_from_having_no_candidate() {
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_blocking_s2n_server(1, 2)],
+        max_idle_age: Duration::from_secs(30),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    });
+    assert_eq!(
+        client.blocking_body_lane_candidacy(&[]),
+        BlockingBodyLaneCandidacy::Candidate
+    );
+    assert_eq!(
+        client.blocking_body_lane_candidacy(&[0]),
+        BlockingBodyLaneCandidacy::None,
+        "the only server is excluded, so there is genuinely no candidate"
+    );
+
+    let health = client.pool.health().clone();
+    let guard = health.lock().await;
+    assert_eq!(
+        client.blocking_body_lane_candidacy(&[]),
+        BlockingBodyLaneCandidacy::Contended,
+        "a held health mutex is 'ask again', not 'no candidate'"
+    );
+    drop(guard);
+    assert_eq!(
+        client.blocking_body_lane_candidacy(&[]),
+        BlockingBodyLaneCandidacy::Candidate
     );
 }
 

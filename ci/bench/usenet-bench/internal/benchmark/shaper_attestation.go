@@ -258,6 +258,17 @@ const (
 	shaperQuietInterval = 250 * time.Millisecond
 )
 
+// The budgets for handing back a lease the run is known to hold after the
+// call that took it has already failed. The foreground wait is what keeps the
+// next suite from finding the lease active; the background budget covers a
+// stray client that takes longer than that to die, so the lease frees when
+// its last connection does rather than never.
+const (
+	shaperStrandedReleaseBudget           = 60 * time.Second
+	shaperStrandedReleaseBackgroundBudget = 10 * time.Minute
+	shaperStrandedReleaseInterval         = 250 * time.Millisecond
+)
+
 // AcquireShaperExecutionLeaseForRun takes the lease for one measured run and
 // will not hand back a lease the previous run's client is still connected to.
 //
@@ -275,12 +286,22 @@ const (
 // only a shaper that stays busy for the whole budget fails the run.
 //
 // On success the lease is held and the caller owns releasing it. On failure no
-// lease is held.
+// lease is held: a lease this call acquired and could not hand back before
+// giving up is released here, in the foreground for as long as the stranded
+// budget allows and in the background after that, because the caller has
+// been told it holds nothing and will not release it.
 func AcquireShaperExecutionLeaseForRun(ctx context.Context, client *http.Client, controlURL, leaseID string, link ServerLinkProfile) (ShaperSnapshot, error) {
 	deadline := time.Now().Add(shaperQuietBudget)
+	// Whether the shaper holds this run's lease right now: set by an acquire
+	// that succeeded, cleared by a release that did. A refused release leaves
+	// it set, and the next acquire is then refused too ("already active"),
+	// so without this the loop would reach its deadline still owning a lease
+	// nobody is going to give back.
+	held := false
 	for {
 		snapshot, err := AcquireShaperExecutionLease(ctx, client, controlURL, leaseID)
 		if err == nil {
+			held = true
 			if snapshot.ActiveDownstreamConnections == 0 {
 				validateErr := snapshot.ValidateFor(link)
 				if validateErr == nil {
@@ -295,26 +316,70 @@ func AcquireShaperExecutionLeaseForRun(ctx context.Context, client *http.Client,
 			err = fmt.Errorf("shaper has %d active downstream connections outside the measured run", snapshot.ActiveDownstreamConnections)
 			if releaseErr := releaseShaperExecutionLeaseAfterRun(client, controlURL, leaseID); releaseErr != nil {
 				err = fmt.Errorf("%w (the lease could not be handed back: %v)", err, releaseErr)
+			} else {
+				held = false
 			}
 		}
 		if time.Now().After(deadline) {
-			return ShaperSnapshot{}, fmt.Errorf("shaper did not become quiet within %s: %w", shaperQuietBudget, err)
+			err = fmt.Errorf("shaper did not become quiet within %s: %w", shaperQuietBudget, err)
+			return ShaperSnapshot{}, failWithoutStrandingShaperExecutionLease(client, controlURL, leaseID, held, err)
 		}
 		select {
 		case <-ctx.Done():
-			return ShaperSnapshot{}, ctx.Err()
+			cause := ctx.Err()
+			if err != nil {
+				cause = fmt.Errorf("%w (last shaper state: %v)", cause, err)
+			}
+			return ShaperSnapshot{}, failWithoutStrandingShaperExecutionLease(client, controlURL, leaseID, held, cause)
 		case <-time.After(shaperQuietInterval):
 		}
 	}
+}
+
+// failWithoutStrandingShaperExecutionLease is the failure return of an
+// acquisition: `cause` as reported, after a lease the run still holds has been
+// handed back, or handed to the background when even the stranded budget was
+// not enough, in which case the error says so.
+func failWithoutStrandingShaperExecutionLease(client *http.Client, controlURL, leaseID string, held bool, cause error) error {
+	if !held {
+		return cause
+	}
+	if err := releaseStrandedShaperExecutionLease(client, controlURL, leaseID); err != nil {
+		return fmt.Errorf("%w (%v)", cause, err)
+	}
+	return cause
 }
 
 // handBackShaperExecutionLease releases a lease the run will not use, so a
 // fatal condition does not also strand the lease for every suite behind it.
 func handBackShaperExecutionLease(client *http.Client, controlURL, leaseID string, cause error) error {
 	if err := releaseShaperExecutionLeaseAfterRun(client, controlURL, leaseID); err != nil {
-		return fmt.Errorf("%w (the lease could not be handed back: %v)", cause, err)
+		if stranded := releaseStrandedShaperExecutionLease(client, controlURL, leaseID); stranded != nil {
+			return fmt.Errorf("%w (the lease could not be handed back: %v; %v)", cause, err, stranded)
+		}
 	}
 	return cause
+}
+
+// releaseStrandedShaperExecutionLease hands back a lease this process is known
+// to hold after the call that took it has already failed. It keeps asking for
+// the stranded budget: the refusal is a stray client's connection that the
+// shaper will not release under, and that client is dying, not living. Past
+// the budget the asking continues in the background and the returned error
+// says so, so the run's failure names the lease it left behind.
+func releaseStrandedShaperExecutionLease(client *http.Client, controlURL, leaseID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shaperStrandedReleaseBudget)
+	defer cancel()
+	foreground := releaseShaperExecutionLeaseUntil(ctx, client, controlURL, leaseID, shaperStrandedReleaseInterval)
+	if foreground == nil {
+		return nil
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), shaperStrandedReleaseBackgroundBudget)
+		defer cancel()
+		_ = releaseShaperExecutionLeaseUntil(ctx, client, controlURL, leaseID, shaperStrandedReleaseInterval)
+	}()
+	return fmt.Errorf("the shaper execution lease is still held after %s and is being released in the background: %w", shaperStrandedReleaseBudget, foreground)
 }
 
 func ReleaseShaperExecutionLease(ctx context.Context, client *http.Client, controlURL, leaseID string) error {
@@ -325,6 +390,13 @@ func ReleaseShaperExecutionLease(ctx context.Context, client *http.Client, contr
 func releaseShaperExecutionLeaseAfterRun(client *http.Client, controlURL, leaseID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	return releaseShaperExecutionLeaseUntil(ctx, client, controlURL, leaseID, 50*time.Millisecond)
+}
+
+// releaseShaperExecutionLeaseUntil asks for the release every `interval` until
+// the shaper grants it or `ctx` ends, and reports the last refusal with the
+// context's error when it is the latter.
+func releaseShaperExecutionLeaseUntil(ctx context.Context, client *http.Client, controlURL, leaseID string, interval time.Duration) error {
 	var lastErr error
 	for {
 		if err := ReleaseShaperExecutionLease(ctx, client, controlURL, leaseID); err == nil {
@@ -335,7 +407,7 @@ func releaseShaperExecutionLeaseAfterRun(client *http.Client, controlURL, leaseI
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("%w (last release error: %v)", ctx.Err(), lastErr)
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(interval):
 		}
 	}
 }
