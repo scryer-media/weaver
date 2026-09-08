@@ -18,6 +18,7 @@ struct Origin {
     addr: SocketAddr,
     ca: PathBuf,
     task: tokio::task::JoinHandle<()>,
+    stalled: Arc<tokio::sync::Notify>,
 }
 impl Drop for Origin {
     fn drop(&mut self) {
@@ -52,6 +53,8 @@ impl Origin {
         ));
         std::fs::write(&ca, cert.cert.pem()).unwrap();
         let body_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stalled = Arc::new(tokio::sync::Notify::new());
+        let stalled_for_task = stalled.clone();
         let task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
@@ -59,6 +62,7 @@ impl Origin {
                     accepted = listener.accept() => {
                         let Ok((stream,_)) = accepted else { break; }; let acceptor = acceptor.clone();
                         let body_attempts = body_attempts.clone();
+                        let stalled = stalled_for_task.clone();
                         tasks.spawn(async move {
                             let stream: Box<dyn TunnelStream> = Box::new(stream);
                             let mut stream: Box<dyn TunnelStream> = if implicit { match acceptor.accept(stream).await { Ok(tls) => Box::new(tls), Err(_) => return } } else { stream };
@@ -80,6 +84,11 @@ impl Origin {
                                         }
                                         b"222 1 <retry@fixture>\r\ncomplete\r\n.\r\n"
                                     }
+                                    else if line.starts_with("BODY <stall@fixture>") {
+                                        stalled.notify_one();
+                                        std::future::pending::<()>().await;
+                                        return;
+                                    }
                                     else if line.starts_with("BODY") { b"430 missing article\r\n" }
                                     else if line.starts_with("QUIT") { let _=stream.write_all(b"205 goodbye\r\n").await; return; }
                                     else if line.starts_with("STARTTLS") {
@@ -94,7 +103,12 @@ impl Origin {
                 }
             }
         });
-        Self { addr, ca, task }
+        Self {
+            addr,
+            ca,
+            task,
+            stalled,
+        }
     }
 }
 
@@ -129,11 +143,9 @@ async fn profile(kind: u8, destination: SocketAddr) -> (Fixture, Arc<dyn TunnelP
             (Fixture::Standard(proxy), Arc::new(provider))
         }
         2 => {
-            let proxy = SshServerDouble::start(SshServerOptions {
-                destinations: mapping,
-                ..Default::default()
-            })
-            .await;
+            let proxy =
+                SshServerDouble::start_with_destinations(SshServerOptions::default(), mapping)
+                    .await;
             let spec = spec_for("nntp-test", &proxy.host(), proxy.port());
             (
                 Fixture::Ssh(proxy),
@@ -141,15 +153,19 @@ async fn profile(kind: u8, destination: SocketAddr) -> (Fixture, Arc<dyn TunnelP
             )
         }
         _ => {
-            let proxy = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
-                tcp_forward: Some(destination),
-                http_port: destination.port(),
-                names: HashMap::from([
-                    ("provider.invalid".into(), vec![TEST_PEER_ADDRESS.into()]),
-                    ("wrong.invalid".into(), vec![TEST_PEER_ADDRESS.into()]),
-                ]),
-                ..Default::default()
-            })
+            let proxy = WireGuardTestPeer::start_for_downloads(
+                WireGuardTestPeerOptions {
+                    http_port: destination.port(),
+                    names: HashMap::from([
+                        ("provider.invalid".into(), vec![TEST_PEER_ADDRESS.into()]),
+                        ("wrong.invalid".into(), vec![TEST_PEER_ADDRESS.into()]),
+                    ]),
+                    ..Default::default()
+                },
+                Some(destination),
+                std::time::Duration::ZERO,
+                true,
+            )
             .await;
             let spec = proxy.client_spec("nntp-test");
             (
@@ -291,6 +307,56 @@ async fn ssh_plain_tls_and_starttls() {
 async fn wireguard_plain_tls_and_starttls() {
     for (tls, starttls) in [(false, false), (true, false), (false, true)] {
         exercise(3, tls, starttls).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
+    for revoke in [false, true] {
+        let origin = Origin::start(true).await;
+        let (_fixture, provider) = profile(3, origin.addr).await;
+        let bridge = Bridge::start(
+            &tokio::runtime::Handle::current(),
+            provider.clone(),
+            Duration::from_secs(5),
+            ("fixture".into(), "secret".into()),
+        )
+        .unwrap();
+        let config = ServerConfig {
+            proxy: Some(bridge.clone()),
+            host: "provider.invalid".into(),
+            port: origin.addr.port(),
+            tls: true,
+            tls_ca_cert: Some(origin.ca.clone()),
+            connect_timeout: Duration::from_secs(5),
+            command_timeout: Duration::from_secs(if revoke { 30 } else { 1 }),
+            ..Default::default()
+        };
+        let client = tokio::task::spawn_blocking(move || {
+            let mut client =
+                BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+            client.send_command(&Command::Body(weaver_nntp::ArticleId::MessageId(
+                "stall@fixture".into(),
+            )))
+        });
+        // The server has decrypted the request and deliberately sends no reply.
+        tokio::time::timeout(Duration::from_secs(5), origin.stalled.notified())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        if revoke {
+            bridge.revoke().await;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        if !revoke {
+            assert!(started.elapsed() >= Duration::from_millis(500));
+        }
+        bridge.revoke().await;
+        provider.shutdown().await;
     }
 }
 

@@ -90,8 +90,8 @@ impl ProxyProfile {
                 }
                 if let Some(key) = &self.secrets.private_key {
                     weaver_tunnel::validate_private_key(key, self.secrets.passphrase.as_deref())?;
-                } else if self.secrets.password.is_none() {
-                    return Err(invalid("SSH requires a password or Ed25519 private key"));
+                } else {
+                    return Err(invalid("SSH requires an Ed25519 private key"));
                 }
             }
             ProxyKind::Socks5 => {
@@ -130,8 +130,7 @@ impl ProxyProfile {
             host: self.host.clone(),
             port: self.port,
             username: self.secrets.username.clone().unwrap_or_default(),
-            password: self.secrets.password.clone(),
-            private_key_pem: self.secrets.private_key.clone(),
+            private_key_pem: self.secrets.private_key.clone().unwrap_or_default(),
             private_key_passphrase: self.secrets.passphrase.clone(),
             pinned_host_key: self.host_key_fingerprint.clone(),
             request_timeout: self.timeout(),

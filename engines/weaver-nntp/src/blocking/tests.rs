@@ -40,11 +40,11 @@ fn assert_s2n_socket_timeout_slice(conn: &BlockingNntpConnection) {
         panic!("expected blocking S2N transport");
     };
     assert_eq!(
-        stream.tcp.read_timeout().unwrap(),
+        stream.tcp.tcp().unwrap().read_timeout().unwrap(),
         Some(S2N_BLOCKING_IO_SLICE)
     );
     assert_eq!(
-        stream.tcp.write_timeout().unwrap(),
+        stream.tcp.tcp().unwrap().write_timeout().unwrap(),
         Some(S2N_BLOCKING_IO_SLICE)
     );
 }

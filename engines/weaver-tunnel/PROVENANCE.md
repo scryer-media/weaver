@@ -6,10 +6,20 @@ configuration validation and protocol fixtures were adapted from
 `81e8de95848a31f024edd86d026db8867c296091` (`release-NEXT`).
 The original repository's GPL v3 license is preserved in `LICENSE`.
 
+SSH, WireGuard, the userspace IP stack and their protocol fixtures now come
+from `scryer-media/proxy-tunnels`, through the full Git revision in this crate's
+`Cargo.toml` and the workspace `Cargo.lock`. The local protocol copies have
+been removed. The shared extraction began at
+`2b537101b58d2cad11664b401b82a726b8958db1`; its key-only SSH authentication,
+per-channel host-key authorization, DNS admission and closing-socket accounting
+are preserved. Download tuning is opt-in, leaving Scryer's defaults unchanged.
+
 The Weaver adaptation replaces implicit runtime ownership with an explicit
-executor, adds revocable bridges, HTTP CONNECT/SOCKS5 upstream transports and
+executor, adds revocable direct streams and bridges, HTTP CONNECT/SOCKS5 upstream transports and
 bounded DNS-over-TCP, and extends lifecycle, trust and consumer fixtures.
 Persistence, routing policy, authorization and UI remain outside this crate.
+The s2n direct-stream integration lives in `weaver-nntp` and uses its existing
+s2n callback APIs and dependencies.
 
 Registry dependencies are pinned by the workspace `Cargo.lock`, with registry
 checksums. The main networking additions resolve as follows:

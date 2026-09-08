@@ -501,7 +501,7 @@ fn ssh_trust_cannot_be_overwritten_by_conflicting_or_stale_handshakes() {
     let mut p = profile(1);
     p.kind = ProxyKind::Ssh;
     p.secrets.username = Some("fixture".into());
-    p.secrets.password = Some("fixture".into());
+    p.secrets.private_key = Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
     db.save_proxy_profile(&p).unwrap();
     db.pin_proxy_host_key(1, 1, "SHA256:first").unwrap();
     assert_eq!(
@@ -544,4 +544,16 @@ async fn cancelled_route_wakes_waiters_and_prevents_bridge_recreation() {
         .unwrap();
     assert!(route.bridge().is_err());
     assert!(route.begin(1).is_none());
+}
+
+#[test]
+fn ssh_profiles_require_a_valid_key_even_if_a_password_is_present() {
+    let mut p = profile(1);
+    p.kind = ProxyKind::Ssh;
+    p.secrets.username = Some("operator".into());
+    p.secrets.password = Some("password-is-not-authentication".into());
+    assert!(p.validate().unwrap_err().to_string().contains("Ed25519"));
+    p.secrets.private_key = Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
+    p.validate().unwrap();
+    assert!(!format!("{:?}", p.ssh_spec()).contains("password-is-not-authentication"));
 }

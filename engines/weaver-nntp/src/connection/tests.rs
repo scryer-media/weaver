@@ -112,7 +112,10 @@ async fn connect_tls_drain_client(
     let remote_addr = tcp.peer_addr().unwrap();
     let connector = TlsConnector::from(client_config);
     let server_name = ServerName::try_from("localhost").unwrap();
-    let tls = connector.connect(server_name, tcp).await.unwrap();
+    let tls = connector
+        .connect(server_name, crate::route_stream::RouteStream::from(tcp))
+        .await
+        .unwrap();
     let now = Instant::now();
 
     NntpConnection {

@@ -3746,6 +3746,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy-tunnels"
+version = "0.20.0"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?rev=8c54eb1348d58afe72cd158fe0d084074617a3a1#8c54eb1348d58afe72cd158fe0d084074617a3a1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "gotatun",
+ "ipnetwork",
+ "russh",
+ "smoltcp",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6076,10 +6092,7 @@ version = "0.11.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
- "gotatun",
- "ipnetwork",
- "russh",
- "smoltcp",
+ "proxy-tunnels",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

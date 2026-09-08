@@ -64,6 +64,7 @@ pub struct Socks5Front {
     timeout: Duration,
     credentials: Option<(String, String)>,
     pub(crate) outcomes: crate::bridge::Outcomes,
+    pub(crate) slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Why a single SOCKS5 conversation ended early. Never surfaced to an
@@ -116,6 +117,7 @@ impl Socks5Front {
             timeout,
             credentials: None,
             outcomes: Default::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(1024)),
         }
     }
 
@@ -133,6 +135,7 @@ impl Socks5Front {
             timeout,
             credentials: Some(credentials),
             outcomes: Default::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(1024)),
         }
     }
 
@@ -149,6 +152,9 @@ impl Socks5Front {
             };
             match accepted {
                 Ok((stream, peer)) => {
+                    let Ok(slot) = self.slots.clone().try_acquire_owned() else {
+                        continue;
+                    };
                     if !peer_is_permitted(&peer) {
                         tracing::warn!(
                             proxy_config_id = self.proxy_config_id.as_str(),
@@ -159,6 +165,7 @@ impl Socks5Front {
                     }
                     let front = Arc::clone(&self);
                     connections.spawn(async move {
+                        let _slot = slot;
                         if let Err(failure) = front.handle_connection(stream).await {
                             tracing::debug!(
                                 proxy_config_id = front.proxy_config_id.as_str(),

@@ -1,53 +1,28 @@
-//! Application-independent TCP proxy and userspace tunnel protocols.
+//! Weaver adapters for shared tunnels and consumer routing.
 //!
-//! A transport proxy already exists when a consumer starts talking to it — the HTTP
-//! client is handed `socks5://gateway:1080` and that is the whole story. A
-//! tunnel does not exist until its owner establishes it, so something has to run
-//! the session and then publish an endpoint the ordinary transport client
-//! factories can dial. That is this crate.
-//!
-//! ```text
-//!   TCP consumer  ──SOCKS5──▶  loopback SOCKS5 front  ──▶  TunnelProvider
-//!   (any consumer)                127.0.0.1:<ephemeral>        (SSH or WireGuard)
-//! ```
-//!
-//! Three pieces, deliberately separated:
-//!
-//! * [`TunnelProvider`] — "open a byte stream to `host:port` on the far side".
-//!   [`SshTunnelProvider`] runs an SSH session and forwards `direct-tcpip`
-//!   channels; [`WireGuardTunnelProvider`] runs a userspace WireGuard device
-//!   with a userspace IP stack on top of it. Both plug into the same seam, and
-//!   everything below inherits both without knowing which is which.
-//! * [`socks5`] — a hand-rolled, loopback-only, authenticated CONNECT SOCKS5
-//!   front. It is what makes a tunnel look like an ordinary proxy to every
-//!   existing egress site.
-//! * [`bridge::Bridge`] — an owned, revocable front reachable from blocking
-//!   and async callers. The legacy registry is retained only for fixtures.
-//!
-//! ## Why this is a separate crate
-//!
-//! Protocols accept [`TunnelSpec`] without application persistence or routing
-//! types. The owning runtime supplies its executor, policy and observer.
-//!
-//! ## What this crate never does
-//!
-//! It never logs key material, never persists anything, and never decides
-//! policy. Host-key pins and health outcomes are handed to a
-//! [`TunnelObserver`] supplied by the caller, which owns the ledgers and the
-//! repository.
+//! SSH and WireGuard protocols live in the Git-pinned `proxy-tunnels` crate.
+//! This crate adapts persisted host-key trust and consumer outcomes, implements
+//! HTTP CONNECT/SOCKS5 upstream transports and routed DNS, and supplies owned
+//! revocable streams. NNTP uses direct in-process I/O; RSS uses authenticated
+//! loopback SOCKS bridges. The server owns policy, persistence and the runtime.
 
 pub mod bridge;
+pub mod direct;
 pub mod dns;
 mod error;
 mod provider;
 #[cfg(any(test, feature = "test-support"))]
 mod registry;
+mod shared;
 pub mod socks5;
+#[path = "shared_ssh.rs"]
 mod ssh;
 pub mod transport;
+#[path = "shared_wireguard.rs"]
 pub mod wireguard;
 
 #[cfg(any(test, feature = "test-support"))]
+#[path = "shared_test_support.rs"]
 pub mod test_support;
 
 pub use error::TunnelError;

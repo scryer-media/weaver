@@ -434,7 +434,11 @@ impl NntpConnection {
                 address_offset,
             )
             .await?;
-            if let NntpTransport::Plain { inner, .. } = &plain {
+            if let NntpTransport::Plain {
+                inner: crate::route_stream::RouteStream::Tcp(inner),
+                ..
+            } = &plain
+            {
                 route_socket = Some(registry.track(socket2::SockRef::from(inner))?);
             }
             if config.tls {

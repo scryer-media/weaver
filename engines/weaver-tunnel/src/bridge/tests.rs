@@ -148,3 +148,79 @@ async fn dialing_preserves_pipelined_client_bytes() {
     assert_eq!(&payload, b"ping");
     bridge.revoke().await;
 }
+
+#[tokio::test]
+async fn direct_stream_works_without_the_listener_and_revokes_a_pending_read() {
+    let bridge = bridge(Arc::new(Fixture::default()));
+    let task = bridge.task.lock().unwrap().take().unwrap();
+    task.abort();
+    let _ = task.await;
+    let (mut stream, _) = bridge.dial("unresolved.invalid", 119).await.unwrap();
+    // A partial request leaves the fixture waiting for the last two bytes.
+    stream.write_all(b"pi").await.unwrap();
+    let reader = tokio::spawn(async move { stream.read_u8().await });
+    tokio::task::yield_now().await;
+    bridge.revoke().await;
+    let error = tokio::time::timeout(Duration::from_secs(1), reader)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+    assert!(bridge.dial("unresolved.invalid", 119).await.is_err());
+}
+
+#[tokio::test]
+async fn abandoning_direct_establishment_cancels_the_owned_runtime_task() {
+    let fixture = Arc::new(Fixture {
+        stalled: true,
+        ..Default::default()
+    });
+    let bridge = bridge(fixture.clone());
+    let dial = tokio::spawn({
+        let bridge = bridge.clone();
+        async move { bridge.dial("unresolved.invalid", 119).await }
+    });
+    fixture.started.notified().await;
+    dial.abort();
+    let _ = dial.await;
+    tokio::time::timeout(Duration::from_secs(1), fixture.dropped.notified())
+        .await
+        .unwrap();
+    assert_eq!(bridge.direct_slots.available_permits(), 1024);
+    bridge.revoke().await;
+}
+
+#[tokio::test]
+async fn direct_admission_is_bounded_before_dialing() {
+    let fixture = Arc::new(Fixture::default());
+    let bridge = bridge(fixture.clone());
+    let _held = bridge
+        .direct_slots
+        .clone()
+        .acquire_many_owned(1024)
+        .await
+        .unwrap();
+    assert!(bridge.dial("unresolved.invalid", 119).await.is_err());
+    assert_eq!(fixture.calls.load(Ordering::Relaxed), 0);
+    bridge.revoke().await;
+}
+
+#[tokio::test]
+async fn revocation_waits_for_pending_direct_dials_to_unwind() {
+    let fixture = Arc::new(Fixture {
+        stalled: true,
+        ..Default::default()
+    });
+    let bridge = bridge(fixture.clone());
+    let dial = tokio::spawn({
+        let bridge = bridge.clone();
+        async move { bridge.dial("unresolved.invalid", 119).await }
+    });
+    fixture.started.notified().await;
+    tokio::time::timeout(Duration::from_secs(1), bridge.revoke())
+        .await
+        .unwrap();
+    assert_eq!(bridge.direct_slots.available_permits(), 1024);
+    assert!(dial.await.unwrap().is_err());
+}

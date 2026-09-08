@@ -74,26 +74,29 @@ impl Fixture {
                 standard = Some(proxy);
             }
             ProxyKind::Ssh => {
-                let proxy = SshServerDouble::start(SshServerOptions {
-                    destinations: mapping,
-                    ..Default::default()
-                })
-                .await;
+                let proxy =
+                    SshServerDouble::start_with_destinations(SshServerOptions::default(), mapping)
+                        .await;
                 p.port = proxy.port();
                 p.secrets.username = Some("operator".into());
-                p.secrets.password = Some("s3cret".into());
+                p.secrets.private_key =
+                    Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
                 ssh = Some(proxy);
             }
             ProxyKind::WireGuard => {
-                let proxy = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
-                    tcp_forward: Some(destination),
-                    http_port: 80,
-                    names: HashMap::from([
-                        ("feed.invalid".into(), vec![TEST_PEER_ADDRESS.into()]),
-                        ("download.invalid".into(), vec![TEST_PEER_ADDRESS.into()]),
-                    ]),
-                    ..Default::default()
-                })
+                let proxy = WireGuardTestPeer::start_for_downloads(
+                    WireGuardTestPeerOptions {
+                        http_port: 80,
+                        names: HashMap::from([
+                            ("feed.invalid".into(), vec![TEST_PEER_ADDRESS.into()]),
+                            ("download.invalid".into(), vec![TEST_PEER_ADDRESS.into()]),
+                        ]),
+                        ..Default::default()
+                    },
+                    Some(destination),
+                    std::time::Duration::ZERO,
+                    true,
+                )
                 .await;
                 let spec = proxy.client_spec("rss");
                 use base64::Engine;

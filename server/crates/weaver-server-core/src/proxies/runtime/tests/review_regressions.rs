@@ -285,7 +285,7 @@ fn concurrent_save_never_erases_a_committed_ssh_pin() {
         let mut profile = profile(id);
         profile.kind = ProxyKind::Ssh;
         profile.secrets.username = Some("fixture".into());
-        profile.secrets.password = Some("fixture".into());
+        profile.secrets.private_key = Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
         db.save_proxy_profile(&profile).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let pin_db = db.clone();

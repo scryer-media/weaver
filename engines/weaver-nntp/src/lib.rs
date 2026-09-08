@@ -50,6 +50,7 @@ pub mod pool;
 mod proxy;
 pub mod response;
 pub mod revocation;
+mod route_stream;
 pub mod server_caps;
 pub mod tls;
 pub mod transfer;

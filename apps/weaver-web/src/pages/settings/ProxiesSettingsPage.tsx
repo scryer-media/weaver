@@ -94,8 +94,9 @@ export function ProxiesSettingsPage() {
           <label className="space-y-2 text-sm">Endpoint port<Input required type="number" min={1} max={65535} value={d.port} onChange={e => update({ port: Number(e.target.value) })} /></label>
           <label className="space-y-2 text-sm">DNS server IPs<textarea className="min-h-20 w-full rounded-md border border-input bg-background p-3" value={d.dns} onChange={e => update({ dns: e.target.value })} /><span className="block text-xs text-muted-foreground">Required for RSS. These servers must be reachable through this proxy.</span></label>
           <label className="space-y-2 text-sm">Connection test timeout (seconds)<Input type="number" min={1} max={300} value={d.timeoutSeconds} onChange={e => update({ timeoutSeconds: Number(e.target.value) })} /></label>
-          {d.kind !== "WIRE_GUARD" && <>{secretField("username", "Username", p?.hasUsername)}{secretField("password", "Password", p?.hasPassword)}</>}
-          {d.kind === "SSH" && <>{secretField("privateKey", "Ed25519 private key", p?.hasPrivateKey, true)}{secretField("passphrase", "Key passphrase", p?.hasPassphrase)}<p className="text-xs text-muted-foreground md:col-span-2">Use a password or an Ed25519 key. A configured key takes precedence. The first successful connection pins the host key; changed keys are rejected.</p></>}
+          {d.kind !== "WIRE_GUARD" && secretField("username", "Username", p?.hasUsername)}
+          {(d.kind === "HTTP_CONNECT" || d.kind === "SOCKS5") && secretField("password", "Password", p?.hasPassword)}
+          {d.kind === "SSH" && <>{secretField("privateKey", "Ed25519 private key", p?.hasPrivateKey, true)}{secretField("passphrase", "Key passphrase", p?.hasPassphrase)}<p className="text-xs text-muted-foreground md:col-span-2">An Ed25519 private key is required. The first successful connection pins the host key; changed keys are rejected.</p></>}
         </div>
         {d.kind === "WIRE_GUARD" && <div className="space-y-4">
           <fieldset className="space-y-3 rounded-md border border-border p-4"><legend className="px-2 text-sm font-semibold">Import WireGuard configuration</legend>
