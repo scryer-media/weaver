@@ -3261,7 +3261,7 @@ pub struct Pipeline {
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.
-    par3_runtime: HashMap<JobId, repair::par3::Par3Job>,
+    par3_runtime: Option<Box<repair::par3::work::Coordinator>>,
     #[cfg(test)]
     pub(super) par2_binding_resolver_calls: std::sync::atomic::AtomicU64,
     /// Direct-store routing state: admitted archive sets, their routers and

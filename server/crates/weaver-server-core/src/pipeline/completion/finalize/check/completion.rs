@@ -285,6 +285,14 @@ impl Pipeline {
             }
         }
 
+        if self
+            .par3_runtime
+            .as_ref()
+            .is_some_and(|coordinator| coordinator.has_work(job_id))
+        {
+            return;
+        }
+
         if matches!(current_status, JobStatus::QueuedRepair) {
             if self.active_repair_jobs() == 0 {
                 self.promote_queued_repairs();

@@ -1,0 +1,80 @@
+use super::*;
+
+const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
+
+#[tokio::test]
+async fn par2_only_publications_create_no_par3_runtime_or_worker_queue() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3100);
+    let spec = standalone_job_spec(
+        "PAR2 isolation",
+        &[("payload.bin".into(), 4), ("set.par2".into(), 8)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, name, bytes) in [
+        (0, "payload.bin", &b"data"[..]),
+        (1, "set.par2", &b"PAR2\0PKT"[..]),
+    ] {
+        write_and_complete_file(&mut pipeline, job_id, file_index, name, bytes).await;
+        let file_id = NzbFileId { job_id, file_index };
+        pipeline.file_prefix_16k.insert(file_id, bytes.to_vec());
+        pipeline.try_load_par3_metadata(job_id, file_id).await;
+        assert!(pipeline.par3_runtime.is_none());
+    }
+}
+
+#[tokio::test]
+async fn completion_waits_for_authenticated_carrier_worker_including_renamed_input() {
+    for filename in ["set.par3", "renamed.bin"] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3101);
+        let mut spec =
+            standalone_job_spec("PAR3 discovery", &[(filename.into(), INDEX.len() as u32)]);
+        spec.files[0].role = FileRole::from_filename(filename);
+        let working = insert_active_job(&mut pipeline, job_id, spec).await;
+        write_and_complete_file(&mut pipeline, job_id, 0, filename, INDEX).await;
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        pipeline
+            .file_prefix_16k
+            .insert(file_id, INDEX[..64].to_vec());
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.status = JobStatus::Downloading;
+            state.refresh_runtime_lanes_from_status();
+        }
+        pipeline.try_load_par3_metadata(job_id, file_id).await;
+        assert!(pipeline.par3_runtime.as_ref().unwrap().has_work(job_id));
+        pipeline.check_job_completion(job_id).await;
+        assert!(matches!(
+            pipeline.jobs[&job_id].status,
+            JobStatus::Downloading
+        ));
+        assert!(working.join(filename).exists());
+        let done = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.par3_runtime.as_mut().unwrap().recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        pipeline.handle_par3_work_done(done);
+        let coordinator = pipeline.par3_runtime.as_ref().unwrap();
+        assert!(!coordinator.has_work(job_id));
+        assert_eq!(coordinator.authenticated_set_count(job_id), 1);
+        pipeline.clear_par2_runtime_state(job_id);
+        assert_eq!(
+            pipeline
+                .par3_runtime
+                .as_ref()
+                .unwrap()
+                .authenticated_set_count(job_id),
+            0
+        );
+    }
+}

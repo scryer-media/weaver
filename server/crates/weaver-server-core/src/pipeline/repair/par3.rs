@@ -181,25 +181,37 @@ impl Pipeline {
         let path = state
             .working_dir
             .join(self.current_filename_for_file(job_id, file));
-        let mut runtime = self.par3_runtime.remove(&job_id).unwrap_or_default();
-        let result = tokio::task::spawn_blocking(move || {
-            let result = runtime.scan_complete(SourceId(u64::from(file_id.file_index)), path);
-            (runtime, result)
-        })
-        .await;
-        match result {
-            Ok((runtime, result)) => {
-                self.par3_runtime.insert(job_id, runtime);
-                if let Err(error) = result {
-                    tracing::warn!(job_id = job_id.0, file_index = file_id.file_index, error = %error, "PAR3 carrier discovery incomplete");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "PAR3 carrier worker failed")
-            }
+        let coordinator = self.par3_runtime.get_or_insert_with(Default::default);
+        if let Err(error) = coordinator
+            .enqueue(job_id, SourceId(u64::from(file_id.file_index)), path)
+            .and_then(|()| coordinator.dispatch())
+        {
+            self.fail_job(job_id, format!("PAR3 discovery failed: {error}"));
+        }
+    }
+
+    pub(in crate::pipeline) fn handle_par3_work_done(&mut self, done: work::WorkDone) {
+        let Some(coordinator) = self.par3_runtime.as_mut() else {
+            return;
+        };
+        let job_id = coordinator.settle(done);
+        if let Err(error) = coordinator.dispatch() {
+            tracing::error!(error = %error, "PAR3 worker dispatch failed");
+        }
+        if let Some(job_id) = job_id
+            && self.jobs.contains_key(&job_id)
+        {
+            tracing::debug!(
+                job_id = job_id.0,
+                sets = coordinator.authenticated_set_count(job_id),
+                "PAR3 carrier worker settled"
+            );
+            self.schedule_job_completion_check(job_id);
         }
     }
 }
+
+pub(in crate::pipeline) mod work;
 
 #[cfg(test)]
 mod tests;

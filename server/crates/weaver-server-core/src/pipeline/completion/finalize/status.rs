@@ -857,7 +857,9 @@ impl Pipeline {
         self.block_crcs.forget_job(job_id);
         self.direct_store.clear_pending_materializations(job_id);
         self.par2_runtime.remove(&job_id);
-        self.par3_runtime.remove(&job_id);
+        if let Some(coordinator) = self.par3_runtime.as_mut() {
+            coordinator.forget(job_id);
+        }
         self.par2_cancellations.remove(&job_id);
         self.direct_post_repair_in_flight.remove(&job_id);
         self.direct_post_repair_results.remove(&job_id);

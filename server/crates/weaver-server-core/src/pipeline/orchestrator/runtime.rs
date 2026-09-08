@@ -384,7 +384,7 @@ impl Pipeline {
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
-            par3_runtime: HashMap::new(),
+            par3_runtime: None,
             #[cfg(test)]
             par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
@@ -1045,6 +1045,14 @@ impl Pipeline {
                     }
                     Some(done) = self.par2_analysis_done_rx.recv() => {
                         self.handle_par2_analysis_done(done).await;
+                    }
+                    Some(done) = async {
+                        match self.par3_runtime.as_mut() {
+                            Some(coordinator) => coordinator.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        self.handle_par3_work_done(done);
                     }
                     Some(done) = self.direct_demotion_done_rx.recv() => {
                         self.handle_direct_demotion_done(done).await;

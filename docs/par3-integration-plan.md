@@ -13,7 +13,13 @@ generations. PAR3-specific state is lazy. Engine allocations share a process-wid
 Official-fixture tests cover split headers/payloads, interior holes, duplicate
 arrivals, evidence reuse, selective output staging, and typed cancellation.
 
-Still pending: incremental decode-to-publication wiring, detached worker tickets,
+Carrier scanning now uses detached tickets: one live carrier worker, bounded
+job/candidate queues, retained ownership returned with the result, and stale
+ticket rejection after a job is forgotten or recreated. Cancelled workers keep
+their capacity until they return. Completion waits for outstanding discovery.
+The coordinator and its completion channel are allocated only on PAR3 admission.
+
+Still pending: incremental decode-to-publication wiring,
 repair/download gating, direct-volume adapters, positioned verification, embedded
 archives, persistence, and product surfaces. Completed carriers are discovered
 in production code, but PAR3 does not yet decide job completion or execute repairs.
@@ -40,6 +46,13 @@ Discovery-slice validation: formatting and all-target/all-feature Clippy pass;
 the locked workspace Nextest sweep reports 3,776 passed and 13 existing skips;
 all three doctests pass. All 652 resolved dependency nodes are identical to the
 first slice after normalizing the approved PAR3 Git revision change.
+
+Worker-slice validation: all-target/all-feature Clippy passes; six targeted
+worker/pipeline tests pass. The full locked workspace sweep passes all 3,782
+tests with eight test workers and 13 existing skips. An earlier full-concurrency
+run reported one leak in the existing disabled-script runner test; it passed
+in isolation and in the full rerun. The strict 500 ms leak-failure policy remains
+unchanged. This is not evidence of a PAR2 throughput result.
 
 ## Decisions
 
