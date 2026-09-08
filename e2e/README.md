@@ -76,7 +76,7 @@ subcommands.
 | `cmd/weaver-e2e` | The CLI |
 | `internal/weaver` | The harness: flows, seeding, assertions, the release gate |
 | `internal/composeutil` | Compose network and subnet helpers |
-| `docker-compose.yml` | The 10-service stack: `weaver`, `weaver-postgres`, `weaver-playwright`, `rss-fixture`, `nntp`, `nntp2`, `nyuu`, `toxiproxy`, `sabnzbd`, `nzbget` |
+| `docker-compose.yml` | The 11-service stack: `weaver`, `weaver-postgres`, `weaver-playwright`, `rss-fixture`, `proxy-fixture`, `nntp`, `nntp2`, `nyuu`, `toxiproxy`, `sabnzbd`, `nzbget` |
 | `services/` | Config and build contexts for the stack services |
 | `playwright-weaver/` | The Playwright project (image `weaver-e2e-playwright:local`); `tests/` is live-mounted into the container |
 | `testdata/<slug>/` | One directory per scenario: `scenario.json` is tracked, the payload bytes are hydrated; `testdata/shared/` holds the source clips the generators encode from |
@@ -179,7 +179,7 @@ extraction or final output.
 | --- | --- | --- |
 | Browser | `ui-settings-crud`, `ui-security`, `ui-ingress-automation`, `ui-post-processing`, `ui-runtime-observability` | Visible controls, validation, persistence, failure and recovery state, browser health |
 | Browser backup matrix | `ui-backup-restore-{sqlite,postgres}-to-{sqlite,postgres}` | Visible backup/restore behavior plus target-state persistence |
-| API/metrics | `rate-limits`, `bandwidth-and-server-quotas`, `provider-connection-cap`, `encryption-key-lifecycle`, `duplicate-and-queue-policy` | Public API responses, Weaver metrics, fake-service counters, lifecycle evidence |
+| API/metrics | `rate-limits`, `bandwidth-and-server-quotas`, `provider-connection-cap`, `proxy-routing`, `encryption-key-lifecycle`, `duplicate-and-queue-policy` | Public API responses, Weaver metrics, fake-service counters, lifecycle evidence |
 | Existing command flow | `adaptive-dispatch` | Its own acceptance oracle |
 
 ```bash
@@ -194,6 +194,21 @@ flow and datastore with status, timing, captured output, Playwright artifacts
 and — on failure — Compose logs, service state and a Weaver metrics snapshot.
 `latest.json` is a stable pointer to the newest run. Flows run in parallel;
 `E2E_WEAVER_RELEASE_GATE_JOBS` (default 8, capped at 16) sets the width.
+
+`proxy-routing` runs on SQLite and PostgreSQL as part of `full`, or alone with
+`task release-gate -- proxy-routing`. Its mixed HTTP CONNECT → SOCKS5 → HTTP
+CONNECT ladder covers ordering, disabled profiles, blocked exhaustion, an empty
+blocked ladder, explicit host fallback, RSS cooldown/primary recovery, redirects
+and inherited NZB requests, NNTP retry after an active proxy connection drops,
+and revocation of an active direct download when host fallback is disabled.
+The application resolver points at a per-stack DNS canary; destination names
+are answered locally. Proxy traffic and host destination traffic are counted
+separately. Positive direct-access controls must increment both connection and
+DNS counters before their absence is accepted as evidence of blocked bypass.
+Ordered events and case boundaries are retained in `proxy-routing-evidence.json`.
+The flow uses existing images and Node built-ins, with no external proxy or VPN
+accounts. SSH, WireGuard and HTTP/3 protocol interoperability remains covered
+by the Rust integration fixtures; this e2e flow owns ladder behavior.
 
 Inside `playwright-weaver/`, `npm run audit` enforces three rules on every
 `ui-*.spec.ts`: the project is self-contained; primary actions and assertions

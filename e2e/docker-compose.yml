@@ -82,6 +82,20 @@ services:
       timeout: 3s
       retries: 5
 
+  # Route failure controls and direct-traffic/DNS canaries. Started only by
+  # the proxy-routing flow; its generated override assigns a per-run address.
+  proxy-fixture:
+    image: ${E2E_WEAVER_PLAYWRIGHT_IMAGE:-weaver-e2e-playwright:local}
+    pull_policy: never
+    command: ["node", "tests/support/proxy-fixture-server.mjs"]
+    volumes:
+      - ./playwright-weaver/tests:/work/tests:ro
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8090/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
   # Fixed RSS/NZB source for the RSS-ingress release-gate flow. It intentionally
   # exercises feed parsing and NZB retrieval, not an indexer implementation.
   rss-fixture:

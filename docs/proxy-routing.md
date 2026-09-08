@@ -316,6 +316,42 @@ measure WAN latency/loss, NNTP decoding or disk writes, and do not establish a
 provider throughput guarantee. PostgreSQL runtime tests, Linux/Windows execution
 and browser-driven UI checks were not rerun for this addition.
 
+## Application e2e fallback validation
+
+The `proxy-routing` behavior flow now runs in the e2e full suite on SQLite and
+PostgreSQL. It drives the public GraphQL API against the Linux Weaver binary,
+with an isolated mixed HTTP CONNECT/SOCKS5 ladder, fake NNTP articles, RSS/NZB
+responses and a DNS/destination canary. Explicit direct controls prove that the
+canary sees host connections and host DNS; blocked cases require zero such
+events. It covers ordering, disabled profiles, empty/exhausted blocked ladders,
+allowed direct fallback, real-time cooldown/primary recovery, redirects,
+inherited NZB routing, article retry after proxy loss and active direct-stream
+revocation. Protocol-specific SSH, WireGuard and HTTP/3 fixtures remain in Rust.
+
+The first run exposed a save-time validation bug: changing an active server to
+disallow direct fallback was rejected when all proxies were down. Routing
+changes with unchanged endpoint, credentials, TLS identity and activation state
+now persist without requiring connectivity, then revoke the old routes before
+the mutation returns. Endpoint/authentication changes and server activation
+retain normal connection validation.
+
+Validation after that fix:
+
+- The complete new flow passed on disposable SQLite and PostgreSQL stacks,
+  each in about 38 seconds, including the real 30-second recovery cooldown.
+- Three Node fixture tests passed, covering host-DNS observation, bounded
+  destination forwarding and pipelined HTTP CONNECT/SOCKS5 authentication.
+- The affected Go harness and Compose-isolation packages passed. Their existing
+  corpus-dependent unit test used the already available local fixture assets.
+- Rust formatting and prescribed host Clippy passed; locked full workspace
+  Nextest passed 3,688 tests with 11 existing skips.
+- E2e TypeScript checks and project audits passed. No dependency changes.
+
+The remaining full e2e flows were not rerun. Each proxy flow saves ordered
+canary events and case boundaries as `proxy-routing-evidence.json` alongside
+the Playwright report. Run it independently from `e2e` with
+`task release-gate -- proxy-routing`.
+
 ## Reproduction
 
 From this worktree:
