@@ -2329,9 +2329,38 @@ mod routing_tests {
 mod probe_tests {
     use super::*;
 
-    /// Marks every worker of `pool` busy, so a test decides the idle state
-    /// itself instead of racing the worker threads' own first publish.
-    fn quiesce(pool: &OwnedDownloadLanePool) {
+    /// Waits for every worker's first idle publish before taking control of
+    /// its idle state. A probe reply is a barrier without changing that state.
+    async fn quiesce(pool: &OwnedDownloadLanePool) {
+        let senders: Vec<_> = lock_pool(&pool.shared)
+            .workers
+            .iter()
+            .map(|worker| worker.sender.clone())
+            .collect();
+        for sender in senders {
+            let (picked_up, picked_up_rx) = oneshot::channel();
+            let (reply, reply_rx) = oneshot::channel();
+            assert!(
+                sender
+                    .send(OwnedLanePoolCommand::Probe {
+                        message_ids: Arc::from([]),
+                        picked_up,
+                        reply,
+                    })
+                    .is_ok()
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                picked_up_rx.await.expect("worker picked up startup probe");
+                assert!(
+                    reply_rx
+                        .await
+                        .expect("worker answered startup probe")
+                        .is_none()
+                );
+            })
+            .await
+            .expect("worker reached its idle command loop");
+        }
         let mut shared = lock_pool(&pool.shared);
         for index in 0..shared.workers.len() {
             shared.mark_busy(index);
@@ -2348,7 +2377,7 @@ mod probe_tests {
     async fn a_worker_without_a_cached_lane_declines_the_probe() {
         let pool = OwnedDownloadLanePool::new(1);
         let handle = pool.probe_handle();
-        quiesce(&pool);
+        quiesce(&pool).await;
         // Idle, but holding nothing: the state a worker is in before its
         // first lease, and after a park that dropped the socket.
         set_idle(&pool, 0, None);
@@ -2367,7 +2396,7 @@ mod probe_tests {
     async fn a_busy_worker_is_not_asked() {
         let pool = OwnedDownloadLanePool::new(2);
         let handle = pool.probe_handle();
-        quiesce(&pool);
+        quiesce(&pool).await;
 
         assert!(handle.idle_workers().is_empty());
         assert!(
@@ -2393,19 +2422,19 @@ mod probe_tests {
         assert!(outcome.servers_settled.is_empty());
     }
 
-    #[test]
-    fn the_probe_handle_tracks_pool_resizes() {
+    #[tokio::test]
+    async fn the_probe_handle_tracks_pool_resizes() {
         let mut pool = OwnedDownloadLanePool::new(1);
         let handle = pool.probe_handle();
         pool.resize(4);
-        quiesce(&pool);
+        quiesce(&pool).await;
         set_idle(&pool, 3, Some(test_idle_lane(0)));
 
         assert_eq!(handle.idle_workers().len(), 1);
 
         pool.resize(2);
         assert_eq!(lock_pool(&handle.shared).workers.len(), 2);
-        quiesce(&pool);
+        quiesce(&pool).await;
         assert!(handle.idle_workers().is_empty());
     }
 }
