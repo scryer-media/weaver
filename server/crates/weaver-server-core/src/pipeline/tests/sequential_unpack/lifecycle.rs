@@ -2,6 +2,44 @@ use super::*;
 use crate::pipeline::direct_unpack::wiring::{AbortLatch, DemotionReason};
 
 #[tokio::test]
+async fn truncated_compression_streams_fail_without_repair_data() {
+    for kind in [
+        SimpleArchiveKind::Deflate,
+        SimpleArchiveKind::Gz,
+        SimpleArchiveKind::Bzip2,
+        SimpleArchiveKind::Xz,
+        SimpleArchiveKind::Brotli,
+        SimpleArchiveKind::Zstd,
+        SimpleArchiveKind::TarGz,
+        SimpleArchiveKind::TarBz2,
+        SimpleArchiveKind::TarXz,
+    ] {
+        let temp = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+        let job = JobId(43123);
+        let (name, mut bytes, _) = fixture(kind);
+        bytes.truncate(bytes.len() - 8);
+        insert_stream(&mut pipeline, job, &[(name.clone(), bytes.clone())]).await;
+        let id = NzbFileId {
+            job_id: job,
+            file_index: 0,
+        };
+        for number in 0..bytes.len().div_ceil(ARTICLE) {
+            land(&mut pipeline, id, &name, &bytes, number).await;
+        }
+        finish(&mut pipeline, job, &name).await;
+        let done = tokio::time::timeout(Duration::from_secs(20), pipeline.extract_done_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ExtractionDone::FullSet { result, .. } = done else {
+            panic!("expected full set")
+        };
+        assert!(result.is_err(), "{kind:?} accepted a truncated stream");
+    }
+}
+
+#[tokio::test]
 async fn bad_compression_trailers_fail_without_repair_data() {
     for kind in [
         SimpleArchiveKind::Gz,

@@ -249,12 +249,16 @@ impl Read for GatedSplitReader {
         let file = self.file_for(index, rewritten)?;
         file.seek(SeekFrom::Start(local))?;
         let read = file.read(&mut buf[..wanted])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("part {index} ended at {local} inside committed archive coverage"),
+            ));
+        }
         self.position += read as u64;
         // What the decoder has actually taken, as opposed to what it could
         // have. Repair only has to leave *these* bytes alone.
-        if read > 0 {
-            self.coverage.note_consumed(index, local + read as u64);
-        }
+        self.coverage.note_consumed(index, local + read as u64);
         Ok(read)
     }
 }
