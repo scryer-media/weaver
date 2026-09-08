@@ -342,3 +342,222 @@ async fn refill_asks_about_groups_only_on_a_server_that_needs_a_selected_group()
         "the initial rule is the one that still asks about priority"
     );
 }
+
+/// Splits the queue so the completion-critical heap holds `critical` items and
+/// the ordinary heap the rest, and returns the compatibility of an ordinary
+/// work item — the batch a payload lane is carrying.
+fn split_queue_classes(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    critical: usize,
+) -> DownloadBatchCompatibility {
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let mut works = state.download_queue.drain_all();
+    assert!(
+        works.len() > critical,
+        "the class split needs work left over for the payload lane"
+    );
+    let lane_sample = works.pop().unwrap();
+    let compatibility = DownloadBatchCompatibility::from_work(&lane_sample);
+    assert!(!compatibility.completion_critical);
+    for work in works.iter_mut().take(critical) {
+        work.completion_critical = true;
+    }
+    works.push(lane_sample);
+    for work in works {
+        state.download_queue.push(work);
+    }
+    compatibility
+}
+
+/// An established connection changes class rather than parking.
+///
+/// Completion-critical work leads the queue because something downstream is
+/// waiting on it, and a lane that already holds an authenticated connection is
+/// the cheapest way to fetch it — cheaper than the park, the dropped socket
+/// and the fresh handshake the class split used to force.
+#[tokio::test]
+async fn lane_refill_changes_class_to_take_completion_critical_work() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41010);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Class Changing Refill",
+            &many_standalone_files("class-change", 6),
+        ),
+    )
+    .await;
+
+    let compatibility = split_queue_classes(&mut pipeline, job_id, 2);
+    // The lane is booked as a payload connection, exactly as dispatch left it.
+    pipeline.active_download_connections = 1;
+    *pipeline
+        .active_download_connections_by_job
+        .entry(job_id)
+        .or_default() = 1;
+
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(refill_request(
+        job_id,
+        compatibility,
+        response_tx,
+    ));
+
+    let response = response_rx.await.unwrap();
+    let lease = response
+        .lease
+        .expect("critical work this lane can serve must not park it");
+    assert!(
+        lease.compatibility.completion_critical,
+        "the critical heap leads, so the refill re-opens the lease around it"
+    );
+    assert!(lease.works.iter().all(|work| work.completion_critical));
+    assert_eq!(
+        pipeline.active_completion_critical_connections, 1,
+        "the connection is now counted under the class it is running"
+    );
+    assert_eq!(
+        pipeline
+            .active_completion_critical_connections_by_job
+            .get(&job_id)
+            .copied(),
+        Some(1),
+        "and the per-job spread sees it, so critical demand is not sent twice"
+    );
+    assert_eq!(
+        pipeline.active_download_connections, 1,
+        "changing class does not add a connection; it re-books the one in hand"
+    );
+}
+
+/// A lane that changes back releases the class it was counted under, so the
+/// two ends of the booking agree and the park cannot underflow it.
+#[tokio::test]
+async fn a_lane_that_changes_class_back_releases_the_critical_booking() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41011);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Class Returning Refill",
+            &many_standalone_files("class-return", 4),
+        ),
+    )
+    .await;
+
+    let mut critical = split_queue_classes(&mut pipeline, job_id, 0);
+    critical.completion_critical = true;
+    pipeline.active_download_connections = 1;
+    pipeline.active_completion_critical_connections = 1;
+    *pipeline
+        .active_completion_critical_connections_by_job
+        .entry(job_id)
+        .or_default() = 1;
+
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(refill_request(job_id, critical, response_tx));
+
+    let response = response_rx.await.unwrap();
+    let lease = response
+        .lease
+        .expect("the job still has ordinary payload for this lane");
+    assert!(!lease.compatibility.completion_critical);
+    assert_eq!(pipeline.active_completion_critical_connections, 0);
+    assert!(
+        pipeline
+            .active_completion_critical_connections_by_job
+            .get(&job_id)
+            .is_none()
+    );
+}
+
+/// The yield exists to get a connection to completion-critical work. When the
+/// lane asking for a refill can serve that work itself, the demand is met here
+/// and there is nothing to yield — no park, no dropped socket, no redial.
+#[tokio::test]
+async fn a_requested_yield_hands_the_lane_critical_work_instead_of_parking_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41012);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Yield To Critical", &many_standalone_files("yield-crit", 6)),
+    )
+    .await;
+
+    let compatibility = split_queue_classes(&mut pipeline, job_id, 2);
+    // The signal belongs to a running dispatch period: opening a new one is
+    // what clears it, so the lane must arrive while this job is already hot.
+    pipeline.hot_dispatch_job = Some(job_id);
+    pipeline.hot_share_yield_signal.request();
+    let parked_before = pipeline
+        .metrics
+        .download_lane_refill_parked_total
+        .load(Ordering::Relaxed);
+
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(refill_request(
+        job_id,
+        compatibility,
+        response_tx,
+    ));
+
+    let response = response_rx.await.unwrap();
+    let lease = response.lease.expect("the yield is served by this lane");
+    assert!(lease.compatibility.completion_critical);
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_lane_refill_parked_total
+            .load(Ordering::Relaxed),
+        parked_before,
+        "a lane that can serve the critical demand must not park to make room \
+         for itself"
+    );
+}
+
+/// With no critical work for this lane to take, the yield still does what it
+/// says: the ordinary payload goes back to the queue untouched and the
+/// connection is returned to the dispatcher.
+#[tokio::test]
+async fn a_requested_yield_still_parks_when_no_critical_work_is_servable() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41013);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Yield Without Critical",
+            &many_standalone_files("yield-none", 5),
+        ),
+    )
+    .await;
+
+    let compatibility = split_queue_classes(&mut pipeline, job_id, 0);
+    pipeline.hot_dispatch_job = Some(job_id);
+    pipeline.hot_share_yield_signal.request();
+    let queued_before = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
+
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(refill_request(
+        job_id,
+        compatibility,
+        response_tx,
+    ));
+
+    let response = response_rx.await.unwrap();
+    assert!(response.lease.is_none());
+    assert_eq!(response.park_reason, LaneParkReason::HotShareYield);
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        queued_before,
+        "the payload the refill had taken goes back to the queue whole"
+    );
+}

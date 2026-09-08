@@ -144,7 +144,10 @@ impl Pipeline {
     /// present in the primary queue must publish its grid first. Indexless
     /// recovery discovery stays completion-bounded instead of turning every
     /// optional volume into a pre-download barrier.
-    fn par2_metadata_bootstrap_files(&mut self, job_id: JobId) -> Option<Vec<u32>> {
+    pub(in crate::pipeline::download::worker) fn par2_metadata_bootstrap_files(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<Vec<u32>> {
         if self.par2_bypassed.contains(&job_id)
             || self
                 .jobs
@@ -406,6 +409,46 @@ impl Pipeline {
         let rule = DownloadBatchRule::Refill {
             match_groups: self.server_needs_group_prologue(server_idx),
         };
+
+        // An established connection is worth more to this job's critical class
+        // than a fresh dial would be: work is completion-critical precisely
+        // because something downstream is waiting on it. A lane carrying
+        // ordinary payload therefore looks at the critical heap first and
+        // changes class, instead of parking, dropping its socket, and leaving
+        // the critical lease to pay for a handshake.
+        if !compatibility.completion_critical
+            && self.job_has_completion_critical_work(job_id)
+            && let Some(first) = self.pop_refill_work_servable_by_lane(
+                job_id,
+                server_idx,
+                &compatibility,
+                rule,
+                par2_metadata_bootstrap_files.as_deref(),
+                DownloadWorkSelection::CompletionCritical,
+                // The critical heap holds both ranks — the index and metadata
+                // reads, and promoted recovery — and an established lane may
+                // take whichever leads it.
+                None,
+                uu_cursor_ordinals.as_ref(),
+            )
+        {
+            if par2_metadata_bootstrap_files.is_some() {
+                self.par2_metadata_bootstrap_claims_work(job_id, &first);
+            }
+            let compatibility = DownloadBatchCompatibility::from_work(&first);
+            let Some(first) = self.reserve_download_work_for_dispatch(job_id, first, false)? else {
+                return Ok(None);
+            };
+            return Ok(Some(self.finish_download_batch_lease(
+                lane_mode,
+                compatibility,
+                first,
+                pressure,
+                rule,
+                par2_metadata_bootstrap_files.as_deref(),
+            )));
+        }
+
         let first = match self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
@@ -415,15 +458,38 @@ impl Pipeline {
         ) {
             Some(first) => first,
             None => {
-                let Some(first) = self.pop_refill_work_servable_by_lane(
+                let mut popped = self.pop_refill_work_servable_by_lane(
                     job_id,
                     server_idx,
                     &compatibility,
                     rule,
                     par2_metadata_bootstrap_files.as_deref(),
                     selection,
+                    Some(compatibility.is_recovery),
                     uu_cursor_ordinals.as_ref(),
-                ) else {
+                );
+                // The other direction of the same rule: a lane whose critical
+                // class has drained carries ordinary payload rather than
+                // parking and leaving the next pass to dial a connection for
+                // work that is queued right now. The exception is an
+                // outstanding yield, where this connection is already owed to
+                // critical demand the dispatcher will place itself.
+                if popped.is_none()
+                    && compatibility.completion_critical
+                    && !self.hot_share_yield_signal.is_requested()
+                {
+                    popped = self.pop_refill_work_servable_by_lane(
+                        job_id,
+                        server_idx,
+                        &compatibility,
+                        rule,
+                        par2_metadata_bootstrap_files.as_deref(),
+                        DownloadWorkSelection::NonCritical,
+                        None,
+                        uu_cursor_ordinals.as_ref(),
+                    );
+                }
+                let Some(first) = popped else {
                     return Ok(None);
                 };
                 compatibility = DownloadBatchCompatibility::from_work(&first);
@@ -460,16 +526,21 @@ impl Pipeline {
             })
     }
 
-    /// Stage two of a refill: the first queued work of this lane's class that
-    /// `server_idx` is actually allowed to fetch.
+    /// Stage two of a refill: the first queued work `server_idx` is actually
+    /// allowed to fetch, within the class `selection` names.
     ///
-    /// The class and the recovery flag still hold — a lane is counted under
-    /// both for its whole life — but the exclude set is allowed to differ,
+    /// The exclude set is allowed to differ from the lane's current batch,
     /// because a differing exclude set is a statement about *other* servers.
     /// The lane's own server must be clear of the work's failure exclusions,
     /// its rotation hint, and the job's retention exclusions; otherwise this
     /// lane genuinely cannot serve it and the queue is left alone. The group
     /// question is the rule's, exactly as in stage one.
+    ///
+    /// `require_recovery` pins the recovery flag when the caller is filling
+    /// the lane's current class, where the batch must stay homogeneous; the
+    /// class-change path passes `None`, because both ranks of the critical
+    /// heap are equally welcome on an established connection and the popped
+    /// work's own compatibility becomes the new batch's.
     #[allow(clippy::too_many_arguments)]
     fn pop_refill_work_servable_by_lane(
         &mut self,
@@ -479,20 +550,18 @@ impl Pipeline {
         rule: DownloadBatchRule,
         bootstrap_files: Option<&[u32]>,
         selection: DownloadWorkSelection,
+        require_recovery: Option<bool>,
         uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
     ) -> Option<DownloadWork> {
         let retention_excludes = self.job_retention_excludes(job_id);
         if retention_excludes.contains(&server_idx) {
             return None;
         }
-        let is_recovery = compatibility.is_recovery;
-        let completion_critical = compatibility.completion_critical;
         let match_groups = matches!(rule, DownloadBatchRule::Refill { match_groups: true });
         let groups = compatibility.groups.clone();
         self.jobs.get_mut(&job_id).and_then(|state| {
             let matches = |work: &DownloadWork| {
-                work.is_recovery == is_recovery
-                    && work.completion_critical == completion_critical
+                require_recovery.is_none_or(|is_recovery| work.is_recovery == is_recovery)
                     && !work.exclude_servers.contains(&server_idx)
                     && work.avoid_server != Some(server_idx)
                     && (!match_groups
