@@ -285,6 +285,10 @@ impl Pipeline {
             }
         }
 
+        if let Err(error) = self.refresh_par3_sources(job_id) {
+            self.fail_job(job_id, format!("PAR3 source refresh failed: {error}"));
+            return;
+        }
         if self
             .par3_runtime
             .as_ref()

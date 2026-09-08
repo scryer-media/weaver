@@ -370,7 +370,9 @@ holes unavailable and distinguishes hole fills from content-generation changes.
 Completed conventional files bind through committed decoded placements. Native
 sessions retain their evidence, while bounded actor views carry file-coordinate
 damage and matrix/cohort requirements. Pending publications hide prior views;
-the shared worker queue rotates between PAR3 jobs.
+the shared worker queue rotates between PAR3 jobs. Conventional writes withdraw
+coverage before disk mutation, and worker epochs reject stale handbacks. Identity
+rebindings retire the corresponding source publications for fresh binding.
 PAR3 repair and completion gating remain under integration. The implementation
 record and remaining acceptance gates live in
 [the PAR3 integration plan](docs/par3-integration-plan.md).

@@ -128,6 +128,41 @@ impl PublishedSources {
         Ok(self.entry(source)?.map(|entry| entry.revision))
     }
 
+    /// Fence readers before a write or rebinding becomes observable. Keep the
+    /// generation tombstone so later publication cannot resurrect old evidence.
+    /// This only changes registry state; it performs no filesystem operations.
+    pub(in crate::pipeline) fn withdraw(&self, source: SourceId) -> EngineResult<()> {
+        let mut registry = self
+            .0
+            .write()
+            .map_err(|_| io::Error::other("source registry poisoned"))?;
+        let Some(old) = registry.sources.get(&source) else {
+            return Ok(());
+        };
+        let generation = old
+            .snapshot
+            .generation
+            .checked_add(1)
+            .ok_or(EngineError::ResourceLimit("source generations"))?;
+        let revision = old
+            .revision
+            .checked_add(1)
+            .ok_or(EngineError::ResourceLimit("source revisions"))?;
+        let replacement = Arc::new(Publication {
+            access: Arc::clone(&old.access),
+            backing: old.backing,
+            snapshot: SourceSnapshot {
+                generation,
+                len: old.snapshot.len,
+            },
+            ranges: Vec::new(),
+            revision,
+        });
+        registry.ranges -= old.ranges.len();
+        registry.sources.insert(source, replacement);
+        Ok(())
+    }
+
     fn entry(&self, source: SourceId) -> io::Result<Option<Arc<Publication>>> {
         Ok(self
             .0

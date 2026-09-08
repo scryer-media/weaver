@@ -76,6 +76,49 @@ async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
             assert_eq!(view.files[0].unresolved[0], 2000..4000);
             assert_eq!(view.requirements[0].additional, 1);
         }
+        let source = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        pipeline.invalidate_par2_session_for_file_write(source);
+        assert_eq!(
+            pipeline
+                .par3_runtime
+                .as_ref()
+                .unwrap()
+                .assessments(job_id)
+                .count(),
+            0
+        );
+        let mut replacement = files[0].1.clone();
+        replacement[2300] ^= 1;
+        tokio::fs::write(working.join("a.bin"), replacement)
+            .await
+            .unwrap();
+        pipeline.try_load_par3_metadata(job_id, source).await;
+        while pipeline.par3_runtime.as_ref().unwrap().has_work(job_id) {
+            let done =
+                tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            pipeline.handle_repair_work_done(done).await;
+        }
+        let (_, view) = pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .assessments(job_id)
+            .next()
+            .unwrap();
+        assert_eq!(
+            view.status,
+            if damaged {
+                par3_rs::session::RepairStatus::Complete
+            } else {
+                par3_rs::session::RepairStatus::NeedRecovery
+            }
+        );
     }
 }
 

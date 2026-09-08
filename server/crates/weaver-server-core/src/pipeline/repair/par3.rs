@@ -99,9 +99,14 @@ impl Par3Job {
         Ok(())
     }
 
-    /// Complete-carrier entrypoint. The same registry/scanner also accepts
-    /// committed partial ranges through `publish_carrier`.
-    fn scan_complete(&mut self, source: SourceId, path: PathBuf) -> EngineResult<()> {
+    /// Disk carrier publication. Callers supply committed ranges; only tests
+    /// with complete official files use the full-carrier convenience path.
+    fn scan_file(
+        &mut self,
+        source: SourceId,
+        path: PathBuf,
+        ranges: Option<Vec<std::ops::Range<u64>>>,
+    ) -> EngineResult<()> {
         let mut disk = DiskSourceAccess::with_options(self.options.clone());
         disk.insert(source, path);
         let access: Arc<dyn SourceAccess> = Arc::new(disk);
@@ -112,18 +117,21 @@ impl Par3Job {
             source_id: source,
             offset: 0,
         })?;
-        if self
-            .carriers
-            .get(&source)
-            .is_some_and(|carrier| carrier.backing == snapshot)
+        if ranges.is_none()
+            && self
+                .carriers
+                .get(&source)
+                .is_some_and(|carrier| carrier.backing == snapshot)
         {
             return Ok(());
         }
-        let ranges = if snapshot.len == 0 {
-            Vec::new()
-        } else {
-            std::iter::once(0..snapshot.len).collect()
-        };
+        let ranges = ranges.unwrap_or_else(|| {
+            if snapshot.len == 0 {
+                Vec::new()
+            } else {
+                std::iter::once(0..snapshot.len).collect()
+            }
+        });
         self.publish_carrier(source, access, snapshot.len, ranges, false)?;
         self.scan(source)
     }
@@ -243,15 +251,10 @@ impl Pipeline {
             }
             return;
         }
-        let path = state
-            .working_dir
-            .join(self.current_filename_for_file(job_id, file));
-        let coordinator = self.par3_runtime.get_or_insert_with(|| {
+        self.par3_runtime.get_or_insert_with(|| {
             Box::new(work::Coordinator::new(self.repair_work_done_tx.clone()))
         });
-        if let Err(error) =
-            coordinator.enqueue(job_id, SourceId(u64::from(file_id.file_index)), path)
-        {
+        if let Err(error) = self.enqueue_par3_file(job_id, file_id) {
             self.fail_job(job_id, format!("PAR3 discovery failed: {error}"));
             return;
         }
@@ -295,6 +298,16 @@ impl Pipeline {
         };
         let name = self.current_filename_for_file(job_id, file);
         let path = state.working_dir.join(&name);
+        let source = SourceId(u64::from(file_id.file_index));
+        let carrier = matches!(file.role(), FileRole::Par3 { .. })
+            || self
+                .file_prefix_16k
+                .get(&file_id)
+                .is_some_and(|prefix| prefix.starts_with(par3_rs::MAGIC))
+            || self
+                .par3_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.is_carrier(job_id, source));
         let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
         for segment in 0..file.total_segments() {
             if !file.has_segment(segment) {
@@ -321,14 +334,48 @@ impl Pipeline {
             }
         }
         let coordinator = self.par3_runtime.as_mut().expect("admitted PAR3 job");
-        coordinator.enqueue_file(
-            job_id,
-            SourceId(u64::from(file_id.file_index)),
-            path,
-            name,
-            ranges,
-        )?;
+        if carrier {
+            coordinator.enqueue_carrier_ranges(job_id, source, path, ranges)?;
+        } else {
+            coordinator.enqueue_file(job_id, source, path, name, ranges)?;
+        }
         coordinator.dispatch()
+    }
+
+    pub(in crate::pipeline) fn invalidate_par3_source_write(&mut self, file_id: NzbFileId) {
+        if let Some(coordinator) = self.par3_runtime.as_mut()
+            && let Err(error) = coordinator
+                .invalidate_source(file_id.job_id, SourceId(u64::from(file_id.file_index)))
+        {
+            self.fail_job(
+                file_id.job_id,
+                format!("PAR3 source invalidation failed: {error}"),
+            );
+        }
+    }
+
+    pub(in crate::pipeline) fn invalidate_par3_bindings(&mut self, job_id: JobId) {
+        if let Some(coordinator) = self.par3_runtime.as_mut()
+            && let Err(error) = coordinator.invalidate_bindings(job_id)
+        {
+            self.fail_job(job_id, format!("PAR3 binding invalidation failed: {error}"));
+        }
+    }
+
+    pub(in crate::pipeline) fn refresh_par3_sources(&mut self, job_id: JobId) -> EngineResult<()> {
+        let Some(coordinator) = self.par3_runtime.as_ref() else {
+            return Ok(());
+        };
+        let dirty = coordinator.dirty_sources(job_id);
+        if dirty.is_empty() || self.job_has_pending_download_pipeline_work(job_id) {
+            return Ok(());
+        }
+        for source in dirty {
+            let file_index = u32::try_from(source.0)
+                .map_err(|_| EngineError::InvalidState("unknown PAR3 source identity"))?;
+            self.enqueue_par3_file(job_id, NzbFileId { job_id, file_index })?;
+        }
+        Ok(())
     }
 
     pub(in crate::pipeline) fn handle_par3_work_done(&mut self, done: work::WorkDone) {

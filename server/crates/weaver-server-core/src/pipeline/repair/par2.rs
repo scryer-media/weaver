@@ -2174,6 +2174,7 @@ impl Pipeline {
     /// retained repair session. Drop source locations before that write is
     /// allowed to become observable; parsed PAR2 packets remain reusable.
     pub(crate) fn invalidate_par2_session_for_file_write(&mut self, file_id: NzbFileId) {
+        self.invalidate_par3_source_write(file_id);
         // A damaged-path analysis reading right now is reading the bytes this
         // write replaces, so its verdict would name a file state that no longer
         // exists. Drop the ticket; the completion check submits a fresh read.
@@ -2194,6 +2195,7 @@ impl Pipeline {
     /// downloaded bytes. A retained location must nevertheless be discarded:
     /// repair always derives a fresh location from the current identity.
     pub(crate) fn invalidate_par2_session_for_identity_rebind(&mut self, job_id: JobId) {
+        self.invalidate_par3_bindings(job_id);
         // Same reason a retained location is discarded here: an analysis in
         // flight was handed the paths the old identities produced, and the
         // verdict it brings back would decide a repair against names that have

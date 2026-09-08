@@ -34,6 +34,14 @@ Dispatch rotates between jobs instead of draining one job's entire backlog.
 Mutable Windows disk source snapshot costs still require tuning before the
 read-free reassessment contract can be claimed on that platform.
 
+Conventional writes and identity rebindings now withdraw prior coverage without
+I/O. Reader snapshots and worker epochs fence old evidence, including an already
+finished worker awaiting actor handback. Retired results keep their worker slot
+until handback and preserve unrelated native evidence. Once writers drain, dirty
+sources are republished through the same bounded queue; carriers also use only
+committed assembly ranges. Source/error/dirty bookkeeping retains its own host
+budget lease, and failed scans retain leases for any publication they installed.
+
 Still pending: incremental decode-to-publication wiring,
 repair/download gating, direct-volume adapters, positioned verification, embedded
 archives, persistence, and product surfaces. Completed carriers are discovered
@@ -82,6 +90,12 @@ New regressions cover late metadata after conventional sources, file-coordinate
 damage, recovery-only evidence reuse, stale views, carrier replay after a new
 generation, host budget rejection and round-robin dispatch. PAR2 performance
 acceptance remains unmeasured.
+
+Generation-fence validation: all 3,791 workspace tests pass with 13 existing
+skips; formatting, all-target/all-feature Clippy and all three doctests pass.
+The 24 targeted PAR3/source tests include open-reader withdrawal, a finished
+worker rejected after a write, retirement of queued stale publications, and
+pipeline re-verification after the existing write-invalidation hook.
 
 ## Decisions
 

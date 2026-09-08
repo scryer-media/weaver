@@ -1017,6 +1017,7 @@ impl Pipeline {
             return;
         };
 
+        self.invalidate_par3_source_write(file_id);
         let segment = match write_segment_to_disk(&file_path, file_offset, segment).await {
             Ok(segment) => segment,
             Err(error) => {
@@ -2561,6 +2562,7 @@ impl Pipeline {
             "download.persist_ready_segments.batch_bytes",
             ready_bytes as u64,
         );
+        self.invalidate_par3_source_write(file_id);
         let write_result = write_segments_to_disk(&file_path, ready).await;
         self.release_write_buffered(ready_bytes, ready_count);
 
@@ -2730,6 +2732,7 @@ impl Pipeline {
         };
 
         let write_start = Instant::now();
+        self.invalidate_par3_source_write(file_id);
         let write_result = write_segments_to_disk(&file_path, segments).await;
         // Hot-path safe: reuses the `write_start` this path already keeps for
         // the `disk_write_latency_us` gauge, so the histogram costs no extra
@@ -3013,6 +3016,7 @@ impl Pipeline {
                             let mut leftovers = leftovers.into_iter();
                             while let Some((offset, buffered)) = leftovers.next() {
                                 let buffered_bytes = buffered.len_bytes();
+                                self.invalidate_par3_source_write(file_id);
                                 if let Err(e) =
                                     write_segment_to_disk(file_path, offset, buffered).await
                                 {

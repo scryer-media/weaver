@@ -8,6 +8,44 @@ fn backing(bytes: &[u8]) -> Arc<dyn SourceAccess> {
 }
 
 #[test]
+fn withdrawing_coverage_fences_open_readers_and_keeps_generation_history() {
+    let sources = PublishedSources::default();
+    let before = sources
+        .replace(
+            SourceId(0),
+            backing(b"abcd"),
+            4,
+            std::iter::once(0..4).collect(),
+        )
+        .unwrap();
+    let mut reader = sources.open_sequential(SourceId(0)).unwrap().unwrap();
+    sources.withdraw(SourceId(0)).unwrap();
+    assert_eq!(sources.next_available(SourceId(0), 0).unwrap(), None);
+    assert_eq!(sources.read_at(SourceId(0), 0, &mut [0; 4]).unwrap(), 0);
+    let error = reader.read(&mut [0; 4]).unwrap_err();
+    assert!(matches!(
+        EngineError::from(error),
+        EngineError::SourceChanged(SourceId(0))
+    ));
+    let after = sources
+        .replace(
+            SourceId(0),
+            backing(b"efgh"),
+            4,
+            std::iter::once(0..4).collect(),
+        )
+        .unwrap();
+    assert!(after.generation > before.generation);
+    assert!(
+        reader.read(&mut [0; 4]).is_err(),
+        "new publication cannot revive an old reader"
+    );
+    let mut bytes = [0; 4];
+    assert_eq!(sources.read_at(SourceId(0), 0, &mut bytes).unwrap(), 4);
+    assert_eq!(&bytes, b"efgh");
+}
+
+#[test]
 fn sparse_disk_image_never_turns_uncommitted_bytes_into_data() {
     let sources = PublishedSources::default();
     let bytes = backing(b"abcd0000ijkl");

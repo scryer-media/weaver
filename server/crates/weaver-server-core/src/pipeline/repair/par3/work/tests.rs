@@ -14,6 +14,63 @@ async fn next(coordinator: &mut Coordinator) -> WorkDone {
 }
 
 #[tokio::test]
+async fn source_write_fences_a_finished_but_unsettled_worker() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    let mut coordinator = Coordinator::default();
+    coordinator
+        .enqueue(JobId(1), SourceId(0), path.clone())
+        .unwrap();
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    assert!(done.result.is_ok());
+    assert!(
+        done.runtime
+            .as_ref()
+            .unwrap()
+            .sets
+            .values()
+            .all(|set| set.view.is_some())
+    );
+    coordinator
+        .invalidate_source(JobId(1), SourceId(0))
+        .unwrap();
+    assert_eq!(
+        coordinator.in_flight.len(),
+        1,
+        "write invalidation cannot release worker capacity"
+    );
+    coordinator.settle(done);
+    assert!(coordinator.in_flight.is_empty());
+    assert!(coordinator.has_work(JobId(1)));
+    assert_eq!(coordinator.assessments(JobId(1)).count(), 0);
+    assert_eq!(coordinator.dirty_sources(JobId(1)), [SourceId(0)]);
+    coordinator.enqueue(JobId(1), SourceId(0), path).unwrap();
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    assert!(!coordinator.has_work(JobId(1)));
+    assert_eq!(coordinator.assessments(JobId(1)).count(), 1);
+}
+
+#[test]
+fn writes_retire_queued_publications_and_unknown_sources_do_not_allocate() {
+    let mut coordinator = Coordinator::default();
+    coordinator
+        .invalidate_source(JobId(1), SourceId(0))
+        .unwrap();
+    assert!(coordinator.jobs.is_empty());
+    coordinator
+        .enqueue(JobId(1), SourceId(0), PathBuf::from("old.par3"))
+        .unwrap();
+    coordinator
+        .invalidate_source(JobId(1), SourceId(0))
+        .unwrap();
+    assert!(coordinator.jobs[&JobId(1)].pending.is_empty());
+    assert_eq!(coordinator.dirty_sources(JobId(1)), [SourceId(0)]);
+}
+
+#[tokio::test]
 async fn busy_job_yields_worker_capacity_to_other_jobs() {
     let root = tempfile::tempdir().unwrap();
     let path = carrier(root.path());

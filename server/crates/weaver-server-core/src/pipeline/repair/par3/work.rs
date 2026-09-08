@@ -9,7 +9,10 @@ const MAX_JOBS: usize = 256;
 const MAX_PENDING: usize = 4096;
 
 enum PendingInput {
-    Carrier(PathBuf),
+    Carrier {
+        path: PathBuf,
+        ranges: Option<Vec<std::ops::Range<u64>>>,
+    },
     File {
         path: PathBuf,
         name: String,
@@ -20,7 +23,12 @@ enum PendingInput {
 impl PendingInput {
     fn retained_cost(&self) -> EngineResult<usize> {
         let (path, extra) = match self {
-            Self::Carrier(path) => (path, Some(0)),
+            Self::Carrier { path, ranges } => (
+                path,
+                ranges
+                    .as_ref()
+                    .map_or(Some(0), |ranges| ranges.capacity().checked_mul(32)),
+            ),
             Self::File { path, name, ranges } => (
                 path,
                 name.capacity()
@@ -44,8 +52,19 @@ struct QueuedInput {
     reservation: assessment::ViewReservation,
 }
 
+struct KnownSource {
+    carrier: bool,
+    // Retained source, dirty and error bookkeeping outlives queued work,
+    // including failed publications which never entered the engine.
+    _reservation: assessment::ViewReservation,
+}
+
 struct JobSlot {
     runtime: Option<Par3Job>,
+    sources: PublishedSources,
+    epoch: u64,
+    known: BTreeMap<SourceId, KnownSource>,
+    dirty: std::collections::BTreeSet<SourceId>,
     pending: BTreeMap<SourceId, QueuedInput>,
     ticket: Option<u64>,
     errors: BTreeMap<SourceId, EngineError>,
@@ -53,8 +72,13 @@ struct JobSlot {
 
 impl Default for JobSlot {
     fn default() -> Self {
+        let runtime = Par3Job::default();
         Self {
-            runtime: Some(Par3Job::default()),
+            sources: runtime.sources.clone(),
+            runtime: Some(runtime),
+            epoch: 0,
+            known: BTreeMap::new(),
+            dirty: std::collections::BTreeSet::new(),
             pending: BTreeMap::new(),
             ticket: None,
             errors: BTreeMap::new(),
@@ -65,6 +89,7 @@ impl Default for JobSlot {
 pub(crate) struct WorkDone {
     job_id: JobId,
     ticket: u64,
+    epoch: u64,
     source: SourceId,
     runtime: Option<Par3Job>,
     result: EngineResult<()>,
@@ -113,18 +138,36 @@ impl Coordinator {
     }
 
     pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
-        self.jobs
-            .get(&job_id)
-            .is_some_and(|job| job.ticket.is_some() || !job.pending.is_empty())
+        self.jobs.get(&job_id).is_some_and(|job| {
+            job.ticket.is_some() || !job.pending.is_empty() || !job.dirty.is_empty()
+        })
     }
 
+    #[cfg(test)]
     pub(super) fn enqueue(
         &mut self,
         job_id: JobId,
         source: SourceId,
         path: PathBuf,
     ) -> EngineResult<()> {
-        self.enqueue_input(job_id, source, PendingInput::Carrier(path))
+        self.enqueue_input(job_id, source, PendingInput::Carrier { path, ranges: None })
+    }
+
+    pub(super) fn enqueue_carrier_ranges(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> EngineResult<()> {
+        self.enqueue_input(
+            job_id,
+            source,
+            PendingInput::Carrier {
+                path,
+                ranges: Some(ranges),
+            },
+        )
     }
 
     pub(super) fn enqueue_file(
@@ -142,13 +185,80 @@ impl Coordinator {
         self.jobs.contains_key(&job_id)
     }
 
+    pub(super) fn is_carrier(&self, job_id: JobId, source: SourceId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.known.get(&source))
+            .is_some_and(|source| source.carrier)
+    }
+
+    pub(super) fn dirty_sources(&self, job_id: JobId) -> Vec<SourceId> {
+        self.jobs
+            .get(&job_id)
+            .filter(|job| job.ticket.is_none())
+            .map(|job| {
+                job.dirty
+                    .iter()
+                    .filter(|source| !job.pending.contains_key(source))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) fn invalidate_source(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<()> {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return Ok(());
+        };
+        if !job.known.contains_key(&source) {
+            return Ok(());
+        }
+        let epoch = job
+            .epoch
+            .checked_add(1)
+            .ok_or(EngineError::ResourceLimit("PAR3 source epochs"))?;
+        job.sources.withdraw(source)?;
+        job.epoch = epoch;
+        job.pending.remove(&source);
+        job.dirty.insert(source);
+        if let Some(runtime) = job.runtime.as_mut() {
+            for set in runtime.sets.values_mut() {
+                set.invalidate(source);
+            }
+            runtime.carriers.remove(&source);
+        }
+        Ok(())
+    }
+
+    pub(super) fn invalidate_bindings(&mut self, job_id: JobId) -> EngineResult<()> {
+        let sources: Vec<_> = self
+            .jobs
+            .get(&job_id)
+            .into_iter()
+            .flat_map(|job| job.known.keys().copied())
+            .collect();
+        for source in sources {
+            self.invalidate_source(job_id, source)?;
+        }
+        Ok(())
+    }
+
     pub(in crate::pipeline) fn assessments(
         &self,
         job_id: JobId,
     ) -> impl Iterator<Item = (par3_rs::InputSetId, &assessment::AssessmentView)> {
         self.jobs
             .get(&job_id)
-            .filter(|job| job.ticket.is_none() && job.pending.is_empty() && job.errors.is_empty())
+            .filter(|job| {
+                job.ticket.is_none()
+                    && job.pending.is_empty()
+                    && job.errors.is_empty()
+                    && job.dirty.is_empty()
+            })
             .and_then(|job| job.runtime.as_ref())
             .into_iter()
             .flat_map(|runtime| runtime.sets.iter())
@@ -179,10 +289,24 @@ impl Coordinator {
             return Err(EngineError::ResourceLimit("pending PAR3 carriers"));
         }
         let reservation = assessment::ViewReservation::acquire(input.retained_cost()?)?;
-        self.jobs
-            .entry(job_id)
-            .or_default()
-            .pending
+        let job = self.jobs.entry(job_id).or_default();
+        if !job.known.contains_key(&source) && job.known.len() >= MAX_PENDING {
+            return Err(EngineError::ResourceLimit("PAR3 known sources"));
+        }
+        let carrier = matches!(input, PendingInput::Carrier { .. });
+        if let Some(known) = job.known.get_mut(&source) {
+            known.carrier = carrier;
+        } else {
+            let reservation = assessment::ViewReservation::acquire(512)?;
+            job.known.insert(
+                source,
+                KnownSource {
+                    carrier,
+                    _reservation: reservation,
+                },
+            );
+        }
+        job.pending
             .insert(source, QueuedInput { input, reservation });
         Ok(())
     }
@@ -215,6 +339,8 @@ impl Coordinator {
         self.next_ticket = ticket;
         self.last_job = Some(job_id);
         let (source, input) = job.pending.pop_first().expect("pending input");
+        let epoch = job.epoch;
+        let assess = job.pending.is_empty() && job.dirty.iter().all(|id| *id == source);
         job.ticket = Some(ticket);
         self.in_flight
             .insert(ticket, (job_id, runtime.options.cancel.clone()));
@@ -223,16 +349,23 @@ impl Coordinator {
             let result = tokio::task::spawn_blocking(move || {
                 // Keep the queue lease live while the worker owns its input;
                 // successful publication transfers it into retained state.
+                let before = runtime.sources.revision(source).ok().flatten();
                 let result = match input.input {
-                    PendingInput::Carrier(path) => runtime.scan_complete(source, path),
+                    PendingInput::Carrier { path, ranges } => {
+                        runtime.scan_file(source, path, ranges)
+                    }
                     PendingInput::File { path, name, ranges } => {
                         runtime.publish_file(source, path, name, ranges)
                     }
                 };
-                if result.is_ok() {
+                if let Ok(Some(after)) = runtime.sources.revision(source)
+                    && Some(after) != before
+                {
+                    // Scanning can fail after publication succeeded. Keep its
+                    // lease even on that exit; the ranges are still retained.
                     runtime.publication_memory.insert(source, input.reservation);
                 }
-                let result = result.and_then(|()| runtime.assess());
+                let result = result.and_then(|()| if assess { runtime.assess() } else { Ok(()) });
                 (runtime, result)
             })
             .await;
@@ -244,6 +377,7 @@ impl Coordinator {
                 .send(RepairWorkDone::Par3(Box::new(WorkDone {
                     job_id,
                     ticket,
+                    epoch,
                     source,
                     runtime,
                     result,
@@ -279,7 +413,26 @@ impl Coordinator {
             return None;
         }
         job.ticket = None;
-        job.runtime = Some(done.runtime.unwrap_or_default());
+        let mut runtime = done.runtime.unwrap_or_default();
+        if done.epoch != job.epoch {
+            // A write raced this operation. Keep capacity until this handback,
+            // retain unrelated evidence, and require fresh publication before
+            // any returned scheduling view can be consumed.
+            job.dirty.insert(done.source);
+            for &source in &job.dirty {
+                for set in runtime.sets.values_mut() {
+                    set.invalidate(source);
+                }
+                runtime.carriers.remove(&source);
+            }
+        } else {
+            job.dirty.remove(&done.source);
+        }
+        job.sources = runtime.sources.clone();
+        job.runtime = Some(runtime);
+        if done.epoch != job.epoch {
+            return Some(done.job_id);
+        }
         match done.result {
             Ok(()) => {
                 job.errors.remove(&done.source);
