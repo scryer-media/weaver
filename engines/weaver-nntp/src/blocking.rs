@@ -2749,6 +2749,8 @@ fn is_transient(err: &NntpError) -> bool {
             | NntpError::TruncatedMultilineBody
             | NntpError::ServerDisconnectedMidBody
             | NntpError::MalformedMultilineTerminator
+            // The next connection can select the group learned from this 412.
+            | NntpError::NoGroupSelected
             | NntpError::ServiceUnavailable
             | NntpError::TooManyConnections
             | NntpError::PoolExhausted
