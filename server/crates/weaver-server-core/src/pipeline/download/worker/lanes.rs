@@ -794,6 +794,23 @@ impl Pipeline {
         self.lane_depth_gauge(next).fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(in crate::pipeline) fn reset_owned_download_lanes(&mut self) {
+        for lease in self.owned_download_lane_pool.reset() {
+            for work in lease.works {
+                self.restore_owned_lane_unrequested_work(work);
+            }
+            self.handle_download_lane_parked(DownloadLaneParked {
+                job_id: lease.job_id,
+                mode: lease.lane_mode,
+                spillover_loan_kind: lease.spillover_loan_kind,
+                completion_critical: lease.compatibility.completion_critical,
+                reason: LaneParkReason::Error,
+                release_connection_slot: true,
+                release_ip_replacement_burst: false,
+            });
+        }
+    }
+
     pub(crate) fn handle_owned_download_lane_event(
         &mut self,
         event: OwnedDownloadLaneEvent,

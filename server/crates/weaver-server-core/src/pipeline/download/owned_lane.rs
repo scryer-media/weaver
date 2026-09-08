@@ -515,13 +515,20 @@ impl OwnedDownloadLanePool {
         self.reset_calls.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn reset(&self) {
+    /// Fence queued runs before workers can take another retired-client lease.
+    /// The actor returns these unstarted leases without charging article retries.
+    pub(crate) fn reset(&self) -> Vec<DownloadBatchLease> {
         #[cfg(test)]
         self.reset_calls.fetch_add(1, Ordering::Relaxed);
-        let shared = lock_pool(&self.shared);
+        let mut shared = lock_pool(&self.shared);
         for worker in &shared.workers {
             let _ = worker.sender.send(OwnedLanePoolCommand::Reset);
         }
+        shared
+            .queued_runs
+            .drain(..)
+            .map(|run| run.initial_lease)
+            .collect()
     }
 
     // The Err variant hands the lease back to the caller for the async
@@ -2258,6 +2265,48 @@ mod routing_tests {
         assert!(shared.workers[1].idle.is_none(), "worker 1 is running it");
         assert!(shared.take_queued_run_or_publish_idle(0, None).is_none());
         assert!(shared.workers[0].idle.is_some());
+    }
+
+    #[test]
+    fn reset_returns_queued_leases_before_a_worker_can_take_old_work() {
+        let nntp = test_client();
+        let (sender, commands) = std_mpsc::channel();
+        let mut shared = shared_with(vec![None]);
+        shared.workers[0].sender = sender;
+        for segment_number in 0..3 {
+            let mut run = test_run(&nntp, Vec::new());
+            run.initial_lease.works[0].segment_id.segment_number = segment_number;
+            shared.queued_runs.push_back(run);
+        }
+        let pool = OwnedDownloadLanePool {
+            shared: Arc::new(std::sync::Mutex::new(shared)),
+            reset_calls: AtomicUsize::new(0),
+        };
+
+        let returned = pool.reset();
+
+        assert_eq!(returned.len(), 3);
+        for (index, lease) in returned.iter().enumerate() {
+            assert_eq!(lease.job_id, JobId(7));
+            assert_eq!(lease.works.len(), 1);
+            assert_eq!(lease.works[0].segment_id.segment_number, index as u32);
+        }
+        assert_eq!(
+            Arc::strong_count(&nntp),
+            1,
+            "queued runs release the old client"
+        );
+        assert!(
+            lock_pool(&pool.shared)
+                .take_queued_run_or_publish_idle(0, None)
+                .is_none(),
+            "finishing a lease must reach the pending reset without another old run"
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(OwnedLanePoolCommand::Reset)
+        ));
+        assert!(pool.reset().is_empty(), "leases are returned only once");
     }
 
     /// Only workers with nothing to lose are warmed: a worker already holding
