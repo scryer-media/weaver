@@ -374,25 +374,15 @@ func chain(args []string) error {
 		return err
 	}
 
-	// The shaper's state at entry is unknown, so the first phase always
-	// configures it rather than trusting whatever a previous session left.
-	applied := ""
-	for index, phase := range phases {
-		if key := phase.shaperKey(); key != applied {
-			if err := stack.apply(config, phase, log); err != nil {
-				return err
-			}
-			applied = key
-		}
+	if err := runChainPhases(config, phases, stack, settle, log, func(phase ChainPhase) {
 		result.Phases = append(result.Phases, runChainPhase(config, phase, log))
 		// The record is rewritten after every phase, so an interrupted session
 		// still leaves an accurate account of what it measured.
 		if err := writeChainResult(resultPath, result); err != nil {
 			log("WARNING: could not write the chain result: %v", err)
 		}
-		if index+1 < len(phases) {
-			time.Sleep(settle)
-		}
+	}); err != nil {
+		return err
 	}
 
 	// Summaries run only after every measurement is finished. Summarizing is
@@ -407,13 +397,6 @@ func chain(args []string) error {
 		}
 	}
 
-	if config.RestoreServerLink != "" {
-		log("restoring the shaper to %s / %s", config.RestoreServerLink, chainRTTLabel(config.RestoreServerRTT))
-		restore := ChainPhase{Name: "restore", ServerLink: config.RestoreServerLink, ServerRTT: config.RestoreServerRTT}
-		if err := stack.apply(config, restore, log); err != nil {
-			log("WARNING: could not restore the shaper: %v", err)
-		}
-	}
 	result.EndedAt = time.Now().UTC()
 	result.Completed = true
 	if err := writeChainResult(resultPath, result); err != nil {
@@ -421,6 +404,36 @@ func chain(args []string) error {
 	}
 	log("CHAIN-DONE %s", resultPath)
 	return chainHarnessFailure(result)
+}
+
+// runChainPhases owns shaping for the measurement loop, including cleanup
+// when a later transition fails after an earlier link was installed.
+func runChainPhases(config ChainConfig, phases []ChainPhase, stack chainStack, settle time.Duration, log func(string, ...any), measure func(ChainPhase)) error {
+	// The entry state is unknown, so the first phase always configures it.
+	applied := ""
+	defer func() {
+		if applied == "" || config.RestoreServerLink == "" {
+			return
+		}
+		log("restoring the shaper to %s / %s", config.RestoreServerLink, chainRTTLabel(config.RestoreServerRTT))
+		restore := ChainPhase{Name: "restore", ServerLink: config.RestoreServerLink, ServerRTT: config.RestoreServerRTT}
+		if err := stack.apply(config, restore, log); err != nil {
+			log("WARNING: could not restore the shaper: %v", err)
+		}
+	}()
+	for index, phase := range phases {
+		if key := phase.shaperKey(); key != applied {
+			if err := stack.apply(config, phase, log); err != nil {
+				return err
+			}
+			applied = key
+		}
+		measure(phase)
+		if index+1 < len(phases) {
+			time.Sleep(settle)
+		}
+	}
+	return nil
 }
 
 // chainHarnessFailure reports the phases that measured nothing. A chain runs
