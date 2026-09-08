@@ -534,6 +534,16 @@ impl DirectSetRouter {
                 })
                 .unwrap_or_default();
             for (position, volume) in parts {
+                // A volume whose damage is still on record is waiting for a
+                // rewrite of its own: the repairer hands over one volume at a
+                // time, and this pass belongs to another. Its articles are all
+                // present and its runs tile, so a gate over it now would compose
+                // the damaged value and, with the reroute flag set, demote a set
+                // whose next rewrite is one call away. Its gate runs when that
+                // rewrite clears the record, exactly as this one's did.
+                if self.damaged_volumes.contains(&volume) {
+                    continue;
+                }
                 let judged = self
                     .members
                     .get(&member_id)

@@ -505,6 +505,78 @@ async fn a_repaired_leading_slice_of_a_multi_article_encrypted_volume_reroutes()
     );
 }
 
+/// The repairer hands the router one volume's rewrite at a time. A set with
+/// two damaged volumes therefore sees the first rewrite while the second
+/// volume's damage is still on record, and the gates that settle the first
+/// must leave the second alone: its articles are all present and its runs
+/// tile, so a gate over it composes the damaged value and — with the reroute
+/// flag now set — demotes a set whose second rewrite is one call away.
+#[tokio::test]
+async fn a_second_damaged_volume_waits_for_its_own_rewrite() {
+    let payload: Vec<u8> = (0..16_000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        REPAIR_MEMBER,
+        &payload,
+        4,
+        REPAIR_PASSWORD,
+        Some(REPAIR_PASSWORD),
+        true,
+    );
+    let mut router = encrypted_router(&volumes, REPAIR_PASSWORD);
+    router.note_par2_available(true);
+    let (_, parts) = cipher_and_part_offsets(&payload, &volumes);
+    for volume in [1usize, 2] {
+        let (part_at, part_len) = parts[volume];
+        assert!(
+            part_at < 500 && part_len > 3_000,
+            "each damaged volume must hold several articles"
+        );
+    }
+
+    const ARTICLE: usize = 1_000;
+    for (index, (_, bytes)) in volumes.iter().enumerate() {
+        if index == 1 || index == 2 {
+            let mut damaged = bytes.clone();
+            for byte in &mut damaged[500..508] {
+                *byte ^= 0x5A;
+            }
+            for (article, chunk) in damaged.chunks(ARTICLE).enumerate() {
+                router
+                    .route(index as u32, (article * ARTICLE) as u64, chunk)
+                    .expect("a damaged article the wire checks passed routes");
+            }
+        } else {
+            router
+                .route(index as u32, 0, bytes)
+                .expect("an undamaged encrypted volume routes");
+        }
+        router
+            .note_volume_complete(index as u32)
+            .expect("the volume's articles are all in");
+    }
+    assert!(
+        router.damaged_volumes().contains(&1) && router.damaged_volumes().contains(&2),
+        "both damaged volumes must be on record: {:?}",
+        router.damaged_volumes()
+    );
+
+    let rewrite_len = (2 * ARTICLE) as u64;
+    route_repaired_span(&mut router, &volumes, 1, 0, rewrite_len)
+        .expect("the first rewrite must not be judged against the second volume's damage");
+    assert!(
+        router.damaged_volumes().contains(&2),
+        "the second volume's damage is still on record until its own rewrite"
+    );
+    assert!(!router.all_members_verified());
+    route_repaired_span(&mut router, &volumes, 2, 0, rewrite_len)
+        .expect("the second rewrite routes like the first");
+    close_stale_gaps(&mut router, &payload);
+    assert!(
+        router.all_members_verified(),
+        "the member must verify once both rewrites are in"
+    );
+}
+
 /// A router over unencrypted `volumes`, with nothing routed yet.
 fn plain_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
     DirectSetRouter::new(DirectSetPlan {
