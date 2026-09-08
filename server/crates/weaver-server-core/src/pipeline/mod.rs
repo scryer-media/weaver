@@ -419,7 +419,7 @@ pub(super) struct DownloadLaneRefillRequest {
     pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
-    pub(super) remote_ip: IpAddr,
+    pub(super) remote_ip: Option<IpAddr>,
     pub(super) supports_pipelining: bool,
     /// The mode the scheduler last **booked** this lane's depth gauge under —
     /// not necessarily the one it is running. A lane started on a lease mode

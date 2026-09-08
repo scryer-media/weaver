@@ -165,7 +165,7 @@ pub struct BlockingBodyLane {
     checkpoint_plan: CheckpointPlan,
     server_id: ServerId,
     stable_server_id: StableServerId,
-    remote_ip: IpAddr,
+    remote_ip: Option<IpAddr>,
     mode: BodyLaneMode,
     /// Command-to-status-line wait. Only sampled when no other request was
     /// outstanding, so pipelined batches cannot report it as near zero.
@@ -181,6 +181,8 @@ pub struct BlockingBodyLane {
 }
 
 pub struct BlockingNntpConnection {
+    route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
+    _route_socket: Option<Arc<socket2::Socket>>,
     transport: BlockingTransport,
     codec: NntpCodec,
     read_buf: BytesMut,
@@ -191,7 +193,7 @@ pub struct BlockingNntpConnection {
     /// recorded against the server rather than the resolved address.
     host: String,
     port: u16,
-    remote_addr: SocketAddr,
+    remote_addr: Option<SocketAddr>,
     command_timeout: Duration,
     current_group: Option<String>,
     credentials: Option<(String, String)>,
@@ -319,7 +321,7 @@ impl BlockingBodyLane {
         self.stable_server_id
     }
 
-    pub fn remote_ip(&self) -> IpAddr {
+    pub fn remote_ip(&self) -> Option<IpAddr> {
         self.remote_ip
     }
 
@@ -874,7 +876,7 @@ impl BlockingBodyLane {
         DecodedBodyTrace {
             attempts: vec![FetchAttemptTrace {
                 server_idx: self.server_id.0,
-                remote_ip: Some(self.remote_ip),
+                remote_ip: self.remote_ip,
                 elapsed,
                 outcome,
                 error,
@@ -952,6 +954,20 @@ impl BlockingNntpConnection {
             ));
         }
 
+        if let Some(registry) = &config.revocation {
+            registry.check()?;
+        }
+        if config.proxy.is_some() {
+            let (tcp, outcome) = crate::proxy::connect_blocking(config)?;
+            return Self::from_tcp(
+                config,
+                tcp,
+                None,
+                backend_override,
+                initial_group,
+                Some(outcome),
+            );
+        }
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
         let addrs = resolve_addrs(&config.host, config.port, excluded_ips, address_offset)?;
         let mut last_error = None;
@@ -963,13 +979,14 @@ impl BlockingNntpConnection {
                         .map_err(NntpError::Io)?;
                     tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
                         .map_err(NntpError::Io)?;
-                    let remote_addr = tcp.peer_addr().unwrap_or(addr);
+                    let remote_addr = Some(tcp.peer_addr().unwrap_or(addr));
                     return Self::from_tcp(
                         config,
                         tcp,
                         remote_addr,
                         backend_override,
                         initial_group,
+                        None,
                     );
                 }
                 Err(error) => last_error = Some(error),
@@ -984,10 +1001,16 @@ impl BlockingNntpConnection {
     fn from_tcp(
         config: &ServerConfig,
         tcp: TcpStream,
-        remote_addr: SocketAddr,
+        remote_addr: Option<SocketAddr>,
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
+        route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
     ) -> Result<Self> {
+        let route_socket = config
+            .revocation
+            .as_ref()
+            .map(|r| r.track(socket2::SockRef::from(&tcp)))
+            .transpose()?;
         let transport = if config.tls {
             let backend = if config.tls_name_mismatch_certificate_der.is_some() {
                 NntpTlsBackend::ManualRustls
@@ -1025,6 +1048,8 @@ impl BlockingNntpConnection {
 
         let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
         let mut conn = Self {
+            route_outcome,
+            _route_socket: route_socket,
             transport,
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
@@ -1107,8 +1132,8 @@ impl BlockingNntpConnection {
         Ok(conn)
     }
 
-    pub fn remote_ip(&self) -> IpAddr {
-        self.remote_addr.ip()
+    pub fn remote_ip(&self) -> Option<IpAddr> {
+        self.remote_addr.map(|addr| addr.ip())
     }
 
     pub fn capabilities(&self) -> &Capabilities {
@@ -1228,7 +1253,13 @@ impl BlockingNntpConnection {
 
     fn write_command_frame_with_timeout(&mut self, cmd: &Command, timeout: Duration) -> Result<()> {
         let encoded = cmd.encode();
-        self.transport.write_all(&encoded, timeout)?;
+        self.transport
+            .write_all(&encoded, timeout)
+            .inspect_err(|_| {
+                if let Some(outcome) = &self.route_outcome {
+                    outcome.failed();
+                }
+            })?;
         Ok(())
     }
 
@@ -1247,7 +1278,11 @@ impl BlockingNntpConnection {
     }
 
     fn flush_commands_with_timeout(&mut self, timeout: Duration) -> Result<()> {
-        self.transport.flush(timeout)
+        self.transport.flush(timeout).inspect_err(|_| {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
+        })
     }
 
     fn flush_commands_with_active_budget(
@@ -1358,6 +1393,9 @@ impl BlockingNntpConnection {
 
     fn poison_on_soft_timeout(&mut self, error: &NntpError) {
         if matches!(error, NntpError::SoftTimeout(_)) {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             self.current_group = None;
         }
@@ -1965,6 +2003,7 @@ impl BlockingNntpConnection {
     }
 
     pub fn quit(&mut self) -> Result<()> {
+        self.route_outcome = None;
         let _ = self.send_command(&Command::Quit);
         Ok(())
     }
@@ -1995,11 +2034,17 @@ impl BlockingNntpConnection {
                 timeout,
             )
             .map_err(|error| {
+                if let Some(outcome) = &self.route_outcome {
+                    outcome.failed();
+                }
                 self.poisoned = true;
                 self.current_group = None;
                 NntpError::Io(error)
             })?;
         if n == 0 {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             self.current_group = None;
             return Err(NntpError::ConnectionClosed);

@@ -6,6 +6,7 @@ type SettingsNavEntry = {
 };
 
 export const settingsNav: readonly SettingsNavEntry[] = [
+  { to: "/settings/proxies", labelKey: "settings.proxies", descriptionKey: "settings.proxiesDesc" },
   {
     to: "/settings/general",
     labelKey: "settings.general",

@@ -892,6 +892,10 @@ type MetricsHistoryResult {
 }
 
 type MutationRoot {
+	saveProxyProfile(id: Int, input: ProxyProfileInput!): ProxyProfile!
+	deleteProxyProfile(id: Int!): Boolean!
+	resetProxyHostKey(id: Int!): ProxyProfile!
+	testProxyProfile(id: Int!): ProxyTestResult!
 	"""
 	Create a new API key. Returns the raw key (shown only once).
 	"""
@@ -927,6 +931,66 @@ type MutationRoot {
 	Change the login password. Requires the current password for verification.
 	"""
 	changePassword(currentPassword: String!, newPassword: String!): Boolean!
+	"""
+	Add a new RSS feed.
+	"""
+	addRssFeed(input: RssFeedInput!): RssFeed!
+	"""
+	Update an RSS feed.
+	"""
+	updateRssFeed(id: Int!, input: RssFeedInput!): RssFeed!
+	"""
+	Delete an RSS feed.
+	"""
+	deleteRssFeed(id: Int!): Boolean!
+	"""
+	Add a new RSS rule.
+	"""
+	addRssRule(feedId: Int!, input: RssRuleInput!): RssRule!
+	"""
+	Update an RSS rule.
+	"""
+	updateRssRule(id: Int!, input: RssRuleInput!): RssRule!
+	"""
+	Delete an RSS rule.
+	"""
+	deleteRssRule(id: Int!): Boolean!
+	"""
+	Run RSS sync immediately for all enabled feeds or one specific feed.
+	"""
+	runRssSync(feedId: Int): RssSyncReport!
+	"""
+	Forget one seen RSS item so it can be reconsidered on a future sync.
+	"""
+	deleteRssSeenItem(feedId: Int!, itemId: String!): Boolean!
+	"""
+	Clear seen RSS items, either globally or for one feed.
+	"""
+	clearRssSeenItems(feedId: Int): Int!
+	"""
+	Add a new NNTP server.
+	"""
+	addServer(input: ServerInput!): Server!
+	"""
+	Update an existing NNTP server by ID.
+	"""
+	updateServer(id: Int!, input: ServerInput!): Server!
+	"""
+	Remove an NNTP server by ID.
+	"""
+	removeServer(id: Int!): [Server!]!
+	"""
+	Reset this server's quota baseline without clearing lifetime usage.
+	"""
+	resetServerDownloadQuotaUsage(id: Int!): Server!
+	"""
+	Test a saved NNTP server using its decrypted persisted credentials.
+	"""
+	testConfiguredServerConnection(id: Int!): TestConnectionResult!
+	"""
+	Test connectivity to an NNTP server without saving it.
+	"""
+	testConnection(input: ServerInput!): TestConnectionResult!
 	"""
 	Add a new category.
 	"""
@@ -1082,66 +1146,6 @@ type MutationRoot {
 	rerunPostProcessing(jobId: Int!): Boolean!
 	cancelJobPostProcessing(jobId: Int!): Boolean!
 	"""
-	Add a new RSS feed.
-	"""
-	addRssFeed(input: RssFeedInput!): RssFeed!
-	"""
-	Update an RSS feed.
-	"""
-	updateRssFeed(id: Int!, input: RssFeedInput!): RssFeed!
-	"""
-	Delete an RSS feed.
-	"""
-	deleteRssFeed(id: Int!): Boolean!
-	"""
-	Add a new RSS rule.
-	"""
-	addRssRule(feedId: Int!, input: RssRuleInput!): RssRule!
-	"""
-	Update an RSS rule.
-	"""
-	updateRssRule(id: Int!, input: RssRuleInput!): RssRule!
-	"""
-	Delete an RSS rule.
-	"""
-	deleteRssRule(id: Int!): Boolean!
-	"""
-	Run RSS sync immediately for all enabled feeds or one specific feed.
-	"""
-	runRssSync(feedId: Int): RssSyncReport!
-	"""
-	Forget one seen RSS item so it can be reconsidered on a future sync.
-	"""
-	deleteRssSeenItem(feedId: Int!, itemId: String!): Boolean!
-	"""
-	Clear seen RSS items, either globally or for one feed.
-	"""
-	clearRssSeenItems(feedId: Int): Int!
-	"""
-	Add a new NNTP server.
-	"""
-	addServer(input: ServerInput!): Server!
-	"""
-	Update an existing NNTP server by ID.
-	"""
-	updateServer(id: Int!, input: ServerInput!): Server!
-	"""
-	Remove an NNTP server by ID.
-	"""
-	removeServer(id: Int!): [Server!]!
-	"""
-	Reset this server's quota baseline without clearing lifetime usage.
-	"""
-	resetServerDownloadQuotaUsage(id: Int!): Server!
-	"""
-	Test a saved NNTP server using its decrypted persisted credentials.
-	"""
-	testConfiguredServerConnection(id: Int!): TestConnectionResult!
-	"""
-	Test connectivity to an NNTP server without saving it.
-	"""
-	testConnection(input: ServerInput!): TestConnectionResult!
-	"""
 	Update general settings.
 	"""
 	updateSettings(input: GeneralSettingsInput!): GeneralSettings!
@@ -1255,7 +1259,61 @@ type ProviderHoldoff {
 	untilEpochMs: Int!
 }
 
+enum ProxyKind {
+	HTTP_CONNECT
+	SOCKS5
+	SSH
+	WIRE_GUARD
+}
+
+type ProxyProfile {
+	id: Int!
+	name: String!
+	kind: ProxyKind!
+	enabled: Boolean!
+	host: String!
+	port: Int!
+	dnsServers: [String!]!
+	tunnelAddresses: [String!]!
+	peerPublicKey: String
+	tunnelPublicKey: String
+	mtu: Int!
+	keepaliveSeconds: Int
+	timeoutSeconds: Int!
+	hostKeyFingerprint: String
+	hasUsername: Boolean!
+	hasPassword: Boolean!
+	hasPrivateKey: Boolean!
+	hasPassphrase: Boolean!
+	hasPresharedKey: Boolean!
+}
+
+input ProxyProfileInput {
+	name: String!
+	kind: ProxyKind!
+	enabled: Boolean!
+	host: String!
+	port: Int!
+	dnsServers: [String!]! = []
+	tunnelAddresses: [String!]! = []
+	peerPublicKey: String
+	mtu: Int! = 1280
+	keepaliveSeconds: Int
+	timeoutSeconds: Int! = 30
+	username: String
+	password: String
+	privateKey: String
+	passphrase: String
+	presharedKey: String
+}
+
+type ProxyTestResult {
+	success: Boolean!
+	message: String!
+}
+
 type QueryRoot {
+	proxyProfiles: [ProxyProfile!]!
 	"""
 	Admin-facing auth status moved to query semantics.
 	"""
@@ -1703,6 +1761,34 @@ enum QueueWaitReason {
 	POST_PROCESSING_CAPACITY
 }
 
+type RoutingFailure {
+	proxyId: Int!
+	message: String!
+}
+
+type RoutingPolicy {
+	proxyIds: [Int!]!
+	allowDirect: Boolean!
+}
+
+input RoutingPolicyInput {
+	proxyIds: [Int!]!
+	allowDirect: Boolean!
+}
+
+enum RoutingState {
+	IDLE
+	PROXY
+	DIRECT
+	BLOCKED
+}
+
+type RoutingStatus {
+	state: RoutingState!
+	selectedProxyId: Int
+	failures: [RoutingFailure!]!
+}
+
 type RssFeed {
 	id: Int!
 	name: String!
@@ -1720,9 +1806,12 @@ type RssFeed {
 	lastError: String
 	consecutiveFailures: Int!
 	rules: [RssRule!]!
+	routing: RoutingPolicy!
+	routingStatus: RoutingStatus!
 }
 
 input RssFeedInput {
+	routing: RoutingPolicyInput
 	name: String!
 	url: String!
 	enabled: Boolean! = true
@@ -2003,6 +2092,8 @@ type Server {
 	Whether that server follows the client's cipher order (null when unknown).
 	"""
 	tlsHonorsClientCipherOrder: Boolean
+	routing: RoutingPolicy!
+	routingStatus: RoutingStatus!
 }
 
 type ServerDetails {
@@ -2030,6 +2121,8 @@ type ServerDetails {
 	Whether that server follows the client's cipher order (null when unknown).
 	"""
 	tlsHonorsClientCipherOrder: Boolean
+	routing: RoutingPolicy!
+	routingStatus: RoutingStatus!
 }
 
 type ServerDownloadQuota {
@@ -2150,6 +2243,7 @@ type ServerHealth {
 }
 
 input ServerInput {
+	routing: RoutingPolicyInput
 	host: String!
 	port: Int!
 	tls: Boolean!

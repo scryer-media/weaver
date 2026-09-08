@@ -389,7 +389,7 @@ pub struct BodyLaneLease {
     client: NntpClient,
     server_id: ServerId,
     conn: Option<PooledConnection>,
-    remote_ip: IpAddr,
+    remote_ip: Option<IpAddr>,
     groups: Vec<String>,
     mode: BodyLaneMode,
     /// Command-to-status-line wait, sampled only when nothing else was
@@ -427,7 +427,7 @@ impl BodyLaneLease {
             .map(|control| control.snapshot())
     }
 
-    pub fn remote_ip(&self) -> IpAddr {
+    pub fn remote_ip(&self) -> Option<IpAddr> {
         self.remote_ip
     }
 
@@ -840,7 +840,7 @@ impl BodyLaneLease {
             .client
             .classify_decoded_batch_item(
                 self.server_id.0,
-                Some(self.remote_ip),
+                self.remote_ip,
                 message_id,
                 item,
                 &mut attempts,
@@ -1030,7 +1030,7 @@ impl NntpClient {
         extra: bool,
         excluded_ips: &[IpAddr],
     ) -> Result<BodyLaneLease> {
-        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut deadline = TokioInstant::now() + self.soft_timeout;
         // A BODY lane fetches by message-id, which RFC 3977 answers with no
         // group selected, so the GROUP round trip is pure added latency on
         // every lane start. The candidate group is still offered to connect:
@@ -1039,27 +1039,15 @@ impl NntpClient {
         // walks the candidate list below.
         let initial_group = groups.first().map(String::as_str);
         let mut conn = if extra {
-            match tokio::time::timeout_at(
-                deadline,
-                self.pool
-                    .acquire_extra_excluding_for_group(server, excluded_ips, initial_group),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => return Err(self.acquire_timeout_error()),
-            }
+            self.pool
+                .acquire_extra_before_deadline(server, excluded_ips, initial_group, &mut deadline)
+                .await
         } else {
-            match tokio::time::timeout_at(
-                deadline,
-                self.pool.acquire_for_group(server, initial_group),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => return Err(self.acquire_timeout_error()),
-            }
-        };
+            self.pool
+                .acquire_before_deadline(server, initial_group, &mut deadline)
+                .await
+        }
+        .map_err(|error| self.map_acquire_timeout(error))?;
 
         if !conn.needs_group_prologue() {
             return Ok(BodyLaneLease {
@@ -1629,10 +1617,10 @@ impl NntpClient {
                 .map(|message_idx| message_ids[*message_idx].to_string())
                 .collect();
 
-            let setup_deadline = TokioInstant::now() + self.soft_timeout;
+            let mut setup_deadline = TokioInstant::now() + self.soft_timeout;
             let batch_started = Instant::now();
             let mut conn = match self
-                .acquire_before_deadline(ServerId(idx), setup_deadline)
+                .acquire_before_deadline(ServerId(idx), &mut setup_deadline)
                 .await
             {
                 Ok(conn) => conn,
@@ -1672,7 +1660,7 @@ impl NntpClient {
                     continue;
                 }
             };
-            let remote_ip = Some(conn.remote_ip());
+            let remote_ip = conn.remote_ip();
 
             let group_result = match tokio::time::timeout_at(
                 setup_deadline,
@@ -2608,13 +2596,18 @@ impl NntpClient {
     async fn acquire_before_deadline(
         &self,
         server: ServerId,
-        deadline: TokioInstant,
+        deadline: &mut TokioInstant,
     ) -> Result<PooledConnection> {
-        match tokio::time::timeout_at(deadline, self.pool.acquire(server)).await {
-            Ok(result) => result,
-            // Nothing was sent: we never got a socket. This is our own
-            // capacity, not the server's health.
-            Err(_) => Err(self.acquire_timeout_error()),
+        self.pool
+            .acquire_before_deadline(server, None, deadline)
+            .await
+            .map_err(|error| self.map_acquire_timeout(error))
+    }
+
+    fn map_acquire_timeout(&self, error: NntpError) -> NntpError {
+        match error {
+            NntpError::AcquireTimeout(_) => self.acquire_timeout_error(),
+            other => other,
         }
     }
 
@@ -2926,9 +2919,9 @@ impl NntpClient {
         let mut attempts = 0u32;
 
         loop {
-            let deadline = TokioInstant::now() + self.soft_timeout;
-            let mut conn = self.acquire_before_deadline(server, deadline).await?;
-            let remote_ip = Some(conn.remote_ip());
+            let mut deadline = TokioInstant::now() + self.soft_timeout;
+            let mut conn = self.acquire_before_deadline(server, &mut deadline).await?;
+            let remote_ip = conn.remote_ip();
 
             // Try to select a group — iterate through the list on failure.
             let group_result =
@@ -3030,9 +3023,9 @@ impl NntpClient {
         let mut attempts = 0u32;
 
         loop {
-            let deadline = TokioInstant::now() + self.soft_timeout;
+            let mut deadline = TokioInstant::now() + self.soft_timeout;
             let mut conn = self
-                .acquire_before_deadline(server, deadline)
+                .acquire_before_deadline(server, &mut deadline)
                 .await
                 .map_err(DecodedBodyError::Nntp)?;
 
@@ -3189,11 +3182,11 @@ impl NntpClient {
         if message_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
-            let mut conn = self.acquire_before_deadline(server, deadline).await?;
+            let mut conn = self.acquire_before_deadline(server, &mut deadline).await?;
             let result = match tokio::time::timeout_at(deadline, async {
                 if conn.capabilities().supports_pipelining() {
                     conn.head_pipeline(message_ids).await
@@ -3271,11 +3264,11 @@ impl NntpClient {
             return self.head_many_from_server(server, message_ids).await;
         }
 
-        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
-            let mut conn = self.acquire_before_deadline(server, deadline).await?;
+            let mut conn = self.acquire_before_deadline(server, &mut deadline).await?;
 
             let result = match tokio::time::timeout_at(deadline, async {
                 if conn.capabilities().supports_pipelining() {
@@ -3352,8 +3345,8 @@ impl NntpClient {
         let mut attempts = 0u32;
 
         loop {
-            let deadline = TokioInstant::now() + self.soft_timeout;
-            let mut conn = self.acquire_before_deadline(server, deadline).await?;
+            let mut deadline = TokioInstant::now() + self.soft_timeout;
+            let mut conn = self.acquire_before_deadline(server, &mut deadline).await?;
 
             let result = match kind {
                 FetchKind::Body => {

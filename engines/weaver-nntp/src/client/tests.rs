@@ -2445,7 +2445,10 @@ async fn extra_body_lane_reports_remote_ip() {
         .await
         .expect("extra BODY lane should acquire");
 
-    assert_eq!(lane.remote_ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        lane.remote_ip(),
+        Some("127.0.0.1".parse::<IpAddr>().unwrap())
+    );
     lane.park();
 }
 

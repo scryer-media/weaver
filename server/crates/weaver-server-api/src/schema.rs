@@ -49,6 +49,7 @@ pub struct JobsSnapshot {
 
 #[derive(Default, MergedObject)]
 pub struct QueryRoot(
+    crate::proxies::ProxiesQuery,
     auth_query::AuthQuery,
     categories_query::CategoriesQuery,
     history_query::HistoryQuery,
@@ -61,13 +62,23 @@ pub struct QueryRoot(
 );
 
 #[derive(Default, MergedObject)]
-pub struct MutationRoot(
+pub struct MutationRoot(ConnectivityMutations, ApplicationMutations);
+
+// Balance the merged tree so adding domains does not exceed downstream
+// crates' default compiler recursion limit when laying out resolver futures.
+#[derive(Default, MergedObject)]
+struct ConnectivityMutations(
+    crate::proxies::ProxiesMutation,
     auth_mutation::AuthMutation,
+    rss_mutation::RssMutation,
+    servers_mutation::ServersMutation,
+);
+
+#[derive(Default, MergedObject)]
+struct ApplicationMutations(
     categories_mutation::CategoriesMutation,
     jobs_mutation::JobsMutation,
     post_processing_mutation::PostProcessingMutation,
-    rss_mutation::RssMutation,
-    servers_mutation::ServersMutation,
     settings_mutation::SettingsMutation,
     system_mutation::SystemMutation,
 );

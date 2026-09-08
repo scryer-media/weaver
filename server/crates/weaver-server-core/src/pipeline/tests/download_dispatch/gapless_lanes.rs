@@ -44,7 +44,7 @@ fn refill_request(
         runtime_generation: 0,
         job_id,
         server_idx: 0,
-        remote_ip: "127.0.0.1".parse().unwrap(),
+        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,

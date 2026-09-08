@@ -61,7 +61,8 @@ pub(crate) fn build_nntp_client(
     config: &Config,
     profile: &SystemProfile,
     policy_registry: &weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
-) -> NntpClient {
+    proxies: &weaver_server_core::proxies::ProxyRuntime,
+) -> Result<NntpClient, String> {
     let transfer_registry = policy_registry.transfer_registry();
     let mut active: Vec<&ServerConfig> = config
         .servers
@@ -81,35 +82,41 @@ pub(crate) fn build_nntp_client(
         weaver_nntp::connection::NntpBufferProfile::adaptive(effective_memory, total_connections);
     let servers = active
         .iter()
-        .map(|server| weaver_nntp::pool::ServerPoolConfig {
-            server: weaver_nntp::ServerConfig {
-                host: server.host.clone(),
-                port: server.port,
-                tls: server.tls,
-                username: server.username.clone(),
-                password: server.password.clone(),
-                tls_ca_cert: server.tls_ca_cert.clone(),
-                buffer_profile,
-                pipelining: weaver_nntp::PipeliningCapability::Known(server.supports_pipelining),
-                ..Default::default()
-            },
-            max_connections: server.connections as usize,
-            group: server.priority,
-            backfill: server.backfill,
-            retention_days: server.retention_days,
-            stable_id: weaver_nntp::transfer::StableServerId(server.id),
-            transfer_control: Some(
-                transfer_registry.control(weaver_nntp::transfer::StableServerId(server.id)),
-            ),
+        .map(|server| {
+            Ok::<_, String>(weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    proxy: proxies.nntp_bridge(server.id)?,
+                    revocation: Some(proxies.nntp_sockets(server.id)?),
+                    host: server.host.clone(),
+                    port: server.port,
+                    tls: server.tls,
+                    username: server.username.clone(),
+                    password: server.password.clone(),
+                    tls_ca_cert: server.tls_ca_cert.clone(),
+                    buffer_profile,
+                    pipelining: weaver_nntp::PipeliningCapability::Known(
+                        server.supports_pipelining,
+                    ),
+                    ..Default::default()
+                },
+                max_connections: server.connections as usize,
+                group: server.priority,
+                backfill: server.backfill,
+                retention_days: server.retention_days,
+                stable_id: weaver_nntp::transfer::StableServerId(server.id),
+                transfer_control: Some(
+                    transfer_registry.control(weaver_nntp::transfer::StableServerId(server.id)),
+                ),
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
-    NntpClient::new(weaver_nntp::client::NntpClientConfig {
+    Ok(NntpClient::new(weaver_nntp::client::NntpClientConfig {
         servers,
         max_idle_age: std::time::Duration::from_secs(300),
         max_retries_per_server: 1,
         soft_timeout: std::time::Duration::from_secs(15),
-    })
+    }))
 }
 
 pub(crate) async fn flush_server_transfer_usage(

@@ -81,6 +81,7 @@ pub struct RssRuleInput {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct RssFeed {
     pub id: u32,
     pub name: String,
@@ -132,6 +133,7 @@ impl RssFeed {
 
 #[derive(Debug, InputObject)]
 pub struct RssFeedInput {
+    pub routing: Option<crate::proxies::RoutingPolicyInput>,
     pub name: String,
     pub url: String,
     #[graphql(default = true)]

@@ -9,7 +9,9 @@ pub mod tls_diagnostics;
 pub mod transfer_policy;
 pub mod usage;
 
-pub use connectivity::{ServerConnectivityResult, probe_server_connection};
+pub use connectivity::{
+    ServerConnectivityResult, probe_server_connection, probe_server_connection_with_proxy,
+};
 pub use model::{
     MAX_PERSISTED_SERVER_DOWNLOAD_BYTES, ServerConfig, ServerDownloadQuotaConfig,
     ServerDownloadQuotaPeriod,

@@ -10,6 +10,8 @@ repository.workspace = true
 slow-tests = []
 
 [dependencies]
+weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
+async-trait = "0.1"
 weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
@@ -75,6 +77,7 @@ keyring-core = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
+weaver-tunnel = { path = "../../../engines/weaver-tunnel", features = ["test-support"] }
 serde_json = { workspace = true }
 # `test-util` for the paused clock: the health-probe reclaim tests assert on
 # multi-second timeout budgets, which only a mocked clock can settle without

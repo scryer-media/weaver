@@ -6,6 +6,7 @@ members = [
     "server/crates/weaver-server-core",
     "server/crates/weaver-server-api",
     "engines/weaver-nntp",
+    "engines/weaver-tunnel",
     "engines/weaver-nzb",
     "engines/weaver-yenc",
 ]
@@ -76,7 +77,7 @@ memmap2 = { version = "0.9", default-features = false }
 zstd = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 sevenz-rust2 = { version = "0.22", default-features = false, features = ["aes256", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd", "socks"] }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode"] }
 ipnet = { version = "2.12", default-features = false, features = ["std"] }

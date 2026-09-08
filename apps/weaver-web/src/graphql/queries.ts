@@ -168,6 +168,8 @@ export const PARSED_RELEASE_FIELDS = `
 
 const SERVER_FIELDS = `
   fragment ServerFields on Server {
+    routing { proxyIds allowDirect }
+    routingStatus { state selectedProxyId failures { proxyId message } }
     id
     host
     port
@@ -202,6 +204,8 @@ const SERVER_FIELDS = `
 
 const SERVER_DETAILS_FIELDS = `
   fragment ServerDetailsFields on ServerDetails {
+    routing { proxyIds allowDirect }
+    routingStatus { state selectedProxyId failures { proxyId message } }
     id
     host
     port
@@ -461,6 +465,8 @@ const RSS_RULE_FIELDS = `
 
 const RSS_FEED_FIELDS = `
   fragment RssFeedFields on RssFeed {
+    routing { proxyIds allowDirect }
+    routingStatus { state selectedProxyId failures { proxyId message } }
     id
     name
     url

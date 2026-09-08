@@ -166,13 +166,13 @@ pin_project_lite::pin_project! {
     #[project = NntpTransportProj]
     pub enum NntpTransport {
         /// Unencrypted TCP.
-        Plain { #[pin] inner: TcpStream, remote_addr: SocketAddr },
+        Plain { #[pin] inner: TcpStream, remote_addr: Option<SocketAddr> },
         /// TLS-encrypted TCP through tokio-rustls.
-        Tls { #[pin] inner: RustlsTlsStream<TcpStream>, remote_addr: SocketAddr },
+        Tls { #[pin] inner: RustlsTlsStream<TcpStream>, remote_addr: Option<SocketAddr> },
         /// TLS-encrypted TCP driven directly through rustls.
-        ManualTls { inner: ManualTlsStream, remote_addr: SocketAddr },
+        ManualTls { inner: ManualTlsStream, remote_addr: Option<SocketAddr> },
         /// TLS-encrypted TCP through s2n-tls (non-Windows only).
-        S2nTls { #[pin] inner: S2nTransportStream, remote_addr: SocketAddr },
+        S2nTls { #[pin] inner: S2nTransportStream, remote_addr: Option<SocketAddr> },
     }
 }
 
@@ -377,7 +377,7 @@ impl NntpTransport {
         )
     }
 
-    pub fn remote_addr(&self) -> SocketAddr {
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
         match self {
             NntpTransport::Plain { remote_addr, .. }
             | NntpTransport::Tls { remote_addr, .. }
@@ -1300,12 +1300,12 @@ fn filter_and_rotate_addrs(
 
 async fn connect_tcp_from_resolved(
     addrs: &[SocketAddr],
-) -> Result<(TcpStream, SocketAddr), NntpError> {
+) -> Result<(TcpStream, Option<SocketAddr>), NntpError> {
     let mut last_error = None;
     for addr in addrs {
         match TcpStream::connect(addr).await {
             Ok(tcp) => {
-                let remote_addr = tcp.peer_addr()?;
+                let remote_addr = Some(tcp.peer_addr()?);
                 tcp.set_nodelay(true)?;
                 set_keepalive(&tcp);
                 return Ok((tcp, remote_addr));
@@ -1333,18 +1333,71 @@ pub async fn inspect_tls_name_mismatch_certificate(
     port: u16,
     ca_cert_path: Option<&Path>,
 ) -> Result<Option<Vec<u8>>, NntpError> {
+    inspect_tls_name_mismatch_certificate_via(host, port, ca_cert_path, None).await
+}
+
+pub async fn inspect_tls_name_mismatch_certificate_via(
+    host: &str,
+    port: u16,
+    ca_cert_path: Option<&Path>,
+    proxy: Option<&Arc<weaver_tunnel::bridge::Bridge>>,
+) -> Result<Option<Vec<u8>>, NntpError> {
+    let timeout = proxy.map_or(std::time::Duration::from_secs(30), |p| p.connect_timeout);
+    tokio::time::timeout(
+        timeout,
+        inspect_certificate_inner(host, port, ca_cert_path, proxy),
+    )
+    .await
+    .map_err(|_| NntpError::Timeout)?
+}
+
+async fn inspect_certificate_inner(
+    host: &str,
+    port: u16,
+    ca_cert_path: Option<&Path>,
+    proxy: Option<&Arc<weaver_tunnel::bridge::Bridge>>,
+) -> Result<Option<Vec<u8>>, NntpError> {
     let captured_leaf_der = Arc::new(Mutex::new(None));
     let tls_config =
         build_tls_config_with_name_mismatch_capture(ca_cert_path, captured_leaf_der.clone())?;
     let server_name = make_server_name(host)?;
-    let addrs = resolve_connect_addrs(host, port, &[], 0).await?;
-    let (tcp, _) = connect_tcp_from_resolved(&addrs).await?;
+    let tcp = if let Some(proxy) = proxy {
+        let mut tcp = TcpStream::connect(proxy.addr()?).await?;
+        tokio::time::timeout(
+            proxy.connect_timeout,
+            weaver_tunnel::transport::socks_connect(
+                &mut tcp,
+                host,
+                port,
+                Some(proxy.credentials()),
+            ),
+        )
+        .await
+        .map_err(|_| NntpError::Timeout)?
+        .map_err(|e| NntpError::Io(std::io::Error::other(e)))?;
+        tcp
+    } else {
+        let addrs = resolve_connect_addrs(host, port, &[], 0).await?;
+        connect_tcp_from_resolved(&addrs).await?.0
+    };
 
     let _ = ManualTlsStream::connect(tcp, tls_config, server_name).await;
     Ok(captured_leaf_der
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take())
+}
+
+/// Detect destination TLS errors without treating them as proxy establishment failures.
+pub fn is_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if error.is::<tokio_rustls::rustls::Error>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// Connect to a host with implicit TLS (e.g. port 563).
@@ -2021,7 +2074,7 @@ mod tests {
             .expect("s2n TLS connect");
         let mut transport = NntpTransport::S2nTls {
             inner: s2n_tls,
-            remote_addr: addr,
+            remote_addr: Some(addr),
         };
         let mut read_buf = BytesMut::with_capacity(TLS_TEST_BUFFER_BYTES);
         let mut total = 0usize;

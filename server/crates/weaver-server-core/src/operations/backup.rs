@@ -50,6 +50,8 @@ const LEGACY_V1_STABLE_TABLES: &[&str] = &[
     "schema_version",
     "settings",
     "servers",
+    "proxy_profiles",
+    "proxy_routes",
     "server_download_usage",
     "categories",
     "api_keys",
@@ -63,6 +65,8 @@ const LEGACY_V1_STABLE_TABLES: &[&str] = &[
 ];
 
 const LEGACY_V1_CLEAR_IMPORT_TABLES: &[&str] = &[
+    "proxy_routes",
+    "proxy_profiles",
     "metrics_history_chunks",
     "rss_seen_items",
     "rss_rules",
@@ -913,8 +917,9 @@ impl Database {
                                 ""
                             };
                             let mut tx = conn.begin().await.map_err(db_err)?;
+                            // Qualify the target while the source archive is attached.
                             for table in LEGACY_V1_CLEAR_IMPORT_TABLES {
-                                let sql = format!("DELETE FROM {table}");
+                                let sql = format!("DELETE FROM main.{table}");
                                 sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
                                     .execute(&mut *tx)
                                     .await
@@ -992,6 +997,20 @@ impl Database {
                             .await
                             .map_err(db_err)?;
                             rebuild_job_history_attributes_tx(&mut tx).await?;
+
+                            // Archives created before proxy routing omit these tables.
+                            // Restore both together so a restricted consumer cannot lose its policy.
+                            for (table, columns) in [
+                                ("proxy_profiles", "id, config, password"),
+                                ("proxy_routes", "consumer, policy"),
+                            ] {
+                                let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM src.sqlite_master WHERE type = 'table' AND name = ?")
+                                    .bind(table).fetch_one(&mut *tx).await.map_err(db_err)?;
+                                if exists != 0 {
+                                    let statement = format!("INSERT INTO main.{table} ({columns}) SELECT {columns} FROM src.{table}");
+                                    sqlx::raw_sql(AssertSqlSafe(statement.as_str())).execute(&mut *tx).await.map_err(db_err)?;
+                                }
+                            }
 
                             tx.commit().await.map_err(db_err)?;
                             Ok::<(), StateError>(())

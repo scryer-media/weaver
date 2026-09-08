@@ -247,6 +247,8 @@ fn spawn_tls_nntp_server(
     });
 
     let config = ServerConfig {
+        proxy: None,
+        revocation: None,
         host: "localhost".to_string(),
         port,
         tls: true,

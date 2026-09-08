@@ -1,3 +1,5 @@
+import { ProxyRoutingEditor, ProxyRoutingStatus } from "@/components/ProxyRoutingEditor";
+import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { FilePenLine, Loader2, Trash2 } from "lucide-react";
 import { useMutation, useQuery } from "urql";
@@ -58,6 +60,8 @@ type ServerDownloadQuota = {
 };
 
 type Server = {
+  routingStatus?: RoutingStatus;
+  routing: RoutingPolicy;
   id: number;
   host: string;
   port: number;
@@ -99,6 +103,7 @@ function describeCipherOrder(
 }
 
 type ServerFormValues = {
+  routing: RoutingPolicy;
   host: string;
   port: number;
   tls: boolean;
@@ -127,6 +132,7 @@ type ServerFormValues = {
 };
 
 const defaultForm: ServerFormValues = {
+  routing: directRouting,
   host: "",
   port: 443,
   tls: true,
@@ -187,6 +193,7 @@ function serverToFormValues(server: ServerDetails | Server): ServerFormValues {
   const quotaUnit = server.downloadQuota.limitBytes >= TIB ? "TB" : "GB";
   const quotaUnitBytes = quotaUnit === "TB" ? TIB : GIB;
   return {
+    routing: server.routing ?? directRouting,
     host: server.host,
     port: server.port,
     tls: server.tls,
@@ -335,6 +342,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
     setTestResult(null);
     const result = await testConnection({
       input: {
+        routing: values.routing,
         host: normalizeServerHost(values.host),
         port: values.port,
         tls: values.tls,
@@ -355,7 +363,8 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
   const handleSave = async (values: ServerFormValues) => {
     setSaveError(null);
     const input = {
-      host: normalizeServerHost(values.host),
+      routing: values.routing,
+        host: normalizeServerHost(values.host),
       port: values.port,
       tls: values.tls,
       username: values.username.trim() || null,
@@ -579,6 +588,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
                             <div className="mt-1 truncate font-mono text-[13px] text-foreground">
                               {server.host}:{server.port}
                             </div>
+                            <ProxyRoutingStatus status={server.routingStatus} />
                           </div>
                         </div>
                       </TableCell>
@@ -812,6 +822,7 @@ function ServerFormCard({
       description={t("settings.serversDesc")}
     >
       <div className="space-y-5">
+        <ProxyRoutingEditor value={values.routing} onChange={routing => setValues(current => ({ ...current, routing }))} />
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           <Field label={t("servers.host")} htmlFor="server-host">
             <Input

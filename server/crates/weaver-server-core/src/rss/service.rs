@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 #[cfg(test)]
 use reqwest::header::{ETAG, IF_NONE_MATCH};
@@ -11,10 +10,10 @@ use crate::RssRuleAction;
 use crate::SchedulerHandle;
 use crate::ingest::{SubmissionOptions, submit_nzb_bytes_with_options};
 use crate::jobs::{CallerScopedIdempotency, SubmissionOrigin};
-use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata};
+use crate::rss::model::{FeedItem, build_submission_metadata};
 #[cfg(test)]
 use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items, unix_now_secs};
-use crate::security::{RuntimeSecurityConfig, resolve_fetch_target};
+use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
 use crate::{Database, RssFeedRow, RssRuleRow, RssSeenItemRow};
 
@@ -194,38 +193,14 @@ impl RssService {
             reqwest::Url::parse(url).map_err(|e| RssServiceError::Http(e.to_string()))?;
 
         for redirect_count in 0..=MAX_RSS_REDIRECTS {
-            let target =
-                resolve_fetch_target(&current_url, self.inner.security.rss_allow_private_network)
-                    .await
-                    .map_err(RssServiceError::Http)?;
-            let client = target
-                .apply_dns_override(
-                    reqwest::Client::builder()
-                        .timeout(Duration::from_secs(30))
-                        .user_agent("weaver-rss/0.1")
-                        .redirect(reqwest::redirect::Policy::none())
-                        .gzip(true),
+            let response = self
+                .send_routed_request(
+                    feed,
+                    &current_url,
+                    &feed_url,
+                    conditional && redirect_count == 0,
                 )
-                .build()
-                .map_err(|e| RssServiceError::Http(e.to_string()))?;
-
-            let mut request = client.get(target.url.clone());
-            if same_rss_origin(&current_url, &feed_url) {
-                request = apply_basic_auth(request, feed);
-            }
-            if conditional && redirect_count == 0 {
-                if let Some(etag) = &feed.etag {
-                    request = request.header(reqwest::header::IF_NONE_MATCH, etag);
-                }
-                if let Some(last_modified) = &feed.last_modified {
-                    request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
-                }
-            }
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| RssServiceError::Http(e.to_string()))?;
+                .await?;
             if response.status().is_redirection() {
                 if redirect_count == MAX_RSS_REDIRECTS {
                     return Err(RssServiceError::Http("too many redirects".to_string()));
@@ -278,7 +253,7 @@ impl RssService {
     }
 }
 
-fn same_rss_origin(request_url: &reqwest::Url, feed_url: &reqwest::Url) -> bool {
+pub(super) fn same_rss_origin(request_url: &reqwest::Url, feed_url: &reqwest::Url) -> bool {
     request_url.scheme() == feed_url.scheme()
         && request_url
             .host_str()
@@ -298,12 +273,19 @@ pub(super) async fn read_response_with_limit(
         return Err(format!("response exceeds {limit} bytes"));
     }
 
+    let route = response
+        .extensions()
+        .get::<super::routing::RoutedBodyContext>()
+        .cloned();
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| format!("body read failed: {e}"))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        // reqwest labels every frame-read failure as Decode, including a
+        // truncated TCP response. Feed parsing happens after this complete read.
+        if let Some(route) = &route {
+            route.failed();
+        }
+        "body read failed".to_string()
+    })? {
         let next_len = body.len().saturating_add(chunk.len());
         if next_len as u64 > limit {
             return Err(format!("response exceeds {limit} bytes"));

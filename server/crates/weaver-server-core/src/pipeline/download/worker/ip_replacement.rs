@@ -201,7 +201,11 @@ impl Pipeline {
                 .await
             {
                 Ok(lane) => {
-                    let candidate_ip = lane.remote_ip();
+                    let Some(candidate_ip) = lane.remote_ip() else {
+                        lane.discard().await;
+                        let _ = trial_tx.send(IpReplacementTrialEvent::AcquireFailed).await;
+                        return;
+                    };
                     if candidate_ip == candidate.old_key.ip {
                         lane.discard().await;
                         let _ = trial_tx.send(IpReplacementTrialEvent::SameIpRejected).await;
