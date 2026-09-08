@@ -3224,6 +3224,7 @@ impl Pipeline {
                         stage_ms = stage_start.elapsed().as_millis() as u64,
                         "file-complete stage: try_load_par2_metadata"
                     );
+                    self.try_load_par3_metadata(job_id, file_id).await;
                     stage_start = Instant::now();
                     self.try_merge_par2_recovery(job_id, file_id).await;
                     crate::runtime::perf_probe::record(

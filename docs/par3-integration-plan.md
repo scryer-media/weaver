@@ -4,16 +4,23 @@ Implementation started on 2026-09-08 in `feature/par3-integration`, based on
 local `release-0.12.0` at `6b079b40acea50e64df2cfce956dd0412963d906`.
 This is an implementation record, not a claim that the entire pipeline is ready.
 
-Current slice: a native operation contract for both engines, exercised through
-the existing PAR2 retained-session execution, invalidation, and eviction paths.
-PAR3 backend tests use unchanged official carriers and check evidence reuse,
-recovery-only merges, selective output staging, and typed cancellation. PAR3
-discovery, scheduling, virtual adapters, extraction, persistence, and product
-surfaces below remain pending. No PAR3 job is selected in production code yet.
+Implemented: the native operation contract, PAR3 carrier roles, completed-carrier
+discovery on blocking workers, retained authenticated packet locations, and a
+source publication adapter separating availability revisions from content
+generations. PAR3-specific state is lazy. Engine allocations share a process-wide
+256 MiB budget and 128 handles; each job uses one codec worker and the default
+64 MiB retained ceiling. Source publication tables bound sources and ranges.
+Official-fixture tests cover split headers/payloads, interior holes, duplicate
+arrivals, evidence reuse, selective output staging, and typed cancellation.
+
+Still pending: incremental decode-to-publication wiring, detached worker tickets,
+repair/download gating, direct-volume adapters, positioned verification, embedded
+archives, persistence, and product surfaces. Completed carriers are discovered
+in production code, but PAR3 does not yet decide job completion or execute repairs.
 
 Dependency baseline: PAR2 0.10.2, UnRAR 0.10.3, and registry Reed-Solomon 0.4.4.
 The approved development pointer pins PAR3 and its separate arithmetic instance
-to rarpar `ca50d43c81a73dc018c6df137fd3e0004ea8f930`. Metadata comparison before
+to rarpar `54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee`. Metadata comparison before
 and after resolution confirms every existing dependency node is unchanged
 except server core's new PAR3 edge: no PAR2 features, versions, or transitive
 edges changed. This isolation is deliberate during the performance comparison.
@@ -28,6 +35,11 @@ workspace Clippy pass; the full locked Nextest sweep reports 3,768 passed and
 `npm ci` and web asset build for the embedded frontend, without manifest or
 lockfile changes. Rustdoc must match the compiler build, including its
 distribution, rather than only its displayed version number.
+
+Discovery-slice validation: formatting and all-target/all-feature Clippy pass;
+the locked workspace Nextest sweep reports 3,776 passed and 13 existing skips;
+all three doctests pass. All 652 resolved dependency nodes are identical to the
+first slice after normalizing the approved PAR3 Git revision change.
 
 ## Decisions
 

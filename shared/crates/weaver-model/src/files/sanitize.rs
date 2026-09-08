@@ -113,7 +113,9 @@ fn duplicate_extension_split(name: &str) -> usize {
         return name.len();
     };
 
-    if name[extension..].eq_ignore_ascii_case(".par2") {
+    if name[extension..].eq_ignore_ascii_case(".par2")
+        || name[extension..].eq_ignore_ascii_case(".par3")
+    {
         let stem = &name[..extension];
         if let Some(vol_extension) = stem.rfind('.').filter(|index| *index > 0)
             && stem[vol_extension..]

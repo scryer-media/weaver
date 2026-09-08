@@ -362,8 +362,12 @@ takes precedence over a chase of its source parts.
 `pipeline/repair/backend` is the operation boundary for retained PAR2 and PAR3
 engines. It preserves native assessments, evidence, source invalidation, errors,
 and repair requests. Calls are statically dispatched above block I/O; PAR2's
-readers, checksum substitutions, and buffer limits remain native. PAR3 is under
-integration and is not yet selected by the download pipeline. The implementation
+readers, checksum substitutions, and buffer limits remain native. PAR3 carrier
+roles control discovery priority; authenticated packets alone establish set
+membership and recovery availability. Completed carriers are scanned on blocking
+workers and retained as lazy payload references. Published source coverage keeps
+holes unavailable and distinguishes hole fills from content-generation changes.
+PAR3 repair and completion gating remain under integration. The implementation
 record and remaining acceptance gates live in
 [the PAR3 integration plan](docs/par3-integration-plan.md).
 

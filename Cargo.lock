@@ -3478,7 +3478,7 @@ dependencies = [
 [[package]]
 name = "par3-rs"
 version = "0.3.0"
-source = "git+https://github.com/scryer-media/rarpar?rev=ca50d43c81a73dc018c6df137fd3e0004ea8f930#ca50d43c81a73dc018c6df137fd3e0004ea8f930"
+source = "git+https://github.com/scryer-media/rarpar?rev=54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee#54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee"
 dependencies = [
  "blake3",
  "crc-fast",
@@ -4021,7 +4021,7 @@ dependencies = [
 [[package]]
 name = "reedsolomon-rs"
 version = "0.4.5"
-source = "git+https://github.com/scryer-media/rarpar?rev=ca50d43c81a73dc018c6df137fd3e0004ea8f930#ca50d43c81a73dc018c6df137fd3e0004ea8f930"
+source = "git+https://github.com/scryer-media/rarpar?rev=54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee#54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee"
 dependencies = [
  "memmap2",
  "rayon",

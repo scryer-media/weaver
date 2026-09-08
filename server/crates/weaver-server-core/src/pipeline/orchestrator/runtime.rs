@@ -384,6 +384,7 @@ impl Pipeline {
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
+            par3_runtime: HashMap::new(),
             #[cfg(test)]
             par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
