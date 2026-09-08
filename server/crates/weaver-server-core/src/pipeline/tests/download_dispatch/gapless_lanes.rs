@@ -469,10 +469,9 @@ async fn a_lane_that_changes_class_back_releases_the_critical_booking() {
     assert!(!lease.compatibility.completion_critical);
     assert_eq!(pipeline.active_completion_critical_connections, 0);
     assert!(
-        pipeline
+        !pipeline
             .active_completion_critical_connections_by_job
-            .get(&job_id)
-            .is_none()
+            .contains_key(&job_id)
     );
 }
 
