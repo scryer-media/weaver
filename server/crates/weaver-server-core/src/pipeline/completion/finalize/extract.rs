@@ -1757,7 +1757,7 @@ impl Pipeline {
         }
         // Parts the topology lists that no NZB file answers to: a part PAR2
         // rebuilt because the post never carried it, adopted into the map by
-        // `adopt_verified_par2_sevenz_part`. Iterating the assembly alone would
+        // `adopt_verified_par2_numbered_part`. Iterating the assembly alone would
         // hand the extractor the same truncated set the repair just completed.
         for (filename, vol) in &topo.volume_map {
             if listed.contains(filename) {
@@ -1943,35 +1943,7 @@ impl Pipeline {
         set_name: &str,
         kind: SimpleArchiveKind,
     ) -> Result<u32, String> {
-        let file_paths = {
-            let state = self
-                .jobs
-                .get(&job_id)
-                .ok_or_else(|| format!("job {job_id:?} not found"))?;
-            let topo = state
-                .assembly
-                .archive_topology_for(set_name)
-                .ok_or_else(|| format!("no topology for set '{set_name}'"))?;
-
-            let set_filenames: std::collections::HashSet<&str> =
-                topo.volume_map.keys().map(|s| s.as_str()).collect();
-            let mut parts: Vec<(u32, std::path::PathBuf)> = Vec::new();
-
-            for file_asm in state.assembly.files() {
-                let current_filename = self.current_filename_for_file(job_id, file_asm);
-                if set_filenames.contains(current_filename.as_str()) {
-                    let vol = topo.volume_map.get(&current_filename).copied().unwrap_or(0);
-                    if let Some(path) = self.resolve_job_input_path(job_id, &current_filename) {
-                        parts.push((vol, path));
-                    }
-                }
-            }
-            parts.sort_by_key(|(n, _)| *n);
-            parts
-                .into_iter()
-                .map(|(_, p)| p)
-                .collect::<Vec<std::path::PathBuf>>()
-        };
+        let file_paths = self.archive_set_part_paths(job_id, set_name)?;
         let password = self.primary_archive_password_for_job(job_id);
         let joined_output_already_present = matches!(kind, SimpleArchiveKind::Split)
             .then(|| self.present_split_join_output(job_id, set_name, &file_paths))

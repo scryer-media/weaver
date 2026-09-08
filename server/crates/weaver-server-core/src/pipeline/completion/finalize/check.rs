@@ -1255,10 +1255,10 @@ pub(crate) struct Par2RarOutputRegistration {
     pub(crate) registered: usize,
     /// The RAR sets those volumes belong to.
     pub(crate) set_names: BTreeSet<String>,
-    /// Split 7z parts the NZB never carried, adopted into their set's
+    /// Numbered parts the NZB never carried, adopted into their set's
     /// topology. Counted apart from `registered` because nothing about them
     /// is a RAR plan to invalidate: the topology *is* their plan.
-    pub(crate) sevenz_parts: usize,
+    pub(crate) numbered_parts: usize,
 }
 
 pub(in crate::pipeline) fn par2_repair_write_set(
