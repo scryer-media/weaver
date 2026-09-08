@@ -26,7 +26,8 @@ The matrix covers TAR, tar.gz, tgz, tar.bz2, tar.xz, gzip, bzip2, XZ, zst,
 zstd, Brotli, raw DEFLATE, plain numbered parts, ZIP, forced ZIP64 and streamed
 ZIP64. Every representation runs clean, missing-article and corrupt-article
 cases. Numbered parts also exercise PAR2 protecting the joined file and a
-whole first, interior or last part absent from the NZB: 52 scenarios in total.
+whole first, interior or last part absent from the NZB, plus shorter and longer
+posted first parts: 54 scenarios in total.
 
 Each scenario holds an archive BODY response behind an explicit gate. It
 requires nonempty member output in that job's direct-unpack staging directory
@@ -34,6 +35,11 @@ while that same job has held responses and remains nonterminal. A fixed sleep
 or an admission log alone cannot satisfy this assertion. The gate leaves the
 ZIP directory and one available numbered part downloadable so bootstrap does
 not depend on releasing the gate.
+
+The wrong-length cases require staged output beyond the posted first part's
+boundary before release. Article and whole-file CRCs match the posted bytes;
+PAR2 describes the original lengths. Final length and BLAKE3 assertions prove
+repair invalidates the old joined output and restores the complete payload.
 
 After release, every job must complete and match the expected length and
 BLAKE3. Clean jobs must install their staged chase output. Damaged jobs must

@@ -46,7 +46,7 @@ func TestDirectUnpackE2E(t *testing.T) {
 			files, payload := unpackFixture(t, filepath.Join(root, "sources", format), format)
 			modes := []string{"clean", "missing", "corrupt"}
 			if format == "split" {
-				modes = append(modes, "joined-missing", "missing-part", "missing-first", "missing-last")
+				modes = append(modes, "joined-missing", "missing-part", "missing-first", "missing-last", "short-first", "long-first")
 			}
 			for _, mode := range modes {
 				t.Run(mode, func(t *testing.T) {
@@ -79,6 +79,20 @@ func TestDirectUnpackE2E(t *testing.T) {
 					if mode == "missing-last" {
 						delete(posted, "payload.bin.004")
 					}
+					// PAR2 describes the original geometry. Both article and file
+					// CRCs describe the posted geometry, so CRC rejection cannot
+					// accidentally provide the chase invalidation being tested.
+					minimumStaged := int64(1)
+					if mode == "short-first" || mode == "long-first" {
+						first := posted["payload.bin.001"]
+						if mode == "short-first" {
+							first = first[:len(first)-64*1024]
+						} else {
+							first = append(append([]byte(nil), first...), make([]byte, 64*1024)...)
+						}
+						posted["payload.bin.001"] = first
+						minimumStaged = int64(len(first) + 64*1024)
+					}
 					gate := &unpackGate{released: make(chan struct{})}
 					var once sync.Once
 					release := func() { once.Do(func() { close(gate.released) }) }
@@ -101,12 +115,12 @@ func TestDirectUnpackE2E(t *testing.T) {
 					deadline := time.Now().Add(20 * time.Second)
 					for time.Now().Before(deadline) {
 						stagedPath, stagedBytes = unpackOutput(stage, outputName)
-						if stagedBytes > 0 && gate.held.Load() > 0 {
+						if stagedBytes >= minimumStaged && gate.held.Load() > 0 {
 							break
 						}
 						time.Sleep(20 * time.Millisecond)
 					}
-					if stagedBytes == 0 || gate.held.Load() == 0 {
+					if stagedBytes < minimumStaged || gate.held.Load() == 0 {
 						t.Fatalf("no extraction while archive BODY responses are held: job=%d status=%s stage=%s bytes=%d held=%d log=%s", job, api.status(job), stagedPath, stagedBytes, gate.held.Load(), logPath)
 					}
 					statusBefore := api.status(job)
@@ -114,6 +128,7 @@ func TestDirectUnpackE2E(t *testing.T) {
 						t.Fatalf("terminal before held article release: %s", statusBefore)
 					}
 					evidence := map[string]any{"jobId": job, "format": format, "mode": mode, "stagedPath": stagedPath, "stagedBytesBeforeRelease": stagedBytes, "heldBodies": gate.held.Load(), "statusBeforeRelease": statusBefore}
+					evidence["minimumStagedBytes"] = minimumStaged
 					release()
 					deadline = time.Now().Add(90 * time.Second)
 					status := ""
