@@ -14,6 +14,46 @@ async fn next(coordinator: &mut Coordinator) -> WorkDone {
 }
 
 #[tokio::test]
+async fn busy_job_yields_worker_capacity_to_other_jobs() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    let mut coordinator = Coordinator::default();
+    coordinator
+        .enqueue(JobId(1), SourceId(0), path.clone())
+        .unwrap();
+    coordinator
+        .enqueue(JobId(1), SourceId(1), path.clone())
+        .unwrap();
+    coordinator.enqueue(JobId(2), SourceId(0), path).unwrap();
+    for expected in [JobId(1), JobId(2), JobId(1)] {
+        coordinator.dispatch().unwrap();
+        let done = next(&mut coordinator).await;
+        assert_eq!(coordinator.settle(done), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn queued_source_change_hides_the_previous_assessment() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    let mut coordinator = Coordinator::default();
+    coordinator
+        .enqueue(JobId(1), SourceId(0), path.clone())
+        .unwrap();
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    assert_eq!(coordinator.assessments(JobId(1)).count(), 1);
+    coordinator.enqueue(JobId(1), SourceId(0), path).unwrap();
+    assert_eq!(coordinator.assessments(JobId(1)).count(), 0);
+    coordinator.dispatch().unwrap();
+    assert_eq!(coordinator.assessments(JobId(1)).count(), 0);
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    assert_eq!(coordinator.assessments(JobId(1)).count(), 1);
+}
+
+#[tokio::test]
 async fn workers_return_retained_state_and_serialize_carriers() {
     let root = tempfile::tempdir().unwrap();
     let path = carrier(root.path());

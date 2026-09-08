@@ -22,6 +22,18 @@ outcomes through the existing repair completion channel, with one format dispatc
 per finished operation. PAR3 does not add another actor receive branch; only
 PAR3 results box their larger retained state.
 
+Authenticated sets now retain native repair sessions. Completed conventional
+sources publish committed decoded placements, including files completed before
+the first carrier; apparent filesystem length never fills an assembly hole.
+Workers bind exact authenticated names and retain native evidence across
+recovery-only merges. Bounded actor views preserve file-coordinate damage,
+verified prefixes, matrix identities and per-cohort recovery requirements.
+Queued publications and their retained ranges share a 16 MiB host budget with
+these views. Pending source changes and worker errors hide old actor answers.
+Dispatch rotates between jobs instead of draining one job's entire backlog.
+Mutable Windows disk source snapshot costs still require tuning before the
+read-free reassessment contract can be claimed on that platform.
+
 Still pending: incremental decode-to-publication wiring,
 repair/download gating, direct-volume adapters, positioned verification, embedded
 archives, persistence, and product surfaces. Completed carriers are discovered
@@ -63,6 +75,13 @@ pass. The final isolated full sweep reports 3,783 passed and 13 existing skips.
 A preceding sweep overlapped Cargo work and reported a leak in a pure NNTP
 sniffer test; the final sweep ran without concurrent Cargo work and no leak
 checks were relaxed. The cause of the intermittent leak reports is unconfirmed.
+
+Retained-assessment validation: all 3,788 workspace tests pass with 13 existing
+skips; formatting, all-target/all-feature Clippy and all three doctests pass.
+New regressions cover late metadata after conventional sources, file-coordinate
+damage, recovery-only evidence reuse, stale views, carrier replay after a new
+generation, host budget rejection and round-robin dispatch. PAR2 performance
+acceptance remains unmeasured.
 
 ## Decisions
 

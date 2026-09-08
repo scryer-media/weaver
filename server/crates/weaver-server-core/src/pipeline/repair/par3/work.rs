@@ -8,9 +8,45 @@ use tokio::sync::mpsc;
 const MAX_JOBS: usize = 256;
 const MAX_PENDING: usize = 4096;
 
+enum PendingInput {
+    Carrier(PathBuf),
+    File {
+        path: PathBuf,
+        name: String,
+        ranges: Vec<std::ops::Range<u64>>,
+    },
+}
+
+impl PendingInput {
+    fn retained_cost(&self) -> EngineResult<usize> {
+        let (path, extra) = match self {
+            Self::Carrier(path) => (path, Some(0)),
+            Self::File { path, name, ranges } => (
+                path,
+                name.capacity()
+                    .checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(ranges.capacity().checked_mul(32)?)),
+            ),
+        };
+        1024usize
+            .checked_add(
+                path.capacity()
+                    .checked_mul(2)
+                    .ok_or(EngineError::ResourceLimit("PAR3 queued path"))?,
+            )
+            .and_then(|bytes| bytes.checked_add(extra?))
+            .ok_or(EngineError::ResourceLimit("PAR3 queued publication"))
+    }
+}
+
+struct QueuedInput {
+    input: PendingInput,
+    reservation: assessment::ViewReservation,
+}
+
 struct JobSlot {
     runtime: Option<Par3Job>,
-    pending: BTreeMap<SourceId, PathBuf>,
+    pending: BTreeMap<SourceId, QueuedInput>,
     ticket: Option<u64>,
     errors: BTreeMap<SourceId, EngineError>,
 }
@@ -41,6 +77,7 @@ pub(in crate::pipeline) struct Coordinator {
     jobs: BTreeMap<JobId, JobSlot>,
     in_flight: BTreeMap<u64, (JobId, CancellationToken)>,
     next_ticket: u64,
+    last_job: Option<JobId>,
     tx: mpsc::Sender<RepairWorkDone>,
     #[cfg(test)]
     test_rx: Option<mpsc::Receiver<RepairWorkDone>>,
@@ -62,6 +99,7 @@ impl Coordinator {
             jobs: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             next_ticket: 0,
+            last_job: None,
             tx,
             #[cfg(test)]
             test_rx: None,
@@ -86,6 +124,43 @@ impl Coordinator {
         source: SourceId,
         path: PathBuf,
     ) -> EngineResult<()> {
+        self.enqueue_input(job_id, source, PendingInput::Carrier(path))
+    }
+
+    pub(super) fn enqueue_file(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+        name: String,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> EngineResult<()> {
+        self.enqueue_input(job_id, source, PendingInput::File { path, name, ranges })
+    }
+
+    pub(super) fn contains_job(&self, job_id: JobId) -> bool {
+        self.jobs.contains_key(&job_id)
+    }
+
+    pub(in crate::pipeline) fn assessments(
+        &self,
+        job_id: JobId,
+    ) -> impl Iterator<Item = (par3_rs::InputSetId, &assessment::AssessmentView)> {
+        self.jobs
+            .get(&job_id)
+            .filter(|job| job.ticket.is_none() && job.pending.is_empty() && job.errors.is_empty())
+            .and_then(|job| job.runtime.as_ref())
+            .into_iter()
+            .flat_map(|runtime| runtime.sets.iter())
+            .filter_map(|(&id, set)| set.view.as_ref().map(|view| (id, view)))
+    }
+
+    fn enqueue_input(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        input: PendingInput,
+    ) -> EngineResult<()> {
         if !self.jobs.contains_key(&job_id) && self.jobs.len() >= MAX_JOBS {
             return Err(EngineError::ResourceLimit("PAR3 job count"));
         }
@@ -103,11 +178,12 @@ impl Coordinator {
         {
             return Err(EngineError::ResourceLimit("pending PAR3 carriers"));
         }
+        let reservation = assessment::ViewReservation::acquire(input.retained_cost()?)?;
         self.jobs
             .entry(job_id)
             .or_default()
             .pending
-            .insert(source, path);
+            .insert(source, QueuedInput { input, reservation });
         Ok(())
     }
 
@@ -115,13 +191,18 @@ impl Coordinator {
         if !self.in_flight.is_empty() {
             return Ok(());
         }
-        let Some((&job_id, job)) = self
+        let ready = |job: &&JobSlot| job.ticket.is_none() && !job.pending.is_empty();
+        let next = self
             .jobs
-            .iter_mut()
-            .find(|(_, job)| job.ticket.is_none() && !job.pending.is_empty())
-        else {
+            .iter()
+            .filter(|(_, job)| ready(job))
+            .find(|(id, _)| self.last_job.is_none_or(|last| **id > last))
+            .or_else(|| self.jobs.iter().find(|(_, job)| ready(job)))
+            .map(|(&id, _)| id);
+        let Some(job_id) = next else {
             return Ok(());
         };
+        let job = self.jobs.get_mut(&job_id).expect("selected ready job");
         let ticket = self
             .next_ticket
             .checked_add(1)
@@ -132,14 +213,26 @@ impl Coordinator {
             ));
         };
         self.next_ticket = ticket;
-        let (source, path) = job.pending.pop_first().expect("pending carrier");
+        self.last_job = Some(job_id);
+        let (source, input) = job.pending.pop_first().expect("pending input");
         job.ticket = Some(ticket);
         self.in_flight
             .insert(ticket, (job_id, runtime.options.cancel.clone()));
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let result = runtime.scan_complete(source, path);
+                // Keep the queue lease live while the worker owns its input;
+                // successful publication transfers it into retained state.
+                let result = match input.input {
+                    PendingInput::Carrier(path) => runtime.scan_complete(source, path),
+                    PendingInput::File { path, name, ranges } => {
+                        runtime.publish_file(source, path, name, ranges)
+                    }
+                };
+                if result.is_ok() {
+                    runtime.publication_memory.insert(source, input.reservation);
+                }
+                let result = result.and_then(|()| runtime.assess());
                 (runtime, result)
             })
             .await;

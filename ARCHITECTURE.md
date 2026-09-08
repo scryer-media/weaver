@@ -367,6 +367,10 @@ roles control discovery priority; authenticated packets alone establish set
 membership and recovery availability. Completed carriers are scanned on blocking
 workers and retained as lazy payload references. Published source coverage keeps
 holes unavailable and distinguishes hole fills from content-generation changes.
+Completed conventional files bind through committed decoded placements. Native
+sessions retain their evidence, while bounded actor views carry file-coordinate
+damage and matrix/cohort requirements. Pending publications hide prior views;
+the shared worker queue rotates between PAR3 jobs.
 PAR3 repair and completion gating remain under integration. The implementation
 record and remaining acceptance gates live in
 [the PAR3 integration plan](docs/par3-integration-plan.md).
