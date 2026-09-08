@@ -7,8 +7,8 @@ configuration validation and protocol fixtures were adapted from
 The original repository's GPL v3 license is preserved in `LICENSE`.
 
 SSH, WireGuard, the userspace IP stack and their protocol fixtures now come
-from `scryer-media/proxy-tunnels`, through the full Git revision in this crate's
-`Cargo.toml` and the workspace `Cargo.lock`. The local protocol copies have
+from `scryer-media/proxy-tunnels`, through signed tag `v0.20.0` in this crate's
+`Cargo.toml`. The workspace `Cargo.lock` records the exact resolved Git commit. The local protocol copies have
 been removed. The shared extraction began at
 `2b537101b58d2cad11664b401b82a726b8958db1`; its key-only SSH authentication,
 per-channel host-key authorization, DNS admission and closing-socket accounting

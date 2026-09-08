@@ -214,10 +214,10 @@ No dependency versions or features changed for this tuning.
 
 ## Shared-engine and direct-I/O validation
 
-The shared engine is pinned to signed commit
-`8c54eb1348d58afe72cd158fe0d084074617a3a1` on
-`scryer-media/proxy-tunnels` branch `feature/weaver-direct-io`. Weaver's lockfile
-resolves that remote Git source; no local path override is required.
+The shared engine uses signed tag `v0.20.0` from `scryer-media/proxy-tunnels`.
+Weaver's lockfile resolves it to `7c63bad3f43e8aaea2ffa5b9190866406ce4eb10`;
+no local path override is required. Protocol source and dependency files are
+identical to the validated commit `8c54eb1348d58afe72cd158fe0d084074617a3a1`.
 
 - Shared crate: 79 tests, formatting and all-target/all-feature Clippy passed.
 - Scryer's application crate compiled unchanged against that shared source in
