@@ -170,6 +170,7 @@ impl TryFrom<ServerDownloadQuotaInput> for ServerDownloadQuotaConfig {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct Server {
     pub id: u32,
     pub host: String,
@@ -237,6 +238,7 @@ impl From<&weaver_server_core::servers::ServerConfig> for Server {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct ServerDetails {
     pub id: u32,
     pub host: String,
@@ -312,6 +314,7 @@ impl From<&weaver_server_core::servers::ServerConfig> for ServerDetails {
 
 #[derive(Debug, InputObject)]
 pub struct ServerInput {
+    pub routing: Option<crate::proxies::RoutingPolicyInput>,
     pub host: String,
     pub port: u16,
     pub tls: bool,

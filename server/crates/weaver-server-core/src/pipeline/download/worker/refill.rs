@@ -49,11 +49,10 @@ impl Pipeline {
         if !allow_refill {
             self.hot_share_yield_signal.clear();
         }
-        let lane_ip_key = ServerIpKey {
-            server_idx,
-            ip: remote_ip,
-        };
-        if self.ip_replacement_retired_ips.contains(&lane_ip_key) {
+        if remote_ip.is_some_and(|ip| {
+            self.ip_replacement_retired_ips
+                .contains(&ServerIpKey { server_idx, ip })
+        }) {
             allow_refill = false;
             park_reason = LaneParkReason::IpReplacementRetired;
         }

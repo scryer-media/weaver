@@ -18,12 +18,26 @@ impl RssMutation {
     #[graphql(guard = "AdminGuard")]
     async fn add_rss_feed(&self, ctx: &Context<'_>, input: RssFeedInput) -> Result<RssFeed> {
         validate_feed_input(&input)?;
+        let proxy_runtime = ctx
+            .data::<weaver_server_core::SchedulerHandle>()?
+            .proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
+        let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
+            input.routing.clone().map(Into::into);
+        let _route = crate::proxies::draft_route(
+            ctx,
+            weaver_server_core::proxies::Consumer::Rss(0),
+            input.routing.clone(),
+        )?;
 
         let db = ctx.data::<Database>()?.clone();
         let feed = tokio::task::spawn_blocking(move || {
             let id = db.next_rss_feed_id()?;
             let row = rss_feed_row_from_create(id, input);
-            db.insert_rss_feed(&row)?;
+            db.insert_rss_feed_with_routing(&row, routing.as_ref())?;
             let rules = db
                 .list_rss_rules(row.id)?
                 .iter()
@@ -35,6 +49,7 @@ impl RssMutation {
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
+        crate::proxies::refresh(ctx).await?;
         Ok(feed)
     }
     /// Update an RSS feed.
@@ -46,6 +61,20 @@ impl RssMutation {
         input: RssFeedInput,
     ) -> Result<RssFeed> {
         validate_feed_input(&input)?;
+        let proxy_runtime = ctx
+            .data::<weaver_server_core::SchedulerHandle>()?
+            .proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
+        let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
+            input.routing.clone().map(Into::into);
+        let _route = crate::proxies::draft_route(
+            ctx,
+            weaver_server_core::proxies::Consumer::Rss(id),
+            input.routing.clone(),
+        )?;
 
         let db = ctx.data::<Database>()?.clone();
         let feed = tokio::task::spawn_blocking(move || {
@@ -55,7 +84,7 @@ impl RssMutation {
                 )));
             };
             let row = rss_feed_row_from_update(existing, input);
-            db.update_rss_feed(&row)?;
+            db.update_rss_feed_with_routing(&row, routing.as_ref())?;
             let rules = db
                 .list_rss_rules(row.id)?
                 .iter()
@@ -67,16 +96,25 @@ impl RssMutation {
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
+        crate::proxies::refresh(ctx).await?;
         Ok(feed)
     }
     /// Delete an RSS feed.
     #[graphql(guard = "AdminGuard")]
     async fn delete_rss_feed(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {
+        let proxy_runtime = ctx
+            .data::<weaver_server_core::SchedulerHandle>()?
+            .proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
         let db = ctx.data::<Database>()?.clone();
         let deleted = tokio::task::spawn_blocking(move || db.delete_rss_feed(id))
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        crate::proxies::refresh(ctx).await?;
         Ok(deleted)
     }
     /// Add a new RSS rule.

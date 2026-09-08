@@ -576,7 +576,7 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
         runtime_generation: 0,
         job_id: JobId(21004),
         server_idx: old_key.server_idx,
-        remote_ip: old_key.ip,
+        remote_ip: Some(old_key.ip),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,

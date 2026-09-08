@@ -5,6 +5,14 @@ use crate::servers::{ServerConfig, record::ServerRecord};
 
 impl Database {
     pub fn insert_server(&self, server: &ServerConfig) -> Result<(), StateError> {
+        self.insert_server_with_routing(server, None)
+    }
+
+    pub fn insert_server_with_routing(
+        &self,
+        server: &ServerConfig,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+    ) -> Result<(), StateError> {
         use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
@@ -12,20 +20,35 @@ impl Database {
         let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &record.password)
             .map_err(StateError::Database)?;
         let args = server_args(record, encrypted_password)?;
+        let routing = routing.cloned();
+        let consumer = crate::proxies::Consumer::Server(server.id);
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.read_exec(),
+            SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
+                let args = args.clone(); let routing = routing.clone();
+                Box::pin(async move {
+            tx.execute(
                 "INSERT INTO servers
                     (id, host, port, tls, username, password, connections, active, supports_pipelining, pipelining_depth, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der)
                  VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 &args,
             )
             .await?;
+            crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref()).await?;
             Ok(())
+                })
+            }).await
         })
     }
 
     pub fn update_server(&self, server: &ServerConfig) -> Result<(), StateError> {
+        self.update_server_with_routing(server, None)
+    }
+
+    pub fn update_server_with_routing(
+        &self,
+        server: &ServerConfig,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+    ) -> Result<(), StateError> {
         use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
@@ -35,10 +58,15 @@ impl Database {
         let mut args = server_args(record, encrypted_password)?;
         let id = args.remove(0);
         args.push(id);
+        let routing = routing.cloned();
+        let consumer = crate::proxies::Consumer::Server(server.id);
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.read_exec(),
-                "UPDATE servers
+            SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
+                let args = args.clone();
+                let routing = routing.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE servers
                     SET host = {}, port = {}, tls = {}, username = {}, password = {},
                         connections = {}, active = {}, supports_pipelining = {},
                         pipelining_depth = {}, priority = {},
@@ -49,10 +77,15 @@ impl Database {
                         download_quota_monthly_reset_day = {}, tls_ca_cert = {},
                         tls_name_mismatch_certificate_der = {}
                   WHERE id = {}",
-                &args,
-            )
-            .await?;
-            Ok(())
+                        &args,
+                    )
+                    .await?;
+                    crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref())
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
         })
     }
 
@@ -83,13 +116,23 @@ impl Database {
     pub fn delete_server(&self, id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.read_exec(),
-                "DELETE FROM servers WHERE id = {}",
-                &[SqlArg::I64(i64::from(id))],
-            )
-            .await?;
-            Ok(changed > 0)
+            SqlRuntime::run_in_transaction(&datastore, "delete_routed_consumer", |tx| {
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "DELETE FROM servers WHERE id = {}",
+                            &[SqlArg::I64(i64::from(id))],
+                        )
+                        .await?;
+                    tx.execute(
+                        "DELETE FROM proxy_routes WHERE consumer = {}",
+                        &[SqlArg::Text(crate::proxies::Consumer::Server(id).key())],
+                    )
+                    .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
         })
     }
 }

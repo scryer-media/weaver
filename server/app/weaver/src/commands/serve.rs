@@ -99,7 +99,13 @@ pub(crate) async fn run(
         .await??,
     );
     let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
-    let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy);
+    let proxy_db = db.clone();
+    let runtime_handle = tokio::runtime::Handle::current();
+    let proxies = tokio::task::spawn_blocking(move || {
+        weaver_server_core::proxies::ProxyRuntime::new(proxy_db, runtime_handle)
+    })
+    .await??;
+    let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy, &proxies)?;
     let total_connections: usize = config
         .servers
         .iter()
@@ -118,6 +124,7 @@ pub(crate) async fn run(
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
     let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
     handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
+    handle.set_proxy_runtime(proxies.clone());
     handle.set_nntp_pool(Arc::clone(nntp.pool()));
 
     let recovered_state =
@@ -423,6 +430,7 @@ pub(crate) async fn run(
         _ = shutdown::wait_for_shutdown() => ServeStop::Signal,
         _ = restart_controller.requested() => ServeStop::Restart,
         result = &mut pipeline_task => {
+            proxies.stop_all().await;
             let error = shutdown::pipeline_exit_error(result);
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             server_task.abort();
@@ -440,7 +448,8 @@ pub(crate) async fn run(
             return Err(error.into());
         }
         result = &mut server_task => {
-            handle.shutdown().await.ok();
+            proxies.stop_all().await;
+    handle.shutdown().await.ok();
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during HTTP shutdown");
             }
@@ -468,6 +477,7 @@ pub(crate) async fn run(
         ServeStop::Signal => info!("received shutdown signal, shutting down"),
         ServeStop::Restart => info!("restart requested, shutting down before starting again"),
     }
+    proxies.stop_all().await;
     handle.shutdown().await.ok();
     if let Err(join_error) = pipeline_task.await {
         error!(error = %join_error, "pipeline task failed during shutdown");

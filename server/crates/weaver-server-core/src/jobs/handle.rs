@@ -103,6 +103,7 @@ pub struct SharedPipelineState {
     metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     download_block: Arc<RwLock<DownloadBlockState>>,
     server_quota_blocked: Arc<AtomicBool>,
+    proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
     server_transfer_policy:
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
     nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
@@ -142,6 +143,7 @@ impl SharedPipelineState {
             metrics_snapshot: Arc::new(RwLock::new(metrics_snapshot)),
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
             server_quota_blocked: Arc::new(AtomicBool::new(false)),
+            proxy_runtime: Arc::new(RwLock::new(None)),
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
             nntp_runtime_activation: Arc::new(RwLock::new(None)),
@@ -1242,6 +1244,18 @@ impl SchedulerHandle {
         &self,
     ) -> Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>> {
         self.state.server_transfer_policy()
+    }
+
+    pub fn set_proxy_runtime(&self, runtime: Arc<crate::proxies::ProxyRuntime>) {
+        *self.state.proxy_runtime.write().expect("proxy runtime") = Some(runtime);
+    }
+
+    pub fn proxy_runtime(&self) -> Option<Arc<crate::proxies::ProxyRuntime>> {
+        self.state
+            .proxy_runtime
+            .read()
+            .expect("proxy runtime")
+            .clone()
     }
 
     pub fn set_nntp_pool(&self, pool: Arc<weaver_nntp::pool::NntpPool>) {

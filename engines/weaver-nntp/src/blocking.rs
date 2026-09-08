@@ -1,4 +1,8 @@
+use crate::route_stream::BlockingSocket;
 use std::collections::VecDeque;
+#[cfg(not(windows))]
+#[path = "s2n_io.rs"]
+mod s2n_io;
 #[cfg(not(windows))]
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
@@ -81,7 +85,8 @@ pub struct BlockingLaneStats {
 struct BlockingS2nStream {
     conn: RawS2nConnection,
     _config: RawS2nConfig,
-    tcp: TcpStream,
+    // Stable address for the s2n callback contexts, even when the lane moves.
+    tcp: Box<BlockingSocket>,
     stats: BlockingLaneStats,
 }
 
@@ -90,14 +95,14 @@ struct BlockingS2nStream {
 /// through the shared `RustlsSession` engine — so throughput economics match
 /// the s2n lane rather than a per-record `rustls::StreamOwned` loop.
 struct BlockingManualTlsStream {
-    tcp: TcpStream,
+    tcp: BlockingSocket,
     session: RustlsSession,
     read_buffer: Vec<u8>,
     stats: BlockingLaneStats,
 }
 
 enum BlockingTransport {
-    Plain(TcpStream),
+    Plain(BlockingSocket),
     Rustls(Box<BlockingManualTlsStream>),
     #[cfg(not(windows))]
     S2n(BlockingS2nStream),
@@ -165,7 +170,7 @@ pub struct BlockingBodyLane {
     checkpoint_plan: CheckpointPlan,
     server_id: ServerId,
     stable_server_id: StableServerId,
-    remote_ip: IpAddr,
+    remote_ip: Option<IpAddr>,
     mode: BodyLaneMode,
     /// Command-to-status-line wait. Only sampled when no other request was
     /// outstanding, so pipelined batches cannot report it as near zero.
@@ -181,6 +186,8 @@ pub struct BlockingBodyLane {
 }
 
 pub struct BlockingNntpConnection {
+    route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
+    _route_socket: Option<Arc<socket2::Socket>>,
     transport: BlockingTransport,
     codec: NntpCodec,
     read_buf: BytesMut,
@@ -191,7 +198,7 @@ pub struct BlockingNntpConnection {
     /// recorded against the server rather than the resolved address.
     host: String,
     port: u16,
-    remote_addr: SocketAddr,
+    remote_addr: Option<SocketAddr>,
     command_timeout: Duration,
     current_group: Option<String>,
     credentials: Option<(String, String)>,
@@ -319,7 +326,7 @@ impl BlockingBodyLane {
         self.stable_server_id
     }
 
-    pub fn remote_ip(&self) -> IpAddr {
+    pub fn remote_ip(&self) -> Option<IpAddr> {
         self.remote_ip
     }
 
@@ -874,7 +881,7 @@ impl BlockingBodyLane {
         DecodedBodyTrace {
             attempts: vec![FetchAttemptTrace {
                 server_idx: self.server_id.0,
-                remote_ip: Some(self.remote_ip),
+                remote_ip: self.remote_ip,
                 elapsed,
                 outcome,
                 error,
@@ -952,6 +959,20 @@ impl BlockingNntpConnection {
             ));
         }
 
+        if let Some(registry) = &config.revocation {
+            registry.check()?;
+        }
+        if config.proxy.is_some() {
+            let (tcp, outcome) = crate::proxy::connect_blocking(config)?;
+            return Self::from_tcp(
+                config,
+                tcp,
+                None,
+                backend_override,
+                initial_group,
+                Some(outcome),
+            );
+        }
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
         let addrs = resolve_addrs(&config.host, config.port, excluded_ips, address_offset)?;
         let mut last_error = None;
@@ -963,13 +984,14 @@ impl BlockingNntpConnection {
                         .map_err(NntpError::Io)?;
                     tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
                         .map_err(NntpError::Io)?;
-                    let remote_addr = tcp.peer_addr().unwrap_or(addr);
+                    let remote_addr = Some(tcp.peer_addr().unwrap_or(addr));
                     return Self::from_tcp(
                         config,
                         tcp,
                         remote_addr,
                         backend_override,
                         initial_group,
+                        None,
                     );
                 }
                 Err(error) => last_error = Some(error),
@@ -983,11 +1005,19 @@ impl BlockingNntpConnection {
 
     fn from_tcp(
         config: &ServerConfig,
-        tcp: TcpStream,
-        remote_addr: SocketAddr,
+        tcp: impl Into<BlockingSocket>,
+        remote_addr: Option<SocketAddr>,
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
+        route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
     ) -> Result<Self> {
+        let tcp = tcp.into();
+        let route_socket = config
+            .revocation
+            .as_ref()
+            .zip(tcp.tcp())
+            .map(|(r, tcp)| r.track(socket2::SockRef::from(tcp)))
+            .transpose()?;
         let transport = if config.tls {
             let backend = if config.tls_name_mismatch_certificate_der.is_some() {
                 NntpTlsBackend::ManualRustls
@@ -1025,6 +1055,8 @@ impl BlockingNntpConnection {
 
         let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
         let mut conn = Self {
+            route_outcome,
+            _route_socket: route_socket,
             transport,
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
@@ -1107,8 +1139,8 @@ impl BlockingNntpConnection {
         Ok(conn)
     }
 
-    pub fn remote_ip(&self) -> IpAddr {
-        self.remote_addr.ip()
+    pub fn remote_ip(&self) -> Option<IpAddr> {
+        self.remote_addr.map(|addr| addr.ip())
     }
 
     pub fn capabilities(&self) -> &Capabilities {
@@ -1228,7 +1260,13 @@ impl BlockingNntpConnection {
 
     fn write_command_frame_with_timeout(&mut self, cmd: &Command, timeout: Duration) -> Result<()> {
         let encoded = cmd.encode();
-        self.transport.write_all(&encoded, timeout)?;
+        self.transport
+            .write_all(&encoded, timeout)
+            .inspect_err(|_| {
+                if let Some(outcome) = &self.route_outcome {
+                    outcome.failed();
+                }
+            })?;
         Ok(())
     }
 
@@ -1247,7 +1285,11 @@ impl BlockingNntpConnection {
     }
 
     fn flush_commands_with_timeout(&mut self, timeout: Duration) -> Result<()> {
-        self.transport.flush(timeout)
+        self.transport.flush(timeout).inspect_err(|_| {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
+        })
     }
 
     fn flush_commands_with_active_budget(
@@ -1358,6 +1400,9 @@ impl BlockingNntpConnection {
 
     fn poison_on_soft_timeout(&mut self, error: &NntpError) {
         if matches!(error, NntpError::SoftTimeout(_)) {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             self.current_group = None;
         }
@@ -1965,6 +2010,7 @@ impl BlockingNntpConnection {
     }
 
     pub fn quit(&mut self) -> Result<()> {
+        self.route_outcome = None;
         let _ = self.send_command(&Command::Quit);
         Ok(())
     }
@@ -1995,11 +2041,17 @@ impl BlockingNntpConnection {
                 timeout,
             )
             .map_err(|error| {
+                if let Some(outcome) = &self.route_outcome {
+                    outcome.failed();
+                }
                 self.poisoned = true;
                 self.current_group = None;
                 NntpError::Io(error)
             })?;
         if n == 0 {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             self.current_group = None;
             return Err(NntpError::ConnectionClosed);
@@ -2076,13 +2128,14 @@ impl BlockingTransport {
 
 impl BlockingManualTlsStream {
     fn connect(
-        tcp: TcpStream,
+        tcp: impl Into<BlockingSocket>,
         host: &str,
         ca_cert_path: Option<&std::path::Path>,
         adopted_name_mismatch_certificate_der: Option<&[u8]>,
         cipher_preference: TlsCipherPreference,
         timeout: Duration,
     ) -> Result<Self> {
+        let tcp = tcp.into();
         tcp.set_read_timeout(Some(timeout)).map_err(NntpError::Io)?;
         tcp.set_write_timeout(Some(timeout))
             .map_err(NntpError::Io)?;
@@ -2209,11 +2262,12 @@ impl BlockingManualTlsStream {
 #[cfg(not(windows))]
 impl BlockingS2nStream {
     fn connect(
-        tcp: TcpStream,
+        tcp: impl Into<BlockingSocket>,
         host: &str,
         ca_cert_path: Option<&std::path::Path>,
         timeout: Duration,
     ) -> Result<Self> {
+        let tcp = Box::new(tcp.into());
         // Keep the direct S2N fd blocking for the throughput path, but wake a
         // stalled syscall often enough for the elapsed operation deadline to
         // be checked without reconfiguring socket options on every I/O call.
@@ -2260,9 +2314,27 @@ impl BlockingS2nStream {
                 s2n::s2n_blinding::SELF_SERVICE_BLINDING,
             )
         })?;
-        check_s2n_status("set fd", unsafe {
-            s2n::s2n_connection_set_fd(self.conn.as_ptr(), self.tcp.as_raw_fd())
-        })?;
+        if let Some(tcp) = self.tcp.tcp() {
+            check_s2n_status("set fd", unsafe {
+                s2n::s2n_connection_set_fd(self.conn.as_ptr(), tcp.as_raw_fd())
+            })?;
+        } else {
+            let context = (&mut *self.tcp as *mut BlockingSocket).cast();
+            // The boxed context outlives conn, and s2n calls it synchronously
+            // on this lane's sole owning thread.
+            check_s2n_status("set receive context", unsafe {
+                s2n::s2n_connection_set_recv_ctx(self.conn.as_ptr(), context)
+            })?;
+            check_s2n_status("set send context", unsafe {
+                s2n::s2n_connection_set_send_ctx(self.conn.as_ptr(), context)
+            })?;
+            check_s2n_status("set receive callback", unsafe {
+                s2n::s2n_connection_set_recv_cb(self.conn.as_ptr(), Some(s2n_io::recv))
+            })?;
+            check_s2n_status("set send callback", unsafe {
+                s2n::s2n_connection_set_send_cb(self.conn.as_ptr(), Some(s2n_io::send))
+            })?;
+        }
         Ok(())
     }
 
@@ -2275,7 +2347,7 @@ impl BlockingS2nStream {
                 let _ = unsafe { s2n::s2n_connection_free_handshake(self.conn.as_ptr()) };
                 return Ok(());
             }
-            if s2n_retryable_blocked(blocked) && started.elapsed() < timeout {
+            if s2n_retryable_blocked() && started.elapsed() < timeout {
                 continue;
             }
             return Err(s2n_last_error("handshake", blocked));
@@ -2350,7 +2422,7 @@ impl BlockingS2nStream {
             } else {
                 stats.backend_pending_after_bytes_returns += 1;
             }
-            if s2n_retryable_blocked(blocked) {
+            if s2n_retryable_blocked() {
                 if total > 0 {
                     break;
                 }
@@ -2398,7 +2470,7 @@ impl BlockingS2nStream {
                     "s2n write returned zero",
                 )));
             }
-            if s2n_retryable_blocked(blocked) && started.elapsed() < timeout {
+            if s2n_retryable_blocked() && started.elapsed() < timeout {
                 continue;
             }
             return Err(s2n_last_error("send", blocked));
@@ -2414,7 +2486,7 @@ impl BlockingS2nStream {
             if rc >= 0 {
                 return Ok(());
             }
-            if s2n_retryable_blocked(blocked) && started.elapsed() < timeout {
+            if s2n_retryable_blocked() && started.elapsed() < timeout {
                 continue;
             }
             return Err(s2n_last_error("flush", blocked));
@@ -2537,7 +2609,7 @@ fn s2n_last_error(context: &str, blocked: s2n::s2n_blocked_status::Type) -> Nntp
     if kind == s2n::s2n_error_type::IO {
         return NntpError::Io(io::Error::last_os_error());
     }
-    if kind == s2n::s2n_error_type::BLOCKED || blocked != s2n::s2n_blocked_status::NOT_BLOCKED {
+    if kind == s2n::s2n_error_type::BLOCKED {
         return NntpError::Io(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("blocking s2n timed out during {context}: blocked={blocked}"),
@@ -2552,10 +2624,9 @@ fn s2n_last_error(context: &str, blocked: s2n::s2n_blocked_status::Type) -> Nntp
 }
 
 #[cfg(not(windows))]
-fn s2n_retryable_blocked(blocked: s2n::s2n_blocked_status::Type) -> bool {
-    if blocked != s2n::s2n_blocked_status::NOT_BLOCKED {
-        return true;
-    }
+fn s2n_retryable_blocked() -> bool {
+    // s2n can leave BLOCKED_ON_READ set after a fatal transport error.
+    // Only the error type determines whether the operation may be retried.
     let errno = unsafe { *s2n::s2n_errno_location() };
     let kind = unsafe { s2n::s2n_error_get_type(errno) as s2n::s2n_error_type::Type };
     kind == s2n::s2n_error_type::BLOCKED

@@ -26,18 +26,27 @@ pub struct ServerConnectivityResult {
 }
 
 pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivityResult {
+    probe_server_connection_with_proxy(config, None).await
+}
+
+pub async fn probe_server_connection_with_proxy(
+    config: &ServerConfig,
+    proxy: Option<std::sync::Arc<weaver_tunnel::bridge::Bridge>>,
+) -> ServerConnectivityResult {
     // Inspect an unadopted TLS server before the ordinary NNTP probe. A trusted
     // hostname mismatch stops here, before any greeting or credentials are
     // exchanged, and the first handshake supplies the exact candidate shown in
     // the server form.
     if config.tls
         && config.tls_name_mismatch_certificate_der.is_none()
-        && let Ok(Some(certificate_der)) = weaver_nntp::tls::inspect_tls_name_mismatch_certificate(
-            &config.host,
-            config.port,
-            config.tls_ca_cert.as_deref(),
-        )
-        .await
+        && let Ok(Some(certificate_der)) =
+            weaver_nntp::tls::inspect_tls_name_mismatch_certificate_via(
+                &config.host,
+                config.port,
+                config.tls_ca_cert.as_deref(),
+                proxy.as_ref(),
+            )
+            .await
     {
         return ServerConnectivityResult {
             success: false,
@@ -53,6 +62,7 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
     }
 
     let nntp_config = weaver_nntp::ServerConfig {
+        proxy: proxy.clone(),
         host: config.host.clone(),
         port: config.port,
         tls: config.tls,
@@ -90,10 +100,11 @@ pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivit
         }
         Err(error) => {
             let adoptable_tls_name_mismatch_certificate_der = if config.tls {
-                weaver_nntp::tls::inspect_tls_name_mismatch_certificate(
+                weaver_nntp::tls::inspect_tls_name_mismatch_certificate_via(
                     &config.host,
                     config.port,
                     config.tls_ca_cert.as_deref(),
+                    proxy.as_ref(),
                 )
                 .await
                 .ok()

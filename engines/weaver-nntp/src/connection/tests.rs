@@ -112,13 +112,18 @@ async fn connect_tls_drain_client(
     let remote_addr = tcp.peer_addr().unwrap();
     let connector = TlsConnector::from(client_config);
     let server_name = ServerName::try_from("localhost").unwrap();
-    let tls = connector.connect(server_name, tcp).await.unwrap();
+    let tls = connector
+        .connect(server_name, crate::route_stream::RouteStream::from(tcp))
+        .await
+        .unwrap();
     let now = Instant::now();
 
     NntpConnection {
+        _route_socket: None,
+        route_outcome: None,
         transport: Some(NntpTransport::Tls {
             inner: tls,
-            remote_addr,
+            remote_addr: Some(remote_addr),
         }),
         codec: NntpCodec::new(),
         read_buf: BytesMut::with_capacity(256 * 1024),
@@ -130,7 +135,7 @@ async fn connect_tls_drain_client(
         capabilities: Capabilities::default(),
         host: "localhost".to_string(),
         port: remote_addr.port(),
-        remote_addr,
+        remote_addr: Some(remote_addr),
         created_at: now,
         last_used: now,
         command_timeout: Duration::from_secs(5),
@@ -672,7 +677,10 @@ async fn manual_tls_transport_bulk_drain_probe() {
     let inner = ManualTlsStream::connect(tcp, client_config, server_name)
         .await
         .unwrap();
-    let mut transport = NntpTransport::ManualTls { inner, remote_addr };
+    let mut transport = NntpTransport::ManualTls {
+        inner,
+        remote_addr: Some(remote_addr),
+    };
 
     flushed_rx.await.expect("test server flushed TLS payload");
 
@@ -722,7 +730,10 @@ async fn manual_tls_transport_bounds_each_turn_and_preserves_stream() {
     let inner = ManualTlsStream::connect(tcp, client_config, server_name)
         .await
         .unwrap();
-    let mut transport = NntpTransport::ManualTls { inner, remote_addr };
+    let mut transport = NntpTransport::ManualTls {
+        inner,
+        remote_addr: Some(remote_addr),
+    };
     let mut received = Vec::with_capacity(payload_len);
     let mut read_buf = BytesMut::with_capacity(TLS_READ_TURN_LIMIT);
     let mut read_calls = 0usize;

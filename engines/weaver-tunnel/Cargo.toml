@@ -1,0 +1,24 @@
+[package]
+name = "weaver-tunnel"
+version.workspace = true
+edition.workspace = true
+license-file = "LICENSE"
+
+[features]
+default = []
+# In-process SSH, WireGuard, DNS and proxy fixtures for consumer integration tests.
+# Never enabled in a product build.
+test-support = ["proxy-tunnels/test-support"]
+
+[dependencies]
+# Shared SSH/WireGuard protocol implementation, pinned to an immutable revision.
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "8c54eb1348d58afe72cd158fe0d084074617a3a1" }
+base64 = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "8c54eb1348d58afe72cd158fe0d084074617a3a1", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }

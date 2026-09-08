@@ -40,6 +40,8 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("weaver_internal_metadata", Ignore, Replace),
     table!("settings", Export, Replace),
     table!("servers", Export, Replace),
+    table!("proxy_profiles", Export, RequireEmpty),
+    table!("proxy_routes", Export, RequireEmpty),
     table!("server_download_usage", Export, RequireZeroUsage),
     table!("server_tls_diagnostics", Export, Replace),
     table!("categories", Export, Replace),

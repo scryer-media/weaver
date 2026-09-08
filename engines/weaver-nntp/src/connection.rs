@@ -249,6 +249,9 @@ pub enum PipeliningCapability {
 /// Configuration for connecting to a single NNTP server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// Revocable route transport. None retains the direct socket path.
+    pub proxy: Option<Arc<weaver_tunnel::bridge::Bridge>>,
+    pub revocation: Option<Arc<crate::revocation::SocketRegistry>>,
     /// Hostname or IP address.
     pub host: String,
     /// Port number.
@@ -288,6 +291,8 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
+            proxy: None,
+            revocation: None,
             host: String::new(),
             port: 563,
             tls: true,
@@ -312,6 +317,8 @@ impl Default for ServerConfig {
 /// to avoid borrow-checker issues when we need simultaneous access to the codec,
 /// buffer, and transport.
 pub struct NntpConnection {
+    route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
+    _route_socket: Option<Arc<socket2::Socket>>,
     /// Wrapped in Option to allow taking ownership during STARTTLS upgrade.
     transport: Option<NntpTransport>,
     codec: NntpCodec,
@@ -323,7 +330,7 @@ pub struct NntpConnection {
     /// Kept alongside `host` so a requirement learned on this connection is
     /// recorded against the endpoint, not the resolved address.
     port: u16,
-    remote_addr: SocketAddr,
+    remote_addr: Option<SocketAddr>,
     created_at: Instant,
     last_used: Instant,
     command_timeout: Duration,
@@ -385,7 +392,11 @@ impl NntpConnection {
         address_offset: usize,
         initial_group: Option<&str>,
     ) -> Result<Self> {
-        let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
+        let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT)
+            + config
+                .proxy
+                .as_ref()
+                .map_or(Duration::ZERO, |p| p.connect_timeout);
         let result = tokio::time::timeout(connect_timeout, async {
             Self::connect_inner(config, excluded_ips, address_offset, initial_group).await
         })
@@ -405,8 +416,44 @@ impl NntpConnection {
     ) -> Result<Self> {
         debug!(host = %config.host, port = config.port, tls = config.tls, "connecting to NNTP server");
 
-        // 1. Establish transport
-        let transport = if config.tls {
+        if let Some(registry) = &config.revocation {
+            registry.check()?;
+        }
+        let mut route_socket = None;
+        let mut route_outcome = None;
+        // Register direct sockets before TLS so revocation also interrupts handshakes.
+        let transport = if config.proxy.is_some() {
+            let (transport, outcome) = crate::proxy::connect(config).await?;
+            route_outcome = Some(outcome);
+            transport
+        } else if let Some(registry) = &config.revocation {
+            let plain = crate::tls::connect_plain_with_ip_policy(
+                &config.host,
+                config.port,
+                excluded_ips,
+                address_offset,
+            )
+            .await?;
+            if let NntpTransport::Plain {
+                inner: crate::route_stream::RouteStream::Tcp(inner),
+                ..
+            } = &plain
+            {
+                route_socket = Some(registry.track(socket2::SockRef::from(inner))?);
+            }
+            if config.tls {
+                crate::tls::upgrade_starttls(
+                    plain,
+                    &config.host,
+                    config.tls_ca_cert.as_deref(),
+                    config.tls_name_mismatch_certificate_der.as_deref(),
+                    config.tls_cipher_preference,
+                )
+                .await?
+            } else {
+                plain
+            }
+        } else if config.tls {
             crate::tls::connect_tls_with_ip_policy(
                 &config.host,
                 config.port,
@@ -431,6 +478,8 @@ impl NntpConnection {
         let remote_addr = transport.remote_addr();
         let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
         let mut conn = NntpConnection {
+            route_outcome,
+            _route_socket: route_socket,
             transport: Some(transport),
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
@@ -660,6 +709,9 @@ impl NntpConnection {
 
         let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
         transport.write_all(&encoded).await.map_err(|e| {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             self.current_group = None;
             NntpError::Io(e)
@@ -670,6 +722,9 @@ impl NntpConnection {
     pub async fn flush_commands(&mut self) -> Result<()> {
         let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
         transport.flush().await.map_err(|e| {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             self.current_group = None;
             NntpError::Io(e)
@@ -760,7 +815,13 @@ impl NntpConnection {
     }
 
     fn poison_on_soft_timeout(&mut self, error: &NntpError) {
-        if matches!(error, NntpError::SoftTimeout(_)) {
+        if matches!(
+            error,
+            NntpError::SoftTimeout(_) | NntpError::Timeout | NntpError::TruncatedMultilineBody
+        ) {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             self.current_group = None;
         }
@@ -903,6 +964,9 @@ impl NntpConnection {
         match result {
             Ok(inner) => inner,
             Err(_) => {
+                if let Some(outcome) = &self.route_outcome {
+                    outcome.failed();
+                }
                 self.poisoned = true;
                 self.current_group = None;
                 Err(NntpError::Timeout)
@@ -1204,12 +1268,18 @@ impl NntpConnection {
             let cmd = Command::Stat(ArticleId::MessageId(msg_id.to_string()));
             let encoded = cmd.encode();
             transport.write_all(&encoded).await.map_err(|e| {
+                if let Some(outcome) = &self.route_outcome {
+                    outcome.failed();
+                }
                 self.poisoned = true;
                 NntpError::Io(e)
             })?;
         }
         // Single flush for the entire batch.
         transport.flush().await.map_err(|e| {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             NntpError::Io(e)
         })?;
@@ -1260,11 +1330,17 @@ impl NntpConnection {
             let cmd = Command::Head(ArticleId::MessageId(msg_id.to_string()));
             let encoded = cmd.encode();
             transport.write_all(&encoded).await.map_err(|e| {
+                if let Some(outcome) = &self.route_outcome {
+                    outcome.failed();
+                }
                 self.poisoned = true;
                 NntpError::Io(e)
             })?;
         }
         transport.flush().await.map_err(|e| {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             NntpError::Io(e)
         })?;
@@ -1867,12 +1943,18 @@ impl NntpConnection {
             .read_into_buf(&mut self.read_buf, socket_read_size)
             .await
             .map_err(|e| {
+                if let Some(outcome) = &self.route_outcome {
+                    outcome.failed();
+                }
                 self.poisoned = true;
                 self.current_group = None;
                 NntpError::Io(e)
             })?;
 
         if n == 0 {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             self.current_group = None;
             return Err(NntpError::ConnectionClosed);
@@ -1889,12 +1971,18 @@ impl NntpConnection {
             .read_into_buf_with_stats(&mut self.read_buf, socket_read_size)
             .await
             .map_err(|e| {
+                if let Some(outcome) = &self.route_outcome {
+                    outcome.failed();
+                }
                 self.poisoned = true;
                 self.current_group = None;
                 NntpError::Io(e)
             })?;
 
         if read.bytes == 0 {
+            if let Some(outcome) = &self.route_outcome {
+                outcome.failed();
+            }
             self.poisoned = true;
             self.current_group = None;
             return Err(NntpError::ConnectionClosed);
@@ -1906,6 +1994,7 @@ impl NntpConnection {
     /// Send QUIT and close the connection gracefully.
     pub async fn quit(&mut self) -> Result<()> {
         self.state = ConnectionState::Closing;
+        self.route_outcome = None;
         let _ = self.send_command(&Command::Quit).await;
         Ok(())
     }
@@ -1947,12 +2036,12 @@ impl NntpConnection {
             .and_then(NntpTransport::negotiated_cipher_suite)
     }
 
-    pub fn remote_addr(&self) -> SocketAddr {
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
         self.remote_addr
     }
 
-    pub fn remote_ip(&self) -> IpAddr {
-        self.remote_addr.ip()
+    pub fn remote_ip(&self) -> Option<IpAddr> {
+        self.remote_addr.map(|addr| addr.ip())
     }
 }
 

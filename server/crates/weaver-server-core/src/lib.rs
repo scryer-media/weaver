@@ -14,6 +14,7 @@ pub mod operations;
 pub mod persistence;
 pub mod pipeline;
 pub mod post_processing;
+pub mod proxies;
 pub mod rss;
 pub mod runtime;
 pub mod schema_migrations;

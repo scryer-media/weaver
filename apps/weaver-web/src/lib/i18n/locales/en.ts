@@ -2,6 +2,8 @@ import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
 
 const en: LocaleDictionary = {
+  "settings.proxies": "Proxies",
+  "settings.proxiesDesc": "Reusable proxy profiles and private routes for servers and RSS feeds.",
   // Brand
 
   // Navigation

@@ -27,6 +27,7 @@ pub async fn rebuild_nntp_from_config(
         SchedulerError::Internal("server transfer policy registry unavailable".to_string())
     })?;
     let transfer_registry = policy_registry.transfer_registry();
+    let proxy_runtime = handle.proxy_runtime();
 
     let configured_servers = config.read().await.servers.clone();
     let registry = std::sync::Arc::clone(&policy_registry);
@@ -52,31 +53,44 @@ pub async fn rebuild_nntp_from_config(
         active.sort_by_key(|server| (server.priority, server.id));
         let servers: Vec<ServerPoolConfig> = active
             .iter()
-            .map(|server| ServerPoolConfig {
-                server: weaver_nntp::ServerConfig {
-                    host: server.host.clone(),
-                    port: server.port,
-                    tls: server.tls,
-                    username: server.username.clone(),
-                    password: server.password.clone(),
-                    tls_ca_cert: server.tls_ca_cert.clone(),
-                    tls_name_mismatch_certificate_der: server
-                        .tls_name_mismatch_certificate_der
-                        .clone(),
-                    pipelining: weaver_nntp::PipeliningCapability::Known(
-                        server.supports_pipelining,
-                    ),
-                    pipelining_depth: server.pipelining_depth,
-                    ..Default::default()
-                },
-                max_connections: server.connections as usize,
-                group: server.priority,
-                backfill: server.backfill,
-                retention_days: server.retention_days,
-                stable_id: StableServerId(server.id),
-                transfer_control: Some(transfer_registry.control(StableServerId(server.id))),
+            .map(|server| {
+                Ok::<_, SchedulerError>(ServerPoolConfig {
+                    server: weaver_nntp::ServerConfig {
+                        proxy: proxy_runtime
+                            .as_ref()
+                            .map(|runtime| runtime.nntp_bridge(server.id))
+                            .transpose()
+                            .map_err(SchedulerError::Internal)?
+                            .flatten(),
+                        revocation: proxy_runtime
+                            .as_ref()
+                            .map(|runtime| runtime.nntp_sockets(server.id))
+                            .transpose()
+                            .map_err(SchedulerError::Internal)?,
+                        host: server.host.clone(),
+                        port: server.port,
+                        tls: server.tls,
+                        username: server.username.clone(),
+                        password: server.password.clone(),
+                        tls_ca_cert: server.tls_ca_cert.clone(),
+                        tls_name_mismatch_certificate_der: server
+                            .tls_name_mismatch_certificate_der
+                            .clone(),
+                        pipelining: weaver_nntp::PipeliningCapability::Known(
+                            server.supports_pipelining,
+                        ),
+                        pipelining_depth: server.pipelining_depth,
+                        ..Default::default()
+                    },
+                    max_connections: server.connections as usize,
+                    group: server.priority,
+                    backfill: server.backfill,
+                    retention_days: server.retention_days,
+                    stable_id: StableServerId(server.id),
+                    transfer_control: Some(transfer_registry.control(StableServerId(server.id))),
+                })
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let total: usize = servers.iter().map(|server| server.max_connections).sum();
         tracing::info!(
@@ -121,6 +135,9 @@ pub async fn reload_runtime_from_db(
         *cfg = loaded.clone();
     }
 
+    if let Some(proxies) = handle.proxy_runtime() {
+        proxies.reload().await?;
+    }
     rebuild_nntp_from_config(config, handle)
         .await
         .map_err(|error| error.to_string())?;

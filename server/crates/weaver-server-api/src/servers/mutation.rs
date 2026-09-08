@@ -34,10 +34,22 @@ impl ServersMutation {
             weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
         >>()?;
         let _mutation_guard = SERVER_MUTATION_GUARD.lock().await;
+        let proxy_runtime = handle.proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
+        let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
+            input.routing.clone().map(Into::into);
+        let route = crate::proxies::draft_route(
+            ctx,
+            weaver_server_core::proxies::Consumer::Server(0),
+            input.routing.clone(),
+        )?;
         let normalized =
             NormalizedServerInput::from_input(input, None).map_err(async_graphql::Error::new)?;
 
-        let probe = validate_server_before_save(&normalized).await?;
+        let probe = validate_server_before_save(&normalized, route.as_ref()).await?;
 
         let id = {
             let db = db.clone();
@@ -58,7 +70,7 @@ impl ServersMutation {
             let db = db.clone();
             let persist = async move {
                 spawn_blocking_db("servers.mutation.add_server.persist", move || {
-                    db.insert_server(&persisted_server)
+                    db.insert_server_with_routing(&persisted_server, routing.as_ref())
                 })
                 .await
             };
@@ -86,6 +98,7 @@ impl ServersMutation {
         let tls_diagnostics = persist_tls_diagnostics(db, id, probe.as_ref()).await?;
         info!(id, "server added");
 
+        crate::proxies::refresh(ctx).await?;
         activate_nntp_runtime("add_server", id, config, handle).await?;
         let snapshot = policy.snapshot(added.id);
         Ok(Server::from_config(&added, snapshot.as_ref())
@@ -106,6 +119,18 @@ impl ServersMutation {
             weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
         >>()?;
         let _mutation_guard = SERVER_MUTATION_GUARD.lock().await;
+        let proxy_runtime = handle.proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
+        let routing: Option<weaver_server_core::proxies::RoutingPolicy> =
+            input.routing.clone().map(Into::into);
+        let route = crate::proxies::draft_route(
+            ctx,
+            weaver_server_core::proxies::Consumer::Server(id),
+            input.routing.clone(),
+        )?;
 
         let existing =
             with_timed_config_read(config, "servers.mutation.update_server.existing", |cfg| {
@@ -119,7 +144,7 @@ impl ServersMutation {
         let normalized = NormalizedServerInput::from_input(input, Some(&existing))
             .map_err(async_graphql::Error::new)?;
 
-        let probe = validate_server_before_save(&normalized).await?;
+        let probe = validate_server_before_save(&normalized, route.as_ref()).await?;
         let mut server = normalized.as_runtime_server_config(id);
         server.supports_pipelining = probe
             .as_ref()
@@ -147,7 +172,7 @@ impl ServersMutation {
             let db = db.clone();
             let persisted_server = server.clone();
             spawn_blocking_db("servers.mutation.update_server.persist", move || {
-                db.update_server(&persisted_server)
+                db.update_server_with_routing(&persisted_server, routing.as_ref())
             })
             .await?;
         }
@@ -167,6 +192,7 @@ impl ServersMutation {
         let tls_diagnostics = persist_tls_diagnostics(db, id, probe.as_ref()).await?;
         info!(id, "server updated");
 
+        crate::proxies::refresh(ctx).await?;
         activate_nntp_runtime("update_server", id, config, handle).await?;
         let snapshot = policy.snapshot(updated.id);
         Ok(Server::from_config(&updated, snapshot.as_ref())
@@ -182,6 +208,11 @@ impl ServersMutation {
             weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
         >>()?;
         let _mutation_guard = SERVER_MUTATION_GUARD.lock().await;
+        let proxy_runtime = handle.proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
 
         with_timed_config_read(config, "servers.mutation.remove_server.validate", |cfg| {
             if cfg.servers.iter().any(|server| server.id == id) {
@@ -220,6 +251,7 @@ impl ServersMutation {
 
         info!(id, "server removed");
 
+        crate::proxies::refresh(ctx).await?;
         activate_nntp_runtime("remove_server", id, config, handle).await?;
         let snapshots = policy
             .snapshots()
@@ -278,6 +310,11 @@ impl ServersMutation {
         ctx: &Context<'_>,
         id: u32,
     ) -> Result<TestConnectionResult> {
+        let proxy_runtime = ctx.data::<SchedulerHandle>()?.proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
         let config = ctx.data::<SharedConfig>()?;
         let server = with_timed_config_read(
             config,
@@ -291,7 +328,12 @@ impl ServersMutation {
             },
         )
         .await?;
-        let probe = weaver_server_core::servers::probe_server_connection(&server).await;
+        let route = crate::proxies::draft_route(
+            ctx,
+            weaver_server_core::proxies::Consumer::Server(id),
+            None,
+        )?;
+        let probe = probe_through_route(&server, route.as_ref()).await?;
         if let Ok(handle) = ctx.data::<SchedulerHandle>() {
             note_probe_first_byte_latency(handle, id, Some(&probe));
         }
@@ -302,9 +344,19 @@ impl ServersMutation {
     #[graphql(guard = "AdminGuard")]
     async fn test_connection(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         input: ServerInput,
     ) -> Result<TestConnectionResult> {
+        let proxy_runtime = ctx.data::<SchedulerHandle>()?.proxy_runtime();
+        let _proxy_guard = match &proxy_runtime {
+            Some(runtime) => Some(runtime.mutations.lock().await),
+            None => None,
+        };
+        let route = crate::proxies::draft_route(
+            ctx,
+            weaver_server_core::proxies::Consumer::Server(0),
+            input.routing.clone(),
+        )?;
         let normalized = match NormalizedServerInput::from_input(input, None) {
             Ok(normalized) => normalized,
             Err(message) => {
@@ -322,11 +374,11 @@ impl ServersMutation {
             }
         };
 
-        Ok(weaver_server_core::servers::probe_server_connection(
-            &normalized.as_runtime_server_config(0),
+        Ok(
+            probe_through_route(&normalized.as_runtime_server_config(0), route.as_ref())
+                .await?
+                .into(),
         )
-        .await
-        .into())
     }
 
     // ── Categories ────────────────────────────────────────────────────
@@ -459,17 +511,41 @@ fn note_probe_first_byte_latency(
 }
 
 /// Probe an active server before it is saved. `None` means the server is
+fn probe_through_route<'a>(
+    server: &'a weaver_server_core::servers::ServerConfig,
+    route: Option<&'a std::sync::Arc<weaver_server_core::proxies::ConsumerRoute>>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ServerConnectivityResult>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        let proxy = match route {
+            Some(route) if !route.policy.is_direct() => {
+                Some(route.bridge().map_err(async_graphql::Error::new)?)
+            }
+            _ => None,
+        };
+        let result =
+            weaver_server_core::servers::probe_server_connection_with_proxy(server, proxy).await;
+        if let Some(route) = route {
+            route.revoke().await;
+        }
+        Ok(result)
+    })
+}
+
+/// Probe an active server before it is saved. `None` means the server is
 /// inactive and no probe ran, so previously learned facts are kept.
 async fn validate_server_before_save(
     input: &NormalizedServerInput,
+    route: Option<&std::sync::Arc<weaver_server_core::proxies::ConsumerRoute>>,
 ) -> Result<Option<ServerConnectivityResult>> {
-    if !input.active {
+    if !input.active
+        || route.is_some_and(|r| r.policy.proxy_ids.is_empty() && !r.policy.allow_direct)
+    {
         return Ok(None);
     }
 
-    let result =
-        weaver_server_core::servers::probe_server_connection(&input.as_runtime_server_config(0))
-            .await;
+    let result = probe_through_route(&input.as_runtime_server_config(0), route).await?;
     if result.success {
         Ok(Some(result))
     } else {
@@ -604,6 +680,7 @@ mod tests {
 
     fn inactive_server_input() -> ServerInput {
         ServerInput {
+            routing: None,
             host: "news.example.com".to_string(),
             port: 119,
             tls: false,

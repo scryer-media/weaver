@@ -22,6 +22,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use crate::connection::{NntpConnection, ServerConfig};
+
+async fn acquisition_budget<T>(
+    deadline: Option<&tokio::time::Instant>,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if let Some(deadline) = deadline {
+        tokio::time::timeout_at(*deadline, future)
+            .await
+            .map_err(|_| NntpError::AcquireTimeout(0))?
+    } else {
+        future.await
+    }
+}
 use crate::error::{NntpError, Result};
 use crate::health::{DisableReason, HealthConfig, HealthTracker, ServerState};
 use crate::transfer::{ServerTransferControl, StableServerId};
@@ -335,6 +348,40 @@ impl NntpPool {
         self.acquire_for_group(server, None).await
     }
 
+    pub(crate) async fn acquire_before_deadline(
+        &self,
+        server: ServerId,
+        initial_group: Option<&str>,
+        deadline: &mut tokio::time::Instant,
+    ) -> Result<PooledConnection> {
+        if self.shutdown.is_cancelled() {
+            return Err(NntpError::PoolShutdown);
+        }
+        let idx = server.0;
+        let semaphore = self.semaphores.get(idx).ok_or(NntpError::PoolExhausted)?;
+        let permit = tokio::time::timeout_at(*deadline, semaphore.clone().acquire_owned())
+            .await
+            .map_err(|_| NntpError::AcquireTimeout(0))?
+            .map_err(|_| NntpError::PoolShutdown)?;
+        self.acquire_with_permit_budget(idx, Some(permit), initial_group, Some(deadline))
+            .await
+    }
+
+    pub(crate) async fn acquire_extra_before_deadline(
+        &self,
+        server: ServerId,
+        excluded_ips: &[IpAddr],
+        initial_group: Option<&str>,
+        deadline: &mut tokio::time::Instant,
+    ) -> Result<PooledConnection> {
+        if self.shutdown.is_cancelled() {
+            return Err(NntpError::PoolShutdown);
+        }
+        self.configs.get(server.0).ok_or(NntpError::PoolExhausted)?;
+        self.acquire_fresh_with_permit(server.0, None, excluded_ips, initial_group, Some(deadline))
+            .await
+    }
+
     /// Acquire a connection; a fresh connection to a pipelining server
     /// selects `initial_group` inside its session-setup write.
     pub async fn acquire_for_group(
@@ -400,7 +447,7 @@ impl NntpPool {
         if idx >= self.pools.len() {
             return Err(NntpError::PoolExhausted);
         }
-        self.acquire_fresh_with_permit(idx, None, excluded_ips, initial_group)
+        self.acquire_fresh_with_permit(idx, None, excluded_ips, initial_group, None)
             .await
     }
 
@@ -411,8 +458,25 @@ impl NntpPool {
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         initial_group: Option<&str>,
     ) -> Result<PooledConnection> {
+        self.acquire_with_permit_budget(idx, permit, initial_group, None)
+            .await
+    }
+
+    async fn acquire_with_permit_budget(
+        &self,
+        idx: usize,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        initial_group: Option<&str>,
+        mut deadline: Option<&mut tokio::time::Instant>,
+    ) -> Result<PooledConnection> {
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
+            if deadline
+                .as_deref()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= *deadline)
+            {
+                return Err(NntpError::AcquireTimeout(0));
+            }
             let candidate = {
                 let mut pool = lock_recovering(&self.pools[idx]);
                 self.take_healthy_idle(&mut pool)
@@ -423,8 +487,9 @@ impl NntpPool {
                     // If the connection is older than stale_check_age, probe it.
                     if c.last_used().elapsed() > self.stale_check_age {
                         trace!(server = idx, "pinging stale idle connection");
-                        match c.ping().await {
+                        match acquisition_budget(deadline.as_deref(), c.ping()).await {
                             Ok(()) => break c,
+                            Err(error @ NntpError::AcquireTimeout(_)) => return Err(error),
                             Err(e) => {
                                 trace!(server = idx, error = %e, "stale ping failed, dropping that connection");
                                 // Only this socket has proven itself dead. Its
@@ -453,13 +518,28 @@ impl NntpPool {
                             if elapsed < self.reconnect_delay {
                                 let remaining = self.reconnect_delay - elapsed;
                                 drop(last_failure); // release lock while sleeping
-                                tokio::time::sleep(remaining).await;
+                                acquisition_budget(deadline.as_deref(), async {
+                                    tokio::time::sleep(remaining).await;
+                                    Ok(())
+                                })
+                                .await?;
                             }
                         }
                     }
 
                     debug!(server = idx, "creating new connection");
-                    match self.connect_server_excluding(idx, &[], initial_group).await {
+                    let started = tokio::time::Instant::now();
+                    let connect = self.connect_server_excluding(idx, &[], initial_group);
+                    let connected = if self.configs[idx].proxy.is_some() {
+                        let result = connect.await;
+                        if let Some(deadline) = deadline.as_deref_mut() {
+                            *deadline += started.elapsed();
+                        }
+                        result
+                    } else {
+                        acquisition_budget(deadline.as_deref(), connect).await
+                    };
+                    match connected {
                         Ok(c) => {
                             // Clear the failure timestamp on success.
                             let mut last_failure = self.last_connect_failure[idx].lock().await;
@@ -496,7 +576,14 @@ impl NntpPool {
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         excluded_ips: &[IpAddr],
         initial_group: Option<&str>,
+        deadline: Option<&mut tokio::time::Instant>,
     ) -> Result<PooledConnection> {
+        if deadline
+            .as_deref()
+            .is_some_and(|deadline| tokio::time::Instant::now() >= *deadline)
+        {
+            return Err(NntpError::AcquireTimeout(0));
+        }
         {
             let last_failure = self.last_connect_failure[idx].lock().await;
             if let Some(ts) = *last_failure {
@@ -504,16 +591,28 @@ impl NntpPool {
                 if elapsed < self.reconnect_delay {
                     let remaining = self.reconnect_delay - elapsed;
                     drop(last_failure);
-                    tokio::time::sleep(remaining).await;
+                    acquisition_budget(deadline.as_deref(), async {
+                        tokio::time::sleep(remaining).await;
+                        Ok(())
+                    })
+                    .await?;
                 }
             }
         }
 
         debug!(server = idx, "creating fresh over-max connection");
-        let conn = match self
-            .connect_server_excluding(idx, excluded_ips, initial_group)
-            .await
-        {
+        let started = tokio::time::Instant::now();
+        let connect = self.connect_server_excluding(idx, excluded_ips, initial_group);
+        let connected = if self.configs[idx].proxy.is_some() {
+            let result = connect.await;
+            if let Some(deadline) = deadline {
+                *deadline += started.elapsed();
+            }
+            result
+        } else {
+            acquisition_budget(deadline.as_deref(), connect).await
+        };
+        let conn = match connected {
             Ok(conn) => {
                 let mut last_failure = self.last_connect_failure[idx].lock().await;
                 *last_failure = None;
@@ -949,7 +1048,7 @@ impl NntpPool {
         lock_recovering(&self.retired_ips).insert((idx, ip));
         lock_recovering(&self.pools[idx])
             .idle
-            .retain(|conn| conn.remote_ip() != ip);
+            .retain(|conn| conn.remote_ip() != Some(ip));
     }
 
     /// Take a healthy idle connection, evicting stale/poisoned ones.
@@ -981,15 +1080,15 @@ pub struct PooledConnection {
 }
 
 impl PooledConnection {
-    pub fn remote_addr(&self) -> SocketAddr {
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
         self.conn
             .as_ref()
             .expect("pooled connection is present")
             .remote_addr()
     }
 
-    pub fn remote_ip(&self) -> IpAddr {
-        self.remote_addr().ip()
+    pub fn remote_ip(&self) -> Option<IpAddr> {
+        self.remote_addr().map(|addr| addr.ip())
     }
 
     /// Explicitly discard this connection instead of returning it to the pool.
@@ -1037,7 +1136,9 @@ impl Drop for PooledConnection {
 
             let retired = healthy
                 && return_to_pool
-                && lock_recovering(&self.retired_ips).contains(&(server_idx, conn.remote_ip()));
+                && conn.remote_ip().is_some_and(|ip| {
+                    lock_recovering(&self.retired_ips).contains(&(server_idx, ip))
+                });
             let mut pool = lock_recovering(&self.pool);
             pool.active_count = pool.active_count.saturating_sub(1);
             if healthy && return_to_pool {

@@ -1,3 +1,5 @@
+import { ProxyRoutingEditor, ProxyRoutingStatus } from "@/components/ProxyRoutingEditor";
+import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
@@ -61,6 +63,8 @@ type RssRule = {
 };
 
 type RssFeed = {
+  routingStatus?: RoutingStatus;
+  routing: RoutingPolicy;
   id: number;
   name: string;
   url: string;
@@ -121,6 +125,7 @@ type RssSeenItem = {
 };
 
 type FeedFormValues = {
+  routing: RoutingPolicy;
   name: string;
   url: string;
   enabled: boolean;
@@ -147,6 +152,7 @@ type RuleFormValues = {
 const NONE_VALUE = "__none__";
 
 const defaultFeedForm: FeedFormValues = {
+  routing: directRouting,
   name: "",
   url: "",
   enabled: true,
@@ -277,6 +283,7 @@ export function RssSettingsPage() {
   const handleFeedSave = async (values: FeedFormValues) => {
     resetFeedback();
     const input = {
+      routing: values.routing,
       name: values.name.trim(),
       url: values.url.trim(),
       enabled: values.enabled,
@@ -443,6 +450,7 @@ export function RssSettingsPage() {
           initialValues={
             editingFeed
               ? {
+                  routing: editingFeed.routing ?? directRouting,
                   name: editingFeed.name,
                   url: editingFeed.url,
                   enabled: editingFeed.enabled,
@@ -548,6 +556,7 @@ export function RssSettingsPage() {
           }
         >
           <div className="space-y-5">
+            <ProxyRoutingStatus status={feed.routingStatus} />
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <DetailCard label={t("rss.pollInterval")}>
                 {feed.pollIntervalSecs}s
@@ -841,6 +850,7 @@ function FeedFormCard({
           />
         </div>
 
+        <ProxyRoutingEditor value={values.routing} onChange={routing => setValues(current => ({ ...current, routing }))} />
         <MetadataEditor
           entries={values.defaultMetadata}
           label={t("rss.defaultMetadata")}

@@ -1427,6 +1427,7 @@ impl Database {
             for query in [
                 "SELECT password FROM servers WHERE password IS NOT NULL",
                 "SELECT password FROM rss_feeds WHERE password IS NOT NULL",
+                "SELECT password FROM proxy_profiles WHERE password IS NOT NULL",
             ] {
                 let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
                 for row in rows {
@@ -1472,6 +1473,10 @@ impl Database {
                 (
                     "RSS feed",
                     "SELECT id, password FROM rss_feeds WHERE password IS NOT NULL",
+                ),
+                (
+                    "proxy",
+                    "SELECT id, password FROM proxy_profiles WHERE password IS NOT NULL",
                 ),
             ] {
                 let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
