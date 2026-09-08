@@ -23,6 +23,7 @@ enum OutOfOrderPersistReason {
     PerFileMaxPending,
     GlobalWriteBacklog,
     QuiescentFlush,
+    DirectZip,
 }
 
 impl OutOfOrderPersistReason {
@@ -31,6 +32,7 @@ impl OutOfOrderPersistReason {
             Self::PerFileMaxPending => "download.write_buffer.out_of_order.per_file_max_pending",
             Self::GlobalWriteBacklog => "download.write_buffer.out_of_order.global_write_backlog",
             Self::QuiescentFlush => "download.write_buffer.out_of_order.quiescent_flush",
+            Self::DirectZip => "download.write_buffer.out_of_order.direct_zip",
         }
     }
 }
@@ -2611,12 +2613,13 @@ impl Pipeline {
         if self.demotion_sweep_owns_file(file_id) {
             return Ok(());
         }
+        let direct_zip = self.direct_unpack_wants_zip_ranges(file_id);
         loop {
             let batch = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
                     return Ok(());
                 };
-                if !write_buf.exceeds_max_pending() {
+                if !direct_zip && !write_buf.exceeds_max_pending() {
                     return Ok(());
                 }
                 write_buf.take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
@@ -2629,7 +2632,11 @@ impl Pipeline {
             self.persist_out_of_order_segments(
                 file_id,
                 batch,
-                OutOfOrderPersistReason::PerFileMaxPending,
+                if direct_zip {
+                    OutOfOrderPersistReason::DirectZip
+                } else {
+                    OutOfOrderPersistReason::PerFileMaxPending
+                },
             )
             .await?;
         }
@@ -2882,6 +2889,16 @@ impl Pipeline {
                         &segments,
                     );
                 }
+
+                if was_duplicate && self.direct_unpack_wants_zip_ranges(file_id) {
+                    self.taint_direct_unpack_for_file(job_id, filename);
+                }
+                self.direct_unpack_note_zip_range(
+                    file_id,
+                    filename,
+                    file_offset,
+                    u64::from(decoded_size),
+                );
 
                 // The file hash is a *running* stream: every chunk must be fed
                 // once, in offset order. A duplicate's bytes were already fed

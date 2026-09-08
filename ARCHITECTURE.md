@@ -341,6 +341,13 @@ That means:
 - extraction rules stay explicit
 - file-role and archive-topology logic should live in coherent modules, not be scattered through unrelated helpers
 
+ZIP and ZIP64 direct unpack share the completed-file ZIP decoder. During a
+download, the reader exposes only committed byte ranges, including prioritized
+central-directory articles; sparse file length is never evidence of coverage.
+ZIP64 sizes and offsets remain 64-bit through seeking and extraction. A chase's
+staged output is installed only after verification and repair settle. Repair
+that may change consumed bytes discards that output and uses the repaired archive.
+
 ### Engine Boundaries Stay Explicit
 
 Engine crates should remain sharp and focused:

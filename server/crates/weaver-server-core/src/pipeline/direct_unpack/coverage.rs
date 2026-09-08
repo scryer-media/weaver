@@ -1,16 +1,17 @@
-//! How much of a 7z set is on disk, and the parking spot for a reader that has
+//! How much of an archive set is on disk, and the parking spot for a reader that has
 //! run ahead of it.
 //!
-//! # Why a watermark is enough
+//! # Committed bytes only
 //!
 //! Direct unpack reads part files that are still being written. That is only
 //! safe because of what the download path already guarantees about them: a
 //! file's buffered writes drain contiguously from zero, and a segment's bytes
 //! are CRC-verified before they are ever committed. So a part file's flushed
 //! prefix is exactly its verified prefix — there is no window in which a byte
-//! below the watermark is present but wrong, and no hole below it waiting to be
-//! backfilled. One integer per part therefore describes everything a reader is
-//! allowed to touch.
+//! below the watermark is waiting to be backfilled. ZIP also needs its central
+//! directory before the payload arrives, so separately committed ranges can be
+//! published out of order. File length never authorizes reading a sparse hole.
+//! Both views obey the same PAR2 damage caps and verification gates.
 //!
 //! # Two sides, two costs
 //!
@@ -127,12 +128,14 @@ struct CoverageState {
     /// has not reached yet is parked rather than raced.
     gated: bool,
     parts: Vec<PartProgress>,
+    /// Committed out-of-order ranges. ZIP needs its directory before its payload.
+    ranges: Vec<std::collections::BTreeMap<u64, u64>>,
     /// Authoritative archive length, derived from the signature header.
     total_len: Option<u64>,
     aborted: Option<String>,
 }
 
-/// Shared download-progress view for one 7z set.
+/// Shared download-progress view for one archive set.
 ///
 /// Cloneable only behind an [`Arc`](std::sync::Arc): the writer half lives on
 /// the download path and the reader half on an extraction thread, and both must
@@ -154,6 +157,7 @@ impl SetCoverage {
             state: Mutex::new(CoverageState {
                 gated: false,
                 parts: vec![PartProgress::default(); part_count],
+                ranges: vec![std::collections::BTreeMap::new(); part_count],
                 total_len: None,
                 aborted: None,
             }),
@@ -165,6 +169,47 @@ impl SetCoverage {
     /// Number of parts this set was created with.
     pub fn part_count(&self) -> usize {
         self.lock().parts.len()
+    }
+
+    /// Publish a range only after its write and assembly commit have succeeded.
+    pub fn note_committed_range(&self, index: usize, mut start: u64, mut end: u64) {
+        if start >= end {
+            return;
+        }
+        let mut state = self.lock();
+        let Some(ranges) = state.ranges.get_mut(index) else {
+            return;
+        };
+        if let Some((&previous_start, &previous_end)) = ranges.range(..=start).next_back()
+            && previous_end >= start
+        {
+            start = previous_start;
+            end = end.max(previous_end);
+            ranges.remove(&previous_start);
+        }
+        while let Some((&next_start, &next_end)) = ranges.range(start..=end).next() {
+            end = end.max(next_end);
+            ranges.remove(&next_start);
+        }
+        ranges.insert(start, end);
+        drop(state);
+        self.advanced.notify_all();
+    }
+
+    fn range_end(state: &CoverageState, index: usize, offset: u64) -> u64 {
+        let part = &state.parts[index];
+        let mut end = part.servable(state.gated);
+        if let Some((_, &range_end)) = state.ranges[index].range(..=offset).next_back() {
+            let mut range_end = range_end;
+            if let Some(cap) = part.damage_cap {
+                range_end = range_end.min(cap);
+            }
+            if state.gated {
+                range_end = range_end.min(part.vouched_prefix.unwrap_or(0));
+            }
+            end = end.max(range_end);
+        }
+        part.len.map_or(end, |len| end.min(len))
     }
 
     /// How many times a reader has parked waiting for this coverage.
@@ -442,6 +487,7 @@ impl SetCoverage {
         // The file at the path is a new one; a reader with the old one open
         // must not resume over it.
         part.rewritten += 1;
+        state.ranges[index].clear();
         // Repair verified what it wrote, so the gate has nothing left to add:
         // the bytes on disk are now the recovery set's own answer.
         state.gated = false;
@@ -545,7 +591,7 @@ impl SetCoverage {
             if part.len.is_some_and(|len| offset >= len) {
                 return Ok(0);
             }
-            let servable = part.servable(state.gated);
+            let servable = Self::range_end(&state, index, offset);
             if offset < servable {
                 return Ok(servable - offset);
             }
@@ -580,7 +626,7 @@ impl SetCoverage {
             }
             let part = Self::part_at(&state, index)?;
 
-            let servable = part.servable(state.gated);
+            let servable = Self::range_end(&state, index, offset);
             if offset < servable {
                 return Ok(PositionInPart::Inside {
                     available: servable - offset,
@@ -647,6 +693,34 @@ impl SetCoverage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_ranges_merge_without_exposing_sparse_holes() {
+        let coverage = SetCoverage::new(1);
+        coverage.note_committed_range(0, 100, 120);
+        coverage.note_committed_range(0, 140, 160);
+        coverage.note_committed_range(0, 120, 140);
+        coverage.advance_watermark(0, 20);
+        assert_eq!(coverage.readable_at(0, 110).unwrap(), 50);
+        let state = coverage.lock();
+        assert_eq!(state.ranges[0].len(), 1);
+        assert_eq!(SetCoverage::range_end(&state, 0, 50), 20);
+        assert_eq!(SetCoverage::range_end(&state, 0, 100), 160);
+    }
+
+    #[test]
+    fn repair_gating_caps_out_of_order_ranges_too() {
+        let coverage = SetCoverage::new(1);
+        coverage.note_committed_range(0, 100, 200);
+        coverage.cap_at_damage(0, 150);
+        coverage.note_vouched_prefix(0, 130);
+        assert_eq!(coverage.readable_at(0, 110).unwrap(), 20);
+        assert_eq!(SetCoverage::range_end(&coverage.lock(), 0, 160), 130);
+        coverage.release_after_repair(0, 180);
+        assert_eq!(coverage.readable_at(0, 160).unwrap(), 20);
+        assert_eq!(coverage.readable_at(0, 180).unwrap(), 0);
+        assert!(coverage.lock().ranges[0].is_empty());
+    }
 
     #[test]
     fn watermark_advances_monotonically() {

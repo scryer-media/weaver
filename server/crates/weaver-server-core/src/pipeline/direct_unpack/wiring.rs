@@ -1,4 +1,4 @@
-//! The controller: deciding which 7z sets to chase, feeding the chase, and
+//! The controller: deciding which archive sets to chase, feeding the chase, and
 //! ending it.
 //!
 //! # Where a chase begins
@@ -15,6 +15,11 @@
 //! length is the header's word until the file finishes; completion settles it,
 //! and a disagreement aborts the set rather than feeding the decoder a stream
 //! that is not the archive the header described.
+//!
+//! A single ZIP (including ZIP64) arms from its committed final article's
+//! extent. Its central directory can be read through committed tail ranges
+//! while the decoder parks on missing payload ranges. Completion and PAR2
+//! still decide whether the staged output can be installed.
 //!
 //! Admission is retried, not latched, while the answer is merely "not yet" — no
 //! bytes on part one, no topology. It latches permanently on a real refusal, so
@@ -42,7 +47,7 @@ use crate::jobs::ids::JobId;
 use crate::pipeline::FullSetExtractionOutcome;
 use crate::pipeline::Pipeline;
 use crate::pipeline::completion::finalize::extract::{
-    SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream,
+    SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream, extract_zip_stream,
 };
 use crate::pipeline::extraction::ExtractionRoot;
 
@@ -53,6 +58,12 @@ use crate::pipeline::extraction::ExtractionRoot;
 /// into a syscall per fragment. 128 KiB is large enough to amortise that and
 /// small enough that a park never sits on a mostly-empty buffer.
 const CHASE_BUFFER_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Copy)]
+enum ChaseFormat {
+    SevenZip { end_header_bytes: u64 },
+    Zip,
+}
 
 /// Why a set will never be chased.
 ///
@@ -475,7 +486,7 @@ impl Pipeline {
             return;
         }
 
-        let Ok(paths) = self.sevenz_set_part_paths(job_id, set_name) else {
+        let Ok(paths) = self.archive_set_part_paths(job_id, set_name) else {
             return;
         };
         if paths.is_empty() {
@@ -539,6 +550,40 @@ impl Pipeline {
             return;
         };
 
+        self.arm_prepared_direct_unpack(
+            job_id,
+            set_name,
+            paths,
+            total_len,
+            ChaseFormat::SevenZip {
+                end_header_bytes: header.next_header_size,
+            },
+        );
+    }
+
+    fn arm_prepared_direct_unpack(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        paths: Vec<PathBuf>,
+        total_len: u64,
+        format: ChaseFormat,
+    ) {
+        // A paused worker still owns this staging path until it is joined and
+        // cleaned up. Reusing it sooner would race both its writes and cleanup.
+        if self
+            .direct_unpack
+            .draining
+            .iter()
+            .any(|((job, set), _)| *job == job_id && set == set_name)
+        {
+            return;
+        }
+        let end_header_bytes = match format {
+            ChaseFormat::SevenZip { end_header_bytes } => end_header_bytes,
+            ChaseFormat::Zip => 0,
+        };
+
         // Admission control, and it is a liveness requirement rather than a
         // tuning knob. A chase occupies one `chase_pool` worker for its whole
         // life, parks included, so arming more chases than there are workers
@@ -599,11 +644,11 @@ impl Pipeline {
         // against the same ceiling the conventional extractor reserves, BEFORE
         // any decoder sees it — checking after the allocation checks nothing.
         let end_header_ceiling = budget.max_memory_bytes();
-        if header.next_header_size > end_header_ceiling {
+        if end_header_bytes > end_header_ceiling {
             warn!(
                 job_id = job_id.0,
                 set_name,
-                declared_end_header_bytes = header.next_header_size,
+                declared_end_header_bytes = end_header_bytes,
                 ceiling = end_header_ceiling,
                 "direct unpack refused an oversized 7z end header"
             );
@@ -638,6 +683,23 @@ impl Pipeline {
             // restart correct for the same reason.
             if let Some(floor) = self.direct_unpack_progress_floor(job_id, path) {
                 coverage.advance_watermark(index, floor);
+            }
+            if matches!(format, ChaseFormat::Zip)
+                && let Some(file_id) = self.direct_unpack_file_id_for_part(job_id, path)
+                && let Some(file) = self
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|s| s.assembly.file(file_id))
+            {
+                // Placements include buffered articles: publish only committed ones.
+                for number in 0..file.total_segments() {
+                    if file.has_segment(number)
+                        && let Some((offset, len)) = file.placement_of(number)
+                        && let Some(end) = offset.checked_add(u64::from(len))
+                    {
+                        coverage.note_committed_range(index, offset, end);
+                    }
+                }
             }
             if let Some(len) = self.direct_unpack_known_part_len(job_id, path) {
                 coverage.note_part_len(index, len);
@@ -682,7 +744,7 @@ impl Pipeline {
             budget,
             password,
             Arc::clone(&counters),
-            header.next_header_size,
+            format,
         );
 
         self.direct_unpack
@@ -712,12 +774,11 @@ impl Pipeline {
             "direct unpack armed"
         );
 
-        self.boost_direct_unpack_tail_window(
-            job_id,
-            &boost_paths,
-            total_len,
-            header.next_header_size,
-        );
+        let tail_hint = match format {
+            ChaseFormat::Zip => 8 * 1024 * 1024,
+            ChaseFormat::SevenZip { end_header_bytes } => end_header_bytes,
+        };
+        self.boost_direct_unpack_tail_window(job_id, &boost_paths, total_len, tail_hint);
     }
 
     /// Pull the archive's tail forward in the download queue.
@@ -846,7 +907,14 @@ impl Pipeline {
         let Some(file_asm) = state.assembly.file(file_id) else {
             return;
         };
-        // Only 7z sets are chased; the seam fires for every non-RAR archive.
+        if matches!(
+            self.classified_role_for_file(job_id, file_asm),
+            weaver_model::files::FileRole::ZipArchive
+        ) {
+            self.try_arm_single_archive(file_id, SIGNATURE_HEADER_LEN);
+            return;
+        }
+        // Split 7z sets need the topology's ordered part list.
         if !matches!(
             self.classified_role_for_file(job_id, file_asm),
             weaver_model::files::FileRole::SevenZipArchive
@@ -860,7 +928,7 @@ impl Pipeline {
         self.try_arm_direct_unpack(job_id, &set_name);
     }
 
-    /// Register a job's bare `.7z` files as arming candidates.
+    /// Register a job's single 7z and ZIP files as arming candidates.
     ///
     /// Called once at admission. Nothing is registered when the gate is off, so
     /// a dark pipeline keeps an empty set and the commit hook keeps costing one
@@ -870,7 +938,11 @@ impl Pipeline {
             return;
         }
         for (file_index, file) in spec.files.iter().enumerate() {
-            if matches!(file.role, weaver_model::files::FileRole::SevenZipArchive) {
+            if matches!(
+                file.role,
+                weaver_model::files::FileRole::SevenZipArchive
+                    | weaver_model::files::FileRole::ZipArchive
+            ) {
                 self.direct_unpack
                     .pending_single_arm
                     .insert(crate::jobs::ids::NzbFileId {
@@ -881,14 +953,13 @@ impl Pipeline {
         }
     }
 
-    /// Try to arm a bare `.7z` from its opening bytes.
+    /// Try to arm a single 7z or ZIP from its committed metadata.
     ///
     /// Rides the commit path rather than the completion path: waiting for
     /// completion would mean waiting for the whole archive, which is exactly the
     /// overlap this exists to win. The candidate is retired from the pending set
-    /// on any outcome that settles it — armed, refused, or no longer a single
-    /// 7z — so the ride is paid for once.
-    fn try_arm_single_sevenz(&mut self, file_id: crate::jobs::ids::NzbFileId, floor: u64) {
+    /// on any outcome that settles it — armed, refused, or no longer supported.
+    fn try_arm_single_archive(&mut self, file_id: crate::jobs::ids::NzbFileId, floor: u64) {
         if floor < SIGNATURE_HEADER_LEN {
             return;
         }
@@ -905,9 +976,11 @@ impl Pipeline {
         // Classification can move a file off `SevenZipArchive` — a rename, or a
         // set that turns out to be split after all. Either way it is no longer
         // this path's business.
+        let role = self.classified_role_for_file(job_id, file_asm);
         if !matches!(
-            self.classified_role_for_file(job_id, file_asm),
+            role,
             weaver_model::files::FileRole::SevenZipArchive
+                | weaver_model::files::FileRole::ZipArchive
         ) {
             self.direct_unpack.pending_single_arm.remove(&file_id);
             return;
@@ -930,7 +1003,27 @@ impl Pipeline {
             return;
         }
 
-        self.arm_direct_unpack_with_paths(job_id, &set_name, vec![path]);
+        if matches!(role, weaver_model::files::FileRole::ZipArchive) {
+            // ZIP has no archive length in its opening header. The committed
+            // final article supplies its actual extent; NZB sizes are encoded
+            // estimates and must never turn sparse holes into readable bytes.
+            let last = file_asm.total_segments().saturating_sub(1);
+            let total_len = file_asm
+                .has_segment(last)
+                .then(|| file_asm.placement_of(last))
+                .flatten()
+                .and_then(|(offset, len)| offset.checked_add(u64::from(len)));
+            let Some(total_len) = total_len else { return };
+            self.arm_prepared_direct_unpack(
+                job_id,
+                &set_name,
+                vec![path],
+                total_len,
+                ChaseFormat::Zip,
+            );
+        } else {
+            self.arm_direct_unpack_with_paths(job_id, &set_name, vec![path]);
+        }
 
         // Armed or refused, the candidate is settled either way. A refusal
         // latches, so leaving it pending would re-read the same 32 bytes on
@@ -1086,7 +1179,7 @@ impl Pipeline {
         budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
         password: Option<String>,
         counters: Arc<crate::jobs::PhaseCounters>,
-        end_header_bytes: u64,
+        format: ChaseFormat,
     ) -> tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>> {
         // The chase's own pool, never the shared post-processing one: `install`
         // holds a worker for as long as the closure runs, and this closure parks.
@@ -1110,7 +1203,33 @@ impl Pipeline {
                     "direct unpack worker started"
                 );
                 let started_at = Instant::now();
-                let outcome = {
+                let outcome = (|| {
+                    if matches!(format, ChaseFormat::Zip) {
+                        let _memory_permit = budget.reserve_memory_wait(8 * 1024 * 1024)?;
+                        let reader = GatedSplitReader::open(&paths, Arc::clone(&coverage))
+                            .map_err(|error| {
+                                format!("failed to open ZIP direct-unpack reader: {error}")
+                            })?;
+                        let (silent_events, _) = tokio::sync::broadcast::channel(1);
+                        let extracted = extract_zip_stream(
+                            std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader),
+                            &root,
+                            &budget,
+                            password.as_deref(),
+                            &silent_events,
+                            job_id,
+                            &set_name,
+                            Some(counters),
+                        )?;
+                        return Ok(FullSetExtractionOutcome {
+                            extracted,
+                            failed: Vec::new(),
+                            selected_password: password,
+                        });
+                    }
+                    let ChaseFormat::SevenZip { end_header_bytes } = format else {
+                        unreachable!()
+                    };
                     // No decoder-memory permit is taken here. The extraction body
                     // reserves per pass — header-sized while it lists the archive,
                     // decoder-sized while it decodes — from the chase-only
@@ -1159,7 +1278,7 @@ impl Pipeline {
                                 format!("failed to open 7z direct-unpack reader: {error}")
                             })
                     })
-                };
+                })();
                 match &outcome {
                     Ok(members) => info!(
                         job_id = log_job.0,
@@ -1181,6 +1300,71 @@ impl Pipeline {
         })
     }
 
+    pub(in crate::pipeline) fn direct_unpack_wants_zip_ranges(
+        &self,
+        file_id: crate::jobs::ids::NzbFileId,
+    ) -> bool {
+        if self.direct_unpack.gate() != DirectUnpackGate::Enabled {
+            return false;
+        }
+        let Some(file) = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|s| s.assembly.file(file_id))
+        else {
+            return false;
+        };
+        matches!(
+            self.classified_role_for_file(file_id.job_id, file),
+            weaver_model::files::FileRole::ZipArchive
+        ) && (self.direct_unpack.pending_single_arm.contains(&file_id)
+            || self
+                .direct_unpack
+                .watermark_targets
+                .get(&file_id.job_id)
+                .is_some_and(|targets| {
+                    targets.contains_key(&self.current_filename_for_file(file_id.job_id, file))
+                }))
+    }
+
+    pub(in crate::pipeline) fn direct_unpack_note_zip_range(
+        &mut self,
+        file_id: crate::jobs::ids::NzbFileId,
+        filename: &str,
+        offset: u64,
+        len: u64,
+    ) {
+        if !self.direct_unpack_wants_zip_ranges(file_id) {
+            return;
+        }
+        if offset == 0
+            && self.direct_unpack.pending_single_arm.contains(&file_id)
+            && let Some(path) = self.resolve_job_input_path(file_id.job_id, filename)
+            && let Some(file) = self
+                .jobs
+                .get(&file_id.job_id)
+                .and_then(|s| s.assembly.file(file_id))
+        {
+            self.boost_direct_unpack_tail_window(
+                file_id.job_id,
+                &[path],
+                file.total_bytes(),
+                8 * 1024 * 1024,
+            );
+        }
+        self.try_arm_single_archive(file_id, SIGNATURE_HEADER_LEN);
+        if let Some((set, index)) = self
+            .direct_unpack
+            .watermark_targets
+            .get(&file_id.job_id)
+            .and_then(|t| t.get(filename))
+            && let Some(armed) = self.direct_unpack.armed.get(&(file_id.job_id, set.clone()))
+            && let Some(end) = offset.checked_add(len)
+        {
+            armed.coverage.note_committed_range(*index, offset, end);
+        }
+    }
+
     /// Publish a part's committed watermark to any chase that wants it.
     ///
     /// On the download's commit path. When nothing is being chased this is a
@@ -1200,7 +1384,7 @@ impl Pipeline {
         // A bare `.7z` waiting on its opening bytes arms here, because this is
         // the only place that learns the floor moved.
         if self.direct_unpack.pending_single_arm.contains(&file_id) {
-            self.try_arm_single_sevenz(file_id, committed_bytes);
+            self.try_arm_single_archive(file_id, committed_bytes);
         }
 
         let Some(targets) = self.direct_unpack.watermark_targets.get(&job_id) else {
@@ -1483,7 +1667,7 @@ impl Pipeline {
             .collect();
 
         for set_name in sets {
-            let paths = match self.sevenz_set_part_paths(job_id, &set_name) {
+            let paths = match self.archive_set_part_paths(job_id, &set_name) {
                 Ok(paths) => paths,
                 Err(error) => {
                     // A chase whose set cannot be resolved is settling nothing
@@ -1698,6 +1882,7 @@ impl Pipeline {
         if let Some(outcome) = self.direct_unpack.outcomes.remove(&key) {
             let usable = outcome.result.is_ok() && !outcome.tainted;
             if usable {
+                self.direct_unpack.latched.insert(key.clone(), "consumed");
                 // Counted here rather than after the move: the install itself
                 // is a rename of files that already exist, and its rare
                 // failures fall back to conventional extraction with a warning
@@ -1735,6 +1920,10 @@ impl Pipeline {
         let Some(armed) = self.direct_unpack.armed.remove(&key) else {
             return ChaseDisposition::None;
         };
+
+        // Extraction now owns this worker and its staging path. A late commit
+        // must not start another chase into the same directory.
+        self.direct_unpack.latched.insert(key, "consumed");
 
         self.direct_unpack.counters.consumed += 1;
         record_event("consumed");
@@ -1977,7 +2166,7 @@ impl Pipeline {
             false
         };
 
-        let paths = match self.sevenz_set_part_paths(job_id, set_name) {
+        let paths = match self.archive_set_part_paths(job_id, set_name) {
             Ok(paths) => paths,
             Err(error) => {
                 info!(
@@ -2252,7 +2441,7 @@ impl Pipeline {
             self.direct_unpack
                 .parked_through_repair
                 .remove(&(job_id, set_name.clone()));
-            let Ok(paths) = self.sevenz_set_part_paths(job_id, &set_name) else {
+            let Ok(paths) = self.archive_set_part_paths(job_id, &set_name) else {
                 continue;
             };
             let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) else {
@@ -2326,7 +2515,7 @@ impl Pipeline {
             .collect();
 
         for set_name in gated {
-            let Ok(paths) = self.sevenz_set_part_paths(job_id, &set_name) else {
+            let Ok(paths) = self.archive_set_part_paths(job_id, &set_name) else {
                 continue;
             };
             let every_part_described = !paths.is_empty()

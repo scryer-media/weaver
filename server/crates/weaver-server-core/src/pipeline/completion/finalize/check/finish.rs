@@ -1102,7 +1102,7 @@ impl Pipeline {
     /// missing from. So the part goes straight into the topology — its name
     /// into `volume_map`, its number marked complete, and the expected count
     /// raised when it lies past the end, since a withheld *last* part is one
-    /// the topology never counted. `sevenz_set_part_paths` then hands it to the
+    /// the topology never counted. `archive_set_part_paths` then hands it to the
     /// extractor off the same map.
     ///
     /// `Ok(false)` when the part belongs to no 7z set this job knows, or the

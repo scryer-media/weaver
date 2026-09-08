@@ -2232,7 +2232,7 @@ async fn a_late_par2_registration_leaves_the_chase_able_to_resolve_its_parts() {
         "the topology must survive a registration that lands after the data does"
     );
     assert!(
-        pipeline.sevenz_set_part_paths(job_id, set_name).is_ok(),
+        pipeline.archive_set_part_paths(job_id, set_name).is_ok(),
         "and the chase must still be able to resolve its parts"
     );
 

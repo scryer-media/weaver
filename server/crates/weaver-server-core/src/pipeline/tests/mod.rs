@@ -58,6 +58,7 @@ mod rar_extraction;
 mod restore_history;
 mod sfv_completion;
 mod terminal_settlement;
+mod zip64;
 
 struct TestHarness {
     _temp_dir: TempDir,
