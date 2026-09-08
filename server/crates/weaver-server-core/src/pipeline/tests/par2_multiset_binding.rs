@@ -507,3 +507,154 @@ async fn a_complete_volume_of_a_foreign_rar_set_is_kept_out_of_the_extra_scan() 
         "the analysed set's own RAR set is never excluded, got {exclusions:?}"
     );
 }
+
+#[tokio::test]
+async fn par2_extra_scan_excludes_what_a_repair_left_behind() {
+    // Installing a repair moves the damaged file it replaces aside and leaves
+    // the copy in the job directory until the whole job has settled. Without
+    // this, every later pass — and every other set sharing the directory —
+    // rolling-reads a second whole payload to confirm what the repaired file
+    // already confirms. A leftover is named by difference against the listing
+    // taken before the repair, never by the shape of its name.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30933);
+    let own_volume = "silver.horizon.part1.rar";
+    let own_bytes = fixture_bytes(59, 128);
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Silver Horizon Repair Leftover",
+            &[(own_volume.to_string(), own_bytes.len() as u32)],
+        ),
+    )
+    .await;
+    let served =
+        build_repairable_par2_set_for_files(&[(own_volume, own_bytes.as_slice())], SLICE_SIZE, 1);
+    let served_id = served.recovery_set_id;
+    install_test_par2_runtime(&mut pipeline, job_id, served, &[]);
+    write_and_complete_file(&mut pipeline, job_id, 0, own_volume, &own_bytes).await;
+
+    // Present before any repair: a stray the job never declared, and a
+    // numbered name the job cannot account for — an obfuscated post is named
+    // exactly like that, and finding this set's bytes under such a name is
+    // what extras are for.
+    let stray = "a3f19c40.bin";
+    let obfuscated = "51273aad56a8b904e96928935278a627.102";
+    for name in [stray, obfuscated] {
+        std::fs::write(working_dir.join(name), fixture_bytes(67, 128)).unwrap();
+    }
+    let leftover = format!("{own_volume}.1");
+    let second_leftover = format!("{own_volume}.2");
+
+    // No repair has run, so nothing is a leftover yet: the numbered copies
+    // could only be posted files.
+    for name in [leftover.as_str(), second_leftover.as_str()] {
+        std::fs::write(working_dir.join(name), fixture_bytes(61, 128)).unwrap();
+    }
+    let exclusions = pipeline.par2_extra_scan_exclusions(job_id, served_id);
+    for name in [
+        leftover.as_str(),
+        second_leftover.as_str(),
+        stray,
+        obfuscated,
+    ] {
+        assert!(
+            !exclusions.contains(&working_dir.join(name)),
+            "before a repair nothing is a leftover, got {exclusions:?}"
+        );
+    }
+    for name in [leftover.as_str(), second_leftover.as_str()] {
+        std::fs::remove_file(working_dir.join(name)).unwrap();
+    }
+
+    // The listing the repair path takes before the repairer touches the
+    // directory, then the copies the repairer leaves behind.
+    let before: std::collections::HashSet<String> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .collect();
+    assert!(before.contains(own_volume) && before.contains(stray) && before.contains(obfuscated));
+    pipeline.par2_pre_repair_dir_entries.insert(job_id, before);
+    for name in [leftover.as_str(), second_leftover.as_str()] {
+        std::fs::write(working_dir.join(name), fixture_bytes(61, 128)).unwrap();
+    }
+
+    let exclusions = pipeline.par2_extra_scan_exclusions(job_id, served_id);
+
+    assert!(
+        exclusions.contains(&working_dir.join(&leftover)),
+        "the copy the repair left beside its target must be excluded, got {exclusions:?}"
+    );
+    assert!(
+        exclusions.contains(&working_dir.join(&second_leftover)),
+        "a second repair leaves a second copy, and it is no different, got {exclusions:?}"
+    );
+    assert!(
+        !exclusions.contains(&working_dir.join(own_volume)),
+        "the repaired file itself is a canonical source, got {exclusions:?}"
+    );
+    assert!(
+        !exclusions.contains(&working_dir.join(stray)),
+        "a file that was there before the repair must stay discoverable, got {exclusions:?}"
+    );
+    assert!(
+        !exclusions.contains(&working_dir.join(obfuscated)),
+        "a numbered name that was there before the repair is not a leftover, got {exclusions:?}"
+    );
+}
+
+#[tokio::test]
+async fn par2_extra_scan_keeps_a_posted_file_that_only_looks_like_a_repair_leftover() {
+    // An obfuscated post numbers its own parts the same way a repair numbers
+    // the copy it sets aside, so `payload.11` sitting beside `payload.1` is two
+    // posted files. Both are this set's own volumes under lying names, which is
+    // precisely the case the extra scan exists to solve — and they stay
+    // candidates even when they land after the pre-repair listing was taken,
+    // because the NZB names them.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30934);
+    let first_alias = "payload.1";
+    let second_alias = "payload.11";
+    let first_bytes = fixture_bytes(71, 128);
+    let second_bytes = fixture_bytes(73, 128);
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Amber Trail Numbered Aliases",
+            &[
+                (first_alias.to_string(), first_bytes.len() as u32),
+                (second_alias.to_string(), second_bytes.len() as u32),
+            ],
+        ),
+    )
+    .await;
+    let served = build_repairable_par2_set_for_files(
+        &[
+            ("amber.trail.part1.rar", first_bytes.as_slice()),
+            ("amber.trail.part2.rar", second_bytes.as_slice()),
+        ],
+        SLICE_SIZE,
+        1,
+    );
+    let served_id = served.recovery_set_id;
+    install_test_par2_runtime(&mut pipeline, job_id, served, &[]);
+    pipeline
+        .par2_pre_repair_dir_entries
+        .insert(job_id, std::collections::HashSet::new());
+    write_and_complete_file(&mut pipeline, job_id, 0, first_alias, &first_bytes).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, second_alias, &second_bytes).await;
+
+    let exclusions = pipeline.par2_extra_scan_exclusions(job_id, served_id);
+
+    for alias in [first_alias, second_alias] {
+        assert!(
+            !exclusions.contains(&working_dir.join(alias)),
+            "a posted file must never be read as a repair leftover, got {exclusions:?}"
+        );
+    }
+}

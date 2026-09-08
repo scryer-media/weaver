@@ -374,6 +374,42 @@ impl Pipeline {
         };
         let working_dir = state.working_dir.clone();
 
+        for name in self.par2_repair_leftover_names(job_id, &before) {
+            let path = working_dir.join(&name);
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!(
+                    job_id = job_id.0,
+                    path = %path.display(),
+                    "removed repair leftover after acceptance"
+                ),
+                Err(error) => warn!(
+                    job_id = job_id.0,
+                    path = %path.display(),
+                    error = %error,
+                    "could not remove repair leftover"
+                ),
+            }
+        }
+    }
+
+    /// The working-directory files a repair left behind, named by difference
+    /// against `before`, the directory listing taken before the first repair
+    /// touched it: an entry that was not there then, that no NZB file answers
+    /// to under any of its names, and that no servable set describes. This is
+    /// the one rule for what a leftover is; [`Self::purge_par2_repair_leftovers`]
+    /// removes them once the job has settled, and until then the extra scan of
+    /// every set keeps them out of its candidates. Sorted, so two calls over an
+    /// unchanged directory compare equal.
+    pub(in crate::pipeline) fn par2_repair_leftover_names(
+        &self,
+        job_id: JobId,
+        before: &HashSet<String>,
+    ) -> Vec<String> {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        let working_dir = state.working_dir.clone();
+
         let mut keep = HashSet::<String>::new();
         for file in state.assembly.files() {
             keep.insert(sanitize_download_filename(file.filename()));
@@ -393,28 +429,15 @@ impl Pipeline {
             }
         }
 
-        for name in directory_entry_names(&working_dir) {
-            if before.contains(&name) || keep.contains(&sanitize_download_filename(&name)) {
-                continue;
-            }
-            let path = working_dir.join(&name);
-            if !path.is_file() {
-                continue;
-            }
-            match std::fs::remove_file(&path) {
-                Ok(()) => info!(
-                    job_id = job_id.0,
-                    path = %path.display(),
-                    "removed repair leftover after acceptance"
-                ),
-                Err(error) => warn!(
-                    job_id = job_id.0,
-                    path = %path.display(),
-                    error = %error,
-                    "could not remove repair leftover"
-                ),
-            }
-        }
+        let mut leftovers: Vec<String> = directory_entry_names(&working_dir)
+            .into_iter()
+            .filter(|name| {
+                !before.contains(name) && !keep.contains(&sanitize_download_filename(name))
+            })
+            .filter(|name| working_dir.join(name).is_file())
+            .collect();
+        leftovers.sort();
+        leftovers
     }
 
     pub(in crate::pipeline) fn fail_par2_repair(&mut self, job_id: JobId, error: String) {

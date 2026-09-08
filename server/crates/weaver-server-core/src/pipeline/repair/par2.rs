@@ -1794,7 +1794,7 @@ impl Pipeline {
     /// an obfuscated file with no binding at all is exactly what extras exist
     /// for, and excluding it would be excluding the answer.
     ///
-    /// Two things can be positively placed elsewhere:
+    /// Three things can be positively placed elsewhere:
     ///
     ///  - A file that binds to a *different* recovery set. The binding
     ///    resolver refuses a name two sets both answer to, so a binding that
@@ -1807,6 +1807,14 @@ impl Pipeline {
     ///    every volume stays discoverable. Incomplete volumes are left alone: a
     ///    file still being written is not yet the archive its name claims, and
     ///    its bytes may still be rearranged.
+    ///  - A file a repair left behind: it appeared in the directory after the
+    ///    pre-repair snapshot and neither the NZB nor any servable set names
+    ///    it, so it is the damaged original a repair moved aside. Named by
+    ///    difference, exactly as [`Self::purge_par2_repair_leftovers`] names
+    ///    what it removes once the whole job has settled — until then the
+    ///    copy stays on disk as evidence, and this keeps it out of every
+    ///    later scan. Its bytes are the pre-repair content of a file the set
+    ///    reads as a canonical source in its own right.
     ///
     /// Without this, a directory holding two recovery sets makes each set read
     /// the other set's whole payload, once per scanning pass, and match nothing
@@ -1819,6 +1827,7 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return Vec::new();
         };
+        let working_dir = state.working_dir.clone();
         let file_ids: Vec<NzbFileId> = state.assembly.files().map(|file| file.file_id()).collect();
         let mut excluded: Vec<PathBuf> = Vec::new();
         let mut own_paths: HashSet<PathBuf> = HashSet::new();
@@ -1870,6 +1879,13 @@ impl Pipeline {
                         .join(self.current_filename_for_file(job_id, file)),
                 );
             }
+        }
+        if let Some(before) = self.par2_pre_repair_dir_entries.get(&job_id) {
+            excluded.extend(
+                self.par2_repair_leftover_names(job_id, before)
+                    .into_iter()
+                    .map(|name| working_dir.join(name)),
+            );
         }
         // A path this set itself resolves to is never an exclusion, whatever
         // else claimed it: the set's own sources are scanned as canonical
