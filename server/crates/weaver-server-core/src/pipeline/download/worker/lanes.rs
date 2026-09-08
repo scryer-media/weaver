@@ -702,12 +702,22 @@ impl Pipeline {
     /// permit loose and open a fresh socket — greeting and authentication and,
     /// on TLS, a handshake — for work that is by definition on the critical
     /// path of finishing a job.
+    ///
+    /// A contended answer counts as yes. Only a definitive "no eligible
+    /// server" may send a lease to the asynchronous path: a momentary
+    /// collision on the shared health state is not a statement about the
+    /// servers, and demoting on it put the lease in a queue for the same
+    /// connection permits the idle owned lanes hold — where it waited out the
+    /// client's whole acquire deadline before failing.
     pub(in crate::pipeline) fn should_use_owned_blocking_lane(
         &self,
         lease: &DownloadBatchLease,
     ) -> bool {
-        self.nntp
-            .has_blocking_body_lane_candidate(&lease.effective_exclude_servers)
+        !matches!(
+            self.nntp
+                .blocking_body_lane_candidacy(&lease.effective_exclude_servers),
+            weaver_nntp::client::BlockingBodyLaneCandidacy::None
+        )
     }
 
     pub(in crate::pipeline::download::worker) fn reconcile_rate_limit_for_download(
@@ -999,6 +1009,48 @@ impl Pipeline {
     /// itself, so a pass that has already run cannot be asked for twice.
     pub(crate) fn take_download_dispatch_wake(&mut self) -> bool {
         std::mem::take(&mut self.download_dispatch_wake)
+    }
+
+    /// Move an established connection's class booking when a refill hands it
+    /// the other class's work.
+    ///
+    /// The connection itself is counted once, at dispatch, under the class its
+    /// first batch carried, and released at park under the class of its last.
+    /// A lane that changes class in between has to move that booking with it,
+    /// or the two ends disagree: the critical spread in
+    /// `dispatch_completion_critical_work` would keep sending demand to a job
+    /// whose lane is already serving it, and the eventual park would decrement
+    /// a count this lane was never added to.
+    pub(in crate::pipeline::download::worker) fn rebook_download_lane_class(
+        &mut self,
+        job_id: JobId,
+        from: DownloadBatchClass,
+        to: DownloadBatchClass,
+    ) {
+        if from.completion_critical == to.completion_critical {
+            return;
+        }
+        if to.completion_critical {
+            self.active_completion_critical_connections += 1;
+            *self
+                .active_completion_critical_connections_by_job
+                .entry(job_id)
+                .or_default() += 1;
+        } else {
+            self.active_completion_critical_connections = self
+                .active_completion_critical_connections
+                .saturating_sub(1);
+            if let Some(in_flight) = self
+                .active_completion_critical_connections_by_job
+                .get_mut(&job_id)
+            {
+                *in_flight = in_flight.saturating_sub(1);
+                if *in_flight == 0 {
+                    self.active_completion_critical_connections_by_job
+                        .remove(&job_id);
+                }
+            }
+        }
     }
 
     pub(crate) fn handle_download_lane_parked(&mut self, parked: DownloadLaneParked) {

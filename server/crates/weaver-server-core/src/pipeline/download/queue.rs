@@ -377,6 +377,17 @@ impl DownloadQueue {
             .and_then(|Reverse(pw)| matches(&pw.work).then_some(&pw.work))
     }
 
+    /// The head of one dispatch class without removing it, in O(1).
+    ///
+    /// For decisions that are about the *shape* of the work rather than the
+    /// work itself — which newsgroups a connection for this job would have to
+    /// be opened for, ahead of any lease being cut.
+    pub fn peek_in_class(&self, completion_critical: bool) -> Option<&DownloadWork> {
+        self.heap_for_class(completion_critical)
+            .peek()
+            .map(|Reverse(pw)| &pw.work)
+    }
+
     pub fn len(&self) -> usize {
         self.completion_critical_heap.len() + self.ordinary_heap.len()
     }
