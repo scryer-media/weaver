@@ -1,5 +1,5 @@
-export type ProxyKind = "HTTP_CONNECT" | "SOCKS5" | "SSH" | "WIRE_GUARD";
-export const proxyLabels: Record<ProxyKind, string> = { HTTP_CONNECT: "HTTP CONNECT", SOCKS5: "SOCKS5", SSH: "SSH", WIRE_GUARD: "WireGuard" };
+export type ProxyKind = "HTTP_CONNECT" | "HTTP3_CONNECT" | "SOCKS5" | "SSH" | "WIRE_GUARD";
+export const proxyLabels: Record<ProxyKind, string> = { HTTP_CONNECT: "HTTP CONNECT", HTTP3_CONNECT: "HTTP/3 CONNECT", SOCKS5: "SOCKS5", SSH: "SSH", WIRE_GUARD: "WireGuard" };
 export type RoutingPolicy = { proxyIds: number[]; allowDirect: boolean };
 export type RoutingStatus = { state: string; selectedProxyId: number | null; failures: { proxyId: number; message: string }[] };
 export const directRouting: RoutingPolicy = { proxyIds: [], allowDirect: true };

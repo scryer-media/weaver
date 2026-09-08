@@ -12,6 +12,8 @@ use weaver_server_core::{
 #[graphql(name = "ProxyKind")]
 pub enum ProxyKind {
     HttpConnect,
+    #[graphql(name = "HTTP3_CONNECT")]
+    Http3Connect,
     #[graphql(name = "SOCKS5")]
     Socks5,
     Ssh,
@@ -21,6 +23,7 @@ impl From<ProxyKind> for proxies::ProxyKind {
     fn from(v: ProxyKind) -> Self {
         match v {
             ProxyKind::HttpConnect => Self::HttpConnect,
+            ProxyKind::Http3Connect => Self::Http3Connect,
             ProxyKind::Socks5 => Self::Socks5,
             ProxyKind::Ssh => Self::Ssh,
             ProxyKind::WireGuard => Self::WireGuard,
@@ -31,6 +34,7 @@ impl From<proxies::ProxyKind> for ProxyKind {
     fn from(v: proxies::ProxyKind) -> Self {
         match v {
             proxies::ProxyKind::HttpConnect => Self::HttpConnect,
+            proxies::ProxyKind::Http3Connect => Self::Http3Connect,
             proxies::ProxyKind::Socks5 => Self::Socks5,
             proxies::ProxyKind::Ssh => Self::Ssh,
             proxies::ProxyKind::WireGuard => Self::WireGuard,

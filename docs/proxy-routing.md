@@ -1,6 +1,6 @@
 # Proxy profiles and consumer routing
 
-Settings → Proxies manages HTTP CONNECT, SOCKS5, SSH and userspace WireGuard
+Settings → Proxies manages HTTP CONNECT, HTTP/3 CONNECT, SOCKS5, SSH and userspace WireGuard
 profiles. Server and RSS editors assign up to eight distinct profiles in order.
 Direct access is a separate final fallback. Assigning the first profile in the
 UI turns that fallback off. Existing consumers retain direct access, and API
@@ -19,14 +19,14 @@ warnings, and never execute hooks.
 
 ## Runtime and persistence
 
-`engines/weaver-tunnel` adapts the Git-pinned `proxy-tunnels` SSH/WireGuard
+`engines/weaver-tunnel` adapts the tag-pinned `proxy-tunnels` SSH/WireGuard/HTTP3
 engine and owns HTTP CONNECT/SOCKS5 upstream transports, routed DNS and bridges.
 `weaver-server-core::proxies` owns encrypted persistence, policies, revisions,
 health, cooldowns and one explicitly initialized application runtime. Source
 provenance and dependency features are recorded in
 `engines/weaver-tunnel/PROVENANCE.md`.
 
-SSH and WireGuard sessions are reused per profile revision. Async and blocking
+SSH, WireGuard and HTTP/3 sessions are reused per profile revision. Async and blocking
 NNTP use revocable in-process streams. Async s2n accepts the routed stream
 directly; blocking s2n uses synchronous receive/send callbacks over that stream,
 with a stable boxed callback context and bounded I/O waits on the owned runtime.
@@ -59,9 +59,22 @@ their existing soft timeout, including extra download lanes.
 RSS uses the same policy for polling, redirects and originating NZB downloads.
 Each candidate route resolves and validates destination addresses before
 connecting to those exact addresses. HTTP Host/TLS names remain unchanged.
-HTTP CONNECT, SOCKS5 and SSH use bounded DNS-over-TCP to configured resolver
+HTTP CONNECT, HTTP/3 CONNECT, SOCKS5 and SSH use bounded DNS-over-TCP to configured resolver
 IPs; WireGuard uses its tunnel resolver. Environment proxy settings cannot
 override the policy. Cross-origin redirects do not carry feed credentials.
+
+HTTP/3 profiles require an HTTP/3 forward proxy with a publicly trusted TLS
+certificate and reachable UDP port (443 by default). Optional Basic credentials
+authenticate CONNECT requests. The profile connection test opens a tunnel to a
+configured DNS server IP on port 53; without one, test an assigned NNTP server.
+There is no automatic HTTP/1 downgrade. Direct access remains controlled by the
+consumer's fallback switch. Each session supports up to 128 admitted streams;
+QUIC connection receive/send windows are 32 MiB, and stream receive windows are
+2 MiB. Up to four sessions, including draining connections, can coexist.
+
+RSS relay pumps use 64 KiB buffers in each direction. The 1,024-connection
+bridge limit bounds these copy buffers to 128 MiB per bridge. NNTP retains its
+direct in-process stream path through s2n or rustls.
 
 Migration 46 supplies equivalent SQLite/PostgreSQL profile and route tables.
 Credential fields are one encrypted JSON value under Weaver's existing key;
@@ -214,9 +227,9 @@ No dependency versions or features changed for this tuning.
 
 ## Shared-engine and direct-I/O validation
 
-The shared engine uses signed tag `v0.20.0` from `scryer-media/proxy-tunnels`.
-Weaver's lockfile resolves it to `7c63bad3f43e8aaea2ffa5b9190866406ce4eb10`;
-no local path override is required. Protocol source and dependency files are
+Before HTTP/3, shared-engine validation used the former `v0.20.0` tag from
+`scryer-media/proxy-tunnels`, resolving to `7c63bad3f43e8aaea2ffa5b9190866406ce4eb10`.
+No local path override was required. Protocol source and dependency files were
 identical to the validated commit `8c54eb1348d58afe72cd158fe0d084074617a3a1`.
 
 - Shared crate: 79 tests, formatting and all-target/all-feature Clippy passed.
@@ -257,6 +270,52 @@ TCP without TLS. The fixture does not include NNTP decoding or disk writes.
 PostgreSQL runtime tests and Linux/Windows builds were not run. Blocking
 STARTTLS remains unsupported as in the base implementation.
 
+## HTTP/3 integration validation
+
+The current shared engine uses signed tag `v0.1.0`, resolving to
+`01481be7fca27a7864fe40e9a4b95fcfa9698ce2`. The standalone crate version sequence
+was reset before this integration; the old `v0.20.0` tag mentioned in historical
+results above is no longer published. The current tag includes bounded attempts
+across proxy endpoint addresses and handling of informational CONNECT responses.
+
+Apple Silicon validation with disposable local fixtures:
+
+- Locked full workspace Nextest: 3,688 passed, 11 existing opt-in tests skipped.
+- Formatting and prescribed host Clippy targets with warnings denied passed.
+- Explicit s2n proxy routing: six tests passed across all five transports,
+  including blocking read deadlines/revocation, async STARTTLS, destination
+  certificate inspection, provider identity and pooled article retry.
+- HTTP/3 RSS fixtures verified routed DNS, validated destination IPs, redirects,
+  private-address rejection, credential stripping across origins and inherited
+  NZB routing without duplicate submissions. Failed HTTP/3 establishment never
+  opened the host destination, and a profile test without DNS never tried TCP.
+- Frontend lint/typecheck, production build, 33 tests and five schema utility
+  tests passed. All 99 executable GraphQL documents validate. Schema comparison
+  reports only the expected `HTTP3_CONNECT` enum addition as dangerous, with no
+  breaking changes; the compatibility checker remains strict.
+- Native macOS, Linux and Windows feature graphs have no active ring backend.
+  No unrelated registry versions or Windows dependency assignments changed.
+- Intel macOS compile checks passed for the tunnel and NNTP crates, using
+  rustup's installed compiler and target standard library.
+
+The optimized `local_route_throughput` harness verified three 16 MiB samples
+per route. Median payload rates on this host:
+
+| Route | MiB/s |
+| --- | ---: |
+| Direct, existing socket path | 2855.9 |
+| Direct, revocation registered | 2903.0 |
+| HTTP CONNECT relay | 3077.0 |
+| SOCKS5 relay | 3070.2 |
+| SSH relay | 840.2 |
+| WireGuard relay | 171.6 |
+| HTTP/3 CONNECT relay | 327.1 |
+
+These short, same-machine measurements include byte verification. They do not
+measure WAN latency/loss, NNTP decoding or disk writes, and do not establish a
+provider throughput guarantee. PostgreSQL runtime tests, Linux/Windows execution
+and browser-driven UI checks were not rerun for this addition.
+
 ## Reproduction
 
 From this worktree:
@@ -265,7 +324,7 @@ From this worktree:
 rtk cargo fmt --all -- --check
 rtk cargo clippy --workspace --offline --locked --lib --bins --tests --examples --benches -- -D warnings
 rtk cargo nextest run --workspace --offline --locked --no-fail-fast
-rtk proxy cargo nextest run -p weaver-nntp --test proxy_routing --offline --locked --run-ignored only --no-capture local_route_throughput
+rtk proxy cargo nextest run --release -p weaver-nntp --test proxy_routing --offline --locked --run-ignored only --no-capture --no-fail-fast local_route_throughput
 rtk proxy env WEAVER_NNTP_TLS_BACKEND=s2n cargo nextest run -p weaver-nntp --test proxy_routing --offline --locked --no-fail-fast
 rtk proxy env WEAVER_NNTP_TLS_BACKEND=s2n WEAVER_THROUGHPUT_MIB=32 WEAVER_THROUGHPUT_SAMPLES=3 WEAVER_THROUGHPUT_CONNECTIONS=20 cargo nextest run --release -p weaver-nntp --test wireguard_throughput --offline --locked --run-ignored only --no-capture --no-fail-fast
 ```

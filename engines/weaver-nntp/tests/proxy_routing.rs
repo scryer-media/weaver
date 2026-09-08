@@ -9,7 +9,7 @@ use weaver_tunnel::{
     bridge::Bridge,
     test_support::{
         SshServerDouble, SshServerOptions, TEST_PEER_ADDRESS, WireGuardTestPeer,
-        WireGuardTestPeerOptions, proxy::ProxyServerDouble, spec_for,
+        WireGuardTestPeerOptions, http3::Http3ServerDouble, proxy::ProxyServerDouble, spec_for,
     },
     transport::{TransportKind, TransportProxy},
 };
@@ -114,6 +114,7 @@ impl Origin {
 
 enum Fixture {
     Standard(ProxyServerDouble),
+    Http3(Http3ServerDouble),
     Ssh(SshServerDouble),
     WireGuard(WireGuardTestPeer),
 }
@@ -152,7 +153,12 @@ async fn profile(kind: u8, destination: SocketAddr) -> (Fixture, Arc<dyn TunnelP
                 Arc::new(SshTunnelProvider::new(spec, observer)),
             )
         }
-        _ => {
+        4 => {
+            let proxy = Http3ServerDouble::start(mapping).await;
+            let provider = proxy.provider();
+            (Fixture::Http3(proxy), provider)
+        }
+        3 => {
             let proxy = WireGuardTestPeer::start_for_downloads(
                 WireGuardTestPeerOptions {
                     http_port: destination.port(),
@@ -173,6 +179,7 @@ async fn profile(kind: u8, destination: SocketAddr) -> (Fixture, Arc<dyn TunnelP
                 Arc::new(WireGuardTunnelProvider::new(spec, observer)),
             )
         }
+        _ => panic!("unknown fixture kind"),
     }
 }
 
@@ -267,6 +274,14 @@ async fn exercise(kind: u8, implicit: bool, starttls: bool) {
                 .iter()
                 .any(|(host, _)| host == "provider.invalid")
         ),
+        Fixture::Http3(proxy) => assert!(
+            proxy
+                .targets
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(host, _)| host == "provider.invalid")
+        ),
         Fixture::Ssh(proxy) => assert!(
             proxy
                 .forwarded_targets()
@@ -292,6 +307,12 @@ async fn http_connect_plain_tls_and_starttls() {
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http3_plain_tls_and_starttls() {
+    for (tls, starttls) in [(false, false), (true, false), (false, true)] {
+        exercise(4, tls, starttls).await;
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socks5_plain_tls_and_starttls() {
     for (tls, starttls) in [(false, false), (true, false), (false, true)] {
         exercise(1, tls, starttls).await;
@@ -312,9 +333,9 @@ async fn wireguard_plain_tls_and_starttls() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
-    for revoke in [false, true] {
+    for (kind, revoke) in [(3, false), (3, true), (4, false), (4, true)] {
         let origin = Origin::start(true).await;
-        let (_fixture, provider) = profile(3, origin.addr).await;
+        let (_fixture, provider) = profile(kind, origin.addr).await;
         let bridge = Bridge::start(
             &tokio::runtime::Handle::current(),
             provider.clone(),
@@ -413,7 +434,7 @@ async fn local_route_throughput() {
             rates[1]
         );
     }
-    for kind in 0..4 {
+    for kind in 0..5 {
         let (_fixture, provider) = profile(kind, addr).await;
         let bridge = Bridge::start(
             &tokio::runtime::Handle::current(),
@@ -440,7 +461,13 @@ async fn local_route_throughput() {
         rates.sort_by(f64::total_cmp);
         println!(
             "{}: {:.1} MiB/s median, verified {BYTES} bytes per sample",
-            ["HTTP CONNECT", "SOCKS5", "SSH", "WireGuard"][kind as usize],
+            [
+                "HTTP CONNECT",
+                "SOCKS5",
+                "SSH",
+                "WireGuard",
+                "HTTP/3 CONNECT"
+            ][kind as usize],
             rates[1]
         );
         bridge.revoke().await;

@@ -13,8 +13,8 @@ mod tests;
 use super::*;
 use crate::Database;
 use weaver_tunnel::{
-    SshTunnelProvider, TunnelError, TunnelObserver, TunnelProvider, TunnelStream,
-    WireGuardTunnelProvider,
+    Http3TunnelProvider, SshTunnelProvider, TunnelError, TunnelObserver, TunnelProvider,
+    TunnelStream, WireGuardTunnelProvider,
     bridge::Bridge,
     transport::{TransportKind, TransportProxy},
 };
@@ -61,6 +61,10 @@ impl ProxyHop {
         });
         let mut wireguard = None;
         let provider: Arc<dyn TunnelProvider> = match profile.kind {
+            ProxyKind::Http3Connect => Arc::new(
+                Http3TunnelProvider::new(profile.http3_spec().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?,
+            ),
             ProxyKind::Ssh => Arc::new(SshTunnelProvider::new(profile.ssh_spec(), observer)),
             ProxyKind::WireGuard => {
                 let wg = Arc::new(WireGuardTunnelProvider::new(
@@ -70,7 +74,7 @@ impl ProxyHop {
                 wireguard = Some(wg.clone());
                 wg
             }
-            kind => Arc::new(TransportProxy {
+            kind @ (ProxyKind::HttpConnect | ProxyKind::Socks5) => Arc::new(TransportProxy {
                 kind: if kind == ProxyKind::Socks5 {
                     TransportKind::Socks5
                 } else {
@@ -397,6 +401,22 @@ pub struct ProxyRuntime {
     stopped: AtomicBool,
 }
 impl ProxyRuntime {
+    #[cfg(test)]
+    pub(crate) fn install_http3_fixture(&self, id: u32, provider: Arc<dyn TunnelProvider>) {
+        assert!(self.routes.lock().unwrap().is_empty());
+        let mut profiles = self.profiles.write().unwrap();
+        let profile = profiles.get(&id).unwrap().profile.clone();
+        assert_eq!(profile.kind, ProxyKind::Http3Connect);
+        profiles.insert(
+            id,
+            Arc::new(ProxyHop {
+                profile,
+                provider,
+                wireguard: None,
+            }),
+        );
+    }
+
     pub fn nntp_sockets(
         &self,
         id: u32,
@@ -638,6 +658,22 @@ impl ProxyRuntime {
     }
     pub async fn test_profile(&self, profile: &ProxyProfile) -> Result<String, String> {
         profile.validate().map_err(|e| e.to_string())?;
+        if profile.kind == ProxyKind::Http3Connect {
+            let dns = profile.dns_servers.first().ok_or(
+                "Configure a routed DNS server IP to test HTTP/3 forwarding, or test an assigned NNTP server",
+            )?;
+            let hop = ProxyHop::new(profile.clone(), &self.db)?;
+            let result = tokio::time::timeout(profile.timeout(), async {
+                let _stream = hop.provider.dial(&dns.to_string(), 53).await?;
+                Ok::<_, TunnelError>(())
+            })
+            .await;
+            hop.provider.shutdown().await;
+            return match result {
+                Ok(Ok(())) => Ok("HTTP/3 proxy TLS, authentication and forwarding succeeded".into()),
+                _ => Err("HTTP/3 proxy connection failed; check UDP reachability, TLS certificate, credentials and routed DNS".into()),
+            };
+        }
         let observer = Arc::new(Observer {
             db: self.db.clone(),
             id: profile.id,

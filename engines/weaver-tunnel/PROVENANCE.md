@@ -6,8 +6,8 @@ configuration validation and protocol fixtures were adapted from
 `81e8de95848a31f024edd86d026db8867c296091` (`release-NEXT`).
 The original repository's GPL v3 license is preserved in `LICENSE`.
 
-SSH, WireGuard, the userspace IP stack and their protocol fixtures now come
-from `scryer-media/proxy-tunnels`, through signed tag `v0.20.0` in this crate's
+SSH, WireGuard, HTTP/3 CONNECT, the userspace IP stack and their protocol fixtures come
+from `scryer-media/proxy-tunnels`, through signed tag `v0.1.0` in this crate's
 `Cargo.toml`. The workspace `Cargo.lock` records the exact resolved Git commit. The local protocol copies have
 been removed. The shared extraction began at
 `2b537101b58d2cad11664b401b82a726b8958db1`; its key-only SSH authentication,
@@ -20,6 +20,15 @@ bounded DNS-over-TCP, and extends lifecycle, trust and consumer fixtures.
 Persistence, routing policy, authorization and UI remain outside this crate.
 The s2n direct-stream integration lives in `weaver-nntp` and uses its existing
 s2n callback APIs and dependencies.
+
+The tag resolves to `01481be7fca27a7864fe40e9a4b95fcfa9698ce2`. HTTP/3 uses
+Quinn 0.11, rustls 0.23, and the shared repository's vendored h3 0.0.8 and
+h3-quinn 0.0.10. The two MIT-licensed vendored libraries preserve upstream
+provenance; their narrow patch encodes ordinary CONNECT without scheme/path
+pseudo-headers. TLS 1.3, certificate verification and QUIC packet protection use
+AWS-LC explicitly. The public root bundle is webpki-roots (MPL-2.0).
+Local HTTP/3 fixtures reuse this stack and Weaver's existing AWS-LC rcgen
+configuration. Their generated private trust root is only installed in tests.
 
 Registry dependencies are pinned by the workspace `Cargo.lock`, with registry
 checksums. The main networking additions resolve as follows:

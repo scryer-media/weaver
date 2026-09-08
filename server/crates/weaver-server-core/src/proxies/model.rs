@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::IpAddr, time::Duration};
-use weaver_tunnel::{TunnelError, TunnelSpec, WireGuardSpec, parse_key};
+use weaver_tunnel::{
+    Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec, TunnelError, TunnelSpec,
+    WireGuardSpec, parse_key,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProxyKind {
     HttpConnect,
+    Http3Connect,
     Socks5,
     Ssh,
     WireGuard,
@@ -109,6 +113,11 @@ impl ProxyProfile {
                     return Err(invalid("SOCKS5 credentials must fit in 255 bytes"));
                 }
             }
+            ProxyKind::Http3Connect => {
+                // Construction validates authority, credentials and timeout;
+                // sessions are lazy, so saving a profile does not use networking.
+                Http3TunnelProvider::new(self.http3_spec()?)?;
+            }
             ProxyKind::HttpConnect => {
                 if self
                     .secrets
@@ -135,6 +144,31 @@ impl ProxyProfile {
             pinned_host_key: self.host_key_fingerprint.clone(),
             request_timeout: self.timeout(),
         }
+    }
+    pub fn http3_spec(&self) -> Result<Http3TunnelSpec, TunnelError> {
+        if self.secrets.username.is_none() && self.secrets.password.is_some() {
+            return Err(TunnelError::Configuration(
+                "HTTP/3 proxy password requires a username".into(),
+            ));
+        }
+        Ok(Http3TunnelSpec {
+            proxy_config_id: self.id.to_string(),
+            revision: self.revision.to_string(),
+            host: self.host.clone(),
+            port: self.port,
+            credentials: self
+                .secrets
+                .username
+                .as_ref()
+                .map(|username| {
+                    Http3ProxyCredentials::new(
+                        username.clone(),
+                        self.secrets.password.clone().unwrap_or_default(),
+                    )
+                })
+                .transpose()?,
+            request_timeout: self.timeout(),
+        })
     }
     pub fn wireguard_spec(&self) -> Result<WireGuardSpec, TunnelError> {
         Ok(WireGuardSpec {

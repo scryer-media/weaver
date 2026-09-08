@@ -9,7 +9,8 @@ use std::{
 use weaver_tunnel::{
     test_support::{
         SshServerDouble, SshServerOptions, TEST_PEER_ADDRESS, WireGuardTestPeer,
-        WireGuardTestPeerOptions, dns::DnsServerDouble, proxy::ProxyServerDouble,
+        WireGuardTestPeerOptions, dns::DnsServerDouble, http3::Http3ServerDouble,
+        proxy::ProxyServerDouble,
     },
     transport::TransportKind,
 };
@@ -19,6 +20,7 @@ const DNS: &str = "192.0.2.53";
 type ObservedTargets = Arc<StdMutex<Vec<(String, u16)>>>;
 pub(super) struct Fixture {
     _proxy: Option<ProxyServerDouble>,
+    http3: Option<Http3ServerDouble>,
     _ssh: Option<SshServerDouble>,
     _wg: Option<WireGuardTestPeer>,
     dns: DnsServerDouble,
@@ -54,10 +56,19 @@ impl Fixture {
             ((PUBLIC.to_string(), 80), destination),
         ]);
         let mut standard = None;
+        let mut http3 = None;
         let mut ssh = None;
         let mut wg = None;
         let mut targets = None;
         match kind {
+            ProxyKind::Http3Connect => {
+                let proxy = Http3ServerDouble::start(mapping).await;
+                p.port = proxy.addr.port();
+                p.secrets.username = Some("fixture".into());
+                p.secrets.password = Some("fixture-only".into());
+                targets = Some(proxy.targets.clone());
+                http3 = Some(proxy);
+            }
             ProxyKind::HttpConnect | ProxyKind::Socks5 => {
                 let proxy = ProxyServerDouble::start(
                     if kind == ProxyKind::HttpConnect {
@@ -112,6 +123,7 @@ impl Fixture {
         }
         Self {
             _proxy: standard,
+            http3,
             _ssh: ssh,
             _wg: wg,
             dns,
@@ -186,6 +198,9 @@ pub(super) fn service(
     )
     .unwrap();
     let runtime = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    if let Some(proxy) = &fixture.http3 {
+        runtime.install_http3_fixture(fixture.profile.id, proxy.provider());
+    }
     let submissions = Arc::new(StdMutex::new(Vec::new()));
     let mut security = RuntimeSecurityConfig::default();
     security.rss_allow_private_network = allow_private;
@@ -256,6 +271,10 @@ async fn routed_http(kind: ProxyKind) {
     task.abort();
 }
 #[tokio::test]
+async fn http3_rss_uses_routed_dns_and_validated_addresses() {
+    routed_http(ProxyKind::Http3Connect).await;
+}
+#[tokio::test]
 async fn http_connect_rss_uses_routed_dns_and_validated_addresses() {
     routed_http(ProxyKind::HttpConnect).await;
 }
@@ -274,9 +293,14 @@ async fn wireguard_rss_uses_tunnel_dns_and_preserves_host() {
 
 #[tokio::test]
 async fn redirect_rebinding_to_private_address_is_rejected_before_connection() {
+    for kind in [ProxyKind::Socks5, ProxyKind::Http3Connect] {
+        reject_private_redirect(kind).await;
+    }
+}
+async fn reject_private_redirect(kind: ProxyKind) {
     let temp = TempDir::new().unwrap();
     let (addr, captured, task) = origin().await;
-    let fixture = Fixture::start(ProxyKind::Socks5, addr).await;
+    let fixture = Fixture::start(kind, addr).await;
     fixture
         .dns
         .names
@@ -308,9 +332,14 @@ async fn redirect_rebinding_to_private_address_is_rejected_before_connection() {
 
 #[tokio::test]
 async fn http_status_and_feed_parsing_errors_do_not_rotate_routes() {
+    for kind in [ProxyKind::HttpConnect, ProxyKind::Http3Connect] {
+        retain_route_on_http_status(kind).await;
+    }
+}
+async fn retain_route_on_http_status(kind: ProxyKind) {
     let temp = TempDir::new().unwrap();
     let (addr, _, task) = origin().await;
-    let fixture = Fixture::start(ProxyKind::HttpConnect, addr).await;
+    let fixture = Fixture::start(kind, addr).await;
     let (service, runtime, feed, _) =
         service(&temp, &fixture, "http://feed.invalid/failure", false);
     let response = service
@@ -332,9 +361,14 @@ async fn http_status_and_feed_parsing_errors_do_not_rotate_routes() {
 
 #[tokio::test]
 async fn automatic_and_manual_nzb_downloads_inherit_feed_routing_without_duplicates() {
+    for kind in [ProxyKind::Socks5, ProxyKind::Http3Connect] {
+        inherit_feed_routing(kind).await;
+    }
+}
+async fn inherit_feed_routing(kind: ProxyKind) {
     let temp = TempDir::new().unwrap();
     let (addr, captured, task) = origin().await;
-    let fixture = Fixture::start(ProxyKind::Socks5, addr).await;
+    let fixture = Fixture::start(kind, addr).await;
     let (service, runtime, feed, submissions) =
         service(&temp, &fixture, "http://feed.invalid/feed", false);
     service

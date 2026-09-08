@@ -87,7 +87,7 @@ export function ProxiesSettingsPage() {
       <form className="space-y-5" onSubmit={e => { e.preventDefault(); void saveEditor(); }}>
         <div className="grid gap-4 md:grid-cols-2">
           <label className="space-y-2 text-sm">Name<Input required maxLength={128} value={d.name} onChange={e => update({ name: e.target.value })} /></label>
-          <label className="space-y-2 text-sm">Type<select className="h-10 w-full rounded-md border border-input bg-background px-3" value={d.kind} disabled={!!p} onChange={e => { const kind = e.target.value as ProxyKind; update({ ...initial, name: d.name, kind, port: { HTTP_CONNECT: 3128, SOCKS5: 1080, SSH: 22, WIRE_GUARD: 51820 }[kind], secrets: {} }); setWarnings([]); }}>
+          <label className="space-y-2 text-sm">Type<select className="h-10 w-full rounded-md border border-input bg-background px-3" value={d.kind} disabled={!!p} onChange={e => { const kind = e.target.value as ProxyKind; update({ ...initial, name: d.name, kind, port: { HTTP_CONNECT: 3128, HTTP3_CONNECT: 443, SOCKS5: 1080, SSH: 22, WIRE_GUARD: 51820 }[kind], secrets: {} }); setWarnings([]); }}>
             {Object.entries(proxyLabels).map(([kind, label]) => <option key={kind} value={kind}>{label}</option>)}
           </select></label>
           <label className="space-y-2 text-sm">Endpoint host<Input required value={d.host} onChange={e => update({ host: e.target.value })} /></label>
@@ -95,7 +95,8 @@ export function ProxiesSettingsPage() {
           <label className="space-y-2 text-sm">DNS server IPs<textarea className="min-h-20 w-full rounded-md border border-input bg-background p-3" value={d.dns} onChange={e => update({ dns: e.target.value })} /><span className="block text-xs text-muted-foreground">Required for RSS. These servers must be reachable through this proxy.</span></label>
           <label className="space-y-2 text-sm">Connection test timeout (seconds)<Input type="number" min={1} max={300} value={d.timeoutSeconds} onChange={e => update({ timeoutSeconds: Number(e.target.value) })} /></label>
           {d.kind !== "WIRE_GUARD" && secretField("username", "Username", p?.hasUsername)}
-          {(d.kind === "HTTP_CONNECT" || d.kind === "SOCKS5") && secretField("password", "Password", p?.hasPassword)}
+          {(d.kind === "HTTP_CONNECT" || d.kind === "HTTP3_CONNECT" || d.kind === "SOCKS5") && secretField("password", "Password", p?.hasPassword)}
+          {d.kind === "HTTP3_CONNECT" && <p className="text-xs text-muted-foreground md:col-span-2">Requires an HTTP/3 forward proxy with a publicly trusted TLS certificate and a reachable UDP port. Configure a DNS server IP reachable through the proxy to use the connection test. The proxy does not automatically downgrade to HTTP or direct access.</p>}
           {d.kind === "SSH" && <>{secretField("privateKey", "Ed25519 private key", p?.hasPrivateKey, true)}{secretField("passphrase", "Key passphrase", p?.hasPassphrase)}<p className="text-xs text-muted-foreground md:col-span-2">An Ed25519 private key is required. The first successful connection pins the host key; changed keys are rejected.</p></>}
         </div>
         {d.kind === "WIRE_GUARD" && <div className="space-y-4">
