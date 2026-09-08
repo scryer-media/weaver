@@ -858,7 +858,7 @@ impl BlockingBodyLane {
                 Some("authentication/access failure".to_string()),
             ),
             Err(DecodedBodyError::Nntp(error)) if is_transient(error) => (
-                FetchAttemptOutcome::TransientFailure,
+                FetchAttemptOutcome::transient(error),
                 Some(error.to_string()),
             ),
             Err(other) => (

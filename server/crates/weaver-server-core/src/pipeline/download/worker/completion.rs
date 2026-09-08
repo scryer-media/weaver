@@ -535,7 +535,8 @@ impl Pipeline {
                     FetchAttemptOutcome::AuthenticationFailure => {
                         crate::operations::instrumentation::ServerAttemptOutcomeKind::AuthFailure
                     }
-                    FetchAttemptOutcome::TransientFailure => {
+                    FetchAttemptOutcome::TransientFailure
+                    | FetchAttemptOutcome::GroupSelectionRequired => {
                         crate::operations::instrumentation::ServerAttemptOutcomeKind::TransientFailure
                     }
                     FetchAttemptOutcome::PermanentFailure => {
@@ -570,7 +571,8 @@ impl Pipeline {
                     FetchAttemptOutcome::AuthenticationFailure => {
                         crate::events::model::ServerAttemptOutcome::AuthenticationFailure
                     }
-                    FetchAttemptOutcome::TransientFailure => {
+                    FetchAttemptOutcome::TransientFailure
+                    | FetchAttemptOutcome::GroupSelectionRequired => {
                         crate::events::model::ServerAttemptOutcome::TransientFailure
                     }
                     FetchAttemptOutcome::PermanentFailure => {

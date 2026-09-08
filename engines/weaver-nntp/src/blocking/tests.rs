@@ -12,6 +12,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
+mod group_discovery;
+
 enum TestArticle {
     Body(Vec<u8>),
     DelayedInitial {

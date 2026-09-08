@@ -661,7 +661,10 @@ async fn group_requirement_discovery_retries_the_decoded_batch_item() {
         .await;
 
     assert!(matches!(disposition, DecodedBatchDisposition::Retry));
-    assert_eq!(attempts[0].outcome, FetchAttemptOutcome::TransientFailure);
+    assert_eq!(
+        attempts[0].outcome,
+        FetchAttemptOutcome::GroupSelectionRequired
+    );
     assert!(matches!(
         last_error,
         Some(DecodedBodyError::Nntp(NntpError::NoGroupSelected))

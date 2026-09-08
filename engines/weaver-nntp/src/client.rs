@@ -264,8 +264,18 @@ pub enum FetchAttemptOutcome {
     QuotaBlocked,
     QuotaUnrequested,
     AuthenticationFailure,
+    GroupSelectionRequired,
     TransientFailure,
     PermanentFailure,
+}
+
+impl FetchAttemptOutcome {
+    pub(crate) fn transient(error: &NntpError) -> Self {
+        match error {
+            NntpError::NoGroupSelected => Self::GroupSelectionRequired,
+            _ => Self::TransientFailure,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1436,7 +1446,7 @@ impl NntpClient {
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::TransientFailure,
+                        outcome: FetchAttemptOutcome::transient(&e),
                         error: Some(e.to_string()),
                     });
                     self.record_transient_server_failure(idx, &e).await;
@@ -2072,7 +2082,7 @@ impl NntpClient {
                     server_idx,
                     remote_ip,
                     elapsed,
-                    outcome: FetchAttemptOutcome::TransientFailure,
+                    outcome: FetchAttemptOutcome::transient(&e),
                     error: Some(e.to_string()),
                 });
                 self.record_transient_server_failure(server_idx, &e).await;
@@ -2196,7 +2206,7 @@ impl NntpClient {
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::TransientFailure,
+                        outcome: FetchAttemptOutcome::transient(&e),
                         error: Some(e.to_string()),
                     });
                     self.record_transient_server_failure(idx, &e).await;
@@ -2445,6 +2455,7 @@ impl NntpClient {
                 FetchAttemptOutcome::NotFound
                 | FetchAttemptOutcome::QuotaBlocked
                 | FetchAttemptOutcome::QuotaUnrequested
+                | FetchAttemptOutcome::GroupSelectionRequired
                 | FetchAttemptOutcome::PermanentFailure => {}
             }
         }
