@@ -631,8 +631,15 @@ async fn install_direct_unpack(
                     pending
                         .coverage
                         .abort("chase exceeded the consumption deadline");
+                    pending.budget.cancel();
                     handle.abort();
-                    let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                    // Aborting a started blocking task does not stop it. Let
+                    // its cancellation checkpoints run before deleting paths
+                    // it can still be writing, without delaying fallback.
+                    tokio::spawn(async move {
+                        let _ = handle.await;
+                        let _ = tokio::fs::remove_dir_all(pending.staging_dir).await;
+                    });
                     None
                 }
                 Some(joined) => match joined {

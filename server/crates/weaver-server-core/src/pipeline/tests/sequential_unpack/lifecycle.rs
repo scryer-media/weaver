@@ -2,6 +2,60 @@ use super::*;
 use crate::pipeline::direct_unpack::wiring::{AbortLatch, DemotionReason};
 
 #[tokio::test]
+async fn pausing_a_chase_waiting_for_memory_does_not_wait_for_another_download() {
+    let temp = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    pipeline.direct_unpack_process_memory = Arc::new(
+        crate::pipeline::extraction::ProcessMemoryBudget::new(1024 * 1024),
+    );
+    let (name, bytes, members) = fixture(SimpleArchiveKind::Gz);
+    let first = JobId(43125);
+    let second = JobId(43126);
+    for job in [first, second] {
+        insert_stream(&mut pipeline, job, &[(name.clone(), bytes.clone())]).await;
+        let id = NzbFileId {
+            job_id: job,
+            file_index: 0,
+        };
+        for number in 0..bytes.len().div_ceil(ARTICLE) / 2 {
+            land(&mut pipeline, id, &name, &bytes, number).await;
+        }
+        if job == first {
+            assert!(
+                wait_for_output(
+                    &pipeline
+                        .direct_unpack_staging_dir(job, &name)
+                        .join(&members[0].0),
+                    8192,
+                )
+                .await
+            );
+        }
+    }
+    let second_staging = pipeline.direct_unpack_staging_dir(second, &name);
+    pipeline.direct_unpack_abort_job(
+        second,
+        "paused",
+        AbortLatch::Retryable,
+        DemotionReason::DownloadEnded,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while second_staging.exists() && tokio::time::Instant::now() < deadline {
+        pipeline.reap_direct_unpack().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let cancelled_without_first = !second_staging.exists();
+    assert!(pipeline.direct_unpack.is_armed(first, &name));
+    pipeline
+        .direct_unpack_shutdown("memory cancellation test cleanup")
+        .await;
+    assert!(
+        cancelled_without_first,
+        "a cancelled memory waiter must not depend on another download finishing"
+    );
+}
+
+#[tokio::test]
 async fn truncated_compression_streams_fail_without_repair_data() {
     for kind in [
         SimpleArchiveKind::Deflate,

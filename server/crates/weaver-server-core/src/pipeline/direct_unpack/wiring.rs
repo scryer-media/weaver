@@ -276,6 +276,7 @@ impl DirectUnpackCounters {
 /// One set currently being chased.
 struct ArmedSet {
     coverage: Arc<SetCoverage>,
+    budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
     staging_dir: PathBuf,
     handle: tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
     started_at: Instant,
@@ -293,6 +294,7 @@ struct ArmedSet {
 /// A chase that has not finished yet, handed to the extraction context so it
 /// can be awaited there rather than on the orchestrator loop.
 pub(in crate::pipeline) struct PendingChase {
+    pub(in crate::pipeline) budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
     pub(in crate::pipeline) handle:
         tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
     pub(in crate::pipeline) staging_dir: PathBuf,
@@ -760,7 +762,7 @@ impl Pipeline {
             Arc::clone(&coverage),
             output_dir.clone(),
             root,
-            budget,
+            Arc::clone(&budget),
             password,
             Arc::clone(&counters),
             format,
@@ -777,6 +779,7 @@ impl Pipeline {
                 aborted_at: None,
                 zombie_announced: false,
                 coverage,
+                budget,
                 staging_dir: output_dir,
                 handle,
                 started_at: Instant::now(),
@@ -1573,6 +1576,7 @@ impl Pipeline {
         let mut armed = armed;
         armed.aborted_at = Some(Instant::now());
         armed.coverage.abort(reason.to_string());
+        armed.budget.cancel();
 
         self.direct_unpack.counters.record_demotion(demotion);
         if latch == AbortLatch::Permanent {
@@ -2017,6 +2021,7 @@ impl Pipeline {
         self.direct_unpack.counters.consumed += 1;
         record_event("consumed");
         ChaseDisposition::Pending(PendingChase {
+            budget: armed.budget,
             handle: armed.handle,
             staging_dir: armed.staging_dir,
             counters: armed.counters,
@@ -2055,6 +2060,7 @@ impl Pipeline {
             armed
                 .coverage
                 .abort("repair rewrote the archive".to_string());
+            armed.budget.cancel();
             self.direct_unpack
                 .counters
                 .record_demotion(DemotionReason::RepairRewrote);
@@ -2548,6 +2554,7 @@ impl Pipeline {
                         // and the chase parked until job teardown; saying so
                         // ends it now, with a reason.
                         coverage.abort(format!("part {index} is unreadable after repair: {error}"));
+                        armed.budget.cancel();
                         break;
                     }
                 }
@@ -2634,6 +2641,7 @@ impl Pipeline {
                         coverage.abort(format!(
                             "part {index} is unreadable after verification: {error}"
                         ));
+                        armed.budget.cancel();
                         break;
                     }
                 }
