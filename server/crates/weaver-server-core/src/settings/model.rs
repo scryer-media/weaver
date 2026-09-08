@@ -226,8 +226,22 @@ pub struct DirectStoreOverrides {
     pub enabled: Option<bool>,
     /// Per-set ceiling on the holds scratch file, in bytes. Decoded bytes whose
     /// destination is not yet known are held in RAM and paged here on a breach;
-    /// breaching *this* ceiling demotes that one set. Defaults to 512 MiB.
+    /// breaching *this* ceiling demotes that one set. Defaults to 1 GiB.
     pub holds_scratch_ceiling_bytes: Option<u64>,
+    /// Process-wide ceiling on RAM-resident holds across every set, in bytes.
+    /// Over it, the set that is routing pages its holds to scratch. Defaults
+    /// to a sixteenth of the memory the process can use, between 64 MiB and
+    /// 1 GiB.
+    pub holds_resident_limit_bytes: Option<u64>,
+    /// Process-wide ceiling on holds scratch across every set, in bytes. A
+    /// spill that would exceed it demotes the set that asked. Defaults to four
+    /// times the per-set ceiling.
+    pub holds_scratch_total_bytes: Option<u64>,
+    /// Free space the working directory's filesystem must keep, in bytes. A
+    /// spill that would leave less demotes the set that asked. Defaults to a
+    /// twentieth of the filesystem, between 512 MiB and 20 GiB; zero disables
+    /// the check.
+    pub holds_disk_reserve_bytes: Option<u64>,
 }
 
 /// Operator-facing switches for 7z direct unpack (`[direct_unpack]`).

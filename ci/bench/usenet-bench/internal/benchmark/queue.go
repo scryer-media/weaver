@@ -512,13 +512,13 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 			artifact.Error = err.Error()
 			return artifact
 		}
-		shaperBefore, err := AcquireShaperExecutionLease(parent, nil, config.ShaperControlURL, leaseID)
+		shaperBefore, err := AcquireShaperExecutionLeaseForRun(parent, nil, config.ShaperControlURL, leaseID, first.ServerLink)
 		if err != nil {
 			artifact.Error = err.Error()
 			return artifact
 		}
 		defer func() {
-			if err := releaseShaperExecutionLeaseAfterRun(config.ShaperControlURL, leaseID); err != nil {
+			if err := releaseShaperExecutionLeaseAfterRun(nil, config.ShaperControlURL, leaseID); err != nil {
 				if artifact.Error != "" {
 					artifact.Error += "; "
 				}
@@ -526,10 +526,6 @@ func executeQueueSuite(parent context.Context, config RunConfig, suite queueSuit
 				artifact.Status = "failed"
 			}
 		}()
-		if err := shaperBefore.ValidateFor(first.ServerLink); err != nil {
-			artifact.Error = err.Error()
-			return artifact
-		}
 		artifact.ShaperBefore = &shaperBefore
 	}
 	adapter, ok := config.Catalog.For(first.Client, first.ArchiveToolchain, first.ExecutionTarget)

@@ -78,7 +78,10 @@ impl Pipeline {
                 // contract is that turning it off at *startup* sweeps and
                 // redownloads mid-flight direct work, not that it takes effect
                 // mid-job.
-                crate::pipeline::direct_store::DirectStoreSettings::resolve(&cfg),
+                crate::pipeline::direct_store::DirectStoreSettings::resolve_on(
+                    &cfg,
+                    crate::pipeline::direct_store::HostFacts::probe(&intermediate_dir),
+                ),
                 // Same contract, same reason: resolved once so a set admitted
                 // under an enabled gate cannot find it disabled mid-chase.
                 crate::pipeline::direct_unpack::DirectUnpackSettings::resolve(&cfg),
@@ -99,6 +102,9 @@ impl Pipeline {
             // `holds_scratch_ceiling` is otherwise unattributable.
             info!(
                 holds_scratch_ceiling_bytes = direct_store_settings.holds_scratch_ceiling_bytes,
+                holds_resident_limit_bytes = direct_store_settings.holds_resident_limit_bytes,
+                holds_scratch_total_bytes = direct_store_settings.holds_scratch_total_bytes,
+                holds_disk_reserve_bytes = direct_store_settings.holds_disk_reserve_bytes,
                 "RAR direct-store routing enabled"
             );
         }
@@ -363,6 +369,10 @@ impl Pipeline {
             propagation_ready_at: HashMap::new(),
             propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
+            last_owned_lane_acquire_failure_log_at: None,
+            last_owned_lane_acquire_failure_at: None,
+            download_lanes_under_cap_since: None,
+            last_download_lanes_under_cap_log_at: None,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
@@ -453,6 +463,10 @@ impl Pipeline {
         };
         let _ = pipeline.refresh_bandwidth_cap_window();
         pipeline.refresh_download_pressure();
+        // The very first lease a lane takes must already know the depth its
+        // server can run at; discovering it from the first response means the
+        // whole opening of every download is sequential.
+        pipeline.seed_download_lane_explorers();
         Ok(pipeline)
     }
 

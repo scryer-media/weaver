@@ -6,7 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -36,9 +40,85 @@ func renderProduct(cfg Config) (productSpec, error) {
 		return productSpec{}, fmt.Errorf("unsupported client %q", cfg.Client)
 	}
 	spec.Rendered = renderAuditConfig(cfg, spec)
-	digest := sha256.Sum256(spec.Rendered)
+	digest := sha256.Sum256(canonicalizeSandboxPaths(cfg, spec.Rendered))
 	spec.ConfigSHA256 = hex.EncodeToString(digest[:])
 	return spec, nil
+}
+
+// sandboxPathPlaceholders lists the per-suite directories the audit rendering
+// mentions, each with the stable token that stands in for it while the
+// configuration digest is computed. Longest paths are replaced first so a
+// directory nested inside another still gets its own token.
+func sandboxPathPlaceholders(cfg Config) []struct {
+	path        string
+	placeholder string
+} {
+	entries := []struct {
+		path        string
+		placeholder string
+	}{
+		{cfg.ConfigDir, "{{suite_config_dir}}"},
+		{cfg.OutputDir, "{{suite_output_dir}}"},
+		{cfg.WorkingDir, "{{suite_working_dir}}"},
+		{cfg.ResultPath, "{{suite_result_path}}"},
+	}
+	kept := entries[:0]
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.path) == "" || seen[entry.path] {
+			continue
+		}
+		seen[entry.path] = true
+		kept = append(kept, entry)
+	}
+	sort.SliceStable(kept, func(left, right int) bool {
+		return len(kept[left].path) > len(kept[right].path)
+	})
+	return kept
+}
+
+// canonicalizeSandboxPaths replaces the per-suite sandbox directories with
+// stable tokens before the rendered configuration is hashed.
+//
+// rendered_config_sha256 is the summarizer's proof that every repetition of a
+// stratum ran the same product configuration; it refuses to publish a stratum
+// whose repetitions disagree. Container lanes mount the sandbox at fixed
+// in-container paths, so their rendering is already identical across
+// repetitions. The native lane gives every suite its own directory under the
+// artifacts tree, so the raw rendering differs on every repetition for nothing
+// but the suite number, and the check fires on configurations that are in fact
+// the same. Hashing the canonical form keeps the check's power -- any real
+// difference in options, endpoints, credentials or launch arguments still
+// moves the digest -- while ignoring where the sandbox happened to be placed.
+// The audit file written beside the run keeps the real paths.
+func canonicalizeSandboxPaths(cfg Config, rendered []byte) []byte {
+	text := string(rendered)
+	for _, entry := range sandboxPathPlaceholders(cfg) {
+		for _, spelling := range pathSpellings(entry.path) {
+			text = strings.ReplaceAll(text, spelling, entry.placeholder)
+		}
+	}
+	return []byte(text)
+}
+
+// pathSpellings lists the ways one path appears in the audit rendering: as the
+// operating system writes it, with its separators escaped the way
+// encoding/json writes them into launch_command, and with the separators
+// normalised to forward slashes for products that accept either. The escaped
+// spelling is replaced first because it is the longest.
+func pathSpellings(path string) []string {
+	spellings := make([]string, 0, 3)
+	for _, candidate := range []string{
+		strings.ReplaceAll(path, `\`, `\\`),
+		path,
+		strings.ReplaceAll(path, `\`, "/"),
+	} {
+		if candidate == "" || slices.Contains(spellings, candidate) {
+			continue
+		}
+		spellings = append(spellings, candidate)
+	}
+	return spellings
 }
 
 func renderWeaver(cfg Config) productSpec {
@@ -131,6 +211,14 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 		"direct_unpack = " + direct,
 		"pre_check = 0",
 		"pause_on_post_processing = 0",
+		// SABnzbd 5 pipelines two BODY requests per connection for a server
+		// added through its UI but downgrades every server it finds in an
+		// ini older than config conversion 5 to one request per connection.
+		// Stamping the current conversion number keeps the rendered server
+		// exactly as a fresh install would create it. Without it a native run
+		// fetches one article per round trip and is not the same measurement
+		// as the Docker lane's.
+		"config_conversion_version = 5",
 		"",
 		"[servers]",
 		"[[benchmark]]",
@@ -139,6 +227,8 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 		"username = " + cfg.NNTPUsername,
 		"password = " + cfg.NNTPPassword,
 		"connections = " + strconv.Itoa(cfg.Connections),
+		// SABnzbd's own default for a newly added server (5.0 and later).
+		"pipelining_requests = 2",
 		"ssl = " + ssl,
 		// Native SAB follows the same explicitly labelled local TLS policy as
 		// Docker. No result may claim CA verification for this product.
@@ -152,14 +242,81 @@ func renderSABnzbd(cfg Config, directUnpack bool) productSpec {
 	}
 }
 
-// nzbgetSevenZipCommand is the official 7-Zip console binary a native NZBGet
-// install resolves from PATH. The 7z corpus lane needs it, so it is stated
-// rather than left to NZBGet's built-in default: a host without it then fails
-// loudly instead of quietly skipping every 7z unpack.
-const nzbgetSevenZipCommand = "7z"
+// NZBGetSevenZipCommand and NZBGetUnrarCommand are the canonical names of the
+// unpackers NZBGet shells out to. The RAR and 7z corpus lanes need them, so
+// they are stated rather than left to NZBGet's built-in defaults, which vary
+// by package: a host without one then fails loudly instead of quietly skipping
+// every unpack.
+const (
+	NZBGetSevenZipCommand = "7z"
+	NZBGetUnrarCommand    = "unrar"
+)
+
+// NZBGetSevenZipNames and NZBGetUnrarNames are the names the same unpacker is
+// installed under. 7-Zip in particular is "7z" from a package manager, "7za"
+// in NZBGet's own macOS bundle and "7zz" from upstream, and NZBGet runs
+// whichever the config names.
+var (
+	NZBGetSevenZipNames = []string{NZBGetSevenZipCommand, "7za", "7zz"}
+	NZBGetUnrarNames    = []string{NZBGetUnrarCommand}
+)
+
+// NZBGetUnpacker settles which unpacker a run will actually use. A packaged
+// install can ship its own next to the daemon -- NZBGet's macOS bundle ships
+// both -- and that copy is the one the product is built against, so it wins
+// over whatever the host happens to have on PATH. Rendering and preflight both
+// call this, so a check cannot pass for a binary the run will not run.
+func NZBGetUnpacker(program string, names []string) string {
+	return resolveNZBGetUnpacker(runtime.GOOS, program, names)
+}
+
+func resolveNZBGetUnpacker(goos, program string, names []string) string {
+	if directory := filepath.Dir(program); strings.TrimSpace(program) != "" {
+		for _, name := range names {
+			if candidate, ok := bundledUnpacker(goos, directory, name); ok {
+				return candidate
+			}
+		}
+	}
+	for _, name := range names {
+		if resolved, err := exec.LookPath(name); err == nil {
+			return resolved
+		}
+	}
+	// Naming the canonical command keeps the rendered config well formed on a
+	// host that has neither; preflight is what reports the absence.
+	return names[0]
+}
+
+// bundledUnpacker is the beside-the-program check. Windows names an
+// executable by its extension and keeps no execute bit, so there the file
+// NZBGet ships is "unrar.exe" and the mode says nothing; everywhere else the
+// bare name with the execute bit is the program.
+func bundledUnpacker(goos, directory, name string) (string, bool) {
+	candidate := filepath.Join(directory, executableName(goos, name))
+	info, err := os.Stat(candidate)
+	if err != nil || info.IsDir() {
+		return "", false
+	}
+	if goos != "windows" && info.Mode()&0o111 == 0 {
+		return "", false
+	}
+	return candidate, true
+}
+
+func executableName(goos, name string) string {
+	if goos == "windows" && filepath.Ext(name) == "" {
+		return name + ".exe"
+	}
+	return name
+}
 
 func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 	_, apiPort, _ := nativeAPIAddress(cfg.APIEndpoint)
+	var program string
+	if len(cfg.LaunchCommand) > 0 {
+		program = cfg.LaunchCommand[0]
+	}
 	encryption := "no"
 	verification := "none"
 	certStore := ""
@@ -194,14 +351,18 @@ func renderNZBGet(cfg Config, directUnpack bool) productSpec {
 		"ControlPort=" + strconv.Itoa(apiPort),
 		"ControlUsername=" + controlUsername,
 		"ControlPassword=" + apiKey,
-		"DaemonMode=no",
 		"OutputMode=log",
 		"DirectWrite=" + directWrite,
 		"DirectUnpack=" + direct,
 		"ParCheck=auto",
 		"ParRepair=yes",
 		"Unpack=yes",
-		"SevenZipCmd=" + nzbgetSevenZipCommand,
+		"UnrarCmd=" + NZBGetUnpacker(program, NZBGetUnrarNames),
+		"SevenZipCmd=" + NZBGetUnpacker(program, NZBGetSevenZipNames),
+		// A packaged install can ship post-processing extensions in its own
+		// script directory. Stating the empty list keeps whatever the host
+		// happens to have installed out of a measured run.
+		"Extensions=",
 		"Server1.Active=yes",
 		"Server1.Name=benchmark",
 		"Server1.Level=0",

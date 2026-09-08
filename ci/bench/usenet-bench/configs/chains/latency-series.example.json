@@ -1,0 +1,428 @@
+{
+  "schema_version": 1,
+  "name": "weaver-latency-series",
+  "compose_file": "../src/configs/server/compose-shaper.example.yml",
+  "compose_project": "nntp-bench",
+  "password_file": "nntp-password",
+  "ca_file": "nntp-ca.pem",
+  "adapters": "adapters.json",
+  "target": "docker-linux",
+  "nntp_host": "nntp",
+  "username": "fixture-user",
+  "shaper_control_url": "http://127.0.0.1:8080",
+  "artifacts_dir": "series",
+  "restore_server_link": "1gbit",
+  "restore_server_rtt": "0s",
+  "require": {
+    "fixture_roots": [
+      "../fixtures",
+      "../fixtures-3"
+    ],
+    "server_pipelining_container": "nntp-bench-nntp-1",
+    "client_version": {
+      "client": "weaver",
+      "entrypoint": "/opt/weaver/weaver",
+      "accept": [
+        "0.11.0"
+      ]
+    }
+  },
+  "fixture_sets": {
+    "full-corpus": [
+      "rar4-393-data-normal-solid-data-incompressible",
+      "rar4-data-normal-solid-data-incompressible",
+      "rar5-5-data-normal-solid-data-incompressible",
+      "rar5-6-data-normal-solid-data-incompressible",
+      "rar5-7-data-normal-solid-data-incompressible",
+      "rar4-393-headers-normal-solid-headers-compressible",
+      "rar4-headers-normal-solid-headers-compressible",
+      "rar5-5-headers-normal-solid-headers-compressible",
+      "rar5-6-headers-normal-solid-headers-compressible",
+      "rar5-7-headers-normal-solid-headers-compressible",
+      "rar4-393-clear-normal-nonsolid-none-incompressible",
+      "rar4-clear-normal-nonsolid-none-compressible",
+      "rar5-7-clear-normal-nonsolid-none-incompressible",
+      "rar4-393-store-store-nonsolid-none-incompressible",
+      "rar4-store-store-nonsolid-none-incompressible",
+      "rar5-5-store-store-nonsolid-none-incompressible",
+      "rar5-6-store-store-nonsolid-none-incompressible",
+      "rar5-7-store-store-nonsolid-none-compressible",
+      "rar5-7-quickopen-store-nonsolid-none-incompressible",
+      "sevenzip-store-store-nonsolid-none-incompressible",
+      "sevenzip-headers-store-nonsolid-headers-incompressible",
+      "sevenzip-lzma2-normal-solid-none-compressible",
+      "repair-rar4-par2-par2-light-normal-solid-none-incompressible",
+      "repair-rar5-par2-par2-heavy-normal-solid-data-incompressible",
+      "repair-rar4-393-recovery-rar-recovery-volume-light-normal-nonsolid-none-incompressible",
+      "repair-rar5-recovery-rar-recovery-volume-heavy-normal-solid-headers-incompressible",
+      "repair-rar5-store-par2-par2-light-store-nonsolid-none-incompressible",
+      "repair-rar5-store-withheld-par2-heavy-withheld-store-nonsolid-headers-incompressible",
+      "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
+      "repair-rar5-store-recovery-rar-recovery-volume-heavy-store-nonsolid-none-incompressible",
+      "repair-sevenzip-store-par2-par2-light-store-nonsolid-none-incompressible",
+      "repair-sevenzip-lzma2-par2-par2-heavy-normal-solid-none-incompressible",
+      "direct-mkv-200mb"
+    ],
+    "bluray-pair": [
+      "rar5-7-bluray-store-nonsolid-none-incompressible",
+      "rar5-7-bluray-normal-nonsolid-none-incompressible"
+    ],
+    "store-corpus": [
+      "rar4-393-store-store-nonsolid-none-incompressible",
+      "rar4-393-store-store-nonsolid-headers-incompressible",
+      "rar4-393-store-store-nonsolid-data-incompressible",
+      "rar4-store-store-nonsolid-none-incompressible",
+      "rar4-store-store-nonsolid-headers-incompressible",
+      "rar4-store-store-nonsolid-data-incompressible",
+      "rar5-5-store-store-nonsolid-none-incompressible",
+      "rar5-5-store-store-nonsolid-headers-incompressible",
+      "rar5-5-store-store-nonsolid-data-incompressible",
+      "rar5-6-store-store-nonsolid-none-incompressible",
+      "rar5-6-store-store-nonsolid-headers-incompressible",
+      "rar5-6-store-store-nonsolid-data-incompressible",
+      "rar5-7-store-store-nonsolid-none-incompressible",
+      "rar5-7-store-store-nonsolid-headers-incompressible",
+      "rar5-7-store-store-nonsolid-data-incompressible",
+      "repair-rar4-store-par2-par2-light-store-nonsolid-none-incompressible",
+      "repair-rar4-store-par2-par2-light-store-nonsolid-headers-incompressible",
+      "repair-rar4-store-par2-par2-light-store-nonsolid-data-incompressible",
+      "repair-rar4-store-par2-par2-heavy-withheld-store-nonsolid-none-incompressible",
+      "repair-rar4-store-par2-par2-heavy-withheld-store-nonsolid-headers-incompressible",
+      "repair-rar4-store-par2-par2-heavy-withheld-store-nonsolid-data-incompressible",
+      "repair-rar5-5-store-par2-par2-light-store-nonsolid-none-incompressible",
+      "repair-rar5-5-store-par2-par2-light-store-nonsolid-headers-incompressible",
+      "repair-rar5-5-store-par2-par2-light-store-nonsolid-data-incompressible",
+      "repair-rar5-5-store-par2-par2-heavy-withheld-store-nonsolid-none-incompressible",
+      "repair-rar5-5-store-par2-par2-heavy-withheld-store-nonsolid-headers-incompressible",
+      "repair-rar5-5-store-par2-par2-heavy-withheld-store-nonsolid-data-incompressible",
+      "repair-rar5-7-store-par2-par2-light-store-nonsolid-none-incompressible",
+      "repair-rar5-7-store-par2-par2-light-store-nonsolid-headers-incompressible",
+      "repair-rar5-7-store-par2-par2-light-store-nonsolid-data-incompressible",
+      "repair-rar5-7-store-par2-par2-heavy-withheld-store-nonsolid-none-incompressible",
+      "repair-rar5-7-store-par2-par2-heavy-withheld-store-nonsolid-headers-incompressible",
+      "repair-rar5-7-store-par2-par2-heavy-withheld-store-nonsolid-data-incompressible",
+      "rar5-7-quickopen-store-nonsolid-none-incompressible",
+      "sevenzip-store-store-nonsolid-none-incompressible",
+      "sevenzip-headers-store-nonsolid-headers-incompressible",
+      "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
+      "repair-rar5-store-recovery-rar-recovery-volume-heavy-store-nonsolid-none-incompressible",
+      "repair-sevenzip-store-par2-par2-light-store-nonsolid-none-incompressible",
+      "direct-mkv"
+    ],
+    "bluray-store": [
+      "rar5-7-bluray-store-nonsolid-none-incompressible"
+    ],
+    "nfs-breadth": [
+      "rar5-6-store-store-nonsolid-none-incompressible",
+      "rar4-data-normal-solid-data-incompressible",
+      "sevenzip-store-store-nonsolid-none-incompressible",
+      "direct-mkv-200mb"
+    ]
+  },
+  "phases": [
+    {
+      "name": "B3-rtt10",
+      "mode": "sequential",
+      "plan": "plan-B3-eqt-tls-local-rtt10-trimmed.json",
+      "fixtures_root": "../fixtures",
+      "artifacts": "artifacts-B3-rtt10",
+      "server_link": "1gbit",
+      "server_rtt": "10ms",
+      "plan_spec": {
+        "fixture_set": "full-corpus",
+        "transports": [
+          "tls"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 3,
+        "seed": 20260905,
+        "exclude_fixtures": [
+          "rar4-393-headers-normal-solid-headers-compressible",
+          "rar4-clear-normal-nonsolid-none-compressible",
+          "rar4-headers-normal-solid-headers-compressible",
+          "rar5-5-headers-normal-solid-headers-compressible",
+          "rar5-6-headers-normal-solid-headers-compressible",
+          "rar5-7-headers-normal-solid-headers-compressible",
+          "sevenzip-lzma2-normal-solid-none-compressible"
+        ],
+        "exclude_clients": [
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar4-393-recovery-rar-recovery-volume-light-normal-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-recovery-rar-recovery-volume-heavy-normal-solid-headers-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and this heavy profile deletes two archive volumes, so nothing else on disk can supply them; excluded on the same capability grounds as its three siblings, which were listed after the 2026-09-05 run while this one was missed"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-store-recovery-rar-recovery-volume-heavy-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          }
+        ]
+      }
+    },
+    {
+      "name": "B3-bluray-rtt10",
+      "mode": "sequential",
+      "plan": "plan-B3-bluray-eqt-tls-local-rtt10.json",
+      "fixtures_root": "../fixtures",
+      "artifacts": "artifacts-B3-bluray-rtt10",
+      "server_link": "1gbit",
+      "server_rtt": "10ms",
+      "plan_spec": {
+        "fixture_set": "bluray-pair",
+        "transports": [
+          "tls"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 3,
+        "seed": 20260905
+      }
+    },
+    {
+      "name": "P3-rtt10",
+      "mode": "sequential",
+      "plan": "plan-P3-eqt-plaintext-local-rtt10-trimmed.json",
+      "fixtures_root": "../fixtures",
+      "artifacts": "artifacts-P3-rtt10",
+      "server_link": "1gbit",
+      "server_rtt": "10ms",
+      "plan_spec": {
+        "fixture_set": "full-corpus",
+        "transports": [
+          "plaintext"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 3,
+        "seed": 20260905,
+        "exclude_fixtures": [
+          "rar4-393-headers-normal-solid-headers-compressible",
+          "rar4-clear-normal-nonsolid-none-compressible",
+          "rar4-headers-normal-solid-headers-compressible",
+          "rar5-5-headers-normal-solid-headers-compressible",
+          "rar5-6-headers-normal-solid-headers-compressible",
+          "rar5-7-headers-normal-solid-headers-compressible",
+          "sevenzip-lzma2-normal-solid-none-compressible"
+        ],
+        "exclude_clients": [
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar4-393-recovery-rar-recovery-volume-light-normal-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-recovery-rar-recovery-volume-heavy-normal-solid-headers-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and this heavy profile deletes two archive volumes, so nothing else on disk can supply them; excluded on the same capability grounds as its three siblings, which were listed after the 2026-09-05 run while this one was missed"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-store-recovery-rar-recovery-volume-heavy-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          }
+        ]
+      }
+    },
+    {
+      "name": "C3-eqt-rtt10",
+      "mode": "sequential",
+      "plan": "plan-C3-nfs-eqt-tls-nfscomplete-rtt10.json",
+      "fixtures_root": "../fixtures",
+      "artifacts": "artifacts-C3-eqt-rtt10",
+      "server_link": "1gbit",
+      "server_rtt": "10ms",
+      "plan_spec": {
+        "fixture_set": "nfs-breadth",
+        "transports": [
+          "tls"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 3,
+        "seed": 20260905,
+        "storage_profile": "nfs-complete",
+        "nfs_link": "nas-100mbit"
+      },
+      "nfs": {
+        "container": "nfs-bench-nfs-1",
+        "network": "nfs-bench_benchmark_storage",
+        "helper_image": "weaver-nntp-bench-nfs:dev",
+        "verify_binary": "../bin/nntpbench"
+      }
+    },
+    {
+      "name": "A3-rtt10",
+      "mode": "sequential",
+      "plan": "plan-A3-stock-tls-local-rtt10-trimmed.json",
+      "fixtures_root": "../fixtures",
+      "artifacts": "artifacts-A3-rtt10",
+      "server_link": "1gbit",
+      "server_rtt": "10ms",
+      "plan_spec": {
+        "fixture_set": "full-corpus",
+        "transports": [
+          "tls"
+        ],
+        "profile": "stock",
+        "repetitions": 3,
+        "seed": 20260905,
+        "exclude_fixtures": [
+          "rar4-393-headers-normal-solid-headers-compressible",
+          "rar4-clear-normal-nonsolid-none-compressible",
+          "rar4-headers-normal-solid-headers-compressible",
+          "rar5-5-headers-normal-solid-headers-compressible",
+          "rar5-6-headers-normal-solid-headers-compressible",
+          "rar5-7-headers-normal-solid-headers-compressible",
+          "sevenzip-lzma2-normal-solid-none-compressible"
+        ],
+        "exclude_clients": [
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar4-393-recovery-rar-recovery-volume-light-normal-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-recovery-rar-recovery-volume-heavy-normal-solid-headers-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and this heavy profile deletes two archive volumes, so nothing else on disk can supply them; excluded on the same capability grounds as its three siblings, which were listed after the 2026-09-05 run while this one was missed"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-store-recovery-rar-recovery-volume-heavy-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Q10-unthrottled",
+      "mode": "queue-transition",
+      "plan": "plan-Q10-eqt-tls-local-queue-10gbit-rtt0.json",
+      "fixtures_root": "../fixtures",
+      "artifacts": "artifacts-Q10-unthrottled",
+      "server_link": "10gbit",
+      "plan_spec": {
+        "fixtures": [
+          "direct-mkv-200mb"
+        ],
+        "transports": [
+          "tls"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 10,
+        "seed": 20260905
+      },
+      "queue_drain_summary": true
+    },
+    {
+      "name": "B3-rtt100",
+      "mode": "sequential",
+      "plan": "plan-B3-eqt-tls-local-rtt100.json",
+      "fixtures_root": "../fixtures-3",
+      "artifacts": "artifacts-B3-rtt100",
+      "server_link": "1gbit",
+      "server_rtt": "100ms",
+      "plan_spec": {
+        "fixture_set": "store-corpus",
+        "transports": [
+          "tls"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 3,
+        "seed": 20260906,
+        "exclude_clients": [
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-store-recovery-rar-recovery-volume-heavy-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          }
+        ]
+      },
+      "summarize_baselines": [
+        "sabnzbd",
+        "nzbget"
+      ],
+      "minimum_blocks": 3
+    },
+    {
+      "name": "B3-bluray-rtt100",
+      "mode": "sequential",
+      "plan": "plan-B3-bluray-eqt-tls-local-rtt100.json",
+      "fixtures_root": "../fixtures-3",
+      "artifacts": "artifacts-B3-bluray-rtt100",
+      "server_link": "1gbit",
+      "server_rtt": "100ms",
+      "plan_spec": {
+        "fixture_set": "bluray-store",
+        "transports": [
+          "tls"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 3,
+        "seed": 20260906
+      },
+      "summarize_baselines": [
+        "sabnzbd",
+        "nzbget"
+      ],
+      "minimum_blocks": 3
+    },
+    {
+      "name": "P3-rtt100",
+      "mode": "sequential",
+      "plan": "plan-P3-eqt-plaintext-local-rtt100.json",
+      "fixtures_root": "../fixtures-3",
+      "artifacts": "artifacts-P3-rtt100",
+      "server_link": "1gbit",
+      "server_rtt": "100ms",
+      "plan_spec": {
+        "fixture_set": "store-corpus",
+        "transports": [
+          "plaintext"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 3,
+        "seed": 20260906,
+        "exclude_clients": [
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar4-store-recovery-rar-recovery-volume-light-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          },
+          {
+            "client": "sabnzbd",
+            "fixture_id": "repair-rar5-store-recovery-rar-recovery-volume-heavy-store-nonsolid-none-incompressible",
+            "reason": "SABnzbd does not use RAR recovery volumes (.rev) and did not finish this fixture in any block of the 2026-09-05 run; recorded as did-not-finish without re-running it"
+          }
+        ]
+      },
+      "summarize_baselines": [
+        "sabnzbd",
+        "nzbget"
+      ],
+      "minimum_blocks": 3
+    }
+  ]
+}

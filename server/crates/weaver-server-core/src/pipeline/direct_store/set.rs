@@ -349,8 +349,17 @@ impl DirectSet {
     /// honest answer: exact once the volume is complete, a lower bound while it
     /// is not, and a mid-download set is neither verified against nor demoted
     /// for its holes anyway.
+    ///
+    /// Either way the floor is the posted extent the virtual volume can
+    /// actually serve, holds included: `received_bytes` falls short of the
+    /// true length by exactly the articles that never came, and a hold waiting
+    /// past such a hole — the payload of a volume whose header was lost — is a
+    /// posted byte the provider answers for ([`Self::volume_coverage_with_holds`]).
+    /// Presenting the volume shorter than its last hold would put those bytes
+    /// past the end of the file PAR2 is handed, and the pass would rebuild
+    /// them from parity it did not need to spend.
     pub(crate) fn virtual_volume_len(&self, volume_index: u32, received_bytes: u64) -> u64 {
-        let covered_end = self.volume_coverage(volume_index).end();
+        let covered_end = self.volume_coverage_with_holds(volume_index).end();
         if self.restart_seeded_volumes.contains(&volume_index) {
             return covered_end;
         }

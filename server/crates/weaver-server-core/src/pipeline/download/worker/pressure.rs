@@ -120,8 +120,8 @@ impl Pipeline {
         &self,
     ) -> bool {
         let params = self.tuner.params();
-        let total = self.effective_download_connection_capacity(params.max_concurrent_downloads);
-        let mut limit = self.normal_download_connection_capacity_limit(total);
+        let mut limit =
+            self.effective_download_connection_capacity(params.max_concurrent_downloads);
         // Ordinary work can only run on fill servers; lanes beyond the fill
         // tier's connection budget would block on saturated fill semaphores
         // without ever reaching backfill. Escalated demand (queued work with
@@ -307,28 +307,20 @@ impl Pipeline {
         self.should_enforce_restart_durable_lead(job_id)
     }
 
-    pub(in crate::pipeline::download::worker) fn normal_download_connection_capacity_limit(
-        &self,
-        effective_total: usize,
-    ) -> usize {
-        let params = self.tuner.params();
-        let recovery_reserve = params
-            .recovery_slots
-            .saturating_sub(self.active_recovery)
-            .min(effective_total);
-        effective_total.saturating_sub(recovery_reserve)
-    }
-
+    /// Every configured connection is available to downloads, always.
+    ///
+    /// Nothing is held back here any more. Two subtractions used to live in
+    /// this function and both reserved capacity for work that was not asking
+    /// for it: a bandwidth-derived recovery reserve, whose recovery blocks stay
+    /// parked until a checkpoint promotes them, and one connection per job
+    /// running a health probe, which is a handful of STAT round trips that ride
+    /// the lanes rather than opening a connection of their own. Between them
+    /// they idled connections for the whole of a job's main download.
     pub(in crate::pipeline::download::worker) fn effective_download_connection_capacity(
         &self,
         configured_max: usize,
     ) -> usize {
-        let active_probes = self
-            .jobs
-            .values()
-            .filter(|s| matches!(s.status, JobStatus::Checking))
-            .count();
-        configured_max.saturating_sub(active_probes)
+        configured_max
     }
 
     pub(in crate::pipeline::download::worker) fn soft_pressure_dispatch_delay(

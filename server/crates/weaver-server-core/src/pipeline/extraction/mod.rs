@@ -1,7 +1,7 @@
 use super::*;
 
 mod rar;
-mod safety;
+pub(crate) mod safety;
 
 pub(crate) use rar::{RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest};
 pub(crate) use safety::{

@@ -139,6 +139,9 @@ fn config_roundtrip() {
         direct_store: Some(crate::settings::DirectStoreOverrides {
             enabled: Some(true),
             holds_scratch_ceiling_bytes: Some(128 * 1024 * 1024),
+            holds_resident_limit_bytes: Some(96 * 1024 * 1024),
+            holds_scratch_total_bytes: Some(3 * 1024 * 1024 * 1024),
+            holds_disk_reserve_bytes: Some(700 * 1024 * 1024),
         }),
         direct_unpack: Some(crate::settings::DirectUnpackOverrides {
             enabled: Some(true),
@@ -193,6 +196,18 @@ fn config_roundtrip() {
     assert_eq!(
         direct_store.holds_scratch_ceiling_bytes,
         Some(128 * 1024 * 1024)
+    );
+    assert_eq!(
+        direct_store.holds_resident_limit_bytes,
+        Some(96 * 1024 * 1024)
+    );
+    assert_eq!(
+        direct_store.holds_scratch_total_bytes,
+        Some(3 * 1024 * 1024 * 1024)
+    );
+    assert_eq!(
+        direct_store.holds_disk_reserve_bytes,
+        Some(700 * 1024 * 1024)
     );
     let direct_unpack = loaded
         .direct_unpack

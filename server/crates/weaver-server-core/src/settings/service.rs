@@ -174,13 +174,25 @@ impl Database {
             let enabled = settings
                 .get("direct_store.enabled")
                 .and_then(|v| v.parse().ok());
-            let holds_scratch_ceiling_bytes = settings
-                .get("direct_store.holds_scratch_ceiling_bytes")
-                .and_then(|v| v.parse().ok());
-            if enabled.is_some() || holds_scratch_ceiling_bytes.is_some() {
+            let bytes_setting = |key: &str| settings.get(key).and_then(|v| v.parse::<u64>().ok());
+            let holds_scratch_ceiling_bytes =
+                bytes_setting("direct_store.holds_scratch_ceiling_bytes");
+            let holds_resident_limit_bytes =
+                bytes_setting("direct_store.holds_resident_limit_bytes");
+            let holds_scratch_total_bytes = bytes_setting("direct_store.holds_scratch_total_bytes");
+            let holds_disk_reserve_bytes = bytes_setting("direct_store.holds_disk_reserve_bytes");
+            if enabled.is_some()
+                || holds_scratch_ceiling_bytes.is_some()
+                || holds_resident_limit_bytes.is_some()
+                || holds_scratch_total_bytes.is_some()
+                || holds_disk_reserve_bytes.is_some()
+            {
                 Some(DirectStoreOverrides {
                     enabled,
                     holds_scratch_ceiling_bytes,
+                    holds_resident_limit_bytes,
+                    holds_scratch_total_bytes,
+                    holds_disk_reserve_bytes,
                 })
             } else {
                 None
@@ -386,11 +398,27 @@ impl Database {
             if let Some(enabled) = direct_store.enabled {
                 self.set_setting("direct_store.enabled", &enabled.to_string())?;
             }
-            if let Some(bytes) = direct_store.holds_scratch_ceiling_bytes {
-                self.set_setting(
+            for (key, bytes) in [
+                (
                     "direct_store.holds_scratch_ceiling_bytes",
-                    &bytes.to_string(),
-                )?;
+                    direct_store.holds_scratch_ceiling_bytes,
+                ),
+                (
+                    "direct_store.holds_resident_limit_bytes",
+                    direct_store.holds_resident_limit_bytes,
+                ),
+                (
+                    "direct_store.holds_scratch_total_bytes",
+                    direct_store.holds_scratch_total_bytes,
+                ),
+                (
+                    "direct_store.holds_disk_reserve_bytes",
+                    direct_store.holds_disk_reserve_bytes,
+                ),
+            ] {
+                if let Some(bytes) = bytes {
+                    self.set_setting(key, &bytes.to_string())?;
+                }
             }
         }
 

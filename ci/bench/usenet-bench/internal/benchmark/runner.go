@@ -400,13 +400,13 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 			artifact.Error = err.Error()
 			return artifact
 		}
-		shaperBefore, err := AcquireShaperExecutionLease(parent, nil, config.ShaperControlURL, leaseID)
+		shaperBefore, err := AcquireShaperExecutionLeaseForRun(parent, nil, config.ShaperControlURL, leaseID, run.ServerLink)
 		if err != nil {
 			artifact.Error = err.Error()
 			return artifact
 		}
 		defer func() {
-			if err := releaseShaperExecutionLeaseAfterRun(config.ShaperControlURL, leaseID); err != nil {
+			if err := releaseShaperExecutionLeaseAfterRun(nil, config.ShaperControlURL, leaseID); err != nil {
 				if artifact.Error != "" {
 					artifact.Error += "; "
 				}
@@ -414,10 +414,6 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 				artifact.Status = "failed"
 			}
 		}()
-		if err := shaperBefore.ValidateFor(run.ServerLink); err != nil {
-			artifact.Error = err.Error()
-			return artifact
-		}
 		artifact.ShaperBefore = &shaperBefore
 	}
 	if err := invokeAdapter(parent, config, run, adapter, fixtureDir, nzbPath, archivePassword, outputDir, configDir, resultPath, logPath, store.Environment()); err != nil {

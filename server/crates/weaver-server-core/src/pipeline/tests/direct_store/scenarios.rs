@@ -8,8 +8,10 @@ mod classification_frontier;
 #[cfg(unix)]
 mod cross_device;
 mod cross_device_probe;
+mod header_encrypted_parse_cost;
 mod quick_open;
 mod rar4_rar3_file_encryption;
+mod repaired_encrypted_spans;
 mod restart;
 mod waiting_for_targeted_recovery;
 

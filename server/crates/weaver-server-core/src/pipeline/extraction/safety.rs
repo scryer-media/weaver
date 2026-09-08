@@ -34,9 +34,7 @@ pub(crate) struct ExtractionLimits {
 impl ExtractionLimits {
     pub(crate) fn from_env(complete_dir: &Path) -> Result<Self, String> {
         let total_filesystem_bytes = disk_space(complete_dir).map(|space| space.total_bytes);
-        let default_min_free = total_filesystem_bytes
-            .map(|total| (total / 20).clamp(512 * MIB, 20 * GIB))
-            .unwrap_or(512 * MIB);
+        let default_min_free = default_disk_reserve_bytes(total_filesystem_bytes);
         let detected_memory = crate::runtime::system_probe::detect_total_memory_bytes()
             .unwrap_or(2 * MAX_MEMORY_LIMIT);
         let default_memory = (detected_memory / 2).clamp(MIN_MEMORY_LIMIT, MAX_MEMORY_LIMIT);
@@ -57,6 +55,16 @@ impl ExtractionLimits {
             )?,
         })
     }
+}
+
+/// The free space a filesystem of `total_filesystem_bytes` should keep: a
+/// twentieth of it, between 512 MiB and 20 GiB, and 512 MiB when the size is
+/// unknown. The extractor's default output reserve, and the same rule the
+/// direct-store holds scratch keeps for the working directory.
+pub(crate) fn default_disk_reserve_bytes(total_filesystem_bytes: Option<u64>) -> u64 {
+    total_filesystem_bytes
+        .map(|total| (total / 20).clamp(512 * MIB, 20 * GIB))
+        .unwrap_or(512 * MIB)
 }
 
 fn parse_positive_u64(name: &str, default: u64) -> Result<u64, String> {

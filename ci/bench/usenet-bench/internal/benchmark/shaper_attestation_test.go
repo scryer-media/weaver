@@ -268,3 +268,106 @@ func TestFetchShaperSnapshotDecodesTheLinkShapingReport(t *testing.T) {
 		t.Fatalf("link shaping report not decoded: %+v", snapshot.LinkShaping)
 	}
 }
+
+// userspaceRoundTripSnapshot is the same shaped snapshot as
+// shapedRoundTripSnapshot, but from a shaper on a host with no tc, where the
+// proxy carries the round trip itself.
+func userspaceRoundTripSnapshot(t *testing.T, rttMicros uint64) ShaperSnapshot {
+	t.Helper()
+	snapshot := shapedRoundTripSnapshot(t, rttMicros)
+	ingress := rttMicros / 2
+	egress := rttMicros - ingress
+	snapshot.LinkShaping = &ShaperLinkShaping{
+		SchemaVersion:          1,
+		EgressMechanism:        "userspace-delay",
+		IngressMechanism:       "userspace-delay",
+		RTTMicros:              rttMicros,
+		EgressDelayMicros:      egress,
+		IngressDelayMicros:     ingress,
+		HandshakeDelayMicros:   rttMicros,
+		EgressQueueBytes:       12_500_000,
+		IngressQueueBytes:      12_500_000,
+		Platform:               "windows/amd64",
+		LiveEgressDelayMicros:  egress,
+		LiveIngressDelayMicros: ingress,
+	}
+	return snapshot
+}
+
+func TestValidateForAcceptsAUserspaceDelayedLink(t *testing.T) {
+	link, err := ResolveServerLinkProfile("1gbit", 0, 0, 250_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := userspaceRoundTripSnapshot(t, 250_000)
+	if err := snapshot.ValidateFor(link); err != nil {
+		t.Fatalf("a userspace-delayed shaper was rejected: %v", err)
+	}
+	// The observed residency floor sits a little above the configured delay;
+	// the same tolerance that covers tc's rounding covers that.
+	tolerated := userspaceRoundTripSnapshot(t, 250_000)
+	tolerated.LinkShaping.LiveEgressDelayMicros = 125_300
+	if err := tolerated.ValidateFor(link); err != nil {
+		t.Fatalf("a residency floor 300us above the delay was rejected: %v", err)
+	}
+
+	cases := map[string]func(s *ShaperSnapshot){
+		"claims a shaped interface":  func(s *ShaperSnapshot) { s.LinkShaping.Interface = "eth1" },
+		"claims a qdisc limit":       func(s *ShaperSnapshot) { s.LinkShaping.NetemLimitPackets = 125_000 },
+		"claims kernel buffers":      func(s *ShaperSnapshot) { s.LinkShaping.TCPWmem = "4096 1048576 134217728" },
+		"claims a kernel release":    func(s *ShaperSnapshot) { s.LinkShaping.KernelRelease = "6.8.0" },
+		"mixes mechanisms":           func(s *ShaperSnapshot) { s.LinkShaping.IngressMechanism = "ifb-netem" },
+		"charges no handshake":       func(s *ShaperSnapshot) { s.LinkShaping.HandshakeDelayMicros = 0 },
+		"charges half a handshake":   func(s *ShaperSnapshot) { s.LinkShaping.HandshakeDelayMicros = 125_000 },
+		"has no queue":               func(s *ShaperSnapshot) { s.LinkShaping.EgressQueueBytes = 0 },
+		"names no platform":          func(s *ShaperSnapshot) { s.LinkShaping.Platform = "" },
+		"delivers early":             func(s *ShaperSnapshot) { s.LinkShaping.LiveEgressDelayMicros = 0 },
+		"drifted from its own delay": func(s *ShaperSnapshot) { s.LinkShaping.LiveIngressDelayMicros = 120_000 },
+		"unknown mechanism":          func(s *ShaperSnapshot) { s.LinkShaping.EgressMechanism = "dummynet" },
+	}
+	for name, mutate := range cases {
+		broken := userspaceRoundTripSnapshot(t, 250_000)
+		mutate(&broken)
+		if err := broken.ValidateFor(link); err == nil {
+			t.Fatalf("%s: attestation must be rejected", name)
+		}
+	}
+}
+
+func TestValidateForKeepsNetemFreeOfUserspaceFields(t *testing.T) {
+	link, err := ResolveServerLinkProfile("1gbit", 0, 0, 250_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A netem report that also carries a handshake charge describes two
+	// mechanisms at once and is evidence for neither.
+	mixed := shapedRoundTripSnapshot(t, 250_000)
+	mixed.LinkShaping.HandshakeDelayMicros = 250_000
+	if err := mixed.ValidateFor(link); err == nil {
+		t.Fatal("a netem attestation carrying userspace fields was accepted")
+	}
+}
+
+func TestUserspaceResidencyToleranceIsAsymmetric(t *testing.T) {
+	link, err := ResolveServerLinkProfile("1gbit", 0, 0, 20_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A 10ms line cannot release a chunk early, so short readings are the
+	// delay not being applied; late ones are the host's scheduler, up to a
+	// bound well above any timer jitter.
+	for _, observed := range []uint64{10_000, 10_002, 12_000, 14_900} {
+		snapshot := userspaceRoundTripSnapshot(t, 20_000)
+		snapshot.LinkShaping.LiveEgressDelayMicros = observed
+		if err := snapshot.ValidateFor(link); err != nil {
+			t.Fatalf("a %dus floor against a 10000us line was rejected: %v", observed, err)
+		}
+	}
+	for _, observed := range []uint64{0, 5_000, 9_800, 16_000} {
+		snapshot := userspaceRoundTripSnapshot(t, 20_000)
+		snapshot.LinkShaping.LiveEgressDelayMicros = observed
+		if err := snapshot.ValidateFor(link); err == nil {
+			t.Fatalf("a %dus floor against a 10000us line was accepted", observed)
+		}
+	}
+}

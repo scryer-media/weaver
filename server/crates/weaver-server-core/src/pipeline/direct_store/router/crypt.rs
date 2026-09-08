@@ -262,7 +262,10 @@ pub(crate) struct HeaderKeyRing {
     verified: Option<String>,
     /// Sticky. A refusal is a demotion, and a demoted set does not come back.
     refusal: Option<HeaderCryptRefusal>,
-    cache: KdfCache,
+    /// The set's shared derivations. The tuple a candidate is *verified*
+    /// against is the same one the header walk then derives the archive key
+    /// from, so sharing this makes the walk's derivation a lookup.
+    cache: std::sync::Arc<KdfCache>,
 }
 
 /// One offered candidate: its value and where it came from, so the log line a
@@ -294,11 +297,17 @@ impl Default for HeaderKeyRing {
 
 impl HeaderKeyRing {
     pub(crate) fn new() -> Self {
+        Self::with_shared_kdf_cache(std::sync::Arc::new(KdfCache::new()))
+    }
+
+    /// A ring that verifies against `cache`; see
+    /// [`KeyRing::with_shared_kdf_cache`].
+    pub(crate) fn with_shared_kdf_cache(cache: std::sync::Arc<KdfCache>) -> Self {
         Self {
             candidates: Vec::new(),
             verified: None,
             refusal: None,
-            cache: KdfCache::new(),
+            cache,
         }
     }
 
@@ -514,7 +523,11 @@ pub(crate) struct KeyRing {
     /// `unrar-rs`'s own KDF cache. Two members of one set nearly always
     /// share a tuple, and a set with 200 members would otherwise pay 200
     /// PBKDF2 runs at admission.
-    cache: KdfCache,
+    ///
+    /// Shared with the rest of the set — the header ring and every header
+    /// walk the router runs — so a derivation any of them pays for is a
+    /// lookup for the others.
+    cache: std::sync::Arc<KdfCache>,
     /// One derivation per [`CryptTuple`].
     keys: BTreeMap<CryptTuple, DerivedKeys>,
     /// Sticky: once a password has been refuted, re-deriving cannot un-refute
@@ -545,9 +558,16 @@ impl Default for KeyRing {
 
 impl KeyRing {
     pub(crate) fn new() -> Self {
+        Self::with_shared_kdf_cache(std::sync::Arc::new(KdfCache::new()))
+    }
+
+    /// A ring that derives into `cache` rather than into one of its own, so
+    /// the set pays for each (password, salt, count) tuple once however many
+    /// of its parts need it.
+    pub(crate) fn with_shared_kdf_cache(cache: std::sync::Arc<KdfCache>) -> Self {
         Self {
             password: None,
-            cache: KdfCache::new(),
+            cache,
             keys: BTreeMap::new(),
             refusal: None,
             admitted: false,

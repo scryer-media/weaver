@@ -7,6 +7,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{Mutex, Semaphore};
+
+/// The idle list and the retired-IP set are guarded synchronously.
+///
+/// Nothing awaits while holding either, and a dropped [`PooledConnection`]
+/// must be able to put its socket back on the idle list *before* it releases
+/// the permit it was holding. Deferring the return to a spawned task released
+/// the permit first, so an acquire that fired in between found the list empty
+/// and dialled a fresh connection past a perfectly warm one.
+use std::sync::Mutex as SyncMutex;
+use std::sync::MutexGuard as SyncMutexGuard;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -31,6 +41,17 @@ pub enum BodyServerAvailability {
     Blocked,
 }
 
+/// Lock a synchronous pool mutex, reading through a poisoning panic.
+///
+/// A poisoned lock only means some thread panicked while holding it. The
+/// guarded values are plain collections of connections, so continuing is safe
+/// and strictly better than refusing to hand out or take back a socket.
+fn lock_recovering<T>(mutex: &SyncMutex<T>) -> SyncMutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Connection pool for a single NNTP server.
 #[allow(dead_code)]
 struct ServerPool {
@@ -42,7 +63,7 @@ struct ServerPool {
 
 /// Multi-server NNTP connection pool.
 pub struct NntpPool {
-    pools: Vec<Arc<Mutex<ServerPool>>>,
+    pools: Vec<Arc<SyncMutex<ServerPool>>>,
     configs: Vec<ServerConfig>,
     stable_ids: Vec<StableServerId>,
     transfer_controls: Vec<Option<Arc<ServerTransferControl>>>,
@@ -65,7 +86,13 @@ pub struct NntpPool {
     /// Per-server deadline (unix epoch ms, `0` = none) before which fresh
     /// connects are skipped because the provider refused the last one.
     over_limit_until: Vec<AtomicU64>,
-    retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
+    /// Per-server epoch-ms floor for the next blocking-connect warning, and the
+    /// failures suppressed since the last one was emitted. A server that cannot
+    /// be connected to fails on every dispatch pass, so an unthrottled warning
+    /// would be a log flood; a silent one is what made the condition invisible.
+    blocking_connect_warn_after: Vec<AtomicU64>,
+    blocking_connect_failures_since_warning: Vec<AtomicU64>,
+    retired_ips: Arc<SyncMutex<HashSet<(usize, IpAddr)>>>,
     connect_cursors: Vec<AtomicUsize>,
 }
 
@@ -91,6 +118,11 @@ impl BlockingConnectionPermit {
 /// connect with "too many connections". Existing sessions keep running; only
 /// new sockets wait, which is what the provider is actually asking for.
 pub const OVER_LIMIT_HOLDOFF: Duration = Duration::from_secs(10 * 60);
+
+/// How often one server's blocking-lane connect failures may be warned about.
+/// Every dispatch pass retries, so the failures arrive as fast as the scheduler
+/// runs; the warning stands for all of them and carries the count.
+const BLOCKING_CONNECT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 fn unix_epoch_ms() -> u64 {
     SystemTime::now()
@@ -171,6 +203,8 @@ impl NntpPool {
         let mut retention_days = Vec::with_capacity(server_count);
         let mut max_connections = Vec::with_capacity(server_count);
         let mut over_limit_until = Vec::with_capacity(server_count);
+        let mut blocking_connect_warn_after = Vec::with_capacity(server_count);
+        let mut blocking_connect_failures_since_warning = Vec::with_capacity(server_count);
         let mut connect_cursors = Vec::with_capacity(server_count);
 
         // A config where every server is backfill has no fill tier to
@@ -195,10 +229,12 @@ impl NntpPool {
             retention_days.push(spc.retention_days);
             max_connections.push(spc.max_connections);
             over_limit_until.push(AtomicU64::new(0));
+            blocking_connect_warn_after.push(AtomicU64::new(0));
+            blocking_connect_failures_since_warning.push(AtomicU64::new(0));
             connect_cursors.push(AtomicUsize::new(0));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
-            pools.push(Arc::new(Mutex::new(ServerPool {
+            pools.push(Arc::new(SyncMutex::new(ServerPool {
                 config: spc.server.clone(),
                 idle: VecDeque::new(),
                 active_count: 0,
@@ -230,7 +266,9 @@ impl NntpPool {
             retention_days,
             max_connections,
             over_limit_until,
-            retired_ips: Arc::new(Mutex::new(HashSet::new())),
+            blocking_connect_warn_after,
+            blocking_connect_failures_since_warning,
+            retired_ips: Arc::new(SyncMutex::new(HashSet::new())),
             connect_cursors,
         }
     }
@@ -240,9 +278,7 @@ impl NntpPool {
     }
 
     async fn retired_ips_for_server(&self, idx: usize) -> Vec<IpAddr> {
-        self.retired_ips
-            .lock()
-            .await
+        lock_recovering(&self.retired_ips)
             .iter()
             .filter_map(|(server_idx, ip)| (*server_idx == idx).then_some(*ip))
             .collect()
@@ -378,7 +414,7 @@ impl NntpPool {
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
             let candidate = {
-                let mut pool = self.pools[idx].lock().await;
+                let mut pool = lock_recovering(&self.pools[idx]);
                 self.take_healthy_idle(&mut pool)
             };
 
@@ -390,13 +426,12 @@ impl NntpPool {
                         match c.ping().await {
                             Ok(()) => break c,
                             Err(e) => {
-                                trace!(server = idx, error = %e, "stale ping failed, draining this server's idle");
-                                // A dead idle connection usually means its
-                                // siblings on the same server died with it
-                                // (provider-side idle reaping). Other servers
-                                // keep their warm sockets; the loop falls
-                                // through to create a fresh connection here.
-                                self.drain_idle_for(idx).await;
+                                trace!(server = idx, error = %e, "stale ping failed, dropping that connection");
+                                // Only this socket has proven itself dead. Its
+                                // siblings are pinged on their own way out of
+                                // the idle list if they are stale too, so the
+                                // loop simply takes the next one rather than
+                                // throwing away warm capacity on suspicion.
                                 continue;
                             }
                         }
@@ -442,10 +477,7 @@ impl NntpPool {
             }
         };
 
-        {
-            let mut pool = self.pools[idx].lock().await;
-            pool.active_count += 1;
-        }
+        lock_recovering(&self.pools[idx]).active_count += 1;
 
         Ok(PooledConnection {
             conn: Some(conn),
@@ -494,10 +526,7 @@ impl NntpPool {
             }
         };
 
-        {
-            let mut pool = self.pools[idx].lock().await;
-            pool.active_count += 1;
-        }
+        lock_recovering(&self.pools[idx]).active_count += 1;
 
         Ok(PooledConnection {
             conn: Some(conn),
@@ -518,7 +547,7 @@ impl NntpPool {
     pub async fn drain_all_idle(&self) {
         let mut total = 0usize;
         for pool in &self.pools {
-            let mut p = pool.lock().await;
+            let mut p = lock_recovering(pool);
             total += p.idle.len();
             p.idle.clear();
         }
@@ -538,7 +567,7 @@ impl NntpPool {
             return;
         };
         let count = {
-            let mut p = pool.lock().await;
+            let mut p = lock_recovering(pool);
             let count = p.idle.len();
             p.idle.clear();
             count
@@ -556,7 +585,7 @@ impl NntpPool {
         self.shutdown.cancel();
 
         for pool in &self.pools {
-            pool.lock().await.idle.clear();
+            lock_recovering(pool).idle.clear();
         }
 
         // Generation replacement must not let the new client race the old
@@ -567,7 +596,7 @@ impl NntpPool {
         loop {
             let mut async_leases = 0usize;
             for pool in &self.pools {
-                async_leases = async_leases.saturating_add(pool.lock().await.active_count);
+                async_leases = async_leases.saturating_add(lock_recovering(pool).active_count);
             }
             let configured_leases: usize = self
                 .semaphores
@@ -643,6 +672,42 @@ impl NntpPool {
             return None;
         }
         (deadline > unix_epoch_ms()).then_some(deadline)
+    }
+
+    /// Records one blocking-lane connect failure and answers whether this one
+    /// should be warned about.
+    ///
+    /// `Some(n)` means "warn, and say that `n` failures have gone unreported
+    /// since the last warning" — `n` counts this one, so the first failure of a
+    /// window reports `1`. `None` means the window is still open and the
+    /// failure has only been counted.
+    pub fn note_blocking_connect_warning(&self, server: ServerId) -> Option<u64> {
+        let idx = server.0;
+        let counter = self.blocking_connect_failures_since_warning.get(idx)?;
+        let suppressed = counter.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        let slot = self.blocking_connect_warn_after.get(idx)?;
+        let now = unix_epoch_ms();
+        let next = now.saturating_add(
+            BLOCKING_CONNECT_WARN_INTERVAL
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
+        slot.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current <= now).then_some(next)
+        })
+        .ok()?;
+        counter.store(0, Ordering::Release);
+        Some(suppressed)
+    }
+
+    /// `host:port` of one configured server, for a log line that has to say
+    /// which one it is talking about.
+    pub fn server_address(&self, server: ServerId) -> String {
+        self.configs
+            .get(server.0)
+            .map(|config| format!("{}:{}", config.host, config.port))
+            .unwrap_or_default()
     }
 
     /// Whether fresh connects to this server are currently held off. One
@@ -881,12 +946,10 @@ impl NntpPool {
         if idx >= self.pools.len() {
             return;
         }
-        {
-            let mut retired = self.retired_ips.lock().await;
-            retired.insert((idx, ip));
-        }
-        let mut pool = self.pools[idx].lock().await;
-        pool.idle.retain(|conn| conn.remote_ip() != ip);
+        lock_recovering(&self.retired_ips).insert((idx, ip));
+        lock_recovering(&self.pools[idx])
+            .idle
+            .retain(|conn| conn.remote_ip() != ip);
     }
 
     /// Take a healthy idle connection, evicting stale/poisoned ones.
@@ -909,8 +972,8 @@ impl NntpPool {
 /// RAII guard that returns a connection to the pool on drop.
 pub struct PooledConnection {
     conn: Option<NntpConnection>,
-    pool: Arc<Mutex<ServerPool>>,
-    retired_ips: Arc<Mutex<HashSet<(usize, IpAddr)>>>,
+    pool: Arc<SyncMutex<ServerPool>>,
+    retired_ips: Arc<SyncMutex<HashSet<(usize, IpAddr)>>>,
     server_idx: usize,
     return_to_pool: bool,
     shutdown: CancellationToken,
@@ -933,13 +996,10 @@ impl PooledConnection {
     /// Use when the connection is in a bad state.
     pub fn discard(mut self) {
         if self.conn.take().is_some() {
-            let pool = self.pool.clone();
-            let server_idx = self.server_idx;
-            drop(tokio::spawn(async move {
-                let mut pool = pool.lock().await;
-                pool.active_count = pool.active_count.saturating_sub(1);
-                trace!(server = server_idx, "discarded connection");
-            }));
+            let mut pool = lock_recovering(&self.pool);
+            pool.active_count = pool.active_count.saturating_sub(1);
+            drop(pool);
+            trace!(server = self.server_idx, "discarded connection");
         }
     }
 }
@@ -959,44 +1019,43 @@ impl DerefMut for PooledConnection {
 }
 
 impl Drop for PooledConnection {
+    /// Return the socket to the idle list here, in the drop itself.
+    ///
+    /// `_permit` is a later field, so it is released only after this body has
+    /// run: by the time the next acquirer can take the permit, the connection
+    /// it should reuse is already on the list. Handing the return to a spawned
+    /// task inverted that — the permit went back first and the return landed
+    /// whenever the runtime got to it, so a caller that re-acquired
+    /// immediately (the probe's per-miss HEAD right after its STAT batch)
+    /// reliably raced past a warm socket and dialled a new one.
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            let pool = self.pool.clone();
-            let retired_ips = self.retired_ips.clone();
             let server_idx = self.server_idx;
             let healthy = conn.is_healthy();
             let poisoned = conn.is_poisoned();
             let return_to_pool = self.return_to_pool;
-            let shutdown = self.shutdown.clone();
 
-            // tokio::spawn can fail during runtime shutdown; if so, the
-            // connection is simply dropped (permit released by _permit).
-            drop(tokio::spawn(async move {
-                let retired = healthy
-                    && return_to_pool
-                    && retired_ips
-                        .lock()
-                        .await
-                        .contains(&(server_idx, conn.remote_ip()));
-                let mut pool = pool.lock().await;
-                pool.active_count = pool.active_count.saturating_sub(1);
-                if healthy && return_to_pool {
-                    if shutdown.is_cancelled() {
-                        trace!(server = server_idx, "dropped connection from shutdown pool");
-                    } else if retired {
-                        trace!(server = server_idx, "dropped retired-ip connection");
-                    } else {
-                        pool.idle.push_back(conn);
-                        trace!(server = server_idx, "returned connection to pool");
-                    }
-                } else if healthy {
-                    trace!(server = server_idx, "dropped non-poolable connection");
-                } else if poisoned {
-                    trace!(server = server_idx, "dropped poisoned connection");
+            let retired = healthy
+                && return_to_pool
+                && lock_recovering(&self.retired_ips).contains(&(server_idx, conn.remote_ip()));
+            let mut pool = lock_recovering(&self.pool);
+            pool.active_count = pool.active_count.saturating_sub(1);
+            if healthy && return_to_pool {
+                if self.shutdown.is_cancelled() {
+                    trace!(server = server_idx, "dropped connection from shutdown pool");
+                } else if retired {
+                    trace!(server = server_idx, "dropped retired-ip connection");
                 } else {
-                    trace!(server = server_idx, "dropped unhealthy connection");
+                    pool.idle.push_back(conn);
+                    trace!(server = server_idx, "returned connection to pool");
                 }
-            }));
+            } else if healthy {
+                trace!(server = server_idx, "dropped non-poolable connection");
+            } else if poisoned {
+                trace!(server = server_idx, "dropped poisoned connection");
+            } else {
+                trace!(server = server_idx, "dropped unhealthy connection");
+            }
         }
     }
 }
@@ -1417,7 +1476,7 @@ mod tests {
         // consult the holdoff.
         drop(accepted_lanes.pop());
         for _ in 0..1000 {
-            if !pool.pools[0].lock().await.idle.is_empty() {
+            if !lock_recovering(&pool.pools[0]).idle.is_empty() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1631,6 +1690,32 @@ mod tests {
             pool.acquire(ServerId(0)).await,
             Err(NntpError::ServerOverLimit { .. })
         ));
+    }
+
+    #[test]
+    fn blocking_connect_warnings_report_once_a_window_and_carry_the_count() {
+        let mut config = test_pool_config(4);
+        config.servers.push(test_pool_config(4).servers.remove(0));
+        let pool = NntpPool::new(config);
+
+        // The first failure of a window reports itself.
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(0)), Some(1));
+        // The rest are counted and stay quiet: a server that refuses one
+        // connect refuses the next dispatch pass's too.
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(0)), None);
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(0)), None);
+        // Each server has its own window.
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(1)), Some(1));
+
+        // Rewind the window rather than sleeping a minute; the throttle is a
+        // wall-clock comparison, so this is the state it reaches on its own.
+        pool.blocking_connect_warn_after[0].store(unix_epoch_ms() - 1, Ordering::Release);
+        assert_eq!(
+            pool.note_blocking_connect_warning(ServerId(0)),
+            Some(3),
+            "the next warning stands for the two it suppressed and itself"
+        );
+        assert_eq!(pool.note_blocking_connect_warning(ServerId(0)), None);
     }
 
     #[test]

@@ -1270,3 +1270,50 @@ func TestAssertHealthProbeScenarioReadsTheProbeLines(t *testing.T) {
 		})
 	}
 }
+
+func TestAssertHealthProbeScenarioCanForbidActivation(t *testing.T) {
+	runDir := t.TempDir()
+	t.Setenv("E2E_RUN_DIR", runDir)
+	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertion := &ScenarioHealthProbeAssertion{ForbidActivated: true}
+
+	for _, test := range []struct {
+		name    string
+		lines   []string
+		wantErr string
+	}{
+		{
+			name:  "a job whose probe stayed off passes",
+			lines: []string{`job_id=91 health check: 3.1% failed`},
+		},
+		{
+			name: "another job's activation is not this job's",
+			lines: []string{
+				`job_id=92 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
+			},
+		},
+		{
+			name: "an activated probe fails",
+			lines: []string{
+				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
+				`job_id=91 total=18 missed=6 miss_pct=33 inconclusive=false health probe complete`,
+			},
+			wantErr: "activated 1 time(s)",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := assertHealthProbeScenario(91, assertion)
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("assertion failed: %v", err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}

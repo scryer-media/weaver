@@ -126,7 +126,7 @@ var ScenarioOnly = map[string]string{
 	"par2-rar-placement-stripped-recovery":    "the same staging, with the recovery volumes stripped after posting",
 	"rar5-multivolume-missing-tail":           "stages the first two volumes of rar5-multivolume and omits the third",
 	"single-mkv-sparse-nzb":                   "stages single-mkv's payload under a sparse NZB numbering",
-	"stat-health-probe":                       "stages single-mkv's payload; articles are deleted by the harness",
+	"stat-health-probe":                       "stages two direct MKVs; the same articles are deleted from each by the harness",
 }
 
 // Recipes is the corpus, one entry per scenario directory that owns bytes.

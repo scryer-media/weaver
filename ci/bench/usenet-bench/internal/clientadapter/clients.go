@@ -121,9 +121,15 @@ type QueueTiming struct {
 // interval. It is intended for adapters that must preserve queue-acceptance
 // timing rather than infer it from a later poll.
 func (api *API) QueueWithTiming(ctx context.Context, nzbPath, archivePassword string) (QueueTiming, error) {
-	timing := QueueTiming{SubmissionStartedAt: time.Now()}
+	// Round(0) strips the monotonic reading, so a duration computed here and
+	// the same duration recomputed from these timestamps after they have been
+	// through JSON agree. They do not otherwise: darwin's wall clock is
+	// microsecond-granular while its monotonic clock is nanosecond-granular,
+	// so an in-process Sub and a post-serialization Sub differ by microseconds
+	// and every timing self-check downstream rejects the result.
+	timing := QueueTiming{SubmissionStartedAt: time.Now().Round(0)}
 	jobID, err := api.Queue(ctx, nzbPath, archivePassword)
-	timing.AcceptedAt = time.Now()
+	timing.AcceptedAt = time.Now().Round(0)
 	if err != nil {
 		return QueueTiming{}, err
 	}
@@ -138,6 +144,21 @@ type TerminalObservation struct {
 	ObservedAt time.Time
 }
 
+// TerminalFailureError reports that the client itself moved a job to a failed
+// terminal state. It is not a harness error: the run happened, the client
+// answered, and the answer was failure. Lanes that own a did-not-finish
+// artifact shape should record the job as failed rather than abandoning the
+// suite, which is why the failure is a distinguishable type rather than a
+// formatted string.
+type TerminalFailureError struct {
+	JobID  string
+	Status string
+}
+
+func (err *TerminalFailureError) Error() string {
+	return fmt.Sprintf("client job %s terminal status %q", err.JobID, err.Status)
+}
+
 // WaitCompleteWithObservation polls the public API and retains the previous
 // confirmed non-terminal observation as the terminal lower bound. Callers can
 // therefore report uncertainty without substituting a nominal poll interval.
@@ -145,7 +166,7 @@ func (api *API) WaitCompleteWithObservation(ctx context.Context, jobID string, i
 	lowerBound := acceptedAt
 	for {
 		observations, err := api.product.observe(ctx, []string{jobID})
-		observedAt := time.Now()
+		observedAt := time.Now().Round(0)
 		if err != nil {
 			return TerminalObservation{}, err
 		}
@@ -155,7 +176,11 @@ func (api *API) WaitCompleteWithObservation(ctx context.Context, jobID string, i
 			case jobComplete:
 				return TerminalObservation{LowerBound: lowerBound, ObservedAt: observedAt}, nil
 			case jobFailed:
-				return TerminalObservation{}, fmt.Errorf("client job %s terminal status %q", jobID, observation.status)
+				// The observation is returned alongside the error: the client
+				// reached a terminal state and the timing up to it is real, so
+				// a lane that can record a did-not-finish job has everything
+				// it needs to record one.
+				return TerminalObservation{LowerBound: lowerBound, ObservedAt: observedAt}, &TerminalFailureError{JobID: jobID, Status: observation.status}
 			case jobQueued, jobActive:
 				lowerBound = observedAt
 			}
@@ -366,7 +391,39 @@ func (api *nzbgetAPI) waitReady(ctx context.Context) (string, error) {
 	if err := json.Unmarshal(raw, &version); err != nil || strings.TrimSpace(version) == "" {
 		return "", fmt.Errorf("NZBGet version response was invalid")
 	}
+	if err := api.checkNotPaused(ctx); err != nil {
+		return "", err
+	}
 	return version, nil
+}
+
+// nzbgetPauseFlags are the switches that each stop NZBGet fetching anything.
+var nzbgetPauseFlags = []string{"DownloadPaused", "ServerPaused", "Download2Paused"}
+
+// checkNotPaused is what makes answering the API mean ready to download.
+// NZBGet pauses every activity when it rejects one line of its configuration
+// -- a setting a newer release renamed is enough -- and then goes on starting,
+// serving its API and accepting NZBs. Without this the run reads as healthy,
+// downloads nothing, and ends at its deadline having measured a pause.
+func (api *nzbgetAPI) checkNotPaused(ctx context.Context) error {
+	var raw json.RawMessage
+	if err := api.rpc(ctx, "status", nil, &raw); err != nil {
+		return fmt.Errorf("read NZBGet status: %w", err)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return fmt.Errorf("NZBGet status response was invalid")
+	}
+	var paused []string
+	for _, flag := range nzbgetPauseFlags {
+		if value, ok := status[flag].(bool); ok && value {
+			paused = append(paused, flag)
+		}
+	}
+	if len(paused) == 0 {
+		return nil
+	}
+	return fmt.Errorf("NZBGet is up but paused (%s); it pauses everything when it rejects a configuration line, so check its log for an \"Invalid option\" error rather than waiting for a download that will not start", strings.Join(paused, ", "))
 }
 
 func (api *nzbgetAPI) queue(ctx context.Context, nzbPath, archivePassword string, options queueOptions) (string, error) {
@@ -731,7 +788,7 @@ func waitForTerminal(ctx context.Context, interval time.Duration, check func(con
 			return time.Time{}, err
 		}
 		if complete {
-			return time.Now().UTC(), nil
+			return time.Now().Round(0).UTC(), nil
 		}
 		timer := time.NewTimer(interval)
 		select {

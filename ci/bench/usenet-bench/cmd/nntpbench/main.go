@@ -5,21 +5,29 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/fixture"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/nativeadapter"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/netcheck"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/nntp"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/rawstack"
 )
 
 func main() {
@@ -53,6 +61,10 @@ func main() {
 		err = sequential(os.Args[2:])
 	case "queue-transition":
 		err = queueTransition(os.Args[2:])
+	case "pin":
+		err = pin(os.Args[2:])
+	case "chain":
+		err = chain(os.Args[2:])
 	case "summarize":
 		err = summarize(os.Args[2:])
 	case "preflight":
@@ -124,10 +136,44 @@ func seed(args []string) error {
 	return printJSON(result)
 }
 
+// excludeFixtures drops named fixtures from a plan's corpus. An id that is not
+// present is refused: a misspelled exclusion would silently keep the fixture
+// the operator meant to remove, and the run would fail on it hours later.
+func excludeFixtures(fixtureIDs, excluded []string) ([]string, error) {
+	if len(excluded) == 0 {
+		return fixtureIDs, nil
+	}
+	drop := make(map[string]bool, len(excluded))
+	for _, id := range excluded {
+		drop[id] = true
+	}
+	kept := make([]string, 0, len(fixtureIDs))
+	for _, id := range fixtureIDs {
+		if drop[id] {
+			delete(drop, id)
+			continue
+		}
+		kept = append(kept, id)
+	}
+	if len(drop) > 0 {
+		missing := make([]string, 0, len(drop))
+		for id := range drop {
+			missing = append(missing, id)
+		}
+		sort.Strings(missing)
+		return nil, fmt.Errorf("--exclude-fixtures names %d fixture(s) the corpus does not contain: %s",
+			len(missing), strings.Join(missing, ", "))
+	}
+	if len(kept) == 0 {
+		return nil, fmt.Errorf("--exclude-fixtures removed every fixture from the plan")
+	}
+	return kept, nil
+}
+
 func plan(args []string) error {
 	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	var fixturesCSV, corpusPath, clientsCSV, archiveToolchainsCSV, transportsCSV, targetsCSV, output, profile, serverLink string
+	var fixturesCSV, excludeFixturesCSV, corpusPath, clientsCSV, archiveToolchainsCSV, transportsCSV, targetsCSV, output, profile, serverLink string
 	var storageProfileID, nfsLink string
 	var repetitions int
 	var seed int64
@@ -135,6 +181,7 @@ func plan(args []string) error {
 	var serverRTT time.Duration
 	var exclusions clientExclusionFlags
 	flags.StringVar(&fixturesCSV, "fixtures", "", "comma-separated generated fixture ids")
+	flags.StringVar(&excludeFixturesCSV, "exclude-fixtures", "", "comma-separated fixture ids to drop from the corpus or from --fixtures; every id must be present, so a typo is refused rather than silently keeping the fixture")
 	flags.Var(&exclusions, "exclude-client", "repeatable; client:fixture-id:reason — do not run this client on this fixture; the summary records every excluded block as that client not finishing, with the reason")
 	flags.StringVar(&corpusPath, "corpus", "fixtures/corpus.json", "declared corpus JSON used when --fixtures is omitted")
 	flags.StringVar(&clientsCSV, "clients", "weaver,sabnzbd,nzbget", "comma-separated clients")
@@ -167,6 +214,10 @@ func plan(args []string) error {
 			return err
 		}
 		fixtureIDs = corpus.FixtureIDs
+	}
+	fixtureIDs, err := excludeFixtures(fixtureIDs, splitCSV(excludeFixturesCSV))
+	if err != nil {
+		return err
 	}
 	clients, err := parseClients(clientsCSV)
 	if err != nil {
@@ -260,19 +311,44 @@ type preflightResult struct {
 	HostOS      string                     `json:"host_os"`
 	HostMatches bool                       `json:"host_matches_target"`
 	Binaries    []preflightBinary          `json:"binaries"`
-	Ready       bool                       `json:"ready"`
+	// RawStack is present only when the host also serves the benchmark, which
+	// is what the native lanes do instead of running the Compose topology.
+	RawStack []rawstack.Check `json:"raw_stack,omitempty"`
+	// Clients holds what a product needs from the host beyond its own
+	// executable. A bare install has none of it.
+	Clients []preflightClientCheck `json:"clients,omitempty"`
+	Ready   bool                   `json:"ready"`
+}
+
+// preflightClientCheck is a condition a never-configured product needs before
+// it can run a benchmark: a tool it shells out to, or a setting the catalog has
+// to carry because the harness will not render it.
+type preflightClientCheck struct {
+	Client string `json:"client"`
+	Name   string `json:"name"`
+	Detail string `json:"detail,omitempty"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
 }
 
 func preflight(args []string) error {
 	flags := flag.NewFlagSet("preflight", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	var targetText, adapterPath, weaverPath, sabPath, nzbgetPath, dockerPath string
+	var chainPath, rawBinDir, rawDataDir, rawPasswordFile, rawHost string
 	flags.StringVar(&targetText, "target", "", "execution target: docker-linux, macos-native, or windows-native")
 	flags.StringVar(&adapterPath, "adapter", "", "path to clientadapter or nativeadapter executable")
 	flags.StringVar(&weaverPath, "weaver", "", "native Weaver executable path")
 	flags.StringVar(&sabPath, "sabnzbd", "", "native SABnzbd executable path")
 	flags.StringVar(&nzbgetPath, "nzbget", "", "native NZBGet executable path")
 	flags.StringVar(&dockerPath, "docker", "docker", "Docker executable for docker-linux")
+	flags.StringVar(&chainPath, "chain", "", "chain description to take the raw stack from, so a check cannot describe a different stack than the run")
+	flags.StringVar(&rawBinDir, "raw-bin-dir", "", "directory holding the staged e2e-nntp and nntpshaper executables")
+	flags.StringVar(&rawDataDir, "raw-data-dir", "", "seeded article store for a raw stack")
+	flags.StringVar(&rawPasswordFile, "raw-password-file", "", "NNTP password file for a raw stack")
+	flags.StringVar(&rawHost, "raw-host", "", "address a raw stack binds (default 127.0.0.1)")
+	var adaptersPath string
+	flags.StringVar(&adaptersPath, "adapters", "", "adapter catalog to take the client executables from, so a check cannot name a client the run will not launch")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -290,11 +366,36 @@ func preflight(args []string) error {
 		HostOS:      runtime.GOOS,
 		HostMatches: runtime.GOOS == expectedHostOS,
 	}
-	if descriptor.ID == benchmark.DockerLinux {
+	switch {
+	case adaptersPath != "":
+		if adapterPath != "" || weaverPath != "" || sabPath != "" || nzbgetPath != "" {
+			return fmt.Errorf("--adapters already declares every executable the run launches; drop the per-client flags rather than naming them twice")
+		}
+		binaries, clients, err := preflightCatalogBinaries(adaptersPath, descriptor.ID)
+		if err != nil {
+			return err
+		}
+		result.Binaries = append(result.Binaries, binaries...)
+		result.Clients = clients
+		if descriptor.ID == benchmark.DockerLinux {
+			result.Binaries = append(result.Binaries, inspectExecutable("docker", dockerPath))
+		}
+	case descriptor.ID == benchmark.DockerLinux:
 		result.Binaries = append(result.Binaries, inspectExecutable("docker", dockerPath))
-	} else {
-		if descriptor.ID == benchmark.MacOSNative && sabPath == "" {
-			sabPath = "/Applications/SABnzbd.app/Contents/MacOS/SABnzbd"
+		if adapterPath != "" {
+			result.Binaries = append(result.Binaries, inspectExecutable("clientadapter", adapterPath))
+		}
+	default:
+		if descriptor.ID == benchmark.MacOSNative {
+			if sabPath == "" {
+				sabPath = "/Applications/SABnzbd.app/Contents/MacOS/SABnzbd"
+			}
+			if nzbgetPath == "" {
+				// Not Contents/MacOS: that entry is the bundle's GUI
+				// launcher, which starts this program under the host user's
+				// own configuration and ignores the one the run renders.
+				nzbgetPath = "/Applications/NZBGet.app/Contents/Resources/daemon/usr/local/bin/nzbget"
+			}
 		}
 		result.Binaries = append(result.Binaries,
 			inspectExecutable("nativeadapter", adapterPath),
@@ -303,12 +404,29 @@ func preflight(args []string) error {
 			inspectExecutable("nzbget", nzbgetPath),
 		)
 	}
-	if adapterPath != "" && descriptor.ID == benchmark.DockerLinux {
-		result.Binaries = append(result.Binaries, inspectExecutable("clientadapter", adapterPath))
+	rawConfig, wanted, err := preflightRawStack(chainPath, rawBinDir, rawDataDir, rawPasswordFile, rawHost)
+	if err != nil {
+		return err
+	}
+	if wanted {
+		if descriptor.ID == benchmark.DockerLinux {
+			return fmt.Errorf("a raw stack is not part of the %s target; it is what the native lanes run instead of the Compose topology", benchmark.DockerLinux)
+		}
+		_, result.RawStack = rawstack.Preflight(rawConfig)
 	}
 	result.Ready = result.HostMatches
 	for _, binary := range result.Binaries {
 		if binary.Status != "present" {
+			result.Ready = false
+		}
+	}
+	for _, check := range result.RawStack {
+		if check.Status != rawstack.CheckOK {
+			result.Ready = false
+		}
+	}
+	for _, check := range result.Clients {
+		if check.Status != "present" {
 			result.Ready = false
 		}
 	}
@@ -319,6 +437,233 @@ func preflight(args []string) error {
 		return fmt.Errorf("preflight is not ready for target %q", descriptor.ID)
 	}
 	return nil
+}
+
+// preflightCatalogBinaries checks the executables the catalog actually
+// launches. The products themselves are installed by hand, so all the harness
+// needs is where they are -- and the catalog is where it is told. Checking the
+// paths retyped on a command line instead would pass for a client the run
+// never launches.
+func preflightCatalogBinaries(path string, target benchmark.ExecutionTarget) ([]preflightBinary, []preflightClientCheck, error) {
+	catalog, err := benchmark.LoadAdapterCatalog(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	var matched []benchmark.Adapter
+	for _, adapter := range catalog.SortedAdapters() {
+		if adapter.Target == target {
+			matched = append(matched, adapter)
+		}
+	}
+	if len(matched) == 0 {
+		return nil, nil, fmt.Errorf("adapter catalog %s declares no adapter for target %q", path, target)
+	}
+	binaries := inspectAdapterExecutables(matched)
+	if target == benchmark.DockerLinux {
+		return binaries, nil, nil
+	}
+	var clients []preflightClientCheck
+	for _, adapter := range matched {
+		binaries = append(binaries, inspectNativeClient(adapter))
+		clients = append(clients, inspectClientRequirements(adapter)...)
+	}
+	return binaries, clients, nil
+}
+
+// weaverEncryptionKeyBytes is the key length Weaver accepts; anything else
+// fails while it is starting up.
+const weaverEncryptionKeyBytes = 32
+
+// inspectClientRequirements covers what a product needs from the host that
+// installing it does not provide. Each of these turns a bare install into a
+// run that fails, or worse hangs, well after the measurement has started.
+func inspectClientRequirements(adapter benchmark.Adapter) []preflightClientCheck {
+	name := string(adapter.Client)
+	checks := []preflightClientCheck{apiPortCheck(name, adapter.Environment["NATIVE_API_ENDPOINT"])}
+	switch adapter.Client {
+	case benchmark.NZBGet:
+		// NZBGet shells out to both unpackers by name. A host where neither
+		// the bundle nor PATH supplies one does not fail: it skips the unpack
+		// and the run fails output verification instead. Resolving through
+		// the same function the config is rendered with is what keeps this
+		// check honest -- it reports the binary the run will invoke.
+		var unpackers []preflightClientCheck
+		program := nativeLaunchProgram(adapter)
+		for _, unpacker := range []struct {
+			names []string
+			lane  string
+		}{
+			{nativeadapter.NZBGetUnrarNames, "every RAR fixture"},
+			{nativeadapter.NZBGetSevenZipNames, "every 7z fixture"},
+		} {
+			canonical := unpacker.names[0]
+			resolved := nativeadapter.NZBGetUnpacker(program, unpacker.names)
+			check := preflightClientCheck{Client: name, Name: canonical, Detail: resolved, Status: "present"}
+			if resolved == canonical {
+				check.Status = "missing"
+				check.Reason = fmt.Sprintf("NZBGet shells out to %s to unpack %s; this host has none of %s beside the program or on PATH", canonical, unpacker.lane, strings.Join(unpacker.names, ", "))
+			}
+			unpackers = append(unpackers, check)
+		}
+		sort.Slice(unpackers, func(i, j int) bool { return unpackers[i].Name < unpackers[j].Name })
+		return append(checks, unpackers...)
+	case benchmark.Weaver:
+		// Without a key of its own Weaver asks the OS keychain, and a run
+		// started from a script waits on a prompt nobody answers. A key it
+		// will not parse is no better: it exits during startup, and the run
+		// reports a client that never became ready rather than a bad key.
+		check := preflightClientCheck{Client: name, Name: "WEAVER_ENCRYPTION_KEY", Status: "present"}
+		key := strings.TrimSpace(adapter.Environment["WEAVER_ENCRYPTION_KEY"])
+		switch {
+		case key == "":
+			check.Status = "missing"
+			check.Reason = "the catalog entry carries no WEAVER_ENCRYPTION_KEY; a native Weaver then waits on a keychain prompt instead of starting"
+		default:
+			decoded, err := base64.StdEncoding.DecodeString(key)
+			switch {
+			case err != nil:
+				check.Status = "unusable"
+				check.Reason = fmt.Sprintf("WEAVER_ENCRYPTION_KEY is not standard base64, which is the only form Weaver accepts: %v", err)
+			case len(decoded) != weaverEncryptionKeyBytes:
+				check.Status = "unusable"
+				check.Reason = fmt.Sprintf("WEAVER_ENCRYPTION_KEY decodes to %d bytes; Weaver requires exactly %d", len(decoded), weaverEncryptionKeyBytes)
+			default:
+				check.Detail = fmt.Sprintf("%d-byte key", len(decoded))
+			}
+		}
+		return append(checks, check)
+	default:
+		return checks
+	}
+}
+
+// apiPortCheck is the one condition no configuration can settle: whether the
+// address the adapter will poll is free. A busy one is not a startup failure --
+// SABnzbd moves to the next port and rewrites its ini -- so the run goes on
+// polling a stranger. On a developer's machine these ports are popular.
+func apiPortCheck(client, endpoint string) preflightClientCheck {
+	check := preflightClientCheck{Client: client, Name: "API address", Status: "present"}
+	host, port, err := nativeadapter.APIAddress(endpoint)
+	if err != nil {
+		check.Status = "unusable"
+		check.Reason = err.Error()
+		return check
+	}
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	check.Detail = address
+	if err := netcheck.Available(address); err != nil {
+		check.Status = "in use"
+		check.Reason = fmt.Sprintf("the client would move to another port and the run would poll whatever answers here: %v", err)
+	}
+	return check
+}
+
+// inspectAdapterExecutables checks the adapter each entry runs. A catalog
+// almost always points every client at the one staged launcher, so that case
+// is reported once rather than once per client; entries that name different
+// launchers are reported apart, because then they really are different files.
+func inspectAdapterExecutables(adapters []benchmark.Adapter) []preflightBinary {
+	shared := ""
+	for index, adapter := range adapters {
+		if len(adapter.Command) == 0 {
+			shared = ""
+			break
+		}
+		if index == 0 {
+			shared = adapter.Command[0]
+			continue
+		}
+		if adapter.Command[0] != shared {
+			shared = ""
+			break
+		}
+	}
+	if shared != "" {
+		return []preflightBinary{inspectExecutable("adapter", shared)}
+	}
+	binaries := make([]preflightBinary, 0, len(adapters))
+	for _, adapter := range adapters {
+		name := string(adapter.Client) + " adapter"
+		if len(adapter.Command) == 0 {
+			binaries = append(binaries, preflightBinary{Name: name, Status: "missing", Reason: "the catalog entry has no command"})
+			continue
+		}
+		binaries = append(binaries, inspectExecutable(name, adapter.Command[0]))
+	}
+	return binaries
+}
+
+// inspectNativeClient resolves the product a native adapter launches. The
+// nativeLaunchProgram is the program a native catalog entry launches, or the
+// empty string when the entry does not name one -- inspectNativeClient reports
+// that case, so this only has to stay quiet about it.
+func nativeLaunchProgram(adapter benchmark.Adapter) string {
+	var argv []string
+	if err := json.Unmarshal([]byte(adapter.Environment["NATIVE_LAUNCH_COMMAND"]), &argv); err != nil || len(argv) == 0 {
+		return ""
+	}
+	return argv[0]
+}
+
+// executable is the first element of NATIVE_LAUNCH_COMMAND; the rest of the
+// argv is templated per run and cannot be checked ahead of one.
+func inspectNativeClient(adapter benchmark.Adapter) preflightBinary {
+	name := string(adapter.Client)
+	raw := adapter.Environment["NATIVE_LAUNCH_COMMAND"]
+	if strings.TrimSpace(raw) == "" {
+		return preflightBinary{Name: name, Status: "missing", Reason: "the catalog entry sets no NATIVE_LAUNCH_COMMAND"}
+	}
+	var argv []string
+	if err := json.Unmarshal([]byte(raw), &argv); err != nil {
+		return preflightBinary{Name: name, Status: "missing", Reason: fmt.Sprintf("NATIVE_LAUNCH_COMMAND is not a JSON argv array: %v", err)}
+	}
+	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
+		return preflightBinary{Name: name, Status: "missing", Reason: "NATIVE_LAUNCH_COMMAND names no program"}
+	}
+	return inspectExecutable(name, argv[0])
+}
+
+// preflightRawStack settles the stack to check. Taking it from the chain
+// description is the form that cannot drift: a check against directories and
+// ports retyped on a command line can pass for a stack the session will never
+// run. The flags exist for the other case, staging a host before its session
+// is written.
+func preflightRawStack(chainPath, binDir, dataDir, passwordFile, host string) (rawstack.Config, bool, error) {
+	byFlag := binDir != "" || dataDir != "" || passwordFile != "" || host != ""
+	if chainPath == "" && !byFlag {
+		return rawstack.Config{}, false, nil
+	}
+	if chainPath != "" && byFlag {
+		return rawstack.Config{}, false, fmt.Errorf("--chain already declares the raw stack; drop the --raw-* flags rather than describing it twice")
+	}
+	if chainPath != "" {
+		config, err := loadChainConfig(chainPath)
+		if err != nil {
+			return rawstack.Config{}, false, err
+		}
+		if config.Stack != ChainStackRaw {
+			return rawstack.Config{}, false, fmt.Errorf("chain %s drives a %s stack, which has no local server side to check", chainPath, config.Stack)
+		}
+		settings, err := chainRawStackConfig(config)
+		if err != nil {
+			return rawstack.Config{}, false, err
+		}
+		return settings, true, nil
+	}
+	if binDir == "" || dataDir == "" {
+		return rawstack.Config{}, false, fmt.Errorf("--raw-bin-dir and --raw-data-dir are both required to check a raw stack")
+	}
+	// The certificate and log directories are made at startup, so a check does
+	// not need them to exist yet -- only to be named.
+	return rawstack.Config{
+		BinDir:       binDir,
+		DataDir:      dataDir,
+		CertDir:      filepath.Join(filepath.Dir(binDir), "certs"),
+		LogDir:       filepath.Join(filepath.Dir(binDir), "logs"),
+		Username:     "fixture-user",
+		PasswordFile: passwordFile,
+		Host:         host,
+	}, true, nil
 }
 
 func inspectExecutable(name, path string) preflightBinary {
@@ -335,8 +680,79 @@ func inspectExecutable(name, path string) preflightBinary {
 		return result
 	}
 	result.Path = resolved
+	if actual, ok := onDiskName(resolved); ok && actual != filepath.Base(resolved) {
+		// macOS resolves paths case-insensitively, so LookPath answers for a
+		// file whose name is not the one the catalog gave. The run then
+		// launches a program nobody named, and the first sign of it is a
+		// client that never becomes ready.
+		result.Status = "misnamed"
+		result.Reason = fmt.Sprintf("the file on disk is named %q, not %q; this host matches paths case-insensitively, so the catalog reached a different program than it names", actual, filepath.Base(resolved))
+		return result
+	}
+	if inner, ok := bundledLauncherTarget(resolved); ok {
+		// A program directly in <bundle>.app/Contents/MacOS is the bundle's
+		// launcher. When the bundle ships a second executable of the same
+		// name deeper in, the launcher starts that one under a configuration
+		// of its own and drops the argv it was given -- so the run measures
+		// whatever the host was already set up to do, or nothing at all.
+		result.Status = "launcher"
+		result.Reason = fmt.Sprintf("this is an app bundle launcher; the same bundle ships the program itself at %s, and the launcher starts it with its own configuration instead of the one the run renders. Name the inner path in the catalog", inner)
+		return result
+	}
 	result.Status = "present"
 	return result
+}
+
+// onDiskName reads back the name the filesystem holds for a path, which is the
+// only way to see a case difference on a filesystem that ignores one.
+func onDiskName(path string) (string, bool) {
+	base := filepath.Base(path)
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		return "", false
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Name(), base) {
+			return entry.Name(), true
+		}
+	}
+	return "", false
+}
+
+// bundledLauncherTarget reports the real program behind an app bundle launcher:
+// an executable of the same name that the bundle ships outside Contents/MacOS.
+// A bundle with only the one executable is the program itself and is fine to
+// launch, which is how SABnzbd ships.
+func bundledLauncherTarget(path string) (string, bool) {
+	directory := filepath.Dir(path)
+	if filepath.Base(directory) != "MacOS" {
+		return "", false
+	}
+	contents := filepath.Dir(directory)
+	if filepath.Base(contents) != "Contents" {
+		return "", false
+	}
+	bundle := filepath.Dir(contents)
+	if filepath.Ext(bundle) != ".app" {
+		return "", false
+	}
+	name := filepath.Base(path)
+	var found string
+	_ = filepath.WalkDir(bundle, func(candidate string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || found != "" {
+			return nil
+		}
+		if candidate == path || !strings.EqualFold(entry.Name(), name) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil || info.Mode()&0o111 == 0 {
+			return nil
+		}
+		found = candidate
+		return fs.SkipAll
+	})
+	return found, found != ""
 }
 
 func verifyOutput(args []string) error {
@@ -573,8 +989,10 @@ Commands:
   sequential     Run each persisted plan entry through a fresh isolated client
   queue           Execute each client lane as one uninterrupted multi-NZB queue (legacy)
   queue-transition Queue twenty forced duplicates of one direct fixture and report drain time
+  pin            Pin a client image by digest in the adapter catalog and pre-pull it
+  chain          Drive a whole declared session: shaper, phases and summaries
   summarize      Produce paired per-stratum statistics from verified sequential artifacts
-  preflight      Check target host and native/Docker executable prerequisites
+  preflight      Check a host: target, client executables, and a raw stack
   verify-output  Verify a client completion directory against fixture hashes
   delete-output  Empty a verified client completion directory
 

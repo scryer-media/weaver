@@ -161,6 +161,17 @@ impl Pipeline {
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
+            // The failing-file set follows the same rule as the bytes: a lost
+            // recovery volume is not damage to the release.
+            let file_index = seg_id.file_id.file_index;
+            if state
+                .spec
+                .files
+                .get(file_index as usize)
+                .is_some_and(|file| file.role.counts_toward_health())
+            {
+                state.health_failing_files.insert(file_index);
+            }
         }
         self.skip_failed_uu_segment(seg_id);
         self.check_health(job_id);
@@ -271,6 +282,8 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = 0;
             state.probe_projected_failed_bytes = 0;
+            state.health_failing_files.clear();
+            state.early_recovery_requested_blocks = 0;
         }
         self.foreign_layout_watches
             .retain(|file_id, _| file_id.job_id != job_id);
@@ -404,9 +417,11 @@ impl Pipeline {
 
         let now = Instant::now();
         let pressure_clear = observation.pressure_clear;
-        // Seeding needs the persisted rung and the connection test's latency;
-        // both are cold-path lookups, so they only run for a server the lanes
-        // have not seen yet.
+        // Every configured server is seeded when the pool is activated, so
+        // this is only the fallback for a server that answered before the
+        // seeding ran or that the pool grew underneath it. Seeding needs the
+        // persisted rung and the connection test's latency; both are cold-path
+        // lookups, so they only run for a server the lanes have not seen yet.
         let seed = if self.download_lane_runtime.servers.contains_key(&server_idx) {
             None
         } else {
@@ -415,13 +430,23 @@ impl Pipeline {
                 self.probe_latency(server_idx),
             ))
         };
+        if seed.is_some()
+            && let Some(stable_id) = self
+                .nntp
+                .pool()
+                .stable_server_id(weaver_nntp::pool::ServerId(server_idx))
+        {
+            self.download_lane_runtime
+                .stable_ids
+                .insert(server_idx, stable_id.0);
+        }
         let explorer = self
             .download_lane_runtime
             .servers
             .entry(server_idx)
             .or_insert_with(|| {
                 let (proven_depth, probe_latency) = seed.unwrap_or_default();
-                ServerPipelineExplorer::seeded(proven_depth, probe_latency)
+                ServerPipelineExplorer::seeded(proven_depth, probe_latency, None)
             });
         explorer.note_supports_pipelining(observation.supports_pipelining);
         if let Some(latency) = observation.latency {
@@ -560,6 +585,95 @@ impl Pipeline {
         self.shared_state.set_download_transport_health(health);
     }
 
+    /// Give every configured server a depth explorer before any lane runs.
+    ///
+    /// Without this the explorer map is empty until the first BODY response
+    /// comes back, and an empty map means [`Self::choose_download_lane_mode`]
+    /// has nothing to take a maximum over and
+    /// [`Self::actual_download_lane_mode`] finds no entry for the server — so
+    /// every lane on a freshly started pool is dispatched sequential, gives
+    /// back a whole round trip per article, and only climbs out of it a rung
+    /// and a window at a time. A server whose PIPELINING capability is
+    /// unknown or known-absent is seeded too, and stays sequential: it is
+    /// there so the per-server lookup finds a definite answer rather than a
+    /// missing one.
+    ///
+    /// Called once when the pipeline is built and again whenever a new pool
+    /// generation is activated, since server indices are positions in the
+    /// pool and a rebuild reshuffles them. What a still-present server had
+    /// already measured is carried across by stable id so a settings change
+    /// does not cost the link model.
+    pub(in crate::pipeline) fn seed_download_lane_explorers(&mut self) {
+        // The identities recorded when the previous explorers were built, not
+        // the ones the pool would report now: by the time this runs, `nntp`
+        // already holds the new generation and every old position has been
+        // renumbered underneath it.
+        let previous_stable_ids = std::mem::take(&mut self.download_lane_runtime.stable_ids);
+        let carried: HashMap<u32, ServerPipelineExplorer> = self
+            .download_lane_runtime
+            .servers
+            .drain()
+            .filter_map(|(server_idx, explorer)| {
+                Some((*previous_stable_ids.get(&server_idx)?, explorer))
+            })
+            .collect();
+        #[expect(clippy::type_complexity, reason = "one-shot seeding tuple")]
+        let seeds: Vec<(
+            usize,
+            Option<u32>,
+            bool,
+            Option<u8>,
+            Option<Duration>,
+            Option<Duration>,
+        )> = self
+            .nntp
+            .pool()
+            .server_configs()
+            .iter()
+            .enumerate()
+            .map(|(server_idx, config)| {
+                let supports_pipelining = matches!(
+                    config.pipelining,
+                    weaver_nntp::PipeliningCapability::Known(true)
+                );
+                let stable_id = self
+                    .nntp
+                    .pool()
+                    .stable_server_id(weaver_nntp::pool::ServerId(server_idx))
+                    .map(|stable_id| stable_id.0);
+                let prior = stable_id.and_then(|stable_id| carried.get(&stable_id));
+                let latency = prior
+                    .and_then(|explorer| explorer.latency())
+                    .or_else(|| self.probe_latency(server_idx));
+                let transfer = prior.and_then(|explorer| {
+                    explorer
+                        .modelled_article_transfer()
+                        .or_else(|| explorer.transfer())
+                });
+                (
+                    server_idx,
+                    stable_id,
+                    supports_pipelining,
+                    config.pipelining_depth,
+                    latency,
+                    transfer,
+                )
+            })
+            .collect();
+        for (server_idx, stable_id, supports_pipelining, proven_depth, latency, transfer) in seeds {
+            let mut explorer = ServerPipelineExplorer::seeded(proven_depth, latency, transfer);
+            explorer.note_supports_pipelining(supports_pipelining);
+            self.download_lane_runtime
+                .servers
+                .insert(server_idx, explorer);
+            if let Some(stable_id) = stable_id {
+                self.download_lane_runtime
+                    .stable_ids
+                    .insert(server_idx, stable_id);
+            }
+        }
+    }
+
     /// The rung a previous run proved for this server, as loaded into the
     /// pool's server configuration.
     fn persisted_pipelining_depth(&self, server_idx: usize) -> Option<u8> {
@@ -580,16 +694,18 @@ impl Pipeline {
         self.shared_state.server_probe_latency(stable_id.0)
     }
 
-    pub(in crate::pipeline::download::worker) fn should_use_owned_blocking_lane(
+    /// Whether this lease can run on an owned blocking lane.
+    ///
+    /// Every class of work does, recovery included. Holding PAR2 recovery back
+    /// on the async path made it the only consumer of a connection permit that
+    /// idle owned lanes were sitting on, so each recovery lease had to prise a
+    /// permit loose and open a fresh socket — greeting and authentication and,
+    /// on TLS, a handshake — for work that is by definition on the critical
+    /// path of finishing a job.
+    pub(in crate::pipeline) fn should_use_owned_blocking_lane(
         &self,
         lease: &DownloadBatchLease,
     ) -> bool {
-        if lease.compatibility.is_recovery {
-            return false;
-        }
-        if lease.works.iter().any(|work| work.is_recovery) {
-            return false;
-        }
         self.nntp
             .has_blocking_body_lane_candidate(&lease.effective_exclude_servers)
     }
@@ -608,16 +724,19 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline::download::worker) fn choose_download_lane_mode(
+    /// The depth a new lease is dispatched at.
+    ///
+    /// Recovery is no longer singled out for sequential mode. It rides the
+    /// same owned lanes as everything else now, and a lane whose depth is
+    /// pinned to one gives back the round trip the pipeline exists to hide —
+    /// on exactly the work a job is waiting on to finish.
+    pub(in crate::pipeline) fn choose_download_lane_mode(
         &mut self,
         job_id: JobId,
         is_recovery: bool,
         pressure: DownloadPressure,
     ) -> DownloadLaneMode {
-        let _ = job_id;
-        if is_recovery {
-            return DownloadLaneMode::Sequential;
-        }
+        let _ = (job_id, is_recovery);
         let pressure_clear = pressure.state == DownloadPressureState::Clear;
         self.download_lane_runtime
             .servers
@@ -627,16 +746,13 @@ impl Pipeline {
             .unwrap_or(DownloadLaneMode::Sequential)
     }
 
-    pub(in crate::pipeline::download::worker) fn download_lane_server_modes(
+    pub(in crate::pipeline) fn download_lane_server_modes(
         &mut self,
         job_id: JobId,
         is_recovery: bool,
         pressure: DownloadPressure,
     ) -> Vec<(usize, DownloadLaneMode)> {
-        let _ = job_id;
-        if is_recovery {
-            return Vec::new();
-        }
+        let _ = (job_id, is_recovery);
         let pressure_clear = pressure.state == DownloadPressureState::Clear;
         self.download_lane_runtime
             .servers
@@ -680,6 +796,7 @@ impl Pipeline {
                 // "ask again shortly": the work goes back to the scheduler on
                 // the owned fast path instead of being demoted to an async
                 // lane on what is not a verdict about the servers at all.
+                self.note_owned_lane_acquire_failure(&lease, &error);
                 if error.should_requeue_owned_work() {
                     let DownloadBatchLease {
                         job_id,
@@ -783,6 +900,54 @@ impl Pipeline {
                 }
             }
         }
+    }
+
+    /// Counts one owned-lane acquire failure by kind, and warns about it at
+    /// most once a minute.
+    ///
+    /// Both arms of the caller — requeue and async fallback — keep the download
+    /// running, so nothing above debug said that a lane had failed to open. A
+    /// job whose owned lanes all fail this way still finishes, on a fraction of
+    /// the connections it was given, with no line in the log to explain it.
+    fn note_owned_lane_acquire_failure(
+        &mut self,
+        lease: &DownloadBatchLease,
+        error: &weaver_nntp::client::BlockingBodyLaneAcquireError,
+    ) {
+        // A `&'static str` per kind rather than a formatted name: this is on
+        // the failure path of every dispatch pass while a server is refusing.
+        let metric = match error.kind() {
+            "provider_capacity" => "download.owned_lane.acquire_failed.provider_capacity",
+            "local_capacity" => "download.owned_lane.acquire_failed.local_capacity",
+            "no_eligible_server" => "download.owned_lane.acquire_failed.no_eligible_server",
+            "selection_contended" => "download.owned_lane.acquire_failed.selection_contended",
+            _ => "download.owned_lane.acquire_failed.other",
+        };
+        crate::runtime::perf_probe::record_value(metric, 1);
+        self.last_owned_lane_acquire_failure_at = Some(Instant::now());
+
+        if self
+            .last_owned_lane_acquire_failure_log_at
+            .is_some_and(|at| at.elapsed() < OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL)
+        {
+            return;
+        }
+        self.last_owned_lane_acquire_failure_log_at = Some(Instant::now());
+        let servers: Vec<usize> = lease
+            .server_modes
+            .iter()
+            .map(|(server_idx, _)| *server_idx)
+            .collect();
+        warn!(
+            job_id = lease.job_id.0,
+            kind = error.kind(),
+            error = %error,
+            requeued_works = lease.works.len(),
+            requeue = error.should_requeue_owned_work(),
+            candidate_servers = ?servers,
+            excluded_servers = ?lease.effective_exclude_servers,
+            "owned blocking download lane could not be acquired"
+        );
     }
 
     pub(in crate::pipeline::download::worker) fn restore_owned_lane_unrequested_work(

@@ -5,16 +5,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/benchmark"
 	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/clientadapter"
+	"github.com/scryer-media/weaver/ci/bench/usenet-bench/internal/netcheck"
 )
 
 // Run executes a native product through its public control API. Sequential
@@ -31,6 +35,11 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	// AdapterResult carries no terminal status, so the single-fixture path
+	// cannot record a did-not-finish job; only the sequential path can.
+	if nativeRun.terminalStatus != "succeeded" {
+		return fmt.Errorf("run native job %s: %s", cfg.RunID, nativeRun.terminalError)
+	}
 	if err := writeResult(cfg.ResultPath, nativeRun.result); err != nil {
 		return err
 	}
@@ -43,6 +52,12 @@ type nativeRun struct {
 	submissionStartedAt time.Time
 	acceptedAt          time.Time
 	terminal            clientadapter.TerminalObservation
+	// terminalStatus is "succeeded" or "failed": a client that reported its
+	// own failure is a recorded outcome, not a harness error. Everything that
+	// stops the run before a terminal observation is still returned as an
+	// error, because there is then nothing honest to record.
+	terminalStatus string
+	terminalError  string
 }
 
 func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
@@ -78,15 +93,22 @@ func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
 			cfg.ClientVersion = recordedAPIVersion(cfg.ClientVersion, actualVersion)
 		}
 	}
+	terminalStatus, terminalError := "succeeded", ""
 	if err == nil {
 		queueTiming, err = api.QueueWithTiming(ctx, cfg.NZBPath, cfg.ArchivePassword)
 		if err == nil {
-			// The native lane has no did-not-finish artifact shape; a job that
-			// never reaches a terminal state is bounded here and reported as
-			// the run's error rather than stalling the pass.
+			// A job that never reaches a terminal state is bounded here and
+			// reported as the run's error: without a terminal observation
+			// there is no timing to record. A job the client itself failed is
+			// different -- it was observed -- so it becomes a recorded
+			// did-not-finish instead of an adapter error.
 			waitCtx, cancelWait := context.WithTimeout(ctx, cfg.JobTimeout)
 			completion, err = api.WaitCompleteWithObservation(waitCtx, queueTiming.JobID, cfg.PollInterval, queueTiming.AcceptedAt)
-			if err != nil && ctx.Err() == nil && waitCtx.Err() != nil {
+			var terminalFailure *clientadapter.TerminalFailureError
+			switch {
+			case errors.As(err, &terminalFailure):
+				terminalStatus, terminalError, err = "failed", terminalFailure.Error(), nil
+			case err != nil && ctx.Err() == nil && waitCtx.Err() != nil:
 				err = fmt.Errorf("client job %s did not reach a terminal state within %s of acceptance", queueTiming.JobID, cfg.JobTimeout)
 			}
 			cancelWait()
@@ -140,6 +162,8 @@ func runSingle(ctx context.Context, cfg Config) (nativeRun, error) {
 		submissionStartedAt: queueTiming.SubmissionStartedAt,
 		acceptedAt:          queueTiming.AcceptedAt,
 		terminal:            completion,
+		terminalStatus:      terminalStatus,
+		terminalError:       terminalError,
 	}, nil
 }
 
@@ -178,7 +202,8 @@ func runSequentialQueue(ctx context.Context, cfg Config) error {
 			QueuedAt:                        nativeRun.acceptedAt,
 			CompletionAt:                    nativeRun.terminal.ObservedAt,
 			FixtureWallClockNanoseconds:     nativeRun.terminal.ObservedAt.Sub(nativeRun.acceptedAt).Nanoseconds(),
-			TerminalStatus:                  "succeeded",
+			TerminalStatus:                  nativeRun.terminalStatus,
+			TerminalError:                   nativeRun.terminalError,
 			ProcessingTimingError:           "native public API does not expose active-processing transitions",
 			ResourceMetrics:                 &nativeRun.result.ResourceMetrics,
 			TerminalObservationLowerBound:   nativeRun.terminal.LowerBound,
@@ -250,6 +275,15 @@ func validateNativeSequentialQueueResult(result benchmark.QueueAdapterResult) er
 	if err := job.ResourceMetrics.Validate(); err != nil {
 		return fmt.Errorf("validate native fixture resource metrics: %w", err)
 	}
+	// "timed_out" is not admissible here: the native lane only reaches this
+	// validator once it holds a terminal observation, and a job it gave up
+	// waiting on has none, so it is returned as an error instead.
+	if job.TerminalStatus != "succeeded" && job.TerminalStatus != "failed" {
+		return fmt.Errorf("native sequential result has invalid terminal status %q", job.TerminalStatus)
+	}
+	if job.TerminalStatus != "succeeded" && strings.TrimSpace(job.TerminalError) == "" {
+		return fmt.Errorf("native sequential result omits the reason the client did not finish")
+	}
 	return nil
 }
 
@@ -264,9 +298,53 @@ type nativeProcess struct {
 	command *exec.Cmd
 	done    chan struct{}
 	err     error
+	cpu     cpuAccountant
+}
+
+// cpuAccountant charges the client's CPU to the run. Which processes it can
+// see and how it counts them is the platform's: the exited process's own
+// user and system time where wait folds in what the kernel charged
+// (cpu_other.go), a job object summing exact cycle counts over the whole tree
+// on Windows (cpu_windows.go). Whatever it cannot vouch for is unavailable
+// with a reason, never a number.
+type cpuAccountant interface {
+	attach(*os.Process) error
+	measurement(*os.ProcessState) benchmark.CounterMeasurement
+	close()
+}
+
+type unavailableCPUAccount struct{ reason string }
+
+func (unavailableCPUAccount) attach(*os.Process) error { return nil }
+
+func (account unavailableCPUAccount) measurement(*os.ProcessState) benchmark.CounterMeasurement {
+	return benchmark.UnavailableMeasurement("client_process", "native-cpu-accounting", runtime.GOOS, account.reason)
+}
+
+func (unavailableCPUAccount) close() {}
+
+// checkAPIPortFree refuses to launch a client onto a port something else is
+// already listening on. The product does not necessarily refuse: SABnzbd
+// relocates to the next free port and rewrites its own ini, after which this
+// adapter polls the original port and reads whatever stranger answers there --
+// waiting on someone else's HTTP until the job timeout, or worse, mistaking
+// their responses for the client's. Nothing downstream can detect that, so it
+// has to be refused here, immediately before the launch that would cause it.
+func checkAPIPortFree(endpoint string) error {
+	host, port, err := nativeAPIAddress(endpoint)
+	if err != nil {
+		return err
+	}
+	if err := netcheck.Available(net.JoinHostPort(host, strconv.Itoa(port))); err != nil {
+		return fmt.Errorf("the client API address is not this run's to use: %w", err)
+	}
+	return nil
 }
 
 func startProcess(ctx context.Context, cfg Config, spec productSpec) (*nativeProcess, error) {
+	if err := checkAPIPortFree(cfg.APIEndpoint); err != nil {
+		return nil, err
+	}
 	logPath := filepath.Join(cfg.ConfigDir, "native-client.log")
 	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
@@ -284,7 +362,11 @@ func startProcess(ctx context.Context, cfg Config, spec productSpec) (*nativePro
 		_ = logFile.Close()
 		return nil, fmt.Errorf("start native %s process: %w", cfg.Client, err)
 	}
-	process := &nativeProcess{command: command, done: make(chan struct{})}
+	process := &nativeProcess{command: command, done: make(chan struct{}), cpu: newCPUAccountant()}
+	if err := process.cpu.attach(command.Process); err != nil {
+		process.cpu.close()
+		process.cpu = unavailableCPUAccount{reason: "native CPU accounting could not attach to the client: " + err.Error()}
+	}
 	go func() {
 		process.err = command.Wait()
 		_ = logFile.Close()
@@ -331,7 +413,11 @@ func (process *nativeProcess) stop() error {
 }
 
 func (process *nativeProcess) ensureStopped() {
-	if process == nil || process.exited() {
+	if process == nil {
+		return
+	}
+	defer process.cpu.close()
+	if process.exited() {
 		return
 	}
 	_ = killNativeProcessTree(process.command.Process)
@@ -341,16 +427,10 @@ func (process *nativeProcess) ensureStopped() {
 }
 
 func (process *nativeProcess) cpuMeasurement() benchmark.CounterMeasurement {
-	const collector = "go-os-process-state"
 	if process == nil || process.command.ProcessState == nil {
-		return benchmark.UnavailableMeasurement("client_process", collector, runtime.GOOS, "native client process did not exit before CPU accounting")
+		return benchmark.UnavailableMeasurement("client_process", "native-cpu-accounting", runtime.GOOS, "native client process did not exit before CPU accounting")
 	}
-	user := process.command.ProcessState.UserTime()
-	system := process.command.ProcessState.SystemTime()
-	if user < 0 || system < 0 {
-		return benchmark.UnavailableMeasurement("client_process", collector, runtime.GOOS, "native process CPU accounting was negative")
-	}
-	return benchmark.MeasuredMeasurement("client_process", collector, runtime.GOOS, uint64((user + system).Nanoseconds()))
+	return process.cpu.measurement(process.command.ProcessState)
 }
 
 func nativeInstructionMeasurement() benchmark.CounterMeasurement {

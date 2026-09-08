@@ -12,6 +12,67 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
+/// Split-7z parts sitting in the working directory that `numbered` (the
+/// volume numbers the assembly declares for `set_name`) does not account for.
+///
+/// The directory is enumerated once and each entry is matched against the
+/// exact `<set>.NNN` spelling, so the cost is bounded by what the directory
+/// holds. Probing candidate names by number instead would make the cost
+/// proportional to the largest declared volume number, and that number is
+/// parsed straight out of an NZB subject: a single part named
+/// `payload.7z.1000000000` would cost a billion metadata lookups on the
+/// orchestration task before this topology could be built.
+fn recovered_7z_parts_on_disk(
+    working_dir: &Path,
+    set_name: &str,
+    numbered: &HashSet<u32>,
+) -> Vec<(String, u32)> {
+    let entries = match std::fs::read_dir(working_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            debug!(
+                working_dir = %working_dir.display(),
+                set_name,
+                error = %error,
+                "7z split topology could not enumerate the working directory for recovered parts"
+            );
+            return Vec::new();
+        }
+    };
+    let prefix = format!("{set_name}.");
+    let mut recovered = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if suffix.len() < 3 || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Some(number) = suffix
+            .parse::<u32>()
+            .ok()
+            .and_then(|one_based| one_based.checked_sub(1))
+        else {
+            continue;
+        };
+        // `.7z.NNN` is the whole naming scheme; a spelling that would not
+        // round-trip (`.0002`) is not a part of this set.
+        if format!("{:03}", number + 1) != suffix || numbered.contains(&number) {
+            continue;
+        }
+        if !entry.path().is_file() {
+            continue;
+        }
+        recovered.push((name.to_owned(), number));
+    }
+    recovered.sort_unstable_by_key(|(_, number)| *number);
+    recovered
+}
+
 fn open_rar_volume_file(path: &Path) -> std::io::Result<Box<dyn unrar_rs::ReadSeek>> {
     #[cfg(test)]
     {
@@ -33,6 +94,47 @@ mod tests {
     use crate::pipeline::rar_state::RarSetState;
     use par2_rs::checksum;
     use std::io::Cursor;
+
+    #[test]
+    fn recovered_7z_parts_are_found_by_enumerating_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str| std::fs::write(dir.path().join(name), b"part").unwrap();
+        write("payload.7z.001");
+        write("payload.7z.002");
+        write("payload.7z.003");
+        write("payload.7z.007");
+        write("payload.7z.0002");
+        write("payload.7z.abc");
+        write("payload.7z");
+        write("other.7z.004");
+        std::fs::create_dir(dir.path().join("payload.7z.005")).unwrap();
+
+        // The declared set names part 3 and a part with a hostile number;
+        // the cost of the scan must not follow that number.
+        let numbered = HashSet::from([2, 999_999_999]);
+        let started = std::time::Instant::now();
+        let recovered = recovered_7z_parts_on_disk(dir.path(), "payload.7z", &numbered);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "recovery scan must be bounded by the directory, not the declared number"
+        );
+
+        assert_eq!(
+            recovered,
+            vec![
+                ("payload.7z.001".to_owned(), 0),
+                ("payload.7z.002".to_owned(), 1),
+                ("payload.7z.007".to_owned(), 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovered_7z_parts_tolerate_a_missing_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        assert!(recovered_7z_parts_on_disk(&missing, "payload.7z", &HashSet::new()).is_empty());
+    }
 
     fn build_many_volume_rar_set(volume_count: usize) -> Vec<(String, Vec<u8>)> {
         assert!(volume_count >= 2);
@@ -271,6 +373,221 @@ mod tests {
         assert_eq!(ready(&cached.plan), ready(&live.plan));
         assert_eq!(cached.plan.member_names, live.plan.member_names);
         assert_eq!(cached.plan.phase.as_str(), live.plan.phase.as_str());
+    }
+
+    /// Five volumes of one split member that arrived out of order: the cached
+    /// snapshot holds 0-1 and 3-4 as the two halves of a broken chain, the
+    /// late-arriving volume 2 is on disk, and volumes 3-4 are the ones whose
+    /// facts have not landed yet — so a single rebuild pass both closes the
+    /// chain (adding 2) and then re-reads 3 and 4.
+    fn late_middle_volume_rebuild_input(temp_dir: &tempfile::TempDir) -> RarSetComputeInput {
+        let files = build_many_volume_rar_set(5);
+
+        // The snapshot the earlier rebuilds left behind: volume 2 had not
+        // finished downloading, so 3 and 4 were integrated across the hole.
+        let mut cached_archive =
+            unrar_rs::RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+        for volume in [1usize, 3, 4] {
+            cached_archive
+                .add_volume(volume, Box::new(Cursor::new(files[volume].1.clone())))
+                .unwrap();
+        }
+
+        let mut volume_map = HashMap::new();
+        let mut volume_paths = BTreeMap::new();
+        let mut facts = BTreeMap::new();
+        for (volume, (filename, bytes)) in files.iter().enumerate() {
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            volume_map.insert(filename.clone(), volume as u32);
+            volume_paths.insert(volume as u32, path);
+            // Volumes 3 and 4 are held by the snapshot but have no facts yet:
+            // that is exactly the pair the refresh branch re-reads in place.
+            if volume < 3 {
+                facts.insert(
+                    volume as u32,
+                    unrar_rs::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                        .expect("synthetic RAR volume facts should parse"),
+                );
+            }
+        }
+
+        RarSetComputeInput {
+            job_id: JobId(99),
+            set_name: "big".to_string(),
+            existing: RarSetState::default(),
+            volume_map,
+            volume_paths,
+            password_candidates: Vec::new(),
+            extracted: HashSet::new(),
+            failed: HashSet::new(),
+            facts,
+            verified_suspect_volumes: HashSet::new(),
+            worker_active: false,
+            cached_headers: Some(cached_archive.serialize_headers()),
+            extraction_generation: 0,
+            reason: RefreshReason::CoverageExpansion,
+        }
+    }
+
+    /// Re-reading a held volume in place drops that volume's segments from the
+    /// member chain, and the head half keeps the cleared `split_after` the
+    /// terminal continuation gave it — so the re-parsed tail can never
+    /// reattach and the member silently loses its trailing volumes. A rebuild
+    /// pass that both closes a chain and re-reads volumes above the closing
+    /// point hits exactly that, and the truncated span is what the extractor
+    /// then decodes: the RAR4 solid stream runs out of ciphertext mid-member.
+    #[test]
+    fn rar_plan_rebuild_keeps_the_whole_member_span_when_late_volumes_are_re_read() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = late_middle_volume_rebuild_input(&temp_dir);
+
+        // The fixture is only meaningful while the snapshot really is a broken
+        // chain that the pass has to close.
+        let cached = Pipeline::deserialize_rar_headers_with_password_candidates(
+            "big",
+            input.cached_headers.as_ref().unwrap(),
+            &[],
+            std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
+        )
+        .expect("fixture snapshot should deserialize")
+        .value;
+        assert_eq!(
+            cached
+                .metadata()
+                .members
+                .iter()
+                .map(|member| (member.volumes.first_volume, member.volumes.last_volume))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (3, 4)],
+            "fixture must start from a chain broken at the missing volume 2"
+        );
+
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("a complete volume set should rebuild the plan");
+
+        let rebuilt = Pipeline::deserialize_rar_headers_with_password_candidates(
+            "big",
+            &computed.headers,
+            &[],
+            std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
+        )
+        .expect("rebuilt snapshot should deserialize")
+        .value;
+        assert_eq!(
+            rebuilt
+                .metadata()
+                .members
+                .iter()
+                .map(|member| (member.volumes.first_volume, member.volumes.last_volume))
+                .collect::<Vec<_>>(),
+            vec![(0, 4)],
+            "the member must span every volume it is split across"
+        );
+    }
+
+    /// A rebuild input for the ordinary in-order arrival: the snapshot holds
+    /// volumes `0..held`, every volume below `present` has facts and a file,
+    /// and the volumes in `held..present` are the ones this pass integrates.
+    fn in_order_growth_rebuild_input(
+        temp_dir: &tempfile::TempDir,
+        volume_count: usize,
+        held: usize,
+        present: usize,
+    ) -> RarSetComputeInput {
+        let files = build_many_volume_rar_set(volume_count);
+        let mut cached_archive =
+            unrar_rs::RarArchive::open(Cursor::new(files[0].1.clone())).unwrap();
+        for (volume, (_, bytes)) in files.iter().enumerate().take(held).skip(1) {
+            cached_archive
+                .add_volume(volume, Box::new(Cursor::new(bytes.clone())))
+                .unwrap();
+        }
+
+        let mut volume_map = HashMap::new();
+        let mut volume_paths = BTreeMap::new();
+        let mut facts = BTreeMap::new();
+        for (volume, (filename, bytes)) in files.iter().enumerate().take(present) {
+            let path = temp_dir.path().join(filename);
+            std::fs::write(&path, bytes).unwrap();
+            volume_map.insert(filename.clone(), volume as u32);
+            volume_paths.insert(volume as u32, path);
+            facts.insert(
+                volume as u32,
+                unrar_rs::RarArchive::parse_volume_facts(Cursor::new(bytes.clone()), None)
+                    .expect("synthetic RAR volume facts should parse"),
+            );
+        }
+
+        RarSetComputeInput {
+            job_id: JobId(96),
+            set_name: "show".to_string(),
+            existing: RarSetState::default(),
+            volume_map,
+            volume_paths,
+            password_candidates: Vec::new(),
+            extracted: HashSet::new(),
+            failed: HashSet::new(),
+            facts,
+            verified_suspect_volumes: HashSet::new(),
+            worker_active: false,
+            cached_headers: Some(cached_archive.serialize_headers()),
+            extraction_generation: 0,
+            reason: RefreshReason::CoverageExpansion,
+        }
+    }
+
+    /// The pass every in-order download runs on each volume completion: the
+    /// snapshot holds everything below the new volume, with facts for all of
+    /// it, and the member is still growing. The live-volume rebuild guard must
+    /// stay out of the way — the new volume is the only file this pass opens.
+    #[test]
+    fn in_order_volume_arrival_extends_cached_headers_and_opens_only_the_new_volume() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = in_order_growth_rebuild_input(&temp_dir, 6, 4, 5);
+        let new_volume_path = input.volume_paths[&4].clone();
+        // Only the live-volume fallback ever opens volume 0.
+        std::fs::remove_file(&input.volume_paths[&0]).unwrap();
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("in-order growth should extend the cached headers");
+
+        assert_eq!(computed.rebuild_source.as_str(), "cached-headers");
+        assert_eq!(rar_refresh_open_tracking::opened(), vec![new_volume_path]);
+        assert_eq!(computed.plan.topology.complete_volumes.len(), 5);
+    }
+
+    /// The pass that closes a member — its last volume just completed — is the
+    /// one whose cached snapshot lags a completed span. Before the live-volume
+    /// rebuild replaced it, that pass already re-read every held volume in
+    /// place, so the replacement must not parse more than that did: every
+    /// volume's headers are read exactly once. Volume 0 is parsed by the
+    /// rebuild's own open and then opened once more only to attach its reader.
+    #[test]
+    fn member_completion_pass_reads_each_volume_once_from_live_volumes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input = in_order_growth_rebuild_input(&temp_dir, 6, 5, 6);
+        let expected_opens: Vec<_> = (0..6u32)
+            .map(|volume| input.volume_paths[&volume].clone())
+            .collect();
+
+        let _tracking = rar_refresh_open_tracking::start();
+        let computed = Pipeline::compute_rar_set_state_blocking(input)
+            .expect("member completion should rebuild from live volumes");
+
+        assert_eq!(computed.rebuild_source.as_str(), "volume-0");
+        assert_eq!(rar_refresh_open_tracking::opened(), expected_opens);
+        assert_eq!(computed.plan.topology.complete_volumes.len(), 6);
+        assert_eq!(
+            computed
+                .plan
+                .ready_members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["big.bin"]
+        );
     }
 
     #[test]
@@ -1192,6 +1509,32 @@ impl Pipeline {
                     }
                 }
             }
+        }
+
+        // Re-reading a volume the snapshot already holds is destructive to a
+        // split member chain: dropping that volume's segments leaves the head
+        // half carrying the cleared `split_after` its terminal continuation
+        // gave it, so the re-parsed tail cannot reattach and the member
+        // silently loses every volume above the re-read one. A pass that also
+        // closes a chain — the late middle volume of an out-of-order arrival —
+        // hits exactly that, and the truncated span is what the extractor
+        // decodes: a solid RAR4 stream then runs out of data mid-member. Build
+        // the whole chain once from live volumes instead of patching it.
+        if using_cached_headers
+            && volume_paths.keys().any(|volume| {
+                (force_refresh_all_volumes || !facts.contains_key(volume))
+                    && archive.has_volume(*volume as usize)
+            })
+            && volume_paths.contains_key(&0)
+        {
+            debug!(
+                set_name = %set_name_owned,
+                "cached RAR headers need a held volume re-read; rebuilding from live volumes"
+            );
+            let selection = open_from_volume_zero()?;
+            archive = selection.value;
+            rebuild_source = RarTopologyRebuildSource::VolumeZero;
+            using_cached_headers = false;
         }
 
         let (mut plan, mut headers, mut rebuild_source, mut used_cached_headers, mut integrated) =
@@ -2389,34 +2732,11 @@ impl Pipeline {
                 // performs lives in the topology alone, so a rebuild from the
                 // assembly's files would silently lose it and the set would go
                 // back to waiting on a part that is sitting right there. The
-                // gaps in the numbering are checked, and then past the end
-                // until the run of names stops; `.7z.NNN` is the whole naming
-                // scheme, so the candidates are exact.
+                // directory is enumerated once, so the work is bounded by its
+                // entries and not by the largest declared volume number.
                 let recovered_parts: Vec<(String, u32)> = {
-                    let numbered: std::collections::HashSet<u32> =
-                        volume_map.values().copied().collect();
-                    let candidate = |number: u32| format!("{set_name}.{:03}", number + 1);
-                    let on_disk = |name: &str| state.working_dir.join(name).is_file();
-                    let mut recovered = Vec::new();
-                    for number in 0..max_number {
-                        if numbered.contains(&number) {
-                            continue;
-                        }
-                        let name = candidate(number);
-                        if on_disk(&name) {
-                            recovered.push((name, number));
-                        }
-                    }
-                    let mut number = max_number + 1;
-                    loop {
-                        let name = candidate(number);
-                        if !on_disk(&name) {
-                            break;
-                        }
-                        recovered.push((name, number));
-                        number += 1;
-                    }
-                    recovered
+                    let numbered: HashSet<u32> = volume_map.values().copied().collect();
+                    recovered_7z_parts_on_disk(&state.working_dir, &set_name, &numbered)
                 };
                 for (name, number) in &recovered_parts {
                     volume_map.insert(name.clone(), *number);
@@ -2431,7 +2751,7 @@ impl Pipeline {
                     );
                 }
 
-                let expected = max_number + 1;
+                let expected = max_number.saturating_add(1);
                 let topology = ArchiveTopology {
                     archive_type: ArchiveType::SevenZip,
                     volume_map,
@@ -2579,7 +2899,7 @@ impl Pipeline {
                     }
                 }
 
-                let expected = max_number + 1;
+                let expected = max_number.saturating_add(1);
                 let topology = ArchiveTopology {
                     archive_type: ArchiveType::Split,
                     volume_map,

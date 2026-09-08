@@ -52,45 +52,6 @@ pub struct ArchiveTopology {
     pub unresolved_spans: Vec<ArchivePendingSpan>,
 }
 
-impl ArchiveTopology {
-    /// Returns volume numbers that can be safely deleted because every member
-    /// that uses them has been extracted. `extracted` is the set of member names
-    /// that completed extraction successfully.
-    pub fn deletable_volumes(&self, extracted: &HashSet<String>) -> HashSet<u32> {
-        // For each volume, check if ALL members spanning it have been extracted.
-        // A volume is deletable only when no unextracted member needs it.
-        let max_vol = self.expected_volume_count.unwrap_or_else(|| {
-            let map_max = self.volume_map.values().max().copied().map_or(0, |v| v + 1);
-            let unresolved_max = self
-                .unresolved_spans
-                .iter()
-                .map(|span| span.last_volume + 1)
-                .max()
-                .unwrap_or(0);
-            map_max.max(unresolved_max)
-        });
-
-        let mut deletable: HashSet<u32> = (0..max_vol).collect();
-
-        for member in &self.members {
-            if !extracted.contains(&member.name) {
-                // This member still needs its volumes — remove them from deletable.
-                for v in member.first_volume..=member.last_volume {
-                    deletable.remove(&v);
-                }
-            }
-        }
-
-        for span in &self.unresolved_spans {
-            for v in span.first_volume..=span.last_volume {
-                deletable.remove(&v);
-            }
-        }
-
-        deletable
-    }
-}
-
 /// A member (file) within an archive set.
 #[derive(Debug, Clone)]
 pub struct ArchiveMember {

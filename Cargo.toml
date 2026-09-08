@@ -13,7 +13,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -91,7 +91,6 @@ bzip2 = "0.6"
 lzma-rust2 = { version = "0.20.1", default-features = false, features = ["std", "xz"] }
 liblzma = { version = "0.4.8", default-features = false, features = ["static", "parallel"] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
-age = { version = "0.12", default-features = false }
 security-framework = { version = "3", default-features = false }
 security-framework-sys = { version = "2", default-features = false }
 keyring = { version = "4", default-features = false, features = ["v1"] }
@@ -126,7 +125,11 @@ par2-rs = { version = "0.10", default-features = false, features = ["native-cryp
 # the `ExtractOptions` weaver still carries. 0.9 also poisons a solid archive
 # whose member failed mid-decode instead of reusing the misaligned dictionary,
 # and 0.9.1 restores `-hp` (header-encrypted) RAR5 sets from `.rev` volumes.
-unrar-rs = { version = "0.10.1", default-features = false, features = ["crypto-aws-lc"] }
+# 0.10.2 (with reedsolomon-rs 0.4.4) decodes RAR3 recovery volumes per column
+# without re-zeroing the RS scratch tables per byte, which cut .rev restores
+# from 3-4x the CPU of unrar to parity, and reopens the reconstructed last
+# volume for its padding trim instead of failing with EBADF.
+unrar-rs = { version = "0.10.3", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

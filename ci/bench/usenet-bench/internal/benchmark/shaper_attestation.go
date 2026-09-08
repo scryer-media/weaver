@@ -37,6 +37,10 @@ type ShaperLinkShaping struct {
 	TCPWmem                string `json:"tcp_wmem"`
 	TCPRmem                string `json:"tcp_rmem"`
 	KernelRelease          string `json:"kernel_release"`
+	HandshakeDelayMicros   uint64 `json:"handshake_delay_micros,omitempty"`
+	EgressQueueBytes       uint64 `json:"egress_queue_bytes,omitempty"`
+	IngressQueueBytes      uint64 `json:"ingress_queue_bytes,omitempty"`
+	Platform               string `json:"platform,omitempty"`
 	LiveEgressDelayMicros  uint64 `json:"live_egress_delay_micros"`
 	LiveIngressDelayMicros uint64 `json:"live_ingress_delay_micros"`
 	LiveError              string `json:"live_error,omitempty"`
@@ -47,6 +51,13 @@ const (
 	shaperEgressNetem              = "netem"
 	shaperIngressIFBNetem          = "ifb-netem"
 	shaperIngressNone              = "none"
+	// A host with no tc -- Windows, macOS -- has the shaper carry the round
+	// trip in the proxy itself. It is a different mechanism with a different
+	// fidelity, not a variant of netem: it cannot delay the client's own TCP
+	// handshake, only pay that round trip back before the greeting. Results
+	// from the two are never comparable, which the execution target already
+	// keeps apart, and the mechanism is recorded in every run artifact.
+	shaperDelayUserspace = "userspace-delay"
 )
 
 // declared strips the per-snapshot live fields so two snapshots' contracts
@@ -66,7 +77,72 @@ func (l ShaperLinkShaping) validateFor(link ServerLinkProfile) error {
 	if l.RTTMicros != link.RTTMicros {
 		return fmt.Errorf("shaper link shaping report declares a %dus round trip, plan declares %dus", l.RTTMicros, link.RTTMicros)
 	}
-	if l.Interface == "" || l.EgressMechanism != shaperEgressNetem {
+	switch l.EgressMechanism {
+	case shaperEgressNetem:
+		if err := l.validateNetem(); err != nil {
+			return err
+		}
+	case shaperDelayUserspace:
+		if err := l.validateUserspace(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("shaper reports unknown egress mechanism %q", l.EgressMechanism)
+	}
+	if l.EgressDelayMicros == 0 || l.EgressDelayMicros+l.IngressDelayMicros != l.RTTMicros {
+		return fmt.Errorf("shaper egress %dus + ingress %dus does not make up the %dus round trip", l.EgressDelayMicros, l.IngressDelayMicros, l.RTTMicros)
+	}
+	if l.LiveError != "" {
+		return fmt.Errorf("shaper could not read its qdiscs back: %s", l.LiveError)
+	}
+	if l.EgressMechanism == shaperDelayUserspace {
+		if err := residencyWithinTolerance("server-to-client", l.LiveEgressDelayMicros, l.EgressDelayMicros); err != nil {
+			return err
+		}
+		return residencyWithinTolerance("client-to-server", l.LiveIngressDelayMicros, l.IngressDelayMicros)
+	}
+	if !delayWithinTolerance(l.LiveEgressDelayMicros, l.EgressDelayMicros) {
+		return fmt.Errorf("tc reports a server-to-client delay of %dus, shaper declares %dus", l.LiveEgressDelayMicros, l.EgressDelayMicros)
+	}
+	if !delayWithinTolerance(l.LiveIngressDelayMicros, l.IngressDelayMicros) {
+		return fmt.Errorf("tc reports a client-to-server delay of %dus, shaper declares %dus", l.LiveIngressDelayMicros, l.IngressDelayMicros)
+	}
+	return nil
+}
+
+// residencyWithinTolerance checks a userspace delay line's observed floor,
+// which is a different kind of reading from a qdisc's configured delay and
+// needs a different tolerance. A chunk can never leave early -- the line sleeps
+// until its release instant -- so anything short is the delay not being applied
+// and fails outright. Late is ordinary: a timer wakes when the host's scheduler
+// gets to it. The bound is loose enough for that jitter and tight enough that a
+// floor this far out over a whole run means the queue, not the link, is setting
+// the pace.
+func residencyWithinTolerance(direction string, observed, declared uint64) error {
+	if observed+clockSlopMicros < declared {
+		return fmt.Errorf("shaper delivered %s bytes after %dus, below the %dus it declares", direction, observed, declared)
+	}
+	late := uint64(0)
+	if observed > declared {
+		late = observed - declared
+	}
+	allowed := declared / 20
+	if allowed < maxResidencyOvershootMicros {
+		allowed = maxResidencyOvershootMicros
+	}
+	if late > allowed {
+		return fmt.Errorf("shaper's lowest observed %s delay is %dus, %dus above the %dus it declares", direction, observed, late, declared)
+	}
+	return nil
+}
+
+const (
+	clockSlopMicros             = 100
+	maxResidencyOvershootMicros = 5_000
+)
+
+func (l ShaperLinkShaping) validateNetem() error {
+	if l.Interface == "" {
 		return fmt.Errorf("shaper link shaping report lacks a netem egress path")
 	}
 	switch l.IngressMechanism {
@@ -81,20 +157,37 @@ func (l ShaperLinkShaping) validateFor(link ServerLinkProfile) error {
 	default:
 		return fmt.Errorf("shaper reports unknown ingress mechanism %q", l.IngressMechanism)
 	}
-	if l.EgressDelayMicros == 0 || l.EgressDelayMicros+l.IngressDelayMicros != l.RTTMicros {
-		return fmt.Errorf("shaper egress %dus + ingress %dus does not make up the %dus round trip", l.EgressDelayMicros, l.IngressDelayMicros, l.RTTMicros)
-	}
 	if l.NetemLimitPackets == 0 {
 		return fmt.Errorf("shaper netem queue limit is unset")
 	}
-	if l.LiveError != "" {
-		return fmt.Errorf("shaper could not read its qdiscs back: %s", l.LiveError)
+	if l.HandshakeDelayMicros != 0 || l.EgressQueueBytes != 0 || l.IngressQueueBytes != 0 || l.Platform != "" {
+		return fmt.Errorf("shaper netem report carries userspace delay fields")
 	}
-	if !delayWithinTolerance(l.LiveEgressDelayMicros, l.EgressDelayMicros) {
-		return fmt.Errorf("tc reports a server-to-client delay of %dus, shaper declares %dus", l.LiveEgressDelayMicros, l.EgressDelayMicros)
+	return nil
+}
+
+// validateUserspace holds the userspace mechanism to the only shape it can
+// have. Every netem field must be empty: a report naming an interface or a
+// qdisc limit was written for a mechanism the process does not run, and
+// accepting it would credit tc evidence to a delay tc never applied.
+func (l ShaperLinkShaping) validateUserspace() error {
+	if l.IngressMechanism != shaperDelayUserspace {
+		return fmt.Errorf("shaper reports a %q egress path with a %q ingress path", l.EgressMechanism, l.IngressMechanism)
 	}
-	if !delayWithinTolerance(l.LiveIngressDelayMicros, l.IngressDelayMicros) {
-		return fmt.Errorf("tc reports a client-to-server delay of %dus, shaper declares %dus", l.LiveIngressDelayMicros, l.IngressDelayMicros)
+	if l.Interface != "" || l.IngressDevice != "" || l.NetemLimitPackets != 0 || l.TCPWmem != "" || l.TCPRmem != "" || l.KernelRelease != "" {
+		return fmt.Errorf("shaper userspace delay report carries netem or kernel evidence")
+	}
+	if l.IngressDelayMicros == 0 {
+		return fmt.Errorf("shaper userspace delay has no client-to-server delay")
+	}
+	if l.HandshakeDelayMicros != l.RTTMicros {
+		return fmt.Errorf("shaper charges a %dus handshake for a %dus round trip", l.HandshakeDelayMicros, l.RTTMicros)
+	}
+	if l.EgressQueueBytes == 0 || l.IngressQueueBytes == 0 {
+		return fmt.Errorf("shaper userspace delay has an unset queue size (egress %d, ingress %d bytes)", l.EgressQueueBytes, l.IngressQueueBytes)
+	}
+	if l.Platform == "" {
+		return fmt.Errorf("shaper userspace delay names no platform")
 	}
 	return nil
 }
@@ -158,17 +251,83 @@ func AcquireShaperExecutionLease(ctx context.Context, client *http.Client, contr
 	return mutateShaperExecutionLease(ctx, client, controlURL, leaseID, http.MethodPost)
 }
 
+// shaperQuietBudget bounds how long a run waits for the shaper to be free of
+// the previous run's connections, and how often it looks.
+const (
+	shaperQuietBudget   = 15 * time.Second
+	shaperQuietInterval = 250 * time.Millisecond
+)
+
+// AcquireShaperExecutionLeaseForRun takes the lease for one measured run and
+// will not hand back a lease the previous run's client is still connected to.
+//
+// A client process outlives the adapter that launched it by a moment: the
+// harness asks it to stop, but its sockets are closed by the operating system
+// afterwards, and a frozen client's children are reaped later still. The
+// previous run's release already waits for the shaper to reach zero active
+// downstream connections, so the shaper is quiet at that instant -- but a
+// client that is still alive keeps redialling, and the first dial to land
+// after a new lease exists is counted against the new run. Failing the suite
+// there is not a measurement of anything: it throws away a run that had not
+// started, and `summarize` refuses a whole artifact root that contains one, so
+// a race in another product's shutdown discards an entire measured phase. The
+// lease is therefore released and taken again until the shaper is quiet, and
+// only a shaper that stays busy for the whole budget fails the run.
+//
+// On success the lease is held and the caller owns releasing it. On failure no
+// lease is held.
+func AcquireShaperExecutionLeaseForRun(ctx context.Context, client *http.Client, controlURL, leaseID string, link ServerLinkProfile) (ShaperSnapshot, error) {
+	deadline := time.Now().Add(shaperQuietBudget)
+	for {
+		snapshot, err := AcquireShaperExecutionLease(ctx, client, controlURL, leaseID)
+		if err == nil {
+			if snapshot.ActiveDownstreamConnections == 0 {
+				validateErr := snapshot.ValidateFor(link)
+				if validateErr == nil {
+					return snapshot, nil
+				}
+				return ShaperSnapshot{}, handBackShaperExecutionLease(client, controlURL, leaseID, validateErr)
+			}
+			// Hand the lease back rather than measuring against it, so the
+			// stray connections drain instead of being attributed here. The
+			// shaper refuses a release while they are still open, so this is
+			// also what waits for them.
+			err = fmt.Errorf("shaper has %d active downstream connections outside the measured run", snapshot.ActiveDownstreamConnections)
+			if releaseErr := releaseShaperExecutionLeaseAfterRun(client, controlURL, leaseID); releaseErr != nil {
+				err = fmt.Errorf("%w (the lease could not be handed back: %v)", err, releaseErr)
+			}
+		}
+		if time.Now().After(deadline) {
+			return ShaperSnapshot{}, fmt.Errorf("shaper did not become quiet within %s: %w", shaperQuietBudget, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ShaperSnapshot{}, ctx.Err()
+		case <-time.After(shaperQuietInterval):
+		}
+	}
+}
+
+// handBackShaperExecutionLease releases a lease the run will not use, so a
+// fatal condition does not also strand the lease for every suite behind it.
+func handBackShaperExecutionLease(client *http.Client, controlURL, leaseID string, cause error) error {
+	if err := releaseShaperExecutionLeaseAfterRun(client, controlURL, leaseID); err != nil {
+		return fmt.Errorf("%w (the lease could not be handed back: %v)", cause, err)
+	}
+	return cause
+}
+
 func ReleaseShaperExecutionLease(ctx context.Context, client *http.Client, controlURL, leaseID string) error {
 	_, err := mutateShaperExecutionLease(ctx, client, controlURL, leaseID, http.MethodDelete)
 	return err
 }
 
-func releaseShaperExecutionLeaseAfterRun(controlURL, leaseID string) error {
+func releaseShaperExecutionLeaseAfterRun(client *http.Client, controlURL, leaseID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var lastErr error
 	for {
-		if err := ReleaseShaperExecutionLease(ctx, nil, controlURL, leaseID); err == nil {
+		if err := ReleaseShaperExecutionLease(ctx, client, controlURL, leaseID); err == nil {
 			return nil
 		} else {
 			lastErr = err

@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "name": "weaver-native-latency-pair",
+  "stack": "raw",
+  "raw": {
+    "bin_dir": "../bin",
+    "data_dir": "../spool/articles",
+    "pipelining": true
+  },
+  "password_file": "nntp-password",
+  "adapters": "adapters.macos.json",
+  "artifacts_dir": "series",
+  "restore_server_link": "1gbit",
+  "restore_server_rtt": "0s",
+  "require": {
+    "fixture_roots": [
+      "../fixtures"
+    ]
+  },
+  "fixture_sets": {
+    "native-breadth": [
+      "rar5-6-store-store-nonsolid-none-incompressible",
+      "rar4-data-normal-solid-data-incompressible",
+      "sevenzip-store-store-nonsolid-none-incompressible",
+      "direct-mkv-200mb"
+    ]
+  },
+  "phases": [
+    {
+      "name": "N0-eqt-local",
+      "mode": "sequential",
+      "plan": "plan-N0-eqt-tls-local.json",
+      "fixtures_root": "../fixtures",
+      "artifacts": "artifacts-N0-eqt-local",
+      "server_link": "1gbit",
+      "server_rtt": "0s",
+      "summarize_baselines": [
+        "sabnzbd",
+        "nzbget"
+      ],
+      "plan_spec": {
+        "fixture_set": "native-breadth",
+        "transports": [
+          "tls"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 3,
+        "seed": 20260906
+      }
+    },
+    {
+      "name": "N100-eqt-local",
+      "mode": "sequential",
+      "plan": "plan-N100-eqt-tls-local.json",
+      "fixtures_root": "../fixtures",
+      "artifacts": "artifacts-N100-eqt-local",
+      "server_link": "1gbit",
+      "server_rtt": "100ms",
+      "summarize_baselines": [
+        "sabnzbd",
+        "nzbget"
+      ],
+      "plan_spec": {
+        "fixture_set": "native-breadth",
+        "transports": [
+          "tls"
+        ],
+        "profile": "equivalent-throughput",
+        "repetitions": 3,
+        "seed": 20260906
+      }
+    }
+  ]
+}

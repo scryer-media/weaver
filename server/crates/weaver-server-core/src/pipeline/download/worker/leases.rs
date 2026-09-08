@@ -456,7 +456,7 @@ impl Pipeline {
             .server_configs()
             .get(server_idx)
             .is_some_and(|config| {
-                weaver_nntp::prologue::prologue_for(&config.host, config.port).group
+                weaver_nntp::server_caps::requires_group_selection(&config.host, config.port)
             })
     }
 

@@ -2486,7 +2486,8 @@ impl Pipeline {
                     .collect();
                 let mut lead_in: Vec<(u32, u64, std::sync::Arc<[u8]>)> = spans
                     .iter()
-                    .filter_map(|span| span.lead_in.clone())
+                    .flat_map(|span| [span.lead_in.clone(), span.lead_out.clone()])
+                    .flatten()
                     .map(|(offset, data)| (volume_index, offset, data))
                     .collect();
                 lead_in.extend(edges);

@@ -47,26 +47,13 @@ where
         let (mut socket, _) = listener.accept().await.unwrap();
         for step in steps {
             if let Some(prefix) = step.expected_prefix() {
-                loop {
-                    let line = read_command_line(&mut socket).await;
-                    // The default prologue sends no MODE READER, but a script
-                    // may drive the learned-fallback path, where a later
-                    // connection does send one. Tolerate it here so only the
-                    // scripts that assert it have to model it.
-                    if line.starts_with("MODE READER") && !prefix.starts_with("MODE READER") {
-                        socket
-                            .write_all(b"500 MODE READER unsupported\r\n")
-                            .await
-                            .unwrap();
-                        socket.flush().await.unwrap();
-                        continue;
-                    }
-                    assert!(
-                        line.starts_with(prefix),
-                        "expected command starting with {prefix:?}, got {line:?}"
-                    );
-                    break;
-                }
+                let line = read_command_line(&mut socket).await;
+                // Session setup sends nothing beyond authentication, so every
+                // line a script sees is one it declared.
+                assert!(
+                    line.starts_with(prefix),
+                    "expected command starting with {prefix:?}, got {line:?}"
+                );
             }
             let delay = step.delay();
             if delay > Duration::ZERO {
