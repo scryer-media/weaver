@@ -1146,6 +1146,9 @@ impl DownloadFailure {
         use weaver_nntp::NntpError;
 
         match error {
+            // A 412 learns the GROUP prologue needed by the next connection;
+            // no article content has been received or rejected yet.
+            NntpError::NoGroupSelected => Some(DownloadFailureKind::ConnectionEstablishment),
             NntpError::PoolExhausted
             | NntpError::PoolShutdown
             | NntpError::TooManyConnections
@@ -1185,7 +1188,6 @@ impl DownloadFailure {
         let kind = Self::infrastructure_kind(error, DownloadFailureKind::ConnectionEstablishment)
             .unwrap_or(match error {
                 NntpError::NoSuchGroup
-                | NntpError::NoGroupSelected
                 | NntpError::CommandNotRecognized
                 | NntpError::TlsRequired
                 | NntpError::UnexpectedResponse { .. }

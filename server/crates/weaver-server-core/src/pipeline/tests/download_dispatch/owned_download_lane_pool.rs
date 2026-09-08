@@ -1572,6 +1572,75 @@ fn lane_acquire_failure_preserves_retry_semantics() {
     assert_eq!(setup_failure.kind, DownloadFailureKind::ContentOrProtocol);
 }
 
+#[tokio::test]
+async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20024);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Group discovery", "group.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            runtime_generation: 0,
+            segment_id,
+            data: Err(DownloadError::from_nntp(
+                weaver_nntp::NntpError::NoGroupSelected,
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.failed_bytes, 0);
+    assert_eq!(state.status, JobStatus::Downloading);
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(retry.segment_id, segment_id);
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
+    assert!(retry.exclude_servers.is_empty());
+    assert_eq!(
+        retry.avoid_server, None,
+        "the same provider can select the learned group"
+    );
+
+    let setup =
+        DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::NoGroupSelected));
+    assert!(setup.kind.preserves_article_retry_budget());
+}
+
 #[test]
 fn only_pre_body_infrastructure_failures_preserve_article_retry_budget() {
     for kind in [
