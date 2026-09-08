@@ -19,6 +19,9 @@ type fakeShaperLease struct {
 	acquires         int
 	releases         int
 	held             bool
+	// Releases are refused, as the shaper refuses them while downstream
+	// connections are open, until this instant.
+	refuseReleasesUntil time.Time
 }
 
 func (fake *fakeShaperLease) client(t *testing.T, leaseID string, started time.Time) *http.Client {
@@ -44,6 +47,9 @@ func (fake *fakeShaperLease) client(t *testing.T, leaseID string, started time.T
 			fake.releases++
 			if !fake.held {
 				return conflict("execution lease ID does not match the active lease"), nil
+			}
+			if time.Now().Before(fake.refuseReleasesUntil) {
+				return conflict("cannot release execution lease with active downstream connections"), nil
 			}
 			fake.held = false
 		}
@@ -127,5 +133,40 @@ func TestAShaperThatStaysBusyStillFailsTheRun(t *testing.T) {
 	defer fake.mu.Unlock()
 	if fake.held {
 		t.Fatal("a failed acquisition must not strand the lease")
+	}
+}
+
+// A client that keeps a connection open after the lease is taken makes the
+// shaper refuse the hand-back, and the quiet budget can run out while the run
+// still owns the lease. The run has reported failure, so nothing else will
+// release it: it must be handed back here, once the connection finally goes,
+// or every suite behind this one is refused by a lease no run holds.
+func TestAFailedAcquisitionHandsBackTheLeaseTheShaperWouldNotRelease(t *testing.T) {
+	leaseID := strings.Repeat("d", 64)
+	fake := &fakeShaperLease{
+		activePerAcquire:    []int64{8},
+		refuseReleasesUntil: time.Now().Add(6 * time.Second),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := AcquireShaperExecutionLeaseForRun(ctx,
+		fake.client(t, leaseID, time.Now().UTC()), "http://shaper.test", leaseID, quietTestLink(t))
+	if err == nil {
+		t.Fatal("a shaper carrying foreign connections was accepted")
+	}
+	if !strings.Contains(err.Error(), "active downstream connections") {
+		t.Fatalf("the failure must still name the busy shaper, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "background") {
+		t.Fatalf("the lease was handed back in the foreground, the error must not say otherwise: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 6*time.Second {
+		t.Fatalf("the run returned after %s, before the shaper would release the lease", elapsed)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.held {
+		t.Fatal("a failed acquisition must not strand the lease, however long the shaper refused the release")
 	}
 }
