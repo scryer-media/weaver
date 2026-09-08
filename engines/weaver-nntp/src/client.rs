@@ -145,6 +145,20 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
 
 impl std::error::Error for BlockingBodyLaneAcquireError {}
 
+/// Whether the synchronous owned lanes can be given a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockingBodyLaneCandidacy {
+    /// At least one eligible server can carry an owned blocking lane.
+    Candidate,
+    /// No eligible server can. This is the only answer that justifies the
+    /// asynchronous path.
+    None,
+    /// The shared server health state was busy, so the candidates could not be
+    /// ranked. Says nothing about the servers: ask again in a moment, on the
+    /// owned lanes.
+    Contended,
+}
+
 /// A BODY fetch that was streamed and decoded inline.
 #[derive(Debug)]
 pub struct DecodedBody {
@@ -2248,12 +2262,17 @@ impl NntpClient {
 
     /// Inspect the synchronous owned-lane candidates without acquiring a
     /// connection permit or opening a connection.
-    pub fn blocking_body_server_selection_with_estimate(
+    ///
+    /// `None` means the shared health state was busy, not that no server is
+    /// eligible. The two must not be folded together: a caller that reads
+    /// contention as "nothing can serve this" takes a permanent decision on a
+    /// momentary lock collision.
+    pub fn try_blocking_body_server_selection_with_estimate(
         &self,
         exclude: &[usize],
         requested_body_bytes: u64,
-    ) -> BodyServerSelection {
-        self.blocking_body_server_selection(exclude, requested_body_bytes)
+    ) -> Option<BodyServerSelection> {
+        self.try_blocking_body_server_selection(exclude, requested_body_bytes)
     }
 
     pub fn try_acquire_blocking_body_lane_with_estimate(
@@ -2363,23 +2382,44 @@ impl NntpClient {
         }
     }
 
+    /// Whether the owned blocking lanes could take this work, and whether the
+    /// answer is one at all.
+    ///
+    /// [`BlockingBodyLaneCandidacy::Contended`] is the reason this is not a
+    /// `bool`: the shared health state was busy for the length of the spin, so
+    /// nothing is known about the servers. Treating that as "no candidate"
+    /// sends the work to the asynchronous lanes, which then queue for the very
+    /// connection permits the idle owned lanes are holding and wait out the
+    /// whole acquire deadline for it.
+    pub fn blocking_body_lane_candidacy(&self, exclude: &[usize]) -> BlockingBodyLaneCandidacy {
+        let Some(selection) = self.try_blocking_body_server_selection(exclude, 0) else {
+            return BlockingBodyLaneCandidacy::Contended;
+        };
+        let has_candidate = selection.eligible.into_iter().any(|server| {
+            // Deliberately blind to the holdoff: an owned lane that is
+            // already connected must keep receiving work while its server
+            // refuses new sockets. A worker with no cached lane finds the
+            // holdoff at acquire time and parks there instead.
+            if self.pool.server_load(server.0).1 == 0 {
+                return false;
+            }
+            let Ok((config, _, _)) = self.pool.blocking_connect_plan(server, &[]) else {
+                return false;
+            };
+            supports_blocking_body_lane(&config)
+        });
+        if has_candidate {
+            BlockingBodyLaneCandidacy::Candidate
+        } else {
+            BlockingBodyLaneCandidacy::None
+        }
+    }
+
     pub fn has_blocking_body_lane_candidate(&self, exclude: &[usize]) -> bool {
-        self.blocking_body_server_selection(exclude, 0)
-            .eligible
-            .into_iter()
-            .any(|server| {
-                // Deliberately blind to the holdoff: an owned lane that is
-                // already connected must keep receiving work while its server
-                // refuses new sockets. A worker with no cached lane finds the
-                // holdoff at acquire time and parks there instead.
-                if self.pool.server_load(server.0).1 == 0 {
-                    return false;
-                }
-                let Ok((config, _, _)) = self.pool.blocking_connect_plan(server, &[]) else {
-                    return false;
-                };
-                supports_blocking_body_lane(&config)
-            })
+        matches!(
+            self.blocking_body_lane_candidacy(exclude),
+            BlockingBodyLaneCandidacy::Candidate
+        )
     }
 
     pub fn record_blocking_attempts(&self, attempts: &[FetchAttemptTrace]) {
@@ -2498,21 +2538,6 @@ impl NntpClient {
         })
     }
 
-    /// Contention-collapsing view of [`Self::try_blocking_body_server_selection`]
-    /// for callers that only ask "is anything available right now?" and
-    /// already treat an empty answer as "not now".
-    fn blocking_body_server_selection(
-        &self,
-        exclude: &[usize],
-        requested_body_bytes: u64,
-    ) -> BodyServerSelection {
-        self.try_blocking_body_server_selection(exclude, requested_body_bytes)
-            .unwrap_or(BodyServerSelection {
-                eligible: Vec::new(),
-                quota_blocked: None,
-            })
-    }
-
     fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
         if matches!(error, NntpError::TooManyConnections) {
             // Provider admission pressure parks new sockets, it does not make
@@ -2555,6 +2580,8 @@ impl NntpClient {
                 | NntpError::ServerOverLimit { .. }
                 | NntpError::PoolExhausted
                 | NntpError::PoolShutdown
+                // Learning session setup is not a server health failure.
+                | NntpError::NoGroupSelected
                 // Local capacity: we never reached the server, so this must
                 // not walk it toward Degraded/Disabled.
                 | NntpError::AcquireTimeout(_)
@@ -3447,6 +3474,8 @@ fn is_transient(err: &NntpError) -> bool {
             | NntpError::TruncatedMultilineBody
             | NntpError::ServerDisconnectedMidBody
             | NntpError::MalformedMultilineTerminator
+            // The next connection can select the group learned from this 412.
+            | NntpError::NoGroupSelected
             | NntpError::ServiceUnavailable
             | NntpError::TooManyConnections
             | NntpError::ServerOverLimit { .. }

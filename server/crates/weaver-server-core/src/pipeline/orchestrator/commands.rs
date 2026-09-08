@@ -563,6 +563,7 @@ impl Pipeline {
                     // stable id rather than by position.
                     self.seed_download_lane_explorers();
                     let recovery_requeues = self.wake_all_infrastructure_retries();
+                    self.reset_owned_download_lanes();
                     self.clear_retention_exclude_cache();
                     for state in self.jobs.values_mut() {
                         state.download_queue.clear_exclude_servers();
@@ -571,7 +572,6 @@ impl Pipeline {
                     self.metrics
                         .nntp_generation_recovery_requeues
                         .fetch_add(recovery_requeues as u64, Ordering::Relaxed);
-                    self.owned_download_lane_pool.reset();
                     self.owned_download_lane_pool
                         .resize(total_connections.max(1));
                     self.tuner.set_connection_limit(total_connections);

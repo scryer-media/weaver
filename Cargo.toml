@@ -14,7 +14,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.11.1"
+version = "0.11.3"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"

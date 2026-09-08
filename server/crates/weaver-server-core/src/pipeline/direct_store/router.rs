@@ -1035,6 +1035,20 @@ pub(crate) struct HoldsScratch {
     /// image is: the pins of a relocated-away image keep decrementing their own
     /// counter, and the fresh file starts unpinned.
     pins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Images a pinned compaction relocated away from, still allocated on disk
+    /// for as long as their readers hold them. Their bytes stay charged to the
+    /// process-wide accountant until the last pin drops — they are real disk
+    /// the scratch ceiling and the reserve were promised to bound — and are
+    /// forgotten at the next publication after that.
+    retired: Vec<RetiredScratchImage>,
+}
+
+/// One relocated-away scratch image: its pin counter, and the bytes it holds
+/// on disk until that counter reaches zero.
+#[derive(Debug)]
+struct RetiredScratchImage {
+    pins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    bytes: u64,
 }
 
 /// A reader's hold on one scratch image: the handle, and the promise that the
@@ -1068,15 +1082,56 @@ impl Drop for HoldsScratchPin {
     }
 }
 
-/// The path a pinned compaction packs into before renaming over `path`. It
+/// The path a pinned compaction packs into before taking over `path`. It
 /// keeps the holds-scratch prefix, so a copy a crash leaves behind is swept at
 /// restart exactly like the scratch itself.
 fn compacting_scratch_path(path: &std::path::Path) -> std::path::PathBuf {
+    scratch_sibling_path(path, "compacting")
+}
+
+/// The path the pinned image is moved aside to while the packed copy takes
+/// over `path`. Same prefix, same sweep, for the same reason.
+fn retired_scratch_path(path: &std::path::Path) -> std::path::PathBuf {
+    scratch_sibling_path(path, "retired")
+}
+
+fn scratch_sibling_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    path.with_file_name(format!("{name}.compacting"))
+    path.with_file_name(format!("{name}.{suffix}"))
+}
+
+/// Puts `packed` at `path` while a reader still holds the file that is there.
+///
+/// Not a rename over the path. A pinned image is an *open* file, and on
+/// Windows an open file cannot be replaced, only moved or unlinked — both of
+/// which its share-delete handle allows. So the pinned image steps aside
+/// first, the packed copy takes the path, and the retired image is unlinked
+/// last: immediately on POSIX, and on Windows the moment its last handle
+/// closes, which is what the pin is. A failure between the two moves puts the
+/// image back where it was, so the caller sees the file it had.
+fn take_over_scratch_path(
+    packed: &std::path::Path,
+    path: &std::path::Path,
+    retired: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(path, retired)?;
+    if let Err(error) = std::fs::rename(packed, path) {
+        let _ = std::fs::rename(retired, path);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::remove_file(retired) {
+        // The path keeps the scratch prefix, so a restart sweeps it; nothing
+        // reads it by name in the meantime.
+        tracing::debug!(
+            retired_path = %retired.display(),
+            error = %error,
+            "direct-store could not unlink a retired holds scratch image"
+        );
+    }
+    Ok(())
 }
 
 /// Creates (or truncates) a scratch file, read/write, marked sparse before a
@@ -1136,11 +1191,26 @@ impl HoldsScratch {
             ceiling,
             sparse: SparseMarking::default(),
             pins: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retired: Vec::new(),
         }
     }
 
+    /// The current image's length: what this set's own ceiling bounds.
     pub(super) fn bytes(&self) -> u64 {
         self.len
+    }
+
+    /// What this scratch occupies on disk: the current image, plus every
+    /// relocated-away image a reader still pins. This is the figure the
+    /// process-wide accountant is told, because it is the disk that is
+    /// actually in use; the images whose last pin has dropped are forgotten
+    /// here, and their bytes with them.
+    pub(super) fn charged_bytes(&mut self) -> u64 {
+        self.retired
+            .retain(|image| image.pins.load(std::sync::atomic::Ordering::Acquire) > 0);
+        self.retired
+            .iter()
+            .fold(self.len, |total, image| total.saturating_add(image.bytes))
     }
 
     fn handle(&self) -> Option<std::sync::Arc<std::fs::File>> {
@@ -1249,12 +1319,15 @@ impl HoldsScratch {
 
     /// [`Self::compact`] under a pin: pack into a fresh file, then take it over.
     ///
-    /// The rename is what keeps everything outside this type unchanged — the
-    /// path is the path, `discard` deletes it, the restart sweep recognises it.
-    /// A failure at any step leaves the current image exactly as it was and
-    /// removes the half-written copy; the caller demotes on `None` as before.
+    /// The take-over is what keeps everything outside this type unchanged —
+    /// the path is the path, `discard` deletes it, the restart sweep recognises
+    /// it. A failure at any step leaves the current image exactly as it was
+    /// and removes the half-written copy; the caller demotes on `None` as
+    /// before. The caller has already had the packed copy's bytes admitted by
+    /// the accountant: while the pins live, both images are on disk.
     fn compact_relocating(&mut self, old: &std::fs::File, live: &[(u64, u64)]) -> Option<Vec<u64>> {
         let packing_path = compacting_scratch_path(&self.path);
+        let retired_path = retired_scratch_path(&self.path);
         let fresh = open_scratch_file(&packing_path, &self.sparse).ok()?;
         let packed = (|| {
             let mut new_offsets = Vec::with_capacity(live.len());
@@ -1267,7 +1340,7 @@ impl HoldsScratch {
                 new_offsets.push(cursor);
                 cursor = cursor.checked_add(len)?;
             }
-            std::fs::rename(&packing_path, &self.path).ok()?;
+            take_over_scratch_path(&packing_path, &self.path, &retired_path).ok()?;
             Some((new_offsets, cursor))
         })();
         match packed {
@@ -1279,9 +1352,16 @@ impl HoldsScratch {
                     pins = self.pins.load(std::sync::atomic::Ordering::Acquire),
                     "direct-store relocated the holds scratch under a live reader"
                 );
+                let pins = std::mem::replace(
+                    &mut self.pins,
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                );
+                self.retired.push(RetiredScratchImage {
+                    pins,
+                    bytes: self.len,
+                });
                 self.file = Some(std::sync::Arc::new(fresh));
                 self.len = cursor;
-                self.pins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 Some(new_offsets)
             }
             None => {
@@ -2185,6 +2265,18 @@ pub(crate) struct DirectSetRouter {
     /// recording it again would park the set on a question that has already
     /// been asked and lost, so the second one demotes.
     repair_rerouted: bool,
+    /// Is [`Self::route_repaired`] mid-drain?
+    ///
+    /// A rewrite reaches the compositions in pieces — an encrypted slice as its
+    /// edge blocks and aligned middle, a volume with several damaged slices as
+    /// one run per slice — and between two of those pieces a part's runs still
+    /// tile: the pieces already fed carry the repaired values and the rest still
+    /// carry the wire-damaged ones. A gate that fires there composes a mixture
+    /// that describes no bytes that ever existed, and with `repair_rerouted`
+    /// set its mismatch is the demotion, not a question. So while this is set
+    /// both integrity layers only record; [`Self::settle_repair_gates`] runs
+    /// them once, over the finished rewrite.
+    repair_draining: bool,
     demoted: Option<DemotionReason>,
 }
 
@@ -2253,6 +2345,7 @@ impl DirectSetRouter {
             par2_available: false,
             damaged_volumes: std::collections::BTreeSet::new(),
             repair_rerouted: false,
+            repair_draining: false,
             demoted: None,
         }
     }
@@ -2898,6 +2991,16 @@ impl DirectSetRouter {
             return Ok(false);
         }
 
+        // Under a pin the pack is a second file beside the first, and the
+        // first stays on disk until its readers let go. That copy is scratch
+        // like any other spill: admitted against the shared total and the
+        // reserve before it is written, and charged for as long as both
+        // images exist. A refusal is a demotion, as it is for a spill.
+        if self.scratch.is_pinned() {
+            self.publish_holds();
+            self.accountant
+                .admit_scratch(live_bytes, &self.plan.working_dir)?;
+        }
         let ranges: Vec<(u64, u64)> = extents
             .iter()
             .map(|extent| (extent.scratch_offset, extent.len))
@@ -2955,7 +3058,7 @@ impl DirectSetRouter {
     /// pays exactly the one fold it paid before the accountant existed.
     fn publish_holds(&mut self) -> u64 {
         let resident = self.resident_bytes();
-        let scratch = self.scratch.bytes();
+        let scratch = self.scratch.charged_bytes();
         self.accountant.publish(&mut self.charge, resident, scratch);
         resident
     }

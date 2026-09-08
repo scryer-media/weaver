@@ -1,11 +1,11 @@
 {
   "slug": "stat-health-probe",
   "title": "E2E.Test.STAT.HealthProbe.2024.1080p-TESTGRP",
-  "description": "Two direct MKVs with the same few articles missing from each. Losses across more than one file are the dead-release shape that arms the health probe, so this exercises its STAT checks without a recovery set and without crossing the terminal health threshold on its own.",
+  "description": "Two direct MKVs with twenty early articles missing from each: about 3% of the combined payload, above the 2% probe trigger and below the 15% terminal threshold. Losses across both files arm STAT health checks without a recovery set.",
   "category": "2000",
   "expected_outcome": "health_failure",
   "segment_size": 65536,
-  "deleteSegmentNumbers": [3, 17, 41, 58, 77],
+  "deleteSegmentNumbers": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
   "fixtureAssets": [
     "par2-multi-grid-overlap-clean/payload.mkv",
     "single-mkv/test-media.mkv"

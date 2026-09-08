@@ -1782,6 +1782,216 @@ async fn a_duplicate_article_after_finalization_leaves_the_finished_output_alone
 }
 
 #[tokio::test]
+async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
+    let volumes = demotion_fixture_volumes("Silver.Horizon.S01E28.mkv");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41062);
+    let other_job_id = JobId(41063);
+    let ordinary_name = "ordinary.bin";
+    let ordinary_bytes = b"ordinary";
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let ordinary_spec = standalone_job_spec(
+        "Ordinary",
+        &[(ordinary_name.to_string(), ordinary_bytes.len() as u32)],
+    );
+    spec.total_bytes += ordinary_spec.total_bytes;
+    spec.files.extend(ordinary_spec.files.clone());
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let other_spec = standalone_job_spec(
+        "Ordinary competitor",
+        &[
+            (ordinary_name.to_string(), ordinary_bytes.len() as u32),
+            ("pending.bin".to_string(), 1),
+        ],
+    );
+    let other_dir = insert_active_job(&mut pipeline, other_job_id, other_spec).await;
+
+    for (file_index, segment_number) in [(0, 0), (0, 1), (1, 0)] {
+        take_queued_segment(
+            &mut pipeline,
+            job_id,
+            SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number,
+            },
+        );
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    pipeline
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
+        .await;
+
+    let protected_file = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let same_job_file = NzbFileId {
+        job_id,
+        file_index: 3,
+    };
+    let other_job_file = NzbFileId {
+        job_id: other_job_id,
+        file_index: 0,
+    };
+    let (tail_start, tail_end) = article_extent(volumes[1].1.len(), 1, 2);
+    let tail = &volumes[1].1[tail_start..tail_end];
+    let expected_crc = checksum::crc32(&volumes[1].1);
+    pipeline
+        .expected_file_crcs
+        .insert(protected_file, expected_crc);
+
+    // Model articles parked by the decode seam, without the submit helper's
+    // automatic ticket processing. The actor still owns an outstanding ticket
+    // even if its detached worker has already finished writing.
+    for (file_id, segment_number, offset, bytes, name) in [
+        (
+            protected_file,
+            1,
+            tail_start as u64,
+            tail,
+            volumes[1].0.as_str(),
+        ),
+        (
+            same_job_file,
+            0,
+            0,
+            ordinary_bytes.as_slice(),
+            ordinary_name,
+        ),
+        (
+            other_job_file,
+            0,
+            0,
+            ordinary_bytes.as_slice(),
+            ordinary_name,
+        ),
+    ] {
+        pipeline
+            .jobs
+            .get_mut(&file_id.job_id)
+            .unwrap()
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .record_placement(segment_number, offset, bytes.len() as u32);
+        let buffered = BufferedDecodedSegment {
+            encoding: SegmentEncoding::Yenc,
+            segment_id: SegmentId {
+                file_id,
+                segment_number,
+            },
+            decoded_size: bytes.len() as u32,
+            data: DecodedChunk::from(bytes.to_vec()),
+            part_crc: checksum::crc32(bytes),
+            part_crc_verified: true,
+            yenc_name: name.to_string(),
+            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+            segments: Vec::new(),
+        };
+        pipeline
+            .write_buffers
+            .entry(file_id)
+            .or_insert_with(|| WriteReorderBuffer::new(4))
+            .insert(offset, buffered);
+        pipeline.note_write_buffered(bytes.len(), 1);
+    }
+    // All wire work is dispatched; only the reconstruction ticket and parked
+    // decoded articles remain. Volume 2 is supplied after the handback below.
+    for id in [job_id, other_job_id] {
+        pipeline
+            .jobs
+            .get_mut(&id)
+            .unwrap()
+            .download_queue
+            .drain_all();
+    }
+    assert!(pipeline.demotion_sweep_owns_file(protected_file));
+    let received_before = pipeline.jobs[&job_id]
+        .assembly
+        .file(protected_file)
+        .unwrap()
+        .received_bytes();
+
+    pipeline.flush_quiescent_write_backlog().await;
+
+    assert_eq!(
+        pipeline.write_buffers[&protected_file].buffered_len(),
+        1,
+        "the idle flush must leave reconstruction-owned articles parked"
+    );
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(protected_file)
+            .unwrap()
+            .received_bytes(),
+        received_before,
+        "the idle flush must not advance the protected assembly"
+    );
+    assert!(!matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Failed { .. }
+    ));
+    assert_eq!(pipeline.write_buffered_bytes, tail.len());
+    assert_eq!(pipeline.write_buffered_segments, 1);
+    assert_eq!(
+        std::fs::read(working_dir.join(ordinary_name)).unwrap(),
+        ordinary_bytes
+    );
+    assert_eq!(
+        std::fs::read(other_dir.join(ordinary_name)).unwrap(),
+        ordinary_bytes
+    );
+    assert!(!pipeline.write_buffers.contains_key(&same_job_file));
+    assert!(!pipeline.write_buffers.contains_key(&other_job_file));
+
+    // A second idle turn with only the protected article is also a no-op.
+    pipeline.flush_quiescent_write_backlog().await;
+    assert_eq!(pipeline.write_buffered_bytes, tail.len());
+    assert_eq!(pipeline.write_buffered_segments, 1);
+    settle_direct_demotion_work(&mut pipeline).await;
+
+    assert!(!pipeline.demotion_sweep_owns_file(protected_file));
+    assert!(
+        pipeline.pending_completion_checks.contains(&job_id),
+        "handback must schedule the job for continued completion"
+    );
+    let reconstructed = std::fs::read(working_dir.join(&volumes[1].0)).unwrap();
+    assert_eq!(reconstructed, volumes[1].1);
+    assert_eq!(checksum::crc32(&reconstructed), expected_crc);
+    assert!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(protected_file)
+            .unwrap()
+            .is_complete()
+    );
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+    assert_eq!(pipeline.write_buffered_segments, 0);
+    assert!(!pipeline.write_buffers.contains_key(&protected_file));
+
+    for segment_number in 0..2 {
+        submit_volume_article(&mut pipeline, job_id, &volumes, 2, segment_number).await;
+    }
+    assert!(!matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Failed { .. }
+    ));
+    assert!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: 2
+            })
+            .unwrap()
+            .is_complete()
+    );
+}
+
+#[tokio::test]
 async fn a_demotion_returns_before_its_reconstruction_sweep_finishes() {
     let member_name = "Silver.Horizon.S01E24.mkv";
     let volumes = demotion_fixture_volumes(member_name);
@@ -3110,6 +3320,268 @@ async fn a_scratch_ceiling_breach_demotes_the_set() {
         "a scratch ceiling breach must demote with its own reason, got {shape}"
     );
     assert!(!direct_partial(&temp_dir, JobId(41054), member_name).exists());
+}
+
+/// A compaction under a pin cannot rewrite the image in place: the reader was
+/// handed offsets into the file it holds open. The pack goes into a second
+/// file that then takes over the path, and the retired image stays on disk,
+/// unlinked, for as long as its last reader does. Both images are disk in use,
+/// so both are charged to the shared total until that reader lets go; the
+/// path carries no sibling files once the take-over is done; and the reader
+/// keeps reading the bytes it was handed, as posted, through the retired image.
+#[tokio::test]
+async fn a_pinned_compaction_charges_the_retired_image_until_its_reader_lets_go() {
+    use std::io::{Read as _, Seek as _};
+
+    let member_name = "Silver.Horizon.S01E19.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 167) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let (a_start, a_end) = article_extent(volumes[0].1.len(), 1, 2);
+    let (b_start, b_end) = article_extent(volumes[1].1.len(), 1, 2);
+    let (c_start, c_end) = article_extent(volumes[2].1.len(), 1, 2);
+    let (a, b, c) = (
+        (a_end - a_start) as u64,
+        (b_end - b_start) as u64,
+        (c_end - c_start) as u64,
+    );
+    assert!(
+        c > 1 && c <= a + 1,
+        "non-vacuity: the third hold fits only once the first is reclaimed"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.direct_store.set_holds_budget(64);
+    // Room for two holds in sequence, not three: the third spill fits only
+    // after the placed first hold's region is reclaimed.
+    pipeline.direct_store.set_holds_scratch_ceiling(a + b + 1);
+    let job_id = JobId(41057);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let scratch_files = |dir: &std::path::Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with(".weaver-holds."))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    let router_scratch = |pipeline: &Pipeline| {
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .map(|set| set.router.scratch_bytes())
+            .unwrap_or(u64::MAX)
+    };
+
+    // Volume 0's payload before its header: the first hold, paged.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    assert_eq!(
+        router_scratch(&pipeline),
+        a,
+        "the first hold is the first spill"
+    );
+    // A reader over that hold pins the image it lives in.
+    let (_, _, provider) = pipeline
+        .direct_virtual_volume(NzbFileId {
+            job_id,
+            file_index: 0,
+        })
+        .expect("volume 0 is a live direct volume");
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.router.scratch_is_pinned()),
+        "non-vacuity: the provider pins the image the hold is paged to"
+    );
+    // Its header places it: the region is dead in the log, the log unchanged.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    assert_eq!(
+        router_scratch(&pipeline),
+        a,
+        "placing a hold reclaims nothing by itself"
+    );
+    // The second hold fills the log to its ceiling.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 1, 1).await;
+    assert_eq!(router_scratch(&pipeline), a + b);
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        a + b
+    );
+
+    // The third hold breaches the ceiling under the pin: the live hold is
+    // packed into a fresh image that takes over the path, and the third
+    // hold lands behind it.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 2, 1).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        !shape.contains("Demoted"),
+        "a reclaimable breach under a pin must not demote, got {shape}"
+    );
+    assert_eq!(
+        router_scratch(&pipeline),
+        b + c,
+        "the current image holds exactly the live holds"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        (a + b) + (b + c),
+        "the retired image is charged beside the current one while its reader lives"
+    );
+    assert_eq!(
+        scratch_files(&working_dir),
+        vec![".weaver-holds.silver.horizon.f0".to_string()],
+        "the take-over leaves neither the packing copy nor the retired image at a path"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.router.scratch_is_pinned()),
+        "the pin moved with the image it was taken on; the fresh image starts unpinned"
+    );
+
+    // The reader was handed offsets into the retired image, and reads the
+    // hold it was built over from it, as posted, after the take-over.
+    let posted = &volumes[0].1;
+    let mut reader = provider.open(0).expect("volume 0 is registered");
+    reader
+        .seek(std::io::SeekFrom::Start(a_start as u64))
+        .unwrap();
+    let mut read_back = vec![0u8; a_end - a_start];
+    reader
+        .read_exact(&mut read_back)
+        .expect("a pinned reader reads through the retired image");
+    assert_eq!(
+        read_back,
+        posted[a_start..a_end],
+        "every byte the reader serves after the take-over is the byte that was posted"
+    );
+
+    // The last pin dropping is what gives the retired image's bytes back —
+    // on the set's next publish, since nothing else runs on a drop. The
+    // reader carries a pin of its own, so both have to go.
+    drop(reader);
+    drop(provider);
+    submit_volume_article(&mut pipeline, job_id, &volumes, 1, 0).await;
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        router_scratch(&pipeline),
+        "with its reader gone the retired image is forgotten, and its charge with it"
+    );
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 2, 0).await;
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "the job must complete; sets = {:?}",
+        pipeline.direct_store.sets_for(job_id)
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        0,
+        "no scratch survives a commit"
+    );
+}
+
+/// The packed copy a pinned compaction writes is a spill like any other: it is
+/// admitted against the shared scratch total before it is written, and a
+/// refusal demotes the set — it does not write a second image the process has
+/// no room for, and it does not strand the half-written copy.
+#[tokio::test]
+async fn a_pinned_compaction_the_shared_total_cannot_admit_demotes_the_set() {
+    use crate::pipeline::direct_store::accountant::HoldsLimits;
+
+    let member_name = "Silver.Horizon.S01E19.mkv";
+    // Volume sizes 734, 734, 732: the third volume's held article is one
+    // byte shorter than the second's, which is the one byte of room the
+    // limit below leaves between admitting the third spill and refusing the
+    // packed copy of the second.
+    let payload: Vec<u8> = (0..2200u32).map(|index| (index % 167) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let (a_start, a_end) = article_extent(volumes[0].1.len(), 1, 2);
+    let (b_start, b_end) = article_extent(volumes[1].1.len(), 1, 2);
+    let (c_start, c_end) = article_extent(volumes[2].1.len(), 1, 2);
+    let (a, b, c) = (
+        (a_end - a_start) as u64,
+        (b_end - b_start) as u64,
+        (c_end - c_start) as u64,
+    );
+    assert!(
+        b > c,
+        "non-vacuity: the packed copy must be the spill that does not fit"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.direct_store.set_holds_budget(64);
+    pipeline.direct_store.set_holds_scratch_ceiling(a + b + 1);
+    // The third spill is admitted exactly; the packed copy of the live hold,
+    // asked for on top of it, is not.
+    pipeline.direct_store.set_holds_limits(HoldsLimits {
+        resident_bytes: u64::MAX,
+        scratch_bytes: a + b + c,
+        disk_reserve_bytes: 0,
+    });
+    let job_id = JobId(41058);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    let (_, _, provider) = pipeline
+        .direct_virtual_volume(NzbFileId {
+            job_id,
+            file_index: 0,
+        })
+        .expect("volume 0 is a live direct volume");
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.router.scratch_is_pinned()),
+        "non-vacuity: the compaction runs under a pin"
+    );
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    submit_volume_article(&mut pipeline, job_id, &volumes, 1, 1).await;
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        a + b,
+        "non-vacuity: the log stands at its ceiling before the third spill"
+    );
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 2, 1).await;
+    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        shape.contains("Demoted(HoldsScratchCeiling)"),
+        "a packed copy the shared total cannot admit demotes the set, got {shape}"
+    );
+    let mut left: Vec<String> = std::fs::read_dir(&working_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".weaver-holds."))
+        .collect();
+    left.sort();
+    assert!(
+        left.is_empty(),
+        "a demotion discards the image and writes no copy of it, got {left:?}"
+    );
+    assert_eq!(
+        pipeline.direct_store.holds_accountant().scratch_bytes(),
+        0,
+        "the demoted set's charge is withdrawn"
+    );
+    drop(provider);
 }
 
 #[tokio::test]
