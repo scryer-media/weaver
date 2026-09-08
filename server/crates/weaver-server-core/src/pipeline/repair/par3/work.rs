@@ -1,6 +1,7 @@
 //! Retained ownership and bounded dispatch for PAR3 blocking work.
 
 use super::*;
+use crate::pipeline::RepairWorkDone;
 use par3_rs::runtime::CancellationToken;
 use tokio::sync::mpsc;
 
@@ -25,7 +26,7 @@ impl Default for JobSlot {
     }
 }
 
-pub(in crate::pipeline) struct WorkDone {
+pub(crate) struct WorkDone {
     job_id: JobId,
     ticket: u64,
     source: SourceId,
@@ -40,24 +41,32 @@ pub(in crate::pipeline) struct Coordinator {
     jobs: BTreeMap<JobId, JobSlot>,
     in_flight: BTreeMap<u64, (JobId, CancellationToken)>,
     next_ticket: u64,
-    tx: mpsc::Sender<WorkDone>,
-    rx: mpsc::Receiver<WorkDone>,
+    tx: mpsc::Sender<RepairWorkDone>,
+    #[cfg(test)]
+    test_rx: Option<mpsc::Receiver<RepairWorkDone>>,
 }
 
+#[cfg(test)]
 impl Default for Coordinator {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel(1);
+        let mut coordinator = Self::new(tx);
+        coordinator.test_rx = Some(rx);
+        coordinator
+    }
+}
+
+impl Coordinator {
+    pub(super) fn new(tx: mpsc::Sender<RepairWorkDone>) -> Self {
         Self {
             jobs: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             next_ticket: 0,
             tx,
-            rx,
+            #[cfg(test)]
+            test_rx: None,
         }
     }
-}
-
-impl Coordinator {
     pub(in crate::pipeline) fn authenticated_set_count(&self, job_id: JobId) -> usize {
         self.jobs
             .get(&job_id)
@@ -139,20 +148,30 @@ impl Coordinator {
                 Err(error) => (None, Err(std::io::Error::other(error).into())),
             };
             let _ = tx
-                .send(WorkDone {
+                .send(RepairWorkDone::Par3(Box::new(WorkDone {
                     job_id,
                     ticket,
                     source,
                     runtime,
                     result,
-                })
+                })))
                 .await;
         });
         Ok(())
     }
 
-    pub(in crate::pipeline) async fn recv(&mut self) -> Option<WorkDone> {
-        self.rx.recv().await
+    #[cfg(test)]
+    async fn recv(&mut self) -> Option<WorkDone> {
+        match self
+            .test_rx
+            .as_mut()
+            .expect("test coordinator receiver")
+            .recv()
+            .await?
+        {
+            RepairWorkDone::Par3(done) => Some(*done),
+            RepairWorkDone::Par2(_) => panic!("PAR3 unit worker returned a PAR2 outcome"),
+        }
     }
 
     /// Return the live job to recheck, or discard a forgotten/stale result.

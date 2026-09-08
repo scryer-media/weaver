@@ -181,7 +181,9 @@ impl Pipeline {
         let path = state
             .working_dir
             .join(self.current_filename_for_file(job_id, file));
-        let coordinator = self.par3_runtime.get_or_insert_with(Default::default);
+        let coordinator = self.par3_runtime.get_or_insert_with(|| {
+            Box::new(work::Coordinator::new(self.repair_work_done_tx.clone()))
+        });
         if let Err(error) = coordinator
             .enqueue(job_id, SourceId(u64::from(file_id.file_index)), path)
             .and_then(|()| coordinator.dispatch())

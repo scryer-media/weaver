@@ -2,6 +2,14 @@ use super::*;
 
 const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
 
+#[test]
+fn repair_completion_envelope_preserves_par2_queue_payload_size() {
+    assert_eq!(
+        std::mem::size_of::<RepairWorkDone>(),
+        std::mem::size_of::<Par2AnalysisWorkDone>()
+    );
+}
+
 #[tokio::test]
 async fn par2_only_publications_create_no_par3_runtime_or_worker_queue() {
     let root = TempDir::new().unwrap();
@@ -56,14 +64,12 @@ async fn completion_waits_for_authenticated_carrier_worker_including_renamed_inp
             JobStatus::Downloading
         ));
         assert!(working.join(filename).exists());
-        let done = tokio::time::timeout(
-            Duration::from_secs(10),
-            pipeline.par3_runtime.as_mut().unwrap().recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        pipeline.handle_par3_work_done(done);
+        let done =
+            tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        pipeline.handle_repair_work_done(done).await;
         let coordinator = pipeline.par3_runtime.as_ref().unwrap();
         assert!(!coordinator.has_work(job_id));
         assert_eq!(coordinator.authenticated_set_count(job_id), 1);

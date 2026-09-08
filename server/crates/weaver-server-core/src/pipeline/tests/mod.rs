@@ -2593,7 +2593,7 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         PostRepair(crate::pipeline::DirectPostRepairWorkDone),
         Tolerated(crate::pipeline::DirectToleratedWorkDone),
         Demotion(crate::pipeline::DirectDemotionWorkDone),
-        Par2Analysis(crate::pipeline::Par2AnalysisWorkDone),
+        Repair(crate::pipeline::RepairWorkDone),
     }
     loop {
         pipeline.pump_decode_queue();
@@ -2614,8 +2614,8 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
             pipeline.handle_direct_demotion_done(done).await;
             handled_a_ticket = true;
         }
-        while let Ok(done) = pipeline.par2_analysis_done_rx.try_recv() {
-            pipeline.handle_par2_analysis_done(done).await;
+        while let Ok(done) = pipeline.repair_work_done_rx.try_recv() {
+            pipeline.handle_repair_work_done(done).await;
             handled_a_ticket = true;
         }
         // A ticket that had already finished by the time this loop looked is
@@ -2630,7 +2630,13 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         let post_repair_pending = !pipeline.direct_post_repair_in_flight.is_empty();
         let tolerated_pending = !pipeline.direct_tolerated_in_flight.is_empty();
         let demotion_pending = !pipeline.direct_demotion_in_flight.is_empty();
-        let par2_analysis_pending = !pipeline.par2_analysis_in_flight.is_empty();
+        let par2_analysis_pending = !pipeline.par2_analysis_in_flight.is_empty()
+            || pipeline.par3_runtime.as_ref().is_some_and(|coordinator| {
+                pipeline
+                    .jobs
+                    .keys()
+                    .any(|job_id| coordinator.has_work(*job_id))
+            });
         if !post_repair_pending && !tolerated_pending && !demotion_pending && !par2_analysis_pending
         {
             return;
@@ -2638,7 +2644,7 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         let post_repair_rx = &mut pipeline.direct_post_repair_done_rx;
         let tolerated_rx = &mut pipeline.direct_tolerated_done_rx;
         let demotion_rx = &mut pipeline.direct_demotion_done_rx;
-        let par2_analysis_rx = &mut pipeline.par2_analysis_done_rx;
+        let repair_rx = &mut pipeline.repair_work_done_rx;
         let ticket = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
                 done = post_repair_rx.recv(), if post_repair_pending => {
@@ -2650,8 +2656,8 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
                 done = demotion_rx.recv(), if demotion_pending => {
                     Ticket::Demotion(done.expect("direct demotion channel should stay open"))
                 }
-                done = par2_analysis_rx.recv(), if par2_analysis_pending => {
-                    Ticket::Par2Analysis(done.expect("PAR2 analysis completion channel should stay open"))
+                done = repair_rx.recv(), if par2_analysis_pending => {
+                    Ticket::Repair(done.expect("repair completion channel should stay open"))
                 }
             }
         })
@@ -2661,7 +2667,7 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
             Ticket::PostRepair(done) => pipeline.handle_direct_post_repair_done(done),
             Ticket::Tolerated(done) => pipeline.handle_direct_tolerated_done(done).await,
             Ticket::Demotion(done) => pipeline.handle_direct_demotion_done(done).await,
-            Ticket::Par2Analysis(done) => pipeline.handle_par2_analysis_done(done).await,
+            Ticket::Repair(done) => pipeline.handle_repair_work_done(done).await,
         }
     }
 }
@@ -2676,14 +2682,12 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
 /// behind rather than on the state a fully drained queue eventually reaches.
 async fn settle_par2_analysis_work(pipeline: &mut Pipeline) {
     while !pipeline.par2_analysis_in_flight.is_empty() {
-        let done = tokio::time::timeout(
-            Duration::from_secs(10),
-            pipeline.par2_analysis_done_rx.recv(),
-        )
-        .await
-        .expect("a detached PAR2 damaged-path analysis should finish")
-        .expect("the PAR2 analysis completion channel should stay open");
-        pipeline.handle_par2_analysis_done(done).await;
+        let done =
+            tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
+                .await
+                .expect("a detached PAR2 damaged-path analysis should finish")
+                .expect("the PAR2 analysis completion channel should stay open");
+        pipeline.handle_repair_work_done(done).await;
         if let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
             pipeline.check_job_completion(queued_job).await;
         }

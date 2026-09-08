@@ -17,7 +17,10 @@ Carrier scanning now uses detached tickets: one live carrier worker, bounded
 job/candidate queues, retained ownership returned with the result, and stale
 ticket rejection after a job is forgotten or recreated. Cancelled workers keep
 their capacity until they return. Completion waits for outstanding discovery.
-The coordinator and its completion channel are allocated only on PAR3 admission.
+The coordinator is allocated only on PAR3 admission. Both engines return native
+outcomes through the existing repair completion channel, with one format dispatch
+per finished operation. PAR3 does not add another actor receive branch; only
+PAR3 results box their larger retained state.
 
 Still pending: incremental decode-to-publication wiring,
 repair/download gating, direct-volume adapters, positioned verification, embedded
@@ -53,6 +56,13 @@ tests with eight test workers and 13 existing skips. An earlier full-concurrency
 run reported one leak in the existing disabled-script runner test; it passed
 in isolation and in the full rerun. The strict 500 ms leak-failure policy remains
 unchanged. This is not evidence of a PAR2 throughput result.
+
+Shared-channel validation: 50 targeted PAR2/PAR3 regressions, the inline queue
+payload-size regression, all-target/all-feature Clippy, and all three doctests
+pass. The final isolated full sweep reports 3,783 passed and 13 existing skips.
+A preceding sweep overlapped Cargo work and reported a leak in a pure NNTP
+sniffer test; the final sweep ran without concurrent Cargo work and no leak
+checks were relaxed. The cause of the intermittent leak reports is unconfirmed.
 
 ## Decisions
 

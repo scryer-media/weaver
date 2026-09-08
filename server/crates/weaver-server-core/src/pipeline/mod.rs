@@ -1795,6 +1795,17 @@ pub(super) struct Par2AnalysisWorkDone {
     pub(super) outcome: completion::finalize::check::Par2AnalysisTicketOutcome,
 }
 
+/// Native outcomes share the existing repair completion queue. Dispatch occurs
+/// once per operation; block reads and native evidence stay format-specific.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keep the existing PAR2 result inline without adding a per-operation allocation"
+)]
+pub(super) enum RepairWorkDone {
+    Par2(Par2AnalysisWorkDone),
+    Par3(Box<repair::par3::work::WorkDone>),
+}
+
 /// One demoted set's reconstruction sweep, detached from the actor.
 ///
 /// The sweep reads every volume of the set out of the overlay and writes it to
@@ -3129,8 +3140,8 @@ pub struct Pipeline {
             Result<par2_rs::Par2RepairOutcome, String>,
         ),
     >,
-    pub(super) par2_analysis_done_tx: mpsc::Sender<Par2AnalysisWorkDone>,
-    pub(super) par2_analysis_done_rx: mpsc::Receiver<Par2AnalysisWorkDone>,
+    pub(super) repair_work_done_tx: mpsc::Sender<RepairWorkDone>,
+    pub(super) repair_work_done_rx: mpsc::Receiver<RepairWorkDone>,
     /// Monotonic fence for demotion sweeps detached from the actor.
     pub(super) next_direct_demotion_work_id: u64,
     /// The demotion sweeps a job has outstanding, keyed by the set each one

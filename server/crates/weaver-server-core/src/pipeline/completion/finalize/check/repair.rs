@@ -1043,7 +1043,7 @@ impl Pipeline {
             "par2 damaged-path analysis started"
         );
 
-        let done_tx = self.par2_analysis_done_tx.clone();
+        let done_tx = self.repair_work_done_tx.clone();
         tokio::spawn(async move {
             let joined = tokio::task::spawn_blocking(move || run_par2_analysis_work(plan)).await;
             let outcome = joined.unwrap_or_else(|error| {
@@ -1052,12 +1052,12 @@ impl Pipeline {
                 ))
             });
             let _ = done_tx
-                .send(Par2AnalysisWorkDone {
+                .send(RepairWorkDone::Par2(Par2AnalysisWorkDone {
                     job_id,
                     work_id,
                     recovery_set_id: set_id,
                     outcome,
-                })
+                }))
                 .await;
         });
         Ok(())
