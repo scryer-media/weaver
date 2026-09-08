@@ -354,6 +354,7 @@ type process struct {
 	name    string
 	command *exec.Cmd
 	log     *os.File
+	done    chan struct{}
 }
 
 // start launches one process and waits for it to answer its own health probe.
@@ -375,7 +376,11 @@ func start(ctx context.Context, config processConfig) (*process, error) {
 		logFile.Close()
 		return nil, fmt.Errorf("start %s: %w", config.name, err)
 	}
-	running := &process{name: config.name, command: command, log: logFile}
+	running := &process{name: config.name, command: command, log: logFile, done: make(chan struct{})}
+	go func() {
+		_ = command.Wait()
+		close(running.done)
+	}()
 	if err := waitHealthy(ctx, config, running); err != nil {
 		_ = running.stop()
 		return nil, err
@@ -407,40 +412,38 @@ func waitHealthy(ctx context.Context, config processConfig, running *process) er
 }
 
 func (p *process) exited() (bool, string) {
-	if p.command.ProcessState != nil {
-		return true, p.command.ProcessState.String()
-	}
-	// Signal 0 is not portable, so ask the OS whether the child has been
-	// reaped instead. Wait is not used here because it would consume the
-	// process; a non-blocking check is all that is wanted.
 	if p.command.Process == nil {
 		return true, "not started"
 	}
-	return false, ""
+	select {
+	case <-p.done:
+		// The waiter publishes ProcessState before closing done.
+		return true, p.command.ProcessState.String()
+	default:
+		return false, ""
+	}
 }
 
 // stop asks the process to exit and escalates if it will not. Windows has no
 // interrupt to send a child, so there it goes straight to a kill.
 func (p *process) stop() error {
 	defer p.log.Close()
-	if p.command.Process == nil {
+	if exited, _ := p.exited(); exited {
 		return nil
 	}
-	done := make(chan error, 1)
-	go func() { done <- p.command.Wait() }()
 	if runtime.GOOS != "windows" {
 		_ = p.command.Process.Signal(os.Interrupt)
 		select {
-		case <-done:
+		case <-p.done:
 			return nil
 		case <-time.After(5 * time.Second):
 		}
 	}
-	if err := p.command.Process.Kill(); err != nil {
+	if err := p.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return fmt.Errorf("kill %s: %w", p.name, err)
 	}
 	select {
-	case <-done:
+	case <-p.done:
 	case <-time.After(5 * time.Second):
 		return fmt.Errorf("%s did not exit after a kill", p.name)
 	}
