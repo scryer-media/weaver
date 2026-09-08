@@ -348,6 +348,15 @@ ZIP64 sizes and offsets remain 64-bit through seeking and extraction. A chase's
 staged output is installed only after verification and repair settle. Repair
 that may change consumed bytes discards that output and uses the repaired archive.
 
+TAR, compressed TAR, gzip, bzip2, XZ, Zstandard, Brotli, and DEFLATE use shared
+sequential decoders during download and at completion. Sequential chases start
+without knowing the archive length: gaps wait for committed bytes and EOF comes
+from the completed final part. Compressed TAR consumes its outer trailer before
+accepting output. Plain split sets join through the same reader after their
+ordered topology is known. All use the existing cancellation, resource budgets,
+staging, and PAR2 invalidation lifecycle. A verified joined file produced by PAR2
+takes precedence over a chase of its source parts.
+
 ### Engine Boundaries Stay Explicit
 
 Engine crates should remain sharp and focused:

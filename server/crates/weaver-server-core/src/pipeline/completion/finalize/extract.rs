@@ -6,6 +6,8 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub(in crate::pipeline) mod sequential;
+
 static XZ_MT_DECODER_PERMIT: Mutex<()> = Mutex::new(());
 
 enum FilesystemXzDecoder<R: std::io::Read> {
@@ -844,9 +846,15 @@ fn extract_tar(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    extract_tar_from_reader(file, root, budget, event_tx, job_id, set_name)
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Tar,
+        archive_path,
+        root,
+        budget,
+        event_tx,
+        job_id,
+        set_name,
+    })
 }
 
 fn extract_tar_gz(
@@ -857,11 +865,15 @@ fn extract_tar_gz(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar.gz: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let gz = flate2::read::GzDecoder::new(file);
-    extract_tar_from_reader(gz, root, budget, event_tx, job_id, set_name)
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::TarGz,
+        archive_path,
+        root,
+        budget,
+        event_tx,
+        job_id,
+        set_name,
+    })
 }
 
 fn extract_tar_bz2(
@@ -872,11 +884,15 @@ fn extract_tar_bz2(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar.bz2: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let bz2 = bzip2::read::BzDecoder::new(file);
-    extract_tar_from_reader(bz2, root, budget, event_tx, job_id, set_name)
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::TarBz2,
+        archive_path,
+        root,
+        budget,
+        event_tx,
+        job_id,
+        set_name,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -888,8 +904,15 @@ fn extract_tar_xz(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let xz = open_sequential_xz_decoder(archive_path, budget)?;
-    extract_tar_from_reader(xz, root, budget, event_tx, job_id, set_name)
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::TarXz,
+        archive_path,
+        root,
+        budget,
+        event_tx,
+        job_id,
+        set_name,
+    })
 }
 
 fn extract_tar_from_reader<R: std::io::Read>(
@@ -984,43 +1007,15 @@ fn extract_gz(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open gz: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let mut gz = flate2::read::GzDecoder::new(file);
-
-    // Output filename: strip .gz extension
-    let archive_name = archive_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let output_name = archive_name
-        .strip_suffix(".gz")
-        .or_else(|| archive_name.strip_suffix(".GZ"))
-        .unwrap_or(&archive_name);
-    let safe_path = root
-        .validate_relative_path(output_name)
-        .map_err(|error| budget.reject_unsafe_path(error))?;
-
-    let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Gz,
+        archive_path,
+        root,
+        budget,
+        event_tx,
         job_id,
-        set_name: set_name.to_string(),
-        member: output_name.to_string(),
-    });
-
-    let mut outfile = buffered_extraction_output(root.create_file(&safe_path, budget)?);
-    let copied = std::io::copy(&mut gz, &mut outfile);
-    let bytes_written = copied
-        .and_then(|bytes| outfile.flush().map(|()| bytes))
-        .map_err(|e| format!("failed to decompress gz: {e}"))?;
-
-    let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
-        job_id,
-        set_name: set_name.to_string(),
-        member: output_name.to_string(),
-    });
-    tracing::info!(job_id = job_id.0, member = %output_name, bytes_written, "gz decompressed");
-
-    Ok(vec![output_name.to_string()])
+        set_name,
+    })
 }
 
 fn strip_ascii_case_suffix<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
@@ -1093,20 +1088,15 @@ fn extract_brotli(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open br: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let reader = brotli::Decompressor::new(file, 4096);
-    extract_single_stream_to_file(
-        reader,
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Brotli,
         archive_path,
         root,
         budget,
-        &[".br"],
-        "br",
         event_tx,
         job_id,
         set_name,
-    )
+    })
 }
 
 fn extract_deflate(
@@ -1117,21 +1107,15 @@ fn extract_deflate(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open deflate: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let reader = flate2::read::DeflateDecoder::new(file);
-    extract_single_stream_to_file(
-        reader,
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Deflate,
         archive_path,
         root,
         budget,
-        &[".deflate"],
-        "deflate",
         event_tx,
         job_id,
         set_name,
-    )
+    })
 }
 
 fn extract_zstd(
@@ -1142,27 +1126,15 @@ fn extract_zstd(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open zstd: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let mut reader =
-        zstd::stream::read::Decoder::new(file).map_err(|e| format!("failed to open zstd: {e}"))?;
-    let max_memory_bytes = budget.max_memory_bytes().max(1024);
-    let window_log = (63 - max_memory_bytes.leading_zeros()).clamp(10, 31);
-    reader
-        .window_log_max(window_log)
-        .map_err(|e| format!("failed to apply zstd memory limit: {e}"))?;
-    extract_single_stream_to_file(
-        reader,
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Zstd,
         archive_path,
         root,
         budget,
-        &[".zstd", ".zst"],
-        "zstd",
         event_tx,
         job_id,
         set_name,
-    )
+    })
 }
 
 fn extract_bzip2(
@@ -1173,20 +1145,15 @@ fn extract_bzip2(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open bz2: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let reader = bzip2::read::BzDecoder::new(file);
-    extract_single_stream_to_file(
-        reader,
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Bzip2,
         archive_path,
         root,
         budget,
-        &[".bz2"],
-        "bz2",
         event_tx,
         job_id,
         set_name,
-    )
+    })
 }
 
 fn extract_xz(
@@ -1210,18 +1177,6 @@ fn extract_xz(
         job_id,
         set_name,
     )
-}
-
-fn open_sequential_xz_decoder(
-    archive_path: &Path,
-    budget: &Arc<JobExtractionBudget>,
-) -> Result<impl std::io::Read, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let memory_limit = crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES.min(budget.max_memory_bytes());
-    crate::ingest::xz_multistream_decoder(file, memory_limit)
-        .map_err(|error| format!("failed to open xz decoder: {error}"))
 }
 
 fn open_filesystem_xz_decoder(
@@ -2014,6 +1969,11 @@ impl Pipeline {
         let joined_output_already_present = matches!(kind, SimpleArchiveKind::Split)
             .then(|| self.present_split_join_output(job_id, set_name, &file_paths))
             .flatten();
+        if joined_output_already_present.is_some() {
+            // PAR2 may protect the joined file instead of its posted parts.
+            // A chase over those parts must never replace the verified join.
+            self.taint_direct_unpack_set(job_id, set_name);
+        }
 
         let output_dir = self.extraction_staging_dir(job_id);
         let budget = self.extraction_budget(job_id, &output_dir)?;
@@ -2026,11 +1986,7 @@ impl Pipeline {
         let pp_pool = self.pp_pool.clone();
         let xz_worker_threads = pp_pool.current_num_threads();
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
-        let disposition = if matches!(kind, SimpleArchiveKind::Zip) {
-            self.take_direct_unpack_disposition(job_id, set_name)
-        } else {
-            crate::pipeline::direct_unpack::wiring::ChaseDisposition::None
-        };
+        let disposition = self.take_direct_unpack_disposition(job_id, set_name);
         let staging_for_install = output_dir.clone();
         let phase_counters_for_install = Arc::clone(&phase_counters);
 

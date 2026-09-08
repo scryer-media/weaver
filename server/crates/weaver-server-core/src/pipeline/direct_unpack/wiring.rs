@@ -21,6 +21,10 @@
 //! while the decoder parks on missing payload ranges. Completion and PAR2
 //! still decide whether the staged output can be installed.
 //!
+//! TAR and single-stream compression start with committed opening bytes and
+//! discover EOF from part completion. Plain split files use the same sequential
+//! reader once topology supplies their ordered part list.
+//!
 //! Admission is retried, not latched, while the answer is merely "not yet" — no
 //! bytes on part one, no topology. It latches permanently on a real refusal, so
 //! a malformed archive is examined once and never again.
@@ -63,6 +67,7 @@ const CHASE_BUFFER_BYTES: usize = 128 * 1024;
 enum ChaseFormat {
     SevenZip { end_header_bytes: u64 },
     Zip,
+    Sequential(crate::pipeline::completion::finalize::SimpleArchiveKind),
 }
 
 /// Why a set will never be chased.
@@ -337,16 +342,6 @@ pub(in crate::pipeline) enum ChaseDisposition {
 }
 
 /// Per-pipeline direct-unpack state.
-///
-/// # A note on single-file 7z sets
-///
-/// Their topology is only built once the archive is fully downloaded, so a
-/// chase admitted for one has nothing left to overlap. It is allowed rather
-/// than special-cased: it costs one decode that the conventional path would
-/// have done anyway, and it keeps the admission rule uniform. Making single-file
-/// sets genuinely early would need a part list derived from the NZB's
-/// classification instead of the topology, which is a larger change than this
-/// work package.
 #[derive(Default)]
 pub(crate) struct DirectUnpackRuntime {
     /// Resolved once at pipeline construction and never re-read, so a set
@@ -356,13 +351,13 @@ pub(crate) struct DirectUnpackRuntime {
     settings: Option<DirectUnpackSettings>,
     /// Sets currently being chased.
     armed: HashMap<(JobId, String), ArmedSet>,
-    /// Files that are a bare `.7z` and have not been offered to arming yet.
+    /// Single-file archives that have not been offered to arming yet.
     ///
     /// A split set arms off its topology, which appears when a part completes.
     /// A single file has no topology until the whole thing has landed, so its
     /// arming has to ride the commit path instead — and this set is what keeps
     /// that ride free: when it is empty, which is every job that carries no
-    /// unsplit 7z, the hot path's added cost is one `is_empty`.
+    /// supported single-file archives, the hot path's added cost is one `is_empty`.
     pending_single_arm: HashSet<crate::jobs::ids::NzbFileId>,
     /// Sets held parked through a PAR2 repair rather than tainted, because
     /// every byte their decoder had already consumed was vouched for by the
@@ -492,7 +487,29 @@ impl Pipeline {
         if paths.is_empty() {
             return;
         }
-        self.arm_direct_unpack_with_paths(job_id, set_name, paths);
+        let is_split = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.assembly.archive_topology_for(set_name))
+            .is_some_and(|topology| {
+                matches!(
+                    topology.archive_type,
+                    crate::jobs::assembly::ArchiveType::Split
+                )
+            });
+        if is_split {
+            self.arm_prepared_direct_unpack(
+                job_id,
+                set_name,
+                paths,
+                None,
+                ChaseFormat::Sequential(
+                    crate::pipeline::completion::finalize::SimpleArchiveKind::Split,
+                ),
+            );
+        } else {
+            self.arm_direct_unpack_with_paths(job_id, set_name, paths);
+        }
     }
 
     /// Arm a set over an explicit ordered part list.
@@ -554,7 +571,7 @@ impl Pipeline {
             job_id,
             set_name,
             paths,
-            total_len,
+            Some(total_len),
             ChaseFormat::SevenZip {
                 end_header_bytes: header.next_header_size,
             },
@@ -566,7 +583,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
         paths: Vec<PathBuf>,
-        total_len: u64,
+        total_len: Option<u64>,
         format: ChaseFormat,
     ) {
         // A paused worker still owns this staging path until it is joined and
@@ -581,7 +598,7 @@ impl Pipeline {
         }
         let end_header_bytes = match format {
             ChaseFormat::SevenZip { end_header_bytes } => end_header_bytes,
-            ChaseFormat::Zip => 0,
+            ChaseFormat::Zip | ChaseFormat::Sequential(_) => 0,
         };
 
         // Admission control, and it is a liveness requirement rather than a
@@ -657,7 +674,9 @@ impl Pipeline {
         }
 
         let coverage = Arc::new(SetCoverage::new(paths.len()));
-        coverage.set_total_len(total_len);
+        if let Some(total_len) = total_len {
+            coverage.set_total_len(total_len);
+        }
 
         // Seed every part length already known, and build the filename lookup
         // the watermark hook uses. A length that is not known yet is not
@@ -684,7 +703,7 @@ impl Pipeline {
             if let Some(floor) = self.direct_unpack_progress_floor(job_id, path) {
                 coverage.advance_watermark(index, floor);
             }
-            if matches!(format, ChaseFormat::Zip)
+            if !matches!(format, ChaseFormat::SevenZip { .. })
                 && let Some(file_id) = self.direct_unpack_file_id_for_part(job_id, path)
                 && let Some(file) = self
                     .jobs
@@ -770,15 +789,18 @@ impl Pipeline {
         info!(
             job_id = job_id.0,
             set_name,
-            total_bytes = total_len,
+            total_bytes = ?total_len,
             "direct unpack armed"
         );
 
         let tail_hint = match format {
             ChaseFormat::Zip => 8 * 1024 * 1024,
             ChaseFormat::SevenZip { end_header_bytes } => end_header_bytes,
+            ChaseFormat::Sequential(_) => return,
         };
-        self.boost_direct_unpack_tail_window(job_id, &boost_paths, total_len, tail_hint);
+        if let Some(total_len) = total_len {
+            self.boost_direct_unpack_tail_window(job_id, &boost_paths, total_len, tail_hint);
+        }
     }
 
     /// Pull the archive's tail forward in the download queue.
@@ -907,18 +929,19 @@ impl Pipeline {
         let Some(file_asm) = state.assembly.file(file_id) else {
             return;
         };
-        if matches!(
-            self.classified_role_for_file(job_id, file_asm),
-            weaver_model::files::FileRole::ZipArchive
-        ) {
+        let role = self.classified_role_for_file(job_id, file_asm);
+        if !matches!(role, weaver_model::files::FileRole::SplitFile { .. })
+            && crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(&role).is_some()
+        {
             self.try_arm_single_archive(file_id, SIGNATURE_HEADER_LEN);
             return;
         }
-        // Split 7z sets need the topology's ordered part list.
+        // Split sets need the topology's ordered part list.
         if !matches!(
             self.classified_role_for_file(job_id, file_asm),
             weaver_model::files::FileRole::SevenZipArchive
                 | weaver_model::files::FileRole::SevenZipSplit { .. }
+                | weaver_model::files::FileRole::SplitFile { .. }
         ) {
             return;
         }
@@ -938,11 +961,13 @@ impl Pipeline {
             return;
         }
         for (file_index, file) in spec.files.iter().enumerate() {
-            if matches!(
-                file.role,
-                weaver_model::files::FileRole::SevenZipArchive
-                    | weaver_model::files::FileRole::ZipArchive
-            ) {
+            if matches!(file.role, weaver_model::files::FileRole::SevenZipArchive)
+                || (!matches!(file.role, weaver_model::files::FileRole::SplitFile { .. })
+                    && crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(
+                        &file.role,
+                    )
+                    .is_some())
+            {
                 self.direct_unpack
                     .pending_single_arm
                     .insert(crate::jobs::ids::NzbFileId {
@@ -977,11 +1002,12 @@ impl Pipeline {
         // set that turns out to be split after all. Either way it is no longer
         // this path's business.
         let role = self.classified_role_for_file(job_id, file_asm);
-        if !matches!(
-            role,
-            weaver_model::files::FileRole::SevenZipArchive
-                | weaver_model::files::FileRole::ZipArchive
-        ) {
+        let simple_kind =
+            crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(&role);
+        if matches!(role, weaver_model::files::FileRole::SplitFile { .. })
+            || (simple_kind.is_none()
+                && !matches!(role, weaver_model::files::FileRole::SevenZipArchive))
+        {
             self.direct_unpack.pending_single_arm.remove(&file_id);
             return;
         }
@@ -1018,8 +1044,16 @@ impl Pipeline {
                 job_id,
                 &set_name,
                 vec![path],
-                total_len,
+                Some(total_len),
                 ChaseFormat::Zip,
+            );
+        } else if let Some(kind) = simple_kind {
+            self.arm_prepared_direct_unpack(
+                job_id,
+                &set_name,
+                vec![path],
+                None,
+                ChaseFormat::Sequential(kind),
             );
         } else {
             self.arm_direct_unpack_with_paths(job_id, &set_name, vec![path]);
@@ -1204,6 +1238,56 @@ impl Pipeline {
                 );
                 let started_at = Instant::now();
                 let outcome = (|| {
+                    if let ChaseFormat::Sequential(kind) = format {
+                        use crate::pipeline::completion::finalize::extract::sequential::{
+                            SequentialExtractionContext, decoder_memory_bytes,
+                            extract_sequential_stream,
+                        };
+                        let _memory_permit = budget.reserve_memory_wait(decoder_memory_bytes(
+                            kind,
+                            budget.max_memory_bytes(),
+                        ))?;
+                        let reader =
+                            GatedSplitReader::open_sequential(&paths, Arc::clone(&coverage))
+                                .map_err(|error| {
+                                    format!(
+                                        "failed to open sequential direct-unpack reader: {error}"
+                                    )
+                                })?;
+                        let (silent_events, _) = tokio::sync::broadcast::channel(1);
+                        let context = SequentialExtractionContext {
+                            kind,
+                            archive_path: &paths[0],
+                            root: &root,
+                            budget: &budget,
+                            event_tx: &silent_events,
+                            job_id,
+                            set_name: &set_name,
+                        };
+                        let extracted = extract_sequential_stream(
+                            std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader),
+                            &context,
+                        )?;
+                        let mut bytes = 0u64;
+                        for name in &extracted {
+                            let metadata =
+                                std::fs::metadata(output_dir.join(name)).map_err(|error| {
+                                    format!("failed to account extracted output: {error}")
+                                })?;
+                            if metadata.is_file() {
+                                bytes = bytes.checked_add(metadata.len()).ok_or_else(|| {
+                                    "extracted output length overflow".to_string()
+                                })?;
+                            }
+                        }
+                        counters.total_bytes.store(bytes, Ordering::Relaxed);
+                        counters.completed_bytes.store(bytes, Ordering::Relaxed);
+                        return Ok(FullSetExtractionOutcome {
+                            extracted,
+                            failed: Vec::new(),
+                            selected_password: None,
+                        });
+                    }
                     if matches!(format, ChaseFormat::Zip) {
                         let _memory_permit = budget.reserve_memory_wait(8 * 1024 * 1024)?;
                         let reader = GatedSplitReader::open(&paths, Arc::clone(&coverage))
@@ -1300,7 +1384,7 @@ impl Pipeline {
         })
     }
 
-    pub(in crate::pipeline) fn direct_unpack_wants_zip_ranges(
+    pub(in crate::pipeline) fn direct_unpack_wants_committed_ranges(
         &self,
         file_id: crate::jobs::ids::NzbFileId,
     ) -> bool {
@@ -1314,27 +1398,28 @@ impl Pipeline {
         else {
             return false;
         };
-        matches!(
-            self.classified_role_for_file(file_id.job_id, file),
-            weaver_model::files::FileRole::ZipArchive
-        ) && (self.direct_unpack.pending_single_arm.contains(&file_id)
-            || self
-                .direct_unpack
-                .watermark_targets
-                .get(&file_id.job_id)
-                .is_some_and(|targets| {
-                    targets.contains_key(&self.current_filename_for_file(file_id.job_id, file))
-                }))
+        crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(
+            &self.classified_role_for_file(file_id.job_id, file),
+        )
+        .is_some()
+            && (self.direct_unpack.pending_single_arm.contains(&file_id)
+                || self
+                    .direct_unpack
+                    .watermark_targets
+                    .get(&file_id.job_id)
+                    .is_some_and(|targets| {
+                        targets.contains_key(&self.current_filename_for_file(file_id.job_id, file))
+                    }))
     }
 
-    pub(in crate::pipeline) fn direct_unpack_note_zip_range(
+    pub(in crate::pipeline) fn direct_unpack_note_range(
         &mut self,
         file_id: crate::jobs::ids::NzbFileId,
         filename: &str,
         offset: u64,
         len: u64,
     ) {
-        if !self.direct_unpack_wants_zip_ranges(file_id) {
+        if !self.direct_unpack_wants_committed_ranges(file_id) {
             return;
         }
         if offset == 0
@@ -1344,6 +1429,10 @@ impl Pipeline {
                 .jobs
                 .get(&file_id.job_id)
                 .and_then(|s| s.assembly.file(file_id))
+            && matches!(
+                self.classified_role_for_file(file_id.job_id, file),
+                weaver_model::files::FileRole::ZipArchive
+            )
         {
             self.boost_direct_unpack_tail_window(
                 file_id.job_id,

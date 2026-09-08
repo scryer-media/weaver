@@ -51,6 +51,9 @@ pub struct GatedSplitReader {
     parts: Vec<Part>,
     coverage: Arc<SetCoverage>,
     position: u64,
+    /// Sequential formats discover EOF from completed parts, without an
+    /// archive-wide length declaration or a seek to the tail.
+    sequential: bool,
     /// Cached archive total. Set once on the coverage and never changed, so one
     /// successful read of it is good for the reader's lifetime — which keeps
     /// every subsequent read and seek off the shared lock. An abort still
@@ -95,8 +98,20 @@ impl GatedSplitReader {
                 .collect(),
             coverage,
             position: 0,
+            sequential: false,
             total_len: None,
         })
+    }
+
+    /// Read a sequential archive before its final size is known. Missing
+    /// bytes still park, and only a completed final part supplies EOF.
+    pub fn open_sequential(
+        paths: &[impl AsRef<Path>],
+        coverage: Arc<SetCoverage>,
+    ) -> io::Result<impl Read> {
+        let mut reader = Self::open(paths, coverage)?;
+        reader.sequential = true;
+        Ok(reader)
     }
 
     /// Current offset in the concatenated archive stream.
@@ -129,7 +144,11 @@ impl GatedSplitReader {
     /// past the end of the last part. The last element is the part's rewrite
     /// count from the same answer, for [`Self::file_for`].
     fn locate(&mut self, position: u64) -> io::Result<Option<(usize, u64, u64, u64)>> {
-        let total = self.total_len()?;
+        let total = if self.sequential {
+            u64::MAX
+        } else {
+            self.total_len()?
+        };
         let mut start = 0u64;
 
         for index in 0..self.parts.len() {
@@ -202,7 +221,11 @@ impl Read for GatedSplitReader {
             return Ok(0);
         }
 
-        let total = self.total_len()?;
+        let total = if self.sequential {
+            u64::MAX
+        } else {
+            self.total_len()?
+        };
         if self.position >= total {
             return Ok(0);
         }
