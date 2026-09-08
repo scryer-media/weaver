@@ -55,7 +55,7 @@ pub struct Config {
     /// RAR direct-store routing. Absent means "every default".
     #[serde(default)]
     pub direct_store: Option<DirectStoreOverrides>,
-    /// 7z direct unpack. Absent means "every default".
+    /// 7z and ZIP/ZIP64 direct unpack. Absent means "every default".
     #[serde(default)]
     pub direct_unpack: Option<DirectUnpackOverrides>,
     /// Naming policy for the files a finished job delivers. Absent means
@@ -244,7 +244,7 @@ pub struct DirectStoreOverrides {
     pub holds_disk_reserve_bytes: Option<u64>,
 }
 
-/// Operator-facing switches for 7z direct unpack (`[direct_unpack]`).
+/// Operator-facing switches for 7z and ZIP/ZIP64 direct unpack (`[direct_unpack]`).
 ///
 /// Same precedence as `[direct_store]` — **environment over config over
 /// default** — resolved in `pipeline::direct_unpack::DirectUnpackSettings::resolve`;
@@ -254,7 +254,7 @@ pub struct DirectStoreOverrides {
 /// filled one and an older config file all mean "use the defaults".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirectUnpackOverrides {
-    /// Begin extracting a 7z set while its parts are still downloading, instead
+    /// Begin extracting a 7z or ZIP set while its parts are still downloading, instead
     /// of waiting for the whole set to land.
     ///
     /// **Defaults to on.** Set to `false` here, or export the environment

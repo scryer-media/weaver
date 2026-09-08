@@ -258,7 +258,11 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm
+          sudo apt-get install -y nasm par2 xz-utils zip
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: e2e/go.sum
       - name: Restore sccache directory
         id: rust-test-sccache-restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -297,6 +301,23 @@ jobs:
           sccache --zero-stats || true
       - name: Run Rust tests
         run: cargo nextest run --workspace --locked --no-fail-fast
+      - name: Build the archive e2e binary
+        run: cargo build --locked -p weaver
+      - name: Prove direct unpack and PAR2 recovery for every sequential format
+        working-directory: e2e
+        env:
+          WEAVER_DIRECT_UNPACK_E2E_BIN: ${{ github.workspace }}/target/debug/weaver
+          TMPDIR: ${{ runner.temp }}
+        run: go test ./internal/weaver -run '^TestDirectUnpackE2E$' -count=1 -v -timeout 10m
+      - name: Upload archive e2e evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: direct-unpack-evidence
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/weaver-direct-unpack-e2e-*/weaver.log
+            ${{ runner.temp }}/weaver-direct-unpack-e2e-*/fixtures/*/evidence.json
       - name: Show sccache stats
         if: always()
         run: |

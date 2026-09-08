@@ -942,7 +942,7 @@ impl NntpPool {
     /// is a 5–10 s transport or capacity blip, and a `ConsecutiveFailures` /
     /// `FailureRatio` disable is an outage that heals by itself; in both cases
     /// waiting is far cheaper than spilling the whole queue onto a paid
-    /// backfill account, which is also how SABnzbd and NZBGet behave. Note
+    /// backfill account. Note
     /// this is an *ordering* gate only — disabled servers must never enter a
     /// request's exclude set, or exhaustion booking would declare the segment
     /// missing before backfill was ever tried.

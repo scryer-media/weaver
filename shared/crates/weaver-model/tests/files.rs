@@ -4,7 +4,7 @@ use weaver_model::files::{
 };
 
 #[test]
-fn sanitize_download_filename_replaces_nzbget_reserved_chars() {
+fn sanitize_download_filename_replaces_reserved_chars() {
     assert_eq!(
         sanitize_download_filename("Fixture:<Payload>\"*.mkv"),
         "Fixture__Payload___.mkv"
@@ -101,7 +101,7 @@ fn unique_download_filenames_disambiguates_windows_device_collisions() {
 }
 
 #[test]
-fn unique_download_filenames_uses_nzbget_style_extension_splits() {
+fn unique_download_filenames_preserves_compound_extensions() {
     assert_eq!(
         unique_download_filenames([
             "Show.part01.rar",
@@ -147,7 +147,7 @@ fn unique_download_filenames_preserves_long_par2_recovery_suffix() {
 }
 
 #[test]
-fn file_role_ignores_nzbget_duplicate_marker() {
+fn file_role_ignores_duplicate_marker() {
     assert_eq!(
         FileRole::from_filename("Show.part02.duplicate1.rar"),
         FileRole::RarVolume { volume_number: 1 }

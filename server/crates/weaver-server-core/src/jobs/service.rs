@@ -917,6 +917,7 @@ impl Pipeline {
                     | weaver_model::files::FileRole::SplitFile { .. }
                     | weaver_model::files::FileRole::SevenZipArchive
                     | weaver_model::files::FileRole::SevenZipSplit { .. }
+                    | weaver_model::files::FileRole::ZipArchive
             )
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
             .flatten();
@@ -939,6 +940,7 @@ impl Pipeline {
                 file_spec.role,
                 weaver_model::files::FileRole::SevenZipArchive
                     | weaver_model::files::FileRole::SevenZipSplit { .. }
+                    | weaver_model::files::FileRole::ZipArchive
             )
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).max())
             .flatten();

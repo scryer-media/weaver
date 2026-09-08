@@ -13,6 +13,8 @@ use crate::pipeline::direct_unpack::settings::{DirectUnpackGate, DirectUnpackSet
 use crate::pipeline::direct_unpack::start_header::MAGIC;
 use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
 
+mod repair_guards;
+
 /// Turn the feature on for one pipeline, the way config would.
 fn enable_direct_unpack(pipeline: &mut Pipeline) {
     pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
@@ -2232,7 +2234,7 @@ async fn a_late_par2_registration_leaves_the_chase_able_to_resolve_its_parts() {
         "the topology must survive a registration that lands after the data does"
     );
     assert!(
-        pipeline.sevenz_set_part_paths(job_id, set_name).is_ok(),
+        pipeline.archive_set_part_paths(job_id, set_name).is_ok(),
         "and the chase must still be able to resolve its parts"
     );
 

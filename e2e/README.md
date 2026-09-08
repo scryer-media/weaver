@@ -69,6 +69,13 @@ task stack:down -- -v
 `task --list` shows every target; `weaver-e2e` with no arguments prints its
 subcommands.
 
+## Direct-unpack archive matrix
+
+The [native archive matrix](docs/direct-unpack.md) starts a fresh SQLite Weaver
+process and a loopback NNTP fixture. It asserts staged output exists while
+archive articles are still withheld, then checks final BLAKE3 and PAR2 repair.
+It runs in the Rust CI job and can also run against a local binary.
+
 ## Layout
 
 | Path | What it is |

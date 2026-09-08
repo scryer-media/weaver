@@ -217,7 +217,6 @@ impl NntpError {
     ///
     /// Some servers (Eweka, etc.) return 481 or 482 with messages like
     /// "too many connections for your user" instead of the standard 502.
-    /// SABnzbd's `clues_too_many()` handles this pattern.
     fn classify_auth_error(message: &str, default: NntpError) -> Self {
         if Self::is_too_many_connections_message(message) {
             NntpError::TooManyConnections

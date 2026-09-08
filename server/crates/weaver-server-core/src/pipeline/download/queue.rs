@@ -26,8 +26,7 @@ pub struct DownloadWork {
     pub exclude_servers: Vec<usize>,
     /// Transport-rotation hint: the server whose established connection just
     /// failed for this segment. Selection avoids it on the next attempt so the
-    /// retry lands elsewhere when an alternative exists — mirroring
-    /// NZBGet's per-article `failedServers` — but unlike `exclude_servers` it
+    /// retry lands elsewhere when an alternative exists. Unlike `exclude_servers`, it
     /// never counts toward article-not-found exhaustion, so one transient
     /// timeout can never help declare an article missing. Replaced (not
     /// accumulated) on each transport failure; advisory only, so an index left

@@ -3069,18 +3069,22 @@ async fn a_part_sharing_the_joined_files_first_16_kib_is_unprotected_before_join
     };
     posting.install(&mut pipeline, job_id).await;
 
+    let protected_count = pipeline.incomplete_par2_protected_data_file_count(job_id);
+    let report = pipeline.classify_incomplete_after_par2(
+        job_id,
+        &crate::pipeline::completion::finalize::check::Par2Reconciliation::default(),
+        "pre-verdict split fragment probe",
+    );
+    // This probe intentionally stops before the missing article arrives. Its
+    // split chase must be woken and joined before the test runtime shuts down.
+    pipeline
+        .direct_unpack_shutdown("pre-verdict probe complete")
+        .await;
+    let report = report.expect("the incomplete fragment must still be classified");
     assert_eq!(
-        pipeline.incomplete_par2_protected_data_file_count(job_id),
-        0,
+        protected_count, 0,
         "a numeric split fragment must not content-bind to the joined description"
     );
-    let report = pipeline
-        .classify_incomplete_after_par2(
-            job_id,
-            &crate::pipeline::completion::finalize::check::Par2Reconciliation::default(),
-            "pre-verdict split fragment probe",
-        )
-        .expect("the incomplete fragment must still be classified");
     assert_eq!(
         report.unproven_protected, 0,
         "the fragment must not enter the protected bucket: {}",

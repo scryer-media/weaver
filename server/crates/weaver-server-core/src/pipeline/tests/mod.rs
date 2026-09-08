@@ -56,8 +56,10 @@ mod par2_multiset_gate;
 mod par2_multiset_grid;
 mod rar_extraction;
 mod restore_history;
+mod sequential_unpack;
 mod sfv_completion;
 mod terminal_settlement;
+mod zip64;
 
 struct TestHarness {
     _temp_dir: TempDir,

@@ -363,8 +363,8 @@ async fn a_par2_less_job_with_no_sfv_is_unchanged() {
     );
 }
 
-/// A named listing is not necessary when its content is unobfuscated. SAB's
-/// fallback recognises this completed file as a listing, then the normal SFV
+/// A named listing is not necessary when its content is unobfuscated. The
+/// content probe recognises this completed file as a listing, then the normal SFV
 /// path verifies the payload without inventing a new name or file identity.
 #[tokio::test]
 async fn an_obfuscated_sfv_listing_with_comments_and_blank_lines_is_used() {

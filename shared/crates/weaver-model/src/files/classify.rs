@@ -53,7 +53,7 @@ impl FileRole {
     /// Infer the file role from a filename using standard Usenet naming conventions.
     pub fn from_filename(name: &str) -> Self {
         let lower = role_filename_view(name).to_ascii_lowercase();
-        let lower = remove_nzbget_duplicate_marker(&lower);
+        let lower = remove_duplicate_marker(&lower);
 
         if lower.ends_with(".par2") {
             if let Some(recovery_blocks) = parse_par2_vol_blocks(&lower) {
@@ -181,7 +181,7 @@ impl FileRole {
     }
 }
 
-fn remove_nzbget_duplicate_marker(lower: &str) -> String {
+fn remove_duplicate_marker(lower: &str) -> String {
     let Some(marker_pos) = lower.rfind(".duplicate") else {
         return lower.to_string();
     };

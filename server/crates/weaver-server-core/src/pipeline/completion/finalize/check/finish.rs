@@ -27,11 +27,6 @@ impl Pipeline {
     /// completion first produced the contradictory sequence this replaces —
     /// `RepairComplete`, then the job failing a moment later, with nothing on
     /// the event stream to say the repair had not held.
-    ///
-    /// This mirrors what both reference implementations announce: SABnzbd runs
-    /// an explicit "verifying repaired files" phase before it accepts a repair,
-    /// and NZBGet reaches `psRepaired` only from a `Process(true)` that came
-    /// back successful, having passed through `ptVerifyingRepaired` first.
     pub(in crate::pipeline) async fn finish_par2_repair(
         &mut self,
         job_id: JobId,
@@ -245,7 +240,7 @@ impl Pipeline {
         .await;
         // Outputs the NZB never carried have no file id to travel through the
         // refresh set, so their sets are invalidated from the registration.
-        let adopted_sevenz_parts = registration.sevenz_parts;
+        let adopted_numbered_parts = registration.numbered_parts;
         self.invalidate_rar_plans_for_repaired_sets(job_id, registration.set_names);
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.refresh_topologies", stage_start);
@@ -328,12 +323,12 @@ impl Pipeline {
         // another completion check, or a stale WaitingForVolumes plan can
         // re-enter PAR2 forever.
         //
-        // A 7z part the repair rebuilt and the topology just adopted is the
+        // A numbered part the repair rebuilt and the topology just adopted is the
         // same situation in the other archive's terms: the set was short a
         // part, now is not, and the extraction that was never attempted (or
         // failed on the truncated set) is what this job is waiting for.
         if has_crc_failures
-            || adopted_sevenz_parts > 0
+            || adopted_numbered_parts > 0
             || self.job_has_live_rar_waiting_for_missing_volumes(job_id)
         {
             self.retry_archive_extraction_after_verify_or_repair(job_id)
@@ -355,10 +350,7 @@ impl Pipeline {
     /// Remove what the repair left behind, now that the repair has been
     /// accepted.
     ///
-    /// Mirrors NZBGet's `DeleteLeftovers()`, which it reaches only from the
-    /// branch where `Process(true)` came back successful, and SABnzbd's
-    /// `deletables` after a finished repair. The gating is the whole point: on
-    /// any failure these files are the evidence, and this is not reached.
+    /// On any failure these files remain as evidence, and cleanup is not reached.
     ///
     /// Only entries that *appeared during* the repair are candidates, and only
     /// when they are neither an NZB entry under any of its names nor a file the
@@ -1025,14 +1017,15 @@ impl Pipeline {
             let role = weaver_model::files::FileRole::from_filename(&file.filename);
             let volume_number = match role {
                 weaver_model::files::FileRole::RarVolume { volume_number } => volume_number,
-                weaver_model::files::FileRole::SevenZipSplit { number } => {
-                    if self.adopt_verified_par2_sevenz_part(
+                weaver_model::files::FileRole::SevenZipSplit { number }
+                | weaver_model::files::FileRole::SplitFile { number } => {
+                    if self.adopt_verified_par2_numbered_part(
                         job_id,
                         &file.filename,
                         &role,
                         number,
                     )? {
-                        registration.sevenz_parts += 1;
+                        registration.numbered_parts += 1;
                     }
                     continue;
                 }
@@ -1092,30 +1085,39 @@ impl Pipeline {
         Ok(registration)
     }
 
-    /// Adopt a `.7z.NNN` part the recovery set proved Complete into its set's
+    /// Adopt a numbered part the recovery set proved Complete into its set's
     /// topology, when the NZB never carried it.
     ///
     /// The RAR arm of [`Self::register_verified_par2_rar_outputs`] persists
-    /// header facts and lets the plan rebuild from them. A 7z split set has no
+    /// header facts and lets the plan rebuild from them. A numbered set has no
     /// header chain: its topology is the numbering of the parts the assembly
     /// registered, which is exactly what a part the NZB never carried is
     /// missing from. So the part goes straight into the topology — its name
     /// into `volume_map`, its number marked complete, and the expected count
     /// raised when it lies past the end, since a withheld *last* part is one
-    /// the topology never counted. `sevenz_set_part_paths` then hands it to the
+    /// the topology never counted. `archive_set_part_paths` then hands it to the
     /// extractor off the same map.
     ///
-    /// `Ok(false)` when the part belongs to no 7z set this job knows, or the
+    /// `Ok(false)` when the part belongs to no matching set this job knows, or the
     /// set already lists it under this or an NZB file's current name. `Err`
     /// when the verdict says Complete but the bytes are not where the
     /// description puts them — the same refusal the RAR arm makes.
-    pub(super) fn adopt_verified_par2_sevenz_part(
+    pub(super) fn adopt_verified_par2_numbered_part(
         &mut self,
         job_id: JobId,
         filename: &str,
         role: &weaver_model::files::FileRole,
         number: u32,
     ) -> Result<bool, String> {
+        let archive_type = match role {
+            weaver_model::files::FileRole::SevenZipSplit { .. } => {
+                crate::jobs::assembly::ArchiveType::SevenZip
+            }
+            weaver_model::files::FileRole::SplitFile { .. } => {
+                crate::jobs::assembly::ArchiveType::Split
+            }
+            _ => return Ok(false),
+        };
         let Some(set_name) = weaver_model::files::archive_base_name(filename, role) else {
             return Ok(false);
         };
@@ -1128,8 +1130,7 @@ impl Pipeline {
             .archive_topologies()
             .iter()
             .find(|(name, topology)| {
-                topology.archive_type == crate::jobs::assembly::ArchiveType::SevenZip
-                    && sanitize_download_filename(name) == set_key
+                topology.archive_type == archive_type && sanitize_download_filename(name) == set_key
             })
             .map(|(name, _)| name.clone())
         else {
@@ -1149,11 +1150,11 @@ impl Pipeline {
         let path = self
             .resolve_job_input_path(job_id, filename)
             .ok_or_else(|| {
-                format!("PAR2 verified 7z part {filename} has no active job directory")
+                format!("PAR2 verified numbered part {filename} has no active job directory")
             })?;
         if !path.is_file() {
             return Err(format!(
-                "PAR2 verified 7z part {} is missing from staging",
+                "PAR2 verified numbered part {} is missing from staging",
                 path.display()
             ));
         }
@@ -1181,8 +1182,11 @@ impl Pipeline {
             part = %filename,
             volume = number,
             expected_volumes = expected,
-            "adopted a PAR2-verified 7z part the NZB never carried"
+            "adopted a PAR2-verified numbered part the NZB never carried"
         );
+        // An existing chase concatenated a smaller part list. Even verified
+        // consumed bytes cannot prove its offsets or its EOF after adoption.
+        self.taint_direct_unpack_set(job_id, &topology_name);
         Ok(true)
     }
 

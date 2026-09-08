@@ -1802,9 +1802,8 @@ struct CachedDiskWriteHandle {
 ///
 /// The last close of a freshly written file is where the kernel flushes its
 /// dirty pages (tens of milliseconds for a large file on macOS), and an owner
-/// thread serves every file that hashes to it. SABnzbd and NZBGet both take
-/// that flush on the thread that wrote, but neither shares a writer across
-/// files; here the owner hands the handle off instead, so a completed file's
+/// thread serves every file that hashes to it. The owner hands the handle
+/// off so a completed file's
 /// flush never queues behind another file's writes. The closer is FIFO, so an
 /// `ack` is sent only once every close queued before it — including earlier
 /// fire-and-forget releases of the same path — has actually happened, which is

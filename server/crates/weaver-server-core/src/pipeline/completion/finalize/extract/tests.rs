@@ -1,4 +1,5 @@
 use super::*;
+mod zip64;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Read, Write};

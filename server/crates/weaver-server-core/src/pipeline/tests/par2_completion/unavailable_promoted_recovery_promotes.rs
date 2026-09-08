@@ -1238,9 +1238,7 @@ async fn waiting_on_present_volumes_is_not_repair_ready_until_a_volume_is_truly_
 /// verified, byte-correct output.
 ///
 /// Once PAR2 has repaired and re-verified a protected output, that verification
-/// is authoritative and the bitmap is diagnostic history. This is exactly what
-/// NZBGet pins in `test_parchecker_repair`, which makes a segment unavailable
-/// and asserts `SUCCESS/PAR`.
+/// is authoritative and the bitmap is diagnostic history.
 #[tokio::test]
 async fn missing_article_repaired_by_par2_completes_despite_incomplete_bitmap() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1692,9 +1690,7 @@ async fn contested_par2_binding_is_refused_and_named() {
 ///
 /// Job 10000 forced this: a 1.09 GB payload that PAR2 repaired and re-verified,
 /// failed because a 738 KB `.nfo` no recovery set ever covered was missing a few
-/// articles. Health 999. Both oracles ship that job — NZBGet's `FAILURE/HEALTH`
-/// requires par to have been *skipped*, and SABnzbd never derives a failure from
-/// missing articles at all — and weaver's final move relocates the working
+/// articles. Health 999. Weaver's final move relocates the working
 /// directory wholesale, so the bytes reach the user regardless. Refusing the job
 /// destroys a good download to report damage on a text file.
 ///
