@@ -1,5 +1,6 @@
 use super::*;
 use crate::pipeline::direct_store::wiring::{DirectDamageResolution, DirectPar2Resolution};
+use crate::pipeline::repair::backend::RepairBackend;
 use crate::runtime::fs as runtime_fs;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -252,22 +253,22 @@ fn run_retained_par2_session(
     let mut retried_source_change = false;
     let mut result = if repair {
         if session.assessment().is_err() {
-            session.analyze().and_then(|_| session.repair())
+            session.assess().and_then(|_| session.execute(()))
         } else {
-            session.repair()
+            session.execute(())
         }
     } else {
-        session.analyze()
+        session.assess()
     };
     if should_retry_par2_source_change(&result, retried_source_change) {
         // One retry gets a fresh unresolved-only analysis. A second change is
         // returned to the caller instead of repeatedly trusting a moving path.
         retried_source_change = true;
         admitted_file_ids.clear();
-        session.invalidate_all_sources();
-        result = session.analyze();
+        session.invalidate(());
+        result = session.assess();
         if result.is_ok() && repair {
-            result = session.repair();
+            result = session.execute(());
         }
     }
     (

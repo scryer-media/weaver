@@ -113,6 +113,9 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 par2-rs = { version = "0.10", default-features = false, features = ["native-crypto"] }
+# Temporary development pointer: advanced verification/repair and review fixes.
+# Keep PAR2's registry dependency and feature graph independent of this engine.
+par3-rs = { version = "0.3", git = "https://github.com/scryer-media/rarpar", rev = "ca50d43c81a73dc018c6df137fd3e0004ea8f930", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x
@@ -155,3 +158,5 @@ incremental = false
 # repository: the e2e harness's Weaver image build refuses such a manifest, and
 # any build without that exact checkout cannot compile the workspace. When a
 # rarpar change is needed, publish it and bump the requirement here instead.
+# The pinned PAR3 Git dependency above is explicitly allowed during integration
+# development; replace it with a registry requirement before integration ends.

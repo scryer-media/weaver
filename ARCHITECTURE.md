@@ -359,6 +359,14 @@ takes precedence over a chase of its source parts.
 
 ### Engine Boundaries Stay Explicit
 
+`pipeline/repair/backend` is the operation boundary for retained PAR2 and PAR3
+engines. It preserves native assessments, evidence, source invalidation, errors,
+and repair requests. Calls are statically dispatched above block I/O; PAR2's
+readers, checksum substitutions, and buffer limits remain native. PAR3 is under
+integration and is not yet selected by the download pipeline. The implementation
+record and remaining acceptance gates live in
+[the PAR3 integration plan](docs/par3-integration-plan.md).
+
 Engine crates should remain sharp and focused:
 
 - NNTP

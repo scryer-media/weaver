@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::backend::RepairBackend;
 use super::*;
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::runtime::fs as runtime_fs;
@@ -2128,7 +2129,7 @@ impl Pipeline {
                 .values()
                 .flat_map(|runtime| runtime.sets.values())
                 .filter_map(|set_runtime| set_runtime.session.as_ref())
-                .map(par2_rs::Par2RepairSession::estimated_retained_bytes)
+                .map(RepairBackend::retained_bytes)
                 .sum::<usize>();
             if retained_bytes <= PAR2_RETAINED_SESSION_BUDGET_BYTES {
                 return;
@@ -2184,7 +2185,7 @@ impl Pipeline {
         for set_runtime in runtime.sets.values_mut() {
             set_runtime.session_evidence_file_ids.clear();
             if let Some(session) = set_runtime.session.as_mut() {
-                session.invalidate_all_sources();
+                session.invalidate(());
             }
         }
     }
@@ -2202,7 +2203,7 @@ impl Pipeline {
             for set_runtime in runtime.sets.values_mut() {
                 set_runtime.session_evidence_file_ids.clear();
                 if let Some(session) = set_runtime.session.as_mut() {
-                    session.invalidate_all_sources();
+                    session.invalidate(());
                 }
             }
         }
