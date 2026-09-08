@@ -1,6 +1,6 @@
 //! Weaver adapters for shared tunnels and consumer routing.
 //!
-//! SSH and WireGuard protocols live in the Git-pinned `proxy-tunnels` crate.
+//! SSH, WireGuard and HTTP/3 protocols live in the Git-pinned `proxy-tunnels` crate.
 //! This crate adapts persisted host-key trust and consumer outcomes, implements
 //! HTTP CONNECT/SOCKS5 upstream transports and routed DNS, and supplies owned
 //! revocable streams. NNTP uses direct in-process I/O; RSS uses authenticated
@@ -10,6 +10,8 @@ pub mod bridge;
 pub mod direct;
 pub mod dns;
 mod error;
+#[path = "shared_http3.rs"]
+mod http3;
 mod provider;
 #[cfg(any(test, feature = "test-support"))]
 mod registry;
@@ -26,6 +28,7 @@ pub mod wireguard;
 pub mod test_support;
 
 pub use error::TunnelError;
+pub use http3::{Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec};
 pub use provider::{
     ED25519_ONLY_PRIVATE_KEY_MESSAGE, NoopTunnelObserver, TunnelObserver, TunnelProvider,
     TunnelSpec, TunnelStream,

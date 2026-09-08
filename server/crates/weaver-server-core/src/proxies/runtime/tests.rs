@@ -1,4 +1,5 @@
 use super::*;
+mod http3;
 mod review_regressions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

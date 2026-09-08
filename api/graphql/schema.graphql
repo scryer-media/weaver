@@ -1261,6 +1261,7 @@ type ProviderHoldoff {
 
 enum ProxyKind {
 	HTTP_CONNECT
+	HTTP3_CONNECT
 	SOCKS5
 	SSH
 	WIRE_GUARD

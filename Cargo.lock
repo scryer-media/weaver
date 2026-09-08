@@ -2150,6 +2150,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3"
+version = "0.0.8"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.1.0#01481be7fca27a7864fe40e9a4b95fcfa9698ce2"
+dependencies = [
+ "bytes",
+ "fastrand",
+ "futures-util",
+ "http",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "h3-quinn"
+version = "0.0.10"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.1.0#01481be7fca27a7864fe40e9a4b95fcfa9698ce2"
+dependencies = [
+ "bytes",
+ "futures",
+ "h3",
+ "quinn",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3747,18 +3773,25 @@ dependencies = [
 
 [[package]]
 name = "proxy-tunnels"
-version = "0.20.0"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.20.0#7c63bad3f43e8aaea2ffa5b9190866406ce4eb10"
+version = "0.1.0"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.1.0#01481be7fca27a7864fe40e9a4b95fcfa9698ce2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "gotatun",
+ "h3",
+ "h3-quinn",
+ "http",
  "ipnetwork",
+ "quinn",
  "russh",
+ "rustls",
  "smoltcp",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3778,6 +3811,7 @@ checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
 dependencies = [
  "bytes",
  "cfg_aliases",
+ "futures-io",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
@@ -6092,9 +6126,16 @@ version = "0.11.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bytes",
+ "h3",
+ "h3-quinn",
+ "http",
  "proxy-tunnels",
+ "quinn",
+ "rcgen",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

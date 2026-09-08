@@ -277,7 +277,9 @@ impl Socks5Front {
         mut stream: TcpStream,
         mut upstream: Box<dyn TunnelStream>,
     ) -> Result<(), Socks5Failure> {
-        tokio::io::copy_bidirectional(&mut stream, &mut upstream)
+        // Local proxy benchmarks favor 64 KiB batches. Connection admission
+        // bounds the additional two buffers per active bridge.
+        tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut upstream, 64 * 1024, 64 * 1024)
             .await
             .map(|_| ())
             .map_err(Socks5Failure::Io)

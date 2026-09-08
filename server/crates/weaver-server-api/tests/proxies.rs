@@ -69,6 +69,64 @@ async fn profile_crud_redacts_secrets_and_preserves_omitted_credentials() {
 }
 
 #[tokio::test]
+async fn http3_profiles_round_trip_and_feed_routes_keep_credentials_private() {
+    let h = harness().await;
+    let result = h
+        .execute(
+            r#"mutation { saveProxyProfile(input: {
+        name: "QUIC gateway", kind: HTTP3_CONNECT, enabled: true,
+        host: "proxy.invalid", port: 443, dnsServers: ["192.0.2.53"],
+        username: "fixture-user", password: "fixture-password"
+    }) { id kind hasUsername hasPassword } }"#,
+        )
+        .await;
+    assert_no_errors(&result);
+    let data = response_data(&result);
+    assert_eq!(data["saveProxyProfile"]["kind"], "HTTP3_CONNECT");
+    assert_eq!(data["saveProxyProfile"]["hasPassword"], true);
+    assert!(!data.to_string().contains("fixture-password"));
+    let id = data["saveProxyProfile"]["id"].as_u64().unwrap();
+    let feed = h
+        .execute(&format!(
+            r#"mutation {{ addRssFeed(input: {{
+        name: "QUIC feed", url: "https://feed.invalid/rss", enabled: false,
+        routing: {{ proxyIds: [{id}], allowDirect: false }}
+    }}) {{ routing {{ proxyIds allowDirect }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&feed);
+    assert_eq!(
+        response_data(&feed)["addRssFeed"]["routing"]["allowDirect"],
+        false
+    );
+    let result = h
+        .execute(&format!(
+            r#"mutation {{ saveProxyProfile(id: {id}, input: {{
+        name: "renamed", kind: HTTP3_CONNECT, enabled: false,
+        host: "proxy.invalid", port: 443, dnsServers: ["192.0.2.53"]
+    }}) {{ kind enabled hasUsername hasPassword }} }}"#
+        ))
+        .await;
+    assert_no_errors(&result);
+    assert_eq!(
+        response_data(&result)["saveProxyProfile"]["hasPassword"],
+        true
+    );
+    assert_eq!(
+        h.db.list_proxy_profiles().unwrap()[0]
+            .secrets
+            .password
+            .as_deref(),
+        Some("fixture-password")
+    );
+    assert_has_errors(
+        &h.execute(&format!("mutation {{ deleteProxyProfile(id: {id}) }}"))
+            .await,
+    );
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
 async fn feed_policy_is_atomic_preserved_and_blocks_referenced_profile_deletion() {
     let h = harness().await;
     let result = h

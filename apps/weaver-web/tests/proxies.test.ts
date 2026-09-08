@@ -23,5 +23,5 @@ test("moving a proxy changes priority and preserves blocked/direct policy", () =
   assert.deepEqual(policy.proxyIds, [1, 2, 3]);
 });
 test("every API profile type has its settings label", () => {
-  assert.deepEqual(proxyLabels, { HTTP_CONNECT: "HTTP CONNECT", SOCKS5: "SOCKS5", SSH: "SSH", WIRE_GUARD: "WireGuard" });
+  assert.deepEqual(proxyLabels, { HTTP_CONNECT: "HTTP CONNECT", HTTP3_CONNECT: "HTTP/3 CONNECT", SOCKS5: "SOCKS5", SSH: "SSH", WIRE_GUARD: "WireGuard" });
 });
