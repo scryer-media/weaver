@@ -517,7 +517,7 @@ const QueueProgressCell = memo(function QueueProgressCell({
 }) {
   return (
     <div className="flex justify-center">
-      <div className="w-full max-w-[176px]">
+      <div className="w-[78px] min-[1440px]:w-[172px]">
         <JobPhaseProgressBars
           jobId={jobId}
           phaseProgress={phaseProgress}
