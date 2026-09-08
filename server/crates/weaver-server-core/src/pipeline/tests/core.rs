@@ -525,6 +525,38 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
     const CONNECTIONS: usize = 8;
     let client = capacity_test_client(port, CONNECTIONS);
     let pool = Arc::clone(client.pool());
+    // Finish one real rejection before dispatching the concurrent workload.
+    // Sockets admitted before holdoff may reach accept() after it is armed;
+    // counting those as reconnects made this assertion depend on scheduling.
+    assert!(matches!(
+        pool.acquire(weaver_nntp::ServerId(0)).await,
+        Err(weaver_nntp::NntpError::TooManyConnections)
+    ));
+    assert!(pool.is_over_limit(weaver_nntp::ServerId(0)));
+    assert_eq!(pool.active_connections(0), 0);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    // Exercise both acquisition paths after the admission boundary is known.
+    for _ in 0..CONNECTIONS {
+        assert!(matches!(
+            pool.acquire(weaver_nntp::ServerId(0)).await,
+            Err(weaver_nntp::NntpError::ServerOverLimit { .. })
+        ));
+    }
+    let client = tokio::task::spawn_blocking(move || {
+        for _ in 0..CONNECTIONS {
+            assert!(matches!(
+                client.try_acquire_blocking_body_lane(&[], &[]),
+                Err(
+                    weaver_nntp::client::BlockingBodyLaneAcquireError::ProviderCapacity(
+                        weaver_nntp::NntpError::ServerOverLimit { .. }
+                    )
+                )
+            ));
+        }
+        client
+    })
+    .await
+    .unwrap();
     let harness = TestHarness::new_with_nntp(client, CONNECTIONS).await;
     let job_id = JobId(80_021);
     let spec = segmented_job_spec("held off provider", "held-off.bin", &vec![1024_u32; 64]);
@@ -535,19 +567,11 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
         .await
         .unwrap();
 
-    wait_until(Duration::from_secs(10), || {
-        pool.is_over_limit(weaver_nntp::ServerId(0))
-    })
-    .await
-    .expect("the provider rejection should park fresh connects");
-
-    // Every dispatch inside the window is answered from the deadline, so the
-    // provider sees no further sockets even though lanes keep asking.
-    let accepted_after_holdoff = accepted.load(Ordering::SeqCst);
+    // The scheduler also keeps the queued workload off the held-off provider.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
         accepted.load(Ordering::SeqCst),
-        accepted_after_holdoff,
+        1,
         "a held-off server must not be reconnected inside its window"
     );
 
@@ -561,6 +585,7 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
 
     harness.shutdown().await;
     server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]
