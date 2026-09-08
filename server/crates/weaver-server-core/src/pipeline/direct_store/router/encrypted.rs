@@ -370,12 +370,8 @@ impl DirectSetRouter {
         let Some(part) = self.part_for(layout_index, volume_index) else {
             return Ok(());
         };
-        let (part_position, part_logical_offset, part_len, packed_crc32) = part;
-        let packed_uses_mac = self
-            .layout_members()
-            .get(layout_index)
-            .and_then(|member| member.parts.get(part_position as usize))
-            .is_some_and(|part| part.packed_hash_uses_mac);
+        let (part_position, part_logical_offset, _, _) = part;
+        let defer_gates = self.repair_draining;
         let Some(member) = self.member_mut(member_id) else {
             return Ok(());
         };
@@ -405,7 +401,6 @@ impl DirectSetRouter {
                     .insert(cipher_offset, destination_len, plain_crc);
             }
         }
-        let part_complete = crypt.emitted_covers(part_logical_offset, part_len);
         if replace {
             let gaps = member.parts.entry(part_position).or_default().overwrite(
                 part_relative,
@@ -432,31 +427,125 @@ impl DirectSetRouter {
             member.covered.insert(cipher_offset, destination_len);
         }
 
-        let part_value = part_complete
-            .then(|| {
-                member
-                    .parts
-                    .get(&part_position)
-                    .and_then(|runs| runs.compose(0, part_len))
-            })
-            .flatten();
-        if let Some(value) = part_value {
-            member.checked_parts.insert(part_position, value);
-            if let Some(expected) = packed_crc32 {
-                let composed = member.crypt.as_ref().map_or(Some(value), |crypt| {
-                    crypt.fold_member_crc(value, packed_uses_mac)
-                });
-                // A fold that refuses to answer is a mismatch: `Some(expected)`
-                // is the only value that passes.
-                if composed != Some(expected)
-                    && !self.record_part_checksum_damage(volume_index, member_id, part_position)
-                {
-                    return Err(self.fail(DemotionReason::PartChecksumMismatch));
-                }
-            }
+        // A repair's pieces are recorded here and judged together afterwards;
+        // see `repair_draining`.
+        if defer_gates {
+            return Ok(());
         }
-
+        self.gate_part(member_id, volume_index)?;
         self.try_verify_member(member_id)
+    }
+
+    /// Layer 1 for the part of `member_id` that lives in `volume_index`: the
+    /// part's packed CRC32, composed from the runs the part was fed, the moment
+    /// the part is complete.
+    ///
+    /// Completeness is asked in the space the part's runs live in. An encrypted
+    /// member's runs are cipher and cover the tail padding, which the
+    /// destination coverage map cannot name, so they are asked of the emitted
+    /// cipher coverage; a plain member's runs are its destination bytes, so the
+    /// coverage map answers. A part that is not complete, or whose runs do not
+    /// tile it — a repair's stale gaps, a hole an article never filled — has no
+    /// value yet and is not judged.
+    ///
+    /// Guarded by that completeness rather than attempted on every run: the
+    /// composition walks the runs it was fed instead of reading one merged
+    /// value, so asking before the part is whole would be a scan per span for
+    /// an answer that cannot exist yet.
+    pub(super) fn gate_part(
+        &mut self,
+        member_id: u32,
+        volume_index: u32,
+    ) -> Result<(), DemotionReason> {
+        let Some(layout_index) = self.layout_index_for_member(member_id) else {
+            return Ok(());
+        };
+        let Some((part_position, part_logical_offset, part_len, packed_crc32)) =
+            self.part_for(layout_index, volume_index)
+        else {
+            return Ok(());
+        };
+        let packed_uses_mac = self
+            .layout_members()
+            .get(layout_index)
+            .and_then(|member| member.parts.get(part_position as usize))
+            .is_some_and(|part| part.packed_hash_uses_mac);
+        let Some(member) = self.member_mut(member_id) else {
+            return Ok(());
+        };
+        let part_complete = match member.crypt.as_ref() {
+            Some(crypt) => crypt.emitted_covers(part_logical_offset, part_len),
+            None => member
+                .covered
+                .missing(part_logical_offset, part_len)
+                .is_empty(),
+        };
+        if !part_complete {
+            return Ok(());
+        }
+        let Some(value) = member
+            .parts
+            .get(&part_position)
+            .and_then(|runs| runs.compose(0, part_len))
+        else {
+            return Ok(());
+        };
+        member.checked_parts.insert(part_position, value);
+        let Some(expected) = packed_crc32 else {
+            return Ok(());
+        };
+        // An encrypted member's value is folded with the hash key when the
+        // part's header keys its checksum. A fold that refuses to answer is a
+        // mismatch: `Some(expected)` is the only value that passes.
+        let composed = member.crypt.as_ref().map_or(Some(value), |crypt| {
+            crypt.fold_member_crc(value, packed_uses_mac)
+        });
+        if composed != Some(expected)
+            && !self.record_part_checksum_damage(volume_index, member_id, part_position)
+        {
+            return Err(self.fail(DemotionReason::PartChecksumMismatch));
+        }
+        Ok(())
+    }
+
+    /// Runs every gate a repair's drain deferred, over the finished rewrite.
+    ///
+    /// Every member is visited, not only the ones the rewrite touched: the
+    /// drain that carried the rewrite also drained every other staged volume,
+    /// and a hold it released may have completed a part anywhere in the set.
+    /// A part already judged is skipped; a member already verified returns
+    /// from its own gate at once.
+    pub(super) fn settle_repair_gates(&mut self) -> Result<(), DemotionReason> {
+        let member_ids: Vec<u32> = self.members.keys().copied().collect();
+        for member_id in member_ids {
+            let Some(layout_index) = self.layout_index_for_member(member_id) else {
+                continue;
+            };
+            let parts: Vec<(u32, u32)> = self
+                .layout_members()
+                .get(layout_index)
+                .map(|member| {
+                    member
+                        .parts
+                        .iter()
+                        .enumerate()
+                        .map(|(position, part)| (position as u32, part.volume))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (position, volume) in parts {
+                let judged = self
+                    .members
+                    .get(&member_id)
+                    .is_some_and(|member| member.checked_parts.contains_key(&position));
+                if judged {
+                    continue;
+                }
+                self.gate_part(member_id, volume)?;
+            }
+            self.try_verify_member(member_id)?;
+        }
+        Ok(())
     }
 
     /// `(position in chain, logical offset, packed length, packed CRC32)` for

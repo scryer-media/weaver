@@ -9,7 +9,9 @@
 use super::*;
 
 use crate::pipeline::direct_store::plan::DirectSetPlan;
-use crate::pipeline::direct_store::router::{DirectDestination, DirectSetRouter, RoutedSpan};
+use crate::pipeline::direct_store::router::{
+    DirectDestination, DirectSetRouter, RepairedChunk, RoutedSpan,
+};
 
 /// The password every fixture in this file is written with.
 const REPAIR_PASSWORD: &str = "moonlit-harbour";
@@ -424,4 +426,170 @@ async fn a_repaired_volume_tail_reroutes_into_a_header_encrypted_member() {
         HeaderCheck::For(REPAIR_PASSWORD),
     );
     a_repaired_volume_tail_reroutes(volumes, &payload).await;
+}
+
+/// The shape a corrupt-but-present article takes, scaled down: a middle volume
+/// posted as several articles, one of them carrying flipped bytes the wire
+/// checks could not see, and PAR2 rewriting the slice that holds it — which
+/// starts at the volume's **first byte**, so the rewrite carries the volume's
+/// headers and the first two articles whole.
+///
+/// Every article of the part is on record when the repair lands, so the part's
+/// runs tile the rewrite exactly and go on tiling after each piece of it. The
+/// rewrite reaches the composition as a head block, an aligned middle and a
+/// tail block, and a gate that judged the part after the head block alone
+/// composed that block's repaired value with the middle's wire-damaged one —
+/// a mismatch over bytes that never existed, and with the repair already
+/// re-routed, a demotion of a set whose bytes on disk were correct.
+#[tokio::test]
+async fn a_repaired_leading_slice_of_a_multi_article_encrypted_volume_reroutes() {
+    let payload: Vec<u8> = (0..12_000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        REPAIR_MEMBER,
+        &payload,
+        3,
+        REPAIR_PASSWORD,
+        Some(REPAIR_PASSWORD),
+        true,
+    );
+    let mut router = encrypted_router(&volumes, REPAIR_PASSWORD);
+    router.note_par2_available(true);
+    let (_, parts) = cipher_and_part_offsets(&payload, &volumes);
+    let (part_at, part_len) = parts[1];
+    assert!(
+        part_at < 500 && part_len > 3_000,
+        "the fixture must hold several articles"
+    );
+
+    const ARTICLE: usize = 1_000;
+    let pristine = &volumes[1].1;
+    let mut damaged = pristine.clone();
+    for byte in &mut damaged[500..508] {
+        *byte ^= 0x5A;
+    }
+
+    for (index, (_, bytes)) in volumes.iter().enumerate() {
+        if index == 1 {
+            for (article, chunk) in damaged.chunks(ARTICLE).enumerate() {
+                router
+                    .route(1, (article * ARTICLE) as u64, chunk)
+                    .expect("a damaged article the wire checks passed routes");
+            }
+        } else {
+            router
+                .route(index as u32, 0, bytes)
+                .expect("an undamaged encrypted volume routes");
+        }
+        router
+            .note_volume_complete(index as u32)
+            .expect("the volume's articles are all in");
+    }
+    assert!(
+        router.damaged_volumes().contains(&1),
+        "the part gate must see the flipped cipher bytes and record the volume as damaged: {:?}",
+        router.damaged_volumes()
+    );
+    assert!(!router.all_members_verified());
+
+    let rewrite_len = (2 * ARTICLE) as u64;
+    let spans = route_repaired_span(&mut router, &volumes, 1, 0, rewrite_len)
+        .expect("a repaired leading slice must route back into the member");
+    assert!(
+        member_bytes_written(&spans) > 0,
+        "the repaired bytes must reach the member's partial"
+    );
+    close_stale_gaps(&mut router, &payload);
+    assert!(
+        router.all_members_verified(),
+        "the member must verify against the repaired image"
+    );
+}
+
+/// A router over unencrypted `volumes`, with nothing routed yet.
+fn plain_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
+    DirectSetRouter::new(DirectSetPlan {
+        set_name: "silver.horizon".to_string(),
+        volumes: (0..volumes.len() as u32)
+            .map(|index| (index, index))
+            .collect(),
+        files: (0..volumes.len() as u32)
+            .map(|index| (index, index))
+            .collect(),
+        identity: None,
+        working_dir: std::path::PathBuf::from("/nonexistent"),
+        destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
+    })
+}
+
+/// The plain-member counterpart. A plain slice reaches the composition as one
+/// run, so a single rewritten slice is judged whole — but a volume with **two**
+/// damaged slices is rewritten as two runs, and a gate that judged the part
+/// after the first composed its repaired value with the second's wire-damaged
+/// one. Same mixture, same wrongful demotion.
+#[tokio::test]
+async fn a_repair_of_two_slices_in_one_plain_volume_reroutes() {
+    let payload: Vec<u8> = (0..12_000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = single_member_store_set(REPAIR_MEMBER, &payload, 3);
+    let mut router = plain_router(&volumes);
+    router.note_par2_available(true);
+
+    const ARTICLE: usize = 1_000;
+    let pristine = &volumes[1].1;
+    let part = &payload[4_000..8_000];
+    let part_at = pristine
+        .windows(part.len())
+        .position(|window| window == part)
+        .expect("the fixture's part is in its own volume");
+    assert!(part_at < 500, "the fixture must hold several articles");
+    let mut damaged = pristine.clone();
+    for at in [500usize, 2_500] {
+        for byte in &mut damaged[at..at + 8] {
+            *byte ^= 0x5A;
+        }
+    }
+
+    for (index, (_, bytes)) in volumes.iter().enumerate() {
+        if index == 1 {
+            for (article, chunk) in damaged.chunks(ARTICLE).enumerate() {
+                router
+                    .route(1, (article * ARTICLE) as u64, chunk)
+                    .expect("a damaged article the wire checks passed routes");
+            }
+        } else {
+            router
+                .route(index as u32, 0, bytes)
+                .expect("an undamaged volume routes");
+        }
+        router
+            .note_volume_complete(index as u32)
+            .expect("the volume's articles are all in");
+    }
+    assert!(
+        router.damaged_volumes().contains(&1),
+        "the part gate must see the flipped bytes and record the volume as damaged: {:?}",
+        router.damaged_volumes()
+    );
+    assert!(!router.all_members_verified());
+
+    // Both damaged articles rewritten in one call, the way a volume's repaired
+    // spans always arrive: two chunks, two runs into the same part.
+    let chunks: Vec<RepairedChunk> = [0usize, 2 * ARTICLE]
+        .into_iter()
+        .map(|at| (at as u64, std::sync::Arc::from(&pristine[at..at + ARTICLE])))
+        .collect();
+    let spans = router
+        .route_repaired(1, &chunks, &[], false)
+        .expect("two repaired slices of one plain volume must route back into the member");
+    assert!(
+        member_bytes_written(&spans) > 0,
+        "the repaired bytes must reach the member's partial"
+    );
+    assert!(
+        !router.has_stale_gaps(),
+        "article-shaped rewrites over article-shaped runs leave nothing to re-read"
+    );
+    assert!(
+        router.all_members_verified(),
+        "the member must verify against the repaired image"
+    );
 }

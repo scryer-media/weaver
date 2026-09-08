@@ -2185,6 +2185,18 @@ pub(crate) struct DirectSetRouter {
     /// recording it again would park the set on a question that has already
     /// been asked and lost, so the second one demotes.
     repair_rerouted: bool,
+    /// Is [`Self::route_repaired`] mid-drain?
+    ///
+    /// A rewrite reaches the compositions in pieces — an encrypted slice as its
+    /// edge blocks and aligned middle, a volume with several damaged slices as
+    /// one run per slice — and between two of those pieces a part's runs still
+    /// tile: the pieces already fed carry the repaired values and the rest still
+    /// carry the wire-damaged ones. A gate that fires there composes a mixture
+    /// that describes no bytes that ever existed, and with `repair_rerouted`
+    /// set its mismatch is the demotion, not a question. So while this is set
+    /// both integrity layers only record; [`Self::settle_repair_gates`] runs
+    /// them once, over the finished rewrite.
+    repair_draining: bool,
     demoted: Option<DemotionReason>,
 }
 
@@ -2253,6 +2265,7 @@ impl DirectSetRouter {
             par2_available: false,
             damaged_volumes: std::collections::BTreeSet::new(),
             repair_rerouted: false,
+            repair_draining: false,
             demoted: None,
         }
     }

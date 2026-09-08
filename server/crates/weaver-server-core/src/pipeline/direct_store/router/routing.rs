@@ -171,10 +171,30 @@ impl DirectSetRouter {
         let volumes: Vec<u32> = std::iter::once(volume_index)
             .chain(self.staging.keys().copied())
             .collect();
+        //
+        // The gates stay quiet for the whole of it. A rewrite lands in the
+        // compositions piece by piece — an encrypted slice as its edge blocks
+        // and aligned middle, a volume with several damaged slices as one run
+        // per slice — and a part whose articles were all on record tiles again
+        // after the *first* piece: that piece with its repaired value, the rest
+        // still with the wire-damaged ones. A gate that fires there composes a
+        // mixture no bytes ever had, and with `repair_rerouted` set its mismatch
+        // demotes a set whose bytes on disk are correct. The gates run once,
+        // below, over the finished rewrite.
+        self.repair_draining = true;
         let mut spans = self.take_migrated_spans();
+        let mut drained = Ok(());
         for volume in volumes {
-            spans.extend(self.drain_volume(volume)?);
+            match self.drain_volume(volume) {
+                Ok(routed) => spans.extend(routed),
+                Err(reason) => {
+                    drained = Err(reason);
+                    break;
+                }
+            }
         }
+        self.repair_draining = false;
+        drained?;
 
         // Every repaired byte must have found a destination. Unlike an ordinary
         // article — whose bytes may legitimately be held above the
@@ -191,6 +211,11 @@ impl DirectSetRouter {
         {
             return Err(self.fail(DemotionReason::RepairRerouteFailed));
         }
+
+        // The deferred gates, over the rewrite as a whole. A part the rewrite
+        // half-covered still has stale gaps here and composes nothing; its
+        // gate runs when the re-read closes them.
+        self.settle_repair_gates()?;
 
         if self.holds_over_budget()
             && let Err(reason) = self.page_holds_to_scratch()
@@ -1989,7 +2014,8 @@ impl DirectSetRouter {
         let Some(part) = self.part_for(layout_index, volume_index) else {
             return Ok(());
         };
-        let (part_position, part_logical_offset, part_len, packed_crc32) = part;
+        let (part_position, part_logical_offset, _, _) = part;
+        let defer_gates = self.repair_draining;
         let Some(member) = self.member_mut(member_id) else {
             return Ok(());
         };
@@ -2032,34 +2058,13 @@ impl DirectSetRouter {
                 .insert(part_relative, len, crc);
         }
 
-        // Layer 1: the part's packed CRC32, as soon as the part is complete.
-        //
-        // Guarded by the coverage map rather than attempted every time: the
-        // composition now walks the runs it was fed instead of reading one
-        // merged value, so asking before the part is whole would be a scan per
-        // span for an answer that cannot exist yet.
-        let part_complete = member
-            .covered
-            .missing(part_logical_offset, part_len)
-            .is_empty();
-        let part_value = part_complete
-            .then(|| {
-                member
-                    .parts
-                    .get(&part_position)
-                    .and_then(|runs| runs.compose(0, part_len))
-            })
-            .flatten();
-        if let Some(value) = part_value {
-            member.checked_parts.insert(part_position, value);
-            if let Some(expected) = packed_crc32
-                && expected != value
-                && !self.record_part_checksum_damage(volume_index, member_id, part_position)
-            {
-                return Err(self.fail(DemotionReason::PartChecksumMismatch));
-            }
+        // A repair's pieces are recorded here and judged together afterwards;
+        // see `repair_draining`.
+        if defer_gates {
+            return Ok(());
         }
-
+        // Layer 1: the part's packed CRC32, as soon as the part is complete.
+        self.gate_part(member_id, volume_index)?;
         self.try_verify_member(member_id)
     }
 }
