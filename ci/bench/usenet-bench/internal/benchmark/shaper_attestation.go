@@ -489,6 +489,39 @@ func FetchShaperSnapshot(ctx context.Context, client *http.Client, controlURL st
 	return snapshot, nil
 }
 
+// FetchShaperSnapshotAfterRun reads the attestation a measured run ends with.
+// The client has already been stopped when this is called, but the shaper
+// keeps counting a connection until both relay directions have drained, and
+// on a delayed link that drain outlives the client's exit by a round trip or
+// two. Those connections carry nothing the run did not already deliver, so
+// the snapshot is read again until they are gone rather than failing a run
+// that finished cleanly. A shaper that stays busy for the whole budget is
+// still reported: that is a client that did not stop, not a link draining.
+func FetchShaperSnapshotAfterRun(ctx context.Context, client *http.Client, controlURL string) (ShaperSnapshot, error) {
+	return fetchShaperSnapshotWhenQuiet(ctx, client, controlURL, shaperQuietBudget, shaperQuietInterval)
+}
+
+func fetchShaperSnapshotWhenQuiet(ctx context.Context, client *http.Client, controlURL string, budget, interval time.Duration) (ShaperSnapshot, error) {
+	deadline := time.Now().Add(budget)
+	for {
+		snapshot, err := FetchShaperSnapshot(ctx, client, controlURL)
+		if err != nil {
+			return ShaperSnapshot{}, err
+		}
+		if snapshot.ActiveDownstreamConnections == 0 {
+			return snapshot, nil
+		}
+		if time.Now().After(deadline) {
+			return snapshot, fmt.Errorf("shaper still has %d active downstream connections %s after the measured run", snapshot.ActiveDownstreamConnections, budget)
+		}
+		select {
+		case <-ctx.Done():
+			return ShaperSnapshot{}, fmt.Errorf("%w (shaper still had %d active downstream connections after the measured run)", ctx.Err(), snapshot.ActiveDownstreamConnections)
+		case <-time.After(interval):
+		}
+	}
+}
+
 // ShaperArticleCensus is what one measured run asked the server for, from the
 // shaper's count of the client's own command lines: how many article requests
 // (ARTICLE/BODY/HEAD/STAT) it sent, how many named a distinct message-id, and

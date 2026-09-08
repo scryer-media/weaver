@@ -37,8 +37,10 @@ func runQueue(ctx context.Context, cfg Config) error {
 
 	cpu := cpuSampler{docker: container.docker, name: container.name, reason: "suite-level telemetry is not reported for this submission mode"}
 	instructions := unavailableInstructionRecorder("suite-level retired instructions are not reported for this submission mode")
-	if input.SubmissionMode == benchmark.SubmissionModeQueued {
+	if input.SubmissionMode == benchmark.SubmissionModeQueued || input.SubmissionMode == benchmark.SubmissionModeQueueDrain {
 		cpu = startCPUSampler(ctx, container.docker, container.name)
+	}
+	if input.SubmissionMode == benchmark.SubmissionModeQueued {
 		instructions = startInstructionRecorder(ctx, cfg, container)
 	}
 	metricsCollected := false

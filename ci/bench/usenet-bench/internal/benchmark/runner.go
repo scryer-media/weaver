@@ -430,7 +430,7 @@ func executeRun(parent context.Context, config RunConfig, run Run) (artifact Run
 		return artifact
 	}
 	if artifact.ShaperBefore != nil {
-		shaperAfter, err := FetchShaperSnapshot(parent, nil, config.ShaperControlURL)
+		shaperAfter, err := FetchShaperSnapshotAfterRun(parent, nil, config.ShaperControlURL)
 		if err != nil {
 			artifact.Error = err.Error()
 			return artifact
