@@ -69,6 +69,17 @@ use crate::pipeline::{
 /// keep the whole plan's resident cost to one buffer.
 const REARM_CHUNK_BYTES: usize = 256 * 1024;
 
+/// A placement failure before any coverage is admitted. The caller decides
+/// whether to reconstruct conventional volumes or retain verified repair output.
+#[derive(Debug)]
+pub(in crate::pipeline) enum DirectPlacementError {
+    Sparse {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    Write(std::io::Error),
+}
+
 #[derive(Clone, Default)]
 struct PendingDemotionMaterialization {
     files: HashSet<NzbFileId>,

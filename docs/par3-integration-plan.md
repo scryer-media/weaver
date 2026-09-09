@@ -89,6 +89,17 @@ Batch-slice validation: all 390 direct-store tests, the full 3,813-test workspac
 sweep (13 existing skips), all three doctests, formatting and workspace Clippy
 pass. Failed closing drains also keep checkpoints fenced until router retirement.
 
+Direct placement now separates writing/coverage admission from demotion policy.
+The conventional wrapper still demotes on sparse or destination-write failure;
+the repair-facing boundary returns the original I/O error so its caller can
+preserve verified materialized output. Failure regressions keep both that output
+and clean virtual coverage intact, without claiming failed writes or launching
+reconstruction. The production PAR3 installation path has not yet switched to
+this boundary.
+Placement-slice validation: all 3,815 workspace Nextest tests (13 existing skips),
+all three doctests, formatting and all-target/all-feature workspace Clippy pass.
+It continues to use the existing unreleased 0.11.3 workspace version.
+
 Still pending: incremental decode-to-publication wiring, mixed-format fallback,
 selective direct-store repair, positioned verification,
 embedded archives, evidence persistence and product surfaces. Rebuilt files currently
