@@ -357,7 +357,7 @@ impl JobExtractionBudget {
     }
 
     /// Whether the extraction root has produced at least one capacity reading.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn disk_capacity_known(&self) -> bool {
         self.disk
             .lock()
