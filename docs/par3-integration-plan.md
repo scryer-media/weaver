@@ -230,10 +230,20 @@ Plain and NZB-password encrypted restart cases pass without demotion or complete
 source refetch, including changed member partials. A separate eight-block encrypted
 case confirms that insufficient recovery fails without delivering output; the
 successful changed-CBC-chain case uses 24 official recovery blocks.
-Initial API password overrides are lost at admission, so that enabled restart
-case still fails. Automatic approval review rejected persisting them in the
-existing password column; the operator decision is pending. No password-storage
-change was applied. The 64 MiB large-geometry limit is separately unresolved.
+Initial API password overrides were lost at admission. With explicit operator
+approval, initial overrides, later updates and parked duplicate-candidate
+passwords now use the existing AES-256-GCM encryption key and stored envelope.
+Restore authenticates decryption and preserves the distinction between no override
+and an explicit empty password. Existing plaintext overrides migrate through the
+normal startup encryption pass; archive credentials participate in missing-key
+and wrong-key validation. The enabled API-password encrypted-RAR restart scenario
+now passes, asserting encrypted storage before restart, byte-exact repair and
+preserved direct extraction. Validation passed formatting, all-target/all-feature
+Clippy, all 3,854 workspace Nextest cases (13 existing skips), and three doctests.
+The full native matrix passes 130 leaves; only the two 65,538-block retained-layout
+limit cases fail. PostgreSQL runtime validation remains unavailable locally.
+This uses the existing unreleased 0.11.3 workspace version and adds no dependencies.
+The 64 MiB large-geometry limit remains separately unresolved.
 
 Repeated direct restart now preserves persisted RAR facts owned by an accepted,
 non-demoted direct checkpoint. Conventional discovery previously discarded those

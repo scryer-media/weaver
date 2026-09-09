@@ -130,6 +130,15 @@ func TestPar3DirectRestartE2E(t *testing.T) {
 			if !ready {
 				t.Fatalf("job never reached durable direct recovery wait: %s log=%s", api.status(job), firstLog)
 			}
+			if password != "" {
+				var stored string
+				if err := db.QueryRow("SELECT password FROM active_jobs WHERE job_id = ?", job).Scan(&stored); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.HasPrefix(stored, "enc:v1:") || stored == password {
+					t.Fatal("submitted archive password was not encrypted at rest")
+				}
+			}
 			before := map[string]int{}
 			nntp.mu.Lock()
 			for id, count := range nntp.requests {

@@ -21,6 +21,9 @@ pub struct ActiveJob {
     pub paused_resume_status: Option<&'static str>,
     pub paused_resume_download_state: Option<&'static str>,
     pub paused_resume_post_state: Option<&'static str>,
+    /// Effective unpack password for restore. Database writes encrypt this
+    /// value; `None` keeps the NZB password and an empty string explicitly clears it.
+    pub password_override: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1790,6 +1790,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             paused_resume_status: None,
             paused_resume_download_state: None,
             paused_resume_post_state: None,
+            password_override: None,
         })
         .unwrap();
     let (assembly, download_queue, recovery_queue) =

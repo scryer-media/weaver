@@ -716,6 +716,7 @@ impl Pipeline {
             paused_resume_post_state: options
                 .initially_paused
                 .then_some(crate::jobs::model::PostState::Idle.as_str()),
+            password_override: Some(spec.password.clone().unwrap_or_default()),
         };
         // Biggest single write on the add-job path: keep it off the
         // orchestrator loop, but never create an in-memory job without durable

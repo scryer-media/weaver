@@ -1428,6 +1428,8 @@ impl Database {
                 "SELECT password FROM servers WHERE password IS NOT NULL",
                 "SELECT password FROM rss_feeds WHERE password IS NOT NULL",
                 "SELECT password FROM proxy_profiles WHERE password IS NOT NULL",
+                "SELECT password FROM active_jobs WHERE password IS NOT NULL",
+                "SELECT source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
             ] {
                 let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
                 for row in rows {
@@ -1477,6 +1479,14 @@ impl Database {
                 (
                     "proxy",
                     "SELECT id, password FROM proxy_profiles WHERE password IS NOT NULL",
+                ),
+                (
+                    "archive job",
+                    "SELECT job_id AS id, password FROM active_jobs WHERE password IS NOT NULL",
+                ),
+                (
+                    "archive candidate",
+                    "SELECT job_id AS id, source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
                 ),
             ] {
                 let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
@@ -1594,6 +1604,37 @@ impl Database {
                     count = feed_rows.len(),
                     "encrypted plaintext RSS feed passwords"
                 );
+            }
+
+            for (select, update) in [
+                (
+                    "SELECT job_id, password FROM active_jobs WHERE password IS NOT NULL",
+                    "UPDATE active_jobs SET password = {} WHERE job_id = {} AND password = {}",
+                ),
+                (
+                    "SELECT job_id, source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
+                    "UPDATE semantic_duplicate_candidates SET source_password = {} WHERE job_id = {} AND source_password = {}",
+                ),
+            ] {
+                let rows = SqlRuntime::fetch_all(datastore.read_exec(), select, &[]).await?;
+                for row in rows {
+                    let password = row.text("password")?;
+                    if password.is_empty() || is_encrypted(&password) {
+                        continue;
+                    }
+                    let encrypted = crate::persistence::encryption::encrypt_value(&key, &password)
+                        .map_err(StateError::Database)?;
+                    SqlRuntime::execute(
+                        datastore.read_exec(),
+                        update,
+                        &[
+                            SqlArg::Text(encrypted),
+                            SqlArg::I64(row.i64("job_id")?),
+                            SqlArg::Text(password),
+                        ],
+                    )
+                    .await?;
+                }
             }
 
             Ok(())
