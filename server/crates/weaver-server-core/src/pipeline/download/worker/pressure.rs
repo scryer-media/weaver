@@ -15,7 +15,7 @@ impl DownloadPressure {
     }
 
     pub(in crate::pipeline::download::worker) fn suppresses_spillover(self) -> bool {
-        self.state == DownloadPressureState::Soft || self.uu_spool_admission_capped
+        self.state == DownloadPressureState::Soft
     }
 }
 
@@ -79,11 +79,12 @@ impl Pipeline {
         cursors: &HashMap<NzbFileId, u32>,
         work: &DownloadWork,
     ) -> bool {
-        // Before a file's first UU part identifies its encoding, ordinal zero
-        // is the only work that could establish its cursor. Permitting it also
-        // leaves yEnc's ordinary ordering unchanged while the UU cache pauses.
-        cursors.get(&work.segment_id.file_id).copied().unwrap_or(0)
-            == work.segment_id.segment_number
+        // Only identified UU files have a sequential cursor. yEnc and files
+        // whose encoding is not yet known retain ordinary dispatch; if an
+        // unknown article proves to be UU, decode enforces park admission.
+        cursors
+            .get(&work.segment_id.file_id)
+            .is_none_or(|next| *next == work.segment_id.segment_number)
     }
 
     pub(in crate::pipeline::download::worker) fn download_pressure_limits(
@@ -335,7 +336,7 @@ impl Pipeline {
         let decode_delay =
             Self::soft_pressure_delay_for(pressure.decode_backlog_bytes, decode_soft, decode_hard);
         let write_delay =
-            Self::soft_pressure_delay_for(pressure.write_pending_bytes, write_soft, write_hard);
+            Self::soft_pressure_delay_for(pressure.write_buffered_bytes, write_soft, write_hard);
         decode_delay.max(write_delay)
     }
 
@@ -437,16 +438,11 @@ impl Pipeline {
             .load(Ordering::Relaxed)
             .saturating_add(self.metrics.decode_active_bytes.load(Ordering::Relaxed))
             .saturating_add(released_result_bytes);
-        // Keep hard pressure tied to resident memory. The total pending gauge
-        // includes transient UU spill files and is deliberately soft-only so
-        // a missing prefix can still dispatch and make the spool drain.
+        // Shared memory pressure counts resident bytes. UU spill files have
+        // their own admission limits and must not pace unrelated yEnc work.
         let write_bytes = self.metrics.write_buffered_bytes.load(Ordering::Relaxed);
-        let write_pending_bytes = self
-            .metrics
-            .write_pending_bytes
-            .load(Ordering::Relaxed)
-            .max(write_bytes);
-        let uu_spool_admission_capped = self.uu_spool_admission_capped(0);
+        let uu_spool_admission_capped =
+            !self.uu_files.is_empty() && self.uu_spool_admission_capped(0);
 
         if decode_bytes >= decode_hard {
             self.download_decode_hard_pressure_latched = true;
@@ -462,7 +458,7 @@ impl Pipeline {
         let decode_hard_pressure = self.download_decode_hard_pressure_latched;
         let write_hard_pressure = self.download_write_hard_pressure_latched;
         let decode_soft_pressure = decode_bytes >= decode_soft;
-        let write_soft_pressure = write_pending_bytes >= write_soft;
+        let write_soft_pressure = write_bytes >= write_soft;
 
         let (state, reason) = if decode_hard_pressure || write_hard_pressure {
             (
@@ -503,7 +499,6 @@ impl Pipeline {
             reason,
             decode_backlog_bytes: decode_bytes,
             write_buffered_bytes: write_bytes,
-            write_pending_bytes,
             uu_spool_admission_capped,
             decode_hard_limit_bytes: decode_hard,
             write_hard_limit_bytes: write_hard,

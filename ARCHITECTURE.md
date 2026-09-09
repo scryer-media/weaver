@@ -202,6 +202,13 @@ That means:
 
 If memory growth is unbounded, the feature is not done.
 
+UU spool admission limits apply only to files identified as UU. A capped UU
+file may still fetch the article that advances its sequential assembly cursor.
+yEnc and files of unknown encoding retain normal dispatch, batching, refill,
+and spillover behavior; decode enforces the UU park limits when an article
+first identifies a file as UU. Disk-spooled UU bytes do not count toward shared
+memory pressure. Resident bytes remain subject to the shared memory budgets.
+
 ### 8. Shared Mutable Runtime State Must Be Explicit
 
 Shared mutable runtime coordination must stay explicit and centrally owned.

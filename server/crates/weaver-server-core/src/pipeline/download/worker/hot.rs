@@ -25,11 +25,24 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline::download::worker) fn job_has_dispatchable_work(
-        &self,
+        &mut self,
         job_id: JobId,
     ) -> bool {
+        let uu_cursor_ordinals = (!self.uu_files.is_empty() && self.uu_spool_admission_capped(0))
+            .then(|| self.uu_spool_cursor_ordinals());
         self.jobs.get(&job_id).is_some_and(|state| {
-            !state.download_queue.is_empty() && Self::status_allows_download_dispatch(&state.status)
+            Self::status_allows_download_dispatch(&state.status)
+                && uu_cursor_ordinals.as_ref().map_or_else(
+                    || !state.download_queue.is_empty(),
+                    |cursors| {
+                        // A capped UU tail cannot consume a spare connection;
+                        // it must not withhold that capacity from another job.
+                        state
+                            .download_queue
+                            .peek_next_matching(|work| Self::uu_work_closes_cursor(cursors, work))
+                            .is_some()
+                    },
+                )
         })
     }
 
@@ -373,7 +386,7 @@ impl Pipeline {
     /// still runs on its own schedule elsewhere; it is protocol capability
     /// detection, not a reason to withhold spillover, so it plays no part here.
     pub(in crate::pipeline::download::worker) fn hot_best_mode_block_reason(
-        &self,
+        &mut self,
         hot_job_id: JobId,
         max_connections: usize,
     ) -> HotBestModeBlockReason {
