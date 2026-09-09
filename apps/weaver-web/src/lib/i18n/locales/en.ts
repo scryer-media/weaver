@@ -50,7 +50,7 @@ const en: LocaleDictionary = {
   "status.queued": "Queued",
   "status.downloading": "Downloading",
   "status.propagating": "Propagating",
-  "status.propagationUntil": "Waiting for propagation. Download starts at {time}.",
+  "status.propagationUntil": "Waiting for propagation. Download starts at {{time}}.",
   "status.fetchingRepairData": "Fetching repair data",
   "status.verifying": "Verifying",
   "status.repairing": "Repairing",

@@ -520,7 +520,7 @@ export function JobDetail() {
       <JobOutputFilesCard jobId={job.id} status={job.status} />
 
       {/* Timeline */}
-      <PipelineTimelineCard timeline={timeline} />
+      <PipelineTimelineCard timeline={timeline} propagating={job.status === "PROPAGATING"} />
 
       {/* Release details */}
       <CollapsibleCard title="Release Details" defaultOpen>
