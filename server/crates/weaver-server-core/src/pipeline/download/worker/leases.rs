@@ -597,16 +597,17 @@ impl Pipeline {
         job_id: JobId,
         server_idx: usize,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
-        if self.refresh_download_pressure().uu_spool_admission_capped {
-            return Ok(None);
-        }
+        let uu_cursor_ordinals = self
+            .refresh_download_pressure()
+            .uu_spool_admission_capped
+            .then(|| self.uu_spool_cursor_ordinals());
         let par2_metadata_bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
         let Some(first) = self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
             None,
             DownloadWorkSelection::NonCritical,
-            None,
+            uu_cursor_ordinals.as_ref(),
         ) else {
             return Ok(None);
         };
@@ -656,7 +657,7 @@ impl Pipeline {
                 par2_metadata_bootstrap_files.as_deref(),
                 Some(DownloadBatchSelector::initial(&compatibility)),
                 DownloadWorkSelection::NonCritical,
-                None,
+                uu_cursor_ordinals.as_ref(),
             ) else {
                 break;
             };
@@ -752,13 +753,18 @@ impl Pipeline {
         // under the initial rule would stop at the first priority change, which
         // is precisely the boundary it exists to cross.
         let selector = DownloadBatchSelector::new(&compatibility, rule);
+        // Keep capped UU files at their next required ordinal throughout the
+        // batch. Other files retain the ordinary runway and can share a lease.
+        let uu_cursor_ordinals = pressure
+            .uu_spool_admission_capped
+            .then(|| self.uu_spool_cursor_ordinals());
         while works.len() < work_limit {
             let Some(next) = self.pop_download_work_for_par2_bootstrap(
                 job_id,
                 par2_metadata_bootstrap_files,
                 Some(selector),
                 selection,
-                None,
+                uu_cursor_ordinals.as_ref(),
             ) else {
                 break;
             };
@@ -903,9 +909,6 @@ impl Pipeline {
         refill: bool,
         article_bytes: u32,
     ) -> usize {
-        if pressure.uu_spool_admission_capped {
-            return 1;
-        }
         if self.hot_dispatch_job == Some(job_id) {
             match pressure.state {
                 DownloadPressureState::Clear => {

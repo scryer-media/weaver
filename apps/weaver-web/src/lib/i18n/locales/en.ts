@@ -49,6 +49,8 @@ const en: LocaleDictionary = {
   // Status labels
   "status.queued": "Queued",
   "status.downloading": "Downloading",
+  "status.propagating": "Propagating",
+  "status.propagationUntil": "Waiting for propagation. Download starts at {{time}}.",
   "status.fetchingRepairData": "Fetching repair data",
   "status.verifying": "Verifying",
   "status.repairing": "Repairing",
@@ -417,6 +419,8 @@ const en: LocaleDictionary = {
   "settings.dataDirDesc": "Weaver stores its database, NZB cache, and internal state here.",
   "settings.cleanupAfterExtract": "Cleanup After Extract",
   "settings.cleanupDesc": "Delete intermediate files after successful extraction",
+  "settings.propagationDelay": "Propagation delay (seconds)",
+  "settings.propagationDelayDesc": "Wait until a post is this old before downloading. 0 starts immediately. Changes apply to waiting downloads without a restart.",
   "settings.maxRetries": "Max Retries",
   "settings.maxRetriesDesc": "How many times Weaver should retry an article before marking it permanently missing.",
   "settings.ipReplacementTrialExtraConnections": "IP Replacement Burst",

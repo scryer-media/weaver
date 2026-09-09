@@ -738,6 +738,7 @@ fn build_service_with_security(
         retry: None,
         max_download_speed: None,
         isp_bandwidth_cap: None,
+        propagation_delay_secs: None,
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

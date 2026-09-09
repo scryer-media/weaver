@@ -80,8 +80,13 @@ pub(crate) type DiskProbe = Box<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
 #[derive(Debug)]
 struct DiskEstimate {
     refreshed: Option<Instant>,
-    /// Free bytes at the last reading, less every spill admitted since.
+    /// Free bytes at the last successful reading, less every spill admitted
+    /// since. Held across probe failures so admissions keep being accounted.
     available: Option<u64>,
+    /// The most recent probe failed; `available` is the last good reading.
+    /// A stale reading is debited but never refuses, since only a fresh
+    /// reading can confirm the reserve is really gone.
+    stale: bool,
 }
 
 /// See the module documentation.
@@ -116,7 +121,19 @@ impl HoldsAccountant {
         Self::with_probe(
             limits,
             Box::new(|path| {
-                crate::operations::disk::disk_space(path).map(|space| space.available_bytes)
+                // A missing working directory must not borrow capacity from
+                // its parent. Keep the estimate stale until this path returns.
+                match crate::operations::disk::probe_disk_space(path) {
+                    Ok(space) => Some(space.available_bytes),
+                    Err(error) => {
+                        tracing::debug!(
+                            path = %path.display(),
+                            error = %error,
+                            "holds scratch free-space reading unavailable"
+                        );
+                        None
+                    }
+                }
             }),
         )
     }
@@ -136,6 +153,7 @@ impl HoldsAccountant {
             disk: Mutex::new(DiskEstimate {
                 refreshed: None,
                 available: None,
+                stale: false,
             }),
             probe,
         }
@@ -192,16 +210,22 @@ impl HoldsAccountant {
             .refreshed
             .is_none_or(|refreshed| refreshed.elapsed() >= DISK_REFRESH_INTERVAL);
         if stale {
-            disk.available = (self.probe)(dir);
+            match (self.probe)(dir) {
+                Some(available) => {
+                    disk.available = Some(available);
+                    disk.stale = false;
+                }
+                None => disk.stale = true,
+            }
             disk.refreshed = Some(Instant::now());
         }
         let Some(available) = disk.available else {
             return Ok(());
         };
-        if available < bytes.saturating_add(self.limits.disk_reserve_bytes) {
+        if !disk.stale && available < bytes.saturating_add(self.limits.disk_reserve_bytes) {
             return Err(DemotionReason::HoldsScratchDiskReserve);
         }
-        disk.available = Some(available - bytes);
+        disk.available = Some(available.saturating_sub(bytes));
         Ok(())
     }
 }
@@ -320,6 +344,41 @@ mod tests {
             Ok(()),
             "a probe that cannot answer must not demote a set that was routing fine"
         );
+    }
+
+    #[test]
+    fn a_probe_outage_holds_the_last_reading_without_refusing() {
+        let free = Arc::new(Mutex::new(Some(1000u64)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let accountant = HoldsAccountant::with_probe(
+            limits(u64::MAX, u64::MAX, 600),
+            probe_returning(Arc::clone(&free), Arc::clone(&calls)),
+        );
+        let dir = Path::new("/nonexistent");
+        assert_eq!(accountant.admit_scratch(300, dir), Ok(()));
+
+        // The filesystem stops answering: the 700 left on the last reading is
+        // still debited, but a breach on a stale number does not demote.
+        *free.lock().unwrap() = None;
+        {
+            let mut disk = accountant.disk.lock().unwrap();
+            disk.refreshed = Some(Instant::now() - DISK_REFRESH_INTERVAL);
+        }
+        assert_eq!(accountant.admit_scratch(500, dir), Ok(()));
+        assert_eq!(accountant.disk.lock().unwrap().available, Some(200));
+        assert!(accountant.disk.lock().unwrap().stale);
+
+        // A fresh reading takes over and enforces again.
+        *free.lock().unwrap() = Some(650);
+        {
+            let mut disk = accountant.disk.lock().unwrap();
+            disk.refreshed = Some(Instant::now() - DISK_REFRESH_INTERVAL);
+        }
+        assert_eq!(
+            accountant.admit_scratch(100, dir),
+            Err(DemotionReason::HoldsScratchDiskReserve)
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 3);
     }
 
     #[test]

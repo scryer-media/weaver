@@ -376,7 +376,8 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     shared_state.set_paused(false);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetSpeedLimit { reply, .. } => {
+                SchedulerCommand::SetPropagationDelay { reply, .. }
+                | SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetIpReplacementTrialExtraConnections { reply, .. } => {

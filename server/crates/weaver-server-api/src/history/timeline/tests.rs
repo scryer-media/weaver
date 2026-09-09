@@ -477,6 +477,48 @@ fn download_resumes_after_pause_without_explicit_second_start() {
 }
 
 #[test]
+fn propagation_wait_is_pending_until_the_actual_download_start() {
+    let mut held = job(JobStatus::Downloading);
+    held.download_state = weaver_server_core::DownloadState::Queued;
+    held.download_wait_reason =
+        Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON.to_owned());
+    held.download_retry_at_epoch_ms = Some(301_000.0);
+    let created = event("JobCreated", 1_000, None, "");
+    let waiting = build_job_timeline(&held, None, std::slice::from_ref(&created));
+    assert_eq!(waiting.outcome, JobStatusGql::Queued);
+    assert_eq!(waiting.lanes.len(), 1);
+    assert_eq!(waiting.lanes[0].stage, TimelineStage::PendingDownload);
+    assert_eq!(waiting.lanes[0].spans[0].started_at, 1_000.0);
+    assert_eq!(waiting.lanes[0].spans[0].ended_at, None);
+
+    held.status = JobStatus::Paused;
+    held.run_state = weaver_server_core::RunState::Paused;
+    assert_eq!(
+        build_job_timeline(&held, None, std::slice::from_ref(&created)).outcome,
+        JobStatusGql::Paused
+    );
+
+    let running = build_job_timeline(
+        &job(JobStatus::Downloading),
+        None,
+        &[created, event("DownloadStarted", 301_000, None, "")],
+    );
+    assert_eq!(running.outcome, JobStatusGql::Downloading);
+    let pending = running
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::PendingDownload)
+        .unwrap();
+    assert_eq!(pending.spans[0].ended_at, Some(301_000.0));
+    let downloading = running
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Downloading)
+        .unwrap();
+    assert_eq!(downloading.spans[0].started_at, 301_000.0);
+}
+
+#[test]
 fn synthesizes_running_download_lane_for_active_job_without_persisted_start_event() {
     let timeline = build_job_timeline(
         &job(JobStatus::Downloading),

@@ -66,6 +66,7 @@ impl Pipeline {
             ip_replacement_trial_extra_connections,
             direct_store_settings,
             direct_unpack_settings,
+            propagation_delay,
         ) = {
             let cfg = config.read().await;
             (
@@ -85,6 +86,7 @@ impl Pipeline {
                 // Same contract, same reason: resolved once so a set admitted
                 // under an enabled gate cannot find it disabled mid-chase.
                 crate::pipeline::direct_unpack::DirectUnpackSettings::resolve(&cfg),
+                Duration::from_secs(u64::from(cfg.propagation_delay_secs())),
             )
         };
         metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
@@ -239,6 +241,11 @@ impl Pipeline {
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
+            uu_spool_capacity: crate::operations::CapacitySampler::new(
+                intermediate_dir.clone(),
+                Pipeline::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL,
+            ),
+            uu_spool_blocked_spill_bytes: None,
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
@@ -246,8 +253,6 @@ impl Pipeline {
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
-            uu_spool_last_free_space_check: None,
-            uu_spool_available_bytes: None,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
             pending_file_progress: HashMap::new(),
@@ -367,6 +372,9 @@ impl Pipeline {
             snapshot_publish_pending: false,
             download_restart_durable_lead_retry_after: HashMap::new(),
             propagation_ready_at: HashMap::new(),
+            published_propagation_holds: HashMap::new(),
+            propagation_delay,
+            #[cfg(test)]
             propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
             last_owned_lane_acquire_failure_log_at: None,
@@ -1204,7 +1212,32 @@ impl Pipeline {
         self.snapshot_published_at = Some(Instant::now());
         self.snapshot_publish_pending = false;
         let _ = self.refresh_bandwidth_cap_window();
-        self.shared_state.publish_jobs(self.list_jobs());
+        let jobs = self.list_jobs();
+        let holds: HashMap<_, _> = jobs
+            .iter()
+            .filter(|job| {
+                job.download_wait_reason.as_deref()
+                    == Some(crate::jobs::handle::PROPAGATION_WAIT_REASON)
+            })
+            .filter_map(|job| {
+                job.download_retry_at_epoch_ms
+                    .map(|at| (job.job_id, at as i64))
+            })
+            .collect();
+        let changed: HashSet<_> = holds
+            .keys()
+            .chain(self.published_propagation_holds.keys())
+            .copied()
+            .filter(|job_id| holds.get(job_id) != self.published_propagation_holds.get(job_id))
+            .collect();
+        self.published_propagation_holds = holds;
+        self.shared_state.publish_jobs(jobs);
+        // Publish the updated payload before notifying live queue subscribers.
+        for job_id in changed {
+            let _ = self
+                .event_tx
+                .send(PipelineEvent::PhaseProgressUpdated { job_id });
+        }
     }
 
     /// Publish the job snapshot unless one was already published inside the
@@ -2318,8 +2351,8 @@ fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
 }
 
 pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {
-    match crate::operations::disk_space(output_dir) {
-        Some(space) => {
+    match crate::operations::probe_nearest_disk_space(output_dir) {
+        Ok(space) => {
             let available = space.available_bytes;
             if available < needed_bytes {
                 let avail_mb = available / (1024 * 1024);
@@ -2334,7 +2367,11 @@ pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) 
                 debug!(available_mb = avail_mb, "disk space check passed");
             }
         }
-        None => debug!("could not check free disk space"),
+        Err(error) => debug!(
+            path = %output_dir.display(),
+            error = %error,
+            "could not check free disk space"
+        ),
     }
 }
 

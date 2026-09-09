@@ -32,6 +32,9 @@ impl Database {
         let ip_replacement_trial_extra_connections = settings
             .get("ip_replacement_trial_extra_connections")
             .and_then(|v| v.parse().ok());
+        let propagation_delay_secs = settings
+            .get("propagation_delay_secs")
+            .and_then(|v| v.parse().ok());
         let cleanup_after_extract = settings
             .get("cleanup_after_extract")
             .and_then(|v| v.parse().ok());
@@ -276,6 +279,7 @@ impl Database {
             cleanup_after_extract,
             isp_bandwidth_cap,
             ip_replacement_trial_extra_connections,
+            propagation_delay_secs,
             watch_folder,
             duplicate_policy,
             direct_store,
@@ -297,6 +301,9 @@ impl Database {
         }
         if let Some(speed) = config.max_download_speed {
             self.set_setting("max_download_speed", &speed.to_string())?;
+        }
+        if let Some(delay) = config.propagation_delay_secs {
+            self.set_setting("propagation_delay_secs", &delay.to_string())?;
         }
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;

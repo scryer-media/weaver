@@ -10,7 +10,7 @@ async fn get_settings_defaults() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            r#"{ settings { dataDir intermediateDir completeDir cleanupAfterExtract maxDownloadSpeed maxRetries enableSrrdbLookup } }"#,
+            r#"{ settings { dataDir intermediateDir completeDir cleanupAfterExtract maxDownloadSpeed maxRetries propagationDelaySecs enableSrrdbLookup } }"#,
         )
         .await;
     assert_no_errors(&resp);
@@ -27,7 +27,31 @@ async fn get_settings_defaults() {
     assert_eq!(s["maxDownloadSpeed"].as_u64().unwrap(), 0);
     // maxRetries defaults to 3.
     assert_eq!(s["maxRetries"].as_u64().unwrap(), 3);
+    assert_eq!(s["propagationDelaySecs"].as_u64().unwrap(), 0);
     assert!(!s["enableSrrdbLookup"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn propagation_delay_persists_and_can_be_disabled() {
+    let h = TestHarness::new().await;
+    for seconds in [300, 0] {
+        let response = h.execute(&format!(
+            "mutation {{ updateSettings(input: {{ propagationDelaySecs: {seconds} }}) {{ propagationDelaySecs }} }}"
+        )).await;
+        assert_no_errors(&response);
+        assert_eq!(
+            response_data(&response)["updateSettings"]["propagationDelaySecs"],
+            seconds
+        );
+        assert_eq!(
+            h.db.load_config().unwrap().propagation_delay_secs(),
+            seconds
+        );
+        assert_eq!(h.config.read().await.propagation_delay_secs(), seconds);
+    }
+    let invalid = h.execute("mutation { updateSettings(input: { propagationDelaySecs: -1 }) { propagationDelaySecs } }").await;
+    assert!(!invalid.errors.is_empty());
+    assert_eq!(h.db.load_config().unwrap().propagation_delay_secs(), 0);
 }
 
 #[tokio::test]

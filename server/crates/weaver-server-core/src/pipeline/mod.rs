@@ -82,46 +82,6 @@ fn download_restart_checkpoint_bytes() -> u64 {
     })
 }
 
-/// How long after a post's own date its articles are left alone before weaver
-/// will fetch them.
-///
-/// # Why there is a delay at all
-///
-/// A binary post does not appear on a server the instant it is made: it
-/// propagates, article by article, and a reader that starts pulling immediately
-/// meets articles that simply have not arrived yet. Every one of those reads is
-/// a not-found that looks exactly like a missing article — it burns a retry, it
-/// spends the article's server budget, it marks servers unhealthy, and on a
-/// par2-less job it can fail a download that would have succeeded ten minutes
-/// later. Waiting costs a few minutes; not waiting costs accuracy in the one
-/// signal weaver uses to decide an article is gone.
-///
-/// # Why it is not a setting
-///
-/// Deliberately not user-facing: no settings row, no schema column, no UI, no
-/// API surface. Both major clients expose this knob and the community guidance
-/// that has grown up around it is a range — roughly five to fifteen minutes —
-/// rather than a value anyone tunes per job. A knob whose right answer is "the
-/// conservative end, always" is not a choice worth asking a user to make; it is
-/// a default worth getting right. The environment variable exists so an
-/// operator can disable the behaviour or shorten it for a test, not as a
-/// supported configuration surface.
-///
-/// `WEAVER_PROPAGATION_DELAY_SECS`: unset takes the conservative end of that
-/// range, `0` disables deferral entirely, and any other value is a delay in
-/// seconds. Read once, like every other environment gate here.
-fn propagation_delay() -> Duration {
-    const DEFAULT_PROPAGATION_DELAY_SECS: u64 = 300;
-    static DELAY: OnceLock<Duration> = OnceLock::new();
-    *DELAY.get_or_init(|| {
-        let secs = std::env::var("WEAVER_PROPAGATION_DELAY_SECS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_PROPAGATION_DELAY_SECS);
-        Duration::from_secs(secs)
-    })
-}
-
 fn health_milli(total: u64, failed_bytes: u64) -> u32 {
     total
         .saturating_sub(failed_bytes)
@@ -3181,15 +3141,15 @@ pub struct Pipeline {
     ///
     /// Absent means the question has not been asked yet or was answered
     /// "eligible" — see [`Pipeline::propagation_hold_until`], which is where the
-    /// answer is computed and cached. Same shape and same role as
-    /// `download_restart_durable_lead_retry_after` above: a per-job "not
-    /// before", read at the dispatch gate and surfaced to the run loop's sleep
-    /// so the wake happens at eligibility rather than by polling.
-    pub(super) propagation_ready_at: HashMap<JobId, Instant>,
-    /// Test-only override of [`propagation_delay`], mirroring
-    /// `stateful_par2_session_forced`. The env gate is read once per process,
-    /// so a test that needs a different delay cannot get one by setting the
-    /// variable.
+    /// answer is computed and cached as a monotonic deadline plus a stable
+    /// epoch-millisecond timestamp for clients. The dispatch gate and run-loop
+    /// sleep use the monotonic deadline, so eligibility wakes without polling.
+    pub(super) propagation_ready_at: HashMap<JobId, (Instant, i64)>,
+    /// Last visible holds, used to notify subscribers after publishing a snapshot.
+    pub(super) published_propagation_holds: HashMap<JobId, i64>,
+    /// Configured minimum post age, updated through the scheduler command channel.
+    pub(super) propagation_delay: Duration,
+    #[cfg(test)]
     pub(super) propagation_delay_forced: Option<Duration>,
     /// Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
@@ -3226,12 +3186,15 @@ pub struct Pipeline {
     pub(super) uu_spool_max_segments: usize,
     /// Free space preserved on the intermediate filesystem while spilling UU.
     pub(super) uu_spool_min_free_bytes: u64,
-    /// Most recent free-space sample for the spool filesystem.
-    pub(super) uu_spool_last_free_space_check: Option<Instant>,
-    /// Cached available bytes for the spool filesystem; `None` means unknown.
-    pub(super) uu_spool_available_bytes: Option<u64>,
+    /// Rate-limited free-space readings for the spool filesystem. Admitted
+    /// spills are debited against the cached reading between probes.
+    pub(super) uu_spool_capacity: crate::operations::CapacitySampler,
+    /// Largest refused UU spill. Dispatch preserves cursor progress until
+    /// this many bytes can be parked in memory or admitted to the spool.
+    pub(super) uu_spool_blocked_spill_bytes: Option<usize>,
     #[cfg(test)]
-    /// Test-only free-space result; `Some(None)` exercises a failed probe.
+    /// Test-only free-space reading; `Some(None)` exercises a filesystem that
+    /// has never produced a reading.
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
     /// Per-file write reorder buffers for decoded segments waiting on write order.
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
