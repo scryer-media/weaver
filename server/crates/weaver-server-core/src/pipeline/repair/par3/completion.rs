@@ -70,9 +70,27 @@ impl Pipeline {
         match status {
             RepairStatus::Complete => false,
             RepairStatus::Ready => {
+                if self.prepare_direct_store_for_par3_repair(job_id, set).await {
+                    return true;
+                }
                 self.prepare_direct_unpack_for_par3_repair(job_id);
                 if self.job_has_active_extraction_tasks(job_id) {
                     return true;
+                }
+                if self.jobs.get(&job_id).is_some_and(|state| {
+                    matches!(
+                        state.status,
+                        JobStatus::Extracting | JobStatus::QueuedExtract
+                    )
+                }) {
+                    // A failed RAR extraction can leave its phase selected
+                    // after the worker retires. Native damage now requires
+                    // repair; do not park behind that idle extraction phase.
+                    self.transition_postprocessing_status(
+                        job_id,
+                        JobStatus::Downloading,
+                        Some("downloading"),
+                    );
                 }
                 if !self.maybe_start_repair(job_id).await {
                     return true;
@@ -216,6 +234,26 @@ impl Pipeline {
                 .await;
             self.enqueue_par3_installed_file(job_id, id)
                 .map_err(|error| error.to_string())?;
+        }
+        if !sets.is_empty() {
+            let repaired_members: std::collections::HashSet<_> = sets
+                .iter()
+                .filter_map(|name| self.rar_sets.get(&(job_id, name.clone())))
+                .filter_map(|state| state.plan.as_ref())
+                .flat_map(|plan| plan.member_names.iter().cloned())
+                .collect();
+            let remaining = self
+                .failed_extractions
+                .get(&job_id)
+                .into_iter()
+                .flatten()
+                .filter(|name| !sets.contains(*name) && !repaired_members.contains(*name))
+                .cloned()
+                .collect();
+            // Retire failures for the installed archive sources, so the old
+            // extraction result cannot trigger a refetch over verified output.
+            // Other archive groups retain their own failure and retry state.
+            self.replace_failed_extraction_members(job_id, remaining);
         }
         self.invalidate_rar_plans_for_repaired_sets(job_id, sets);
         self.par3_runtime

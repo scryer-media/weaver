@@ -94,13 +94,21 @@ func (a unpackAPI) query(query string, variables any, out any) error {
 }
 
 func (a unpackAPI) submit(nzb []byte, slug string) (int, error) {
+	return a.submitWithPassword(nzb, slug, "")
+}
+
+func (a unpackAPI) submitWithPassword(nzb []byte, slug, password string) (int, error) {
 	var result struct {
 		SubmitNzb struct {
 			Accepted bool
 			Item     struct{ ID int }
 		}
 	}
-	err := a.query(`mutation($input: SubmitNzbInput!) {submitNzb(input:$input) {accepted item {id}}}`, map[string]any{"input": map[string]any{"nzbBase64": base64.StdEncoding.EncodeToString(nzb), "filename": slug + ".nzb"}}, &result)
+	input := map[string]any{"nzbBase64": base64.StdEncoding.EncodeToString(nzb), "filename": slug + ".nzb"}
+	if password != "" {
+		input["password"] = password
+	}
+	err := a.query(`mutation($input: SubmitNzbInput!) {submitNzb(input:$input) {accepted item {id}}}`, map[string]any{"input": input}, &result)
 	if err != nil {
 		return 0, err
 	}

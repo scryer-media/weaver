@@ -216,6 +216,9 @@ pub(crate) enum DemotionReason {
     /// conventional repair path, which is exactly the shape a job with no
     /// direct set would have taken.
     Par2Damaged,
+    /// PAR3 requires reconstruction before this direct archive can finalize.
+    /// The conventional repair path currently owns installation for this set.
+    Par3Damaged,
     /// One of the set's source volumes could not be bound, unambiguously, to a
     /// PAR2 description in the job's recovery set.
     ///
@@ -507,6 +510,7 @@ impl DemotionReason {
             // layout for a *live* set, and reusing it for a demoted one is what
             // would move this answer to `Virtual`.
             Self::Par2Damaged => VolumeDemand::Real,
+            Self::Par3Damaged => VolumeDemand::Real,
             // The overlay `par2_access` presents is keyed by PAR2 file id, so a
             // volume with no unambiguous binding cannot be served through it at
             // all.
@@ -618,6 +622,7 @@ impl DemotionReason {
             Self::EncryptedFactsDisagree => "encrypted_facts_disagree",
             Self::EncryptedPostedBytesUnavailable => "encrypted_posted_bytes_unavailable",
             Self::Par2Damaged => "par2_damaged",
+            Self::Par3Damaged => "par3_damaged",
             Self::Par2Unbindable => "par2_unbindable",
             Self::ToleratedExtractionFailed => "tolerated_extraction_failed",
             Self::HoldsBudgetExceeded => "holds_budget",

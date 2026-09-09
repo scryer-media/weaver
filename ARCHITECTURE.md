@@ -373,10 +373,13 @@ damage and matrix/cohort requirements. Pending publications hide prior views;
 the shared worker queue rotates between PAR3 jobs. Conventional writes withdraw
 coverage before disk mutation, and worker epochs reject stale handbacks. Identity
 rebindings retire the corresponding source publications for fresh binding.
-Conventional PAR3 completion now requests recovery carriers and dispatches native
+Conventional PAR3 completion requests individual recovery articles and dispatches native
 staged repairs. Verified installed files reconcile assembly and persistence without
-translating PAR3 fingerprints into PAR2 MD5. Article-level acquisition, shared
-mutation views, virtual sources and restart evidence remain under integration. The implementation
+translating PAR3 fingerprints into PAR2 MD5. PAR3 reads direct volume images through
+a separately bounded reader, retaining cipher frontiers and checking backing
+generations. Direct finalization waits for verification; damaged archive groups
+currently use the existing demotion barrier before repair. Selective direct repair,
+shared mutation views and restart evidence remain under integration. The implementation
 record and remaining acceptance gates live in
 [the PAR3 integration plan](docs/par3-integration-plan.md).
 

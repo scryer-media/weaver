@@ -27,6 +27,10 @@ pub(super) struct RepairCompletion {
 }
 
 enum PendingInput {
+    Virtual {
+        image: virtual_source::VirtualInput,
+        name: String,
+    },
     Repair {
         set: par3_rs::InputSetId,
         path: PathBuf,
@@ -49,6 +53,13 @@ enum PendingInput {
 impl PendingInput {
     fn retained_cost(&self) -> EngineResult<usize> {
         let (path, extra) = match self {
+            Self::Virtual { name, .. } => {
+                return name
+                    .capacity()
+                    .checked_mul(2)
+                    .and_then(|cost| cost.checked_add(1024))
+                    .ok_or(EngineError::ResourceLimit("PAR3 virtual publication"));
+            }
             Self::Repair { path, .. } => (path, Some(0)),
             Self::Installed { path, name } => (path, name.capacity().checked_mul(2)),
             Self::Carrier { path, ranges } => (
@@ -214,6 +225,17 @@ impl Coordinator {
 
     pub(super) fn contains_job(&self, job_id: JobId) -> bool {
         self.jobs.contains_key(&job_id)
+    }
+
+    pub(super) fn enqueue_virtual(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        volume: crate::pipeline::direct_store::provider::VirtualVolume,
+        name: String,
+    ) -> EngineResult<()> {
+        let image = virtual_source::VirtualInput::new(volume, &execution_options())?;
+        self.enqueue_input(job_id, source, PendingInput::Virtual { image, name })
     }
 
     pub(super) fn admit(&mut self, job_id: JobId) -> EngineResult<()> {
@@ -550,6 +572,9 @@ impl Coordinator {
                 };
                 let before = runtime.sources.revision(source).ok().flatten();
                 let result = match input.input {
+                    PendingInput::Virtual { image, name } => {
+                        runtime.publish_virtual(source, image, name)
+                    }
                     PendingInput::Repair { .. } => unreachable!("repair dispatched above"),
                     PendingInput::Installed { path, name } => std::fs::metadata(&path)
                         .map_err(EngineError::from)

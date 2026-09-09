@@ -60,8 +60,16 @@ can authenticate packets beyond a hole and revisit the unfinished packet after
 arrival. The native missing-article scenario repairs using only the first article
 of a two-article recovery volume; its remaining protection is not downloaded.
 
+PAR3 can now read direct-store volume images, including encrypted members,
+without materializing clean archives. One bounded reader per job retains the
+cipher frontier; backing snapshots fence shared partial files before writes.
+Metadata, held-file pins, temporary buffers and open readers carry resource
+leases. Direct finalization waits for PAR3 verification. Damaged archive groups
+currently demote through the existing reconstruction barrier before repair;
+selective routing of repaired volumes back into direct store remains pending.
+
 Still pending: incremental decode-to-publication wiring, mixed-format fallback,
-direct-volume adapters, positioned verification,
+selective direct-store repair, positioned verification,
 embedded archives, evidence persistence and product surfaces. Rebuilt files currently
 receive a verification read when republished; clean native evidence is retained.
 PAR3 repairs conservatively retire extraction chases until a PAR3 mutation view
@@ -140,6 +148,24 @@ skips; formatting and all-target/all-feature Clippy pass. All seven native-proce
 scenarios pass with the stricter partial-carrier request assertion. An official
 two-packet carrier regression authenticates the packet beyond an interior hole,
 then counts both packets exactly once after the missing range arrives.
+
+Virtual-source and archive validation: 22 native PAR3 scenarios pass, including
+ZIP, ZIP64, split files, stored RAR and encrypted multi-volume RAR. Clean RAR
+jobs finalize without materializing source volumes; a single-byte corruption
+needs only the first recovery packet. All 54 existing PAR2 archive E2E cases
+also pass. These runs found and fixed an idle extraction phase blocking repair,
+lost reconstructed and buffered article placements during demotion, and stale
+extraction failures refetching over repaired output. Known archive damage now
+waits for PAR3 publication and verification, and demotion fences virtual reads
+until its materialization ticket returns. Native Windows and performance
+acceptance remain outstanding.
+
+Formatting, all-target/all-feature Clippy, all three doctests and the final
+locked workspace sweep pass: 3,804 tests with 13 existing skips. Two earlier
+eight-worker sweeps reported leak timeouts in unrelated restore-history and yEnc
+tests. Both passed in isolation; a serial sweep and the final four-worker sweep
+passed completely. The strict leak threshold is unchanged; the intermittent
+reports' cause remains unconfirmed.
 
 ## Decisions
 

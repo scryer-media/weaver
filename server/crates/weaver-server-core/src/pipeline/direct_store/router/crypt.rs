@@ -945,6 +945,15 @@ pub(crate) struct CipherSeed {
 }
 
 impl MemberCipher {
+    /// Conservative storage retained by a read-side cipher image, including
+    /// its immutable checkpoint map and coverage runs.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        1024usize
+            .saturating_add(self.checkpoints.len().saturating_mul(96))
+            .saturating_add(self.covered.ranges().len().saturating_mul(32))
+            .saturating_add(self.tail_plain.as_ref().map_or(0, Vec::capacity))
+    }
+
     pub(crate) fn unpacked_size(&self) -> u64 {
         self.unpacked_size
     }

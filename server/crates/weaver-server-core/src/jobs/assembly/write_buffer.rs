@@ -207,6 +207,23 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         self.buffered_bytes
     }
 
+    /// Owned bytes still awaiting a write, including duplicate arrivals but
+    /// excluding persisted markers. Reconciliation can restore their placement
+    /// metadata without draining them or claiming that they are already on disk.
+    pub(crate) fn buffered_chunks(&self) -> impl Iterator<Item = (u64, &T)> {
+        self.pending
+            .iter()
+            .filter_map(|(&offset, chunk)| match chunk {
+                PendingChunk::Buffered(bytes) => Some((offset, bytes)),
+                PendingChunk::Persisted { .. } => None,
+            })
+            .chain(
+                self.redundant
+                    .iter()
+                    .map(|(offset, bytes)| (*offset, bytes)),
+            )
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty() && self.redundant.is_empty()
     }

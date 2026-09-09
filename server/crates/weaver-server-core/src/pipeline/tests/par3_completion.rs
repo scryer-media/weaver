@@ -46,6 +46,17 @@ async fn settle_par3(pipeline: &mut Pipeline, job_id: JobId) {
 
 #[tokio::test]
 async fn par3_repairs_an_interior_article_hole_and_reconciles_completion() {
+    assert_par3_repairs_from_status(JobStatus::Downloading).await;
+}
+
+#[tokio::test]
+async fn par3_repair_can_follow_retired_extraction_work() {
+    for status in [JobStatus::Extracting, JobStatus::QueuedExtract] {
+        assert_par3_repairs_from_status(status).await;
+    }
+}
+
+async fn assert_par3_repairs_from_status(status: JobStatus) {
     let root = TempDir::new().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
     let job_id = JobId(3103);
@@ -136,7 +147,7 @@ async fn par3_repairs_an_interior_article_hole_and_reconciles_completion() {
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
-        state.status = JobStatus::Downloading;
+        state.status = status;
         state.refresh_runtime_lanes_from_status();
     }
     assert!(pipeline.check_par3_completion(job_id).await);

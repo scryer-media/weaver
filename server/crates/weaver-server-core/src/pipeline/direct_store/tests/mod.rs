@@ -1158,4 +1158,5 @@ fn encrypted_crypt_router_partial(
 }
 
 mod par2_fileaccess_adapter_over;
+mod par3_source_access;
 mod recording_test_doubles;

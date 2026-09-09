@@ -356,6 +356,73 @@ async fn direct_store_ignores_a_duplicate_article() {
 }
 
 #[tokio::test]
+async fn par3_metadata_wait_keeps_clean_direct_members_unfinalized() {
+    let member_name = "waiting.mkv";
+    let payload: Vec<u8> = (0..3000u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 2);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(410052);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let mut spec = direct_store_job_spec_with_articles("PAR3 metadata wait", &volumes, 3);
+    // The carrier has not arrived. Its declared role must hold finalization,
+    // without pretending that the name supplies an authenticated set or proof.
+    let carrier = FileSpec {
+        filename: "repair.par3".into(),
+        role: FileRole::from_filename("repair.par3"),
+        groups: vec!["alt.binaries.test".into()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: 696,
+            message_id: "pending-par3-index@example.com".into(),
+        }],
+    };
+    spec.total_bytes += 696;
+    spec.files.push(carrier);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for file_index in 0..2 {
+        for segment_number in 0..3 {
+            take_queued_segment(
+                &mut pipeline,
+                job_id,
+                SegmentId {
+                    file_id: NzbFileId { job_id, file_index },
+                    segment_number,
+                },
+            );
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                &volumes,
+                file_index,
+                segment_number,
+                3,
+            )
+            .await;
+        }
+    }
+    assert!(pipeline.par3_verification_pending(job_id));
+    let sets = pipeline.direct_store.sets_for(job_id);
+    assert_eq!(sets.len(), 1);
+    assert!(!sets[0].is_demoted());
+    assert!(!sets[0].is_finalized());
+    assert_eq!(
+        std::fs::read(direct_partial(&temp_dir, job_id, member_name)).unwrap(),
+        payload
+    );
+    assert!(
+        volumes
+            .iter()
+            .all(|(name, _)| !working_dir.join(name).exists())
+    );
+    assert!(!payload_root(&temp_dir, job_id).join(member_name).exists());
+    assert!(!pipeline.archive_extraction_held_for_known_damage(job_id));
+    pipeline.note_known_archive_set_damage(job_id, "silver.horizon");
+    assert!(pipeline.archive_extraction_held_for_known_damage(job_id));
+}
+
+#[tokio::test]
 async fn a_clean_three_article_member_stays_virtual_and_routes_once() {
     let member_name = "Silver.Horizon.S01E04.Clean.mkv";
     let payload: Vec<u8> = (0..3000u32).map(|index| (index % 173) as u8).collect();
@@ -1961,6 +2028,18 @@ async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
     let reconstructed = std::fs::read(working_dir.join(&volumes[1].0)).unwrap();
     assert_eq!(reconstructed, volumes[1].1);
     assert_eq!(checksum::crc32(&reconstructed), expected_crc);
+    for ordinal in 0..2 {
+        let (start, end) = article_extent(volumes[1].1.len(), ordinal, 2);
+        assert_eq!(
+            pipeline.jobs[&job_id]
+                .assembly
+                .file(protected_file)
+                .unwrap()
+                .placement_of(ordinal),
+            Some((start as u64, (end - start) as u32)),
+            "both reconstructed and buffered articles keep their placement after handback"
+        );
+    }
     assert!(
         pipeline.jobs[&job_id]
             .assembly
@@ -2592,6 +2671,30 @@ async fn a_malformed_chain_demotion_leaves_a_partial_crc_atom_provisional() {
         queued_segments(&mut pipeline, job_id),
         vec![(1, 1), (2, 0), (2, 1)],
         "the provisional article is targeted for conventional ownership without refetching its complete neighbours"
+    );
+    for (file_index, segment_number) in [(0, 0), (0, 1), (1, 0)] {
+        let (start, end) = article_extent(volumes[file_index as usize].1.len(), segment_number, 2);
+        assert_eq!(
+            pipeline.jobs[&job_id]
+                .assembly
+                .file(NzbFileId { job_id, file_index })
+                .unwrap()
+                .placement_of(segment_number),
+            Some((start as u64, (end - start) as u32)),
+            "reconstructed articles retain their exact readable placement"
+        );
+    }
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: 1
+            })
+            .unwrap()
+            .placement_of(1),
+        None,
+        "the provisional sparse tail is unavailable"
     );
     assert_eq!(
         pipeline.jobs.get(&job_id).unwrap().downloaded_bytes,

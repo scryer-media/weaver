@@ -57,6 +57,70 @@ fn inputs() -> [(String, Vec<u8>); 3] {
 }
 
 #[test]
+fn native_repair_reads_virtual_sources_and_materializes_only_the_damaged_file() {
+    use crate::pipeline::direct_store::{
+        ByteRanges,
+        provider::{HeldRun, VirtualVolume},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut job = Par3Job::default();
+    for (index, (name, bytes)) in inputs().into_iter().enumerate() {
+        let bytes: Arc<[u8]> = bytes.into();
+        let len = bytes.len() as u64;
+        let held = if index == 0 {
+            vec![
+                HeldRun::memory(0, Arc::clone(&bytes), 0, 2000),
+                HeldRun::memory(4000, Arc::clone(&bytes), 4000, 1000),
+            ]
+        } else {
+            vec![HeldRun::memory(0, Arc::clone(&bytes), 0, len)]
+        };
+        let volume = VirtualVolume {
+            volume_index: index as u32,
+            envelope: root.path().join(format!("{index}.unused-envelope")),
+            extents: Vec::new(),
+            partials: Arc::default(),
+            covered: ByteRanges::new(),
+            envelope_covered: ByteRanges::new(),
+            held: Arc::new(held),
+            len,
+            ciphers: Arc::default(),
+        };
+        let image = virtual_source::VirtualInput::new(volume, &job.options).unwrap();
+        job.publish_virtual(SourceId(index as u64 + 1), image, name)
+            .unwrap();
+    }
+    for (id, name, bytes) in [(99, "set.par3", INDEX), (98, "set.vol0+1.par3", RECOVERY)] {
+        let path = root.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        job.scan_file(SourceId(id), path, None).unwrap();
+    }
+    job.assess().unwrap();
+    let (&id, set) = job.sets.first_key_value().unwrap();
+    assert_eq!(
+        set.view.as_ref().unwrap().status,
+        par3_rs::session::RepairStatus::Ready
+    );
+    let unresolved = &set.view.as_ref().unwrap().files[0].unresolved;
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0], 2000..4000);
+    let verifications = set.native.diagnostics().source_verifications;
+    job.assess().unwrap();
+    assert_eq!(
+        job.sets[&id].native.diagnostics().source_verifications,
+        verifications
+    );
+    let output = root.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let report = job.repair(id, &output).unwrap();
+    assert_eq!(report.installed.len(), 1);
+    assert_eq!(std::fs::read(output.join("a.bin")).unwrap(), inputs()[0].1);
+    assert!(!output.join("b.txt").exists());
+    assert!(!output.join("sub/c.bin").exists());
+    assert!(!root.path().join("0.unused-envelope").exists());
+}
+
+#[test]
 fn retained_job_assessment_reuses_evidence_and_invalidates_changed_sources() {
     use par3_rs::session::RepairStatus;
     let root = tempfile::tempdir().unwrap();

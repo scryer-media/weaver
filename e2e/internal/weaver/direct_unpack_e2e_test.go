@@ -206,7 +206,7 @@ func unpackJobLog(raw string, job int) string {
 	return strings.Join(lines, "\n")
 }
 
-func startUnpackWeaver(t *testing.T, bin, root string, nntpPort int) (string, string) {
+func startUnpackWeaver(t *testing.T, bin, root string, nntpPort int, extraEnv ...string) (string, string) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -244,6 +244,7 @@ priority = 0
 		}
 	}
 	cmd.Env = append(cmd.Env, "WEAVER_FORCE_KEY_FILE=1", "WEAVER_DIRECT_UNPACK=true", "RUST_LOG=info,weaver_server_core::pipeline::completion=debug", "NO_COLOR=1")
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	if err := cmd.Start(); err != nil {
 		logFile.Close()

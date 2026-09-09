@@ -58,6 +58,7 @@ pub(in crate::pipeline) struct Par3Job {
     sets: BTreeMap<par3_rs::InputSetId, assessment::SetSession>,
     bindings: BTreeMap<String, SourceId>,
     publication_memory: BTreeMap<SourceId, assessment::ViewReservation>,
+    virtual_readers: Arc<virtual_source::ReaderCache>,
 }
 
 impl Default for Par3Job {
@@ -69,6 +70,7 @@ impl Default for Par3Job {
             sets: BTreeMap::new(),
             bindings: BTreeMap::new(),
             publication_memory: BTreeMap::new(),
+            virtual_readers: Arc::default(),
         }
     }
 }
@@ -81,10 +83,20 @@ impl Par3Job {
         name: String,
         ranges: Vec<std::ops::Range<u64>>,
     ) -> EngineResult<()> {
+        let access = disk_source(source, path, &self.options)?;
+        self.publish_access(source, access, name, ranges)
+    }
+
+    fn publish_access(
+        &mut self,
+        source: SourceId,
+        access: Arc<dyn SourceAccess>,
+        name: String,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> EngineResult<()> {
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
             return Err(EngineError::ResourceLimit("PAR3 source bindings"));
         }
-        let access = disk_source(source, path, &self.options)?;
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
             offset: 0,
@@ -99,6 +111,27 @@ impl Par3Job {
         self.bindings.retain(|_, bound| *bound != source);
         self.bindings.insert(name, source);
         Ok(())
+    }
+
+    fn publish_virtual(
+        &mut self,
+        source: SourceId,
+        image: virtual_source::VirtualInput,
+        name: String,
+    ) -> EngineResult<()> {
+        let ranges = image
+            .volume
+            .readable_ranges()
+            .into_iter()
+            .map(|(start, end)| start..end)
+            .collect();
+        let access = virtual_source::VirtualSource::new(
+            source,
+            image,
+            self.options.clone(),
+            Arc::clone(&self.virtual_readers),
+        )?;
+        self.publish_access(source, Arc::new(access), name, ranges)
     }
 
     fn assess(&mut self) -> EngineResult<()> {
@@ -343,6 +376,12 @@ impl Pipeline {
     }
 
     fn enqueue_par3_file(&mut self, job_id: JobId, file_id: NzbFileId) -> EngineResult<()> {
+        if self.direct_demotion_in_flight.contains_key(&job_id) {
+            // The handback republishes committed ranges after reconstruction.
+            // Neither the old virtual image nor the growing disk image is a
+            // stable publication while that ticket owns the destination.
+            return Ok(());
+        }
         let state = &self.jobs[&job_id];
         let Some(file) = state.assembly.file(file_id) else {
             return Ok(());
@@ -384,16 +423,134 @@ impl Pipeline {
                 ranges.push(offset..end);
             }
         }
+        let virtual_volume = if carrier {
+            None
+        } else {
+            self.par3_virtual_volume(file_id)
+        };
+        tracing::trace!(job_id = job_id.0, source = ?source, complete = file.is_complete(),
+            virtual_volume = virtual_volume.is_some(), ranges = ?ranges,
+            "PAR3 committed source publication queued");
         let coordinator = self.par3_runtime.as_mut().expect("admitted PAR3 job");
         if carrier {
             coordinator.enqueue_carrier_ranges(job_id, source, path, ranges)?;
+        } else if let Some(volume) = virtual_volume {
+            coordinator.enqueue_virtual(job_id, source, volume, name)?;
         } else {
             coordinator.enqueue_file(job_id, source, path, name, ranges)?;
         }
         coordinator.dispatch()
     }
 
+    fn par3_virtual_volume(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<crate::pipeline::direct_store::provider::VirtualVolume> {
+        let set = self
+            .direct_store
+            .sets_for(file_id.job_id)
+            .iter()
+            .find(|set| {
+                !set.is_demoted() && set.plan().volume_for_file(file_id.file_index).is_some()
+            })?;
+        let index = set.plan().volume_for_file(file_id.file_index)?;
+        if let Some(retained) = set.retained_volumes() {
+            return retained
+                .iter()
+                .find(|volume| volume.volume_index == index)
+                .cloned();
+        }
+        if set.is_finalized() {
+            return None;
+        }
+        let file = self.jobs.get(&file_id.job_id)?.assembly.file(file_id)?;
+        let len = set.virtual_volume_len(index, file.received_bytes());
+        set.virtual_volumes(&BTreeMap::from([(index, len)]))
+            .into_iter()
+            .find(|volume| volume.volume_index == index)
+    }
+
+    async fn prepare_direct_store_for_par3_repair(
+        &mut self,
+        job_id: JobId,
+        input_set: par3_rs::InputSetId,
+    ) -> bool {
+        let damaged: std::collections::BTreeSet<_> = self
+            .par3_runtime
+            .as_ref()
+            .into_iter()
+            .flat_map(|runtime| runtime.assessments(job_id))
+            .filter(|(id, _)| *id == input_set)
+            .flat_map(|(_, view)| view.files.iter())
+            .filter(|file| !file.complete)
+            .filter_map(|file| file.source.and_then(|source| u32::try_from(source.0).ok()))
+            .collect();
+        let sets: Vec<_> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
+            .filter(|(_, set)| {
+                set.plan()
+                    .volumes
+                    .values()
+                    .any(|file| damaged.contains(file))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if sets.is_empty() {
+            return false;
+        }
+        // The native verifier can keep clean archive groups virtual. An archive
+        // needing installation currently crosses the existing demotion barrier
+        // first, so its router can never finalize pre-repair member bytes.
+        for index in sets {
+            self.invalidate_par3_direct_set(job_id, index);
+            self.demote_direct_set(
+                job_id,
+                index,
+                crate::pipeline::direct_store::router::DemotionReason::Par3Damaged,
+            )
+            .await;
+        }
+        self.schedule_job_completion_check(job_id);
+        true
+    }
+
+    pub(in crate::pipeline) fn par3_verification_pending(&self, job_id: JobId) -> bool {
+        let runtime = self.par3_runtime.as_ref();
+        let candidate = runtime.is_some_and(|runtime| runtime.contains_job(job_id))
+            || self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| state.assembly.has_par3_candidates());
+        candidate
+            && (self.job_has_pending_download_pipeline_work(job_id)
+                || !runtime.is_some_and(|runtime| runtime.verified(job_id)))
+    }
+
     pub(in crate::pipeline) fn invalidate_par3_source_write(&mut self, file_id: NzbFileId) {
+        if !self
+            .par3_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.contains_job(file_id.job_id))
+        {
+            return;
+        }
+        if let Some(index) = self
+            .direct_store
+            .sets_for(file_id.job_id)
+            .iter()
+            .position(|set| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && set.plan().volume_for_file(file_id.file_index).is_some()
+            })
+        {
+            self.invalidate_par3_direct_set(file_id.job_id, index);
+            return;
+        }
         if let Some(coordinator) = self.par3_runtime.as_mut()
             && let Err(error) = coordinator
                 .invalidate_source(file_id.job_id, SourceId(u64::from(file_id.file_index)))
@@ -401,6 +558,31 @@ impl Pipeline {
             self.fail_job(
                 file_id.job_id,
                 format!("PAR3 source invalidation failed: {error}"),
+            );
+        }
+    }
+
+    pub(in crate::pipeline) fn invalidate_par3_direct_set(&mut self, job_id: JobId, index: usize) {
+        let Some(coordinator) = self
+            .par3_runtime
+            .as_mut()
+            .filter(|runtime| runtime.contains_job(job_id))
+        else {
+            return;
+        };
+        let Some(set) = self.direct_store.set(job_id, index) else {
+            return;
+        };
+        // A split member's plaintext partial backs several source volumes.
+        // Retire every view of that archive before any destination is written.
+        let result =
+            set.plan().volumes.values().try_for_each(|file| {
+                coordinator.invalidate_source(job_id, SourceId(u64::from(*file)))
+            });
+        if let Err(error) = result {
+            self.fail_job(
+                job_id,
+                format!("PAR3 virtual source invalidation failed: {error}"),
             );
         }
     }
@@ -417,7 +599,9 @@ impl Pipeline {
         let Some(coordinator) = self.par3_runtime.as_ref() else {
             return Ok(());
         };
-        if !coordinator.contains_job(job_id) || self.job_has_pending_download_pipeline_work(job_id)
+        if !coordinator.contains_job(job_id)
+            || self.job_has_pending_download_pipeline_work(job_id)
+            || self.direct_demotion_in_flight.contains_key(&job_id)
         {
             return Ok(());
         }
@@ -463,6 +647,20 @@ impl Pipeline {
                 tracing::debug!(job_id = job_id.0, set = ?set, status = ?view.status,
                     files = view.files.len(), cohorts = view.requirements.len(),
                     "PAR3 retained assessment settled");
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    for file in view.files.iter().filter(|file| !file.complete) {
+                        tracing::trace!(
+                            job_id = job_id.0,
+                            path = %file.path,
+                            source = ?file.source,
+                            unresolved_ranges = file.unresolved.len(),
+                            unresolved_bytes = file.unresolved.iter().fold(0u64, |bytes, range| {
+                                bytes.saturating_add(range.end.saturating_sub(range.start))
+                            }),
+                            "PAR3 source remains incomplete"
+                        );
+                    }
+                }
             }
             tracing::debug!(
                 job_id = job_id.0,
@@ -481,6 +679,7 @@ mod assessment;
 mod completion;
 #[cfg(windows)]
 mod disk_windows;
+pub(in crate::pipeline) mod virtual_source;
 pub(in crate::pipeline) mod work;
 
 #[cfg(test)]

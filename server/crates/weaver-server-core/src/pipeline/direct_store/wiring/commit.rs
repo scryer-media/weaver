@@ -98,6 +98,7 @@ impl Pipeline {
         if spans.is_empty() {
             return true;
         }
+        self.invalidate_par3_direct_set(job_id, set_index);
         let batches = self.direct_write_batches(job_id, set_index, spans);
         if let Err(path) = self.prepare_direct_destinations(job_id, &batches).await {
             // A destination that could not be marked sparse is refused *before*
@@ -812,7 +813,8 @@ impl Pipeline {
         for set_index in seeded {
             self.rearm_restart_seeded_gates(job_id, set_index).await;
         }
-        if self.direct_finalization_waits_for_par2(job_id) {
+        if self.direct_finalization_waits_for_par2(job_id) || self.par3_verification_pending(job_id)
+        {
             return;
         }
         // Damage on record and no PAR2 verdict left to answer it.
