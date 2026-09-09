@@ -32,6 +32,8 @@ Successful repairs must reproduce the expected BLAKE3 and byte length, stop befo
 requesting the final surplus carrier, and leave no spent `.par3` files in the
 delivered directory. The test retains its directory and writes per-case evidence
 with request counts and terminal status beside the Weaver log and database.
+The missing-article case also requires exactly one article from its two-article
+recovery volume, proving acquisition stops before the carrier is complete.
 
 This matrix does not yet cover virtual/encrypted sources, archive extraction,
 embedded protection, restart evidence, both datastores or performance acceptance.

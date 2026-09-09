@@ -44,15 +44,21 @@ committed assembly ranges. Source/error/dirty bookkeeping retains its own host
 budget lease, and failed scans retain leases for any publication they installed.
 
 Conventional PAR3 jobs now enter a completion gate and execute native staged
-repair on the shared completion transport. The gate requests one recovery carrier
+repair on the shared completion transport. The gate requests one recovery article
 at a time and reassesses native cohort requirements without trusting filename
 capacity hints. Verified installations reconcile assembly and persistent file
 completion; partial installation errors remain failures. No PAR3 digest is stored
 as PAR2 MD5. The article-hole pipeline regression restores the missing bytes and
 checks that a clean neighboring file was not rewritten.
 
-Still pending: incremental decode-to-publication wiring, article-level selective
-acquisition, mixed-format fallback, direct-volume adapters, positioned verification,
+Carrier probes retain a budgeted article frontier. Known decoded placements guide
+missing-offset requests; unknown positions use finite ordinal probes. Scanning
+can authenticate packets beyond a hole and revisit the unfinished packet after
+arrival. The native missing-article scenario repairs using only the first article
+of a two-article recovery volume; its remaining protection is not downloaded.
+
+Still pending: incremental decode-to-publication wiring, mixed-format fallback,
+direct-volume adapters, positioned verification,
 embedded archives, evidence persistence and product surfaces. Rebuilt files currently
 receive a verification read when republished; clean native evidence is retained.
 PAR3 repairs conservatively retire extraction chases until a PAR3 mutation view
@@ -125,6 +131,12 @@ abort, missing partial-source publication, and counting an unavailable index as
 missing payload after alternate carriers verified the set. See `e2e/docs/par3.md`.
 Local Windows cross-checking is blocked by missing Windows SDK headers in AWS-LC;
 native Windows validation remains outstanding.
+
+Article-selection validation: all 3,794 workspace tests pass with 13 existing
+skips; formatting and all-target/all-feature Clippy pass. All seven native-process
+scenarios pass with the stricter partial-carrier request assertion. An official
+two-packet carrier regression authenticates the packet beyond an interior hole,
+then counts both packets exactly once after the missing range arrives.
 
 ## Decisions
 

@@ -47,6 +47,8 @@ struct Carrier {
     backing: SourceSnapshot,
     scanner: PacketScanner,
     revision: u64,
+    needed: Option<u64>,
+    resume: Option<u64>,
 }
 
 pub(in crate::pipeline) struct Par3Job {
@@ -199,6 +201,8 @@ impl Par3Job {
                     backing,
                     scanner,
                     revision: 0,
+                    needed: None,
+                    resume: None,
                 },
             );
         }
@@ -217,6 +221,10 @@ impl Par3Job {
         if revision == carrier.revision {
             return Ok(());
         }
+        if let Some(resume) = carrier.resume.take() {
+            carrier.scanner.seek(resume)?;
+        }
+        carrier.needed = None;
         loop {
             match carrier.scanner.poll()? {
                 ScanEvent::Packet(packet) => {
@@ -239,7 +247,20 @@ impl Par3Job {
                         .expect("inserted set")
                         .merge(packet)?;
                 }
-                ScanEvent::End | ScanEvent::NeedData { .. } => {
+                ScanEvent::NeedData { offset } => {
+                    let position = carrier.scanner.position();
+                    carrier.resume = Some(carrier.resume.map_or(position, |old| old.min(position)));
+                    carrier.needed = Some(carrier.needed.map_or(offset, |old| old.min(offset)));
+                    if let Some(next) = self.sources.next_available(source, offset)?
+                        && next.start > offset
+                    {
+                        carrier.scanner.seek(next.start)?;
+                        continue;
+                    }
+                    carrier.revision = revision;
+                    return Ok(());
+                }
+                ScanEvent::End => {
                     carrier.revision = revision;
                     return Ok(());
                 }

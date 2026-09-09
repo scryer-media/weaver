@@ -4,6 +4,38 @@ use par3_rs::source::MemorySourceAccess;
 const INDEX: &[u8] = include_bytes!("../backend/fixtures/set.par3");
 const RECOVERY: &[u8] = include_bytes!("../backend/fixtures/set.vol0+1.par3");
 
+#[test]
+fn scanning_resumes_after_a_hole_and_revisits_the_unfinished_packet_on_arrival() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../e2e/internal/weaver/testdata/par3-native/set.vol1+2.par3"
+    ));
+    let len = bytes.len() as u64;
+    let mut job = Par3Job::default();
+    job.publish_carrier(
+        SourceId(0),
+        source(bytes),
+        len,
+        vec![0..1100, 2100..len],
+        true,
+    )
+    .unwrap();
+    job.scan(SourceId(0)).unwrap();
+    assert_eq!(available_recovery(&mut job), 1);
+    assert_eq!(job.carriers[&SourceId(0)].needed, Some(1100));
+    job.publish_carrier(
+        SourceId(0),
+        source(bytes),
+        len,
+        std::iter::once(0..len).collect(),
+        true,
+    )
+    .unwrap();
+    job.scan(SourceId(0)).unwrap();
+    assert_eq!(available_recovery(&mut job), 2);
+    assert_eq!(job.carriers[&SourceId(0)].needed, None);
+}
+
 fn source(bytes: &[u8]) -> Arc<dyn SourceAccess> {
     let mut memory = MemorySourceAccess::default();
     memory.insert(SourceId(0), 1, Arc::from(bytes));

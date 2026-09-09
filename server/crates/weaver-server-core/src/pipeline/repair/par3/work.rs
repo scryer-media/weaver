@@ -75,7 +75,7 @@ struct QueuedInput {
 
 struct KnownSource {
     carrier: bool,
-    promoted: bool,
+    promoted: BTreeMap<u32, assessment::ViewReservation>,
     // Retained source, dirty and error bookkeeping outlives queued work,
     // including failed publications which never entered the engine.
     _reservation: assessment::ViewReservation,
@@ -264,18 +264,43 @@ impl Coordinator {
         self.jobs
             .get(&job_id)
             .and_then(|job| job.known.get(&SourceId(u64::from(file_index))))
-            .is_some_and(|source| source.promoted)
+            .is_some_and(|source| !source.promoted.is_empty())
     }
 
-    pub(super) fn promote(&mut self, job_id: JobId, file_index: u32) -> EngineResult<()> {
+    pub(in crate::pipeline) fn article_promoted(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        ordinal: u32,
+    ) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.known.get(&SourceId(u64::from(file_index))))
+            .is_some_and(|source| source.promoted.contains_key(&ordinal))
+    }
+
+    pub(super) fn needed_offset(&self, job_id: JobId, file_index: u32) -> Option<u64> {
+        self.jobs
+            .get(&job_id)?
+            .runtime
+            .as_ref()?
+            .carriers
+            .get(&SourceId(u64::from(file_index)))?
+            .needed
+    }
+
+    pub(super) fn promote(
+        &mut self,
+        job_id: JobId,
+        file_index: u32,
+        ordinal: u32,
+    ) -> EngineResult<()> {
         let job = self
             .jobs
             .get_mut(&job_id)
             .ok_or(EngineError::InvalidState("unknown PAR3 job"))?;
         let source = SourceId(u64::from(file_index));
-        if let Some(known) = job.known.get_mut(&source) {
-            known.promoted = true;
-        } else {
+        if !job.known.contains_key(&source) {
             if job.known.len() >= MAX_PENDING {
                 return Err(EngineError::ResourceLimit("PAR3 recovery candidates"));
             }
@@ -283,10 +308,14 @@ impl Coordinator {
                 source,
                 KnownSource {
                     carrier: true,
-                    promoted: true,
+                    promoted: BTreeMap::new(),
                     _reservation: assessment::ViewReservation::acquire(512)?,
                 },
             );
+        }
+        let known = job.known.get_mut(&source).expect("admitted source");
+        if let std::collections::btree_map::Entry::Vacant(entry) = known.promoted.entry(ordinal) {
+            entry.insert(assessment::ViewReservation::acquire(96)?);
         }
         Ok(())
     }
@@ -426,7 +455,7 @@ impl Coordinator {
                 source,
                 KnownSource {
                     carrier,
-                    promoted: false,
+                    promoted: BTreeMap::new(),
                     _reservation: reservation,
                 },
             );

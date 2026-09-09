@@ -169,6 +169,9 @@ func TestPar3E2E(t *testing.T) {
 				if (mode == "clean" || name == "set.vol3+1.par3") && count != 0 {
 					t.Fatalf("unneeded recovery carrier downloaded: %s (%d requests)", name, count)
 				}
+				if mode == "missing" && name == "set.vol1+2.par3" && count != 1 {
+					t.Fatalf("repair needs only the first article from this carrier: got %d requests", count)
+				}
 			}
 			evidence, err := json.MarshalIndent(map[string]any{"jobId": job, "status": status, "requests": requests, "expectedBlake3": blake3.Sum256(payload)}, "", "  ")
 			if err != nil {

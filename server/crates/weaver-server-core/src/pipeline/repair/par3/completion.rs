@@ -251,13 +251,6 @@ impl Pipeline {
             .enumerate()
             .filter(|(_, file)| matches!(file.role, FileRole::Par3 { .. }))
             .map(|(index, _)| index as u32)
-            .filter(|index| {
-                !self
-                    .par3_runtime
-                    .as_ref()
-                    .expect("admitted job")
-                    .is_promoted(job_id, *index)
-            })
             .collect();
         let state = self.jobs.get_mut(&job_id).expect("live job");
         let mut pool = state.recovery_queue.drain_all();
@@ -266,23 +259,45 @@ impl Pipeline {
                 .download_queue
                 .extract_matching(|work| candidates.contains(&work.segment_id.file_id.file_index)),
         );
+        let runtime = self.par3_runtime.as_ref().expect("admitted job");
         let selected = pool
             .iter()
-            .map(|work| work.segment_id.file_id.file_index)
-            .filter(|index| candidates.contains(index))
-            .min();
+            .map(|work| work.segment_id)
+            .filter(|id| {
+                candidates.contains(&id.file_id.file_index)
+                    && !runtime.article_promoted(job_id, id.file_id.file_index, id.segment_number)
+            })
+            .min_by_key(|id| {
+                let needed = runtime.needed_offset(job_id, id.file_id.file_index);
+                let established = needed.is_some_and(|needed| {
+                    state
+                        .assembly
+                        .file(id.file_id)
+                        .and_then(|file| file.placement_of(id.segment_number))
+                        .is_some_and(|(offset, len)| {
+                            offset <= needed && needed < offset.saturating_add(u64::from(len))
+                        })
+                });
+                let rank = if established {
+                    0
+                } else if needed.is_some() {
+                    1
+                } else {
+                    2
+                };
+                (rank, id.file_id.file_index, id.segment_number)
+            });
         let Some(selected) = selected else {
             for work in pool {
                 state.recovery_queue.push(work);
             }
             return false;
         };
-        if let Err(error) = self
-            .par3_runtime
-            .as_mut()
-            .expect("admitted job")
-            .promote(job_id, selected)
-        {
+        if let Err(error) = self.par3_runtime.as_mut().expect("admitted job").promote(
+            job_id,
+            selected.file_id.file_index,
+            selected.segment_number,
+        ) {
             for work in pool {
                 state.recovery_queue.push(work);
             }
@@ -290,7 +305,7 @@ impl Pipeline {
             return true;
         }
         for mut work in pool {
-            if work.segment_id.file_id.file_index == selected {
+            if work.segment_id == selected {
                 work.priority = crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY;
                 work.completion_critical = true;
                 state.download_queue.push(work);
@@ -299,8 +314,9 @@ impl Pipeline {
             }
         }
         // The candidate's name is only a discovery hint. Reassess authenticated
-        // matrix/cohort requirements after each carrier, without crediting any
-        // advertised block count in advance.
+        // matrix/cohort requirements after each article. Unknown decoded
+        // offsets use finite ordinal probes; NZB encoded sizes never substitute
+        // for established decoded positions.
         self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
         self.update_queue_metrics();
         true

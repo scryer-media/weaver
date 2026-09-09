@@ -34,7 +34,11 @@ impl Pipeline {
 
     pub(crate) fn segment_is_completion_critical(&self, segment_id: SegmentId) -> bool {
         self.par3_runtime.as_ref().is_some_and(|runtime| {
-            runtime.is_promoted(segment_id.file_id.job_id, segment_id.file_id.file_index)
+            runtime.article_promoted(
+                segment_id.file_id.job_id,
+                segment_id.file_id.file_index,
+                segment_id.segment_number,
+            )
         }) || self
             .par2_runtime(segment_id.file_id.job_id)
             .and_then(|runtime| runtime.files.get(&segment_id.file_id.file_index))
