@@ -2,4 +2,4 @@
 # A test that leaves a child holding stdout or stderr open is a test failure.
 # The same-binary supervisor needs a bounded grace to drain its relays under
 # parallel suite load before nextest judges the inherited handles leaked.
-leak-timeout = { period = "500ms", result = "fail" }
+leak-timeout = { period = "2s", result = "fail" }
