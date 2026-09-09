@@ -96,6 +96,7 @@ impl Par3Job {
         name: String,
         ranges: Vec<std::ops::Range<u64>>,
     ) -> EngineResult<()> {
+        bindings::check_source(source)?;
         if !self.disk_publications.contains_key(&source)
             && self.disk_publications.len() >= MAX_CARRIERS
         {
@@ -149,6 +150,7 @@ impl Par3Job {
         ranges: Vec<std::ops::Range<u64>>,
         continuity: Option<(SourceSnapshot, SourceSnapshot)>,
     ) -> EngineResult<SourceSnapshot> {
+        bindings::check_source(source)?;
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
             return Err(EngineError::ResourceLimit("PAR3 source bindings"));
         }
@@ -178,7 +180,8 @@ impl Par3Job {
                 set.invalidate(source);
             }
         }
-        // Retire an old filename when this stable source has been rebound.
+        // Retire both host and native names when this stable source is rebound.
+        self.retire_name_bindings(source, &name)?;
         self.bindings.retain(|_, bound| *bound != source);
         self.bindings.insert(name, source);
         Ok(published)
@@ -271,9 +274,11 @@ impl Par3Job {
         ranges: Option<Vec<std::ops::Range<u64>>>,
         start: u64,
     ) -> EngineResult<()> {
+        bindings::check_source(source)?;
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
             return Err(EngineError::ResourceLimit("PAR3 source bindings"));
         }
+        self.retire_name_bindings(source, &name)?;
         self.bindings.retain(|_, bound| *bound != source);
         self.bindings.insert(name.clone(), source);
         self.scan_file_from(source, path, ranges, start)?;
@@ -318,6 +323,7 @@ impl Par3Job {
         ranges: Option<Vec<std::ops::Range<u64>>>,
         start: u64,
     ) -> EngineResult<()> {
+        bindings::check_source(source)?;
         let access = disk_source(source, path.clone(), &self.options)?;
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
@@ -371,6 +377,7 @@ impl Par3Job {
         ranges: Vec<std::ops::Range<u64>>,
         arrival: bool,
     ) -> EngineResult<()> {
+        bindings::check_source(source)?;
         if !self.carriers.contains_key(&source) && self.carriers.len() >= MAX_CARRIERS {
             return Err(EngineError::ResourceLimit("job carrier count"));
         }

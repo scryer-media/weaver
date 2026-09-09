@@ -5,6 +5,87 @@ const INDEX: &[u8] = include_bytes!("../backend/fixtures/set.par3");
 const RECOVERY: &[u8] = include_bytes!("../backend/fixtures/set.vol0+1.par3");
 
 #[test]
+fn retired_binding_identity_cannot_be_published() {
+    let mut job = Par3Job::default();
+    let id = bindings::RETIRED_SOURCE;
+    let ranges = || std::iter::once(0..INDEX.len() as u64).collect();
+    assert!(matches!(
+        job.publish_access(id, source(INDEX), "a.bin".into(), ranges(), None),
+        Err(EngineError::InvalidState("reserved PAR3 source identity"))
+    ));
+    assert!(matches!(
+        job.publish_carrier(id, source(INDEX), INDEX.len() as u64, ranges(), false),
+        Err(EngineError::InvalidState("reserved PAR3 source identity"))
+    ));
+    assert!(matches!(
+        job.scan_embedded(
+            id,
+            PathBuf::from("absent.zip"),
+            "archive.zip".into(),
+            None,
+            0
+        ),
+        Err(EngineError::InvalidState("reserved PAR3 source identity"))
+    ));
+    assert!(job.sources.snapshot(id).unwrap().is_none());
+    assert!(job.bindings.is_empty());
+    assert!(job.carriers.is_empty());
+}
+
+#[test]
+fn embedded_name_rebinding_withdraws_old_native_identity_without_rescanning() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../e2e/internal/weaver/testdata/par3-inside/archive.zip"
+    ));
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("archive.zip");
+    std::fs::write(&path, bytes).unwrap();
+    let mut job = Par3Job::default();
+    job.scan_embedded(SourceId(0), path.clone(), "archive.zip".into(), None, 0)
+        .unwrap();
+    job.assess().unwrap();
+    assert_eq!(
+        job.sets
+            .values()
+            .next()
+            .unwrap()
+            .view
+            .as_ref()
+            .unwrap()
+            .status,
+        par3_rs::session::RepairStatus::Complete
+    );
+    let scanned = job.options.scan_work.used();
+    let read = job.options.diagnostics.source_io().read_bytes;
+    job.scan_embedded(SourceId(0), path.clone(), "alias.zip".into(), None, 0)
+        .unwrap();
+    job.assess().unwrap();
+    let view = job.sets.values().next().unwrap().view.as_ref().unwrap();
+    assert!(!view.files[0].complete);
+    assert!(view.files[0].source.is_none());
+    assert!(view.embedded_source.is_none());
+    assert!(view.verified_sources.is_empty());
+    assert_eq!(job.options.scan_work.used(), scanned);
+    assert_eq!(job.options.diagnostics.source_io().read_bytes, read);
+    job.scan_embedded(SourceId(0), path, "archive.zip".into(), None, 0)
+        .unwrap();
+    job.assess().unwrap();
+    assert_eq!(
+        job.sets
+            .values()
+            .next()
+            .unwrap()
+            .view
+            .as_ref()
+            .unwrap()
+            .status,
+        par3_rs::session::RepairStatus::Complete
+    );
+    assert_eq!(job.options.scan_work.used(), scanned);
+}
+
+#[test]
 fn shared_description_consistency_requires_no_source_reads() {
     const ROOT: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -501,6 +582,35 @@ fn unchanged_disk_publications_retain_evidence_but_withdrawal_and_rebinding_do_n
     assert!(job.sets.values().next().unwrap().view.is_none());
     assert!(!job.bindings.contains_key(name));
     assert_eq!(job.bindings.get("alias.bin"), Some(&SourceId(1)));
+    job.assess().unwrap();
+    let set = job.sets.values().next().unwrap();
+    let view = set.view.as_ref().unwrap();
+    assert_eq!(view.status, par3_rs::session::RepairStatus::NeedRecovery);
+    assert!(
+        view.files[0].source.is_none(),
+        "retired names need a new explicit binding"
+    );
+    assert!(!view.files[0].complete);
+    assert!(view.files[1..].iter().all(|file| file.complete));
+    assert_eq!(set.native.diagnostics().source_verifications, before + 1);
+    job.publish_file(
+        SourceId(1),
+        root.path().join(name),
+        name.clone(),
+        std::iter::once(0..bytes.len() as u64).collect(),
+    )
+    .unwrap();
+    job.assess().unwrap();
+    let set = job.sets.values().next().unwrap();
+    assert_eq!(
+        set.view.as_ref().unwrap().status,
+        par3_rs::session::RepairStatus::Complete
+    );
+    assert_eq!(
+        set.view.as_ref().unwrap().files[0].source,
+        Some(SourceId(1))
+    );
+    assert_eq!(set.native.diagnostics().source_verifications, before + 2);
 }
 
 #[test]

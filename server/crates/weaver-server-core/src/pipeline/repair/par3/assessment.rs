@@ -62,9 +62,14 @@ impl AssessmentView {
         let reservation = ViewReservation::acquire(
             cost.ok_or(EngineError::ResourceLimit("PAR3 assessment view size"))?,
         )?;
+        let mut files = assessment.files.clone();
+        for file in &mut files {
+            if file.source == Some(bindings::RETIRED_SOURCE) {
+                file.source = None;
+            }
+        }
         Ok(Self {
             status: assessment.status,
-            files: assessment.files.clone(),
             requirements: assessment.requirements.clone(),
             embedded_source: layout
                 .filter(|layout| {
@@ -73,13 +78,13 @@ impl AssessmentView {
                             matches!(extent.kind, par3_rs::layout::ExtentKind::Unprotected)
                         })
                 })
-                .and_then(|_| assessment.files.first().and_then(|file| file.source)),
-            verified_sources: assessment
-                .files
+                .and_then(|_| files.first().and_then(|file| file.source)),
+            verified_sources: files
                 .iter()
                 .filter(|file| file.complete)
                 .filter_map(|file| file.source)
                 .collect(),
+            files,
             _reservation: reservation,
         })
     }

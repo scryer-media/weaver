@@ -1,9 +1,50 @@
-//! Consistency of authenticated descriptions sharing an output path.
+//! Explicit source bindings and consistency of shared authenticated descriptions.
 
 use super::*;
 use par3_rs::layout::{ExtentKind, FileLayout};
 
+// The native 0.3 API has no unbind operation. A reserved, permanently absent
+// identity withdraws an old binding without rebuilding the retained session.
+// Weaver file identities are u32 indices; publication rejects this sentinel.
+pub(super) const RETIRED_SOURCE: SourceId = SourceId(u64::MAX);
+
+pub(super) fn check_source(source: SourceId) -> EngineResult<()> {
+    if source == RETIRED_SOURCE {
+        return Err(EngineError::InvalidState("reserved PAR3 source identity"));
+    }
+    Ok(())
+}
+
 impl Par3Job {
+    pub(super) fn retire_name_bindings(
+        &mut self,
+        source: SourceId,
+        name: &str,
+    ) -> EngineResult<()> {
+        if !self
+            .bindings
+            .iter()
+            .any(|(old, bound)| *bound == source && old != name)
+        {
+            return Ok(());
+        }
+        for set in self.sets.values_mut() {
+            set.view = None;
+        }
+        for set in self.sets.values_mut() {
+            self.options.cancel.check()?;
+            let Some(layout) = set.native.layout()? else {
+                continue;
+            };
+            for file in layout.files() {
+                if file.path != name && self.bindings.get(&file.path) == Some(&source) {
+                    set.native.bind_file(&file.path, RETIRED_SOURCE)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_shared_layouts(&mut self) -> EngineResult<()> {
         if self.sets.len() < 2 {
             return Ok(());

@@ -431,6 +431,19 @@ Validation passes all 178 native scenarios, all 3,865 workspace Nextest tests
 formatting and all-target/all-feature Clippy. The runtime GraphQL schema remains
 byte-for-byte unchanged.
 
+Source-name rebinding now withdraws the previous native binding as well as the
+host lookup. The published native API has no unbind operation, so an unavailable
+reserved identity retires an old name without discarding unrelated evidence.
+Source and carrier publication reject that identity; host assessments expose it
+as missing, never as a selectable source. Standalone and embedded regressions
+confirm the old path cannot remain complete after a rebind, unchanged siblings
+are not reread, packet scanning does not restart, and a new explicit binding
+restores verification. The original regression reproduced a false `Complete`
+assessment before the fix. Automatic content placement is still a separate gate.
+Validation passed all 178 native scenarios, 3,867 Rust tests (13 existing skips),
+three doctests, formatting, and all-target/all-feature Clippy. This uses
+prospective 0.11.3 without dependency changes.
+
 Standalone mixed-format coordination now gives PAR2 its first repair attempt and
 excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence
 only affected PAR3 source evidence, then republish installed bytes for native
