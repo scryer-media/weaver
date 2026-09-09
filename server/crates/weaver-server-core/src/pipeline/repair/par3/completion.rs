@@ -161,6 +161,17 @@ impl Pipeline {
                     reconstructed_blocks = report.reconstructed_blocks,
                     "PAR3 repair installed verified outputs"
                 );
+                self.metrics.job_lifecycle.note_repair(
+                    crate::operations::instrumentation::StageOutcomeKind::Complete,
+                    report.reconstructed_blocks,
+                );
+                let _ = self
+                    .event_tx
+                    .send(crate::events::model::PipelineEvent::RepairComplete {
+                        job_id,
+                        slices_repaired: u32::try_from(report.reconstructed_blocks)
+                            .unwrap_or(u32::MAX),
+                    });
                 self.release_direct_unpack_after_repair(job_id);
                 self.transition_postprocessing_status(
                     job_id,

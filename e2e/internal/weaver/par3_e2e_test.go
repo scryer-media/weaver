@@ -173,12 +173,24 @@ func TestPar3E2E(t *testing.T) {
 					t.Fatalf("repair needs only the first article from this carrier: got %d requests", count)
 				}
 			}
-			evidence, err := json.MarshalIndent(map[string]any{"jobId": job, "status": status, "requests": requests, "expectedBlake3": blake3.Sum256(payload)}, "", "  ")
+			var history struct {
+				HistoryItem *struct {
+					FailedBytes uint64
+					Health      uint32
+				}
+			}
+			if err := api.query(`query($id:Int!) {historyItem(id:$id) {failedBytes health}}`, map[string]any{"id": job}, &history); err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := json.MarshalIndent(map[string]any{"jobId": job, "status": status, "requests": requests, "expectedBlake3": blake3.Sum256(payload), "history": history.HistoryItem}, "", "  ")
 			if err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(root, slug+"-evidence.json"), evidence, 0644); err != nil {
 				t.Fatal(err)
+			}
+			if status == "COMPLETED" && (history.HistoryItem == nil || history.HistoryItem.FailedBytes != 0 || history.HistoryItem.Health != 1000) {
+				t.Fatalf("verified PAR3 delivery retained failed articles in history: %+v", history.HistoryItem)
 			}
 		})
 	}

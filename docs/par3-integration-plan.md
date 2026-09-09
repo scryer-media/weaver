@@ -130,9 +130,22 @@ Encrypted-readback validation: all 3,824 workspace Nextest tests pass (13 existi
 skips), including all 401 direct-store/readback regressions. Formatting,
 all-target/all-feature workspace Clippy, all three doctests, the 22 existing
 native PAR3 scenarios and 54 PAR2 archive scenarios pass. This remains within
-the existing unreleased 0.11.3 version. Terminal PAR3 health accounting is a
-separate remaining defect: the new assertion exposes a successful conventional
-repair retaining its recovered article's failure contribution.
+the existing unreleased 0.11.3 version.
+
+Terminal delivery accounting now accepts current, authenticated PAR3 verdicts
+for bound protected source identities. It excludes unrelated files and recovery
+carriers, and withdraws those verdicts while a source is invalidated or work is
+pending. This fixes a completed conventional repair retaining recovered article
+failures in history. Successful native repairs also emit the shared repair
+completion event and lifecycle metric. All 22 native PAR3 E2E scenarios now check
+history health and failed bytes; successful delivery requires 1000/1000 health
+and zero failed bytes. The terminal settlement and stale-evidence regressions
+pass. Formatting, workspace Clippy, three doctests and all 54 PAR2 archive E2E
+cases pass. The initial full sweep reported a process-handle leak after the
+disabled-script test passed its assertions. All 13 post-processing tests passed
+in isolation, and the full confirmation sweep passed all 3,825 tests with 13
+existing skips and unchanged leak detection. No assertion or timeout was weakened.
+This continues the existing unreleased 0.11.3 version.
 
 Still pending: incremental decode-to-publication wiring, mixed-format fallback,
 multi-damage selective direct-store repair and archive-damage deferral, positioned verification,

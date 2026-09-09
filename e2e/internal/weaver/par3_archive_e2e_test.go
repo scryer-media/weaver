@@ -87,8 +87,14 @@ func TestPar3ArchiveE2E(t *testing.T) {
 						}
 					}
 					nntp.mu.Unlock()
-					var history struct{ HistoryItem *struct{ Error *string } }
-					if err := api.query(`query($id:Int!) {historyItem(id:$id) {error}}`, map[string]any{"id": job}, &history); err != nil {
+					var history struct {
+						HistoryItem *struct {
+							Error       *string
+							FailedBytes uint64
+							Health      uint32
+						}
+					}
+					if err := api.query(`query($id:Int!) {historyItem(id:$id) {error failedBytes health}}`, map[string]any{"id": job}, &history); err != nil {
 						t.Fatal(err)
 					}
 					failure := ""
@@ -96,10 +102,13 @@ func TestPar3ArchiveE2E(t *testing.T) {
 						failure = *history.HistoryItem.Error
 					}
 					par3WriteJSON(t, filepath.Join(root, slug+"-evidence.json"), map[string]any{
-						"jobId": job, "status": status, "error": failure, "requests": requests, "expectedSHA256": fmt.Sprintf("%x", sha256.Sum256(payload)),
+						"jobId": job, "status": status, "error": failure, "history": history.HistoryItem, "requests": requests, "expectedSHA256": fmt.Sprintf("%x", sha256.Sum256(payload)),
 					})
 					if status != "COMPLETED" {
 						t.Fatalf("job=%d status=%s error=%s log=%s", job, status, failure, logPath)
+					}
+					if history.HistoryItem == nil || history.HistoryItem.FailedBytes != 0 || history.HistoryItem.Health != 1000 {
+						t.Fatalf("verified PAR3 archive retained failed articles in history: %+v", history.HistoryItem)
 					}
 					actual, err := os.ReadFile(filepath.Join(root, "complete", slug, member))
 					if err != nil || !bytes.Equal(actual, payload) {

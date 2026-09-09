@@ -518,6 +518,15 @@ impl Coordinator {
                 == count
     }
 
+    /// A terminal claim must name a bound protected source. A clean job does
+    /// not establish evidence for its unprotected files or recovery carriers.
+    pub(in crate::pipeline) fn verified_file(&self, job_id: JobId, source: SourceId) -> bool {
+        self.verified(job_id)
+            && self
+                .assessments(job_id)
+                .any(|(_, view)| view.verified_sources.contains(&source))
+    }
+
     fn enqueue_input(
         &mut self,
         job_id: JobId,

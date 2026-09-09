@@ -434,3 +434,56 @@ async fn readback_rejects_stale_handback_without_releasing_worker_early() {
     ));
     assert!(coordinator.has_work(JobId(1)));
 }
+
+#[tokio::test]
+async fn terminal_claims_require_current_bound_source_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut coordinator, _) = ready_inline_repair(root.path());
+    assert!(
+        !coordinator.verified_file(JobId(1), SourceId(1)),
+        "an unsettled set is not a terminal verdict"
+    );
+    let path = root.path().join("b.txt");
+    std::fs::write(&path, b"qrstuvwxyz").unwrap();
+    coordinator
+        .enqueue_file(
+            JobId(1),
+            SourceId(3),
+            path,
+            "b.txt".into(),
+            std::iter::once(0..10).collect(),
+        )
+        .unwrap();
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    assert!(coordinator.verified(JobId(1)));
+    for source in [SourceId(1), SourceId(2), SourceId(3)] {
+        assert!(coordinator.verified_file(JobId(1), source));
+    }
+    assert!(
+        !coordinator.verified_file(JobId(1), SourceId(99)),
+        "a carrier is not a protected payload"
+    );
+    assert!(
+        !coordinator.verified_file(JobId(1), SourceId(100)),
+        "unprotected neighbours have no claim"
+    );
+    assert!(
+        !coordinator.verified_file(JobId(2), SourceId(1)),
+        "source ids are local to the job"
+    );
+    coordinator
+        .invalidate_source(JobId(1), SourceId(3))
+        .unwrap();
+    assert!(
+        !coordinator.verified_file(JobId(1), SourceId(3)),
+        "withdrawal revokes the old claim"
+    );
+    assert!(
+        !coordinator.verified_file(JobId(1), SourceId(1)),
+        "pending reassessment hides terminal verdicts"
+    );
+    coordinator.forget(JobId(1));
+    assert!(!coordinator.verified_file(JobId(1), SourceId(2)));
+}

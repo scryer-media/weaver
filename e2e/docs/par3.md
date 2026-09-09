@@ -2,7 +2,8 @@
 
 `TestPar3E2E` owns a new Weaver process, loopback NNTP fixture and SQLite database.
 It submits NZBs through the authenticated GraphQL API and checks final output
-bytes, terminal status, recovery article requests and standalone carrier cleanup.
+bytes, terminal status, history health, recovery article requests and standalone
+carrier cleanup. Successful cases require zero failed bytes and 1000/1000 health.
 No existing application instance, database or service is used.
 
 From the repository root:

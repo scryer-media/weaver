@@ -35,6 +35,7 @@ pub(in crate::pipeline) struct AssessmentView {
     pub status: RepairStatus,
     pub files: Vec<AssessedFile>,
     pub requirements: Vec<RecoveryRequirement>,
+    pub(super) verified_sources: std::collections::BTreeSet<SourceId>,
     _reservation: ViewReservation,
 }
 
@@ -42,7 +43,7 @@ impl AssessmentView {
     fn capture(assessment: &RepairAssessment) -> EngineResult<Self> {
         let cost = assessment.files.iter().try_fold(512usize, |bytes, file| {
             bytes
-                .checked_add(256)?
+                .checked_add(320)?
                 .checked_add(file.path.len())?
                 .checked_add(file.unresolved.len().checked_mul(32)?)
         });
@@ -61,6 +62,12 @@ impl AssessmentView {
             status: assessment.status,
             files: assessment.files.clone(),
             requirements: assessment.requirements.clone(),
+            verified_sources: assessment
+                .files
+                .iter()
+                .filter(|file| file.complete)
+                .filter_map(|file| file.source)
+                .collect(),
             _reservation: reservation,
         })
     }
