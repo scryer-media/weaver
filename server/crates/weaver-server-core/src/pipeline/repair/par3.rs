@@ -498,19 +498,22 @@ impl Pipeline {
         let Some(file) = state.assembly.file(file_id) else {
             return;
         };
-        let signature = self
-            .file_prefix_16k
-            .get(&file_id)
-            .is_some_and(|prefix| prefix.starts_with(par3_rs::MAGIC));
+        let prefix = self.file_prefix_16k.get(&file_id);
+        let signature = prefix.is_some_and(|prefix| prefix.starts_with(par3_rs::MAGIC));
+        let container_signature = prefix.is_some_and(|prefix| {
+            prefix.starts_with(b"PK\x03\x04")
+                || prefix.starts_with(b"PK\x05\x06")
+                || prefix.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])
+        });
         if !file.is_complete() && self.job_has_pending_download_pipeline_work(job_id) {
             return;
         }
         let embedded = if !self.par3_inside_probes.contains(file_id)
             && !signature
-            && matches!(
+            && (container_signature || matches!(
                 file.role(),
                 FileRole::ZipArchive | FileRole::SevenZipArchive
-            ) {
+            )) {
             let path = state
                 .working_dir
                 .join(self.current_filename_for_file(job_id, file));

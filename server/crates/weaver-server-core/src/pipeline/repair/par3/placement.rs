@@ -13,6 +13,7 @@ struct Digest {
 #[derive(Default)]
 pub(super) struct NameSearch {
     digests: BTreeMap<SourceId, Digest>,
+    embedded: embedded::Cache,
     found: Option<NameMatch>,
     read_bytes: u64,
 }
@@ -144,6 +145,9 @@ impl Par3Job {
                 _reservation: reservation,
             });
             break;
+        }
+        if self.name_search.found.is_none() {
+            self.discover_embedded_name(&layouts)?;
         }
         Ok(())
     }
@@ -337,3 +341,5 @@ mod tests {
         assert_eq!(job.name_search.read_bytes, 0);
     }
 }
+
+mod embedded;

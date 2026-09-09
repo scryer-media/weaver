@@ -47,6 +47,7 @@ func TestPar3InsideE2E(t *testing.T) {
 					modes = append(modes, "corrupt-footer")
 				}
 			}
+			modes = append(modes, "renamed", "obfuscated")
 			for _, mode := range modes {
 				t.Run(mode, func(t *testing.T) {
 					posted := bytes.Clone(inserted)
@@ -70,7 +71,10 @@ func TestPar3InsideE2E(t *testing.T) {
 						}
 					}
 					slug := "par3-inside-" + format + "-" + mode
-					nzb := nntp.publishInside(slug, mode, name, posted, len(original))
+					postedName := name
+					if mode == "renamed" { postedName = "renamed" + filepath.Ext(name) }
+					if mode == "obfuscated" { postedName = "opaque.dat" }
+					nzb := nntp.publishInside(slug, mode, postedName, posted, len(original))
 					if err := os.WriteFile(filepath.Join(root, slug+".nzb"), nzb, 0644); err != nil {
 						t.Fatal(err)
 					}
@@ -106,7 +110,7 @@ func TestPar3InsideE2E(t *testing.T) {
 						"jobId": job, "status": status, "error": failure, "history": history.HistoryItem,
 						"expectedSHA256": fmt.Sprintf("%x", sha256.Sum256(payload)),
 					})
-					api.assertEmbeddedRepairWarning(t, job, mode != "clean" && mode != "insufficient")
+					api.assertEmbeddedRepairWarning(t, job, mode != "clean" && mode != "insufficient" && mode != "renamed" && mode != "obfuscated")
 					if mode == "insufficient" {
 						if status != "FAILED" || !strings.Contains(failure, "PAR3") {
 							t.Fatalf("expected native insufficient-recovery failure, got %s: %s; log=%s", status, failure, logPath)

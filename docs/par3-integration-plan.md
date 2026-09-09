@@ -466,6 +466,24 @@ Rust sweep (13 existing skips), 54 focused tests after the source-lifetime fix
 all-feature Clippy. Full sweeps are batched by capability; targeted checks resolve
 failures found within that cycle.
 
+Embedded content identity now handles clean renamed and obfuscated ZIP, ZIP64,
+and 7z carriers, including large protection regions. Container signatures permit
+the existing bounded framing probe even when an NZB calls the archive `opaque.dat`.
+The native verifier hashes the authenticated protected stream, excluding the
+embedded packet gap, and requires both the whole fingerprint and complete protected
+extents before proposing an identity. Matching still grants no session evidence.
+The host-budgeted result cache binds the layout, file description, source generation,
+and availability revision; holes defer matching and stale proposals are rejected.
+Identity installation retires obsolete ZIP/7z/split extraction rosters only when no
+other file references them. Otherwise the old roster remains an outstanding
+obligation. This closes the E2E failure in which an authenticated rename succeeded
+but extraction subsequently queued the obsolete archive name. All 44 embedded
+native scenarios passed, including twelve new clean renamed/obfuscated cases, and
+44 focused native adapter tests passed again after the final roster-reference guard.
+Formatting and Clippy are deferred to the final MVP capstone at the operator's
+request; full functional sweeps remain batched by capability. This capability uses
+the existing prospective 0.11.3 version and adds no dependencies.
+
 Content placement is not complete: damaged/shifted donors need extent placement,
 shared aliases need separate output mappings, and authenticated nested paths need
 safe mapping into Weaver's download identities. Interrupted filesystem placement

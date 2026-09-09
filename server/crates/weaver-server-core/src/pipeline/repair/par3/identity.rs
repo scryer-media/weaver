@@ -52,6 +52,18 @@ impl Pipeline {
         {
             return Err("PAR3 content source is not a regular file".into());
         }
+        let old_non_rar_sets: Vec<String> = state.assembly.archive_topologies().iter()
+            .filter(|(name, topology)| {
+                !matches!(topology.archive_type, crate::jobs::assembly::ArchiveType::Rar)
+                    && topology.volume_map.contains_key(&old_name)
+                    && !state.assembly.files().any(|other| {
+                        other.file_id() != id
+                            && self.classified_archive_set_name_for_file(job_id, other)
+                                .as_deref() == Some(name.as_str())
+                    })
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
         let old_sets = self.rar_set_names_for_files(job_id, &[id]);
         // Keep the original name until the identity is durable. Hard-link
         // placement is exclusive and writes no clean payload bytes. A collision
@@ -74,6 +86,14 @@ impl Pipeline {
         let touched = std::collections::HashSet::from([old_name]);
         for set in &old_sets {
             self.invalidate_archive_set_for_identity_rebind(job_id, set, &touched);
+        }
+        // The retired ZIP/7z/split roster must disappear before readiness
+        // queues extraction. Its old names no longer designate source files.
+        for set in old_non_rar_sets {
+            self.jobs.get_mut(&job_id).expect("live job")
+                .assembly.remove_archive_topology(&set);
+            self.db.clear_extraction_chunks_for_set(job_id, &set)
+                .map_err(|error| format!("failed to retire content extraction state: {error}"))?;
         }
         let role = weaver_model::files::FileRole::from_filename(&found.name);
         if !matches!(role, FileRole::RarVolume { .. })
