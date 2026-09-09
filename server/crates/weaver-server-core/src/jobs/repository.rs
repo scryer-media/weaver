@@ -22,6 +22,7 @@ pub struct OrphanActiveStateCounts {
     pub active_volume_status: usize,
     pub active_rar_verified_suspect: usize,
     pub active_direct_coverage: usize,
+    pub active_repair_outputs: usize,
 }
 
 impl OrphanActiveStateCounts {
@@ -40,12 +41,13 @@ impl OrphanActiveStateCounts {
             + self.active_volume_status
             + self.active_rar_verified_suspect
             + self.active_direct_coverage
+            + self.active_repair_outputs
     }
 }
 
 const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
@@ -60,6 +62,7 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
     "active_volume_status",
     "active_rar_verified_suspect",
     "active_direct_coverage",
+    "active_repair_outputs",
 ];
 
 async fn run_inline_incremental_vacuum(datastore: &StoreDatastore) -> Result<(), StateError> {
@@ -311,6 +314,7 @@ impl Database {
                                 "active_rar_verified_suspect",
                             )
                             .await?,
+                            active_repair_outputs: delete_orphan_rows(tx, "active_repair_outputs").await?,
                             active_direct_coverage: delete_orphan_rows(
                                 tx,
                                 "active_direct_coverage",

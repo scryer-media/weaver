@@ -34,6 +34,7 @@ impl Drop for ViewReservation {
 pub(in crate::pipeline) struct AssessmentView {
     pub status: RepairStatus,
     pub files: Vec<AssessedFile>,
+    pub(super) output_lengths: Vec<u64>,
     pub requirements: Vec<RecoveryRequirement>,
     pub(super) embedded_source: Option<SourceId>,
     pub(super) verified_sources: std::collections::BTreeSet<SourceId>,
@@ -47,7 +48,7 @@ impl AssessmentView {
     ) -> EngineResult<Self> {
         let cost = assessment.files.iter().try_fold(512usize, |bytes, file| {
             bytes
-                .checked_add(320)?
+                .checked_add(328)?
                 .checked_add(file.path.len())?
                 .checked_add(file.unresolved.len().checked_mul(32)?)
         });
@@ -70,6 +71,7 @@ impl AssessmentView {
         }
         Ok(Self {
             status: assessment.status,
+            output_lengths: layout.map(|layout| layout.files().iter().map(|file| file.len).collect()).unwrap_or_default(),
             requirements: assessment.requirements.clone(),
             embedded_source: layout
                 .filter(|layout| {

@@ -1531,8 +1531,12 @@ impl Pipeline {
                 .or_insert(*floor);
             *slot = (*slot).max(*floor);
         }
-        let (assembly, download_queue, recovery_queue) =
+        let (mut assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
+        let repair_outputs = self.db.load_repair_outputs(job_id).map_err(crate::SchedulerError::State)?;
+        let repair_output_indices = super::repair_outputs::restore_assembly(
+            job_id, &repair_outputs, &working_dir, &mut assembly, &mut file_identities,
+        ).await.map_err(crate::SchedulerError::Internal)?;
         // A restored job resumes mid-download; its unsplit archives are still
         // candidates, and their persisted floor is what they will arm from.
         self.register_direct_unpack_singles(job_id, &spec);
@@ -1750,6 +1754,7 @@ impl Pipeline {
         }
         self.reload_metadata_from_disk(job_id).await;
         let mut archive_refresh_file_indices = refreshed_rar_files;
+        archive_refresh_file_indices.extend(repair_output_indices);
         archive_refresh_file_indices.extend(
             complete_files
                 .iter()

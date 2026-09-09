@@ -41,7 +41,7 @@ func TestPar3ArchiveE2E(t *testing.T) {
 			}
 			files, payload, member, password := par3ArchiveFixture(t, dir, format)
 			par3ArchiveParity(t, reference, dir, files)
-			modes := []string{"clean", "renamed", "corrupt", "missing", "mixed-prefer-par2", "mixed-fallback"}
+			modes := []string{"clean", "renamed", "omitted", "corrupt", "missing", "mixed-prefer-par2", "mixed-fallback"}
 			if strings.HasPrefix(format, "rar-") {
 				modes = append(modes, "disguised-carrier")
 			}
@@ -124,6 +124,15 @@ func TestPar3ArchiveE2E(t *testing.T) {
 							}
 						}
 					}
+                    if mode == "omitted" {
+                        for name := range posted { if strings.HasSuffix(name, ".par3") { delete(posted, name) } }
+                        omittedDir := filepath.Join(dir, "omitted-data")
+                        if err := os.MkdirAll(omittedDir, 0755); err != nil { t.Fatal(err) }
+                        par3ReferenceParity(t, reference, omittedDir, posted, []string{"-e1", "-D", "-s65536", "-c1"})
+                        for name := range posted {
+                            if !strings.HasSuffix(name, ".par3") || strings.Contains(name, ".vol") { delete(posted, name) }
+                        }
+                    }
 					articleMode := "clean"
 					if strings.HasPrefix(mode, "missing") {
 						articleMode = mode
@@ -233,7 +242,7 @@ func TestPar3ArchiveE2E(t *testing.T) {
 					if err != nil || !bytes.Equal(actual, payload) {
 						t.Fatalf("extracted member mismatch: %v got=%x want=%x", err, sha256.Sum256(actual), sha256.Sum256(payload))
 					}
-					if strings.HasPrefix(format, "rar-") && mode != "renamed" {
+					if strings.HasPrefix(format, "rar-") && mode != "renamed" && mode != "omitted" {
 						log, err := os.ReadFile(logPath)
 						if err != nil {
 							t.Fatal(err)

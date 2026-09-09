@@ -92,7 +92,7 @@ impl Pipeline {
         let runtime = self.par3_runtime.as_ref().expect("admitted PAR3 job");
         let next = runtime
             .assessments(job_id)
-            .find(|(_, view)| {
+            .filter(|(_, view)| {
                 view.status != RepairStatus::Complete
                     || view.files.iter().any(|file| {
                         file.source.is_some_and(|source| {
@@ -121,7 +121,10 @@ impl Pipeline {
                     status,
                     self.par3_damage_overlaps_settled_par2(job_id, view),
                 )
-            });
+            })
+            // Repair an independent ready set before requesting recovery for
+            // a blocked sibling. One set's deficit need not delay the others.
+            .min_by_key(|(_, status, _)| *status != RepairStatus::Ready);
         let Some((set, status, conflicts)) = next else {
             if runtime.authenticated_set_count(job_id) == 0 {
                 if self.promote_par3_recovery(job_id) {
@@ -160,6 +163,10 @@ impl Pipeline {
                         JobStatus::Downloading,
                         Some("downloading"),
                     );
+                }
+                if let Err(error) = self.prepare_par3_outputs(job_id, set) {
+                    self.fail_job(job_id, format!("PAR3 output planning failed: {error}"));
+                    return true;
                 }
                 if !self.maybe_start_repair(job_id).await {
                     return true;

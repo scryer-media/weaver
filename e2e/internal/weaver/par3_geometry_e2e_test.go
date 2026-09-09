@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+    "sync"
 	"testing"
 	"time"
 )
@@ -39,6 +40,8 @@ func TestPar3GeometryE2E(t *testing.T) {
 		facts   []string
 	}
 	cases := []geometry{
+        {"full-cauchy", 262144 + 123, []string{"-e1", "-s32768", "-c9"}, nil},
+        {"full-fft", 262144 + 123, []string{"-e8", "-s32768", "-c9"}, []string{"FFT based Reed-Solomon Codes"}},
 		{"gf16", 1048576 + 123, []string{"-e1", "-s1024", "-c8"}, []string{"Galois field size = 2", "Galois field generator = 0x1100B"}},
 		{"fft", 1048576 + 123, []string{"-e8", "-s32768", "-c8"}, []string{"FFT based Reed-Solomon Codes"}},
 		{"uneven-cohorts", 1048576 + 32768 + 123, []string{"-e8", "-i2", "-s32768", "-c9"}, []string{"Actual block count = 34", "Number of cohort = 3"}},
@@ -69,6 +72,10 @@ func TestPar3GeometryE2E(t *testing.T) {
 				payload = bytes.Repeat(append([]byte("prefix13bytes"), payload...), 16)
 			}
 			expected := map[string][]byte{"payload.bin": payload}
+            if strings.HasPrefix(spec.name, "full-") {
+                expected["empty.bin"] = []byte{}
+                expected["inline.bin"] = bytes.Clone(payload[:17])
+            }
 			if spec.name == "packed-tails" {
 				expected["second.bin"] = append(bytes.Clone(payload[:8192]), bytes.Repeat([]byte{23}, 96)...)
 				expected["third.bin"] = append(bytes.Clone(payload[:8192]), bytes.Repeat([]byte{71}, 128)...)
@@ -138,6 +145,11 @@ func TestPar3GeometryE2E(t *testing.T) {
 				}
 			}
 			modes := []string{"clean", "corrupt"}
+            switch spec.name {
+            case "full-cauchy": modes = []string{"omitted", "omitted-collision"}
+            case "full-fft": modes = []string{"omitted"}
+            case "aligned-dedup", "sliding-dedup", "data-only", "packed-tails": modes = append(modes, "omitted")
+            }
 			if spec.name == "uneven-cohorts" {
 				modes = append(modes, "cohort-deficit")
 			}
@@ -150,6 +162,9 @@ func TestPar3GeometryE2E(t *testing.T) {
 					for name, data := range carriers {
 						posted[name] = bytes.Clone(data)
 					}
+                    if strings.HasPrefix(mode, "omitted") {
+                        for name := range expected { delete(posted, name) }
+                    }
 					if mode == "corrupt" {
 						for name, data := range expected {
 							offset := len(data) / 2
@@ -171,6 +186,17 @@ func TestPar3GeometryE2E(t *testing.T) {
 					}
 					slug := "par3-geometry-" + spec.name + "-" + mode
 					nzb := nntp.publishUnpack(slug, "clean", posted, nil)
+                    var release func()
+                    if mode == "omitted-collision" {
+                        gate := &unpackGate{released: make(chan struct{})}
+                        release = sync.OnceFunc(func() { close(gate.released) })
+                        t.Cleanup(release)
+                        nntp.mu.Lock()
+                        for id, article := range nntp.articles {
+                            if strings.HasPrefix(id, slug+"-") { article.gate = gate; nntp.articles[id] = article }
+                        }
+                        nntp.mu.Unlock()
+                    }
 					if err := os.WriteFile(filepath.Join(root, slug+".nzb"), nzb, 0644); err != nil {
 						t.Fatal(err)
 					}
@@ -179,6 +205,10 @@ func TestPar3GeometryE2E(t *testing.T) {
 						t.Fatal(err)
 					}
 					api.cancelOnFailure(t, job)
+                    if release != nil {
+                        if err := os.WriteFile(filepath.Join(root, "intermediate", slug, "payload.bin"), []byte("unclaimed existing output"), 0644); err != nil { t.Fatal(err) }
+                        release()
+                    }
 					status := ""
 					deadline := time.Now().Add(90 * time.Second)
 					for time.Now().Before(deadline) {
@@ -231,6 +261,14 @@ func TestPar3GeometryE2E(t *testing.T) {
 						}
 						return
 					}
+                    if mode == "omitted-collision" {
+                        if status != "FAILED" || history.HistoryItem == nil || history.HistoryItem.Error == nil || !strings.Contains(*history.HistoryItem.Error, "unclaimed output already exists") {
+                            t.Fatalf("unclaimed output was not refused: status=%s history=%+v log=%s", status, history.HistoryItem, logPath)
+                        }
+                        actual, err := os.ReadFile(filepath.Join(root, "intermediate", slug, "payload.bin"))
+                        if err != nil || string(actual) != "unclaimed existing output" { t.Fatalf("collision overwrote existing output: %v", err) }
+                        return
+                    }
 					if status != "COMPLETED" {
 						failure := ""
 						if history.HistoryItem != nil && history.HistoryItem.Error != nil {

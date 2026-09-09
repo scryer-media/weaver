@@ -484,6 +484,30 @@ Formatting and Clippy are deferred to the final MVP capstone at the operator's
 request; full functional sweeps remain batched by capability. This capability uses
 the existing prospective 0.11.3 version and adds no dependencies.
 
+PAR3 can now reconstruct ordinary flat-path outputs that the NZB never listed,
+including empty and inline files, and feed reconstructed ZIP/ZIP64, split, stored
+RAR and encrypted RAR archives into extraction. A dedicated `active_repair_outputs`
+manifest reserves stable file indices, paths and authenticated lengths before
+installation. Reservations are atomic, idempotent and contradictory replays fail;
+unclaimed existing files and links are refused before any output is written.
+A repair-output assembly state has no articles and adds no declared or received
+download bytes. Missing planned outputs stay pending on restart; regular images
+at the expected length become candidates for fresh native verification, never
+trusted evidence. The manifest participates in job cleanup and database-restore
+reset policy. Independent ready sets are repaired before requesting recovery for
+blocked siblings. The native restart case reconstructs an NZB-absent file, waits
+on a second set, changes the reconstructed bytes while Weaver is stopped, and
+verifies that restart restores membership and repairs the changed bytes.
+
+Thirteen new native cases cover six omission geometries, five archive extraction
+formats, collision refusal and durable output restart. All 210 combined native
+scenarios pass. The broad Rust sweep ran 3,878 tests: 3,872 passed and six found a
+single missed schema-version constant update from 46 to 47. The constant is fixed;
+all 19 migration and output-manifest tests pass on the targeted rerun. All 118 focused assembly, persistence and
+repair regressions passed before that fix. Formatting and Clippy remain deferred
+to the MVP capstone. Migration 47 and the existing prospective 0.11.3 version cover
+this capability; no third-party dependencies changed.
+
 Content placement is not complete: damaged/shifted donors need extent placement,
 shared aliases need separate output mappings, and authenticated nested paths need
 safe mapping into Weaver's download identities. Interrupted filesystem placement

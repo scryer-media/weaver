@@ -663,6 +663,9 @@ impl Pipeline {
         let Some(file) = state.assembly.file(file_id) else {
             return Ok(());
         };
+        // Planned outputs have no articles or readable bytes until native
+        // installation hands them back. Do not open a destination that is absent.
+        if file.is_repair_output() && !file.is_complete() { return Ok(()); }
         let name = self.current_filename_for_file(job_id, file);
         let path = state.working_dir.join(&name);
         let source = SourceId(u64::from(file_id.file_index));
@@ -977,6 +980,7 @@ mod coordination;
 #[cfg(windows)]
 mod disk_windows;
 mod identity;
+mod outputs;
 pub(in crate::pipeline) mod inside;
 mod placement;
 mod readback;
