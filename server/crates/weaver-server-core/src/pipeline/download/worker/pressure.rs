@@ -27,7 +27,7 @@ impl Pipeline {
 
     /// Whether ahead-of-cursor UU parking is at one of its aggregate limits.
     ///
-    /// This is the predicate the dispatcher and the memory park consult, so it
+    /// This is the predicate the memory park consults, so it
     /// only ever caps on evidence: the byte cap, the segment cap, or a
     /// free-space reading (fresh or held from the last good probe) that shows
     /// the reserve gone. A filesystem that has never produced a reading does
@@ -38,6 +38,15 @@ impl Pipeline {
         &mut self,
         additional_spooled_bytes: usize,
     ) -> bool {
+        let available = self.uu_spool_capacity().best_available_bytes();
+        self.uu_spool_limits_reached(additional_spooled_bytes, available)
+    }
+
+    fn uu_spool_limits_reached(
+        &self,
+        additional_spooled_bytes: usize,
+        available: Option<u64>,
+    ) -> bool {
         let byte_limit_reached = self
             .uu_spooled_bytes
             .saturating_add(additional_spooled_bytes)
@@ -46,12 +55,25 @@ impl Pipeline {
         let required_free = self
             .uu_spool_min_free_bytes
             .saturating_add(additional_spooled_bytes as u64);
-        let free_space_too_low = self
-            .uu_spool_capacity()
-            .best_available_bytes()
-            .is_some_and(|available| available < required_free);
+        let free_space_too_low = available.is_some_and(|available| available < required_free);
 
         byte_limit_reached || segment_limit_reached || free_space_too_low
+    }
+
+    /// After a refused spill, fetch only known UU cursors until parking can
+    /// retain the refused bytes. Memory parking remains available to arrivals
+    /// already in flight, and yEnc retains its ordinary dispatch path.
+    pub(in crate::pipeline) fn uu_spool_dispatch_capped(&mut self) -> bool {
+        let available = self.uu_spool_capacity().best_available_bytes();
+        if let Some(bytes) = self.uu_spool_blocked_spill_bytes {
+            let fits_memory =
+                self.write_buffered_bytes.saturating_add(bytes) < self.write_backlog_budget_bytes;
+            let fits_spool = available.is_some() && !self.uu_spool_limits_reached(bytes, available);
+            if fits_memory || fits_spool {
+                self.uu_spool_blocked_spill_bytes = None;
+            }
+        }
+        self.uu_spool_limits_reached(0, available) || self.uu_spool_blocked_spill_bytes.is_some()
     }
 
     /// Admit `spilled_bytes` of UU spool to disk, debiting the cached
@@ -62,18 +84,17 @@ impl Pipeline {
     /// one the bytes are refused and the part is requeued, which keeps the
     /// spool from writing blind into a filesystem it cannot measure.
     pub(in crate::pipeline) fn admit_uu_spill(&mut self, spilled_bytes: usize) -> bool {
-        if self.uu_spool_admission_capped(spilled_bytes) {
-            return false;
-        }
-        let required_free = self
-            .uu_spool_min_free_bytes
-            .saturating_add(spilled_bytes as u64);
-        let admitted = self
-            .uu_spool_capacity()
-            .best_available_bytes()
-            .is_some_and(|available| available >= required_free);
+        let available = self.uu_spool_capacity().best_available_bytes();
+        let admitted =
+            available.is_some() && !self.uu_spool_limits_reached(spilled_bytes, available);
         if admitted {
             self.uu_spool_capacity.debit(spilled_bytes as u64);
+        } else {
+            self.uu_spool_blocked_spill_bytes = Some(
+                self.uu_spool_blocked_spill_bytes
+                    .unwrap_or(0)
+                    .max(spilled_bytes),
+            );
         }
         admitted
     }
@@ -472,7 +493,7 @@ impl Pipeline {
         // their own admission limits and must not pace unrelated yEnc work.
         let write_bytes = self.metrics.write_buffered_bytes.load(Ordering::Relaxed);
         let uu_spool_admission_capped =
-            !self.uu_files.is_empty() && self.uu_spool_admission_capped(0);
+            !self.uu_files.is_empty() && self.uu_spool_dispatch_capped();
 
         if decode_bytes >= decode_hard {
             self.download_decode_hard_pressure_latched = true;

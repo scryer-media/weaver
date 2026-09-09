@@ -121,9 +121,9 @@ impl HoldsAccountant {
         Self::with_probe(
             limits,
             Box::new(|path| {
-                // The working directory may not exist yet; its nearest
-                // existing ancestor answers for the filesystem.
-                match crate::operations::disk::probe_nearest_disk_space(path) {
+                // A missing working directory must not borrow capacity from
+                // its parent. Keep the estimate stale until this path returns.
+                match crate::operations::disk::probe_disk_space(path) {
                     Ok(space) => Some(space.available_bytes),
                     Err(error) => {
                         tracing::debug!(

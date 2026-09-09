@@ -3189,6 +3189,9 @@ pub struct Pipeline {
     /// Rate-limited free-space readings for the spool filesystem. Admitted
     /// spills are debited against the cached reading between probes.
     pub(super) uu_spool_capacity: crate::operations::CapacitySampler,
+    /// Largest refused UU spill. Dispatch preserves cursor progress until
+    /// this many bytes can be parked in memory or admitted to the spool.
+    pub(super) uu_spool_blocked_spill_bytes: Option<usize>,
     #[cfg(test)]
     /// Test-only free-space reading; `Some(None)` exercises a filesystem that
     /// has never produced a reading.

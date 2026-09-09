@@ -28,22 +28,41 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> bool {
-        let uu_cursor_ordinals = (!self.uu_files.is_empty() && self.uu_spool_admission_capped(0))
-            .then(|| self.uu_spool_cursor_ordinals());
+        let uu_capped = !self.uu_files.is_empty() && self.uu_spool_dispatch_capped();
         self.jobs.get(&job_id).is_some_and(|state| {
-            Self::status_allows_download_dispatch(&state.status)
-                && uu_cursor_ordinals.as_ref().map_or_else(
-                    || !state.download_queue.is_empty(),
-                    |cursors| {
-                        // A capped UU tail cannot consume a spare connection;
-                        // it must not withhold that capacity from another job.
-                        state
-                            .download_queue
-                            .peek_next_matching(|work| Self::uu_work_closes_cursor(cursors, work))
-                            .is_some()
-                    },
-                )
+            if !Self::status_allows_download_dispatch(&state.status) {
+                return false;
+            }
+            if !uu_capped {
+                return !state.download_queue.is_empty();
+            }
+            // A blocked UU head must not hide another encoding deeper in
+            // either heap. Reuse per-file counts instead of scanning articles
+            // or allocating a cursor map for this availability check.
+            let queued_uu: usize = self
+                .uu_files
+                .keys()
+                .filter(|file_id| file_id.job_id == job_id)
+                .map(|file_id| state.download_queue.queued_count_for_file(*file_id) as usize)
+                .sum();
+            state.download_queue.len() > queued_uu
+                || state
+                    .download_queue
+                    .peek_next_matching(|work| {
+                        self.uu_files
+                            .get(&work.segment_id.file_id)
+                            .is_none_or(|uu| uu.next_index == work.segment_id.segment_number)
+                    })
+                    .is_some()
         })
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn job_has_dispatchable_work_for_test(
+        &mut self,
+        job_id: JobId,
+    ) -> bool {
+        self.job_has_dispatchable_work(job_id)
     }
 
     pub(in crate::pipeline::download::worker) fn job_has_completion_critical_work(

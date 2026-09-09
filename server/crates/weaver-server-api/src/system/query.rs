@@ -391,7 +391,7 @@ fn probe_configured_storage(input: ConfiguredStorageInput) -> ConfiguredStorage 
         };
     }
 
-    match weaver_server_core::operations::probe_nearest_disk_space(&input.path) {
+    match weaver_server_core::operations::probe_disk_space(&input.path) {
         Ok(space) => ConfiguredStorage {
             labels: input.labels,
             path,

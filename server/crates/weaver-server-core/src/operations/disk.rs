@@ -197,9 +197,10 @@ fn windows_probe_path(absolute: &[u16]) -> Vec<u16> {
 }
 
 /// Probe `path`, falling back to its nearest existing ancestor when the path
-/// itself has not been created yet. Every other failure is returned as-is so a
-/// permission problem or an unmounted filesystem is never masked by an
-/// ancestor that lives on a different device.
+/// itself has not been created yet. Only use this for advisory startup
+/// estimates: a missing path may also mean a disconnected storage root, and
+/// its parent's capacity does not establish that the target is available.
+/// Permission and I/O errors are returned unchanged.
 pub fn probe_nearest_disk_space(path: &Path) -> Result<DiskSpace, DiskProbeError> {
     let mut candidate = path;
     loop {
@@ -332,10 +333,11 @@ impl fmt::Debug for CapacitySampler {
 }
 
 impl CapacitySampler {
-    /// Sample the filesystem behind `path` (or its nearest existing ancestor)
-    /// at most once per `ttl`. No probe runs until the first `sample`.
+    /// Sample the exact storage path at most once per `ttl`. A missing root
+    /// stays unavailable rather than borrowing its parent's capacity.
+    /// No probe runs until the first `sample`.
     pub fn new(path: PathBuf, ttl: Duration) -> Self {
-        Self::with_probe(path, ttl, Box::new(probe_nearest_disk_space))
+        Self::with_probe(path, ttl, Box::new(probe_disk_space))
     }
 
     /// Like [`Self::new`] with a caller-supplied probe (tests, injected
@@ -393,8 +395,13 @@ impl CapacitySampler {
     }
 
     pub fn refresh_at(&mut self, now: Instant) -> Capacity {
+        let started = Instant::now();
+        let result = (self.probe)(&self.path);
+        // A slow syscall must not consume its own cache lifetime. Preserve
+        // the caller's clock origin while stamping completion, not initiation.
+        let now = now + started.elapsed();
         self.last_attempt = Some(now);
-        match (self.probe)(&self.path) {
+        match result {
             Ok(space) => {
                 if let Some(since) = self.failing_since.take() {
                     info!(
@@ -671,6 +678,54 @@ mod tests {
     }
 
     #[test]
+    fn sampler_waits_a_full_ttl_after_a_slow_probe_finishes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let ttl = Duration::from_millis(10);
+        let probe_delay = ttl * 2;
+        let mut sampler = CapacitySampler::with_probe(
+            PathBuf::from("/scripted"),
+            ttl,
+            Box::new(move |_| {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(probe_delay);
+                Ok(DiskSpace {
+                    total_bytes: 2000,
+                    available_bytes: 1000,
+                })
+            }),
+        );
+        let started = Instant::now();
+        sampler.sample_at(started);
+        // This timestamp is at or before completion, independent of how long
+        // the test thread was descheduled during the probe.
+        sampler.sample_at(started + probe_delay);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "slow probes must not expire their own TTL"
+        );
+    }
+
+    #[test]
+    fn sampler_keeps_a_disappeared_root_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        std::fs::create_dir(&root).unwrap();
+        let mut sampler = CapacitySampler::new(root.clone(), Duration::ZERO);
+        let first = sampler.sample().reading().unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let missing = sampler.sample().reading().unwrap();
+        assert!(
+            missing.stale,
+            "parent capacity must not replace a disappeared storage root"
+        );
+        assert_eq!(missing.sampled_at, first.sampled_at);
+        std::fs::create_dir(&root).unwrap();
+        assert!(!sampler.sample().reading().unwrap().stale);
+    }
+
+    #[test]
     fn sampler_respects_the_ttl_and_accounts_debits_and_credits_between_probes() {
         let calls = Arc::new(AtomicUsize::new(0));
         let results = Arc::new(Mutex::new(vec![Ok(1000), Ok(5000)]));
@@ -719,7 +774,12 @@ mod tests {
     fn sampler_probes_the_real_filesystem_by_default() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut sampler = CapacitySampler::new(dir.path().join("pending"), Duration::from_secs(1));
-        let reading = sampler.sample().reading().expect("reading via ancestor");
+        assert_eq!(sampler.sample(), Capacity::Unknown);
+        std::fs::create_dir(dir.path().join("pending")).unwrap();
+        let reading = sampler
+            .refresh()
+            .reading()
+            .expect("reading of the created root");
         assert!(reading.total_bytes > 0);
         assert!(!reading.stale);
     }

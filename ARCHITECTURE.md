@@ -211,13 +211,19 @@ memory pressure. Resident bytes remain subject to the shared memory budgets.
 
 Free-space gates (UU spool, direct-store scratch, extraction reserve) share
 one rule: a filesystem that cannot be measured is not evidence that it is
-full. Each gate samples through the operations capacity sampler, which
-rate-limits probes, holds the last good reading (marked stale) across probe
-failures, debits admitted bytes between probes, and logs each outage and
-recovery once with the operating-system reason. A fresh reading that confirms
+full. UU and extraction use the operations capacity sampler; holds scratch
+maintains its own cached estimate. Both keep and debit the last good reading
+across probe failures. The operations sampler logs outage/recovery transitions
+and starts each probe's TTL when the attempt finishes, so a slow syscall cannot
+expire its own cache lifetime. Active storage checks probe the exact root;
+ancestor capacity is only an advisory startup estimate. A fresh reading that confirms
 the reserve is gone refuses; a stale or unknown reading never fails a job on
 its own. The only place "unknown" refuses is a write that needs a reading to be
 judged at all (a UU spill), and that refusal is a requeue, not a failure.
+After a spill is refused, known UU files dispatch cursor work until the refused
+bytes fit in memory or the spool. This prevents successful tail articles from
+being repeatedly fetched and discarded during an outage. Memory parking for
+in-flight arrivals remains available; yEnc keeps its normal batching/refill path.
 
 ### 8. Shared Mutable Runtime State Must Be Explicit
 

@@ -414,7 +414,28 @@ async fn uu_park_refuses_to_spill_when_free_space_is_unknown() {
     assert!(!pipeline.uu_spool_root.join(job_id.0.to_string()).exists());
     assert!(
         !pipeline.uu_spool_admission_capped(0),
-        "an unknown reading must not cap dispatch"
+        "an unknown reading must not refuse memory parking"
+    );
+    assert!(
+        pipeline.uu_spool_dispatch_capped(),
+        "a refused spill must stop speculative refetches"
+    );
+
+    pipeline.write_backlog_budget_bytes = parts[1].len() + 1;
+    assert!(
+        !pipeline.uu_spool_dispatch_capped(),
+        "freeing memory restores parallel UU dispatch"
+    );
+
+    pipeline.write_backlog_budget_bytes = 1;
+    assert!(!pipeline.admit_uu_spill(parts[1].len()));
+    assert!(pipeline.uu_spool_dispatch_capped());
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(
+        pipeline.uu_spool_min_free_bytes + parts[1].len() as u64,
+    ));
+    assert!(
+        !pipeline.uu_spool_dispatch_capped(),
+        "a recovered capacity reading restores dispatch"
     );
 }
 

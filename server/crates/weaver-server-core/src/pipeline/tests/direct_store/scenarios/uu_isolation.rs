@@ -262,7 +262,7 @@ async fn mixed_uu_and_yenc_archives_complete_with_uu_admission_capped() {
 
 #[tokio::test]
 async fn capped_uu_keeps_yenc_batches_and_trials_while_restricting_its_own_tail() {
-    for trial in [false, true] {
+    for (trial, unknown_capacity) in [(false, false), (true, false), (false, true), (true, true)] {
         let temp_dir = tempfile::tempdir().unwrap();
         let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
             &temp_dir,
@@ -307,10 +307,19 @@ async fn capped_uu_keeps_yenc_batches_and_trials_while_restricting_its_own_tail(
         for work in queued {
             state.download_queue.push(work);
         }
-        pipeline.uu_spool_max_segments = 0;
+        if unknown_capacity {
+            pipeline.write_backlog_budget_bytes = 1;
+            pipeline.uu_spool_available_bytes_for_test = Some(None);
+            assert!(!pipeline.admit_uu_spill(100));
+        } else {
+            pipeline.uu_spool_max_segments = 0;
+        }
         pipeline.hot_dispatch_job = Some(job_id);
+        assert!(
+            pipeline.job_has_dispatchable_work_for_test(job_id),
+            "a blocked UU head must not hide queued yEnc from hot scheduling"
+        );
         let pressure = pipeline.refresh_download_pressure();
-        assert!(pipeline.uu_spool_admission_capped(0));
         let lease = if trial {
             pipeline.try_lease_ip_replacement_trial_batch_for_test(job_id, 0)
         } else {

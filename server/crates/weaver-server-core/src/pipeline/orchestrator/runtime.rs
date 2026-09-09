@@ -245,6 +245,7 @@ impl Pipeline {
                 intermediate_dir.clone(),
                 Pipeline::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL,
             ),
+            uu_spool_blocked_spill_bytes: None,
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
