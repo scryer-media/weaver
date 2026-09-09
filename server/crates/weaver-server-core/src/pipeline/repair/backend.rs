@@ -7,6 +7,14 @@
 
 use std::path::Path;
 
+/// Native facts that permit trying another repair format. An unclassified
+/// failure (including I/O and cancellation) never gains eligibility from text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::pipeline) enum AlternateRepairReason {
+    InsufficientRecovery,
+    ResourceLimited,
+}
+
 pub(in crate::pipeline) trait RepairBackend {
     type Assessment<'a>
     where

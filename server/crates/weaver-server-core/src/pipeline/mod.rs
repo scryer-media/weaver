@@ -1635,6 +1635,9 @@ pub(super) struct Par2SetRuntime {
     /// A final answer that could not verify or repair this set.  The gate keeps
     /// processing later sets before turning these failures into the job result.
     pub(super) failure: Option<String>,
+    /// A native recoverability verdict can permit another format to try. I/O,
+    /// cancellation and other unclassified failures keep this empty.
+    pub(in crate::pipeline) alternate_repair: Option<repair::backend::AlternateRepairReason>,
     /// Damage observed while deciding this set.  The aggregate reports one
     /// job-level verification metric after every servable set has settled.
     pub(super) missing_blocks: u32,

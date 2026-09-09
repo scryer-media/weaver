@@ -777,6 +777,7 @@ impl Pipeline {
 
 mod assessment;
 mod completion;
+mod coordination;
 #[cfg(windows)]
 mod disk_windows;
 mod readback;

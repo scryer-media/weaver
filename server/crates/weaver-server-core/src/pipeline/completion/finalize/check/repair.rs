@@ -385,6 +385,7 @@ impl Pipeline {
     ) -> Result<par2_rs::Par2RepairOutcome, String> {
         let set_id = par2_set.recovery_set_id;
         if repair {
+            self.fence_par3_before_par2_repair(job_id, set_id, verification)?;
             // The repairer is about to rewrite damaged sources in place. A
             // chase that consumed only bytes the recovery set positively found
             // Intact is safe to leave parked through that — repair cannot
@@ -1698,7 +1699,7 @@ impl Pipeline {
 
     /// Whether every servable set has reached a final answer and no later
     /// index can add one. A failed set is settled, but not verified.
-    pub(super) fn par2_gate_settlement_complete(&self, job_id: JobId) -> bool {
+    pub(in crate::pipeline) fn par2_gate_settlement_complete(&self, job_id: JobId) -> bool {
         let set_ids = self.par2_servable_set_ids(job_id);
         !set_ids.is_empty()
             && self.par2_metadata_discovery_closed(job_id)
@@ -1748,6 +1749,7 @@ impl Pipeline {
         };
         set_runtime.settled = true;
         set_runtime.failure = None;
+        set_runtime.alternate_repair = None;
         set_runtime.post_verdict_reconcile_attempts = 0;
         // A settled set owes no repair.
         set_runtime.pending_repair = None;
@@ -1785,6 +1787,7 @@ impl Pipeline {
         if let Some(set_runtime) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id) {
             set_runtime.settled = true;
             set_runtime.failure = Some(message.clone());
+            set_runtime.alternate_repair = None;
             set_runtime.post_verdict_reconcile_attempts = 0;
             // A failed set owes no repair.
             set_runtime.pending_repair = None;
@@ -1811,12 +1814,26 @@ impl Pipeline {
         self.finish_or_rearm_after_par2_set_failure(job_id);
     }
 
-    /// A failed set must leave its siblings time to settle, but once the last
-    /// one has answered the job failure belongs to this same gate entry.  In
-    /// particular, a one-set job must retain the immediate failure behaviour
-    /// it had before the aggregate existed.
+    pub(super) async fn finish_par2_set_with_alternate(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        message: String,
+        reason: crate::pipeline::repair::backend::AlternateRepairReason,
+    ) {
+        let _ = self.mark_par2_set_failed(job_id, set_id, message);
+        if let Some(set) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id) {
+            set.alternate_repair = Some(reason);
+        }
+        self.finish_or_rearm_after_par2_set_failure(job_id);
+    }
+
+    /// Sibling PAR2 sets and explicitly eligible alternate work get their own
+    /// attempt. A PAR2-only job retains its immediate terminal failure behavior.
     pub(super) fn finish_or_rearm_after_par2_set_failure(&mut self, job_id: JobId) {
-        if let Some(message) = self.aggregate_par2_failure_message(job_id) {
+        if let Some(message) = self.aggregate_par2_failure_message(job_id)
+            && !self.par3_has_work_after_par2_failure(job_id)
+        {
             self.fail_job(job_id, message);
         } else {
             self.schedule_job_completion_check(job_id);

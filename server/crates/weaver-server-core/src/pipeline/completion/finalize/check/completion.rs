@@ -3,6 +3,7 @@
 //! that is not simply a method of the same type.
 
 use super::*;
+use crate::pipeline::repair::backend::AlternateRepairReason;
 
 impl Pipeline {
     pub(super) async fn check_rar_job_completion(&mut self, job_id: JobId) {
@@ -1362,7 +1363,13 @@ impl Pipeline {
                         &verification.repairable
                     {
                         let msg = par2_resource_limit_message(reason);
-                        self.finish_par2_set_failure(job_id, set_id, msg).await;
+                        self.finish_par2_set_with_alternate(
+                            job_id,
+                            set_id,
+                            msg,
+                            AlternateRepairReason::ResourceLimited,
+                        )
+                        .await;
                         return;
                     }
 
@@ -1631,12 +1638,13 @@ impl Pipeline {
                             );
                             return;
                         }
-                        self.finish_par2_set_failure(
+                        self.finish_par2_set_with_alternate(
                             job_id,
                             set_id,
                             format!(
                                 "not repairable: {blocks_needed} damaged slices, only {total_recovery_capacity} recovery blocks advertised"
                             ),
+                            AlternateRepairReason::InsufficientRecovery,
                         )
                         .await;
                         return;
@@ -1662,7 +1670,13 @@ impl Pipeline {
                                 "not repairable: {blocks_needed} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
                             );
-                            self.finish_par2_set_failure(job_id, set_id, msg).await;
+                            self.finish_par2_set_with_alternate(
+                                job_id,
+                                set_id,
+                                msg,
+                                AlternateRepairReason::InsufficientRecovery,
+                            )
+                            .await;
                             return;
                         }
 
@@ -1675,7 +1689,13 @@ impl Pipeline {
                             recovery_still_settling,
                             promoted_recovery.parked_promoted_recovery,
                         ) {
-                            self.finish_par2_set_failure(job_id, set_id, msg).await;
+                            self.finish_par2_set_with_alternate(
+                                job_id,
+                                set_id,
+                                msg,
+                                AlternateRepairReason::InsufficientRecovery,
+                            )
+                            .await;
                             return;
                         }
 
@@ -1712,7 +1732,13 @@ impl Pipeline {
                         let msg = format!(
                             "not repairable: PAR2 analysis found incomplete critical repair metadata or unusable recovery despite {recovery_now} available recovery blocks"
                         );
-                        self.finish_par2_set_failure(job_id, set_id, msg).await;
+                        self.finish_par2_set_with_alternate(
+                            job_id,
+                            set_id,
+                            msg,
+                            AlternateRepairReason::InsufficientRecovery,
+                        )
+                        .await;
                         return;
                     }
 
@@ -2015,7 +2041,13 @@ impl Pipeline {
                     &verification.repairable
                 {
                     let msg = par2_resource_limit_message(reason);
-                    self.finish_par2_set_failure(job_id, set_id, msg).await;
+                    self.finish_par2_set_with_alternate(
+                        job_id,
+                        set_id,
+                        msg,
+                        AlternateRepairReason::ResourceLimited,
+                    )
+                    .await;
                     return;
                 }
 
@@ -2196,17 +2228,24 @@ impl Pipeline {
                         &repair_preview.verification.repairable
                     {
                         let msg = par2_resource_limit_message(reason);
-                        self.finish_par2_set_failure(job_id, set_id, msg).await;
+                        self.finish_par2_set_with_alternate(
+                            job_id,
+                            set_id,
+                            msg,
+                            AlternateRepairReason::ResourceLimited,
+                        )
+                        .await;
                         return;
                     }
 
                     if total_recovery_capacity < damaged {
-                        self.finish_par2_set_failure(
+                        self.finish_par2_set_with_alternate(
                             job_id,
                             set_id,
                             format!(
                                 "not repairable: {damaged} damaged slices, only {total_recovery_capacity} recovery blocks advertised"
                             ),
+                            AlternateRepairReason::InsufficientRecovery,
                         )
                         .await;
                         return;
@@ -2235,7 +2274,13 @@ impl Pipeline {
                                 "not repairable: {damaged} damaged slices, \
                                  only {targeted_total} recovery blocks available in NZB"
                             );
-                            self.finish_par2_set_failure(job_id, set_id, msg).await;
+                            self.finish_par2_set_with_alternate(
+                                job_id,
+                                set_id,
+                                msg,
+                                AlternateRepairReason::InsufficientRecovery,
+                            )
+                            .await;
                             return;
                         }
 
@@ -2248,7 +2293,13 @@ impl Pipeline {
                             recovery_still_settling,
                             promoted_recovery.parked_promoted_recovery,
                         ) {
-                            self.finish_par2_set_failure(job_id, set_id, msg).await;
+                            self.finish_par2_set_with_alternate(
+                                job_id,
+                                set_id,
+                                msg,
+                                AlternateRepairReason::InsufficientRecovery,
+                            )
+                            .await;
                             return;
                         }
 

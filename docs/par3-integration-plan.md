@@ -266,9 +266,25 @@ positive cases remain enabled. The operator decision on a larger per-session
 ceiling within the unchanged global pool is pending. Do not treat this matrix
 as fully passing or infer performance acceptance from the successful cases.
 
-Still pending: incremental decode-to-publication wiring, mixed-format fallback,
-positioned verification, embedded archives, evidence persistence and product
-surfaces. Rebuilt files currently
+Standalone mixed-format coordination now gives PAR2 its first repair attempt and
+excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence
+only affected PAR3 source evidence, then republish installed bytes for native
+verification. After PAR2 exhausts recovery, PAR3 may repair shared sources; affected
+PAR2 sets reopen and perform their own verification. Current, conflicting native
+verdicts refuse further writes and delivery. Ten real-process scenarios cover
+independent clean/repair jobs, preservation of an unrelated PAR2 failure,
+shared clean/preferred/fallback/insufficient jobs, and conflicting official
+descriptions in both directions and after fallback. Fallback eligibility is a
+typed native fact (insufficient recovery or resource limitation); error strings,
+I/O and cancellation cannot grant it. The focused handoff regression measures
+exactly one new native PAR3 source verification after a one-file PAR2 repair,
+with zero verification rereads for its clean siblings.
+Cross-format temporary file lists share the existing 16 MiB host budget, and
+PAR2-only jobs allocate no handoff state. Mixed archive/direct-extraction and
+multi-set overlap coverage remain to be broadened.
+
+Still pending: incremental decode-to-publication wiring, positioned verification,
+embedded archives, evidence persistence and product surfaces. Rebuilt files currently
 receive a verification read when republished; clean native evidence is retained.
 PAR3 repairs conservatively retire extraction chases until a PAR3 mutation view
 can positively vouch for their consumed bytes. Full E2E and performance acceptance

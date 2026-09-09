@@ -2342,6 +2342,11 @@ impl Pipeline {
 
         let state = self.jobs.get(&job_id)?;
         let role = recovery_file_role(&state.spec, file_index)?;
+        if matches!(role, weaver_model::files::FileRole::Par3 { .. }) {
+            // PAR3 packet sizes and volume indices do not predict PAR2 rows.
+            // Validated PAR2 packet ownership above remains authoritative.
+            return None;
+        }
 
         if matches!(
             role,

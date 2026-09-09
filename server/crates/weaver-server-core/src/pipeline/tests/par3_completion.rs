@@ -3,6 +3,232 @@ use super::*;
 const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
 
 #[tokio::test]
+async fn alternate_repair_requires_a_typed_native_reason_for_every_failed_set() {
+    use crate::pipeline::repair::backend::AlternateRepairReason;
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3112);
+    let mut spec = standalone_job_spec(
+        "Typed alternate repair",
+        &[("set.par3".into(), INDEX.len() as u32)],
+    );
+    spec.files[0].role = FileRole::from_filename("set.par3");
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, "set.par3", INDEX).await;
+    pipeline
+        .try_load_par3_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+        )
+        .await;
+    settle_par3(&mut pipeline, job_id).await;
+    let set_id = par2_rs::RecoverySetId::from_bytes([7; 16]);
+    let set = pipeline
+        .ensure_par2_runtime(job_id)
+        .sets
+        .entry(set_id)
+        .or_default();
+    set.settled = true;
+    // The message deliberately includes recovery language. Eligibility must
+    // come from the native verdict kind, never a substring in an error body.
+    set.failure = Some("I/O failure while reading insufficient recovery".into());
+    assert!(!pipeline.par3_has_work_after_par2_failure(job_id));
+    for reason in [
+        AlternateRepairReason::InsufficientRecovery,
+        AlternateRepairReason::ResourceLimited,
+    ] {
+        pipeline
+            .ensure_par2_runtime(job_id)
+            .sets
+            .get_mut(&set_id)
+            .unwrap()
+            .alternate_repair = Some(reason);
+        assert!(pipeline.par3_has_work_after_par2_failure(job_id));
+    }
+    let sibling = par2_rs::RecoverySetId::from_bytes([8; 16]);
+    let set = pipeline
+        .ensure_par2_runtime(job_id)
+        .sets
+        .entry(sibling)
+        .or_default();
+    set.settled = true;
+    set.failure = Some("cancelled".into());
+    assert!(
+        !pipeline.par3_has_work_after_par2_failure(job_id),
+        "an eligible sibling cannot turn a terminal failure into fallback work"
+    );
+}
+
+#[tokio::test]
+async fn par2_capacity_and_promotion_exclude_par3_recovery_carriers() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3110);
+    let payload = vec![3u8; 10000];
+    let index = build_test_par2_index_for_files(&[("payload.bin", &payload)], 2048);
+    let mut spec = standalone_job_spec(
+        "Mixed recovery ownership",
+        &[
+            ("payload.bin".into(), payload.len() as u32),
+            ("repair.par2".into(), index.len() as u32),
+            ("repair.vol0+16.par3".into(), 1 << 20),
+        ],
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, "repair.par2", &index).await;
+    pipeline
+        .try_load_par2_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 1,
+            },
+        )
+        .await;
+    let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+    assert_eq!(pipeline.total_recovery_block_capacity(job_id, set_id), 0);
+    assert_eq!(pipeline.promote_recovery_targeted(job_id, set_id, 1), 0);
+    assert_eq!(
+        pipeline.jobs[&job_id].recovery_queue.len(),
+        1,
+        "the PAR3 volume must remain available to its own engine"
+    );
+}
+
+#[tokio::test]
+async fn par2_installation_fences_par3_evidence_and_reverifies_only_the_rewritten_source() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3111);
+    let original: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
+    let mut files = vec![
+        ("a.bin", original.clone()),
+        ("b.txt", b"qrstuvwxyz".to_vec()),
+        (
+            "sub/c.bin",
+            (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+        ),
+        ("set.par3", INDEX.to_vec()),
+    ];
+    let par2 = build_test_par2_index_for_files(
+        &[
+            ("a.bin", &files[0].1),
+            ("b.txt", &files[1].1),
+            ("sub/c.bin", &files[2].1),
+        ],
+        2048,
+    );
+    files.push(("set.par2", par2));
+    files[0].1[2300] ^= 1;
+    let mut spec = standalone_job_spec(
+        "Cross-format source fence",
+        &files
+            .iter()
+            .map(|(name, bytes)| ((*name).into(), bytes.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    let working = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::create_dir(working.join("sub")).await.unwrap();
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+    }
+    pipeline
+        .try_load_par2_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 4,
+            },
+        )
+        .await;
+    pipeline
+        .try_load_par3_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 3,
+            },
+        )
+        .await;
+    settle_par3(&mut pipeline, job_id).await;
+    let source = par3_rs::source::SourceId(0);
+    let clean = par3_rs::source::SourceId(1);
+    let runtime = pipeline.par3_runtime.as_ref().unwrap();
+    assert!(!runtime.verified_file(job_id, source));
+    assert!(runtime.source_verified(job_id, clean));
+    let reads = runtime.source_verifications(job_id);
+    let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+    let native = pipeline
+        .par2_set_for(job_id, set_id)
+        .unwrap()
+        .as_ref()
+        .clone();
+    let mut options = par2_rs::Par2RepairSessionOptions::new(working.clone(), Vec::new());
+    options.file_set = Some(native);
+    options.memory_limit = Some(8 << 20);
+    let outcome = tokio::task::spawn_blocking(move || {
+        par2_rs::Par2RepairSession::open(options)
+            .unwrap()
+            .analyze()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome
+            .verification
+            .files
+            .iter()
+            .filter(|file| !matches!(file.status, par2_rs::verify::FileStatus::Complete))
+            .count(),
+        1
+    );
+    pipeline
+        .fence_par3_before_par2_repair(job_id, set_id, Some(&outcome.verification))
+        .unwrap();
+    assert!(pipeline.par3_runtime.as_ref().unwrap().has_work(job_id));
+    assert!(
+        !pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .verified_file(job_id, source)
+    );
+    // Model the verified installation after the native PAR2 operation. The
+    // strong PAR3 proof must come from its fresh source read, not this write.
+    tokio::fs::write(working.join("a.bin"), &original)
+        .await
+        .unwrap();
+    let rewritten = outcome
+        .verification
+        .files
+        .iter()
+        .filter(|file| !matches!(file.status, par2_rs::verify::FileStatus::Complete))
+        .map(|file| file.file_id)
+        .collect();
+    pipeline
+        .refresh_par3_after_par2_repair(job_id, set_id, &rewritten)
+        .unwrap();
+    settle_par3(&mut pipeline, job_id).await;
+    let runtime = pipeline.par3_runtime.as_ref().unwrap();
+    assert!(runtime.verified(job_id));
+    assert_eq!(
+        runtime.source_verifications(job_id),
+        reads + 1,
+        "the repaired source owes native verification; clean siblings owe none"
+    );
+}
+
+#[tokio::test]
 async fn par3_index_avoids_speculative_recovery_and_defers_early_health_abort() {
     let root = TempDir::new().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&root).await;

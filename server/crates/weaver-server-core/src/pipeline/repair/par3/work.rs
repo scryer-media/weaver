@@ -518,6 +518,20 @@ impl Coordinator {
             .filter_map(|(&id, set)| set.view.as_ref().map(|view| (id, view)))
     }
 
+    #[cfg(test)]
+    pub(in crate::pipeline) fn source_verifications(&self, job_id: JobId) -> u64 {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())
+            .map_or(0, |runtime| {
+                runtime
+                    .sets
+                    .values()
+                    .map(|set| set.native.diagnostics().source_verifications)
+                    .sum()
+            })
+    }
+
     pub(in crate::pipeline) fn verified(&self, job_id: JobId) -> bool {
         let count = self.authenticated_set_count(job_id);
         count != 0
@@ -531,10 +545,14 @@ impl Coordinator {
     /// A terminal claim must name a bound protected source. A clean job does
     /// not establish evidence for its unprotected files or recovery carriers.
     pub(in crate::pipeline) fn verified_file(&self, job_id: JobId, source: SourceId) -> bool {
-        self.verified(job_id)
-            && self
-                .assessments(job_id)
-                .any(|(_, view)| view.verified_sources.contains(&source))
+        self.verified(job_id) && self.source_verified(job_id, source)
+    }
+
+    /// Current native evidence for one bound source can survive damage in a
+    /// sibling. Terminal delivery still requires the aggregate verdict above.
+    pub(in crate::pipeline) fn source_verified(&self, job_id: JobId, source: SourceId) -> bool {
+        self.assessments(job_id)
+            .any(|(_, view)| view.verified_sources.contains(&source))
     }
 
     fn enqueue_input(

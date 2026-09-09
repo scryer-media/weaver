@@ -107,6 +107,20 @@ Run these additional suites with the same binary variables:
 go test -mod=readonly ./internal/weaver -run '^TestPar3(Geometry|DirectRestart|Restart)E2E$' -count=1 -v -timeout 20m
 ```
 
+`TestPar3MixedE2E` uses the same binary variables plus the installed official
+`par2` creator. Ten standalone-file cases cover independent sets, PAR2 preference
+for shared sources, PAR3 fallback after PAR2 recovery exhaustion, insufficient
+recovery and conflicting descriptions. Successful fallback requires both native
+verdicts, byte-exact output and healthy history; conflicts must terminate without
+output. A repaired independent PAR3 set cannot erase an unrelated PAR2 failure.
+Carrier request counts reject speculative PAR3 downloads when PAR2 can
+complete the repair. PAR2 creation arguments and binary/input/carrier hashes are
+recorded alongside the PAR3 reference provenance.
+
+```sh
+go test -mod=readonly ./internal/weaver -run '^TestPar3MixedE2E$' -count=1 -v -timeout 8m
+```
+
 Embedded protection, durable evidence replay, both datastores and performance
 acceptance remain tracked in
 `docs/par3-integration-plan.md` at the repository root.

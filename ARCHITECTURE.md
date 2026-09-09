@@ -377,6 +377,13 @@ damage and matrix/cohort requirements. Pending publications hide prior views;
 the shared worker queue rotates between PAR3 jobs. Conventional writes withdraw
 coverage before disk mutation, and worker epochs reject stale handbacks. Identity
 rebindings retire the corresponding source publications for fresh binding.
+`pipeline/repair/par3/coordination` keeps cross-format handoffs above block I/O.
+PAR2 recovery estimates exclude PAR3 carriers. PAR2 gets the first repair attempt;
+its writes fence the affected PAR3 sources and republish the installed images for
+fresh verification, retaining clean sibling evidence. After PAR2 exhausts its
+recovery, admitted PAR3 work can repair the shared files; affected PAR2 sets then
+verify the new bytes themselves. Conflicting native verdicts refuse delivery.
+Temporary handoff lists use the PAR3 host budget; PAR2-only jobs allocate none.
 Conventional PAR3 completion requests individual recovery articles and dispatches native
 staged repairs. Verified installed files reconcile assembly and persistence without
 translating PAR3 fingerprints into PAR2 MD5. PAR3 reads direct volume images through

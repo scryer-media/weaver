@@ -43,7 +43,15 @@ impl Pipeline {
         if self.job_has_pending_download_pipeline_work(job_id) || runtime.has_work(job_id) {
             return true;
         }
-        if !self.par2_servable_set_ids(job_id).is_empty() && !self.par2_verified.contains(&job_id) {
+        if !self.par2_bypassed.contains(&job_id)
+            && !self.par2_servable_set_ids(job_id).is_empty()
+            && !self.par2_gate_settlement_complete(job_id)
+        {
+            return false;
+        }
+        if self.aggregate_par2_failure_message(job_id).is_some()
+            && !self.par3_has_work_after_par2_failure(job_id)
+        {
             return false;
         }
         if let Some(error) = runtime.error(job_id) {
@@ -53,8 +61,14 @@ impl Pipeline {
         let next = runtime
             .assessments(job_id)
             .find(|(_, view)| view.status != RepairStatus::Complete)
-            .map(|(id, view)| (id, view.status));
-        let Some((set, status)) = next else {
+            .map(|(id, view)| {
+                (
+                    id,
+                    view.status,
+                    self.par3_damage_overlaps_settled_par2(job_id, view),
+                )
+            });
+        let Some((set, status, conflicts)) = next else {
             if runtime.authenticated_set_count(job_id) == 0 {
                 if self.promote_par3_recovery(job_id) {
                     return true;
@@ -67,6 +81,10 @@ impl Pipeline {
             }
             return self.settle_par3_archive_checks(job_id).await;
         };
+        if conflicts {
+            self.fail_job(job_id, "conflicting PAR2 and PAR3 source verdicts; refusing to overwrite completed PAR2 data".into());
+            return true;
+        }
         match status {
             RepairStatus::Complete => false,
             RepairStatus::Ready => {
@@ -270,7 +288,9 @@ impl Pipeline {
         }
         let ids: Vec<_> = files.iter().map(|(id, _)| *id).collect();
         let sets = self.rar_set_names_for_files(job_id, &ids);
+        self.rearm_par2_after_par3_installations(job_id, &files);
         for (id, _) in files {
+            self.block_crcs.forget_file(id);
             self.invalidate_par2_session_for_file_write(id);
             self.jobs
                 .get_mut(&job_id)
@@ -323,7 +343,11 @@ impl Pipeline {
         Ok(())
     }
 
-    fn enqueue_par3_installed_file(&mut self, job_id: JobId, id: NzbFileId) -> EngineResult<()> {
+    pub(super) fn enqueue_par3_installed_file(
+        &mut self,
+        job_id: JobId,
+        id: NzbFileId,
+    ) -> EngineResult<()> {
         let state = &self.jobs[&job_id];
         let file = state
             .assembly

@@ -256,6 +256,11 @@ impl Pipeline {
             return self.fail_par2_repair(job_id, error);
         }
         stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.reconcile", stage_start);
+        if let Err(error) =
+            self.refresh_par3_after_par2_repair(job_id, par2_set.recovery_set_id, &rewritten)
+        {
+            return self.fail_par2_repair(job_id, error.to_string());
+        }
         // Repair rewrote bytes; digests streamed before it describe content
         // that is gone. Every `Complete` entry in the merged result is vouched
         // by a pass that read the disk — the files the repair rewrote by the
