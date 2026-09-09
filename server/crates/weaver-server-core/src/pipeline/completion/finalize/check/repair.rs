@@ -2091,7 +2091,7 @@ impl Pipeline {
         self.note_stage_finished(job_id, JobStageKind::Verify);
     }
 
-    /// Record that this job ended with no PAR2 verdict to be had.
+    /// Record that this job ended with no verification verdict to be had.
     ///
     /// A job with no recovery set can never produce `intact`, `damaged` or
     /// `missing`: there is nothing to verify the payload against. Without
@@ -2115,6 +2115,7 @@ impl Pipeline {
     /// Called at the two terminal transitions — the final move and job failure
     /// — to attribute a job that never had a recovery set.
     pub(in crate::pipeline) fn note_job_unverifiable_if_no_par2_set(&mut self, job_id: JobId) {
+        self.note_par3_verification(job_id);
         if self.par2_set(job_id).is_none() {
             self.note_job_verification_unavailable(job_id);
         }

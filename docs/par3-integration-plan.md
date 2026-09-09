@@ -413,6 +413,24 @@ Validation passes all 178 native scenarios, 3,864 workspace Nextest tests
 (13 existing skips), three doctests, formatting and workspace Clippy. The runtime
 GraphQL schema remains byte-for-byte identical to the checked-in schema.
 
+Settled PAR3 assessments now record native verification outcomes and history
+messages without widening the GraphQL event enum. Missing source bindings report
+`missing`; incomplete bound inputs report `damaged`; complete protected data
+reports `intact`. The terminal fallback consumes any pending native verdict before
+considering `unverifiable`. Verification receipts use actual full/incremental
+source work and set membership, excluding recovery arrivals, metadata-only
+rebuilds and cache reuse. Source changes fence receipts until fresh assessment.
+Verification timing includes native assessment/arrival calls that read source
+bytes, excluding queue waits and packet scans. This leaves PAR2 timing and its
+hot paths intact; PAR2-only jobs allocate no PAR3 receipt state. Official-fixture
+regressions cover replay, changed sources and false terminal fallback attribution.
+This uses prospective 0.11.3 without dependency changes. Live verification progress,
+source placement and remaining lifecycle gates still require completion.
+Validation passes all 178 native scenarios, all 3,865 workspace Nextest tests
+(13 existing skips), the added incremental-arrival assertions, three doctests,
+formatting and all-target/all-feature Clippy. The runtime GraphQL schema remains
+byte-for-byte unchanged.
+
 Standalone mixed-format coordination now gives PAR2 its first repair attempt and
 excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence
 only affected PAR3 source evidence, then republish installed bytes for native

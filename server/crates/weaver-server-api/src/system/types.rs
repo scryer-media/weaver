@@ -665,6 +665,16 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                     "verification found damage".into()
                 },
             },
+            PipelineEvent::Par3VerificationComplete { job_id, passed } => Self {
+                kind: EventKind::JobVerificationComplete,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: if *passed {
+                    "PAR3 verification passed".into()
+                } else {
+                    "PAR3 verification found incomplete protected data".into()
+                },
+            },
             PipelineEvent::RepairStarted { job_id } => Self {
                 kind: EventKind::RepairStarted,
                 job_id: Some(job_id.0),

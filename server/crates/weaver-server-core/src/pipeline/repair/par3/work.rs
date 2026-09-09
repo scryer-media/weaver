@@ -138,6 +138,7 @@ struct JobSlot {
     completed_repair: Option<RepairCompletion>,
     completed_readback: Option<EngineResult<readback::ReadbackDone>>,
     installing: bool,
+    verification: Option<verification::Receipt>,
 }
 
 impl Default for JobSlot {
@@ -155,6 +156,7 @@ impl Default for JobSlot {
             completed_repair: None,
             completed_readback: None,
             installing: false,
+            verification: None,
         }
     }
 }
@@ -1000,6 +1002,8 @@ impl Drop for Coordinator {
         }
     }
 }
+
+mod verification;
 
 #[cfg(test)]
 mod tests;

@@ -335,6 +335,8 @@ fn retained_job_assessment_reuses_evidence_and_invalidates_changed_sources() {
     assert_eq!(view.requirements[0].available, [0]);
     assert_eq!(view.requirements[0].cohort, 0);
     assert_eq!(view.requirements[0].cohorts, 1);
+    let incremental_runs = set.verification_runs;
+    let elapsed_before = set.verification_elapsed;
     let published_before = job.sources.snapshot(SourceId(1)).unwrap();
     job.publish_file(
         SourceId(1),
@@ -357,6 +359,9 @@ fn retained_job_assessment_reuses_evidence_and_invalidates_changed_sources() {
         RepairStatus::Complete
     );
     assert_eq!(job.sources.snapshot(SourceId(1)).unwrap(), published_before);
+    let set = job.sets.values().next().unwrap();
+    assert_eq!(set.verification_runs, incremental_runs + 1);
+    assert!(set.verification_elapsed > elapsed_before);
     assert_eq!(
         job.sets
             .values()

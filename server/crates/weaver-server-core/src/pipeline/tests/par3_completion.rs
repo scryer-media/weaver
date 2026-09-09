@@ -664,11 +664,32 @@ async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
             assert_eq!(view.files[0].unresolved[0], 2000..4000);
             assert_eq!(view.requirements[0].additional, 1);
         }
+        let expected_counts = if damaged { [0, 1, 0, 0] } else { [1, 0, 0, 0] };
+        let reads = pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .source_verifications(job_id);
+        for _ in 0..3 {
+            pipeline.note_par3_verification(job_id);
+            pipeline.note_job_unverifiable_if_no_par2_set(job_id);
+            assert_eq!(par3_verification_counts(&pipeline), expected_counts);
+            assert_eq!(
+                pipeline
+                    .par3_runtime
+                    .as_ref()
+                    .unwrap()
+                    .source_verifications(job_id),
+                reads
+            );
+        }
         let source = NzbFileId {
             job_id,
             file_index: 0,
         };
         pipeline.invalidate_par2_session_for_file_write(source);
+        pipeline.note_par3_verification(job_id);
+        assert_eq!(par3_verification_counts(&pipeline), expected_counts);
         assert_eq!(
             pipeline
                 .par3_runtime
@@ -707,7 +728,21 @@ async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
                 par3_rs::session::RepairStatus::NeedRecovery
             }
         );
+        pipeline.note_job_unverifiable_if_no_par2_set(job_id);
+        assert_eq!(par3_verification_counts(&pipeline), [1, 1, 0, 0]);
     }
+}
+
+fn par3_verification_counts(pipeline: &Pipeline) -> [u64; 4] {
+    let snapshot = pipeline.metrics.job_lifecycle.snapshot();
+    ["intact", "damaged", "missing", "unverifiable"].map(|outcome| {
+        snapshot
+            .verifications
+            .iter()
+            .find(|(name, _)| *name == outcome)
+            .unwrap()
+            .1
+    })
 }
 
 #[test]

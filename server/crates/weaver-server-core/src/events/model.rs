@@ -152,6 +152,10 @@ pub enum PipelineEvent {
     /// Job-level PAR2 verification completed.
     JobVerificationComplete { job_id: JobId, passed: bool },
 
+    /// A settled native PAR3 assessment verified the described protected data
+    /// or established that it remains incomplete.
+    Par3VerificationComplete { job_id: JobId, passed: bool },
+
     /// Updated repair confidence after verification.
     RepairConfidenceUpdated {
         job_id: JobId,

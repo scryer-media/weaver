@@ -60,6 +60,7 @@ pub fn pipeline_job_id(event: &PipelineEvent) -> Option<u64> {
         | PipelineEvent::Par2MetadataLoaded { job_id }
         | PipelineEvent::JobVerificationStarted { job_id }
         | PipelineEvent::JobVerificationComplete { job_id, .. }
+        | PipelineEvent::Par3VerificationComplete { job_id, .. }
         | PipelineEvent::RepairConfidenceUpdated { job_id, .. }
         | PipelineEvent::RepairStarted { job_id }
         | PipelineEvent::RepairComplete { job_id, .. }

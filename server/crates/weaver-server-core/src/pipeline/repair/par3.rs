@@ -173,8 +173,7 @@ impl Par3Job {
         self.disk_publications.remove(&source);
         for set in self.sets.values_mut() {
             if continuity.is_some() {
-                set.view = None;
-                set.native.source_arrived(source)?;
+                set.source_arrived(source, &self.options)?;
             } else {
                 set.invalidate(source);
             }

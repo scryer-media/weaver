@@ -62,6 +62,8 @@ impl Pipeline {
             self.fail_job(job_id, format!("PAR3 assessment failed: {error}"));
             return true;
         }
+        self.note_par3_verification(job_id);
+        let runtime = self.par3_runtime.as_ref().expect("admitted PAR3 job");
         let next = runtime
             .assessments(job_id)
             .find(|(_, view)| {

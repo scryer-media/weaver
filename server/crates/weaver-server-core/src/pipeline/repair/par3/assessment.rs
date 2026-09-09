@@ -89,6 +89,8 @@ pub(super) struct SetSession {
     pub native: par3_rs::Par3RepairSession,
     pub view: Option<AssessmentView>,
     pub cauchy_matrix: Option<par3_rs::Fingerprint>,
+    pub verification_elapsed: std::time::Duration,
+    pub verification_runs: u64,
 }
 
 impl SetSession {
@@ -101,6 +103,8 @@ impl SetSession {
             native: par3_rs::Par3RepairSession::new(id, Arc::new(sources), options)?,
             view: None,
             cauchy_matrix: None,
+            verification_elapsed: std::time::Duration::ZERO,
+            verification_runs: 0,
         })
     }
 
@@ -126,10 +130,32 @@ impl SetSession {
     pub fn assess(&mut self) -> EngineResult<()> {
         self.view = None;
         let layout = self.native.layout()?;
+        let before = self.native.diagnostics().source_verifications;
+        let started = std::time::Instant::now();
         self.view = Some(AssessmentView::capture(
             self.native.assess()?,
             layout.as_deref(),
         )?);
+        if self.native.diagnostics().source_verifications != before {
+            self.verification_runs = self.verification_runs.saturating_add(1);
+            self.verification_elapsed = self.verification_elapsed.saturating_add(started.elapsed());
+        }
+        Ok(())
+    }
+
+    pub fn source_arrived(
+        &mut self,
+        source: SourceId,
+        options: &ExecutionOptions,
+    ) -> EngineResult<()> {
+        self.view = None;
+        let before = options.diagnostics.source_io().read_bytes;
+        let started = std::time::Instant::now();
+        self.native.source_arrived(source)?;
+        if options.diagnostics.source_io().read_bytes != before {
+            self.verification_runs = self.verification_runs.saturating_add(1);
+            self.verification_elapsed = self.verification_elapsed.saturating_add(started.elapsed());
+        }
         Ok(())
     }
 

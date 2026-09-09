@@ -182,7 +182,8 @@ func TestPar3E2E(t *testing.T) {
 			if err := api.query(`query($id:Int!) {historyItem(id:$id) {failedBytes health}}`, map[string]any{"id": job}, &history); err != nil {
 				t.Fatal(err)
 			}
-			evidence, err := json.MarshalIndent(map[string]any{"jobId": job, "status": status, "requests": requests, "expectedBlake3": blake3.Sum256(payload), "history": history.HistoryItem}, "", "  ")
+			verificationEvents := api.assertPar3VerificationHistory(t, job, mode)
+			evidence, err := json.MarshalIndent(map[string]any{"jobId": job, "status": status, "requests": requests, "expectedBlake3": blake3.Sum256(payload), "history": history.HistoryItem, "verificationEvents": verificationEvents}, "", "  ")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -194,4 +195,48 @@ func TestPar3E2E(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (a unpackAPI) assertPar3VerificationHistory(t *testing.T, job int, mode string) []string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var result struct {
+			JobEvents []struct{ Kind, Message string }
+		}
+		if err := a.query(`query($id:Int!) {jobEvents(jobId:$id) {kind message}}`, map[string]any{"id": job}, &result); err != nil {
+			t.Fatal(err)
+		}
+		var messages []string
+		passed, incomplete, terminal := 0, 0, false
+		for _, event := range result.JobEvents {
+			if event.Kind == "JOB_VERIFICATION_COMPLETE" && strings.HasPrefix(event.Message, "PAR3 verification ") {
+				messages = append(messages, event.Message)
+				if event.Message == "PAR3 verification passed" {
+					passed++
+				} else {
+					incomplete++
+				}
+			}
+			terminal = terminal || event.Kind == "JOB_COMPLETED" || event.Kind == "JOB_FAILED"
+		}
+		if terminal {
+			if mode == "clean" && (passed != 1 || incomplete != 0) {
+				t.Fatalf("clean native verification was duplicated or missing: %v", messages)
+			}
+			if mode != "clean" && incomplete == 0 {
+				t.Fatalf("native damage verdict missing: %v", messages)
+			}
+			if mode == "unrecoverable" && passed != 0 {
+				t.Fatalf("unrecoverable input claimed verification success: %v", messages)
+			}
+			if mode != "unrecoverable" && passed == 0 {
+				t.Fatalf("verified delivery has no native pass: %v", messages)
+			}
+			return messages
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("job=%d: native verification history was not persisted", job)
+	return nil
 }
