@@ -149,6 +149,7 @@ fn par3_archive_checksum_deferral_requires_a_final_archive_verdict() {
 fn complete_direct_set_waits_for_native_verdict_application() {
     let mut set = transaction_set();
     set.router.note_par3_available(true);
+    set.note_repair_attempted();
     set.begin_repair_transaction(vec![0, 1]).unwrap();
     for volume in 0..2 {
         let spans = set
@@ -160,6 +161,13 @@ fn complete_direct_set_waits_for_native_verdict_application() {
     }
     set.finish_repair_transaction().unwrap();
     assert!(set.all_volumes_complete());
+    for volume in 0..2 {
+        assert_eq!(
+            set.virtual_volume_len(volume, 600),
+            464,
+            "declared encoded progress must not extend a repaired decoded image"
+        );
+    }
     assert!(set.router.all_members_verified());
     assert!(!set.ready_to_finalize());
     set.router.settle_par3_verification().unwrap();

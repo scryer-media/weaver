@@ -590,16 +590,15 @@ impl Pipeline {
             .find(|volume| volume.volume_index == index)
     }
 
-    /// Both declared carriers and authenticated late discovery can defer an
-    /// archive gate. Preserve the existing PAR2 policy for mixed jobs.
+    /// Declared carriers and authenticated late discovery can hold archive
+    /// checks through either engine's attempt. PAR2-only jobs keep their policy.
     pub(in crate::pipeline) fn par3_direct_checks_available(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
-            !crate::pipeline::direct_store::plan::spec_carries_par2(&state.spec)
-                && (crate::pipeline::direct_store::plan::spec_defers_to_par3(&state.spec)
-                    || self
-                        .par3_runtime
-                        .as_ref()
-                        .is_some_and(|runtime| runtime.authenticated_set_count(job_id) != 0))
+            crate::pipeline::direct_store::plan::spec_defers_to_par3(&state.spec)
+                || self
+                    .par3_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.authenticated_set_count(job_id) != 0)
         })
     }
 

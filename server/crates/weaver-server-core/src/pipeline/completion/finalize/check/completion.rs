@@ -1176,6 +1176,18 @@ impl Pipeline {
                             run_par2_repairer = false;
                             direct_verdict = Some(*verification);
                         }
+                        DirectPar2Resolution::RecoveryExhausted { needed, available } => {
+                            self.finish_par2_set_with_alternate(
+                                job_id,
+                                set_id,
+                                format!(
+                                    "not repairable: direct PAR2 verification needs {needed} recovery blocks, only {available} available after targeted recovery"
+                                ),
+                                AlternateRepairReason::InsufficientRecovery,
+                            )
+                            .await;
+                            return;
+                        }
                         DirectPar2Resolution::Pending => return,
                         DirectPar2Resolution::Deferred => {
                             // The same wait the analysis below performs when it

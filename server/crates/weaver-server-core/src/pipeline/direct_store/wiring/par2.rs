@@ -880,6 +880,16 @@ impl Pipeline {
             }
             DirectRepairAnswer::Deferred => DirectPar2Resolution::Deferred,
             DirectRepairAnswer::Declined => {
+                if self.par3_direct_checks_available(job_id)
+                    && !self.job_has_pending_download_pipeline_work(job_id)
+                    && let par2_rs::verify::Repairability::Insufficient { blocks_needed, .. } =
+                        verification.repairable
+                {
+                    return DirectPar2Resolution::RecoveryExhausted {
+                        needed: blocks_needed,
+                        available: verification.recovery_blocks_available,
+                    };
+                }
                 // The other end of the safety valve above. The repair refused,
                 // so the parked set has run out of help; it demotes under the
                 // routing gate's own reason rather than under the generic
@@ -1833,8 +1843,8 @@ impl Pipeline {
             // burn the latch, the checkpoint row and the live-PAR2 state on
             // its way to the same refusal — and the set would then face its
             // retry already latched. Declining from here costs the sets
-            // nothing, and the demotion answers exactly as it always did. The
-            // wave budget goes with it: it belongs to the wait that just
+            // nothing. The caller can demote or preserve the virtual sources
+            // for an eligible PAR3 handoff. The wave budget belongs to the wait that just
             // ended, and the next damage verdict starts its own.
             self.direct_store.repair_defer_waves.remove(&job_id);
             let any_live_settled = by_set.keys().any(|set_index| {
@@ -1854,7 +1864,7 @@ impl Pipeline {
                 warn!(
                     job_id = job_id.0,
                     failure = %super::super::repair::DirectRepairFailure::Unrepairable,
-                    "repairing a direct set in place was not possible; demoting it"
+                    "direct PAR2 repair exhausted reachable recovery"
                 );
             }
             return DirectRepairAnswer::Declined;
@@ -2710,6 +2720,13 @@ impl Pipeline {
                 self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id)
                     && !set.is_demoted()
                     && !set.is_finalized()
+                    // Insufficient PAR2 recovery can hand off to PAR3 without
+                    // materializing every virtual source in this archive.
+                    && !(set.router.awaits_par3_verdict()
+                        && matches!(
+                            verification.repairable,
+                            par2_rs::verify::Repairability::Insufficient { .. }
+                        ))
             }) {
                 continue;
             }
@@ -2782,6 +2799,9 @@ impl Pipeline {
             .filter(|(_, set)| self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id))
             .filter(|(_, set)| {
                 !set.is_demoted() && !set.is_finalized() && !set.router.damaged_volumes().is_empty()
+                    // The PAR3 completion gate still owes this archive its
+                    // native verdict, including any eligible fallback repair.
+                    && !set.router.awaits_par3_verdict()
             })
             .map(|(index, _)| index)
             .collect();

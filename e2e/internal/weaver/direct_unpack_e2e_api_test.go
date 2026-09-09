@@ -29,13 +29,27 @@ func provisionUnpackAPI(t *testing.T, root, url string) unpackAPI {
 		t.Fatal(err)
 	}
 	hash := sha256.Sum256([]byte(key))
+	// The API listener starts after database initialization. Writing as soon as
+	// api_keys exists races the remaining startup migrations on the same DB.
+	deadline := time.Now().Add(30 * time.Second)
+	client := &http.Client{Timeout: time.Second}
+	for {
+		resp, err := client.Get(url + "/graphql")
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	db, err := sql.Open("sqlite", filepath.Join(root, "weaver.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	// Startup creates the schema. Provision only this test's newly created DB.
-	deadline := time.Now().Add(30 * time.Second)
+	// Provision only this test's newly created DB after startup has settled.
 	for {
 		_, err = db.Exec("INSERT INTO api_keys (name,key_hash,scope,created_at) VALUES (?,?,?,?)", "direct-unpack-e2e", hash[:], "admin", time.Now().UnixMilli())
 		if err == nil {

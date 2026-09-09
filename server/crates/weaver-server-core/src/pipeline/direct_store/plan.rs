@@ -161,14 +161,12 @@ pub(crate) fn spec_carries_par2(spec: &JobSpec) -> bool {
         .any(|file| matches!(file.role, FileRole::Par2 { .. }))
 }
 
-/// Preserve current PAR2 precedence for mixed jobs. PAR3-only sets may wait
-/// for authenticated PAR3 verification before failing an archive checksum.
+/// A declared PAR3 carrier earns time for native verification before an
+/// archive checksum failure demotes the set. Repair ordering still prefers PAR2.
 pub(crate) fn spec_defers_to_par3(spec: &JobSpec) -> bool {
-    !spec_carries_par2(spec)
-        && spec
-            .files
-            .iter()
-            .any(|file| matches!(file.role, FileRole::Par3 { .. }))
+    spec.files
+        .iter()
+        .any(|file| matches!(file.role, FileRole::Par3 { .. }))
 }
 
 impl DirectSetPlan {

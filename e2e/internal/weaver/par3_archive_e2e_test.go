@@ -41,7 +41,7 @@ func TestPar3ArchiveE2E(t *testing.T) {
 			}
 			files, payload, member, password := par3ArchiveFixture(t, dir, format)
 			par3ArchiveParity(t, reference, dir, files)
-			modes := []string{"clean", "corrupt", "missing"}
+			modes := []string{"clean", "corrupt", "missing", "mixed-prefer-par2", "mixed-fallback"}
 			if strings.HasPrefix(format, "rar-") {
 				modes = append(modes, "disguised-carrier")
 			}
@@ -54,9 +54,46 @@ func TestPar3ArchiveE2E(t *testing.T) {
 					for name, data := range files {
 						posted[name] = bytes.Clone(data)
 					}
-					if mode == "corrupt" || mode == "disguised-carrier" {
-						for _, name := range unpackSortedNames(posted) {
+					mixed := strings.HasPrefix(mode, "mixed-")
+					if mixed {
+						par2Dir := filepath.Join(dir, mode+"-par2")
+						if err := os.MkdirAll(par2Dir, 0755); err != nil {
+							t.Fatal(err)
+						}
+						protected := make(map[string][]byte)
+						for name, data := range files {
 							if !strings.HasSuffix(name, ".par3") {
+								protected[name] = data
+							}
+						}
+						args := []string{"create", "-q", "-s65536", "-c20", filepath.Join(par2Dir, "repair.par2")}
+						for _, name := range unpackSortedNames(protected) {
+							args = append(args, filepath.Join(par2Dir, name))
+						}
+						unpackParity(t, par2Dir, protected)
+						par2, err := exec.LookPath("par2")
+						if err != nil {
+							t.Fatal(err)
+						}
+						binary, err := os.ReadFile(par2)
+						if err != nil {
+							t.Fatal(err)
+						}
+						hashes := make(map[string]string)
+						for name, data := range protected {
+							hashes[name] = fmt.Sprintf("%x", sha256.Sum256(data))
+							if strings.HasSuffix(name, ".par2") && (mode != "mixed-fallback" || !strings.Contains(name, ".vol")) {
+								posted[name] = data
+							}
+						}
+						par3WriteJSON(t, filepath.Join(par2Dir, "provenance.json"), map[string]any{
+							"binary": par2, "binarySHA256": fmt.Sprintf("%x", sha256.Sum256(binary)),
+							"arguments": args, "fileSHA256": hashes,
+						})
+					}
+					if mode == "corrupt" || mode == "disguised-carrier" || mixed {
+						for _, name := range unpackSortedNames(posted) {
+							if !strings.HasSuffix(name, ".par3") && !strings.HasSuffix(name, ".par2") {
 								// Corrupt the protected archive before yEnc encoding so
 								// both transport CRCs describe the damaged input.
 								posted[name][len(posted[name])/2] ^= 0x80
@@ -208,9 +245,9 @@ func TestPar3ArchiveE2E(t *testing.T) {
 							t.Fatal("two-volume repair did not limit installation to the damaged files")
 						}
 					}
-					if mode == "clean" || mode == "corrupt" || (mode == "missing" && format == "rar-store") {
+					if mode == "clean" || mode == "corrupt" || mixed || (mode == "missing" && format == "rar-store") {
 						for index, name := range unpackSortedNames(posted) {
-							if (mode == "clean" || name != "repair.vol0+1.par3") && strings.Contains(name, ".vol") && strings.HasSuffix(name, ".par3") {
+							if (mode == "clean" || mode == "mixed-prefer-par2" || name != "repair.vol0+1.par3") && strings.Contains(name, ".vol") && strings.HasSuffix(name, ".par3") {
 								for id, count := range requests {
 									if strings.HasPrefix(id, fmt.Sprintf("%s-%d-", slug, index)) && count != 0 {
 										t.Fatalf("archive requested unneeded recovery: %s", name)

@@ -280,8 +280,21 @@ I/O and cancellation cannot grant it. The focused handoff regression measures
 exactly one new native PAR3 source verification after a one-file PAR2 repair,
 with zero verification rereads for its clean siblings.
 Cross-format temporary file lists share the existing 16 MiB host budget, and
-PAR2-only jobs allocate no handoff state. Mixed archive/direct-extraction and
-multi-set overlap coverage remain to be broadened.
+PAR2-only jobs allocate no handoff state. Ten additional native scenarios cover
+PAR2-first and PAR3-fallback repair for ZIP, ZIP64, split payloads, stored RAR and
+encrypted multi-volume RAR. All ten pass, with byte-exact members, no RAR direct
+store demotion, no PAR3 recovery download when PAR2 suffices, and only the first
+PAR3 recovery packet downloaded for the fallback damage. Direct admission keeps
+both native verdicts outstanding; an exhausted native PAR2 verdict can hand off
+without a disk-only reanalysis. Repaired virtual source lengths use committed
+decoded coverage, since completion progress is in NZB encoded units. The harness
+also waits for HTTP startup before inserting its fixture API key, avoiding a
+write racing SQLite initialization. Broader multi-set overlap coverage remains
+open. Validation passed formatting, all-target/all-feature Clippy, all 3,849
+workspace Nextest cases (13 existing skips), and three doctests. The full native
+matrix passes 129 leaves; the API-password restart case and two 65,538-block
+memory-limit cases remain failing. This slice continues the existing unreleased
+0.11.3 version.
 
 Still pending: incremental decode-to-publication wiring, positioned verification,
 embedded archives, evidence persistence and product surfaces. Rebuilt files currently
