@@ -41,8 +41,8 @@ Implemented: the native operation contract, PAR3 carrier roles, completed-carrie
 discovery on blocking workers, retained authenticated packet locations, and a
 source publication adapter separating availability revisions from content
 generations. PAR3-specific state is lazy. Engine allocations share a process-wide
-256 MiB budget and 128 handles; each job uses one codec worker and the approved
-128 MiB retained ceiling. Source publication tables bound sources and ranges.
+256 MiB budget and 128 handles; each job uses one codec worker and each native
+set has the approved 128 MiB retained ceiling. Source publication tables bound sources and ranges.
 Official-fixture tests cover split headers/payloads, interior holes, duplicate
 arrivals, evidence reuse, selective output staging, and typed cancellation.
 
@@ -381,6 +381,23 @@ workspace Nextest tests (13 existing skips), all three doctests, formatting and
 all-target/all-feature workspace Clippy. The fixture regeneration is byte-exact.
 Native archive harnesses now cancel their own unfinished job after a failed
 scenario, preserving its failure and artifacts without starving subsequent cases.
+
+PAR3 sets sharing an output path now compare authenticated length, comparable
+whole protected-data fingerprints, and fingerprints or inline bytes of equal
+complete extents before assessment. Different codecs and block sizes remain
+compatible; whole fingerprints over different unprotected gaps are not compared,
+and fragment digests never stand in for complete hashes. Temporary indexing is
+charged to the existing host budget, with cancellation between comparisons.
+Contradictory descriptions fail before repair can overwrite the shared path.
+Four official-reference native cases cover clean and damaged shared inputs under
+compatible Cauchy/FFT sets and contradictory sets. A deterministic standard-library
+fixture generator supplies the small index-only Rust regression, which confirms
+repeated consistency checks and conflict rejection require no source reads. This
+uses the existing prospective 0.11.3 version, with no dependency changes. Renamed
+source placement and remaining lifecycle/product gates are still open.
+Validation passes all 178 native scenarios, 3,863 workspace Nextest tests
+(13 existing skips), three doctests, formatting, and all-target/all-feature
+workspace Clippy.
 
 Standalone mixed-format coordination now gives PAR2 its first repair attempt and
 excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence

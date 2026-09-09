@@ -1,0 +1,45 @@
+{
+  "referenceRevision": "2971702e501f1350b1c7b9d11369af9157d6ed56",
+  "referenceSHA256": "8b718420ad68d78c6e4f4ac607e7e8502776f8ddc39b506013e609ca43d2ac62",
+  "sets": [
+    {
+      "arguments": [
+        "create",
+        "-e1",
+        "-s32768",
+        "-c8",
+        "repair.par3",
+        "payload.bin"
+      ],
+      "index": "cauchy.par3",
+      "indexSHA256": "a0ef6d93774c2ed50bf499495e098dddedaf018724efa50eb8f07af63360d8be",
+      "payloadSHA256": "8114015b2f29d15fc78c01c450251c4994bb475158e64464db1f4b733cabbfe5"
+    },
+    {
+      "arguments": [
+        "create",
+        "-e8",
+        "-s16384",
+        "-c8",
+        "repair.par3",
+        "payload.bin"
+      ],
+      "index": "fft.par3",
+      "indexSHA256": "124bdecd60659b6e006b7bebfcdee98732f30348b3f6a08919b61ab6f9d36602",
+      "payloadSHA256": "8114015b2f29d15fc78c01c450251c4994bb475158e64464db1f4b733cabbfe5"
+    },
+    {
+      "arguments": [
+        "create",
+        "-e8",
+        "-s16384",
+        "-c8",
+        "repair.par3",
+        "payload.bin"
+      ],
+      "index": "conflict.par3",
+      "indexSHA256": "4baaa0e95b2084e0cc1026269f5c3b35f9c960ed24621af2585d9e37970c42a7",
+      "payloadSHA256": "a0df92fbd853d652418833fcfc6b95d982ed5942f1c07c7a65fa6061d4fcacd6"
+    }
+  ]
+}

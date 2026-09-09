@@ -48,6 +48,8 @@ func TestPar3GeometryE2E(t *testing.T) {
 		{"data-only", 131072 + 123, []string{"-e1", "-D", "-s32768", "-c1"}, []string{"Wrote archive file"}},
 		{"packed-tails", 8192 + 80, []string{"-e1", "-s8192", "-c4"}, []string{"Tail packing = 2"}},
 		{"multiple-sets", 262144 + 123, []string{"-e1", "-s32768", "-c8"}, nil},
+		{"shared-compatible", 262144 + 123, []string{"-e1", "-s32768", "-c8"}, nil},
+		{"shared-conflict", 262144 + 123, []string{"-e1", "-s32768", "-c8"}, nil},
 	}
 	for _, spec := range cases {
 		t.Run(spec.name, func(t *testing.T) {
@@ -81,7 +83,7 @@ func TestPar3GeometryE2E(t *testing.T) {
 					t.Fatalf("reference did not establish %q: %s", fact, facts)
 				}
 			}
-			if spec.name == "multiple-sets" {
+			if spec.name == "multiple-sets" || strings.HasPrefix(spec.name, "shared-") {
 				// Distinct official input sets use different codecs and unique
 				// carrier names. Carrier bytes remain exactly as the reference wrote them.
 				renamed := make(map[string][]byte, len(carriers))
@@ -93,20 +95,33 @@ func TestPar3GeometryE2E(t *testing.T) {
 				}
 				carriers = renamed
 				second := bytes.Clone(payload)
-				for i := range second {
-					second[i] ^= 0x5a
+				otherName := "payload.bin"
+				if spec.name == "multiple-sets" {
+					for i := range second {
+						second[i] ^= 0x5a
+					}
+					otherName = "second.bin"
+					expected[otherName] = second
+				} else if spec.name == "shared-conflict" {
+					second[0] ^= 0x80
 				}
-				expected["second.bin"] = second
 				secondDir := filepath.Join(dir, "second-set")
 				if err := os.MkdirAll(secondDir, 0755); err != nil {
 					t.Fatal(err)
 				}
-				other := map[string][]byte{"second.bin": second}
-				otherFacts := par3ReferenceParity(t, reference, secondDir, other, []string{"-e8", "-s32768", "-c8"})
+				other := map[string][]byte{otherName: second}
+				blockSize := "-s32768"
+				if strings.HasPrefix(spec.name, "shared-") {
+					blockSize = "-s16384"
+				}
+				otherFacts := par3ReferenceParity(t, reference, secondDir, other, []string{"-e8", blockSize, "-c8"})
 				if !strings.Contains(otherFacts, "FFT based Reed-Solomon Codes") {
 					t.Fatalf("second set did not establish FFT geometry: %s", otherFacts)
 				}
 				for name, data := range other {
+					if name == "payload.bin" {
+						continue
+					}
 					if strings.HasSuffix(name, ".par3") {
 						name = "fft." + name
 					}
@@ -163,6 +178,7 @@ func TestPar3GeometryE2E(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
+					api.cancelOnFailure(t, job)
 					status := ""
 					deadline := time.Now().Add(90 * time.Second)
 					for time.Now().Before(deadline) {
@@ -203,6 +219,15 @@ func TestPar3GeometryE2E(t *testing.T) {
 						}
 						if _, err := os.Stat(filepath.Join(root, "complete", slug, "payload.bin")); !os.IsNotExist(err) {
 							t.Fatalf("unrepairable cohort delivered an output: %v", err)
+						}
+						return
+					}
+					if spec.name == "shared-conflict" {
+						if status != "FAILED" || history.HistoryItem == nil || history.HistoryItem.Error == nil || !strings.Contains(*history.HistoryItem.Error, "contradictory authenticated PAR3") {
+							t.Fatalf("conflicting descriptions were not refused: status=%s history=%+v log=%s", status, history.HistoryItem, logPath)
+						}
+						if _, err := os.Stat(filepath.Join(root, "complete", slug, "payload.bin")); !os.IsNotExist(err) {
+							t.Fatalf("contradictory sets published an output: %v", err)
 						}
 						return
 					}

@@ -5,6 +5,63 @@ const INDEX: &[u8] = include_bytes!("../backend/fixtures/set.par3");
 const RECOVERY: &[u8] = include_bytes!("../backend/fixtures/set.vol0+1.par3");
 
 #[test]
+fn shared_description_consistency_requires_no_source_reads() {
+    const ROOT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../e2e/internal/weaver/testdata/par3-shared"
+    );
+    for conflict in [false, true] {
+        let mut job = Par3Job::default();
+        job.scan_file(SourceId(99), PathBuf::from(ROOT).join("cauchy.par3"), None)
+            .unwrap();
+        job.scan_file(
+            SourceId(100),
+            PathBuf::from(ROOT).join(if conflict {
+                "conflict.par3"
+            } else {
+                "fft.par3"
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            job.sets.len(),
+            2,
+            "distinct official input sets must be admitted"
+        );
+        let root = tempfile::tempdir().unwrap();
+        if conflict {
+            // Even an available candidate must not be hashed or rewritten once
+            // authenticated descriptions already contradict each other.
+            let path = root.path().join("payload.bin");
+            std::fs::write(&path, vec![0; 262144 + 123]).unwrap();
+            job.publish_file(
+                SourceId(0),
+                path,
+                "payload.bin".into(),
+                std::iter::once(0..262144 + 123).collect(),
+            )
+            .unwrap();
+        }
+        let read = job.options.diagnostics.source_io().read_bytes;
+        for _ in 0..3 {
+            let result = job.assess();
+            if conflict {
+                assert!(matches!(
+                    result,
+                    Err(EngineError::InvalidState(
+                        "contradictory authenticated PAR3 descriptions for one output path"
+                    ))
+                ));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(job.options.diagnostics.source_io().read_bytes, read);
+        }
+    }
+}
+
+#[test]
 fn embedded_late_metadata_rewinds_once_and_preserves_hole_continuity() {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),

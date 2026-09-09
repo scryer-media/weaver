@@ -208,6 +208,7 @@ impl Par3Job {
     }
 
     fn assess(&mut self) -> EngineResult<()> {
+        self.validate_shared_layouts()?;
         for set in self.sets.values_mut() {
             set.view = None;
             if let Some(layout) = set.native.layout()? {
@@ -959,6 +960,7 @@ impl Pipeline {
 }
 
 mod assessment;
+mod bindings;
 mod completion;
 mod coordination;
 #[cfg(windows)]
