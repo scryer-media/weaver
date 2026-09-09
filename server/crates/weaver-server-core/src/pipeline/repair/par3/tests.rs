@@ -68,7 +68,10 @@ fn embedded_name_rebinding_withdraws_old_native_identity_without_rescanning() {
     assert!(view.verified_sources.is_empty());
     assert_eq!(job.options.scan_work.used(), scanned);
     let matched_read = job.options.diagnostics.source_io().read_bytes;
-    assert!(matched_read > read, "the renamed carrier needs an identity check");
+    assert!(
+        matched_read > read,
+        "the renamed carrier needs an identity check"
+    );
     let found = job.take_name_match().unwrap().unwrap();
     assert_eq!(found.name, "archive.zip");
     assert_eq!(found.source, SourceId(0));

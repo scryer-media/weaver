@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -44,14 +43,12 @@ func provisionUnpackAPI(t *testing.T, root, url string) unpackAPI {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	db, err := sql.Open("sqlite", filepath.Join(root, "weaver.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openNativeUnpackDB(t, root, false)
+	var err error
 	defer db.Close()
 	// Provision only this test's newly created DB after startup has settled.
 	for {
-		_, err = db.Exec("INSERT INTO api_keys (name,key_hash,scope,created_at) VALUES (?,?,?,?)", "direct-unpack-e2e", hash[:], "admin", time.Now().UnixMilli())
+		_, err = db.Exec("INSERT INTO api_keys (name,key_hash,scope,created_at) VALUES ($1,$2,$3,$4)", "direct-unpack-e2e", hash[:], "admin", time.Now().UnixMilli())
 		if err == nil {
 			break
 		}

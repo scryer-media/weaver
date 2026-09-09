@@ -3414,6 +3414,21 @@ mod tests {
                 CompletedHashProvenance::Verified,
             )
             .unwrap();
+            let mut intent = identity.clone();
+            intent.current_filename = intent.source_filename.clone();
+            intent.classification_source = FileIdentitySource::Par3Pending;
+            db.save_file_identity(job.job_id, &intent).unwrap();
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let restored = db.load_active_jobs().unwrap();
+            let intent = &restored[&job.job_id].file_identities[&0];
+            assert_eq!(
+                intent.classification_source,
+                FileIdentitySource::Par3Pending
+            );
+            assert_eq!(intent.current_filename, "obfuscated.dat");
+            assert_eq!(intent.canonical_filename.as_deref(), Some("archive.zip"));
             db.save_file_identity(job.job_id, &identity).unwrap();
         }
         let db = Database::open(&path).unwrap();

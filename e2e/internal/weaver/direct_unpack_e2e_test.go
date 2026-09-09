@@ -214,6 +214,7 @@ func startUnpackWeaver(t *testing.T, bin, root string, nntpPort int, extraEnv ..
 
 func startManagedUnpackWeaver(t *testing.T, bin, root, logName string, nntpPort int, extraEnv ...string) (string, string, func()) {
 	t.Helper()
+	databaseURL := nativeUnpackPostgresURL(t, root)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -251,6 +252,9 @@ priority = 0
 	}
 	cmd.Env = append(cmd.Env, "WEAVER_FORCE_KEY_FILE=1", "WEAVER_DIRECT_UNPACK=true", "RUST_LOG=info,weaver_server_core::pipeline::completion=debug", "NO_COLOR=1")
 	cmd.Env = append(cmd.Env, extraEnv...)
+	if databaseURL != "" {
+		cmd.Env = append(cmd.Env, "WEAVER_DATABASE_URL="+databaseURL)
+	}
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	if err := cmd.Start(); err != nil {
 		logFile.Close()

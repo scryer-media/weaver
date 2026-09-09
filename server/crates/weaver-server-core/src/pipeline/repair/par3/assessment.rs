@@ -71,7 +71,9 @@ impl AssessmentView {
         }
         Ok(Self {
             status: assessment.status,
-            output_lengths: layout.map(|layout| layout.files().iter().map(|file| file.len).collect()).unwrap_or_default(),
+            output_lengths: layout
+                .map(|layout| layout.files().iter().map(|file| file.len).collect())
+                .unwrap_or_default(),
             requirements: assessment.requirements.clone(),
             embedded_source: layout
                 .filter(|layout| {

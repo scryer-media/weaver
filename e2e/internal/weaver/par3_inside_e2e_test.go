@@ -72,8 +72,12 @@ func TestPar3InsideE2E(t *testing.T) {
 					}
 					slug := "par3-inside-" + format + "-" + mode
 					postedName := name
-					if mode == "renamed" { postedName = "renamed" + filepath.Ext(name) }
-					if mode == "obfuscated" { postedName = "opaque.dat" }
+					if mode == "renamed" {
+						postedName = "renamed" + filepath.Ext(name)
+					}
+					if mode == "obfuscated" {
+						postedName = "opaque.dat"
+					}
 					nzb := nntp.publishInside(slug, mode, postedName, posted, len(original))
 					if err := os.WriteFile(filepath.Join(root, slug+".nzb"), nzb, 0644); err != nil {
 						t.Fatal(err)
@@ -153,6 +157,15 @@ func TestPar3InsideE2E(t *testing.T) {
 // an unflushed warning for an absent warning on clean or failed jobs.
 func (a unpackAPI) assertEmbeddedRepairWarning(t *testing.T, job int, expected bool) {
 	t.Helper()
+	want := 0
+	if expected {
+		want = 1
+	}
+	a.assertEmbeddedRepairWarnings(t, job, want)
+}
+
+func (a unpackAPI) assertEmbeddedRepairWarnings(t *testing.T, job, want int) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		var result struct {
@@ -172,10 +185,6 @@ func (a unpackAPI) assertEmbeddedRepairWarning(t *testing.T, job int, expected b
 			terminal = terminal || event.Kind == "JOB_COMPLETED" || event.Kind == "JOB_FAILED"
 		}
 		if terminal {
-			want := 0
-			if expected {
-				want = 1
-			}
 			if warnings != want {
 				t.Fatalf("job=%d: got %d persisted repair warnings, want %d", job, warnings, want)
 			}

@@ -2,7 +2,6 @@ package weaver
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/xml"
 	"fmt"
 	"net"
@@ -106,17 +105,14 @@ func TestPar3DirectRestartE2E(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(root, "weaver.db"))+"?mode=ro")
-			if err != nil {
-				t.Fatal(err)
-			}
+			db := openNativeUnpackDB(t, root, true)
 			defer db.Close()
 			db.SetMaxOpenConns(1)
 			ready := false
 			deadline := time.Now().Add(30 * time.Second)
 			for time.Now().Before(deadline) {
 				var checkpoints int
-				err := db.QueryRow("SELECT COUNT(*) FROM active_direct_coverage WHERE job_id = ?", job).Scan(&checkpoints)
+				err := db.QueryRow("SELECT COUNT(*) FROM active_direct_coverage WHERE job_id = $1", job).Scan(&checkpoints)
 				log, _ := os.ReadFile(firstLog)
 				if err == nil && checkpoints > 0 && gate.held.Load() > 0 && strings.Contains(string(log), "status=NeedRecovery") {
 					ready = true
@@ -132,7 +128,7 @@ func TestPar3DirectRestartE2E(t *testing.T) {
 			}
 			if password != "" {
 				var stored string
-				if err := db.QueryRow("SELECT password FROM active_jobs WHERE job_id = ?", job).Scan(&stored); err != nil {
+				if err := db.QueryRow("SELECT password FROM active_jobs WHERE job_id = $1", job).Scan(&stored); err != nil {
 					t.Fatal(err)
 				}
 				if !strings.HasPrefix(stored, "enc:v1:") || stored == password {
@@ -220,7 +216,7 @@ func TestPar3DirectRestartE2E(t *testing.T) {
 					t.Fatalf("failpoint preceded native repair installation: read=%v equal=%v", err, bytes.Equal(rebuilt, original))
 				}
 				var checkpoints int
-				if err := db.QueryRow("SELECT COUNT(*) FROM active_direct_coverage WHERE job_id = ?", job).Scan(&checkpoints); err != nil {
+				if err := db.QueryRow("SELECT COUNT(*) FROM active_direct_coverage WHERE job_id = $1", job).Scan(&checkpoints); err != nil {
 					t.Fatal(err)
 				}
 				wantCheckpoints := 0
@@ -272,7 +268,7 @@ func TestPar3DirectRestartE2E(t *testing.T) {
 				}
 				for _, table := range []string{"active_jobs", "active_direct_coverage"} {
 					var rows int
-					if err := db.QueryRow("SELECT COUNT(*) FROM "+table+" WHERE job_id = ?", job).Scan(&rows); err != nil || rows != 0 {
+					if err := db.QueryRow("SELECT COUNT(*) FROM "+table+" WHERE job_id = $1", job).Scan(&rows); err != nil || rows != 0 {
 						t.Fatalf("cancelled job retained restorable %s rows: rows=%d err=%v", table, rows, err)
 					}
 				}

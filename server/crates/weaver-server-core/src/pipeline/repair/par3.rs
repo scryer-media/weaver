@@ -67,9 +67,11 @@ pub(in crate::pipeline) struct Par3Job {
     sources: PublishedSources,
     carriers: BTreeMap<SourceId, Carrier>,
     sets: BTreeMap<par3_rs::InputSetId, assessment::SetSession>,
+    dormant_views: BTreeMap<par3_rs::InputSetId, assessment::AssessmentView>,
     bindings: BTreeMap<String, SourceId>,
     disk_publications: BTreeMap<SourceId, DiskPublication>,
     name_search: placement::NameSearch,
+    donor_search: donors::Cache,
     publication_memory: BTreeMap<SourceId, assessment::ViewReservation>,
     virtual_readers: Arc<virtual_source::ReaderCache>,
 }
@@ -81,9 +83,11 @@ impl Default for Par3Job {
             sources: PublishedSources::default(),
             carriers: BTreeMap::new(),
             sets: BTreeMap::new(),
+            dormant_views: BTreeMap::new(),
             bindings: BTreeMap::new(),
             disk_publications: BTreeMap::new(),
             name_search: placement::NameSearch::default(),
+            donor_search: donors::Cache::default(),
             publication_memory: BTreeMap::new(),
             virtual_readers: Arc::default(),
         }
@@ -211,7 +215,34 @@ impl Par3Job {
             .map(|_| ())
     }
 
+    /// Keep bounded scheduling facts while releasing idle native analysis.
+    /// Only recovery-waiting jobs are eligible; no queued repair loses its plan.
+    fn evict_native_sessions(&mut self) {
+        for (id, mut set) in std::mem::take(&mut self.sets) {
+            if let Some(view) = set.view.take() {
+                self.dormant_views.insert(id, view);
+            }
+        }
+        for carrier in self.carriers.values_mut() {
+            carrier.revision = 0;
+            carrier.resume = Some(carrier.scan_start);
+        }
+        self.name_search = placement::NameSearch::default();
+        self.donor_search = donors::Cache::default();
+    }
+
     fn assess(&mut self) -> EngineResult<()> {
+        if !self.dormant_views.is_empty() {
+            // Reopen from currently published carrier ranges on this worker.
+            // Reauthenticate packets and source bytes instead of inventing
+            // serialized codec state or treating cached UI facts as evidence.
+            let _reservation = assessment::ViewReservation::acquire(self.carriers.len() * 8)?;
+            let carriers: Vec<_> = self.carriers.keys().copied().collect();
+            for source in carriers {
+                self.scan(source)?;
+            }
+            self.dormant_views.clear();
+        }
         self.validate_shared_layouts()?;
         for set in self.sets.values_mut() {
             set.view = None;
@@ -224,7 +255,11 @@ impl Par3Job {
             }
             set.assess()?;
         }
-        self.discover_name()
+        self.discover_name()?;
+        if self.name_search.source().is_none() {
+            self.discover_donors()?;
+        }
+        Ok(())
     }
 
     fn repair(
@@ -510,10 +545,11 @@ impl Pipeline {
         }
         let embedded = if !self.par3_inside_probes.contains(file_id)
             && !signature
-            && (container_signature || matches!(
-                file.role(),
-                FileRole::ZipArchive | FileRole::SevenZipArchive
-            )) {
+            && (container_signature
+                || matches!(
+                    file.role(),
+                    FileRole::ZipArchive | FileRole::SevenZipArchive
+                )) {
             let path = state
                 .working_dir
                 .join(self.current_filename_for_file(job_id, file));
@@ -665,7 +701,9 @@ impl Pipeline {
         };
         // Planned outputs have no articles or readable bytes until native
         // installation hands them back. Do not open a destination that is absent.
-        if file.is_repair_output() && !file.is_complete() { return Ok(()); }
+        if file.is_repair_output() && !file.is_complete() {
+            return Ok(());
+        }
         let name = self.current_filename_for_file(job_id, file);
         let path = state.working_dir.join(&name);
         let source = SourceId(u64::from(file_id.file_index));
@@ -979,9 +1017,10 @@ mod completion;
 mod coordination;
 #[cfg(windows)]
 mod disk_windows;
+mod donors;
 mod identity;
-mod outputs;
 pub(in crate::pipeline) mod inside;
+mod outputs;
 mod placement;
 mod readback;
 pub(in crate::pipeline) mod virtual_source;

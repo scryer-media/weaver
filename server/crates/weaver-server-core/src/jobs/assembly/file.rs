@@ -223,7 +223,9 @@ impl FileAssembly {
     }
 
     pub fn reset(&mut self) {
-        if let Some(ready) = &mut self.repair_output_ready { *ready = false; }
+        if let Some(ready) = &mut self.repair_output_ready {
+            *ready = false;
+        }
         self.received.fill(false);
         self.received_bytes = 0;
         self.placements.clear();
@@ -248,7 +250,9 @@ impl FileAssembly {
     /// use it as one. The bytes actually written are the sum of the recorded
     /// placements; `contiguous_placements_proven` is what reasons about those.
     pub fn mark_complete(&mut self) {
-        if let Some(ready) = &mut self.repair_output_ready { *ready = true; }
+        if let Some(ready) = &mut self.repair_output_ready {
+            *ready = true;
+        }
         self.received.fill(true);
         self.received_bytes = self.total_bytes;
     }
@@ -271,7 +275,9 @@ impl FileAssembly {
 
     /// Completion fraction (0.0 to 1.0).
     pub fn progress(&self) -> f64 {
-        if let Some(ready) = self.repair_output_ready { return if ready { 1.0 } else { 0.0 }; }
+        if let Some(ready) = self.repair_output_ready {
+            return if ready { 1.0 } else { 0.0 };
+        }
         if self.total_segments == 0 {
             return 1.0;
         }
@@ -280,7 +286,9 @@ impl FileAssembly {
 
     /// Whether all segments have been received.
     pub fn is_complete(&self) -> bool {
-        if let Some(ready) = self.repair_output_ready { return ready; }
+        if let Some(ready) = self.repair_output_ready {
+            return ready;
+        }
         self.received.count_ones() == self.total_segments as usize
     }
 

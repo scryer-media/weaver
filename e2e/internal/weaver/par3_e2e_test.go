@@ -76,6 +76,11 @@ func TestPar3E2E(t *testing.T) {
 				// authenticated fingerprints can detect and correct the change.
 				files["payload.bin"][100000] ^= 0x80
 			}
+			if mode == "unrecoverable" {
+				// Remove every repeated donor from the regenerated protected
+				// input. Carrier bytes remain the official fixture unchanged.
+				clear(files["payload.bin"])
+			}
 			if mode == "missing" {
 				articleMode = "missing"
 			}
@@ -199,8 +204,8 @@ func TestPar3E2E(t *testing.T) {
 				if (mode == "clean" || mode == "renamed" || name == "set.vol3+1.par3") && count != 0 {
 					t.Fatalf("unneeded recovery carrier downloaded: %s (%d requests)", name, count)
 				}
-				if mode == "missing" && name == "set.vol1+2.par3" && count != 1 {
-					t.Fatalf("repair needs only the first article from this carrier: got %d requests", count)
+				if mode == "missing" && count != 0 {
+					t.Fatalf("repeated donor bytes need no recovery carrier: %s (%d requests)", name, count)
 				}
 			}
 			var history struct {

@@ -650,7 +650,7 @@ async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
         assert_eq!(
             view.status,
             if damaged {
-                par3_rs::session::RepairStatus::NeedRecovery
+                par3_rs::session::RepairStatus::Ready
             } else {
                 par3_rs::session::RepairStatus::Complete
             }
@@ -662,7 +662,10 @@ async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
         if damaged {
             assert_eq!(view.files[0].unresolved.len(), 1);
             assert_eq!(view.files[0].unresolved[0], 2000..4000);
-            assert_eq!(view.requirements[0].additional, 1);
+            // This official input repeats every 256 bytes. The damaged
+            // block has a strong donor elsewhere in the same file; it still
+            // needs installation, but no recovery download.
+            assert!(view.requirements.is_empty());
         }
         let expected_counts = if damaged { [0, 1, 0, 0] } else { [1, 0, 0, 0] };
         let reads = pipeline
@@ -725,7 +728,7 @@ async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
             if damaged {
                 par3_rs::session::RepairStatus::Complete
             } else {
-                par3_rs::session::RepairStatus::NeedRecovery
+                par3_rs::session::RepairStatus::Ready
             }
         );
         pipeline.note_job_unverifiable_if_no_par2_set(job_id);
@@ -806,6 +809,12 @@ async fn completion_waits_for_authenticated_carrier_worker_including_renamed_inp
             pipeline.jobs[&job_id].status,
             JobStatus::Downloading
         ));
+        let jobs = pipeline.list_jobs();
+        let visible = jobs.iter().find(|job| job.job_id == job_id).unwrap();
+        assert!(matches!(visible.status, JobStatus::Verifying));
+        assert_eq!(visible.post_state, crate::jobs::model::PostState::Verifying);
+        assert!(!visible.finalizing_download);
+        assert!(!visible.fetching_repair_data);
         assert!(working.join(filename).exists());
         let done =
             tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
@@ -892,7 +901,11 @@ async fn restored_completed_images_are_reverified_without_article_placements() {
             if changed { 2 } else { 3 }
         );
         if changed {
-            assert_eq!(view.status, par3_rs::session::RepairStatus::NeedRecovery);
+            assert_eq!(view.status, par3_rs::session::RepairStatus::Ready);
+            assert!(
+                view.requirements.is_empty(),
+                "repeated source bytes donate the damaged block"
+            );
         }
     }
 }

@@ -66,6 +66,9 @@ impl Par3Job {
                     && file.len != 0
                     && file.fingerprint != [0; 16]
                     && !self.bindings.contains_key(&file.path)
+                    // Nested outputs retain independent manifest ownership;
+                    // extent donation preserves the original flat NZB source.
+                    && !file.path.contains('/')
                     && !file
                         .extents
                         .iter()
@@ -126,9 +129,9 @@ impl Par3Job {
                 continue;
             };
             if matches.any(|other| other.path != file.path) {
-                return Err(EngineError::InvalidState(
-                    "ambiguous PAR3 content aliases require separate output placement",
-                ));
+                // Compatible aliases need independent output identities. The
+                // extent donor path can satisfy each without renaming this source.
+                continue;
             }
             let path = self
                 .disk_publications

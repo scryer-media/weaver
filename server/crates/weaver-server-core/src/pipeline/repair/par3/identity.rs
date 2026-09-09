@@ -4,6 +4,46 @@ use super::*;
 use crate::jobs::record::FileIdentitySource;
 
 impl Pipeline {
+    /// Complete the durable intent before restore can publish a source or
+    /// decide that an obfuscated embedded archive is an ordinary payload.
+    pub(crate) fn restore_pending_par3_content_names(
+        &self,
+        job_id: JobId,
+        directory: &std::path::Path,
+        identities: &mut std::collections::HashMap<u32, crate::jobs::record::ActiveFileIdentity>,
+    ) -> Result<(), String> {
+        let pending: Vec<u32> = identities
+            .values()
+            .filter(|identity| identity.classification_source == FileIdentitySource::Par3Pending)
+            .map(|identity| identity.file_index)
+            .collect();
+        for index in pending {
+            let mut identity = identities[&index].clone();
+            let name = identity
+                .canonical_filename
+                .clone()
+                .ok_or("missing PAR3 move target")?;
+            if identities.values().any(|other| {
+                other.file_index != index
+                    && (other.current_filename == name
+                        || other.current_filename == identity.current_filename)
+            }) {
+                return Err("PAR3 move collides with another job file".into());
+            }
+            finish_content_move(directory, &identity.current_filename, &name)
+                .map_err(|error| format!("cannot resume PAR3 content move: {error}"))?;
+            identity.current_filename = name;
+            identity.classification_source = FileIdentitySource::Par3;
+            self.db
+                .save_file_identity(job_id, &identity)
+                .map_err(|error| {
+                    format!("cannot commit restored PAR3 content identity: {error}")
+                })?;
+            identities.insert(index, identity);
+        }
+        Ok(())
+    }
+
     pub(super) async fn apply_par3_content_identity(
         &mut self,
         job_id: JobId,
@@ -52,37 +92,46 @@ impl Pipeline {
         {
             return Err("PAR3 content source is not a regular file".into());
         }
-        let old_non_rar_sets: Vec<String> = state.assembly.archive_topologies().iter()
+        let old_non_rar_sets: Vec<String> = state
+            .assembly
+            .archive_topologies()
+            .iter()
             .filter(|(name, topology)| {
-                !matches!(topology.archive_type, crate::jobs::assembly::ArchiveType::Rar)
-                    && topology.volume_map.contains_key(&old_name)
+                !matches!(
+                    topology.archive_type,
+                    crate::jobs::assembly::ArchiveType::Rar
+                ) && topology.volume_map.contains_key(&old_name)
                     && !state.assembly.files().any(|other| {
                         other.file_id() != id
-                            && self.classified_archive_set_name_for_file(job_id, other)
-                                .as_deref() == Some(name.as_str())
+                            && self
+                                .classified_archive_set_name_for_file(job_id, other)
+                                .as_deref()
+                                == Some(name.as_str())
                     })
             })
             .map(|(name, _)| name.clone())
             .collect();
         let old_sets = self.rar_set_names_for_files(job_id, &[id]);
-        // Keep the original name until the identity is durable. Hard-link
-        // placement is exclusive and writes no clean payload bytes. A collision
-        // (including a symlink) fails without changing either existing file.
-        std::fs::hard_link(&old_path, &target)
-            .map_err(|error| format!("cannot place {}: {error}", target.display()))?;
-        identity.current_filename = found.name.clone();
+        // Persist both names before changing the directory. Atomic exclusive
+        // rename needs neither hard-link support nor a copy of the clean file.
+        // A failed final database write leaves the durable intent replayable.
         identity.canonical_filename = Some(found.name.clone());
         identity.classification =
             Self::canonical_archive_identity_from_filename(&found.name).or(identity.classification);
+        identity.classification_source = FileIdentitySource::Par3Pending;
+        self.set_file_identity(job_id, identity.clone())?;
+        crate::e2e_failpoint::maybe_trip("par3.content_name.intent");
+        finish_content_move(
+            old_path.parent().ok_or("missing content directory")?,
+            &old_name,
+            &found.name,
+        )
+        .map_err(|error| format!("cannot place {}: {error}", target.display()))?;
+        crate::e2e_failpoint::maybe_trip("par3.content_name.moved");
+        identity.current_filename = found.name.clone();
         identity.classification_source = FileIdentitySource::Par3;
-        if let Err(error) = self.set_file_identity(job_id, identity) {
-            let rollback = std::fs::remove_file(&target);
-            return Err(format!("{error}; new-name rollback: {rollback:?}"));
-        }
-        // Identity persistence also updates the completed-file name in the
-        // same transaction, preserving its existing checksum provenance.
-        std::fs::remove_file(&old_path)
-            .map_err(|error| format!("failed to retire old content name: {error}"))?;
+        self.set_file_identity(job_id, identity)?;
+        crate::e2e_failpoint::maybe_trip("par3.content_name.persisted");
         let touched = std::collections::HashSet::from([old_name]);
         for set in &old_sets {
             self.invalidate_archive_set_for_identity_rebind(job_id, set, &touched);
@@ -90,9 +139,13 @@ impl Pipeline {
         // The retired ZIP/7z/split roster must disappear before readiness
         // queues extraction. Its old names no longer designate source files.
         for set in old_non_rar_sets {
-            self.jobs.get_mut(&job_id).expect("live job")
-                .assembly.remove_archive_topology(&set);
-            self.db.clear_extraction_chunks_for_set(job_id, &set)
+            self.jobs
+                .get_mut(&job_id)
+                .expect("live job")
+                .assembly
+                .remove_archive_topology(&set);
+            self.db
+                .clear_extraction_chunks_for_set(job_id, &set)
                 .map_err(|error| format!("failed to retire content extraction state: {error}"))?;
         }
         let role = weaver_model::files::FileRole::from_filename(&found.name);
@@ -118,5 +171,123 @@ impl Pipeline {
         self.release_direct_unpack_after_repair(job_id);
         self.schedule_job_completion_check(job_id);
         Ok(())
+    }
+}
+
+/// Replaying the filesystem half grants no checksum evidence. Restored bytes
+/// must still pass native verification with their newly published generation.
+fn finish_content_move(
+    directory: &std::path::Path,
+    old_name: &str,
+    new_name: &str,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    if [old_name, new_name].into_iter().any(|name| {
+        name.is_empty() || weaver_model::files::sanitize_download_filename(name) != name
+    }) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "unsafe PAR3 content name",
+        ));
+    }
+    let old = directory.join(old_name);
+    let target = directory.join(new_name);
+    match std::fs::symlink_metadata(&old) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            crate::runtime::fs::rename_file_exclusive(&old, &target)?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // The atomic move completed before the identity transaction.
+            if !std::fs::symlink_metadata(&target)?.file_type().is_file() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "PAR3 move target is not a regular file",
+                ));
+            }
+        }
+        Ok(_) => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "PAR3 move source is not a regular file",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    // Flush the directory before declaring the database identity complete.
+    #[cfg(unix)]
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_move_is_atomic_replayable_and_preserves_collisions() {
+        use std::io::ErrorKind;
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("opaque.dat");
+        let target = root.path().join("payload.bin");
+        std::fs::write(&old, b"verified payload").unwrap();
+        std::fs::write(&target, b"unrelated").unwrap();
+        assert_eq!(
+            finish_content_move(root.path(), "opaque.dat", "payload.bin")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&old).unwrap(), b"verified payload");
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated");
+        std::fs::remove_file(&target).unwrap();
+        let before = std::fs::metadata(&old).unwrap();
+        finish_content_move(root.path(), "opaque.dat", "payload.bin").unwrap();
+        assert!(!old.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                before.ino(),
+                std::fs::metadata(&target).unwrap().ino(),
+                "rename must not copy clean bytes"
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = before;
+        finish_content_move(root.path(), "opaque.dat", "payload.bin").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"verified payload");
+        assert!(finish_content_move(root.path(), "../opaque.dat", "payload.bin").is_err());
+        assert!(finish_content_move(root.path(), "opaque.dat", "../payload.bin").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &old).unwrap();
+            assert_eq!(
+                finish_content_move(root.path(), "opaque.dat", "payload.bin")
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInput
+            );
+            std::fs::remove_file(&old).unwrap();
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink("missing", &target).unwrap();
+            assert!(finish_content_move(root.path(), "opaque.dat", "payload.bin").is_err());
+        }
+    }
+
+    #[test]
+    fn content_move_supports_case_only_names_and_replay() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("PAYLOAD.BIN"), b"payload").unwrap();
+        finish_content_move(root.path(), "PAYLOAD.BIN", "payload.bin").unwrap();
+        finish_content_move(root.path(), "PAYLOAD.BIN", "payload.bin").unwrap();
+        let names: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("payload.bin")]);
+        assert_eq!(
+            std::fs::read(root.path().join("payload.bin")).unwrap(),
+            b"payload"
+        );
     }
 }

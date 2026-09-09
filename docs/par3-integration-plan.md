@@ -2,7 +2,8 @@
 
 Implementation started on 2026-09-08 in `feature/par3-integration`, based on
 local `release-0.12.0` at `6b079b40acea50e64df2cfce956dd0412963d906`.
-This is an implementation record, not a claim that the entire pipeline is ready.
+The functional MVP is implemented and validated on macOS/ARM64. This record
+keeps native Linux/Windows and final performance qualification outstanding.
 
 ## Functional MVP completion
 
@@ -12,19 +13,19 @@ including explicit safe failure for insufficient recovery, unsupported native
 features, changed sources and exhausted resources. It must not silently narrow
 coverage to make the positive scenarios pass.
 
-Remaining correctness gates:
+Functional correctness gates (final capstone results recorded below):
 
 - [x] Large interleaved sets pass clean and damaged native cases under a documented,
   enforced shared memory budget; retain the enabled 65,538-block regressions.
-- [ ] Embedded ZIP, ZIP64 and 7z discovery, protected-data repair and extraction
+- [x] Embedded ZIP, ZIP64 and 7z discovery, protected-data repair and extraction
   preserve container structure, member bytes and authenticated packet gaps.
-- [ ] Renamed/obfuscated sources and overlapping source aliases bind consistently;
+- [x] Renamed/obfuscated sources and overlapping source aliases bind consistently;
   conflicting authenticated descriptions fail without delivering corrupt output.
-- [ ] Concurrent jobs, eviction, cancellation during native work and partial
+- [x] Concurrent jobs, cancellation during native work, idle-session eviction and partial
   installations enforce shared limits and preserve verified output safely.
-- [ ] SQLite and PostgreSQL restart scenarios preserve required bindings and
+- [x] SQLite and PostgreSQL restart scenarios preserve required bindings and
   acquisition state, using fresh verification wherever continuity is unproven.
-- [ ] API/history/progress/metrics distinguish native PAR3 work accurately while
+- [x] API/history/progress/metrics distinguish native PAR3 work accurately while
   preserving existing PAR2 contracts.
 - [ ] The full native matrix and Rust/consumer sweeps pass on the supported
   platforms, with explicit records for any unavailable validation environment.
@@ -34,6 +35,54 @@ acceptable interim implementations when they preserve correctness and resource
 bounds. Positioned hashing, evidence replay and faster repair are optimization
 work; they cannot substitute for the gates above. Preserve the existing PAR2
 non-regression requirement and measured baseline throughout this work.
+
+## Final macOS/ARM64 capstone — 2026-09-09
+
+The completed implementation passed the full available local validation batch:
+
+- `cargo nextest run --locked --workspace --all-features --no-fail-fast
+  --test-threads 4`: 3,888 passed, zero failures, 13 pre-existing ignored tests;
+  the explicitly approved isolated PostgreSQL fixture was configured.
+- `cargo test --locked --workspace --all-features --doc --no-fail-fast`:
+  all three doctests passed.
+- Workspace formatting and all-target, all-feature Clippy with `-D warnings`
+  passed. Final review corrected the Windows `MoveFileExW` success condition;
+  that branch is not exercised by the Mac runs, and host linting was repeated.
+- The final native SQLite matrix passed all 247 leaf scenarios in 208.961 seconds,
+  including 54 existing PAR2 archive regressions. Native PostgreSQL restart and
+  concurrency scenarios passed all 33 leaves in 49.222 seconds. Both used the
+  normal `cargo build --locked -p weaver` binary and pinned official PAR3 reference.
+- The complete Go consumer suite, `go test -mod=readonly ./...`, passed with
+  existing generated corpus prerequisites hydrated locally. No fixture bytes,
+  ledger entries or dependencies were changed to satisfy missing prerequisites.
+- Eviction tests use real official metadata and native sessions, including a
+  smaller shared pool that reaches the production dispatch threshold. They
+  prove LRU release, preserved scheduling requirements, no eviction reads or
+  idle replay loop, fresh source verification after arrivals, and protection of
+  queued, running and installing jobs.
+
+The PostgreSQL schema comparison exposed an omitted Boolean normalization entry
+for `server_tls_diagnostics.honors_client_cipher_order`. Its existing SQLite
+integer and PostgreSQL Boolean columns now compare semantically; production
+schemas and the drift-detection assertion remain unchanged.
+
+Evidence logs are `/private/tmp/weaver-par3-final-full-rust.log`,
+`weaver-par3-final-doc.log`, `weaver-par3-final-clippy.log`,
+`weaver-par3-final-windows-branch-clippy.log`,
+`weaver-par3-final-sqlite-native.log`, `weaver-par3-final-postgres-native.log`,
+and the preceding unchanged Go consumer run `weaver-par3-capstone-go2.log`.
+All log basenames in this paragraph are under `/private/tmp`. Native logs name
+preserved per-scenario artifacts with hashes, source provenance and process logs.
+The owned PostgreSQL container was stopped and retained; no existing service was
+stopped and container deletion was not authorized.
+
+Native Linux was not run in this arc. Native Windows remains unvalidated; the
+local cross-check is blocked by missing Windows SDK headers in AWS-LC. The
+platform gate above therefore remains open. The known macOS linker unwind-table
+size warning remains visible. Final-candidate pipeline throughput, x86-64 native
+measurements and full PAR3 codec performance acceptance are also outstanding;
+correctness results do not replace those measurements. Publication and deployment
+remain separate operator actions. These changes retain prospective 0.11.3.
 
 ## Implementation record
 
@@ -508,11 +557,83 @@ repair regressions passed before that fix. Formatting and Clippy remain deferred
 to the MVP capstone. Migration 47 and the existing prospective 0.11.3 version cover
 this capability; no third-party dependencies changed.
 
-Content placement is not complete: damaged/shifted donors need extent placement,
-shared aliases need separate output mappings, and authenticated nested paths need
-safe mapping into Weaver's download identities. Interrupted filesystem placement
-and unsupported hard-link filesystems also need explicit reconciliation. These
-remain MVP gates; a clean filename match does not close them.
+Damaged and shifted sources now donate BLAKE3-confirmed extents through the native
+CRC64 search API. Only explicitly published candidates are searched, with bounded
+read work and retained attempts tied to layout, identity, generation and coverage.
+Unchanged assessments and recovery-only arrivals do not repeat donor reads;
+changed generations invalidate confirmations. Compatible aliases use independent
+output identities, so one donor can restore multiple missing paths without losing
+its NZB ownership. Nested relative outputs retain their authenticated paths in the
+manifest; reservation and restart reject ambiguous components and non-directory
+ancestors, with native installation checking containment again before writing.
+
+Eighteen new native cases cover damaged/shifted Cauchy, FFT and packed-tail donors,
+parity-free alias restoration, nested payload omission/donation, and nested
+ZIP/ZIP64, split, stored RAR and encrypted RAR extraction. The full native sweep
+exposed two old periodic-fixture expectations: repeated donor bytes now repair a
+missing article without parity, and an insufficient-recovery fixture must damage
+all repeated donors to remain unrecoverable. Only regenerated protected inputs
+were changed; official carrier bytes and provenance remain unchanged. Of 228
+native cases, 226 passed in the broad sweep and the two corrected expectations
+pass in the nine-case native rerun. The Rust sweep ran 3,882 tests: 3,879 passed,
+two had the same periodic-donor expectation, and one yEnc test passed assertions
+but triggered Nextest's leaked-handle check. All 13 completion tests pass after
+correcting the expectations; the isolated yEnc rerun passes without a leaked
+handle report. The 51 focused adapter and output-persistence tests also pass.
+
+Native cancellation is now exercised while a source read is actually in flight:
+forgetting the job cancels its token but retains its worker slot until handback,
+then the next job proceeds without admitting stale results. Three new native
+ZIP/ZIP64/7z scenarios repair an embedded archive, stop the owned process while
+another set awaits recovery, change protected archive bytes, then restart. Fresh
+verification repairs the changed bytes, extraction is byte-exact, and both
+independent replacement warnings remain persisted. These three cases and all 16
+focused worker lifecycle tests pass.
+
+Native verification waits are projected as `Verifying` in the job-list API after
+downloads settle, without mutating scheduler phases. The first implementation
+changed the scheduler state and passed all 3,884 Rust tests, but the native sweep
+caught a clean ZIP completion stall. That state mutation was removed; presentation
+now derives from retained native work, leaving the existing completion behavior
+intact. All 231 combined native scenarios pass on the corrected candidate
+(187.043 seconds), and all 191 focused queue/API regressions pass. The full Rust
+sweep passed 3,884 tests with 13 existing skips before the presentation-only
+correction; that correction is covered by the queue/API rerun.
+
+The new real-process name crash scenarios exposed a pre-commit restart hole:
+obfuscated ZIP/ZIP64 sources could move to completion without extraction.
+Content placement now persists an explicit `par3_pending` identity containing
+both names before an atomic exclusive move, then commits the current name and
+completed-file row together. Restore finishes the intent before publishing
+sources or evaluating completion. Linux/macOS/Windows primitives never copy or
+overwrite the target and need no hard-link support. Restored bytes still require
+native verification. Fifteen native cases cover payloads, case-only names and
+embedded ZIP/ZIP64/7z at intent, move and identity-commit interruption boundaries.
+Collision, symlink, case-only and no-copy regressions accompany durable identity
+roundtrips. No schema or dependency change is required.
+
+The native harness now supports an explicitly supplied loopback PostgreSQL
+fixture, allocating a fresh database per test root and preserving it only across
+that scenario's restarts. It cleans up those databases after the owned processes
+stop. SQLite remains the default. PostgreSQL restart coverage includes direct
+plain/encrypted RAR, changed source bytes, AES-GCM password overrides,
+cancellation, partial coverage commit, NZB-absent output ownership, embedded
+replacement warnings and all name-transaction boundaries. A concurrent-job
+scenario holds Cauchy recovery while independent FFT and Data-only repairs finish;
+all three jobs deliver exact bytes and healthy history on both datastores.
+
+These batches continue prospective 0.11.3 without third-party dependency changes.
+Under shared memory pressure, dispatch evicts the least recently used idle
+recovery-waiting native sessions until 128 MiB of work headroom is available or
+no eligible victim remains. Bounded scheduling views retain recovery requirements;
+current carrier ranges are reauthenticated and sources freshly verified on the
+next arrival. Queued, running, installing and ready-to-repair sessions are never
+victims. Eviction performs no source reads and does not spin a recovery wait.
+PAR2 retains its existing budgets and policy. Oversized active work still returns
+typed resource exhaustion; this is not a promise of unlimited large sessions.
+The original optimized integration acceptance still requires final-candidate pipeline performance and native Linux/Windows
+evidence; earlier ARM64 CLI comparisons are retained as their stated baseline,
+not reused as a new measurement.
 
 Standalone mixed-format coordination now gives PAR2 its first repair attempt and
 excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence

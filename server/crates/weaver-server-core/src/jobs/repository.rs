@@ -314,7 +314,8 @@ impl Database {
                                 "active_rar_verified_suspect",
                             )
                             .await?,
-                            active_repair_outputs: delete_orphan_rows(tx, "active_repair_outputs").await?,
+                            active_repair_outputs: delete_orphan_rows(tx, "active_repair_outputs")
+                                .await?,
                             active_direct_coverage: delete_orphan_rows(
                                 tx,
                                 "active_direct_coverage",

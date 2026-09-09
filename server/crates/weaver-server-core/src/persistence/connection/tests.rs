@@ -626,6 +626,7 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
             | ("servers", "supports_pipelining")
             | ("servers", "backfill")
             | ("servers", "download_quota_enabled")
+            | ("server_tls_diagnostics", "honors_client_cipher_order")
             | ("active_jobs", "normalization_retried")
             | ("active_par2_files", "promoted")
             | ("active_extraction_chunks", "verified")

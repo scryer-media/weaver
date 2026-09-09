@@ -1,6 +1,7 @@
 # Native PAR3 pipeline scenarios
 
-`TestPar3E2E` owns a new Weaver process, loopback NNTP fixture and SQLite database.
+`TestPar3E2E` owns a new Weaver process, loopback NNTP fixture and isolated database.
+SQLite is the default; the optional PostgreSQL fixture is described below.
 It submits NZBs through the authenticated GraphQL API and checks final output
 bytes, terminal status, history health, recovery article requests and standalone
 carrier cleanup. Successful cases require zero failed bytes and 1000/1000 health.
@@ -12,7 +13,7 @@ From the repository root:
 cargo build --locked -p weaver
 cd e2e
 WEAVER_PAR3_E2E_BIN="$(cd .. && pwd)/target/debug/weaver" \
-  go test ./internal/weaver -run '^TestPar3E2E$' -count=1 -v -timeout 8m
+  go test -mod=readonly ./internal/weaver -run '^TestPar3E2E$' -count=1 -v -timeout 8m
 ```
 
 The checked-in carriers under `internal/weaver/testdata/par3-native` come from
@@ -33,8 +34,9 @@ Successful repairs must reproduce the expected BLAKE3 and byte length, stop befo
 requesting the final surplus carrier, and leave no spent `.par3` files in the
 delivered directory. The test retains its directory and writes per-case evidence
 with request counts and terminal status beside the Weaver log and database.
-The missing-article case also requires exactly one article from its two-article
-recovery volume, proving acquisition stops before the carrier is complete.
+The periodic missing-article input is recoverable from strongly verified donor
+extents and requires zero recovery downloads. Non-repeating archive cases still
+check selective recovery-packet and article acquisition.
 
 `TestPar3ArchiveE2E` adds clean, corrupt and missing-article cases for ZIP,
 ZIP64, split files, stored RAR and encrypted multi-volume RAR. Direct-store
@@ -45,7 +47,7 @@ protection in the preserved run directory:
 ```sh
 WEAVER_PAR3_E2E_BIN=/absolute/path/to/weaver \
 WEAVER_PAR3_REFERENCE_BIN=/absolute/path/to/official/par3 \
-  go test ./internal/weaver -run '^TestPar3ArchiveE2E$' -count=1 -v -timeout 15m
+  go test -mod=readonly ./internal/weaver -run '^TestPar3ArchiveE2E$' -count=1 -v -timeout 15m
 ```
 
 The fixture helper records the reference binary hash, exact arguments, protected
@@ -61,15 +63,15 @@ finalization without demotion. Encrypted RAR also loses an article in each of tw
 repairs to enter the shared direct output. Every single-byte
 corruption case must complete using only the first recovery packet; downloading
 extra parity to compensate for lost source-coverage metadata fails the test.
-The conventional/archive matrix covers 35 PAR3 scenarios, alongside 54
-existing PAR2 archive regression cases. Ten archive cases exercise PAR2-first and
+The conventional/archive matrix runs alongside 54 existing PAR2 archive
+regression cases, including omitted and nested authenticated archive paths. Ten archive cases exercise PAR2-first and
 PAR3-fallback repair for each format, preserving RAR direct extraction. The two disguised-carrier cases post an
 official recovery volume as `.bin` and hold the damaged RAR until that carrier
 authenticates; both must keep direct extraction. This is correctness evidence, not a throughput
 or full integration readiness claim.
 
-`TestPar3InsideE2E` uses the same binary variables for 18 embedded-protection
-scenarios. The official `insert` command creates ZIP, ZIP64 and 7z protection;
+`TestPar3InsideE2E` uses the same binary variables for embedded-protection
+scenarios, including large packet gaps and renamed or obfuscated carriers. The official `insert` command creates ZIP, ZIP64 and 7z protection;
 installed `7zz` creates only the uncompressed 7z fixture. The harness records
 reference arguments and executable, original archive, inserted archive and member
 hashes. Clean, corrupt-body, corrupt-header, interior missing-article,
@@ -81,8 +83,8 @@ Successful cases require native PAR3 authentication, byte-exact extraction and
 healthy history. Insufficient recovery must fail without publishing a member.
 The engine stages explicit carrier replacement, preserves available authenticated
 packets, and requests no extra parity merely to restore protection completeness.
-This suite does not establish embedded restart, renamed placement or large
-damaged-framing coverage; those remain separate MVP gates.
+The large ZIP/ZIP64 cases cover damaged framing and packet gaps beyond a small
+footer probe. Embedded restart and name-transaction crashes have separate suites.
 
 ```sh
 WEAVER_PAR3_E2E_BIN=/absolute/path/to/weaver \
@@ -98,10 +100,11 @@ and no recovery downloads for the FFT set when only Cauchy input is damaged.
 Clean cases must avoid recovery downloads. A cohort-deficit case must refuse
 delivery even when other cohorts have surplus recovery. Both 65,538-block cases
 pass with Weaver's approved 128 MiB per-session retained ceiling; the shared
-process-wide engine budget remains 256 MiB. The full native matrix passes all
-142 cases. This is correctness evidence, not completed performance acceptance.
+process-wide engine budget remains 256 MiB. Donor cases cover damaged/shifted
+Cauchy, FFT and packed tails, parity-free aliases, nested paths and Data-only
+NZB-absent outputs. These are correctness checks, not performance acceptance.
 
-`TestPar3RestartE2E` owns two successive processes over its isolated SQLite state.
+`TestPar3RestartE2E` owns two successive processes over its isolated datastore.
 It stops while recovery is blocked, changes a completed source on disk, resumes,
 and requires byte-exact repair with no completed-source refetch. This tests fresh
 verification after restart, not durable evidence replay.
@@ -150,6 +153,38 @@ recorded alongside the PAR3 reference provenance.
 go test -mod=readonly ./internal/weaver -run '^TestPar3MixedE2E$' -count=1 -v -timeout 8m
 ```
 
-Embedded protection, durable evidence replay, both datastores and performance
-acceptance remain tracked in
-`docs/par3-integration-plan.md` at the repository root.
+`TestPar3OutputRestartE2E` reconstructs an output absent from the NZB, changes
+it while stopped, then requires fresh repair after restoring its durable ownership.
+`TestPar3InsideRestartE2E` does the equivalent for ZIP, ZIP64 and 7z, preserving
+one warning per actual embedded replacement.
+
+`TestPar3NameRestartE2E` crashes after durable rename intent, atomic move and
+identity commit. Payloads, case-only filenames and embedded ZIP/ZIP64/7z must
+resume with correct output names and extraction, without refetching clean parity.
+The directory move requires no hard links or clean-payload copying.
+
+`TestPar3ConcurrentE2E` holds one job's Cauchy recovery while separate FFT and
+Data-only jobs finish. Releasing recovery then completes the first job, with
+byte-exact output and healthy history for all three.
+
+To run the native matrix, supply the binaries above and include the existing
+PAR2 regression binary variable:
+
+```sh
+WEAVER_DIRECT_UNPACK_E2E_BIN=/absolute/path/to/weaver \
+  go test -mod=readonly ./internal/weaver \
+  -run '^Test(Par3(Archive|Geometry|Mixed|DirectRestart|OutputRestart|Restart|Inside|InsideRestart|NameRestart|Concurrent)?E2E|DirectUnpackE2E)$' \
+  -count=1 -v -timeout 20m
+```
+
+For PostgreSQL, explicitly set `WEAVER_NATIVE_E2E_POSTGRES_URL` to a disposable,
+operator-approved PostgreSQL fixture on a literal loopback IP, with permission
+to create databases. Each native test root gets a unique database; restarts reuse
+that database, and test cleanup drops only that database after stopping its
+processes. Never point this variable at an application database. The harness
+neither starts nor removes a container and reuses the repository's existing Go
+PostgreSQL driver. Run the same commands to select PostgreSQL; omit the variable
+to select SQLite.
+
+The current validation record, unavailable platform environments and outstanding
+optimized performance acceptance are in `docs/par3-integration-plan.md`.

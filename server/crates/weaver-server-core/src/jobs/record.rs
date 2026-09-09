@@ -32,6 +32,8 @@ pub enum FileIdentitySource {
     Probe,
     Par2,
     Par3,
+    /// A durable move intent: current_filename is the old path and canonical_filename the target.
+    Par3Pending,
     Nested,
 }
 
@@ -42,6 +44,7 @@ impl FileIdentitySource {
             Self::Probe => "probe",
             Self::Par2 => "par2",
             Self::Par3 => "par3",
+            Self::Par3Pending => "par3_pending",
             Self::Nested => "nested",
         }
     }
@@ -52,6 +55,7 @@ impl FileIdentitySource {
             "probe" => Some(Self::Probe),
             "par2" => Some(Self::Par2),
             "par3" => Some(Self::Par3),
+            "par3_pending" => Some(Self::Par3Pending),
             "nested" => Some(Self::Nested),
             _ => None,
         }

@@ -130,6 +130,7 @@ struct JobSlot {
     runtime: Option<Par3Job>,
     sources: PublishedSources,
     epoch: u64,
+    last_used: u64,
     known: BTreeMap<SourceId, KnownSource>,
     dirty: std::collections::BTreeSet<SourceId>,
     pending: BTreeMap<WorkKey, QueuedInput>,
@@ -148,6 +149,7 @@ impl Default for JobSlot {
             sources: runtime.sources.clone(),
             runtime: Some(runtime),
             epoch: 0,
+            last_used: 0,
             known: BTreeMap::new(),
             dirty: std::collections::BTreeSet::new(),
             pending: BTreeMap::new(),
@@ -209,7 +211,14 @@ impl Coordinator {
         self.jobs
             .get(&job_id)
             .and_then(|job| job.runtime.as_ref())
-            .map_or(0, |runtime| runtime.sets.len())
+            .map_or(0, |runtime| {
+                runtime.sets.len()
+                    + runtime
+                        .dormant_views
+                        .keys()
+                        .filter(|id| !runtime.sets.contains_key(id))
+                        .count()
+            })
     }
 
     pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
@@ -609,8 +618,13 @@ impl Coordinator {
             })
             .and_then(|job| job.runtime.as_ref())
             .into_iter()
-            .flat_map(|runtime| runtime.sets.iter())
-            .filter_map(|(&id, set)| set.view.as_ref().map(|view| (id, view)))
+            .flat_map(|runtime| {
+                runtime
+                    .sets
+                    .iter()
+                    .filter_map(|(&id, set)| set.view.as_ref().map(|view| (id, view)))
+                    .chain(runtime.dormant_views.iter().map(|(&id, view)| (id, view)))
+            })
     }
 
     #[cfg(test)]
@@ -722,6 +736,61 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Reclaim the least recently used recovery-waiting sessions before
+    /// admitting another work unit. PAR2 budgets and policy are independent.
+    fn evict_idle_sessions(&mut self, protected: JobId, headroom: usize) {
+        let Some(memory) = self
+            .jobs
+            .get(&protected)
+            .and_then(|job| job.runtime.as_ref())
+            .map(|runtime| runtime.options.memory.clone())
+        else {
+            return;
+        };
+        while memory.available() < headroom {
+            let victim = self
+                .jobs
+                .iter()
+                .filter(|(id, job)| {
+                    **id != protected
+                        && job.ticket.is_none()
+                        && !job.installing
+                        && job.pending.is_empty()
+                        && job.dirty.is_empty()
+                        && job.errors.is_empty()
+                        && job.completed_repair.is_none()
+                        && job.completed_readback.is_none()
+                        && job.runtime.as_ref().is_some_and(|runtime| {
+                            !runtime.sets.is_empty()
+                                && runtime.name_search.source().is_none()
+                                && runtime.sets.values().all(|set| {
+                                    set.view.as_ref().is_some_and(|view| {
+                                        view.status == par3_rs::session::RepairStatus::NeedRecovery
+                                    })
+                                })
+                        })
+                })
+                .min_by_key(|(id, job)| (job.last_used, **id))
+                .map(|(&id, _)| id);
+            let Some(victim) = victim else {
+                break;
+            };
+            let before = memory.used();
+            self.jobs
+                .get_mut(&victim)
+                .expect("idle victim")
+                .runtime
+                .as_mut()
+                .expect("retained idle runtime")
+                .evict_native_sessions();
+            tracing::debug!(
+                job_id = victim.0,
+                released_bytes = before.saturating_sub(memory.used()),
+                "evicted idle PAR3 sessions; current arrivals will reopen native analysis"
+            );
+        }
+    }
+
     pub(super) fn dispatch(&mut self) -> EngineResult<()> {
         if !self.in_flight.is_empty() {
             return Ok(());
@@ -744,6 +813,7 @@ impl Coordinator {
         let Some(job_id) = next else {
             return Ok(());
         };
+        self.evict_idle_sessions(job_id, 128 << 20);
         let job = self.jobs.get_mut(&job_id).expect("selected ready job");
         let ticket = self
             .next_ticket
@@ -754,6 +824,9 @@ impl Coordinator {
                 "PAR3 session already owned by a worker",
             ));
         };
+        if !runtime.dormant_views.is_empty() {
+            job.verification = None;
+        }
         self.next_ticket = ticket;
         self.last_job = Some(job_id);
         let (key, input) = if job.installing {
@@ -944,6 +1017,7 @@ impl Coordinator {
             return None;
         }
         job.ticket = None;
+        job.last_used = done.ticket;
         let mut runtime = done.runtime.unwrap_or_default();
         if done.epoch != job.epoch {
             // A write raced this operation. Keep capacity until this handback,

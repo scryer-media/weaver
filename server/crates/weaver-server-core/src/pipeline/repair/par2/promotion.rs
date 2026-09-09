@@ -1162,17 +1162,21 @@ impl Pipeline {
             let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
                 state.assembly.optional_recovery_bytes();
             let health = health_milli(total, state.failed_bytes);
+            let native_verifying = self.show_par3_verification_wait(state.job_id);
+            let status = if native_verifying {
+                JobStatus::Verifying
+            } else {
+                state.status.clone()
+            };
             let (mut download_state, post_state, run_state) =
-                crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
+                crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
             let has_current_download_activity =
                 self.job_has_current_download_activity(state.job_id);
             if matches!(download_state, crate::jobs::model::DownloadState::Complete)
                 && has_current_download_activity
             {
                 download_state = crate::jobs::model::DownloadState::Downloading;
-            } else if matches!(state.status, JobStatus::Downloading)
-                && !has_current_download_activity
-            {
+            } else if matches!(status, JobStatus::Downloading) && !has_current_download_activity {
                 download_state = crate::jobs::model::DownloadState::Queued;
             }
             let remaining_par_files = state
@@ -1200,10 +1204,12 @@ impl Pipeline {
                 },
                 download_wait_reason: download_wait.map(|wait| wait.reason.to_owned()),
                 download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
-                status: state.status.clone(),
+                status,
                 download_state,
-                finalizing_download: self.jobs_finalizing_download.contains(&state.job_id),
-                fetching_repair_data: jobs_fetching_repair_data.contains(&state.job_id),
+                finalizing_download: !native_verifying
+                    && self.jobs_finalizing_download.contains(&state.job_id),
+                fetching_repair_data: !native_verifying
+                    && jobs_fetching_repair_data.contains(&state.job_id),
                 post_state,
                 run_state,
                 progress: Self::effective_progress(state),

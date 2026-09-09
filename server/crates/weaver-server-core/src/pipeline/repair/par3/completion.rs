@@ -6,6 +6,19 @@ use par3_rs::session::RepairStatus;
 use par3_rs::session_repair::InstalledFile;
 
 impl Pipeline {
+    /// Read-only presentation of a drained download awaiting native work.
+    /// Scheduler phases retain their own transition and completion contracts.
+    pub(in crate::pipeline) fn show_par3_verification_wait(&self, job_id: JobId) -> bool {
+        self.par3_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.has_work(job_id))
+            && self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| matches!(state.status, JobStatus::Downloading))
+            && !self.job_has_pending_download_pipeline_work(job_id)
+    }
+
     /// Return true when PAR3 owns the next completion step. PAR2 keeps its
     /// existing first opportunity when a job has a usable PAR2 set.
     pub(in crate::pipeline) async fn check_par3_completion(&mut self, job_id: JobId) -> bool {
