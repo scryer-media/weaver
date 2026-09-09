@@ -179,6 +179,44 @@ fn member_bytes_written(spans: &[RoutedSpan]) -> u64 {
         .sum()
 }
 
+#[tokio::test]
+async fn cipher_edge_plans_refuse_before_exceeding_the_request_budget() {
+    let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        REPAIR_MEMBER,
+        &payload,
+        2,
+        REPAIR_PASSWORD,
+        Some(REPAIR_PASSWORD),
+        true,
+    );
+    let mut router = encrypted_router(&volumes, REPAIR_PASSWORD);
+    route_all(&mut router, &volumes);
+    let expected = router.cipher_edge_reads(1);
+    assert!(
+        !expected.is_empty(),
+        "the split member needs its predecessor"
+    );
+    assert!(
+        expected
+            .iter()
+            .all(|(volume, _, len)| *volume == 0 && *len <= 31)
+    );
+    assert!(
+        router
+            .cipher_edge_reads_bounded(1, expected.len() - 1)
+            .is_none()
+    );
+    assert_eq!(
+        router.cipher_edge_reads_bounded(1, expected.len()),
+        Some(expected)
+    );
+    assert!(
+        router.all_members_verified(),
+        "planning cannot mutate the router"
+    );
+}
+
 /// A repaired span in the middle of a member's part must route back in.
 ///
 /// PAR2 rebuilt these very cipher bytes, so the composition that describes them

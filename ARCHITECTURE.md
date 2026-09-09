@@ -377,12 +377,13 @@ Conventional PAR3 completion requests individual recovery articles and dispatche
 staged repairs. Verified installed files reconcile assembly and persistence without
 translating PAR3 fingerprints into PAR2 MD5. PAR3 reads direct volume images through
 a separately bounded reader, retaining cipher frontiers and checking backing
-generations. Direct finalization waits for verification. Live plain direct sets
-receive verified installed outputs in bounded, generation-checked readback tickets;
-coverage is admitted after placement and conventional completed-file rows are
-suppressed for those virtual sources. Encrypted direct repair still uses the
-existing demotion barrier. Multi-volume repair coordination, shared mutation
-views and restart evidence remain under integration. The implementation
+generations. Direct finalization waits for verification. Live direct sets receive
+a single damaged volume's verified output in bounded, generation-checked
+readback tickets. Encrypted readback captures neighbour CBC edges before shared
+partials change. Coverage is admitted after placement and conventional
+completed-file rows are suppressed for those virtual sources. Multiple damaged
+volumes and earlier archive-checksum demotions still use conventional repair.
+Shared mutation views and restart evidence remain under integration. The implementation
 record and remaining acceptance gates live in
 [the PAR3 integration plan](docs/par3-integration-plan.md).
 

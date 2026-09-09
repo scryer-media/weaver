@@ -64,10 +64,11 @@ PAR3 can now read direct-store volume images, including encrypted members,
 without materializing clean archives. One bounded reader per job retains the
 cipher frontier; backing snapshots fence shared partial files before writes.
 Metadata, held-file pins, temporary buffers and open readers carry resource
-leases. Direct finalization waits for PAR3 verification. Live plain direct sets
-now receive verified repair outputs through bounded readback tickets. Encrypted
-sets still cross the reconstruction barrier; archive checksum failures that
-already demoted a set continue through conventional repair.
+leases. Direct finalization waits for PAR3 verification. Live direct sets now
+receive a single damaged volume's verified repair output through bounded
+readback tickets, including encrypted members. Several damaged volumes still
+cross the reconstruction barrier, as do archive checksum failures that demote
+before native repair can run.
 
 Repair read-back now has a codec-independent file-range boundary that preserves
 I/O errors and can return bounded stripes with their CBC edge bytes. The PAR2
@@ -117,8 +118,24 @@ adjustment. All 22 native PAR3 E2E cases and 54 existing PAR2 archive E2E cases
 pass. The missing plain RAR test now requires direct finalization without demotion.
 Formatting, all-target/all-feature workspace Clippy and three doctests pass.
 
+Encrypted readback captures all cross-volume CBC edges before the first stripe
+can rewrite a shared partial. Verified installed neighbours take precedence over
+old virtual sources. At most 4,096 edge requests share a 1 MiB host reservation;
+the router refuses excess requests before building the list. Same-volume CBC
+edges accompany each stripe under its existing memory/handle lease. An edge
+hole or changed source refuses before placement, and a failed preflight cannot
+be resumed as though its drained requests succeeded. The native encrypted
+missing-article scenario now requires direct finalization without demotion.
+Encrypted-readback validation: all 3,824 workspace Nextest tests pass (13 existing
+skips), including all 401 direct-store/readback regressions. Formatting,
+all-target/all-feature workspace Clippy, all three doctests, the 22 existing
+native PAR3 scenarios and 54 PAR2 archive scenarios pass. This remains within
+the existing unreleased 0.11.3 version. Terminal PAR3 health accounting is a
+separate remaining defect: the new assertion exposes a successful conventional
+repair retaining its recovered article's failure contribution.
+
 Still pending: incremental decode-to-publication wiring, mixed-format fallback,
-encrypted and multi-damage selective direct-store repair, positioned verification,
+multi-damage selective direct-store repair and archive-damage deferral, positioned verification,
 embedded archives, evidence persistence and product surfaces. Rebuilt files currently
 receive a verification read when republished; clean native evidence is retained.
 PAR3 repairs conservatively retire extraction chases until a PAR3 mutation view

@@ -2651,8 +2651,19 @@ impl DirectSetRouter {
     /// from the neighbour's own destination reproduces exactly what was posted)
     /// and hands back to [`Self::route_repaired`] as unrepaired lead-in.
     pub(crate) fn cipher_edge_reads(&self, volume_index: u32) -> Vec<(u32, u64, u64)> {
+        self.cipher_edge_reads_bounded(volume_index, usize::MAX)
+            .expect("unbounded edge plan")
+    }
+
+    /// Refuse before allocating more than `limit` edge requests. The caller
+    /// reserves their metadata and bytes before requesting this plan.
+    pub(crate) fn cipher_edge_reads_bounded(
+        &self,
+        volume_index: u32,
+        limit: usize,
+    ) -> Option<Vec<(u32, u64, u64)>> {
         let mut reads = Vec::new();
-        for extent in self.volume_member_extents(volume_index) {
+        for extent in self.routed_extents.get(&volume_index).into_iter().flatten() {
             let Some(member) = self.members.get(&extent.member_id) else {
                 continue;
             };
@@ -2672,46 +2683,31 @@ impl DirectSetRouter {
                 if from >= to {
                     continue;
                 }
-                reads.extend(self.locate_member_cipher(extent.member_id, from, to - from));
-            }
-        }
-        reads.retain(|(volume, _, _)| *volume != volume_index);
-        reads
-    }
-
-    /// Where a member-logical (== cipher) range physically lives, as
-    /// `(volume, physical offset, length)` per volume it crosses.
-    ///
-    /// Read off the **routed extent history** rather than the layout's part
-    /// table, for the same reason: the history is what the destinations
-    /// actually are, and a member that turned ineligible after routing would
-    /// otherwise map its own bytes to the envelope.
-    fn locate_member_cipher(
-        &self,
-        member_id: u32,
-        logical_offset: u64,
-        len: u64,
-    ) -> Vec<(u32, u64, u64)> {
-        let end = logical_offset.saturating_add(len);
-        let mut found = Vec::new();
-        for (volume, extents) in &self.routed_extents {
-            for extent in extents {
-                if extent.member_id != member_id {
-                    continue;
-                }
-                let extent_end = extent.logical_offset.saturating_add(extent.len);
-                let from = logical_offset.max(extent.logical_offset);
-                let to = end.min(extent_end);
-                if from < to {
-                    found.push((
-                        *volume,
-                        extent.physical_offset + (from - extent.logical_offset),
-                        to - from,
-                    ));
+                for (volume, extents) in &self.routed_extents {
+                    if *volume == volume_index {
+                        continue;
+                    }
+                    for candidate in extents
+                        .iter()
+                        .filter(|candidate| candidate.member_id == extent.member_id)
+                    {
+                        let begin = from.max(candidate.logical_offset);
+                        let end = to.min(candidate.logical_offset.saturating_add(candidate.len));
+                        if begin < end {
+                            if reads.len() == limit {
+                                return None;
+                            }
+                            reads.push((
+                                *volume,
+                                candidate.physical_offset + (begin - candidate.logical_offset),
+                                end - begin,
+                            ));
+                        }
+                    }
                 }
             }
         }
-        found
+        Some(reads)
     }
 
     /// Whether some encrypted member this set has **routed bytes for** cannot

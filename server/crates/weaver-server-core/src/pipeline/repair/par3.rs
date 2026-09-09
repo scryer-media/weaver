@@ -491,7 +491,20 @@ impl Pipeline {
             .filter(|(id, _)| *id == input_set)
             .flat_map(|(_, view)| view.files.iter())
             .filter(|file| !file.complete)
-            .filter_map(|file| file.source.and_then(|source| u32::try_from(source.0).ok()))
+            .filter_map(|file| {
+                file.source
+                    .and_then(|source| u32::try_from(source.0).ok())
+                    .or_else(|| {
+                        self.jobs
+                            .get(&job_id)?
+                            .assembly
+                            .files()
+                            .find(|candidate| {
+                                self.current_filename_for_file(job_id, candidate) == file.path
+                            })
+                            .map(|candidate| candidate.file_id().file_index)
+                    })
+            })
             .collect();
         let sets: Vec<_> = self
             .direct_store
@@ -499,20 +512,22 @@ impl Pipeline {
             .iter()
             .enumerate()
             .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
-            .filter(|(_, set)| set.router.routes_encrypted())
             .filter(|(_, set)| {
                 set.plan()
                     .volumes
                     .values()
-                    .any(|file| damaged.contains(file))
+                    .filter(|file| damaged.contains(file))
+                    .take(2)
+                    .count()
+                    > 1
             })
             .map(|(index, _)| index)
             .collect();
         if sets.is_empty() {
             return false;
         }
-        // Encrypted cross-volume edges still require the conventional repair
-        // barrier. Plain direct sets receive verified output in bounded stripes.
+        // Several damaged volumes still need a set-wide replacement boundary.
+        // A single damaged volume, plain or encrypted, receives bounded stripes.
         for index in sets {
             self.invalidate_par3_direct_set(job_id, index);
             self.demote_direct_set(

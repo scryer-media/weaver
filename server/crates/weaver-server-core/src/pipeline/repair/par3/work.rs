@@ -625,8 +625,8 @@ impl Coordinator {
             let result = tokio::task::spawn_blocking(move || {
                 // Keep the queue lease live while the worker owns its input;
                 // successful publication transfers it into retained state.
-                if let PendingInput::Readback(installation) = input.input {
-                    let result = installation.read(&runtime.options);
+                if let PendingInput::Readback(mut installation) = input.input {
+                    let result = installation.read(&runtime.sources, &runtime.options);
                     return (
                         runtime,
                         Ok(WorkOutput::Readback(readback::ReadbackDone {

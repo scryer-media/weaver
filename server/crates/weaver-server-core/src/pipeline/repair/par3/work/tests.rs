@@ -354,10 +354,15 @@ fn readback_installation(path: PathBuf, options: &ExecutionOptions) -> Box<readb
             set: 0,
             volume: 0,
             output: 0,
+            cipher: false,
+            edges: Vec::new(),
         }],
         current: 0,
         offset: 0,
         crc32: 0,
+        edge_reads: Vec::new(),
+        preflight_failed: false,
+        _edge_reservation: None,
     })
 }
 

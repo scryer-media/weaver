@@ -5,6 +5,19 @@ use crate::pipeline::direct_store::repair::{RepairedSpan, read_repaired_range};
 
 pub(super) const STRIPE_BYTES: u64 = 256 * 1024;
 pub(super) const STRIPE_RESERVATION: usize = 2 * STRIPE_BYTES as usize + 4096;
+const MAX_EDGES: usize = 4096;
+const EDGE_RESERVATION: usize = MAX_EDGES * 256;
+
+type CipherEdge = (u32, u64, Arc<[u8]>);
+
+pub(super) struct EdgeRead {
+    target: usize,
+    source: SourceId,
+    volume: u32,
+    offset: u64,
+    len: u64,
+    output: Option<usize>,
+}
 
 pub(super) struct VerifiedOutput {
     pub path: PathBuf,
@@ -44,6 +57,7 @@ impl VerifiedOutput {
         &self,
         volume: u32,
         offset: u64,
+        cipher_edges: bool,
         options: &ExecutionOptions,
     ) -> EngineResult<RepairedSpan> {
         options.cancel.check()?;
@@ -58,7 +72,7 @@ impl VerifiedOutput {
         // before the final snapshot, which may need its own handle on Windows.
         let span = {
             let _handle = options.handles.acquire()?;
-            read_repaired_range(&self.path, volume, self.len, offset..end, false)?
+            read_repaired_range(&self.path, volume, self.len, offset..end, cipher_edges)?
                 .ok_or(EngineError::InvalidState("empty PAR3 readback stripe"))?
         };
         options.cancel.check()?;
@@ -72,6 +86,8 @@ pub(super) struct Target {
     pub set: usize,
     pub volume: u32,
     pub output: usize,
+    pub cipher: bool,
+    pub edges: Vec<CipherEdge>,
 }
 
 pub(super) struct Installation {
@@ -80,17 +96,94 @@ pub(super) struct Installation {
     pub current: usize,
     pub offset: u64,
     pub crc32: u32,
+    pub edge_reads: Vec<EdgeRead>,
+    pub preflight_failed: bool,
+    pub _edge_reservation: Option<assessment::ViewReservation>,
 }
 
 impl Installation {
-    pub fn read(&self, options: &ExecutionOptions) -> EngineResult<RepairedSpan> {
+    pub fn read(
+        &mut self,
+        sources: &PublishedSources,
+        options: &ExecutionOptions,
+    ) -> EngineResult<RepairedSpan> {
+        if self.preflight_failed {
+            return Err(EngineError::InvalidState(
+                "PAR3 cipher preflight previously failed",
+            ));
+        }
+        self.preflight_failed = true;
+        // Capture every neighbour before any stripe changes a shared partial.
+        // A repaired neighbour comes from its verified installed image; an
+        // untouched neighbour comes from the retained, budgeted virtual source.
+        let outputs = self
+            .completion
+            .outputs
+            .as_ref()
+            .map_err(|_| EngineError::InvalidState("PAR3 installed output was not captured"))?;
+        for read in self.edge_reads.drain(..) {
+            options.cancel.check()?;
+            if read.len == 0 || read.len > 31 {
+                return Err(EngineError::InvalidState("invalid PAR3 cipher edge"));
+            }
+            let mut bytes = vec![0; read.len as usize];
+            if let Some(output) = read.output {
+                let image = &outputs[output];
+                image.check()?;
+                let mut filled = 0;
+                while filled < bytes.len() {
+                    let n = image.access.read_at(
+                        SourceId(0),
+                        read.offset + filled as u64,
+                        &mut bytes[filled..],
+                    )?;
+                    if n == 0 {
+                        return Err(EngineError::Unavailable {
+                            source_id: read.source,
+                            offset: read.offset + filled as u64,
+                        });
+                    }
+                    filled += n;
+                }
+                image.check()?;
+            } else {
+                let before = sources
+                    .snapshot(read.source)?
+                    .ok_or(EngineError::Unavailable {
+                        source_id: read.source,
+                        offset: read.offset,
+                    })?;
+                let mut filled = 0;
+                while filled < bytes.len() {
+                    let n = sources.read_at(
+                        read.source,
+                        read.offset + filled as u64,
+                        &mut bytes[filled..],
+                    )?;
+                    if n == 0 {
+                        return Err(EngineError::Unavailable {
+                            source_id: read.source,
+                            offset: read.offset + filled as u64,
+                        });
+                    }
+                    filled += n;
+                }
+                if sources.snapshot(read.source)? != Some(before) {
+                    return Err(EngineError::SourceChanged(read.source));
+                }
+            }
+            self.targets[read.target]
+                .edges
+                .push((read.volume, read.offset, Arc::from(bytes)));
+        }
+        self.preflight_failed = false;
         let target = &self.targets[self.current];
         self.completion
             .outputs
             .as_ref()
             .map_err(|_| EngineError::InvalidState("PAR3 installed output was not captured"))?
             [target.output]
-            .stripe(target.volume, self.offset, options)
+            .stripe(target.volume, self.offset, target.cipher, options)
     }
 }
 
@@ -148,6 +241,8 @@ impl Pipeline {
                         .volume_for_file(file.file_id().file_index)
                         .expect("matched volume"),
                     output,
+                    cipher: set.router.routes_encrypted(),
+                    edges: Vec::new(),
                 });
             }
         }
@@ -156,12 +251,65 @@ impl Pipeline {
             return;
         }
         targets.sort_by_key(|target| (target.set, target.volume));
+        let edge_reservation = if targets.iter().any(|target| target.cipher) {
+            match assessment::ViewReservation::acquire(EDGE_RESERVATION) {
+                Ok(reservation) => Some(reservation),
+                Err(error) => {
+                    self.fail_job(job_id, error.to_string());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let mut edge_reads = Vec::new();
+        for (index, target) in targets
+            .iter()
+            .enumerate()
+            .filter(|(_, target)| target.cipher)
+        {
+            let set = self
+                .direct_store
+                .set(job_id, target.set)
+                .expect("matched set");
+            let Some(reads) = set
+                .router
+                .cipher_edge_reads_bounded(target.volume, MAX_EDGES - edge_reads.len())
+            else {
+                self.fail_job(
+                    job_id,
+                    "PAR3 cipher edge plan exceeds the host budget".into(),
+                );
+                return;
+            };
+            for (volume, offset, len) in reads {
+                let Some(file) = set.plan().volumes.get(&volume) else {
+                    self.fail_job(job_id, "PAR3 cipher neighbour has no job binding".into());
+                    return;
+                };
+                let output = targets
+                    .iter()
+                    .find(|target| target.file.file_index == *file)
+                    .map(|target| target.output);
+                edge_reads.push(EdgeRead {
+                    target: index,
+                    source: SourceId(u64::from(*file)),
+                    volume,
+                    offset,
+                    len,
+                    output,
+                });
+            }
+        }
         let installation = Box::new(Installation {
             completion,
             targets,
             current: 0,
             offset: 0,
             crc32: 0,
+            edge_reads,
+            preflight_failed: false,
+            _edge_reservation: edge_reservation,
         });
         if let Err(error) = self
             .par3_runtime
@@ -239,8 +387,15 @@ impl Pipeline {
         }
         let end = installation.offset + span.len;
         let finish = end == len;
+        let mut lead_in = target.edges.clone();
+        lead_in.extend(
+            [span.lead_in.clone(), span.lead_out.clone()]
+                .into_iter()
+                .flatten()
+                .map(|(offset, bytes)| (volume, offset, bytes)),
+        );
         let routed = set
-            .route_repaired_batch(volume, &span.chunks, &[], finish)
+            .route_repaired_batch(volume, &span.chunks, &lead_in, finish)
             .map_err(|reason| format!("PAR3 direct routing failed: {}", reason.metric()))?;
         self.try_place_direct_spans(job_id, set_index, &routed)
             .await
@@ -322,7 +477,7 @@ mod tests {
         let mut crc = 0;
         let mut stripes = 0;
         while offset < image.len {
-            let span = image.stripe(3, offset, &options).unwrap();
+            let span = image.stripe(3, offset, false, &options).unwrap();
             assert_eq!(span.volume_index, 3);
             assert_eq!(span.source_offset, offset);
             assert!(span.len <= STRIPE_BYTES);
@@ -339,7 +494,7 @@ mod tests {
         assert_eq!(stripes, 3);
         assert_eq!(crc, par2_rs::checksum::crc32(&bytes));
         assert!(matches!(
-            image.stripe(3, offset, &options),
+            image.stripe(3, offset, false, &options),
             Err(EngineError::InvalidState(_))
         ));
         // Every stripe released its handle, including the rejected cursor.
@@ -357,13 +512,13 @@ mod tests {
         std::fs::write(&replacement, b"modified").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         assert!(matches!(
-            image.stripe(0, 0, &options),
+            image.stripe(0, 0, false, &options),
             Err(EngineError::SourceChanged(_))
         ));
         let image = VerifiedOutput::capture(path, 8, &options).unwrap();
         options.cancel.cancel();
         assert!(matches!(
-            image.stripe(0, 0, &options),
+            image.stripe(0, 0, false, &options),
             Err(EngineError::Cancelled)
         ));
     }
@@ -382,10 +537,134 @@ mod tests {
         let image = VerifiedOutput::capture(path, 5, &options).unwrap();
         let handle = options.handles.acquire().unwrap();
         assert!(matches!(
-            image.stripe(0, 0, &options),
+            image.stripe(0, 0, false, &options),
             Err(EngineError::ResourceLimit(_))
         ));
         drop(handle);
-        assert_eq!(image.stripe(0, 0, &options).unwrap().len, 5);
+        assert_eq!(image.stripe(0, 0, false, &options).unwrap().len, 5);
+    }
+    fn encrypted_installation(root: &std::path::Path, options: &ExecutionOptions) -> Installation {
+        let path = root.join("repaired.rar");
+        std::fs::write(&path, vec![19; STRIPE_BYTES as usize + 17]).unwrap();
+        Installation {
+            completion: work::RepairCompletion {
+                result: Ok(Default::default()),
+                outputs: Ok(vec![
+                    VerifiedOutput::capture(path, STRIPE_BYTES + 17, options).unwrap(),
+                ]),
+                _reservation: Some(assessment::ViewReservation::acquire(4096).unwrap()),
+            },
+            targets: vec![Target {
+                file: NzbFileId {
+                    job_id: JobId(1),
+                    file_index: 0,
+                },
+                set: 0,
+                volume: 0,
+                output: 0,
+                cipher: true,
+                edges: Vec::new(),
+            }],
+            current: 0,
+            offset: 0,
+            crc32: 0,
+            edge_reads: vec![EdgeRead {
+                target: 0,
+                source: SourceId(1),
+                volume: 1,
+                offset: 3,
+                len: 31,
+                output: None,
+            }],
+            preflight_failed: false,
+            _edge_reservation: Some(
+                assessment::ViewReservation::acquire(EDGE_RESERVATION).unwrap(),
+            ),
+        }
+    }
+
+    #[test]
+    fn cipher_edges_are_captured_before_shared_backings_change() {
+        let root = tempfile::tempdir().unwrap();
+        let options = execution_options();
+        let mut installation = encrypted_installation(root.path(), &options);
+        let neighbour = root.path().join("neighbour");
+        let original: Vec<u8> = (0..64).collect();
+        std::fs::write(&neighbour, &original).unwrap();
+        let sources = PublishedSources::default();
+        sources
+            .replace(
+                SourceId(1),
+                disk_source(SourceId(1), neighbour.clone(), &options).unwrap(),
+                64,
+                std::iter::once(0..64).collect(),
+            )
+            .unwrap();
+        let first = installation.read(&sources, &options).unwrap();
+        assert_eq!(first.len, STRIPE_BYTES);
+        assert_eq!(&*installation.targets[0].edges[0].2, &original[3..34]);
+        assert_eq!(first.lead_out.as_ref().unwrap().1.len(), 16);
+        sources.withdraw(SourceId(1)).unwrap();
+        std::fs::write(neighbour, [0; 64]).unwrap();
+        installation.offset = STRIPE_BYTES;
+        let last = installation.read(&sources, &options).unwrap();
+        assert_eq!(last.len, 17);
+        assert_eq!(last.lead_in.as_ref().unwrap().1.len(), 32);
+        assert_eq!(installation.targets[0].edges.len(), 1);
+        assert_eq!(&*installation.targets[0].edges[0].2, &original[3..34]);
+    }
+
+    #[test]
+    fn cipher_edge_uses_verified_repaired_neighbour_instead_of_old_source() {
+        let root = tempfile::tempdir().unwrap();
+        let options = execution_options();
+        let mut installation = encrypted_installation(root.path(), &options);
+        let neighbour = root.path().join("repaired-neighbour");
+        std::fs::write(&neighbour, [23; 64]).unwrap();
+        installation
+            .completion
+            .outputs
+            .as_mut()
+            .unwrap()
+            .push(VerifiedOutput::capture(neighbour, 64, &options).unwrap());
+        installation.edge_reads[0].output = Some(1);
+        // No old source exists at all: only the verified output can answer.
+        installation
+            .read(&PublishedSources::default(), &options)
+            .unwrap();
+        assert_eq!(&*installation.targets[0].edges[0].2, &[23; 31]);
+    }
+
+    #[test]
+    fn unavailable_cipher_edge_refuses_before_returning_any_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let options = execution_options();
+        let mut installation = encrypted_installation(root.path(), &options);
+        let neighbour = root.path().join("neighbour");
+        std::fs::write(&neighbour, [1; 64]).unwrap();
+        let sources = PublishedSources::default();
+        sources
+            .replace(
+                SourceId(1),
+                disk_source(SourceId(1), neighbour, &options).unwrap(),
+                64,
+                vec![0..10, 20..64],
+            )
+            .unwrap();
+        assert!(matches!(
+            installation.read(&sources, &options),
+            Err(EngineError::Unavailable {
+                source_id: SourceId(1),
+                offset: 10
+            })
+        ));
+        assert!(installation.targets[0].edges.is_empty());
+        assert_eq!(installation.offset, 0);
+        assert!(matches!(
+            installation.read(&sources, &options),
+            Err(EngineError::InvalidState(
+                "PAR3 cipher preflight previously failed"
+            ))
+        ));
     }
 }
