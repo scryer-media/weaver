@@ -68,6 +68,16 @@ leases. Direct finalization waits for PAR3 verification. Damaged archive groups
 currently demote through the existing reconstruction barrier before repair;
 selective routing of repaired volumes back into direct store remains pending.
 
+Repair read-back now has a codec-independent file-range boundary that preserves
+I/O errors and can return bounded stripes with their CBC edge bytes. The PAR2
+wrapper still supplies all of a volume's rewritten ranges to its existing
+router call. Whole-volume confirmation now checks actual `(start, end)` coverage;
+an overlapping range cannot inflate coverage over a hole or a missing tail.
+Streaming router transactions and their pipeline wiring remain pending. This
+fix uses the existing unreleased workspace version, 0.11.3.
+Validation: formatting, all-target/all-feature workspace Clippy, all 3,807
+workspace Nextest tests (13 existing skips), and all three doctests pass.
+
 Still pending: incremental decode-to-publication wiring, mixed-format fallback,
 selective direct-store repair, positioned verification,
 embedded archives, evidence persistence and product surfaces. Rebuilt files currently

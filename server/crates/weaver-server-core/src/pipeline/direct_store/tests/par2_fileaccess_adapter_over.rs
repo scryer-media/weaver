@@ -1335,6 +1335,54 @@ fn a_rewrite_widens_to_whole_articles_so_the_volume_composition_stays_exact() {
 }
 
 #[test]
+fn whole_volume_rewrite_requires_actual_end_to_end_ranges() {
+    use super::super::reconstruct::{PartialArticle, VolumeReconstruction};
+    use super::super::repair::DamagedDirectVolume;
+
+    let mut volume = DamagedDirectVolume {
+        volume_index: 0,
+        par2_file_id: par2_rs::FileId::from_bytes([9; 16]),
+        len: 300,
+        path: std::path::PathBuf::new(),
+        rewrite: Vec::new(),
+        reconstruction: VolumeReconstruction {
+            volume_index: 0,
+            path: std::path::PathBuf::new(),
+            len: 300,
+            assembly_complete: false,
+            covered: ByteRanges::new(),
+            crcs: CrcRuns::default(),
+            partial_article: PartialArticle::CarryThrough,
+        },
+    };
+    for ranges in [
+        vec![(0, 300)],
+        vec![(0, 100), (100, 200), (200, 300)],
+        vec![(0, 150), (100, 300)],
+    ] {
+        volume.rewrite = ranges;
+        assert!(volume.rewrote_whole_volume(), "{:?}", volume.rewrite);
+    }
+    for ranges in [
+        vec![],
+        vec![(0, 100), (100, 200)], // Missing tail; 200 is an end, not a length.
+        vec![(0, 100), (50, 100), (140, 300)], // An overlap cannot cover a hole.
+        vec![(1, 300)],
+        vec![(0, 200), (150, 300), (100, 200)], // Unsorted.
+        vec![(0, 300), (200, 100)],             // Reversed.
+        vec![(0, 0), (0, 300)],
+        vec![(0, 301)],
+        vec![(0, u64::MAX)],
+    ] {
+        volume.rewrite = ranges;
+        assert!(!volume.rewrote_whole_volume(), "{:?}", volume.rewrite);
+    }
+    volume.len = 0;
+    volume.rewrite = vec![(0, 0)];
+    assert!(!volume.rewrote_whole_volume());
+}
+
+#[test]
 fn an_encrypted_sets_read_back_carries_the_posted_bytes_on_both_sides_of_a_span() {
     use super::super::reconstruct::{PartialArticle, VolumeReconstruction};
     use super::super::repair::{DamagedDirectVolume, read_repaired_spans};
@@ -1395,6 +1443,102 @@ fn an_encrypted_sets_read_back_carries_the_posted_bytes_on_both_sides_of_a_span(
         span.len, 120,
         "neither edge is part of the span: they did not change, so they must \
          not rewrite the volume composition"
+    );
+}
+
+#[test]
+fn repaired_ranges_stream_exact_posted_bytes_and_cipher_edges() {
+    use super::super::repair::read_repaired_range;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("repaired-volume");
+    let image: Vec<u8> = (0..700_001).map(|index| (index % 251) as u8).collect();
+    std::fs::write(&path, &image).unwrap();
+    let len = image.len() as u64;
+    let mut combined = 0;
+    // Deliberately unaligned: the reader must return both halves of a CBC
+    // boundary without adding either edge to the stripe's CRC or coverage.
+    for start in (0..len).step_by(65_537) {
+        let end = (start + 65_537).min(len);
+        let span = read_repaired_range(&path, 7, len, start..end, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(span.volume_index, 7);
+        assert_eq!(span.source_offset, start);
+        assert_eq!(span.len, end - start);
+        assert_eq!(span.chunks.len(), 1);
+        assert_eq!(span.chunks[0].0, start);
+        assert_eq!(
+            span.chunks[0].1.as_ref(),
+            &image[start as usize..end as usize]
+        );
+        let mut retained = span.chunks[0].1.len();
+        if start == 0 {
+            assert!(span.lead_in.is_none());
+        } else {
+            let (offset, bytes) = span.lead_in.as_ref().unwrap();
+            assert_eq!(*offset, start.saturating_sub(32));
+            assert_eq!(bytes.as_ref(), &image[*offset as usize..start as usize]);
+            retained += bytes.len();
+        }
+        if end == len {
+            assert!(span.lead_out.is_none());
+        } else {
+            let (offset, bytes) = span.lead_out.as_ref().unwrap();
+            assert_eq!(*offset, end);
+            assert_eq!(
+                bytes.as_ref(),
+                &image[end as usize..(end + 16).min(len) as usize]
+            );
+            retained += bytes.len();
+        }
+        assert!(retained <= 65_537 + 48);
+        combined = weaver_yenc::crc32_combine(combined, span.crc32, span.len);
+    }
+    assert_eq!(combined, par2_rs::checksum::crc32(&image));
+    assert!(
+        read_repaired_range(&path, 7, len, len..len, true)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn repaired_range_refuses_invalid_geometry_and_preserves_io_errors() {
+    use super::super::repair::read_repaired_range;
+    use std::io::ErrorKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("repaired-volume");
+    let missing = read_repaired_range(&path, 0, 100, 0..100, false).unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::NotFound);
+    assert!(missing.raw_os_error().is_some());
+    for range in [
+        std::ops::Range { start: 20, end: 10 },
+        0..101,
+        100..u64::MAX,
+    ] {
+        // Refuse the geometry before touching even a missing file.
+        assert_eq!(
+            read_repaired_range(&path, 0, 100, range, true)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput,
+        );
+    }
+    std::fs::write(&path, [0; 99]).unwrap();
+    assert_eq!(
+        read_repaired_range(&path, 0, 100, 0..100, false)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::UnexpectedEof,
+    );
+    // A missing CBC edge is also a short read, never synthesized padding.
+    assert_eq!(
+        read_repaired_range(&path, 0, 100, 0..98, true)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::UnexpectedEof,
     );
 }
 
