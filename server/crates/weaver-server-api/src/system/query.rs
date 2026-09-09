@@ -292,8 +292,13 @@ impl SystemQuery {
         let usage = tokio::task::spawn_blocking(move || {
             dirs.into_iter()
                 .filter_map(|(label, path)| -> Option<DiskUsage> {
-                    let space =
-                        weaver_server_core::operations::disk_space(std::path::Path::new(&path))?;
+                    let space = weaver_server_core::operations::probe_disk_space(
+                        std::path::Path::new(&path),
+                    )
+                    .map_err(|error| {
+                        tracing::debug!(%label, %path, %error, "disk usage row omitted");
+                    })
+                    .ok()?;
                     Some(DiskUsage {
                         label,
                         total_bytes: space.total_bytes,
@@ -386,8 +391,8 @@ fn probe_configured_storage(input: ConfiguredStorageInput) -> ConfiguredStorage 
         };
     }
 
-    match weaver_server_core::operations::disk_space(&input.path) {
-        Some(space) => ConfiguredStorage {
+    match weaver_server_core::operations::probe_nearest_disk_space(&input.path) {
+        Ok(space) => ConfiguredStorage {
             labels: input.labels,
             path,
             capacity: Some(DiskCapacity {
@@ -397,11 +402,13 @@ fn probe_configured_storage(input: ConfiguredStorageInput) -> ConfiguredStorage 
             }),
             error: None,
         },
-        None => ConfiguredStorage {
+        Err(error) => ConfiguredStorage {
             labels: input.labels,
             path,
             capacity: None,
-            error: Some("Filesystem capacity is unavailable for this path".to_string()),
+            error: Some(format!(
+                "Filesystem capacity is unavailable for this path: {error}"
+            )),
         },
     }
 }

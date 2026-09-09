@@ -282,12 +282,21 @@ impl HostFacts {
     /// Probes the real host. `working_dir` may not exist yet at startup, so
     /// the nearest existing ancestor answers for its filesystem.
     pub(crate) fn probe(working_dir: &std::path::Path) -> Self {
+        let working_fs_total_bytes = match crate::operations::probe_nearest_disk_space(working_dir)
+        {
+            Ok(space) => Some(space.total_bytes),
+            Err(error) => {
+                tracing::warn!(
+                    path = %working_dir.display(),
+                    error = %error,
+                    "working directory capacity is unknown; direct-store limits fall back to their defaults"
+                );
+                None
+            }
+        };
         Self {
             total_memory_bytes: crate::runtime::system_probe::detect_total_memory_bytes(),
-            working_fs_total_bytes: working_dir
-                .ancestors()
-                .find_map(crate::operations::disk::disk_space)
-                .map(|space| space.total_bytes),
+            working_fs_total_bytes,
         }
     }
 }

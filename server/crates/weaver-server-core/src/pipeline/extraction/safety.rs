@@ -10,7 +10,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use tracing::{info, warn};
 
-use crate::operations::disk::disk_space;
+use crate::operations::disk::{Capacity, CapacitySampler, probe_nearest_disk_space};
 use crate::operations::metrics::PipelineMetrics;
 
 const MIB: u64 = 1024 * 1024;
@@ -33,7 +33,12 @@ pub(crate) struct ExtractionLimits {
 
 impl ExtractionLimits {
     pub(crate) fn from_env(complete_dir: &Path) -> Result<Self, String> {
-        let total_filesystem_bytes = disk_space(complete_dir).map(|space| space.total_bytes);
+        // The completed-download directory may not exist yet at startup; its
+        // nearest existing ancestor answers for the filesystem the reserve is
+        // derived from.
+        let total_filesystem_bytes = probe_nearest_disk_space(complete_dir)
+            .ok()
+            .map(|space| space.total_bytes);
         let default_min_free = default_disk_reserve_bytes(total_filesystem_bytes);
         let detected_memory = crate::runtime::system_probe::detect_total_memory_bytes()
             .unwrap_or(2 * MAX_MEMORY_LIMIT);
@@ -133,10 +138,18 @@ impl std::fmt::Display for ExtractionFailure {
     }
 }
 
+/// Free-space accounting for the extraction root.
+///
+/// The sampler re-reads the filesystem at most once per
+/// [`DISK_REFRESH_INTERVAL`] and holds the last good reading across probe
+/// failures, so a transient stat error (a NAS hiccup, a path that is briefly
+/// unreachable) never rejects a write on its own. Only a fresh reading that
+/// confirms the reserve would be breached rejects; while the filesystem cannot
+/// be read the reserve check stands down and the write itself is the last
+/// line of defence.
 #[derive(Debug)]
 struct DiskBudgetState {
-    estimated_available: u64,
-    last_refresh: Instant,
+    sampler: CapacitySampler,
 }
 
 #[derive(Debug, Default)]
@@ -296,10 +309,16 @@ impl JobExtractionBudget {
             .saturating_mul(limits.max_ratio)
             .max(GIB);
         let effective_job_limit_bytes = limits.max_job_bytes.min(ratio_limit_bytes);
-        let initial_disk_space = disk_space(&root_path);
-        let estimated_available = initial_disk_space
-            .map(|space| space.available_bytes)
-            .unwrap_or(0);
+        let mut sampler = CapacitySampler::new(root_path.clone(), DISK_REFRESH_INTERVAL);
+        if sampler.refresh() == Capacity::Unknown {
+            // The sampler already logged the operating-system reason. The job
+            // proceeds without a reserve check until a reading arrives; the
+            // extraction root's own writes surface a full disk.
+            warn!(
+                root = %root_path.display(),
+                "extraction root capacity is unknown; the disk reserve is not enforced until a reading arrives"
+            );
+        }
         let budget = Arc::new(Self {
             limits,
             process_memory,
@@ -312,10 +331,7 @@ impl JobExtractionBudget {
             memory_reserved: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
             failure: Mutex::new(None),
-            disk: Mutex::new(DiskBudgetState {
-                estimated_available,
-                last_refresh: Instant::now(),
-            }),
+            disk: Mutex::new(DiskBudgetState { sampler }),
             active: Mutex::new(ActiveState::default()),
             idle: Condvar::new(),
             metrics,
@@ -337,18 +353,18 @@ impl JobExtractionBudget {
                 .reject_job_bytes(initial_bytes, "existing staging output")
                 .to_string());
         }
-        if initial_disk_space.is_none() {
-            return Err(budget
-                .reject(
-                    ExtractionRejectionReason::DiskReserve,
-                    format!(
-                        "failed to determine available space for extraction root '{}'",
-                        budget.root_path.display()
-                    ),
-                )
-                .to_string());
-        }
         Ok(budget)
+    }
+
+    /// Whether the extraction root has produced at least one capacity reading.
+    #[cfg(test)]
+    pub(crate) fn disk_capacity_known(&self) -> bool {
+        self.disk
+            .lock()
+            .expect("extraction disk state poisoned")
+            .sampler
+            .current()
+            != Capacity::Unknown
     }
 
     pub(crate) fn is_rejection(error: &str) -> bool {
@@ -596,21 +612,14 @@ impl JobExtractionBudget {
 
     fn reserve_disk(&self, bytes: u64) -> Result<(), ExtractionFailure> {
         let mut disk = self.disk.lock().expect("extraction disk state poisoned");
-        if disk.last_refresh.elapsed() >= DISK_REFRESH_INTERVAL {
-            let space = disk_space(&self.root_path).ok_or_else(|| {
-                self.reject(
-                    ExtractionRejectionReason::DiskReserve,
-                    format!(
-                        "failed to refresh available space for extraction root '{}'",
-                        self.root_path.display()
-                    ),
-                )
-            })?;
-            disk.estimated_available = space.available_bytes;
-            disk.last_refresh = Instant::now();
-        }
-        let remaining = disk.estimated_available.saturating_sub(bytes);
-        if remaining < self.limits.min_free_bytes {
+        let Some(reading) = disk.sampler.sample().reading() else {
+            // No reading has ever succeeded for this root: nothing to account
+            // against, and refusing on ignorance would fail the job for a
+            // problem the filesystem never reported.
+            return Ok(());
+        };
+        let remaining = reading.available_bytes.saturating_sub(bytes);
+        if remaining < self.limits.min_free_bytes && !reading.stale {
             return Err(self.reject(
                 ExtractionRejectionReason::DiskReserve,
                 format!(
@@ -619,7 +628,10 @@ impl JobExtractionBudget {
                 ),
             ));
         }
-        disk.estimated_available = remaining;
+        // A stale reading keeps being debited so the estimate stays honest,
+        // but only a fresh reading may reject: the next successful probe
+        // confirms or clears the breach within one refresh interval.
+        disk.sampler.debit(bytes);
         Ok(())
     }
 
@@ -628,8 +640,11 @@ impl JobExtractionBudget {
             return;
         }
         self.total_written.fetch_sub(bytes, Ordering::AcqRel);
-        let mut disk = self.disk.lock().expect("extraction disk state poisoned");
-        disk.estimated_available = disk.estimated_available.saturating_add(bytes);
+        self.disk
+            .lock()
+            .expect("extraction disk state poisoned")
+            .sampler
+            .credit(bytes);
     }
 
     fn reject_job_bytes(&self, requested: u64, context: &str) -> ExtractionFailure {
@@ -1601,14 +1616,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unavailable_disk_probe_rejects_budget_creation() {
+    fn unavailable_disk_probe_stands_the_reserve_down_instead_of_rejecting() {
         use std::os::unix::ffi::OsStringExt;
 
         let invalid_path = PathBuf::from(std::ffi::OsString::from_vec(b"bad\0path".to_vec()));
-        let error =
-            JobExtractionBudget::new(limits(), invalid_path, 1, 0, 0, PipelineMetrics::new())
-                .unwrap_err();
-        assert!(error.contains("disk_reserve"));
+        let budget = JobExtractionBudget::new(
+            Arc::new(ExtractionLimits {
+                min_free_bytes: u64::MAX,
+                ..(*limits()).clone()
+            }),
+            invalid_path,
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .expect("an unreadable root must not reject the job up front");
+        assert!(!budget.disk_capacity_known());
+        budget
+            .reserve_write(0, 1)
+            .expect("without any reading the reserve cannot be judged breached");
     }
 
     #[cfg(unix)]
