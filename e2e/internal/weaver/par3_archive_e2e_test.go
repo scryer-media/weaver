@@ -105,8 +105,8 @@ func TestPar3ArchiveE2E(t *testing.T) {
 					if err != nil || !bytes.Equal(actual, payload) {
 						t.Fatalf("extracted member mismatch: %v got=%x want=%x", err, sha256.Sum256(actual), sha256.Sum256(payload))
 					}
-					if mode == "clean" || mode == "corrupt" {
-						if mode == "clean" && strings.HasPrefix(format, "rar-") {
+					if mode == "clean" || mode == "corrupt" || (mode == "missing" && format == "rar-store") {
+						if (mode == "clean" && strings.HasPrefix(format, "rar-")) || (mode == "missing" && format == "rar-store") {
 							log, err := os.ReadFile(logPath)
 							if err != nil {
 								t.Fatal(err)
@@ -115,13 +115,13 @@ func TestPar3ArchiveE2E(t *testing.T) {
 							for _, line := range strings.Split(string(log), "\n") {
 								if strings.Contains(line, fmt.Sprintf("job_id=%d ", job)) {
 									if strings.Contains(line, "direct-store set demoted") {
-										t.Fatal("clean RAR unexpectedly demoted")
+										t.Fatal("RAR expected to stay direct unexpectedly demoted")
 									}
 									finalized = finalized || strings.Contains(line, "direct-store set finalized without materializing a volume")
 								}
 							}
 							if !finalized {
-								t.Fatal("clean RAR did not finish through direct-store verification")
+								t.Fatal("RAR did not finish through direct-store verification")
 							}
 						}
 						for index, name := range unpackSortedNames(posted) {

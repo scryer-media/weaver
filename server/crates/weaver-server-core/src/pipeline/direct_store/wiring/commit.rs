@@ -206,7 +206,11 @@ impl Pipeline {
     /// to parse and it is suppressed for direct volumes, so for a live direct
     /// set this is the only writer, and after a demotion the conventional path
     /// upserts the same facts over the materialized volumes.
-    pub(super) async fn cache_direct_volume_facts(&mut self, job_id: JobId, set_index: usize) {
+    pub(in crate::pipeline) async fn cache_direct_volume_facts(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+    ) {
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
@@ -986,7 +990,7 @@ impl Pipeline {
         }
     }
 
-    pub(super) async fn run_direct_barrier(
+    pub(in crate::pipeline) async fn run_direct_barrier(
         &mut self,
         job_id: JobId,
         set_index: usize,

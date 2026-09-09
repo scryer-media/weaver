@@ -64,9 +64,10 @@ PAR3 can now read direct-store volume images, including encrypted members,
 without materializing clean archives. One bounded reader per job retains the
 cipher frontier; backing snapshots fence shared partial files before writes.
 Metadata, held-file pins, temporary buffers and open readers carry resource
-leases. Direct finalization waits for PAR3 verification. Damaged archive groups
-currently demote through the existing reconstruction barrier before repair;
-selective routing of repaired volumes back into direct store remains pending.
+leases. Direct finalization waits for PAR3 verification. Live plain direct sets
+now receive verified repair outputs through bounded readback tickets. Encrypted
+sets still cross the reconstruction barrier; archive checksum failures that
+already demoted a set continue through conventional repair.
 
 Repair read-back now has a codec-independent file-range boundary that preserves
 I/O errors and can return bounded stripes with their CBC edge bytes. The PAR2
@@ -94,14 +95,30 @@ The conventional wrapper still demotes on sparse or destination-write failure;
 the repair-facing boundary returns the original I/O error so its caller can
 preserve verified materialized output. Failure regressions keep both that output
 and clean virtual coverage intact, without claiming failed writes or launching
-reconstruction. The production PAR3 installation path has not yet switched to
-this boundary.
+reconstruction. PAR3 readback now uses this checked placement boundary.
 Placement-slice validation: all 3,815 workspace Nextest tests (13 existing skips),
 all three doctests, formatting and all-target/all-feature workspace Clippy pass.
 It continues to use the existing unreleased 0.11.3 workspace version.
 
+PAR3 installation now captures authenticated output lengths and backing snapshots
+on its native worker, then routes live plain direct volumes in 256 KiB stripes.
+Each stripe carries a host-memory lease through placement and uses the shared
+handle budget. The existing PAR3 worker tickets yield between stripes and keep
+assessments/finalization fenced until installation settles. Checkpoints retire
+before replacement; whole-volume CRC composition is replaced only after all
+stripes are placed, followed by cached layout facts and a coverage barrier.
+Native verified output survives routing or placement failure. Repaired direct
+files republish virtual images and do not acquire conventional completed-file
+rows. Their decoded lengths come from committed coverage, never assembly's
+encoded progress count. This continues the unreleased 0.11.3 workspace version.
+Readback validation: all 3,820 workspace Nextest tests pass (13 existing skips),
+with all 21 native PAR3 boundary tests rerun after the final error-preservation
+adjustment. All 22 native PAR3 E2E cases and 54 existing PAR2 archive E2E cases
+pass. The missing plain RAR test now requires direct finalization without demotion.
+Formatting, all-target/all-feature workspace Clippy and three doctests pass.
+
 Still pending: incremental decode-to-publication wiring, mixed-format fallback,
-selective direct-store repair, positioned verification,
+encrypted and multi-damage selective direct-store repair, positioned verification,
 embedded archives, evidence persistence and product surfaces. Rebuilt files currently
 receive a verification read when republished; clean native evidence is retained.
 PAR3 repairs conservatively retire extraction chases until a PAR3 mutation view

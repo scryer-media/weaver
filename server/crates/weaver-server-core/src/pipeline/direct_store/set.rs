@@ -586,6 +586,38 @@ impl DirectSet {
         }
     }
 
+    /// Apply one bounded replacement batch; the caller must place its spans
+    /// before advancing and retire the job on any placement failure.
+    pub(crate) fn route_repaired_batch(
+        &mut self,
+        volume: u32,
+        chunks: &[super::router::RepairedChunk],
+        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        finish: bool,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        match self
+            .router
+            .route_repaired_batch(volume, chunks, lead_in, finish, finish)
+        {
+            Ok(spans) => {
+                self.latched_direct |= !spans.is_empty();
+                Ok(spans)
+            }
+            Err(reason) => {
+                self.demote(reason);
+                Err(reason)
+            }
+        }
+    }
+
+    /// Replace article composition only after a complete verified image has
+    /// been routed and placed. Stripe boundaries are not article boundaries.
+    pub(crate) fn note_repaired_whole_volume_crc(&mut self, volume: u32, len: u64, crc: u32) {
+        let runs = self.volume_crcs.entry(volume).or_default();
+        *runs = CrcRuns::default();
+        runs.insert(0, len, crc);
+    }
+
     pub(crate) fn mark_finalized(&mut self) {
         if !self.is_demoted() {
             self.status = DirectSetStatus::Finalized;

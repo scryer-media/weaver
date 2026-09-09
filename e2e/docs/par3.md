@@ -55,7 +55,8 @@ or article availability for damage cases. The pinned reference revision is
 `2971702e501f1350b1c7b9d11369af9157d6ed56`; platform adaptations need their own
 provenance alongside the binary hash.
 
-Clean RAR cases require direct finalization without demotion. Every single-byte
+Clean RAR cases and the wholly missing plain RAR volume require direct
+finalization without demotion. Every single-byte
 corruption case must complete using only the first recovery packet; downloading
 extra parity to compensate for lost source-coverage metadata fails the test.
 The native matrix currently passes all 22 PAR3 scenarios, alongside 54 existing
@@ -63,5 +64,5 @@ PAR2 archive regression cases. This is correctness evidence, not a throughput
 or full integration readiness claim.
 
 These matrices do not yet cover embedded protection, restart evidence, both
-datastores, selective direct-store repair or performance acceptance.
+datastores, encrypted/multi-volume selective direct repair or performance acceptance.
 Those remain tracked in `docs/par3-integration-plan.md` at the repository root.

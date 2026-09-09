@@ -12,21 +12,25 @@ const MAX_PENDING: usize = 4096;
 enum WorkKey {
     Source(SourceId),
     Repair(par3_rs::InputSetId),
+    Readback,
 }
 
 enum WorkOutput {
     Published,
     Repaired(RepairCompletion),
+    Readback(readback::ReadbackDone),
 }
 
 /// Keep output-path accounting alive through channel handback, partial-error
 /// handling and asynchronous assembly/database reconciliation.
 pub(super) struct RepairCompletion {
     pub result: EngineResult<par3_rs::session_repair::SessionRepairReport>,
+    pub outputs: EngineResult<Vec<readback::VerifiedOutput>>,
     pub _reservation: Option<assessment::ViewReservation>,
 }
 
 enum PendingInput {
+    Readback(Box<readback::Installation>),
     Virtual {
         image: virtual_source::VirtualInput,
         name: String,
@@ -53,6 +57,7 @@ enum PendingInput {
 impl PendingInput {
     fn retained_cost(&self) -> EngineResult<usize> {
         let (path, extra) = match self {
+            Self::Readback(_) => return Ok(readback::STRIPE_RESERVATION),
             Self::Virtual { name, .. } => {
                 return name
                     .capacity()
@@ -109,6 +114,8 @@ struct JobSlot {
     ticket: Option<u64>,
     errors: BTreeMap<SourceId, EngineError>,
     completed_repair: Option<RepairCompletion>,
+    completed_readback: Option<EngineResult<readback::ReadbackDone>>,
+    installing: bool,
 }
 
 impl Default for JobSlot {
@@ -124,6 +131,8 @@ impl Default for JobSlot {
             ticket: None,
             errors: BTreeMap::new(),
             completed_repair: None,
+            completed_readback: None,
+            installing: false,
         }
     }
 }
@@ -181,7 +190,10 @@ impl Coordinator {
 
     pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|job| {
-            job.ticket.is_some() || !job.pending.is_empty() || !job.dirty.is_empty()
+            job.installing
+                || job.ticket.is_some()
+                || !job.pending.is_empty()
+                || !job.dirty.is_empty()
         })
     }
 
@@ -297,6 +309,48 @@ impl Coordinator {
         self.dispatch()
     }
 
+    pub(super) fn is_installing(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|job| job.installing)
+    }
+
+    pub(super) fn queue_readback(
+        &mut self,
+        job_id: JobId,
+        installation: Box<readback::Installation>,
+    ) -> EngineResult<()> {
+        self.check_pending_capacity(job_id, WorkKey::Readback)?;
+        let reservation = assessment::ViewReservation::acquire(readback::STRIPE_RESERVATION)?;
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(EngineError::InvalidState("missing PAR3 installation job"))?;
+        if job.ticket.is_some() || job.pending.contains_key(&WorkKey::Readback) {
+            return Err(EngineError::InvalidState("PAR3 readback already queued"));
+        }
+        job.installing = true;
+        job.pending.insert(
+            WorkKey::Readback,
+            QueuedInput {
+                input: PendingInput::Readback(installation),
+                reservation,
+            },
+        );
+        self.dispatch()
+    }
+
+    pub(super) fn take_readback(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<EngineResult<readback::ReadbackDone>> {
+        self.jobs.get_mut(&job_id)?.completed_readback.take()
+    }
+
+    pub(super) fn finish_installation(&mut self, job_id: JobId) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.installing = false;
+        }
+    }
+
     pub(super) fn take_repair_result(&mut self, job_id: JobId) -> Option<RepairCompletion> {
         self.jobs.get_mut(&job_id)?.completed_repair.take()
     }
@@ -381,7 +435,7 @@ impl Coordinator {
     pub(super) fn dirty_sources(&self, job_id: JobId) -> Vec<SourceId> {
         self.jobs
             .get(&job_id)
-            .filter(|job| job.ticket.is_none())
+            .filter(|job| job.ticket.is_none() && !job.installing)
             .map(|job| {
                 job.dirty
                     .iter()
@@ -411,7 +465,7 @@ impl Coordinator {
         job.epoch = epoch;
         job.pending.remove(&WorkKey::Source(source));
         job.pending
-            .retain(|key, _| matches!(key, WorkKey::Source(_)));
+            .retain(|key, _| !matches!(key, WorkKey::Repair(_)));
         job.dirty.insert(source);
         if let Some(runtime) = job.runtime.as_mut() {
             for set in runtime.sets.values_mut() {
@@ -442,7 +496,8 @@ impl Coordinator {
         self.jobs
             .get(&job_id)
             .filter(|job| {
-                job.ticket.is_none()
+                !job.installing
+                    && job.ticket.is_none()
                     && job.pending.is_empty()
                     && job.errors.is_empty()
                     && job.dirty.is_empty()
@@ -519,7 +574,14 @@ impl Coordinator {
         if !self.in_flight.is_empty() {
             return Ok(());
         }
-        let ready = |job: &&JobSlot| job.ticket.is_none() && !job.pending.is_empty();
+        let ready = |job: &&JobSlot| {
+            job.ticket.is_none()
+                && if job.installing {
+                    job.pending.contains_key(&WorkKey::Readback)
+                } else {
+                    !job.pending.is_empty()
+                }
+        };
         let next = self
             .jobs
             .iter()
@@ -542,7 +604,16 @@ impl Coordinator {
         };
         self.next_ticket = ticket;
         self.last_job = Some(job_id);
-        let (key, input) = job.pending.pop_first().expect("pending input");
+        let (key, input) = if job.installing {
+            (
+                WorkKey::Readback,
+                job.pending
+                    .remove(&WorkKey::Readback)
+                    .expect("pending readback"),
+            )
+        } else {
+            job.pending.pop_first().expect("pending input")
+        };
         let epoch = job.epoch;
         let assess =
             job.pending.is_empty() && job.dirty.iter().all(|id| key == WorkKey::Source(*id));
@@ -554,12 +625,69 @@ impl Coordinator {
             let result = tokio::task::spawn_blocking(move || {
                 // Keep the queue lease live while the worker owns its input;
                 // successful publication transfers it into retained state.
+                if let PendingInput::Readback(installation) = input.input {
+                    let result = installation.read(&runtime.options);
+                    return (
+                        runtime,
+                        Ok(WorkOutput::Readback(readback::ReadbackDone {
+                            installation,
+                            result,
+                            _reservation: input.reservation,
+                        })),
+                    );
+                }
                 if let PendingInput::Repair { set, path } = input.input {
+                    let layout = runtime
+                        .sets
+                        .get_mut(&set)
+                        .ok_or(EngineError::InvalidState("missing PAR3 repair set"))
+                        .and_then(|set| set.native.layout())
+                        .and_then(|layout| {
+                            layout.ok_or(EngineError::InvalidState("missing PAR3 repair layout"))
+                        });
+                    let layout = match layout {
+                        Ok(layout) => layout,
+                        Err(error) => {
+                            return (
+                                runtime,
+                                Ok(WorkOutput::Repaired(RepairCompletion {
+                                    result: Err(error),
+                                    outputs: Ok(Vec::new()),
+                                    _reservation: Some(input.reservation),
+                                })),
+                            );
+                        }
+                    };
                     let result = runtime.repair(set, &path);
+                    let installed = match &result {
+                        Ok(report) => report.installed.as_slice(),
+                        Err(EngineError::RepairInterrupted { installed, .. }) => {
+                            installed.as_slice()
+                        }
+                        _ => &[],
+                    };
+                    let outputs = installed
+                        .iter()
+                        .map(|output| {
+                            let file = layout
+                                .files()
+                                .iter()
+                                .find(|file| path.join(&file.path) == output.path)
+                                .ok_or(EngineError::InvalidState(
+                                    "PAR3 output has no authenticated length",
+                                ))?;
+                            readback::VerifiedOutput::capture(
+                                output.path.clone(),
+                                file.len,
+                                &runtime.options,
+                            )
+                        })
+                        .collect();
                     return (
                         runtime,
                         Ok(WorkOutput::Repaired(RepairCompletion {
                             result,
+                            outputs,
                             _reservation: Some(input.reservation),
                         })),
                     );
@@ -575,7 +703,9 @@ impl Coordinator {
                     PendingInput::Virtual { image, name } => {
                         runtime.publish_virtual(source, image, name)
                     }
-                    PendingInput::Repair { .. } => unreachable!("repair dispatched above"),
+                    PendingInput::Repair { .. } | PendingInput::Readback(_) => {
+                        unreachable!("repair dispatched above")
+                    }
                     PendingInput::Installed { path, name } => std::fs::metadata(&path)
                         .map_err(EngineError::from)
                         .and_then(|metadata| {
@@ -675,12 +805,23 @@ impl Coordinator {
                     result: Err(EngineError::InvalidState(
                         "PAR3 repair output changed before handback",
                     )),
+                    outputs: Ok(Vec::new()),
                     _reservation: None,
                 });
+            } else if done.key == WorkKey::Readback {
+                job.completed_readback = Some(Err(EngineError::InvalidState(
+                    "PAR3 readback changed before handback",
+                )));
             }
             return Some(done.job_id);
         }
         match (done.key, done.result) {
+            (WorkKey::Readback, result) => {
+                job.completed_readback = Some(result.and_then(|output| match output {
+                    WorkOutput::Readback(done) => Ok(done),
+                    _ => Err(EngineError::InvalidState("missing PAR3 readback result")),
+                }));
+            }
             (WorkKey::Repair(_), result) => {
                 job.completed_repair = Some(match result {
                     Ok(WorkOutput::Repaired(completion)) => completion,
@@ -688,6 +829,7 @@ impl Coordinator {
                         result: Err(other
                             .err()
                             .unwrap_or(EngineError::InvalidState("missing PAR3 repair report"))),
+                        outputs: Ok(Vec::new()),
                         _reservation: None,
                     },
                 });

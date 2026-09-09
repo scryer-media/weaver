@@ -336,3 +336,96 @@ fn excessive_repair_result_paths_are_rejected_before_dispatch_or_installation() 
         par3_rs::session::RepairStatus::Ready
     );
 }
+
+fn readback_installation(path: PathBuf, options: &ExecutionOptions) -> Box<readback::Installation> {
+    let output =
+        readback::VerifiedOutput::capture(path, readback::STRIPE_BYTES + 1, options).unwrap();
+    Box::new(readback::Installation {
+        completion: RepairCompletion {
+            result: Ok(Default::default()),
+            outputs: Ok(vec![output]),
+            _reservation: Some(assessment::ViewReservation::acquire(4096).unwrap()),
+        },
+        targets: vec![readback::Target {
+            file: NzbFileId {
+                job_id: JobId(1),
+                file_index: 0,
+            },
+            set: 0,
+            volume: 0,
+            output: 0,
+        }],
+        current: 0,
+        offset: 0,
+        crc32: 0,
+    })
+}
+
+#[tokio::test]
+async fn readback_yields_between_stripes_and_fences_assessment() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("repaired.rar");
+    std::fs::write(&path, vec![7; readback::STRIPE_BYTES as usize + 1]).unwrap();
+    let mut coordinator = Coordinator::default();
+    coordinator.admit(JobId(1)).unwrap();
+    coordinator
+        .queue_readback(JobId(1), readback_installation(path, &execution_options()))
+        .unwrap();
+    coordinator
+        .enqueue(JobId(2), SourceId(1), carrier(root.path()))
+        .unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    let readback = coordinator.take_readback(JobId(1)).unwrap().unwrap();
+    assert_eq!(
+        readback.result.as_ref().unwrap().len,
+        readback::STRIPE_BYTES
+    );
+    assert!(
+        coordinator.has_work(JobId(1)),
+        "placement still owns the completion fence"
+    );
+    assert_eq!(coordinator.assessments(JobId(1)).count(), 0);
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    assert_eq!(coordinator.settle(done), Some(JobId(2)));
+    let readback::ReadbackDone {
+        mut installation, ..
+    } = readback;
+    installation.offset = readback::STRIPE_BYTES;
+    coordinator.queue_readback(JobId(1), installation).unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    let readback = coordinator.take_readback(JobId(1)).unwrap().unwrap();
+    assert_eq!(readback.result.unwrap().len, 1);
+    coordinator.finish_installation(JobId(1));
+    assert!(!coordinator.has_work(JobId(1)));
+}
+
+#[tokio::test]
+async fn readback_rejects_stale_handback_without_releasing_worker_early() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("repaired.rar");
+    std::fs::write(&path, vec![7; readback::STRIPE_BYTES as usize + 1]).unwrap();
+    let mut coordinator = Coordinator::default();
+    coordinator
+        .enqueue(JobId(1), SourceId(0), carrier(root.path()))
+        .unwrap();
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    coordinator
+        .queue_readback(JobId(1), readback_installation(path, &execution_options()))
+        .unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator
+        .invalidate_source(JobId(1), SourceId(0))
+        .unwrap();
+    assert_eq!(coordinator.in_flight.len(), 1);
+    coordinator.settle(done);
+    assert!(matches!(
+        coordinator.take_readback(JobId(1)).unwrap(),
+        Err(EngineError::InvalidState(_))
+    ));
+    assert!(coordinator.has_work(JobId(1)));
+}

@@ -376,6 +376,13 @@ impl Pipeline {
     }
 
     fn enqueue_par3_file(&mut self, job_id: JobId, file_id: NzbFileId) -> EngineResult<()> {
+        if self
+            .par3_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.is_installing(job_id))
+        {
+            return Ok(());
+        }
         if self.direct_demotion_in_flight.contains_key(&job_id) {
             // The handback republishes committed ranges after reconstruction.
             // Neither the old virtual image nor the growing disk image is a
@@ -463,8 +470,9 @@ impl Pipeline {
         if set.is_finalized() {
             return None;
         }
-        let file = self.jobs.get(&file_id.job_id)?.assembly.file(file_id)?;
-        let len = set.virtual_volume_len(index, file.received_bytes());
+        // Completion progress may use the NZB's encoded size. The provider's
+        // committed decoded coverage is the only source-space length here.
+        let len = set.virtual_volume_len(index, 0);
         set.virtual_volumes(&BTreeMap::from([(index, len)]))
             .into_iter()
             .find(|volume| volume.volume_index == index)
@@ -491,6 +499,7 @@ impl Pipeline {
             .iter()
             .enumerate()
             .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
+            .filter(|(_, set)| set.router.routes_encrypted())
             .filter(|(_, set)| {
                 set.plan()
                     .volumes
@@ -502,9 +511,8 @@ impl Pipeline {
         if sets.is_empty() {
             return false;
         }
-        // The native verifier can keep clean archive groups virtual. An archive
-        // needing installation currently crosses the existing demotion barrier
-        // first, so its router can never finalize pre-repair member bytes.
+        // Encrypted cross-volume edges still require the conventional repair
+        // barrier. Plain direct sets receive verified output in bounded stripes.
         for index in sets {
             self.invalidate_par3_direct_set(job_id, index);
             self.demote_direct_set(
@@ -600,6 +608,7 @@ impl Pipeline {
             return Ok(());
         };
         if !coordinator.contains_job(job_id)
+            || coordinator.is_installing(job_id)
             || self.job_has_pending_download_pipeline_work(job_id)
             || self.direct_demotion_in_flight.contains_key(&job_id)
         {
@@ -637,6 +646,7 @@ impl Pipeline {
         };
         let job_id = coordinator.settle(done);
         let repair = job_id.and_then(|id| coordinator.take_repair_result(id));
+        let readback = job_id.and_then(|id| coordinator.take_readback(id));
         if let Err(error) = coordinator.dispatch() {
             tracing::error!(error = %error, "PAR3 worker dispatch failed");
         }
@@ -672,6 +682,9 @@ impl Pipeline {
         if let (Some(job_id), Some(result)) = (job_id, repair) {
             self.finish_par3_repair(job_id, result).await;
         }
+        if let (Some(job_id), Some(result)) = (job_id, readback) {
+            self.apply_par3_readback(job_id, result).await;
+        }
     }
 }
 
@@ -679,6 +692,7 @@ mod assessment;
 mod completion;
 #[cfg(windows)]
 mod disk_windows;
+mod readback;
 pub(in crate::pipeline) mod virtual_source;
 pub(in crate::pipeline) mod work;
 

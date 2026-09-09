@@ -128,13 +128,14 @@ impl Pipeline {
         }
     }
 
-    pub(super) async fn finish_par3_repair(
+    pub(super) async fn complete_par3_repair(
         &mut self,
         job_id: JobId,
         completion: work::RepairCompletion,
     ) {
         let work::RepairCompletion {
             result,
+            outputs: _outputs,
             _reservation,
         } = completion;
         if !self.jobs.contains_key(&job_id) {
@@ -201,6 +202,7 @@ impl Pipeline {
         // instead of persisting a different algorithm under the existing field.
         let entries: Vec<_> = files
             .iter()
+            .filter(|(id, _)| self.par3_virtual_volume(*id).is_none())
             .map(|(id, name)| (id.file_index, name.clone(), None))
             .collect();
         if !entries.is_empty() {
@@ -230,10 +232,15 @@ impl Pipeline {
             self.file_hash_states.remove(&id);
             self.expected_file_crcs.remove(&id);
             self.file_hash_reread_required.remove(&id);
-            self.refresh_archive_state_for_completed_file(job_id, id, true)
-                .await;
-            self.enqueue_par3_installed_file(job_id, id)
-                .map_err(|error| error.to_string())?;
+            if self.par3_virtual_volume(id).is_some() {
+                self.enqueue_par3_file(job_id, id)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                self.refresh_archive_state_for_completed_file(job_id, id, true)
+                    .await;
+                self.enqueue_par3_installed_file(job_id, id)
+                    .map_err(|error| error.to_string())?;
+            }
         }
         if !sets.is_empty() {
             let repaired_members: std::collections::HashSet<_> = sets
