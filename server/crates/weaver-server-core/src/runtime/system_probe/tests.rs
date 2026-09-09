@@ -78,6 +78,7 @@ fn cgroup_v1_memory_limit_ignores_unlimited_ancestors() {
     assert_eq!(limit, Some(1_u64 << 30));
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn parse_filesystem_types() {
     assert_eq!(parse_filesystem_type("APFS"), FilesystemType::Apfs);

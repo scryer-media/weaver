@@ -209,6 +209,16 @@ and spillover behavior; decode enforces the UU park limits when an article
 first identifies a file as UU. Disk-spooled UU bytes do not count toward shared
 memory pressure. Resident bytes remain subject to the shared memory budgets.
 
+Free-space gates (UU spool, direct-store scratch, extraction reserve) share
+one rule: a filesystem that cannot be measured is not evidence that it is
+full. Each gate samples through the operations capacity sampler, which
+rate-limits probes, holds the last good reading (marked stale) across probe
+failures, debits admitted bytes between probes, and logs each outage and
+recovery once with the operating-system reason. A fresh reading that confirms
+the reserve is gone refuses; a stale or unknown reading never fails a job on
+its own. The only place "unknown" refuses is a write that needs a reading to be
+judged at all (a UU spill), and that refusal is a requeue, not a failure.
+
 ### 8. Shared Mutable Runtime State Must Be Explicit
 
 Shared mutable runtime coordination must stay explicit and centrally owned.

@@ -3186,12 +3186,12 @@ pub struct Pipeline {
     pub(super) uu_spool_max_segments: usize,
     /// Free space preserved on the intermediate filesystem while spilling UU.
     pub(super) uu_spool_min_free_bytes: u64,
-    /// Most recent free-space sample for the spool filesystem.
-    pub(super) uu_spool_last_free_space_check: Option<Instant>,
-    /// Cached available bytes for the spool filesystem; `None` means unknown.
-    pub(super) uu_spool_available_bytes: Option<u64>,
+    /// Rate-limited free-space readings for the spool filesystem. Admitted
+    /// spills are debited against the cached reading between probes.
+    pub(super) uu_spool_capacity: crate::operations::CapacitySampler,
     #[cfg(test)]
-    /// Test-only free-space result; `Some(None)` exercises a failed probe.
+    /// Test-only free-space reading; `Some(None)` exercises a filesystem that
+    /// has never produced a reading.
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
     /// Per-file write reorder buffers for decoded segments waiting on write order.
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,

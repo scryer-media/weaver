@@ -241,6 +241,10 @@ impl Pipeline {
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
+            uu_spool_capacity: crate::operations::CapacitySampler::new(
+                intermediate_dir.clone(),
+                Pipeline::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL,
+            ),
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
@@ -248,8 +252,6 @@ impl Pipeline {
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
-            uu_spool_last_free_space_check: None,
-            uu_spool_available_bytes: None,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
             pending_file_progress: HashMap::new(),
@@ -2348,8 +2350,8 @@ fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
 }
 
 pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {
-    match crate::operations::disk_space(output_dir) {
-        Some(space) => {
+    match crate::operations::probe_nearest_disk_space(output_dir) {
+        Ok(space) => {
             let available = space.available_bytes;
             if available < needed_bytes {
                 let avail_mb = available / (1024 * 1024);
@@ -2364,7 +2366,11 @@ pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) 
                 debug!(available_mb = avail_mb, "disk space check passed");
             }
         }
-        None => debug!("could not check free disk space"),
+        Err(error) => debug!(
+            path = %output_dir.display(),
+            error = %error,
+            "could not check free disk space"
+        ),
     }
 }
 

@@ -22,8 +22,18 @@ impl DownloadPressure {
 impl Pipeline {
     /// The cache avoids turning every dispatch decision into a filesystem
     /// query while still making low-space admission responsive.
-    const UU_SPOOL_DISK_SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+    pub(in crate::pipeline) const UU_SPOOL_DISK_SPACE_CHECK_INTERVAL: Duration =
+        Duration::from_secs(1);
 
+    /// Whether ahead-of-cursor UU parking is at one of its aggregate limits.
+    ///
+    /// This is the predicate the dispatcher and the memory park consult, so it
+    /// only ever caps on evidence: the byte cap, the segment cap, or a
+    /// free-space reading (fresh or held from the last good probe) that shows
+    /// the reserve gone. A filesystem that has never produced a reading does
+    /// not cap here; it only refuses to *spill* (see
+    /// [`Self::admit_uu_spill`]), because memory parking never touches it and
+    /// a probe outage must not stall every UU job's dispatch.
     pub(in crate::pipeline) fn uu_spool_admission_capped(
         &mut self,
         additional_spooled_bytes: usize,
@@ -37,33 +47,53 @@ impl Pipeline {
             .uu_spool_min_free_bytes
             .saturating_add(additional_spooled_bytes as u64);
         let free_space_too_low = self
-            .uu_spool_available_bytes()
-            .is_none_or(|available| available < required_free);
+            .uu_spool_capacity()
+            .best_available_bytes()
+            .is_some_and(|available| available < required_free);
 
         byte_limit_reached || segment_limit_reached || free_space_too_low
     }
 
-    fn uu_spool_available_bytes(&mut self) -> Option<u64> {
+    /// Admit `spilled_bytes` of UU spool to disk, debiting the cached
+    /// free-space reading so a burst of spills inside one probe interval
+    /// cannot each see the same headroom.
+    ///
+    /// Unlike the memory park, a spill needs a reading to be judged: without
+    /// one the bytes are refused and the part is requeued, which keeps the
+    /// spool from writing blind into a filesystem it cannot measure.
+    pub(in crate::pipeline) fn admit_uu_spill(&mut self, spilled_bytes: usize) -> bool {
+        if self.uu_spool_admission_capped(spilled_bytes) {
+            return false;
+        }
+        let required_free = self
+            .uu_spool_min_free_bytes
+            .saturating_add(spilled_bytes as u64);
+        let admitted = self
+            .uu_spool_capacity()
+            .best_available_bytes()
+            .is_some_and(|available| available >= required_free);
+        if admitted {
+            self.uu_spool_capacity.debit(spilled_bytes as u64);
+        }
+        admitted
+    }
+
+    fn uu_spool_capacity(&mut self) -> crate::operations::Capacity {
         #[cfg(test)]
         if let Some(available) = self.uu_spool_available_bytes_for_test {
-            return available;
+            use crate::operations::{Capacity, CapacityReading};
+            return match available {
+                Some(available_bytes) => Capacity::Known(CapacityReading {
+                    available_bytes,
+                    total_bytes: u64::MAX,
+                    sampled_at: Instant::now(),
+                    stale: false,
+                }),
+                None => Capacity::Unknown,
+            };
         }
 
-        let now = Instant::now();
-        if self
-            .uu_spool_last_free_space_check
-            .is_some_and(|checked_at| {
-                now.saturating_duration_since(checked_at) < Self::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL
-            })
-        {
-            return self.uu_spool_available_bytes;
-        }
-
-        let available = crate::operations::disk_space(&self.intermediate_dir)
-            .map(|space| space.available_bytes);
-        self.uu_spool_last_free_space_check = Some(now);
-        self.uu_spool_available_bytes = available;
-        available
+        self.uu_spool_capacity.sample()
     }
 
     pub(in crate::pipeline::download::worker) fn uu_spool_cursor_ordinals(

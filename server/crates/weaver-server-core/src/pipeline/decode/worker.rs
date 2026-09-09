@@ -2195,12 +2195,11 @@ impl Pipeline {
         let decoded_bytes = data.len_bytes();
         let projected_resident = self.write_buffered_bytes.saturating_add(decoded_bytes);
         let spills = projected_resident >= self.write_backlog_budget_bytes;
-        if self.uu_spool_admission_capped(0)
-            || (spills && self.uu_spool_admission_capped(decoded_bytes))
-        {
+        if self.uu_spool_admission_capped(0) || (spills && !self.admit_uu_spill(decoded_bytes)) {
             // The part is already decoded, but holding it would exceed the
             // aggregate cache cap or consume the intermediate filesystem's
-            // reserved free space. Requeue without retry burn, exactly like a
+            // reserved free space (or, for a spill, the filesystem cannot be
+            // measured at all). Requeue without retry burn, exactly like a
             // per-file farthest-part displacement.
             return Ok(vec![segment_number]);
         }
@@ -2498,11 +2497,20 @@ impl Pipeline {
 
     fn fail_job_for_disk_write(&mut self, error: SegmentWriteError, context: &'static str) {
         let job_id = error.file_id.job_id;
-        let message = format!("{context} for {}: {}", error.file_id, error.source);
+        let out_of_space = crate::operations::is_out_of_space(&error.source);
+        let message = if out_of_space {
+            format!(
+                "{context} for {}: filesystem out of space or over quota ({})",
+                error.file_id, error.source
+            )
+        } else {
+            format!("{context} for {}: {}", error.file_id, error.source)
+        };
         error!(
             job_id = job_id.0,
             file_id = %error.file_id,
             error = %error.source,
+            out_of_space,
             context,
             "disk write failed; failing job"
         );
