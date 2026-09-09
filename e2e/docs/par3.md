@@ -74,9 +74,10 @@ aligned/sliding deduplication, Data-only repair and packed tails. It also puts
 independent Cauchy and FFT sets in one job, requiring both repairs when damaged
 and no recovery downloads for the FFT set when only Cauchy input is damaged.
 Clean cases must avoid recovery downloads. A cohort-deficit case must refuse
-delivery even when other cohorts have surplus recovery. The two large-block cases currently
-exceed the published engine's 64 MiB retained-state limit and remain enabled;
-this matrix is not yet fully passing.
+delivery even when other cohorts have surplus recovery. Both 65,538-block cases
+pass with Weaver's approved 128 MiB per-session retained ceiling; the shared
+process-wide engine budget remains 256 MiB. The full native matrix passes all
+142 cases. This is correctness evidence, not completed performance acceptance.
 
 `TestPar3RestartE2E` owns two successive processes over its isolated SQLite state.
 It stops while recovery is blocked, changes a completed source on disk, resumes,

@@ -5,6 +5,28 @@ const INDEX: &[u8] = include_bytes!("../backend/fixtures/set.par3");
 const RECOVERY: &[u8] = include_bytes!("../backend/fixtures/set.vol0+1.par3");
 
 #[test]
+fn retained_sessions_share_the_process_memory_pool_and_release_their_charge() {
+    let mut first = Par3Job::default();
+    let second = Par3Job::default();
+    let before = second.options.memory.used();
+    first
+        .publish_carrier(
+            SourceId(0),
+            source(INDEX),
+            INDEX.len() as u64,
+            std::iter::once(0..INDEX.len() as u64).collect(),
+            true,
+        )
+        .unwrap();
+    first.scan(SourceId(0)).unwrap();
+    assert!(first.options.memory.used() > before);
+    assert_eq!(second.options.memory.used(), first.options.memory.used());
+    assert!(second.options.memory.available() < second.options.memory.limit());
+    drop(first);
+    assert_eq!(second.options.memory.used(), before);
+}
+
+#[test]
 fn scanning_resumes_after_a_hole_and_revisits_the_unfinished_packet_on_arrival() {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),

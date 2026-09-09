@@ -4,12 +4,45 @@ Implementation started on 2026-09-08 in `feature/par3-integration`, based on
 local `release-0.12.0` at `6b079b40acea50e64df2cfce956dd0412963d906`.
 This is an implementation record, not a claim that the entire pipeline is ready.
 
+## Functional MVP completion
+
+The operator requested complete case coverage before further optimization on
+2026-09-09. The MVP must handle the agreed standalone and embedded formats,
+including explicit safe failure for insufficient recovery, unsupported native
+features, changed sources and exhausted resources. It must not silently narrow
+coverage to make the positive scenarios pass.
+
+Remaining correctness gates:
+
+- [x] Large interleaved sets pass clean and damaged native cases under a documented,
+  enforced shared memory budget; retain the enabled 65,538-block regressions.
+- [ ] Embedded ZIP, ZIP64 and 7z discovery, protected-data repair and extraction
+  preserve container structure, member bytes and authenticated packet gaps.
+- [ ] Renamed/obfuscated sources and overlapping source aliases bind consistently;
+  conflicting authenticated descriptions fail without delivering corrupt output.
+- [ ] Concurrent jobs, eviction, cancellation during native work and partial
+  installations enforce shared limits and preserve verified output safely.
+- [ ] SQLite and PostgreSQL restart scenarios preserve required bindings and
+  acquisition state, using fresh verification wherever continuity is unproven.
+- [ ] API/history/progress/metrics distinguish native PAR3 work accurately while
+  preserving existing PAR2 contracts.
+- [ ] The full native matrix and Rust/consumer sweeps pass on the supported
+  platforms, with explicit records for any unavailable validation environment.
+
+Conservative rereads, fresh restart verification and extraction restart remain
+acceptable interim implementations when they preserve correctness and resource
+bounds. Positioned hashing, evidence replay and faster repair are optimization
+work; they cannot substitute for the gates above. Preserve the existing PAR2
+non-regression requirement and measured baseline throughout this work.
+
+## Implementation record
+
 Implemented: the native operation contract, PAR3 carrier roles, completed-carrier
 discovery on blocking workers, retained authenticated packet locations, and a
 source publication adapter separating availability revisions from content
 generations. PAR3-specific state is lazy. Engine allocations share a process-wide
-256 MiB budget and 128 handles; each job uses one codec worker and the default
-64 MiB retained ceiling. Source publication tables bound sources and ranges.
+256 MiB budget and 128 handles; each job uses one codec worker and the approved
+128 MiB retained ceiling. Source publication tables bound sources and ranges.
 Official-fixture tests cover split headers/payloads, interior holes, duplicate
 arrivals, evidence reuse, selective output staging, and typed cancellation.
 
@@ -270,11 +303,17 @@ deduplication, Data-only repair and packed tails. Three additional passing cases
 put independent Cauchy and FFT sets in one job: clean, both damaged, and only
 Cauchy damaged. The last case prohibits recovery downloads for the clean FFT set.
 The matrix also verifies that surplus recovery in other cohorts cannot satisfy
-one cohort's deficit. Official creation and verbose listing establish each geometry. The 65,538-block interleaving case
-currently fails at the published engine's 64 MiB retained-layout ceiling; both
-positive cases remain enabled. The operator decision on a larger per-session
-ceiling within the unchanged global pool is pending. Do not treat this matrix
-as fully passing or infer performance acceptance from the successful cases.
+one cohort's deficit. Official creation and verbose listing establish each geometry.
+The 65,538-block cases initially exceeded the engine's default 64 MiB retained
+ceiling. With explicit operator approval on 2026-09-09, Weaver now allows 128 MiB
+retained per session within the unchanged shared 256 MiB engine pool. Both clean
+and damaged cases pass, and the complete native matrix now passes all 142 leaves.
+The shared-session regression observes another session's retained allocations and
+confirms that dropping the owner releases its charge. Formatting, full Clippy,
+all 3,856 workspace Nextest cases (13 existing skips), and three doctests pass.
+This establishes case correctness, not performance acceptance. Newly added
+embedded-archive coverage remains a separate incomplete gate. The existing
+unreleased 0.11.3 version covers this change; dependencies and PAR2 limits did not change.
 
 Standalone mixed-format coordination now gives PAR2 its first repair attempt and
 excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence
@@ -572,7 +611,7 @@ Unsupported/ambiguous layouts fail explicitly; never silently strip protection.
 ### 5. Resources, restart, and product surfaces
 
 Keep PAR2 limits unchanged. PAR3 lazily shares one process-wide 256 MiB engine
-budget, a 64 MiB retained ceiling per session, and a 16 MiB aggregate input queue.
+budget, the approved 128 MiB retained ceiling per session, and a 16 MiB aggregate input queue.
 Include sessions in existing aggregate retained-session eviction accounting.
 Account for queued buffer ownership without double-counting physical memory;
 share handle leases and admit workers through existing post-processing capacity.

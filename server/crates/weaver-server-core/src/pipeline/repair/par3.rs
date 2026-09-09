@@ -20,6 +20,7 @@ fn execution_options() -> ExecutionOptions {
     static HANDLES: OnceLock<HandleBudget> = OnceLock::new();
     let mut options = ExecutionOptions::default();
     options.memory = MEMORY.get_or_init(|| MemoryBudget::new(256 << 20)).clone();
+    options.retained_bytes = 128 << 20;
     options.handles = HANDLES.get_or_init(|| HandleBudget::new(128)).clone();
     options.open_handles = 128;
     options.workers = 1;
