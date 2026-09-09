@@ -3470,7 +3470,7 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs 0.4.4",
+ "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -3478,12 +3478,13 @@ dependencies = [
 [[package]]
 name = "par3-rs"
 version = "0.3.0"
-source = "git+https://github.com/scryer-media/rarpar?rev=54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee#54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "babf22e684e010ce2df662e32c16d290bb79db2ce778535f1ae9da2551f13e8b"
 dependencies = [
  "blake3",
  "crc-fast",
  "rayon",
- "reedsolomon-rs 0.4.5",
+ "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -4010,18 +4011,9 @@ dependencies = [
 
 [[package]]
 name = "reedsolomon-rs"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2454c7242439358b5bafb7a3cccacfc0a55a31894604036f121bbf1bded019f6"
-dependencies = [
- "memmap2",
- "rayon",
-]
-
-[[package]]
-name = "reedsolomon-rs"
 version = "0.4.5"
-source = "git+https://github.com/scryer-media/rarpar?rev=54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee#54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04bd2b18265c8b055ea65a86fe8c0e95a91ad2cbe8fb845b0ba8ffc214931084"
 dependencies = [
  "memmap2",
  "rayon",
@@ -5757,7 +5749,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs 0.4.4",
+ "reedsolomon-rs",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",
@@ -6113,7 +6105,7 @@ dependencies = [
  "pbkdf2",
  "quick-xml",
  "rayon",
- "reedsolomon-rs 0.4.4",
+ "reedsolomon-rs",
  "regex",
  "reqwest",
  "rmp-serde",

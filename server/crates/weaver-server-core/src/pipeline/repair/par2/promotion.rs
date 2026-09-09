@@ -23,13 +23,20 @@ impl Pipeline {
     }
 
     pub(crate) fn is_promoted_recovery_file(&self, job_id: JobId, file_index: u32) -> bool {
-        self.par2_runtime(job_id)
-            .and_then(|runtime| runtime.files.get(&file_index))
-            .is_some_and(|file| file.promoted)
+        self.par3_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.is_promoted(job_id, file_index))
+            || self
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&file_index))
+                .is_some_and(|file| file.promoted)
     }
 
     pub(crate) fn segment_is_completion_critical(&self, segment_id: SegmentId) -> bool {
-        self.par2_runtime(segment_id.file_id.job_id)
+        self.par3_runtime.as_ref().is_some_and(|runtime| {
+            runtime.is_promoted(segment_id.file_id.job_id, segment_id.file_id.file_index)
+        }) || self
+            .par2_runtime(segment_id.file_id.job_id)
             .and_then(|runtime| runtime.files.get(&segment_id.file_id.file_index))
             .is_some_and(|file| {
                 file.promoted

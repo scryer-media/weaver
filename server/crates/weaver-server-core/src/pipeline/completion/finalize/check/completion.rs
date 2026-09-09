@@ -259,6 +259,18 @@ impl Pipeline {
         // for that one a verdict and a repair are genuinely still possible.
         let has_incomplete_data_files = if self.par2_verified.contains(&job_id) {
             self.incomplete_par2_protected_data_file_count(job_id) > 0
+        } else if self
+            .par3_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.verified(job_id))
+        {
+            // An omitted index is protection metadata, not missing payload,
+            // once alternate carriers authenticated and verified the set.
+            self.jobs[&job_id].assembly.files().any(|file| {
+                !file.is_complete()
+                    && !file.role().is_recovery()
+                    && !matches!(file.role(), weaver_model::files::FileRole::Par3 { .. })
+            })
         } else {
             complete_data_files < total_data_files
         };
@@ -375,6 +387,10 @@ impl Pipeline {
         // and fail a job whose bytes are all present. The ticket's completion
         // applies the bookkeeping and schedules this check again.
         if self.direct_demotion_in_flight.contains_key(&job_id) {
+            return;
+        }
+
+        if self.check_par3_completion(job_id).await {
             return;
         }
 
@@ -2439,7 +2455,7 @@ impl Pipeline {
                     return;
                 }
                 if !par2_bypassed {
-                    self.cleanup_par2_files(job_id).await;
+                    self.cleanup_recovery_files(job_id).await;
                 }
                 // A split set the recovery data joined for us lands here rather
                 // than in the extraction arm, so its spent parts are removed

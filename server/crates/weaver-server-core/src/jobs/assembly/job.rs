@@ -9,6 +9,7 @@ use super::file::FileAssembly;
 pub struct JobAssembly {
     job_id: JobId,
     files: HashMap<NzbFileId, FileAssembly>,
+    has_par3_candidates: bool,
 
     /// Archive topologies keyed by archive set name (e.g., "Show.S01E01.7z").
     /// Supports multiple independent archive sets per job (e.g., season packs).
@@ -92,13 +93,21 @@ impl JobAssembly {
         Self {
             job_id,
             files: HashMap::new(),
+            has_par3_candidates: false,
             archive_topologies: HashMap::new(),
         }
     }
 
     /// Add a file to track.
     pub fn add_file(&mut self, assembly: FileAssembly) {
+        self.has_par3_candidates |= matches!(assembly.role(), FileRole::Par3 { .. });
         self.files.insert(assembly.file_id(), assembly);
+    }
+
+    /// Whether admission saw a declared PAR3 carrier. This is a discovery hint,
+    /// retained across renaming; it does not establish a set or its capacity.
+    pub fn has_par3_candidates(&self) -> bool {
+        self.has_par3_candidates
     }
 
     /// Get a file assembly by id (mutable).

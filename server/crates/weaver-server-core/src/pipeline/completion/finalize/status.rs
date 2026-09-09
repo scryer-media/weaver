@@ -817,29 +817,35 @@ impl Pipeline {
         }
     }
 
-    pub(super) async fn cleanup_par2_files(&self, job_id: JobId) {
+    pub(super) async fn cleanup_recovery_files(&self, job_id: JobId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
         let cleanup_dir = state.working_dir.clone();
-        let par2_files: Vec<String> = state
+        let recovery_files: Vec<String> = state
             .assembly
             .files()
-            .filter(|f| matches!(f.role(), weaver_model::files::FileRole::Par2 { .. }))
+            .filter(|f| {
+                matches!(
+                    f.role(),
+                    weaver_model::files::FileRole::Par2 { .. }
+                        | weaver_model::files::FileRole::Par3 { .. }
+                )
+            })
             .map(|f| self.current_filename_for_file(job_id, f))
             .collect();
-        if par2_files.is_empty() {
+        if recovery_files.is_empty() {
             return;
         }
 
         let mut removed = 0u32;
-        for filename in &par2_files {
+        for filename in &recovery_files {
             let path = cleanup_dir.join(filename);
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => removed += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    warn!(file = %path.display(), error = %e, "failed to delete PAR2 file");
+                    warn!(file = %path.display(), error = %e, "failed to delete recovery file");
                 }
             }
         }
@@ -847,8 +853,8 @@ impl Pipeline {
             info!(
                 job_id = job_id.0,
                 removed,
-                total = par2_files.len(),
-                "deleted PAR2 files"
+                total = recovery_files.len(),
+                "deleted recovery files"
             );
         }
     }

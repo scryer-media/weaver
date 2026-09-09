@@ -373,7 +373,10 @@ damage and matrix/cohort requirements. Pending publications hide prior views;
 the shared worker queue rotates between PAR3 jobs. Conventional writes withdraw
 coverage before disk mutation, and worker epochs reject stale handbacks. Identity
 rebindings retire the corresponding source publications for fresh binding.
-PAR3 repair and completion gating remain under integration. The implementation
+Conventional PAR3 completion now requests recovery carriers and dispatches native
+staged repairs. Verified installed files reconcile assembly and persistence without
+translating PAR3 fingerprints into PAR2 MD5. Article-level acquisition, shared
+mutation views, virtual sources and restart evidence remain under integration. The implementation
 record and remaining acceptance gates live in
 [the PAR3 integration plan](docs/par3-integration-plan.md).
 

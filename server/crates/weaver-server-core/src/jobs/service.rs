@@ -861,7 +861,7 @@ impl Pipeline {
         let mut assembly = JobAssembly::new(job_id);
         let mut download_queue = DownloadQueue::new();
         let mut recovery_queue = DownloadQueue::new();
-        let mut has_par2_index = false;
+        let mut has_recovery_index = false;
         let mut recovery_files: Vec<(u32, u64)> = Vec::new();
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
@@ -882,8 +882,9 @@ impl Pipeline {
             if matches!(
                 file_spec.role,
                 weaver_model::files::FileRole::Par2 { is_index: true, .. }
+                    | weaver_model::files::FileRole::Par3 { is_index: true }
             ) {
-                has_par2_index = true;
+                has_recovery_index = true;
             }
 
             let priority = file_spec.role.download_priority();
@@ -981,7 +982,7 @@ impl Pipeline {
             assembly.add_file(file_assembly);
         }
 
-        if !has_par2_index && !recovery_files.is_empty() {
+        if !has_recovery_index && !recovery_files.is_empty() {
             recovery_files.sort_by_key(|&(_, size)| size);
             let promoted_file_index = recovery_files[0].0;
 

@@ -163,7 +163,7 @@ func (s *unpackNNTP) publishUnpack(slug, mode string, files map[string][]byte, g
 		data := files[name]
 		count := (len(data) + segment - 1) / segment
 		fmt.Fprintf(&nzb, `<file poster="fixture" date="1" subject="%s"><groups><group>alt.test</group></groups><segments>`, xmlUnpackText(fmt.Sprintf(`"%s" yEnc (%d/%d)`, name, 1, count)))
-		parity := strings.HasSuffix(name, ".par2")
+		parity := strings.HasSuffix(name, ".par2") || strings.HasSuffix(name, ".par3")
 		for index := 0; index < count; index++ {
 			start, end := index*segment, min((index+1)*segment, len(data))
 			body := bytes.Clone(data[start:end])

@@ -113,9 +113,8 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 par2-rs = { version = "0.10", default-features = false, features = ["native-crypto"] }
-# Temporary development pointer: advanced verification/repair and review fixes.
-# Keep PAR2's registry dependency and feature graph independent of this engine.
-par3-rs = { version = "0.3", git = "https://github.com/scryer-media/rarpar", rev = "54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee", default-features = false }
+# Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
+par3-rs = { version = "0.3", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x

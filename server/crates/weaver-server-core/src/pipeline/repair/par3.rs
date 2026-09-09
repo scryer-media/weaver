@@ -26,6 +26,23 @@ fn execution_options() -> ExecutionOptions {
     options
 }
 
+fn disk_source(
+    source: SourceId,
+    path: PathBuf,
+    options: &ExecutionOptions,
+) -> EngineResult<Arc<dyn SourceAccess>> {
+    #[cfg(windows)]
+    {
+        disk_windows::open(source, path, options)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut disk = DiskSourceAccess::with_options(options.clone());
+        disk.insert(source, path);
+        Ok(Arc::new(disk))
+    }
+}
+
 struct Carrier {
     backing: SourceSnapshot,
     scanner: PacketScanner,
@@ -65,9 +82,7 @@ impl Par3Job {
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
             return Err(EngineError::ResourceLimit("PAR3 source bindings"));
         }
-        let mut disk = DiskSourceAccess::with_options(self.options.clone());
-        disk.insert(source, path);
-        let access: Arc<dyn SourceAccess> = Arc::new(disk);
+        let access = disk_source(source, path, &self.options)?;
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
             offset: 0,
@@ -99,6 +114,23 @@ impl Par3Job {
         Ok(())
     }
 
+    fn repair(
+        &mut self,
+        id: par3_rs::InputSetId,
+        output: &std::path::Path,
+    ) -> EngineResult<par3_rs::session_repair::SessionRepairReport> {
+        use super::backend::{Par3RepairRequest, RepairBackend};
+        let set = self
+            .sets
+            .get_mut(&id)
+            .ok_or(EngineError::InvalidState("unknown PAR3 set"))?;
+        set.view = None;
+        set.native.execute(Par3RepairRequest {
+            output,
+            backup: false,
+        })
+    }
+
     /// Disk carrier publication. Callers supply committed ranges; only tests
     /// with complete official files use the full-carrier convenience path.
     fn scan_file(
@@ -107,12 +139,7 @@ impl Par3Job {
         path: PathBuf,
         ranges: Option<Vec<std::ops::Range<u64>>>,
     ) -> EngineResult<()> {
-        let mut disk = DiskSourceAccess::with_options(self.options.clone());
-        disk.insert(source, path);
-        let access: Arc<dyn SourceAccess> = Arc::new(disk);
-        // Acquire immutable Windows sharing locks before snapshots so their
-        // generation checks do not repeatedly hash the complete carrier.
-        let access = access.pin(source, &self.options)?.unwrap_or(access);
+        let access = disk_source(source, path, &self.options)?;
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
             offset: 0,
@@ -265,7 +292,10 @@ impl Pipeline {
                 .assembly
                 .files()
                 .filter(|file| {
-                    file.is_complete() && !file.role().is_recovery() && file.file_id() != file_id
+                    !file.role().is_recovery()
+                        && file.file_id() != file_id
+                        && (file.is_complete()
+                            || (0..file.total_segments()).any(|segment| file.has_segment(segment)))
                 })
                 .take(MAX_CARRIERS + 1)
                 .map(|file| file.file_id())
@@ -366,9 +396,27 @@ impl Pipeline {
         let Some(coordinator) = self.par3_runtime.as_ref() else {
             return Ok(());
         };
-        let dirty = coordinator.dirty_sources(job_id);
-        if dirty.is_empty() || self.job_has_pending_download_pipeline_work(job_id) {
+        if !coordinator.contains_job(job_id) || self.job_has_pending_download_pipeline_work(job_id)
+        {
             return Ok(());
+        }
+        let mut dirty = coordinator.dirty_sources(job_id);
+        // An incomplete source may never emit a file-complete event. Metadata
+        // can also precede its first byte. Publish its surviving placements once
+        // the download drains, without rereading already known clean sources.
+        if let Some(state) = self.jobs.get(&job_id) {
+            for file in state.assembly.files() {
+                let source = SourceId(u64::from(file.file_id().file_index));
+                if !coordinator.knows_source(job_id, source)
+                    && (file.is_complete()
+                        || (0..file.total_segments()).any(|part| file.has_segment(part)))
+                {
+                    if dirty.len() >= MAX_CARRIERS {
+                        return Err(EngineError::ResourceLimit("PAR3 source count"));
+                    }
+                    dirty.push(source);
+                }
+            }
         }
         for source in dirty {
             let file_index = u32::try_from(source.0)
@@ -378,11 +426,12 @@ impl Pipeline {
         Ok(())
     }
 
-    pub(in crate::pipeline) fn handle_par3_work_done(&mut self, done: work::WorkDone) {
+    pub(in crate::pipeline) async fn handle_par3_work_done(&mut self, done: work::WorkDone) {
         let Some(coordinator) = self.par3_runtime.as_mut() else {
             return;
         };
         let job_id = coordinator.settle(done);
+        let repair = job_id.and_then(|id| coordinator.take_repair_result(id));
         if let Err(error) = coordinator.dispatch() {
             tracing::error!(error = %error, "PAR3 worker dispatch failed");
         }
@@ -401,10 +450,16 @@ impl Pipeline {
             );
             self.schedule_job_completion_check(job_id);
         }
+        if let (Some(job_id), Some(result)) = (job_id, repair) {
+            self.finish_par3_repair(job_id, result).await;
+        }
     }
 }
 
 mod assessment;
+mod completion;
+#[cfg(windows)]
+mod disk_windows;
 pub(in crate::pipeline) mod work;
 
 #[cfg(test)]

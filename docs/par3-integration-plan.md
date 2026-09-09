@@ -31,8 +31,9 @@ verified prefixes, matrix identities and per-cohort recovery requirements.
 Queued publications and their retained ranges share a 16 MiB host budget with
 these views. Pending source changes and worker errors hide old actor answers.
 Dispatch rotates between jobs instead of draining one job's entire backlog.
-Mutable Windows disk source snapshot costs still require tuning before the
-read-free reassessment contract can be claimed on that platform.
+Windows publications establish a strong generation once, then check file identity
+and change time through budgeted handles. They retain no sharing lock that could
+block a later article write. Native Windows runtime validation remains required.
 
 Conventional writes and identity rebindings now withdraw prior coverage without
 I/O. Reader snapshots and worker epochs fence old evidence, including an already
@@ -42,17 +43,29 @@ sources are republished through the same bounded queue; carriers also use only
 committed assembly ranges. Source/error/dirty bookkeeping retains its own host
 budget lease, and failed scans retain leases for any publication they installed.
 
-Still pending: incremental decode-to-publication wiring,
-repair/download gating, direct-volume adapters, positioned verification, embedded
-archives, persistence, and product surfaces. Completed carriers are discovered
-in production code, but PAR3 does not yet decide job completion or execute repairs.
+Conventional PAR3 jobs now enter a completion gate and execute native staged
+repair on the shared completion transport. The gate requests one recovery carrier
+at a time and reassesses native cohort requirements without trusting filename
+capacity hints. Verified installations reconcile assembly and persistent file
+completion; partial installation errors remain failures. No PAR3 digest is stored
+as PAR2 MD5. The article-hole pipeline regression restores the missing bytes and
+checks that a clean neighboring file was not rewritten.
+
+Still pending: incremental decode-to-publication wiring, article-level selective
+acquisition, mixed-format fallback, direct-volume adapters, positioned verification,
+embedded archives, evidence persistence and product surfaces. Rebuilt files currently
+receive a verification read when republished; clean native evidence is retained.
+PAR3 repairs conservatively retire extraction chases until a PAR3 mutation view
+can positively vouch for their consumed bytes. Full E2E and performance acceptance
+remain in progress.
 
 Dependency baseline: PAR2 0.10.2, UnRAR 0.10.3, and registry Reed-Solomon 0.4.4.
-The approved development pointer pins PAR3 and its separate arithmetic instance
-to rarpar `54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee`. Metadata comparison before
-and after resolution confirms every existing dependency node is unchanged
-except server core's new PAR3 edge: no PAR2 features, versions, or transitive
-edges changed. This isolation is deliberate during the performance comparison.
+The original development pointer used rarpar
+`54e51e83226767b2ff93ec56e2d3d59e1bdcc8ee`. With explicit operator approval,
+Weaver now uses published PAR3 0.3.0 and shared registry Reed-Solomon 0.4.5.
+The published source trees match the reviewed pointer. Dependency metadata shows
+only the approved PAR3 origin and arithmetic unification changes: PAR2 remains
+0.10.2 with native-crypto, and UnRAR remains 0.10.3 with crypto-aws-lc.
 
 Performance baselines and matched ARM64/x86-64 acceptance measurements below
 remain required. Source/dependency identity and correctness tests alone do not
@@ -96,6 +109,22 @@ skips; formatting, all-target/all-feature Clippy and all three doctests pass.
 The 24 targeted PAR3/source tests include open-reader withdrawal, a finished
 worker rejected after a write, retirement of queued stale publications, and
 pipeline re-verification after the existing write-invalidation hook.
+
+Conventional-repair validation: all 3,792 workspace tests pass with 13 existing
+skips; all-target/all-feature workspace Clippy passes. The 25 targeted PAR3/source
+tests include a repair through the pipeline gate with an interior article hole,
+native output verification, completion reconciliation and no clean-file rewrite.
+
+Acquisition validation: all 3,793 workspace tests pass with 13 existing skips;
+all-target/all-feature Clippy passes. Seven native-process scenarios exercise
+the authenticated API, real yEnc/NNTP downloads, repair and final move: clean,
+corrupt with valid yEnc CRCs, missing article, missing/omitted/late index, and
+insufficient recovery. Clean jobs request no recovery carrier and repairs stop
+before the final surplus carrier. These tests found and fixed premature health
+abort, missing partial-source publication, and counting an unavailable index as
+missing payload after alternate carriers verified the set. See `e2e/docs/par3.md`.
+Local Windows cross-checking is blocked by missing Windows SDK headers in AWS-LC;
+native Windows validation remains outstanding.
 
 ## Decisions
 
