@@ -922,6 +922,11 @@ impl DirectSet {
         S: super::barrier::DestinationSync + ?Sized,
         P: CoveragePersist + ?Sized,
     {
+        // A repair deleted the old checkpoint before changing destinations.
+        // Do not recreate it from a mixture of old and replacement bytes.
+        if self.router.repair_batch_in_progress() {
+            return None;
+        }
         // Level the barrier with the router before it builds a snapshot: the
         // plan digest it stamps and the destinations it claims must both be the
         // ones the set is routing against *now*, not the ones it was built with.

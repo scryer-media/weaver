@@ -2282,6 +2282,10 @@ pub(crate) struct DirectSetRouter {
     /// both integrity layers only record; [`Self::settle_repair_gates`] runs
     /// them once, over the finished rewrite.
     repair_draining: bool,
+    /// A volume whose replacement spans are arriving across several calls.
+    /// Its integrity gates and durable coverage remain pending until the last
+    /// batch arrives. A different volume cannot finish this replacement.
+    repair_batch: Option<u32>,
     demoted: Option<DemotionReason>,
 }
 
@@ -2351,6 +2355,7 @@ impl DirectSetRouter {
             damaged_volumes: std::collections::BTreeSet::new(),
             repair_rerouted: false,
             repair_draining: false,
+            repair_batch: None,
             demoted: None,
         }
     }
@@ -3290,7 +3295,9 @@ impl DirectSetRouter {
 
     /// Whether every learned member has passed its whole-member gate.
     pub(crate) fn all_members_verified(&self) -> bool {
-        !self.members.is_empty() && self.members.values().all(|member| member.verified)
+        !self.repair_batch_in_progress()
+            && !self.members.is_empty()
+            && self.members.values().all(|member| member.verified)
     }
 }
 

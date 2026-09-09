@@ -73,10 +73,21 @@ I/O errors and can return bounded stripes with their CBC edge bytes. The PAR2
 wrapper still supplies all of a volume's rewritten ranges to its existing
 router call. Whole-volume confirmation now checks actual `(start, end)` coverage;
 an overlapping range cannot inflate coverage over a hole or a missing tail.
-Streaming router transactions and their pipeline wiring remain pending. This
-fix uses the existing unreleased workspace version, 0.11.3.
+This fix uses the existing unreleased workspace version, 0.11.3.
 Validation: formatting, all-target/all-feature workspace Clippy, all 3,807
 workspace Nextest tests (13 existing skips), and all three doctests pass.
+
+The router now accepts replacement batches for one volume and defers integrity
+gates until the last batch. Pending batches block finalization and checkpoint
+recreation; foreign-volume, empty closing and premature whole-volume calls are
+refused. Regressions cover plain/encrypted parts and a wholly missing final
+volume whose headers span several arrivals. PAR2 keeps its one-call repair
+wrapper. PAR3 read-back scheduling, installation reconciliation and aggregate
+memory validation still need wiring; this primitive alone does not make
+production repairs selective or establish a total-memory bound.
+Batch-slice validation: all 390 direct-store tests, the full 3,813-test workspace
+sweep (13 existing skips), all three doctests, formatting and workspace Clippy
+pass. Failed closing drains also keep checkpoints fenced until router retirement.
 
 Still pending: incremental decode-to-publication wiring, mixed-format fallback,
 selective direct-store repair, positioned verification,

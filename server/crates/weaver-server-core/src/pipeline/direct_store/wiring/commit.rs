@@ -966,6 +966,9 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
+        if set.router.repair_batch_in_progress() {
+            return;
+        }
         // Read before the barrier runs, which resets it. Two numbers, because
         // the interesting one is the second: the barrier's 256 MiB trigger is
         // checked per routed batch, so anything above it is the overshoot the

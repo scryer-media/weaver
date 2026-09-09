@@ -101,6 +101,68 @@ impl DirectSetRouter {
         lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
         whole_volume: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        if self.repair_batch.is_some() {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        self.route_repaired_batch(volume_index, chunks, lead_in, whole_volume, true)
+    }
+
+    /// Routes a batch of replacement bytes while deferring integrity checks
+    /// until `finish`. Every batch belongs to the same volume and the last
+    /// batch must carry bytes; an empty call cannot close a partial replacement.
+    ///
+    /// `whole_volume` is permitted only on the final batch. As with
+    /// [`Self::route_repaired`], the caller must establish that the combined
+    /// batches carry the complete verified image before asserting it. Held
+    /// bytes use the existing scratch budget between batches. Returned spans
+    /// must be placed before the caller submits the next batch.
+    ///
+    /// Cancellation or a placement error requires demoting/discarding this
+    /// router: a partially applied replacement cannot be rolled back here.
+    pub(crate) fn route_repaired_batch(
+        &mut self,
+        volume_index: u32,
+        chunks: &[RepairedChunk],
+        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        whole_volume: bool,
+        finish: bool,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        if let Some(reason) = self.demoted {
+            return Err(reason);
+        }
+        if self
+            .repair_batch
+            .is_some_and(|volume| volume != volume_index)
+            || (whole_volume && !finish)
+            || (self.repair_batch.is_some() && chunks.iter().all(|(_, bytes)| bytes.is_empty()))
+        {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        self.repair_batch = Some(volume_index);
+        self.repair_draining = true;
+        let result =
+            self.route_repaired_batch_inner(volume_index, chunks, lead_in, whole_volume, finish);
+        // A failed closing drain may already have changed compositions. Keep
+        // checkpoints and finalization fenced until the failed router retires.
+        if finish && result.is_ok() {
+            self.repair_batch = None;
+            self.repair_draining = false;
+        }
+        result.map_err(|reason| self.fail(reason))
+    }
+
+    pub(crate) fn repair_batch_in_progress(&self) -> bool {
+        self.repair_batch.is_some()
+    }
+
+    fn route_repaired_batch_inner(
+        &mut self,
+        volume_index: u32,
+        chunks: &[RepairedChunk],
+        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        whole_volume: bool,
+        finish: bool,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         if let Some(reason) = self.demoted {
             return Err(reason);
         }
@@ -193,7 +255,7 @@ impl DirectSetRouter {
                 }
             }
         }
-        self.repair_draining = false;
+        self.repair_draining = !finish;
         drained?;
 
         // Every repaired byte must have found a destination. Unlike an ordinary
@@ -204,10 +266,11 @@ impl DirectSetRouter {
         // cannot place bytes it previously placed. That is a demotion, not a
         // hold: leaving it staged would sit on a repaired byte the member is
         // waiting for, forever.
-        if self
-            .staging
-            .get(&volume_index)
-            .is_some_and(|staging| !staging.repaired.is_empty())
+        if finish
+            && self
+                .staging
+                .get(&volume_index)
+                .is_some_and(|staging| !staging.repaired.is_empty())
         {
             return Err(self.fail(DemotionReason::RepairRerouteFailed));
         }
@@ -215,7 +278,9 @@ impl DirectSetRouter {
         // The deferred gates, over the rewrite as a whole. A part the rewrite
         // half-covered still has stale gaps here and composes nothing; its
         // gate runs when the re-read closes them.
-        self.settle_repair_gates()?;
+        if finish {
+            self.settle_repair_gates()?;
+        }
 
         if self.holds_over_budget()
             && let Err(reason) = self.page_holds_to_scratch()
