@@ -125,6 +125,7 @@ impl Pipeline {
             self.par2_runtime(job_id).is_some_and(|runtime| {
                 runtime.sets.iter().any(|(set_id, set)| {
                     set.settled
+                        && !set.settled_via_strong_decode
                         && set.failure.is_none()
                         && self
                             .resolve_par2_file_binding_in_set(
@@ -135,6 +136,79 @@ impl Pipeline {
                 })
             })
         })
+    }
+
+    fn par3_reports_damage_for_par2_set(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> bool {
+        self.par3_runtime.as_ref().is_some_and(|runtime| {
+            runtime.assessments(job_id).any(|(_, view)| {
+                view.files.iter().filter(|file| !file.complete).any(|file| {
+                    file.source
+                        .and_then(|source| u32::try_from(source.0).ok())
+                        .is_some_and(|file_index| {
+                            self.resolve_par2_file_binding_in_set(
+                                NzbFileId { job_id, file_index },
+                                set_id,
+                            )
+                            .is_some()
+                        })
+                })
+            })
+        })
+    }
+
+    /// A bound PAR3 damage report requires the selected PAR2 set to hash its
+    /// own bytes. An archive-type shortcut supplies no contradictory digest.
+    pub(in crate::pipeline) fn par3_requires_authoritative_par2(&self, job_id: JobId) -> bool {
+        self.par3_runtime.is_some()
+            && self
+                .par2_served_set_id(job_id)
+                .is_some_and(|set_id| self.par3_reports_damage_for_par2_set(job_id, set_id))
+    }
+
+    pub(in crate::pipeline) fn reopen_par2_strong_decode_claims_on_par3_damage(
+        &mut self,
+        job_id: JobId,
+    ) -> bool {
+        if self.par3_runtime.is_none() {
+            return false;
+        }
+        let mut reopened = false;
+        loop {
+            let candidate = self.par2_runtime(job_id).and_then(|runtime| {
+                runtime
+                    .sets
+                    .iter()
+                    .find(|(set_id, set)| {
+                        set.settled
+                            && set.settled_via_strong_decode
+                            && set.failure.is_none()
+                            && self.par3_reports_damage_for_par2_set(job_id, **set_id)
+                    })
+                    .map(|(set_id, _)| *set_id)
+            });
+            let Some(set_id) = candidate else {
+                break;
+            };
+            let set = self
+                .par2_runtime
+                .get_mut(&job_id)
+                .expect("selected job")
+                .sets
+                .get_mut(&set_id)
+                .expect("selected set");
+            set.settled = false;
+            set.settled_via_strong_decode = false;
+            set.post_verdict_reconcile_attempts = 0;
+            reopened = true;
+        }
+        if reopened {
+            self.par2_verified.remove(&job_id);
+        }
+        reopened
     }
 
     /// PAR2's installed bytes are candidates for fresh PAR3 verification. A

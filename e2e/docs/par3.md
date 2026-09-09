@@ -68,6 +68,28 @@ official recovery volume as `.bin` and hold the damaged RAR until that carrier
 authenticates; both must keep direct extraction. This is correctness evidence, not a throughput
 or full integration readiness claim.
 
+`TestPar3InsideE2E` uses the same binary variables for 18 embedded-protection
+scenarios. The official `insert` command creates ZIP, ZIP64 and 7z protection;
+installed `7zz` creates only the uncompressed 7z fixture. The harness records
+reference arguments and executable, original archive, inserted archive and member
+hashes. Clean, corrupt-body, corrupt-header, interior missing-article,
+protection-only missing-article and insufficient-recovery cases exercise each
+container. Missing articles are 16 KiB so one interior hole fits the reference's
+default insertion capacity. No protection packet bytes are modified.
+
+Successful cases require native PAR3 authentication, byte-exact extraction and
+healthy history. Insufficient recovery must fail without publishing a member.
+The engine stages explicit carrier replacement, preserves available authenticated
+packets, and requests no extra parity merely to restore protection completeness.
+This suite does not establish embedded restart, renamed placement or large
+damaged-framing coverage; those remain separate MVP gates.
+
+```sh
+WEAVER_PAR3_E2E_BIN=/absolute/path/to/weaver \
+WEAVER_PAR3_REFERENCE_BIN=/absolute/path/to/official/par3 \
+  go test -mod=readonly ./internal/weaver -run '^TestPar3InsideE2E$' -count=1 -v -timeout 8m
+```
+
 `TestPar3GeometryE2E` uses the same binary variables and records official creation
 and verbose listing output for GF16, FFT, uneven cohorts, more than 65,536 blocks,
 aligned/sliding deduplication, Data-only repair and packed tails. It also puts

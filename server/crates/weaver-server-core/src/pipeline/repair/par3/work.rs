@@ -43,6 +43,12 @@ enum PendingInput {
         path: PathBuf,
         name: String,
     },
+    Embedded {
+        path: PathBuf,
+        name: String,
+        ranges: Option<Vec<std::ops::Range<u64>>>,
+        start: u64,
+    },
     Carrier {
         path: PathBuf,
         ranges: Option<Vec<std::ops::Range<u64>>>,
@@ -67,6 +73,18 @@ impl PendingInput {
             }
             Self::Repair { path, .. } => (path, Some(0)),
             Self::CompleteFile { path, name } => (path, name.capacity().checked_mul(2)),
+            Self::Embedded {
+                path, name, ranges, ..
+            } => (
+                path,
+                name.capacity().checked_mul(2).and_then(|bytes| {
+                    bytes.checked_add(
+                        ranges
+                            .as_ref()
+                            .map_or(Some(0), |ranges| ranges.capacity().checked_mul(32))?,
+                    )
+                }),
+            ),
             Self::Carrier { path, ranges } => (
                 path,
                 ranges
@@ -98,6 +116,7 @@ struct QueuedInput {
 
 struct KnownSource {
     carrier: bool,
+    embedded_start: Option<u64>,
     promoted: BTreeMap<u32, assessment::ViewReservation>,
     // Retained source, dirty and error bookkeeping outlives queued work,
     // including failed publications which never entered the engine.
@@ -233,6 +252,31 @@ impl Coordinator {
         )
     }
 
+    pub(super) fn enqueue_embedded(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+        name: String,
+        ranges: Option<Vec<std::ops::Range<u64>>>,
+        start: u64,
+    ) -> EngineResult<()> {
+        self.enqueue_input(
+            job_id,
+            source,
+            PendingInput::Embedded {
+                path,
+                name,
+                ranges,
+                start,
+            },
+        )
+    }
+
+    pub(super) fn embedded_start(&self, job_id: JobId, source: SourceId) -> Option<u64> {
+        self.jobs.get(&job_id)?.known.get(&source)?.embedded_start
+    }
+
     pub(super) fn enqueue_file(
         &mut self,
         job_id: JobId,
@@ -284,24 +328,29 @@ impl Coordinator {
         set: par3_rs::InputSetId,
         path: PathBuf,
     ) -> EngineResult<()> {
-        let Some((_, view)) = self
-            .assessments(job_id)
-            .find(|(id, view)| *id == set && view.status == par3_rs::session::RepairStatus::Ready)
-        else {
+        let Some((_, view)) = self.assessments(job_id).find(|(id, view)| {
+            *id == set
+                && (view.status == par3_rs::session::RepairStatus::Ready
+                    || (view.status == par3_rs::session::RepairStatus::Complete
+                        && view
+                            .embedded_source
+                            .is_some_and(|source| self.embedded_start(job_id, source).is_some())))
+        }) else {
             return Err(EngineError::InvalidState("PAR3 repair is not ready"));
         };
         // Reserve before execution can install anything. Include the native
         // report, partial-error temporary paths, and reconciliation copies.
-        let outputs =
-            view.files
-                .iter()
-                .filter(|file| !file.complete)
-                .try_fold(2048usize, |bytes, file| {
-                    bytes
-                        .checked_add(4096)?
-                        .checked_add(path.capacity().checked_mul(16)?)?
-                        .checked_add(file.path.len().checked_mul(16)?)
-                });
+        let replacing_carrier = view.status == par3_rs::session::RepairStatus::Complete;
+        let outputs = view
+            .files
+            .iter()
+            .filter(|file| replacing_carrier || !file.complete)
+            .try_fold(2048usize, |bytes, file| {
+                bytes
+                    .checked_add(4096)?
+                    .checked_add(path.capacity().checked_mul(16)?)?
+                    .checked_add(file.path.len().checked_mul(16)?)
+            });
         let outputs = outputs.ok_or(EngineError::ResourceLimit("PAR3 repair result paths"))?;
         self.check_pending_capacity(job_id, WorkKey::Repair(set))?;
         let input = PendingInput::Repair { set, path };
@@ -417,6 +466,7 @@ impl Coordinator {
                 source,
                 KnownSource {
                     carrier: true,
+                    embedded_start: None,
                     promoted: BTreeMap::new(),
                     _reservation: assessment::ViewReservation::acquire(512)?,
                 },
@@ -570,15 +620,24 @@ impl Coordinator {
         if !job.known.contains_key(&source) && job.known.len() >= MAX_PENDING {
             return Err(EngineError::ResourceLimit("PAR3 known sources"));
         }
-        let carrier = matches!(input, PendingInput::Carrier { .. });
+        let carrier = matches!(
+            input,
+            PendingInput::Carrier { .. } | PendingInput::Embedded { .. }
+        );
+        let embedded_start = match &input {
+            PendingInput::Embedded { start, .. } => Some(*start),
+            _ => None,
+        };
         if let Some(known) = job.known.get_mut(&source) {
             known.carrier = carrier;
+            known.embedded_start = embedded_start;
         } else {
             let reservation = assessment::ViewReservation::acquire(512)?;
             job.known.insert(
                 source,
                 KnownSource {
                     carrier,
+                    embedded_start,
                     promoted: BTreeMap::new(),
                     _reservation: reservation,
                 },
@@ -753,6 +812,12 @@ impl Coordinator {
                             };
                             runtime.publish_file(source, path, name, ranges)
                         }),
+                    PendingInput::Embedded {
+                        path,
+                        name,
+                        ranges,
+                        start,
+                    } => runtime.scan_embedded(source, path, name, ranges, start),
                     PendingInput::Carrier { path, ranges } => {
                         runtime.scan_file(source, path, ranges)
                     }

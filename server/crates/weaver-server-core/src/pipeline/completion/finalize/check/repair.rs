@@ -1748,6 +1748,13 @@ impl Pipeline {
             return SetGateOutcome::Waiting;
         };
         set_runtime.settled = true;
+        set_runtime.settled_via_strong_decode = matches!(
+            &reason,
+            Par2SetSettlementReason::Clean {
+                verification_mode: CleanPar2VerificationMode::StrongDecode,
+                ..
+            }
+        );
         set_runtime.failure = None;
         set_runtime.alternate_repair = None;
         set_runtime.post_verdict_reconcile_attempts = 0;

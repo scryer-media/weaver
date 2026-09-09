@@ -1632,6 +1632,8 @@ pub(super) struct Par2SetRuntime {
     /// and reconciliation latch therefore live with the set rather than with
     /// the job.
     pub(super) settled: bool,
+    /// Integrity was deferred to archive extraction instead of a PAR2 hash pass.
+    pub(in crate::pipeline) settled_via_strong_decode: bool,
     /// A final answer that could not verify or repair this set.  The gate keeps
     /// processing later sets before turning these failures into the job result.
     pub(super) failure: Option<String>,
@@ -3276,6 +3278,8 @@ pub struct Pipeline {
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.
     par3_runtime: Option<Box<repair::par3::work::Coordinator>>,
+    /// Bounded archive framing probes, retired with each job and rebuilt on restore.
+    par3_inside_probes: repair::par3::inside::Probes,
     #[cfg(test)]
     pub(super) par2_binding_resolver_calls: std::sync::atomic::AtomicU64,
     /// Direct-store routing state: admitted archive sets, their routers and

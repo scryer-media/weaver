@@ -225,6 +225,7 @@ impl Pipeline {
             self.uu_park_requeues
                 .retain(|segment_id, _| segment_id.file_id != file_id);
             self.file_prefix_16k.remove(&file_id);
+            self.par3_inside_probes.remove(file_id);
             self.file_declared_size.remove(&file_id);
         }
 

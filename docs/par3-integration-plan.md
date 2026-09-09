@@ -315,12 +315,54 @@ This establishes case correctness, not performance acceptance. Newly added
 embedded-archive coverage remains a separate incomplete gate. The existing
 unreleased 0.11.3 version covers this change; dependencies and PAR2 limits did not change.
 
+Embedded ZIP, ZIP64 and 7z discovery now reads bounded archive framing on blocking
+workers, reuses the CRC-validated 7z start header, and hashes candidate packets
+through the retained scanner. The framing probe does not initialize Windows
+whole-file source hashing. Probe records are charged to the existing host budget
+and retired with the job. Completion probes also cover incomplete and restored
+archives; native publication still exposes only committed article ranges.
+
+Embedded sources remain archives while also carrying packets. Protected damage
+uses the native `SelfRepairPlan` and a separate staging directory; protected bytes
+and container framing are verified before installation. Available authenticated
+packets are preserved in an explicitly requested replacement carrier, with no
+additional parity requested solely for completeness. Replacement emits an
+operator warning rather than claiming byte-for-byte restoration. A hole confined
+to the unprotected packet gap takes the same verified replacement path before
+assembly completion. Ordinary intact archives are not rewritten. Nested embedded
+destinations are currently refused explicitly; renamed placement, larger damaged
+framing fallback, embedded restart/cancellation and durable warning surfaces
+remain part of the open MVP gates.
+
+The new official-reference insertion harness covers each of the three containers
+with clean bytes, corrupt body, corrupt header, a recoverable interior article
+hole, missing protection-only bytes and insufficient recovery. Successful cases
+require native PAR3 authentication and byte-exact extracted members; unrecoverable
+cases must fail without publishing extracted output. Ordinary ZIP payloads and
+comments containing the PAR3 signature do not admit a carrier. Fixture provenance
+records the reference executable and input/output hashes. The existing prospective
+0.11.3 version covers the integration, with no dependency or PAR2 limit changes.
+All 18 embedded cases pass. The combined native matrix passes all 160 leaves,
+and three repeated runs pass all 12 selected mixed ZIP/ZIP64 cases after the
+native-versus-deferred PAR2 settlement fix described below. Final formatting,
+all-target/all-feature workspace Clippy, all 3,859 workspace Nextest cases
+(13 existing skips), and all three doctests pass. The clean-set guard also
+checks that authenticated matrix identity survives a clean assessment with
+no recovery requirements. This remains correctness evidence rather than
+throughput acceptance or completion of the remaining MVP gates.
+
 Standalone mixed-format coordination now gives PAR2 its first repair attempt and
 excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence
 only affected PAR3 source evidence, then republish installed bytes for native
 verification. After PAR2 exhausts recovery, PAR3 may repair shared sources; affected
 PAR2 sets reopen and perform their own verification. Current, conflicting native
-verdicts refuse further writes and delivery. Ten real-process scenarios cover
+verdicts refuse further writes and delivery. A `strong_decode` settlement defers
+integrity to archive extraction and is tracked separately from a PAR2 hash pass.
+Current, bound PAR3 damage reopens only overlapping deferred claims and forces
+the selected PAR2 set through its own authoritative verification. This fixes a
+mixed ZIP/ZIP64 timing failure without weakening native conflict checks. Reopening
+claims performs no source reads and preserves unrelated settled sets.
+Ten real-process scenarios cover
 independent clean/repair jobs, preservation of an unrelated PAR2 failure,
 shared clean/preferred/fallback/insufficient jobs, and conflicting official
 descriptions in both directions and after fallback. Fallback eligibility is a

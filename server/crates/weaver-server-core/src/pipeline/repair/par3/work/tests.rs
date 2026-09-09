@@ -320,6 +320,52 @@ async fn repair_results_keep_their_path_lease_through_handback_and_partial_failu
 }
 
 #[test]
+fn discovery_hint_cannot_authorize_rewriting_a_clean_standalone_set() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut coordinator, set) = ready_inline_repair(root.path());
+    let job = coordinator.jobs.get_mut(&JobId(1)).unwrap();
+    let runtime = job.runtime.as_mut().unwrap();
+    let path = root.path().join("b.txt");
+    std::fs::write(&path, b"qrstuvwxyz").unwrap();
+    runtime
+        .publish_file(
+            SourceId(3),
+            path,
+            "b.txt".into(),
+            std::iter::once(0..10).collect(),
+        )
+        .unwrap();
+    runtime.assess().unwrap();
+    assert!(runtime.sets[&set].cauchy_matrix.is_some());
+    assert!(
+        runtime.sets[&set]
+            .view
+            .as_ref()
+            .unwrap()
+            .requirements
+            .is_empty()
+    );
+    job.known.insert(
+        SourceId(1),
+        KnownSource {
+            carrier: true,
+            embedded_start: Some(0),
+            promoted: BTreeMap::new(),
+            _reservation: assessment::ViewReservation::acquire(512).unwrap(),
+        },
+    );
+    let (_, view) = coordinator.assessments(JobId(1)).next().unwrap();
+    assert_eq!(view.status, par3_rs::session::RepairStatus::Complete);
+    assert_eq!(view.embedded_source, None);
+    assert!(matches!(
+        coordinator.request_repair(JobId(1), set, root.path().to_owned()),
+        Err(EngineError::InvalidState(_))
+    ));
+    assert!(coordinator.in_flight.is_empty());
+    assert!(!coordinator.has_work(JobId(1)));
+}
+
+#[test]
 fn excessive_repair_result_paths_are_rejected_before_dispatch_or_installation() {
     let root = tempfile::tempdir().unwrap();
     let (mut coordinator, set) = ready_inline_repair(root.path());

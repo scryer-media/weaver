@@ -247,6 +247,37 @@ async fn par2_installation_fences_par3_evidence_and_reverifies_only_the_rewritte
     assert!(runtime.source_verified(job_id, clean));
     let reads = runtime.source_verifications(job_id);
     let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+    // Archive-type shortcuts can settle before an extraction failure arrives.
+    // Native PAR3 damage must reopen both overlapping claims without reading
+    // sources, then require PAR2's own authoritative pass.
+    for id in pipeline.par2_servable_set_ids(job_id) {
+        pipeline.settle_par2_set(job_id, id,
+            crate::pipeline::completion::finalize::check::Par2SetSettlementReason::Clean {
+                slice_size: 2048,
+                verification_mode: crate::pipeline::completion::finalize::check::CleanPar2VerificationMode::StrongDecode,
+            }).await;
+    }
+    assert!(pipeline.par2_verified.contains(&job_id));
+    assert!(pipeline.reopen_par2_strong_decode_claims_on_par3_damage(job_id));
+    assert!(!pipeline.par2_verified.contains(&job_id));
+    assert!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .sets
+            .values()
+            .all(|set| !set.settled)
+    );
+    assert!(pipeline.par3_requires_authoritative_par2(job_id));
+    assert!(!pipeline.reopen_par2_strong_decode_claims_on_par3_damage(job_id));
+    assert_eq!(
+        pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .source_verifications(job_id),
+        reads
+    );
     let native = pipeline
         .par2_set_for(job_id, set_id)
         .unwrap()

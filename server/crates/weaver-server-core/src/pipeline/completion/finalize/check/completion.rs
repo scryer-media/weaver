@@ -301,6 +301,14 @@ impl Pipeline {
             }
         }
 
+        self.discover_embedded_par3_at_completion(job_id).await;
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| matches!(state.status, JobStatus::Failed { .. }))
+        {
+            return;
+        }
         if let Err(error) = self.refresh_par3_sources(job_id) {
             self.fail_job(job_id, format!("PAR3 source refresh failed: {error}"));
             return;
@@ -593,6 +601,7 @@ impl Pipeline {
         let known_archive_damage =
             self.archive_extraction_held_for_known_damage(job_id) || known_file_crc_damage;
         let authoritative_par2_verification_owed = rar_par2_repair_ready
+            || self.par3_requires_authoritative_par2(job_id)
             || known_archive_damage
             || has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)

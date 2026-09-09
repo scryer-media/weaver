@@ -232,6 +232,18 @@ impl Par3Job {
             .get_mut(&id)
             .ok_or(EngineError::InvalidState("unknown PAR3 set"))?;
         set.view = None;
+        if let Some(layout) = set.native.layout()?
+            && layout.files().iter().any(|file| {
+                file.extents
+                    .iter()
+                    .any(|extent| matches!(extent.kind, par3_rs::layout::ExtentKind::Unprotected))
+            })
+        {
+            let matrix = set.cauchy_matrix.ok_or(EngineError::InvalidState(
+                "embedded recovery matrix unavailable",
+            ))?;
+            return inside::repair(&mut set.native, matrix, output, &self.options);
+        }
         set.native.execute(Par3RepairRequest {
             output,
             backup: false,
@@ -246,6 +258,32 @@ impl Par3Job {
         source: SourceId,
         path: PathBuf,
         ranges: Option<Vec<std::ops::Range<u64>>>,
+    ) -> EngineResult<()> {
+        self.scan_file_from(source, path, ranges, 0)
+    }
+
+    fn scan_embedded(
+        &mut self,
+        source: SourceId,
+        path: PathBuf,
+        name: String,
+        ranges: Option<Vec<std::ops::Range<u64>>>,
+        start: u64,
+    ) -> EngineResult<()> {
+        if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
+            return Err(EngineError::ResourceLimit("PAR3 source bindings"));
+        }
+        self.bindings.retain(|_, bound| *bound != source);
+        self.bindings.insert(name, source);
+        self.scan_file_from(source, path, ranges, start)
+    }
+
+    fn scan_file_from(
+        &mut self,
+        source: SourceId,
+        path: PathBuf,
+        ranges: Option<Vec<std::ops::Range<u64>>>,
+        start: u64,
     ) -> EngineResult<()> {
         let access = disk_source(source, path.clone(), &self.options)?;
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
@@ -285,10 +323,9 @@ impl Par3Job {
             }
         }
         self.publish_carrier(source, access, snapshot.len, ranges, false)?;
-        self.carriers
-            .get_mut(&source)
-            .expect("published carrier")
-            .path = Some(path);
+        let carrier = self.carriers.get_mut(&source).expect("published carrier");
+        carrier.path = Some(path);
+        carrier.scanner.seek(start)?;
         self.scan(source)
     }
 
@@ -421,10 +458,51 @@ impl Pipeline {
             .file_prefix_16k
             .get(&file_id)
             .is_some_and(|prefix| prefix.starts_with(par3_rs::MAGIC));
-        if !file.is_complete() {
+        if !file.is_complete() && self.job_has_pending_download_pipeline_work(job_id) {
             return;
         }
-        let carrier = matches!(file.role(), FileRole::Par3 { .. }) || signature;
+        let embedded = if !self.par3_inside_probes.contains(file_id)
+            && !signature
+            && matches!(
+                file.role(),
+                FileRole::ZipArchive | FileRole::SevenZipArchive
+            ) {
+            let path = state
+                .working_dir
+                .join(self.current_filename_for_file(job_id, file));
+            if let Err(error) = self.par3_inside_probes.insert(file_id) {
+                self.fail_job(
+                    job_id,
+                    format!("Embedded PAR3 discovery budget exhausted: {error}"),
+                );
+                return;
+            }
+            match tokio::task::spawn_blocking(move || inside::probe(path)).await {
+                Ok(Ok(start)) => start,
+                Ok(Err(error)) => {
+                    self.fail_job(job_id, format!("Embedded PAR3 discovery failed: {error}"));
+                    return;
+                }
+                Err(error) => {
+                    self.fail_job(
+                        job_id,
+                        format!("Embedded PAR3 discovery worker failed: {error}"),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let carrier = matches!(
+            self.jobs[&job_id]
+                .assembly
+                .file(file_id)
+                .expect("completed file")
+                .role(),
+            FileRole::Par3 { .. }
+        ) || signature
+            || embedded.is_some();
         let admitted = self
             .par3_runtime
             .as_ref()
@@ -438,7 +516,7 @@ impl Pipeline {
         self.par3_runtime.get_or_insert_with(|| {
             Box::new(work::Coordinator::new(self.repair_work_done_tx.clone()))
         });
-        if let Err(error) = self.enqueue_par3_file(job_id, file_id) {
+        if let Err(error) = self.enqueue_par3_file_with_inside(job_id, file_id, embedded) {
             self.fail_job(job_id, format!("PAR3 discovery failed: {error}"));
             return;
         }
@@ -478,7 +556,49 @@ impl Pipeline {
         }
     }
 
+    pub(in crate::pipeline) async fn discover_embedded_par3_at_completion(
+        &mut self,
+        job_id: JobId,
+    ) {
+        if self.job_has_pending_download_pipeline_work(job_id) {
+            return;
+        }
+        loop {
+            let candidate = self.jobs.get(&job_id).and_then(|state| {
+                state
+                    .assembly
+                    .files()
+                    .find(|file| {
+                        matches!(
+                            file.role(),
+                            FileRole::ZipArchive | FileRole::SevenZipArchive
+                        ) && !self.par3_inside_probes.contains(file.file_id())
+                            && (file.is_complete()
+                                || (0..file.total_segments()).any(|part| file.has_segment(part)))
+                    })
+                    .map(|file| file.file_id())
+            });
+            let Some(file) = candidate else {
+                return;
+            };
+            self.try_load_par3_metadata(job_id, file).await;
+            // Budget errors must not turn completion into a retry loop.
+            if !self.par3_inside_probes.contains(file) {
+                return;
+            }
+        }
+    }
+
     fn enqueue_par3_file(&mut self, job_id: JobId, file_id: NzbFileId) -> EngineResult<()> {
+        self.enqueue_par3_file_with_inside(job_id, file_id, None)
+    }
+
+    fn enqueue_par3_file_with_inside(
+        &mut self,
+        job_id: JobId,
+        file_id: NzbFileId,
+        embedded: Option<u64>,
+    ) -> EngineResult<()> {
         if self
             .par3_runtime
             .as_ref()
@@ -499,7 +619,13 @@ impl Pipeline {
         let name = self.current_filename_for_file(job_id, file);
         let path = state.working_dir.join(&name);
         let source = SourceId(u64::from(file_id.file_index));
-        let carrier = matches!(file.role(), FileRole::Par3 { .. })
+        let embedded = embedded.or_else(|| {
+            self.par3_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.embedded_start(job_id, source))
+        });
+        let carrier = embedded.is_some()
+            || matches!(file.role(), FileRole::Par3 { .. })
             || self
                 .file_prefix_16k
                 .get(&file_id)
@@ -548,7 +674,20 @@ impl Pipeline {
             virtual_volume = virtual_volume.is_some(), complete_disk_image, ranges = ?ranges,
             "PAR3 committed source publication queued");
         let coordinator = self.par3_runtime.as_mut().expect("admitted PAR3 job");
-        if carrier && complete_disk_image {
+        if let Some(start) = embedded {
+            coordinator.enqueue_embedded(
+                job_id,
+                source,
+                path,
+                name,
+                if complete_disk_image {
+                    None
+                } else {
+                    Some(ranges)
+                },
+                start,
+            )?;
+        } else if carrier && complete_disk_image {
             coordinator.enqueue_complete_carrier(job_id, source, path)?;
         } else if carrier {
             coordinator.enqueue_carrier_ranges(job_id, source, path, ranges)?;
@@ -780,6 +919,7 @@ mod completion;
 mod coordination;
 #[cfg(windows)]
 mod disk_windows;
+pub(in crate::pipeline) mod inside;
 mod readback;
 pub(in crate::pipeline) mod virtual_source;
 pub(in crate::pipeline) mod work;

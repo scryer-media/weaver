@@ -35,12 +35,16 @@ pub(in crate::pipeline) struct AssessmentView {
     pub status: RepairStatus,
     pub files: Vec<AssessedFile>,
     pub requirements: Vec<RecoveryRequirement>,
+    pub(super) embedded_source: Option<SourceId>,
     pub(super) verified_sources: std::collections::BTreeSet<SourceId>,
     _reservation: ViewReservation,
 }
 
 impl AssessmentView {
-    fn capture(assessment: &RepairAssessment) -> EngineResult<Self> {
+    fn capture(
+        assessment: &RepairAssessment,
+        layout: Option<&par3_rs::layout::BlockLayout>,
+    ) -> EngineResult<Self> {
         let cost = assessment.files.iter().try_fold(512usize, |bytes, file| {
             bytes
                 .checked_add(320)?
@@ -62,6 +66,14 @@ impl AssessmentView {
             status: assessment.status,
             files: assessment.files.clone(),
             requirements: assessment.requirements.clone(),
+            embedded_source: layout
+                .filter(|layout| {
+                    layout.files().len() == 1
+                        && layout.files()[0].extents.iter().any(|extent| {
+                            matches!(extent.kind, par3_rs::layout::ExtentKind::Unprotected)
+                        })
+                })
+                .and_then(|_| assessment.files.first().and_then(|file| file.source)),
             verified_sources: assessment
                 .files
                 .iter()
@@ -76,6 +88,7 @@ impl AssessmentView {
 pub(super) struct SetSession {
     pub native: par3_rs::Par3RepairSession,
     pub view: Option<AssessmentView>,
+    pub cauchy_matrix: Option<par3_rs::Fingerprint>,
 }
 
 impl SetSession {
@@ -87,13 +100,23 @@ impl SetSession {
         Ok(Self {
             native: par3_rs::Par3RepairSession::new(id, Arc::new(sources), options)?,
             view: None,
+            cauchy_matrix: None,
         })
     }
 
     pub fn merge(&mut self, packet: IngestedPacket) -> EngineResult<()> {
         // Clear the actor's old answer even when native admission fails partway.
         let previous = self.view.take();
+        let cauchy_matrix = packet
+            .metadata()
+            .filter(|packet| matches!(packet.body(), par3_rs::packet::PacketBody::CauchyMatrix(_)))
+            .map(|packet| packet.hash());
         let effect = self.native.merge(packet)?;
+        // Complete protected data has no recovery requirements. Preserve the
+        // authenticated matrix identity for explicit carrier-only replacement.
+        if self.cauchy_matrix.is_none() {
+            self.cauchy_matrix = cauchy_matrix;
+        }
         if matches!(effect, MergeEffect::Replay) {
             self.view = previous;
         }
@@ -102,7 +125,11 @@ impl SetSession {
 
     pub fn assess(&mut self) -> EngineResult<()> {
         self.view = None;
-        self.view = Some(AssessmentView::capture(self.native.assess()?)?);
+        let layout = self.native.layout()?;
+        self.view = Some(AssessmentView::capture(
+            self.native.assess()?,
+            layout.as_deref(),
+        )?);
         Ok(())
     }
 

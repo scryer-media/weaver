@@ -34,6 +34,10 @@ impl Pipeline {
                 return true;
             }
         }
+        if self.reopen_par2_strong_decode_claims_on_par3_damage(job_id) {
+            self.schedule_job_completion_check(job_id);
+            return true;
+        }
         let Some(runtime) = self.par3_runtime.as_ref() else {
             return false;
         };
@@ -60,11 +64,33 @@ impl Pipeline {
         }
         let next = runtime
             .assessments(job_id)
-            .find(|(_, view)| view.status != RepairStatus::Complete)
+            .find(|(_, view)| {
+                view.status != RepairStatus::Complete
+                    || view.files.iter().any(|file| {
+                        file.source.is_some_and(|source| {
+                            view.embedded_source == Some(source)
+                                && runtime.embedded_start(job_id, source).is_some()
+                                && u32::try_from(source.0).ok().is_some_and(|file_index| {
+                                    self.jobs[&job_id]
+                                        .assembly
+                                        .file(NzbFileId { job_id, file_index })
+                                        .is_some_and(|file| !file.is_complete())
+                                })
+                        })
+                    })
+            })
             .map(|(id, view)| {
+                // Intact protected bytes with a hole in the embedded packet
+                // gap still need an explicit replacement carrier before the
+                // assembly can claim a complete archive. Request no extra parity.
+                let status = if view.status == RepairStatus::Complete {
+                    RepairStatus::Ready
+                } else {
+                    view.status
+                };
                 (
                     id,
-                    view.status,
+                    status,
                     self.par3_damage_overlaps_settled_par2(job_id, view),
                 )
             });
