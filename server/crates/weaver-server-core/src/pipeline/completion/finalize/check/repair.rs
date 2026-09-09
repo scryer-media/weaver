@@ -1879,7 +1879,7 @@ impl Pipeline {
     /// path has nothing this job can verify or repair.  The binding condition
     /// is deliberately conservative: an empty but known assembly file still
     /// takes the ordinary pass, because it may be waiting for recoverable data.
-    pub(super) fn par2_set_is_absent_from_job(
+    pub(in crate::pipeline) fn par2_set_is_absent_from_job(
         &self,
         job_id: JobId,
         set_id: par2_rs::RecoverySetId,
@@ -1891,8 +1891,8 @@ impl Pipeline {
             return false;
         };
         let has_assembly_binding = state.assembly.files().any(|file| {
-            self.resolve_par2_file_binding(file.file_id())
-                .is_some_and(|binding| binding.recovery_set_id == set_id)
+            self.resolve_par2_file_binding_in_set(file.file_id(), set_id)
+                .is_some()
         });
         if has_assembly_binding {
             return false;
@@ -1997,7 +1997,9 @@ impl Pipeline {
         let runtime = self.par2_runtime(job_id)?;
         let set_ids = runtime.ordered_set_ids();
         if set_ids.is_empty() {
-            return (!self.par2_metadata_candidate_indices(job_id).is_empty()).then(|| {
+            return (!self.par2_metadata_candidate_indices(job_id).is_empty()
+                && !self.par3_verifies_all_payloads(job_id))
+            .then(|| {
                 "PAR2 metadata discovery exhausted without finding a recovery set".to_string()
             });
         }

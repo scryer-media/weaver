@@ -269,8 +269,11 @@ impl Pipeline {
             // once alternate carriers authenticated and verified the set.
             self.jobs[&job_id].assembly.files().any(|file| {
                 !file.is_complete()
-                    && !file.role().is_recovery()
-                    && !matches!(file.role(), weaver_model::files::FileRole::Par3 { .. })
+                    && !matches!(
+                        file.role(),
+                        weaver_model::files::FileRole::Par2 { .. }
+                            | weaver_model::files::FileRole::Par3 { .. }
+                    )
             })
         } else {
             complete_data_files < total_data_files

@@ -3,6 +3,76 @@ use super::*;
 const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
 
 #[tokio::test]
+async fn missing_par2_metadata_requires_current_par3_evidence_for_every_payload() {
+    for unprotected in [false, true] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3113);
+        let mut files = vec![
+            ("a.bin", (0..5000u32).map(|i| (i * 7 + 3) as u8).collect()),
+            ("b.txt", b"qrstuvwxyz".to_vec()),
+            (
+                "sub/c.bin",
+                (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+            ),
+            ("set.par3", INDEX.to_vec()),
+        ];
+        if unprotected {
+            files.push(("unprotected.bin", b"not covered by the PAR3 set".to_vec()));
+        }
+        let mut descriptions: Vec<_> = files
+            .iter()
+            .map(|(name, bytes)| ((*name).into(), bytes.len() as u32))
+            .collect();
+        descriptions.push(("missing.par2".into(), 100));
+        let mut spec = standalone_job_spec("Missing PAR2 metadata", &descriptions);
+        for file in &mut spec.files {
+            file.role = FileRole::from_filename(&file.filename);
+        }
+        let working = insert_active_job(&mut pipeline, job_id, spec).await;
+        tokio::fs::create_dir(working.join("sub")).await.unwrap();
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+        }
+        assert!(!pipeline.par3_verifies_all_payloads(job_id));
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 3,
+                },
+            )
+            .await;
+        settle_par3(&mut pipeline, job_id).await;
+        let runtime = pipeline.par3_runtime.as_ref().unwrap();
+        assert!(runtime.verified(job_id));
+        let reads = runtime.source_verifications(job_id);
+        for _ in 0..3 {
+            assert_eq!(pipeline.par3_verifies_all_payloads(job_id), !unprotected);
+        }
+        assert_eq!(
+            pipeline
+                .par3_runtime
+                .as_ref()
+                .unwrap()
+                .source_verifications(job_id),
+            reads,
+            "completion policy must consume current evidence without reading sources"
+        );
+        assert!(!pipeline.par2_verified.contains(&job_id));
+        pipeline.invalidate_par3_source_write(NzbFileId {
+            job_id,
+            file_index: 0,
+        });
+        assert!(
+            !pipeline.par3_verifies_all_payloads(job_id),
+            "a source write must withdraw the alternative completion verdict"
+        );
+    }
+}
+
+#[tokio::test]
 async fn alternate_repair_requires_a_typed_native_reason_for_every_failed_set() {
     use crate::pipeline::repair::backend::AlternateRepairReason;
     let root = TempDir::new().unwrap();
@@ -125,6 +195,10 @@ async fn par2_installation_fences_par3_evidence_and_reverifies_only_the_rewritte
         2048,
     );
     files.push(("set.par2", par2));
+    files.push((
+        "sibling.par2",
+        build_test_par2_index_for_files(&[("a.bin", &original)], 2048),
+    ));
     files[0].1[2300] ^= 1;
     let mut spec = standalone_job_spec(
         "Cross-format source fence",
@@ -141,15 +215,21 @@ async fn par2_installation_fences_par3_evidence_and_reverifies_only_the_rewritte
     for (index, (name, bytes)) in files.iter().enumerate() {
         write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
     }
-    pipeline
-        .try_load_par2_metadata(
-            job_id,
-            NzbFileId {
+    for file_index in [4, 5] {
+        pipeline
+            .try_load_par2_metadata(job_id, NzbFileId { job_id, file_index })
+            .await;
+    }
+    assert_eq!(pipeline.par2_servable_set_ids(job_id).len(), 2);
+    assert!(
+        pipeline
+            .resolve_par2_file_binding(NzbFileId {
                 job_id,
-                file_index: 4,
-            },
-        )
-        .await;
+                file_index: 0,
+            })
+            .is_none(),
+        "handoff must resolve the selected set when the global binding is ambiguous"
+    );
     pipeline
         .try_load_par3_metadata(
             job_id,

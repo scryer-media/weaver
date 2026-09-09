@@ -299,12 +299,40 @@ both native verdicts outstanding; an exhausted native PAR2 verdict can hand off
 without a disk-only reanalysis. Repaired virtual source lengths use committed
 decoded coverage, since completion progress is in NZB encoded units. The harness
 also waits for HTTP startup before inserting its fixture API key, avoiding a
-write racing SQLite initialization. Broader multi-set overlap coverage remains
-open. Validation passed formatting, all-target/all-feature Clippy, all 3,849
-workspace Nextest cases (13 existing skips), and three doctests. The full native
-matrix passes 129 leaves; the API-password restart case and two 65,538-block
-memory-limit cases remain failing. This slice continues the existing unreleased
-0.11.3 version.
+write racing SQLite initialization. That slice passed formatting,
+all-target/all-feature Clippy, all 3,849 workspace Nextest cases (13 existing
+skips), and three doctests. Its native matrix passed 129 leaves; the subsequent
+encrypted-password persistence fix above resolved the API-password restart failure.
+The two 65,538-block memory-limit cases remain open.
+
+Six additional native cases cover two distinct PAR2 sets sharing one PAR3 source:
+clean, PAR2-first repair, PAR3 fallback, and conflicts in both directions and after
+fallback. They exposed a handoff that used a globally ambiguous file binding when
+the active PAR2 set was known. Fencing and refresh now resolve that exact set;
+conflict detection checks every settled set. All six pass, and fallback requires
+fresh authoritative verification from both distinct PAR2 set IDs. The Rust
+regression also covers overlapping sets and still measures exactly one source
+verification after repair, with no clean sibling rereads. A second regression
+reproduced the same ambiguity in absent-set detection: an empty shared source
+could incorrectly skip both native sets. That check now uses the selected set's
+binding too; a known source remains that set's responsibility even without a disk
+image.
+
+Unavailable PAR2 metadata can no longer veto delivery after current authenticated
+PAR3 evidence verifies every payload. This exception never clears a parsed PAR2
+set's failure or turns PAR3 hashes into PAR2 checksums. Payloads outside the PAR3
+set and evidence invalidated by a write remain ineligible. Native clean/repair
+cases reproduce the previous failure and now pass; negative cases and a Rust
+regression cover unrelated verified sources, stale evidence and zero policy I/O.
+These changes continue the existing unreleased 0.11.3 version without new dependencies.
+Formatting, all-target/all-feature Clippy and all three doctests pass. The initial
+workspace sweep passed 3,854 tests and reported the previously reproduced
+exited-successfully process-handle leak in the disabled-script test. That test
+passed in isolation; the unchanged four-worker confirmation sweep passed all
+3,855 tests with 13 existing skips. Leak detection and assertions remain unchanged.
+The rebuilt native binary passes 140 of 142 E2E leaves, including all twenty mixed
+cases and the encrypted API-password restart. Only the two 65,538-block retained
+layout budget cases fail. Both remain enabled; the 64 MiB ceiling is unchanged.
 
 Still pending: incremental decode-to-publication wiring, positioned verification,
 embedded archives, evidence persistence and product surfaces. Rebuilt files currently

@@ -65,6 +65,23 @@ impl Pipeline {
         })
     }
 
+    /// An unavailable PAR2 index has no authenticated source descriptions to
+    /// settle. It may be omitted only when current PAR3 evidence covers every
+    /// payload; an unrelated verified set cannot excuse unverified bytes.
+    pub(in crate::pipeline) fn par3_verifies_all_payloads(&self, job_id: JobId) -> bool {
+        let Some(runtime) = self.par3_runtime.as_ref() else {
+            return false;
+        };
+        runtime.verified(job_id)
+            && self.jobs.get(&job_id).is_some_and(|state| {
+                state.assembly.files().all(|file| {
+                    matches!(file.role(), FileRole::Par2 { .. } | FileRole::Par3 { .. })
+                        || runtime
+                            .source_verified(job_id, SourceId(u64::from(file.file_id().file_index)))
+                })
+            })
+    }
+
     pub(super) fn rearm_par2_after_par3_installations(
         &mut self,
         job_id: JobId,
@@ -105,13 +122,18 @@ impl Pipeline {
             let Ok(file_index) = u32::try_from(source.0) else {
                 return false;
             };
-            let Some(binding) = self.resolve_par2_file_binding(NzbFileId { job_id, file_index })
-            else {
-                return false;
-            };
-            self.par2_runtime(job_id)
-                .and_then(|runtime| runtime.set_runtime(binding.recovery_set_id))
-                .is_some_and(|set| set.settled && set.failure.is_none())
+            self.par2_runtime(job_id).is_some_and(|runtime| {
+                runtime.sets.iter().any(|(set_id, set)| {
+                    set.settled
+                        && set.failure.is_none()
+                        && self
+                            .resolve_par2_file_binding_in_set(
+                                NzbFileId { job_id, file_index },
+                                *set_id,
+                            )
+                            .is_some()
+                })
+            })
         })
     }
 
@@ -165,8 +187,7 @@ impl Pipeline {
         let mut files = Vec::with_capacity(count);
         for file in state.assembly.files() {
             let id = file.file_id();
-            if let Some(binding) = self.resolve_par2_file_binding(id)
-                && binding.recovery_set_id == set_id
+            if let Some(binding) = self.resolve_par2_file_binding_in_set(id, set_id)
                 && include(binding.par2_file_id)
             {
                 files.push(id);

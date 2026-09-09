@@ -44,14 +44,25 @@ func TestPar3MixedE2E(t *testing.T) {
 	for _, scenario := range []struct {
 		name                                            string
 		overlap, damage, omitPar2Recovery, insufficient bool
-		conflict, postPar2Original                      bool
+		conflict, postPar2Original, secondPar2          bool
+		missingPar2Metadata                             bool
 	}{
 		{name: "independent-clean"},
 		{name: "independent-repair", damage: true},
 		{name: "independent-par2-failure", damage: true, omitPar2Recovery: true},
+		{name: "independent-missing-par2-metadata-clean", omitPar2Recovery: true, missingPar2Metadata: true},
+		{name: "independent-missing-par2-metadata-repair", damage: true, omitPar2Recovery: true, missingPar2Metadata: true},
 		{name: "overlap-clean", overlap: true},
 		{name: "overlap-prefer-par2", overlap: true, damage: true},
 		{name: "overlap-fallback", overlap: true, damage: true, omitPar2Recovery: true},
+		{name: "overlap-missing-par2-metadata-clean", overlap: true, omitPar2Recovery: true, missingPar2Metadata: true},
+		{name: "overlap-missing-par2-metadata-repair", overlap: true, damage: true, omitPar2Recovery: true, missingPar2Metadata: true},
+		{name: "overlap-two-par2-clean", overlap: true, secondPar2: true},
+		{name: "overlap-two-par2-prefer", overlap: true, damage: true, secondPar2: true},
+		{name: "overlap-two-par2-fallback", overlap: true, damage: true, omitPar2Recovery: true, secondPar2: true},
+		{name: "overlap-two-par2-conflict-par2-complete", overlap: true, conflict: true, postPar2Original: true, secondPar2: true},
+		{name: "overlap-two-par2-conflict-par3-complete", overlap: true, conflict: true, secondPar2: true},
+		{name: "overlap-two-par2-conflict-after-fallback", overlap: true, conflict: true, damage: true, omitPar2Recovery: true, secondPar2: true},
 		{name: "overlap-insufficient", overlap: true, damage: true, omitPar2Recovery: true, insufficient: true},
 		{name: "overlap-conflict-par2-complete", overlap: true, conflict: true, postPar2Original: true},
 		{name: "overlap-conflict-par3-complete", overlap: true, conflict: true},
@@ -119,8 +130,54 @@ func TestPar3MixedE2E(t *testing.T) {
 					}
 				}
 			}
+			if scenario.secondPar2 {
+				// A clean witness makes this a distinct PAR2 set protecting the
+				// same damaged payload. Every set must independently settle.
+				witness := []byte("a separately protected clean witness")
+				extra := map[string][]byte{"payload.bin": bytes.Clone(payload), "witness.bin": witness}
+				extraDir := filepath.Join(dir, "second-par2")
+				if err := os.MkdirAll(extraDir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				unpackParity(t, extraDir, extra)
+				hashes := map[string]string{}
+				for name, data := range extra {
+					hashes[name] = fmt.Sprintf("%x", sha256.Sum256(data))
+					if strings.HasSuffix(name, ".par2") && (!scenario.omitPar2Recovery || !strings.Contains(name, ".vol")) {
+						posted["secondary"+strings.TrimPrefix(name, "repair")] = data
+					}
+				}
+				posted["witness.bin"], expected["witness.bin"] = witness, witness
+				par3WriteJSON(t, filepath.Join(extraDir, "provenance.json"), map[string]any{
+					"binary": par2, "binarySHA256": fmt.Sprintf("%x", sha256.Sum256(par2Binary)),
+					"arguments":  []string{"create", "-q", "-s65536", "-c20", filepath.Join(extraDir, "repair.par2"), filepath.Join(extraDir, "payload.bin"), filepath.Join(extraDir, "witness.bin")},
+					"fileSHA256": hashes, "postedCarrierPrefix": "secondary",
+				})
+			}
 			slug := "par3-mixed-" + scenario.name
 			nzb := nntp.publishUnpack(slug, "clean", posted, nil)
+			if scenario.missingPar2Metadata {
+				// Keep the declared official index in the NZB, but make every
+				// article unavailable. Its filename cannot confer a native verdict.
+				nntp.mu.Lock()
+				missing := 0
+				for index, name := range unpackSortedNames(posted) {
+					if !strings.HasSuffix(name, ".par2") {
+						continue
+					}
+					for id, article := range nntp.articles {
+						if strings.HasPrefix(id, fmt.Sprintf("%s-%d-", slug, index)) {
+							article.missing = true
+							nntp.articles[id] = article
+							missing++
+						}
+					}
+				}
+				nntp.mu.Unlock()
+				if missing == 0 {
+					t.Fatal("fixture did not declare an unavailable PAR2 index")
+				}
+			}
 			if err := os.WriteFile(filepath.Join(root, slug+".nzb"), nzb, 0644); err != nil {
 				t.Fatal(err)
 			}
@@ -193,14 +250,46 @@ func TestPar3MixedE2E(t *testing.T) {
 					t.Fatalf("recovery carrier incorrectly reported as delivered payload: %s", line)
 				}
 			}
+			if scenario.missingPar2Metadata && !scenario.overlap {
+				if status != "FAILED" || !strings.Contains(failure, "PAR2 metadata discovery exhausted") {
+					t.Fatalf("unrelated PAR3 evidence excused unverified payload: status=%s error=%s log=%s", status, failure, logPath)
+				}
+				if scenario.damage && strings.Count(jobLog, "PAR3 repair installed verified outputs") != 1 {
+					t.Fatalf("independent PAR3 repair did not settle before metadata failure: log=%s", logPath)
+				}
+				for name := range expected {
+					if _, err := os.Stat(filepath.Join(root, "complete", slug, name)); !os.IsNotExist(err) {
+						t.Fatalf("unverified mixed job delivered %s: %v", name, err)
+					}
+				}
+				return
+			}
 			if scenario.damage && scenario.omitPar2Recovery && !scenario.insufficient {
 				installed := strings.Index(jobLog, "PAR3 repair installed verified outputs")
 				if installed < 0 || strings.Count(jobLog, "PAR3 repair installed verified outputs") != 1 {
 					t.Fatalf("fallback must install exactly one native repair: log=%s", logPath)
 				}
 				if scenario.overlap && !scenario.conflict {
-					if !strings.Contains(jobLog[installed:], "PAR2 clean set verification source") || !strings.Contains(jobLog[installed:], `verification_mode="authoritative"`) {
-						t.Fatalf("fallback omitted fresh native PAR2 verification: log=%s", logPath)
+					verifiedSets := map[string]bool{}
+					for _, line := range strings.Split(jobLog[installed:], "\n") {
+						if !strings.Contains(line, "PAR2 clean set verification source") || !strings.Contains(line, `verification_mode="authoritative"`) {
+							continue
+						}
+						for _, field := range strings.Fields(line) {
+							if id, ok := strings.CutPrefix(field, "recovery_set_id="); ok && id != "" {
+								verifiedSets[id] = true
+							}
+						}
+					}
+					wantSets := 1
+					if scenario.secondPar2 {
+						wantSets = 2
+					}
+					if scenario.missingPar2Metadata {
+						wantSets = 0
+					}
+					if len(verifiedSets) != wantSets {
+						t.Fatalf("fallback verified %d native PAR2 sets, want %d: log=%s", len(verifiedSets), wantSets, logPath)
 					}
 				}
 				if !scenario.overlap {

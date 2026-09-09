@@ -61,8 +61,9 @@ finalization without demotion. Encrypted RAR also loses an article in each of tw
 repairs to enter the shared direct output. Every single-byte
 corruption case must complete using only the first recovery packet; downloading
 extra parity to compensate for lost source-coverage metadata fails the test.
-The conventional/archive matrix passes all 25 PAR3 scenarios, alongside 54
-existing PAR2 archive regression cases. The two disguised-carrier cases post an
+The conventional/archive matrix covers 35 PAR3 scenarios, alongside 54
+existing PAR2 archive regression cases. Ten archive cases exercise PAR2-first and
+PAR3-fallback repair for each format, preserving RAR direct extraction. The two disguised-carrier cases post an
 official recovery volume as `.bin` and hold the damaged RAR until that carrier
 authenticates; both must keep direct extraction. This is correctness evidence, not a throughput
 or full integration readiness claim.
@@ -97,9 +98,10 @@ process. Both require byte-exact repaired archive installation before the crash;
 a published checkpoint must resume without refetching completed source volumes.
 The pre-persistence interruption may refetch because no checkpoint survived.
 
-The API-password case remains enabled and currently fails because initial job
-admission does not persist its password override. Its persistence fix awaits
-operator approval; successful NZB-password cases do not cover that gap.
+The API-password case also passes. It checks that the initial override is stored
+using the existing AES-256-GCM encryption envelope before restarting, then requires
+byte-exact repair and preserved direct extraction. Startup requires the same key;
+missing, incorrect or corrupted encryption keys/values are covered by Rust tests.
 
 Run these additional suites with the same binary variables:
 
@@ -108,11 +110,15 @@ go test -mod=readonly ./internal/weaver -run '^TestPar3(Geometry|DirectRestart|R
 ```
 
 `TestPar3MixedE2E` uses the same binary variables plus the installed official
-`par2` creator. Ten standalone-file cases cover independent sets, PAR2 preference
+`par2` creator. Twenty standalone-file cases cover independent sets, PAR2 preference
 for shared sources, PAR3 fallback after PAR2 recovery exhaustion, insufficient
-recovery and conflicting descriptions. Successful fallback requires both native
-verdicts, byte-exact output and healthy history; conflicts must terminate without
-output. A repaired independent PAR3 set cannot erase an unrelated PAR2 failure.
+recovery and conflicting descriptions. Overlapping PAR2 sets must independently
+verify after a shared PAR3 repair, and each set's verified data remains protected
+against conflicting rewrites. Successful fallback requires native verdicts,
+byte-exact output and healthy history; conflicts must terminate without output.
+When all advertised PAR2 metadata is unavailable, current PAR3 evidence must cover
+every payload before the job can succeed. An unrelated verified or repaired PAR3
+set cannot erase a PAR2 failure or excuse unverified payloads.
 Carrier request counts reject speculative PAR3 downloads when PAR2 can
 complete the repair. PAR2 creation arguments and binary/input/carrier hashes are
 recorded alongside the PAR3 reference provenance.
