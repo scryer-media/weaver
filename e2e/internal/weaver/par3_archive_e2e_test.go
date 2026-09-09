@@ -31,7 +31,7 @@ func TestPar3ArchiveE2E(t *testing.T) {
 	t.Logf("preserved artifacts: %s", root)
 	nntp := startUnpackNNTP(t)
 	url, logPath := startUnpackWeaver(t, bin, root, nntp.listener.Addr().(*net.TCPAddr).Port,
-		"WEAVER_RAR_DIRECT_STORE=true", "RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+		"WEAVER_RAR_DIRECT_STORE=true", "RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace,weaver_server_core::pipeline::direct_store::router=debug")
 	api := provisionUnpackAPI(t, root, url)
 	for _, format := range []string{"zip", "zip64", "split", "rar-store", "rar-encrypted"} {
 		t.Run(format, func(t *testing.T) {
@@ -41,13 +41,20 @@ func TestPar3ArchiveE2E(t *testing.T) {
 			}
 			files, payload, member, password := par3ArchiveFixture(t, dir, format)
 			par3ArchiveParity(t, reference, dir, files)
-			for _, mode := range []string{"clean", "corrupt", "missing"} {
+			modes := []string{"clean", "corrupt", "missing"}
+			if strings.HasPrefix(format, "rar-") {
+				modes = append(modes, "disguised-carrier")
+			}
+			if format == "rar-encrypted" {
+				modes = append(modes, "missing-two")
+			}
+			for _, mode := range modes {
 				t.Run(mode, func(t *testing.T) {
 					posted := make(map[string][]byte, len(files))
 					for name, data := range files {
 						posted[name] = bytes.Clone(data)
 					}
-					if mode == "corrupt" {
+					if mode == "corrupt" || mode == "disguised-carrier" {
 						for _, name := range unpackSortedNames(posted) {
 							if !strings.HasSuffix(name, ".par3") {
 								// Corrupt the protected archive before yEnc encoding so
@@ -57,18 +64,83 @@ func TestPar3ArchiveE2E(t *testing.T) {
 							}
 						}
 					}
+					if mode == "disguised-carrier" {
+						// The first official recovery carrier includes metadata.
+						// Omit the other carriers and change only its posted name.
+						carrier, ok := posted["repair.vol0+1.par3"]
+						if !ok {
+							t.Fatal("missing first official recovery carrier")
+						}
+						for name := range posted {
+							if strings.HasSuffix(name, ".par3") {
+								delete(posted, name)
+							}
+						}
+						posted["000.metadata.bin"] = carrier
+					}
 					articleMode := "clean"
-					if mode == "missing" {
-						articleMode = "missing"
+					if strings.HasPrefix(mode, "missing") {
+						articleMode = mode
 					}
 					slug := "par3-archive-" + format + "-" + mode
 					nzb := nntp.publishUnpack(slug, articleMode, posted, nil)
+					var release func()
+					if mode == "disguised-carrier" {
+						gate := &unpackGate{released: make(chan struct{})}
+						var released bool
+						release = func() {
+							if !released {
+								close(gate.released)
+								released = true
+							}
+						}
+						t.Cleanup(release)
+						// Hold the corrupted volume until the unnamed carrier has
+						// authenticated. Other volumes remain available to download.
+						for index, name := range unpackSortedNames(posted) {
+							if !strings.HasSuffix(name, ".rar") {
+								continue
+							}
+							prefix := fmt.Sprintf("%s-%d-", slug, index)
+							nntp.mu.Lock()
+							for id, article := range nntp.articles {
+								if strings.HasPrefix(id, prefix) {
+									article.gate = gate
+									nntp.articles[id] = article
+								}
+							}
+							nntp.mu.Unlock()
+							break
+						}
+					}
 					if err := os.WriteFile(filepath.Join(root, slug+".nzb"), nzb, 0644); err != nil {
 						t.Fatal(err)
 					}
 					job, err := api.submitWithPassword(nzb, slug, password)
 					if err != nil {
 						t.Fatal(err)
+					}
+					if release != nil {
+						authenticated := false
+						deadline := time.Now().Add(15 * time.Second)
+						for time.Now().Before(deadline) && !authenticated {
+							log, err := os.ReadFile(logPath)
+							if err != nil {
+								t.Fatal(err)
+							}
+							for _, line := range strings.Split(string(log), "\n") {
+								if strings.Contains(line, fmt.Sprintf("job_id=%d ", job)) && strings.Contains(line, "PAR3 carrier worker settled") && strings.Contains(line, "sets=1") {
+									authenticated = true
+								}
+							}
+							if !authenticated {
+								time.Sleep(20 * time.Millisecond)
+							}
+						}
+						if !authenticated {
+							t.Fatalf("unnamed carrier never authenticated: job=%d log=%s", job, logPath)
+						}
+						release()
 					}
 					status := ""
 					deadline := time.Now().Add(90 * time.Second)
@@ -114,22 +186,26 @@ func TestPar3ArchiveE2E(t *testing.T) {
 					if err != nil || !bytes.Equal(actual, payload) {
 						t.Fatalf("extracted member mismatch: %v got=%x want=%x", err, sha256.Sum256(actual), sha256.Sum256(payload))
 					}
-					if (mode == "clean" || mode == "missing") && strings.HasPrefix(format, "rar-") {
+					if strings.HasPrefix(format, "rar-") {
 						log, err := os.ReadFile(logPath)
 						if err != nil {
 							t.Fatal(err)
 						}
-						finalized := false
+						finalized, selectiveRepair := false, false
 						for _, line := range strings.Split(string(log), "\n") {
 							if strings.Contains(line, fmt.Sprintf("job_id=%d ", job)) {
 								if strings.Contains(line, "direct-store set demoted") {
 									t.Fatal("RAR expected to stay direct unexpectedly demoted")
 								}
 								finalized = finalized || strings.Contains(line, "direct-store set finalized without materializing a volume")
+								selectiveRepair = selectiveRepair || (strings.Contains(line, "PAR3 repair installed verified outputs") && strings.Contains(line, " files=2 "))
 							}
 						}
 						if !finalized {
 							t.Fatal("RAR did not finish through direct-store verification")
+						}
+						if mode == "missing-two" && !selectiveRepair {
+							t.Fatal("two-volume repair did not limit installation to the damaged files")
 						}
 					}
 					if mode == "clean" || mode == "corrupt" || (mode == "missing" && format == "rar-store") {
@@ -188,11 +264,17 @@ func par3ArchiveFixture(t *testing.T, dir, format string) (map[string][]byte, []
 
 func par3ArchiveParity(t *testing.T, reference, dir string, files map[string][]byte) {
 	t.Helper()
+	par3ReferenceParity(t, reference, dir, files, []string{"-s32768", "-c8", "-e1"})
+}
+
+func par3ReferenceParity(t *testing.T, reference, dir string, files map[string][]byte, options []string) string {
+	t.Helper()
 	binary, err := os.ReadFile(reference)
 	if err != nil {
 		t.Fatal(err)
 	}
-	args := []string{"create", "-s32768", "-c8", "-e1", "repair.par3"}
+	args := append([]string{"create"}, options...)
+	args = append(args, "repair.par3")
 	manifest := map[string]string{}
 	for _, name := range unpackSortedNames(files) {
 		if err := os.WriteFile(filepath.Join(dir, name), files[name], 0644); err != nil {
@@ -225,6 +307,16 @@ func par3ArchiveParity(t *testing.T, reference, dir string, files map[string][]b
 	par3WriteJSON(t, filepath.Join(dir, "provenance.json"), map[string]any{
 		"reference": reference, "referenceSHA256": fmt.Sprintf("%x", sha256.Sum256(binary)), "arguments": args, "sha256": manifest,
 	})
+	listing := exec.Command(reference, "list", "-v", "-v", "repair.par3")
+	listing.Dir = dir
+	listed, err := listing.CombinedOutput()
+	if err != nil {
+		t.Fatalf("official PAR3 listing: %v: %s", err, listed)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "listing.txt"), listed, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return string(out) + string(listed)
 }
 
 func par3WriteJSON(t *testing.T, path string, value any) {

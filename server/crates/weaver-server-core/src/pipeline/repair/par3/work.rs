@@ -39,7 +39,7 @@ enum PendingInput {
         set: par3_rs::InputSetId,
         path: PathBuf,
     },
-    Installed {
+    CompleteFile {
         path: PathBuf,
         name: String,
     },
@@ -66,7 +66,7 @@ impl PendingInput {
                     .ok_or(EngineError::ResourceLimit("PAR3 virtual publication"));
             }
             Self::Repair { path, .. } => (path, Some(0)),
-            Self::Installed { path, name } => (path, name.capacity().checked_mul(2)),
+            Self::CompleteFile { path, name } => (path, name.capacity().checked_mul(2)),
             Self::Carrier { path, ranges } => (
                 path,
                 ranges
@@ -204,6 +204,15 @@ impl Coordinator {
         source: SourceId,
         path: PathBuf,
     ) -> EngineResult<()> {
+        self.enqueue_complete_carrier(job_id, source, path)
+    }
+
+    pub(super) fn enqueue_complete_carrier(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+    ) -> EngineResult<()> {
         self.enqueue_input(job_id, source, PendingInput::Carrier { path, ranges: None })
     }
 
@@ -258,14 +267,15 @@ impl Coordinator {
         Ok(())
     }
 
-    pub(super) fn enqueue_installed(
+    /// Publish actual disk bytes as candidates; this does not admit verification evidence.
+    pub(super) fn enqueue_complete_file(
         &mut self,
         job_id: JobId,
         source: SourceId,
         path: PathBuf,
         name: String,
     ) -> EngineResult<()> {
-        self.enqueue_input(job_id, source, PendingInput::Installed { path, name })
+        self.enqueue_input(job_id, source, PendingInput::CompleteFile { path, name })
     }
 
     pub(super) fn request_repair(
@@ -635,7 +645,7 @@ impl Coordinator {
                 // Keep the queue lease live while the worker owns its input;
                 // successful publication transfers it into retained state.
                 if let PendingInput::Readback(mut installation) = input.input {
-                    let result = installation.read(&runtime.sources, &runtime.options);
+                    let result = installation.read_unit(&runtime.sources, &runtime.options);
                     return (
                         runtime,
                         Ok(WorkOutput::Readback(readback::ReadbackDone {
@@ -715,7 +725,7 @@ impl Coordinator {
                     PendingInput::Repair { .. } | PendingInput::Readback(_) => {
                         unreachable!("repair dispatched above")
                     }
-                    PendingInput::Installed { path, name } => std::fs::metadata(&path)
+                    PendingInput::CompleteFile { path, name } => std::fs::metadata(&path)
                         .map_err(EngineError::from)
                         .and_then(|metadata| {
                             let ranges = if metadata.len() == 0 {

@@ -1185,6 +1185,70 @@ fn a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary() 
 // ---------------------------------------------------------------------------
 
 #[test]
+fn bounded_stale_gap_reads_make_progress_without_a_whole_plan() {
+    let repaired: Vec<u8> = (0..400).map(|index| (index % 251) as u8).collect();
+    let (mut router, member_id) = straddle_router(&repaired, 64);
+    router.stage_for_test(0, 64, &repaired[..300]);
+    router.drain_for_test(0).unwrap();
+    router.begin_repair_transaction(vec![0]).unwrap();
+    router
+        .route_repaired_batch(
+            0,
+            &[(64 + 200, Arc::from(&repaired[200..]))],
+            &[],
+            false,
+            true,
+        )
+        .unwrap();
+    assert!(router.has_stale_gaps());
+    assert!(router.next_stale_gap(0, 8192).is_err());
+    assert!(router.next_stale_gap(37, 0).is_err());
+    let mut read = 0;
+    let mut stripes = 0;
+    while let Some(run) = router.next_stale_gap(37, 8192).unwrap() {
+        assert_eq!(run.member_id, member_id);
+        assert_eq!(run.logical_offset, read);
+        assert!(run.len > 0 && run.len <= 37);
+        let end = read + run.len;
+        router
+            .note_restored_member_crc(
+                member_id,
+                read,
+                run.len,
+                par2_rs::checksum::crc32(&repaired[read as usize..end as usize]),
+            )
+            .unwrap();
+        read = end;
+        stripes += 1;
+    }
+    assert_eq!((read, stripes), (200, 6));
+    assert!(!router.has_stale_gaps());
+    assert!(router.repair_batch_in_progress());
+    assert!(!router.all_members_verified());
+    router.finish_repair_transaction().unwrap();
+    assert!(router.all_members_verified());
+}
+
+#[test]
+fn unread_stale_gap_cannot_release_a_replacement_transaction() {
+    let bytes = [42; 400];
+    let (mut router, _) = straddle_router(&bytes, 64);
+    router.stage_for_test(0, 64, &bytes[..300]);
+    router.drain_for_test(0).unwrap();
+    router.begin_repair_transaction(vec![0]).unwrap();
+    router
+        .route_repaired_batch(0, &[(264, Arc::from(&bytes[200..]))], &[], false, true)
+        .unwrap();
+    assert!(router.has_stale_gaps());
+    assert_eq!(
+        router.finish_repair_transaction(),
+        Err(DemotionReason::RepairGapUnreadable)
+    );
+    assert!(router.repair_batch_in_progress());
+    assert!(!router.all_members_verified());
+}
+
+#[test]
 fn deleting_the_row_before_a_repair_keeps_the_coverage_the_provider_reads() {
     // The ordering rule, and the distinction that makes it survivable. The row
     // has to go *before* a repair rewrites the bytes it claims — otherwise a

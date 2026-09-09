@@ -396,3 +396,72 @@ async fn completion_waits_for_authenticated_carrier_worker_including_renamed_inp
         );
     }
 }
+
+#[tokio::test]
+async fn restored_completed_images_are_reverified_without_article_placements() {
+    for changed in [false, true] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3111);
+        let mut files = [
+            (
+                "a.bin",
+                (0..5000u32).map(|i| (i * 7 + 3) as u8).collect::<Vec<_>>(),
+            ),
+            ("b.txt", b"qrstuvwxyz".to_vec()),
+            (
+                "sub/c.bin",
+                (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+            ),
+            ("set.par3", INDEX.to_vec()),
+        ];
+        if changed {
+            files[0].1[123] ^= 1;
+        }
+        let mut spec = standalone_job_spec(
+            "PAR3 restored images",
+            &files
+                .iter()
+                .map(|(name, bytes)| ((*name).into(), bytes.len() as u32 + 333))
+                .collect::<Vec<_>>(),
+        );
+        spec.files[3].role = FileRole::from_filename("set.par3");
+        let working = insert_active_job(&mut pipeline, job_id, spec).await;
+        tokio::fs::create_dir(working.join("sub")).await.unwrap();
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            tokio::fs::write(working.join(name), bytes).await.unwrap();
+            let file = pipeline
+                .jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .assembly
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                })
+                .unwrap();
+            file.mark_complete();
+            assert!(file.placement_of(0).is_none());
+        }
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 3,
+                },
+            )
+            .await;
+        settle_par3(&mut pipeline, job_id).await;
+        let runtime = pipeline.par3_runtime.as_ref().unwrap();
+        assert_eq!(runtime.verified(job_id), !changed);
+        let (_, view) = runtime.assessments(job_id).next().unwrap();
+        assert_eq!(
+            view.files.iter().filter(|file| file.complete).count(),
+            if changed { 2 } else { 3 }
+        );
+        if changed {
+            assert_eq!(view.status, par3_rs::session::RepairStatus::NeedRecovery);
+        }
+    }
+}

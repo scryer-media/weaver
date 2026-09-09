@@ -360,6 +360,8 @@ fn readback_installation(path: PathBuf, options: &ExecutionOptions) -> Box<readb
         current: 0,
         offset: 0,
         crc32: 0,
+        settling_set: None,
+        pending_gap: None,
         edge_reads: Vec::new(),
         preflight_failed: false,
         _edge_reservation: None,
@@ -382,10 +384,10 @@ async fn readback_yields_between_stripes_and_fences_assessment() {
     let done = next(&mut coordinator).await;
     coordinator.settle(done);
     let readback = coordinator.take_readback(JobId(1)).unwrap().unwrap();
-    assert_eq!(
-        readback.result.as_ref().unwrap().len,
-        readback::STRIPE_BYTES
-    );
+    assert!(matches!(
+        readback.result.as_ref().unwrap(),
+        readback::ReadbackUnit::Stripe(span) if span.len == readback::STRIPE_BYTES
+    ));
     assert!(
         coordinator.has_work(JobId(1)),
         "placement still owns the completion fence"
@@ -402,7 +404,9 @@ async fn readback_yields_between_stripes_and_fences_assessment() {
     let done = next(&mut coordinator).await;
     coordinator.settle(done);
     let readback = coordinator.take_readback(JobId(1)).unwrap().unwrap();
-    assert_eq!(readback.result.unwrap().len, 1);
+    assert!(matches!(
+        readback.result.unwrap(), readback::ReadbackUnit::Stripe(span) if span.len == 1
+    ));
     coordinator.finish_installation(JobId(1));
     assert!(!coordinator.has_work(JobId(1)));
 }

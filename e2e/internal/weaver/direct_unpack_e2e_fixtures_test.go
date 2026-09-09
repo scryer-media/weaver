@@ -157,6 +157,7 @@ func (s *unpackNNTP) publishUnpack(slug, mode string, files map[string][]byte, g
 	var nzb bytes.Buffer
 	nzb.WriteString(`<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">`)
 	damaged := false
+	damagedFiles := 0
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for fileIndex, name := range unpackSortedNames(files) {
@@ -177,14 +178,15 @@ func (s *unpackNNTP) publishUnpack(slug, mode string, files map[string][]byte, g
 			if !parity && !firstSplit && index == count/2 {
 				article.gate = gate
 			}
-			if !parity && !firstSplit && !damaged && index == count*3/4 {
-				if mode == "missing" || mode == "joined-missing" {
+			if !parity && !firstSplit && (!damaged || (mode == "missing-two" && damagedFiles < 2)) && index == count*3/4 {
+				if mode == "missing" || mode == "joined-missing" || mode == "missing-two" {
 					article.missing = true
 				}
 				if mode == "corrupt" {
 					body[len(body)/2] ^= 0x80
 				}
 				damaged = true
+				damagedFiles++
 			}
 			article.body = unpackYenc(name, body, index+1, count, start+1, len(data), crc32.ChecksumIEEE(data))
 			s.articles[id] = article

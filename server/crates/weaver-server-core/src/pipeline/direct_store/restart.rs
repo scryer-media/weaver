@@ -695,8 +695,10 @@ impl Pipeline {
             // which restore has already re-derived from the stored NZB and the
             // job's password override.
             set.router.set_password(spec.password.as_deref());
+            let par2_available = super::plan::spec_carries_par2(spec);
+            set.router.note_par2_available(par2_available);
             set.router
-                .note_par2_available(super::plan::spec_carries_par2(spec));
+                .note_par3_available(!par2_available && super::plan::spec_defers_to_par3(spec));
             let volume_facts = facts.get(&set_name).cloned().unwrap_or_default();
             if volume_facts.is_empty() {
                 continue;
@@ -819,8 +821,11 @@ impl Pipeline {
                     let mut set = DirectSet::new(job_id, plan.clone());
                     self.direct_store.apply_ceilings(&mut set);
                     set.router.set_password(spec.password.as_deref());
-                    set.router
-                        .note_par2_available(super::plan::spec_carries_par2(spec));
+                    let par2_available = super::plan::spec_carries_par2(spec);
+                    set.router.note_par2_available(par2_available);
+                    set.router.note_par3_available(
+                        !par2_available && super::plan::spec_defers_to_par3(spec),
+                    );
                     set
                 }
             };

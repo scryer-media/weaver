@@ -186,6 +186,7 @@ fn retained_job_assessment_reuses_evidence_and_invalidates_changed_sources() {
     assert_eq!(view.requirements[0].available, [0]);
     assert_eq!(view.requirements[0].cohort, 0);
     assert_eq!(view.requirements[0].cohorts, 1);
+    let published_before = job.sources.snapshot(SourceId(1)).unwrap();
     job.publish_file(
         SourceId(1),
         root.path().join("a.bin"),
@@ -205,6 +206,18 @@ fn retained_job_assessment_reuses_evidence_and_invalidates_changed_sources() {
             .unwrap()
             .status,
         RepairStatus::Complete
+    );
+    assert_eq!(job.sources.snapshot(SourceId(1)).unwrap(), published_before);
+    assert_eq!(
+        job.sets
+            .values()
+            .next()
+            .unwrap()
+            .native
+            .diagnostics()
+            .source_verifications,
+        verifications,
+        "new visibility must retain already verified extents"
     );
     let mut changed = inputs()[0].1.clone();
     changed[2300] ^= 1;
@@ -234,6 +247,106 @@ fn retained_job_assessment_reuses_evidence_and_invalidates_changed_sources() {
             .status,
         RepairStatus::Ready
     );
+}
+
+#[test]
+fn unchanged_disk_publications_retain_evidence_but_withdrawal_and_rebinding_do_not() {
+    let root = tempfile::tempdir().unwrap();
+    let mut job = Par3Job::default();
+    let inputs = inputs();
+    for (index, (name, bytes)) in inputs.iter().enumerate() {
+        let path = root.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        job.publish_file(
+            SourceId(index as u64 + 1),
+            path,
+            name.clone(),
+            std::iter::once(0..bytes.len() as u64).collect(),
+        )
+        .unwrap();
+    }
+    job.publish_carrier(
+        SourceId(0),
+        source(INDEX),
+        INDEX.len() as u64,
+        std::iter::once(0..INDEX.len() as u64).collect(),
+        false,
+    )
+    .unwrap();
+    job.scan(SourceId(0)).unwrap();
+    job.assess().unwrap();
+    let before = job
+        .sets
+        .values()
+        .next()
+        .unwrap()
+        .native
+        .diagnostics()
+        .source_verifications;
+    let snapshot = job.sources.snapshot(SourceId(1)).unwrap().unwrap();
+    let revision = job.sources.revision(SourceId(1)).unwrap();
+    for (index, (name, bytes)) in inputs.iter().enumerate() {
+        job.publish_file(
+            SourceId(index as u64 + 1),
+            root.path().join(name),
+            name.clone(),
+            std::iter::once(0..bytes.len() as u64).collect(),
+        )
+        .unwrap();
+    }
+    assert!(job.sets.values().next().unwrap().view.is_some());
+    assert_eq!(job.sources.snapshot(SourceId(1)).unwrap(), Some(snapshot));
+    assert_eq!(job.sources.revision(SourceId(1)).unwrap(), revision);
+    job.assess().unwrap();
+    assert_eq!(
+        job.sets
+            .values()
+            .next()
+            .unwrap()
+            .native
+            .diagnostics()
+            .source_verifications,
+        before
+    );
+
+    // An explicit write fence must retire evidence even when the disk bytes
+    // and their metadata happen to be unchanged at the next publication.
+    job.sources.withdraw(SourceId(1)).unwrap();
+    let (name, bytes) = &inputs[0];
+    job.publish_file(
+        SourceId(1),
+        root.path().join(name),
+        name.clone(),
+        std::iter::once(0..bytes.len() as u64).collect(),
+    )
+    .unwrap();
+    assert!(job.sets.values().next().unwrap().view.is_none());
+    assert_ne!(job.sources.snapshot(SourceId(1)).unwrap(), Some(snapshot));
+    job.assess().unwrap();
+    assert_eq!(
+        job.sets
+            .values()
+            .next()
+            .unwrap()
+            .native
+            .diagnostics()
+            .source_verifications,
+        before + 1
+    );
+
+    let alias = root.path().join("alias.bin");
+    std::fs::hard_link(root.path().join(name), &alias).unwrap();
+    job.publish_file(
+        SourceId(1),
+        alias,
+        "alias.bin".into(),
+        std::iter::once(0..bytes.len() as u64).collect(),
+    )
+    .unwrap();
+    assert!(job.sets.values().next().unwrap().view.is_none());
+    assert!(!job.bindings.contains_key(name));
+    assert_eq!(job.bindings.get("alias.bin"), Some(&SourceId(1)));
 }
 
 #[test]
@@ -319,6 +432,73 @@ fn recovery_payload_waits_for_interior_hole_and_counts_only_once() {
     )
     .unwrap();
     job.scan(SourceId(0)).unwrap();
+    assert_eq!(available_recovery(&mut job), 1);
+}
+
+#[test]
+fn disk_carrier_replays_validate_identity_and_logical_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("set.vol0+1.par3");
+    std::fs::write(&path, RECOVERY).unwrap();
+    let alias = root.path().join("renamed.par3");
+    std::fs::hard_link(&path, &alias).unwrap();
+    let mut job = Par3Job::default();
+    let id = SourceId(0);
+    job.scan_file(id, path.clone(), None).unwrap();
+    assert_eq!(available_recovery(&mut job), 1);
+    let snapshot = job.sources.snapshot(id).unwrap();
+    let revision = job.sources.revision(id).unwrap();
+    let scanned = job.options.scan_work.used();
+    for ranges in [
+        None,
+        Some(std::iter::once(0..RECOVERY.len() as u64).collect()),
+    ] {
+        job.scan_file(id, path.clone(), ranges).unwrap();
+        assert_eq!(job.sources.snapshot(id).unwrap(), snapshot);
+        assert_eq!(job.sources.revision(id).unwrap(), revision);
+        assert_eq!(job.options.scan_work.used(), scanned);
+        assert_eq!(available_recovery(&mut job), 1);
+    }
+    job.sources.withdraw(id).unwrap();
+    job.scan_file(id, path.clone(), None).unwrap();
+    assert_ne!(job.sources.snapshot(id).unwrap(), snapshot);
+    assert!(job.options.scan_work.used() > scanned);
+    assert_eq!(available_recovery(&mut job), 1);
+
+    // Even identical inode metadata cannot establish a filename binding.
+    let snapshot = job.sources.snapshot(id).unwrap();
+    job.scan_file(id, alias, None).unwrap();
+    assert_ne!(job.sources.snapshot(id).unwrap(), snapshot);
+    assert_eq!(available_recovery(&mut job), 1);
+}
+
+#[test]
+fn disk_carrier_visibility_retains_pending_packet_hashes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("set.vol0+1.par3");
+    std::fs::write(&path, RECOVERY).unwrap();
+    let mut job = Par3Job::default();
+    let id = SourceId(0);
+    let len = RECOVERY.len() as u64;
+    job.scan_file(id, path.clone(), Some(std::iter::once(0..1100).collect()))
+        .unwrap();
+    let snapshot = job.sources.snapshot(id).unwrap();
+    assert_eq!(available_recovery(&mut job), 0);
+    assert_eq!(job.carriers[&id].needed, Some(1100));
+    assert_eq!(job.carriers[&id].resume, None);
+    let read = job.options.diagnostics.source_io().read_bytes;
+    job.scan_file(id, path.clone(), Some(std::iter::once(0..2100).collect()))
+        .unwrap();
+    assert_eq!(job.sources.snapshot(id).unwrap(), snapshot);
+    assert_eq!(
+        job.options.diagnostics.source_io().read_bytes - read,
+        1000,
+        "the packet prefix must not be read or hashed again"
+    );
+    assert_eq!(available_recovery(&mut job), 0);
+    job.scan_file(id, path, Some(std::iter::once(0..len).collect()))
+        .unwrap();
+    assert_eq!(job.sources.snapshot(id).unwrap(), snapshot);
     assert_eq!(available_recovery(&mut job), 1);
 }
 

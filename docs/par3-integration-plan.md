@@ -65,10 +65,9 @@ without materializing clean archives. One bounded reader per job retains the
 cipher frontier; backing snapshots fence shared partial files before writes.
 Metadata, held-file pins, temporary buffers and open readers carry resource
 leases. Direct finalization waits for PAR3 verification. Live direct sets now
-receive a single damaged volume's verified repair output through bounded
-readback tickets, including encrypted members. Several damaged volumes still
-cross the reconstruction barrier, as do archive checksum failures that demote
-before native repair can run.
+receive verified repair outputs through bounded readback tickets, including
+multiple damaged volumes and encrypted members. Archive checksum failures that
+demote before native repair can run still cross the reconstruction barrier.
 
 Repair read-back now has a codec-independent file-range boundary that preserves
 I/O errors and can return bounded stripes with their CBC edge bytes. The PAR2
@@ -84,9 +83,8 @@ gates until the last batch. Pending batches block finalization and checkpoint
 recreation; foreign-volume, empty closing and premature whole-volume calls are
 refused. Regressions cover plain/encrypted parts and a wholly missing final
 volume whose headers span several arrivals. PAR2 keeps its one-call repair
-wrapper. PAR3 read-back scheduling, installation reconciliation and aggregate
-memory validation still need wiring; this primitive alone does not make
-production repairs selective or establish a total-memory bound.
+wrapper. This batch-primitive slice preceded the PAR3 read-back scheduler,
+installation reconciliation and memory accounting described below.
 Batch-slice validation: all 390 direct-store tests, the full 3,813-test workspace
 sweep (13 existing skips), all three doctests, formatting and workspace Clippy
 pass. Failed closing drains also keep checkpoints fenced until router retirement.
@@ -147,9 +145,130 @@ in isolation, and the full confirmation sweep passed all 3,825 tests with 13
 existing skips and unchanged leak detection. No assertion or timeout was weakened.
 This continues the existing unreleased 0.11.3 version.
 
+Multi-volume direct repair now uses ordered set-wide replacement transactions.
+Checksum checks and durable coverage stay fenced between stripes and volumes;
+failed or incomplete replacement cannot reopen them. CBC preflight uses known
+archive part geometry, so an adjacent repaired volume supplies cipher edges that
+never reached direct storage. The native two-missing-volume encrypted RAR case
+first reproduced the old demotion and then an omitted CBC edge, and now passes
+without demotion. That slice passed all 3,830 workspace Nextest tests (13 existing
+skips), with formatting, all-target/all-feature Clippy, three doctests, 23 PAR3
+and 54 PAR2 native E2E cases passing. This continues unreleased 0.11.3.
+
+Completed conventional sources restored without article-placement records now
+publish their actual disk extent as a candidate. They receive fresh native
+verification; the completion marker does not confer checksum evidence. Partial
+sources and virtual holes retain explicit availability. A real-process SQLite
+restart test stops while recovery is blocked, changes another downloaded source,
+and resumes successfully without refetching either completed payload. Its first
+run exposed empty source publications that incorrectly exhausted recovery.
+
+Declared PAR3-only archive jobs now defer early part/member checksum failures
+until native verification settles. A complete native verdict then reopens the
+archive checks; it cannot override a failing archive checksum or close an active
+replacement transaction. Mixed jobs retain the existing PAR2 policy. Plain and
+encrypted single-byte corruption now pass the stronger native E2E requirement
+of direct finalization without demotion. Four focused router regressions pass.
+Authenticated discovery now also updates active and subsequently admitted direct
+sets when the carrier was posted under an unrelated filename. Two native cases
+hold the corrupted RAR volume until an official recovery carrier named `.bin`
+authenticates; both first reproduced demotion and now remain direct. Deferral
+cannot retroactively undo a demotion that preceded every PAR3 hint.
+The archive-deferral slice passed all 3,835 workspace Nextest tests (13 existing
+skips), full workspace Clippy and 93 of 95 native E2E cases. Only the two large
+interleaving cases described below failed.
+
+Checked stale-gap rereads now run through the same PAR3 worker ticket and shared
+memory/handle budgets as output readback. Each handback covers at most 256 KiB,
+with a 64 KiB read buffer and one bounded path; the router selects one run without
+allocating the full plan or a part-boundary list. It checks source snapshots
+around the read, rejects changed worker epochs and layout on handback, and keeps
+replacement/checkpoint gates fenced until every gap has a checksum. Reread errors
+fail the job while preserving verified native images. Focused bounded-I/O,
+cancellation and worker-fence tests pass, as do all 78 conventional/archive/restart
+PAR3 and PAR2 archive E2E cases. All 3,839 workspace Nextest tests pass (13
+existing skips), along with workspace Clippy, formatting and all three doctests.
+
+Identical disk publications now preserve native evidence only when the backing
+path and generation, filename binding, logical publication generation and exact
+committed ranges still match. A write fence or rebinding forces fresh verification
+even if the underlying bytes happen to be unchanged. A focused regression asserts
+zero additional authoritative source verifications on unchanged publication.
+This does not yet preserve generations across actual hole-filling writes.
+That slice passed all 3,840 workspace Nextest tests (13 existing skips), full
+Clippy, formatting, three doctests and 96 of 98 native E2E cases. Only the two
+large-interleaving cases failed.
+
+A publication that only extends committed visibility over an unchanged disk
+backing now preserves its logical generation and native evidence. The registry
+rechecks both physical and logical generations when admitting the extension;
+withdrawal or changed backing rejects the continuity claim. The focused test
+closes an interior hole without repeating authoritative verification of clean
+extents. This slice passed all 3,841 workspace Nextest tests (13 existing skips),
+full Clippy and 98 of 100 native E2E cases. The same two large-interleaving cases
+remain blocked by the retained-layout ceiling.
+
+Disk carrier replay now validates the path and logical publication generation
+as well as the backing snapshot. Withdrawal or rebinding forces authentication
+again, while identical ranges incur no scan work. Visibility extensions retain
+the scanner; a missing suffix keeps its pending packet hash unless scanning
+explicitly jumps past a hole to discover later packets. Focused regressions
+measure exactly the newly visible bytes read inside an incomplete packet and
+verify replay, withdrawal and rebinding against official carrier fixtures.
+Actual carrier writes still require a new generation and fresh scanning.
+All 3,843 workspace Nextest tests pass (13 existing skips), alongside formatting,
+full Clippy and all three doctests.
+Both the debug and optimized native binaries pass 98 of 100 E2E scenarios; only
+the two known large-interleaving resource-limit failures remain.
+
+Direct restart tests exposed an ordering gap between native verification and
+router settlement. Restored encrypted members can mark every participating volume
+as suspect, even when native repair needs only one volume. Direct finalization now
+waits for the native verdict to clear that deferred state and re-run the archive
+checks; completion re-enters finalization before conventional extraction can run.
+Plain and NZB-password encrypted restart cases pass without demotion or completed
+source refetch, including changed member partials. A separate eight-block encrypted
+case confirms that insufficient recovery fails without delivering output; the
+successful changed-CBC-chain case uses 24 official recovery blocks.
+Initial API password overrides are lost at admission, so that enabled restart
+case still fails. Automatic approval review rejected persisting them in the
+existing password column; the operator decision is pending. No password-storage
+change was applied. The 64 MiB large-geometry limit is separately unresolved.
+
+Repeated direct restart now preserves persisted RAR facts owned by an accepted,
+non-demoted direct checkpoint. Conventional discovery previously discarded those
+facts because virtual source volumes had no complete disk image, leaving a later
+checkpoint impossible to restore. The regression repeats a PAR2 direct restart
+and checks identical persisted facts, retained download floors and final bytes.
+Four native PAR3 crash cases interrupt repaired coverage before persistence or
+after publication for plain and encrypted RAR; all pass with byte-exact installed
+archive images before the interruption. Published checkpoints resume without
+completed-source refetch. Two cancellation cases also pass, checking cancelled
+history, active-row retirement, no delivered output and no further downloads.
+
+The intermittent process-handle leak also reproduced outside Weaver in a scratch
+Rust crate with no dependencies and four tests that only sleep (two for 40 ms,
+two for 900 ms). Under the same 500 ms leak-failure timeout, two of 60 concurrent
+stress iterations failed. The Weaver post-processing group passed all 20 serial
+stress iterations, and its disabled-script case passed all 30 isolated iterations.
+This isolates the intermittent failure from Weaver application code; the precise
+runner/OS cause remains unconfirmed. No leak timeout, test assertion or repository
+concurrency setting was weakened.
+
+The advanced native matrix now covers GF16, FFT, uneven cohorts, aligned/sliding
+deduplication, Data-only repair and packed tails. Three additional passing cases
+put independent Cauchy and FFT sets in one job: clean, both damaged, and only
+Cauchy damaged. The last case prohibits recovery downloads for the clean FFT set.
+The matrix also verifies that surplus recovery in other cohorts cannot satisfy
+one cohort's deficit. Official creation and verbose listing establish each geometry. The 65,538-block interleaving case
+currently fails at the published engine's 64 MiB retained-layout ceiling; both
+positive cases remain enabled. The operator decision on a larger per-session
+ceiling within the unchanged global pool is pending. Do not treat this matrix
+as fully passing or infer performance acceptance from the successful cases.
+
 Still pending: incremental decode-to-publication wiring, mixed-format fallback,
-multi-damage selective direct-store repair and archive-damage deferral, positioned verification,
-embedded archives, evidence persistence and product surfaces. Rebuilt files currently
+positioned verification, embedded archives, evidence persistence and product
+surfaces. Rebuilt files currently
 receive a verification read when republished; clean native evidence is retained.
 PAR3 repairs conservatively retire extraction chases until a PAR3 mutation view
 can positively vouch for their consumed bytes. Full E2E and performance acceptance
@@ -163,9 +282,27 @@ The published source trees match the reviewed pointer. Dependency metadata shows
 only the approved PAR3 origin and arithmetic unification changes: PAR2 remains
 0.10.2 with native-crypto, and UnRAR remains 0.10.3 with crypto-aws-lc.
 
-Performance baselines and matched ARM64/x86-64 acceptance measurements below
-remain required. Source/dependency identity and correctness tests alone do not
-establish the 2% non-regression requirement.
+The first [ARM64 CLI comparison](par2-performance-arm64.md) passes all nine
+elapsed-time gates across streaming, large-block and many-small-file fixtures,
+with 256 successful trials including warm-ups. The largest upper ratio bound
+is 1.0150. Full pipeline and x86-64 measurements below remain required; this is
+not full performance acceptance or an integration-readiness claim.
+
+The first performance harness is now `cargo xtask perf par2-compare`, documented
+in [paired PAR2 measurements](par2-performance.md). It compares clean verification,
+damaged verification and repair through the native CLI, using private fixture
+copies, matching output hashes, alternating pairs, CPU/RSS/filesystem operation
+counters and separate confidence gates. It adds no dependencies. Its 36 xtask
+tests pass. An identical-binary smoke run completed 152 trials with valid output
+hashes; both verification workloads remained statistically inconclusive after
+30 pairs, while repair passed. This validates the harness behavior, not candidate
+performance. End-to-end download/session/extraction measurements remain required.
+Full formatting and Clippy pass. The initial full Rust sweep reported 3,844 passes
+and one exited-successfully NNTP HTTP3 test with leaked output handles. It passed
+in isolation; the unchanged four-worker confirmation sweep passed all 3,845 tests
+with 13 existing skips. No assertion, leak timeout or repository concurrency policy
+was changed. The existing unreleased 0.11.3 version covers the application changes;
+the new private xtask helper has no additional publishable-crate impact.
 
 First-slice validation on macOS ARM64: formatting and all-target/all-feature
 workspace Clippy pass; the full locked Nextest sweep reports 3,768 passed and

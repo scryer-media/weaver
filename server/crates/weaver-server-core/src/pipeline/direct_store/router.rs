@@ -216,9 +216,6 @@ pub(crate) enum DemotionReason {
     /// conventional repair path, which is exactly the shape a job with no
     /// direct set would have taken.
     Par2Damaged,
-    /// PAR3 requires reconstruction before this direct archive can finalize.
-    /// The conventional repair path currently owns installation for this set.
-    Par3Damaged,
     /// One of the set's source volumes could not be bound, unambiguously, to a
     /// PAR2 description in the job's recovery set.
     ///
@@ -510,7 +507,6 @@ impl DemotionReason {
             // layout for a *live* set, and reusing it for a demoted one is what
             // would move this answer to `Virtual`.
             Self::Par2Damaged => VolumeDemand::Real,
-            Self::Par3Damaged => VolumeDemand::Real,
             // The overlay `par2_access` presents is keyed by PAR2 file id, so a
             // volume with no unambiguous binding cannot be served through it at
             // all.
@@ -622,7 +618,6 @@ impl DemotionReason {
             Self::EncryptedFactsDisagree => "encrypted_facts_disagree",
             Self::EncryptedPostedBytesUnavailable => "encrypted_posted_bytes_unavailable",
             Self::Par2Damaged => "par2_damaged",
-            Self::Par3Damaged => "par3_damaged",
             Self::Par2Unbindable => "par2_unbindable",
             Self::ToleratedExtractionFailed => "tolerated_extraction_failed",
             Self::HoldsBudgetExceeded => "holds_budget",
@@ -2251,6 +2246,9 @@ pub(crate) struct DirectSetRouter {
     /// already true when this is consulted. See
     /// [`super::plan::spec_carries_par2`] for why an index alone counts.
     par2_available: bool,
+    /// A PAR3-only job may defer archive checksum failures until its native
+    /// verifier settles. Resolved verdicts never earn another deferral.
+    par3_verification_pending: bool,
     /// Volumes whose posted bytes failed an archive-level checksum that the
     /// wire's own yEnc CRC could not see.
     ///
@@ -2259,7 +2257,7 @@ pub(crate) struct DirectSetRouter {
     /// evidence (the wire is exactly what lied), and any member spanning the
     /// volume holds its whole-member gate until the repair has had its say.
     ///
-    /// Empty unless [`Self::par2_available`], and emptied per volume
+    /// Empty unless PAR2 or PAR3 can answer, and emptied per volume
     /// by [`Self::route_repaired`] — the repair's answer supersedes the
     /// question.
     damaged_volumes: std::collections::BTreeSet<u32>,
@@ -2286,6 +2284,9 @@ pub(crate) struct DirectSetRouter {
     /// Its integrity gates and durable coverage remain pending until the last
     /// batch arrives. A different volume cannot finish this replacement.
     repair_batch: Option<u32>,
+    /// Ordered volumes still awaiting replacement within a set-wide transaction.
+    /// An empty queue remains a fence until the caller confirms placement.
+    repair_transaction: Option<std::collections::VecDeque<u32>>,
     demoted: Option<DemotionReason>,
 }
 
@@ -2352,10 +2353,12 @@ impl DirectSetRouter {
             #[cfg(test)]
             parse_walks: 0,
             par2_available: false,
+            par3_verification_pending: false,
             damaged_volumes: std::collections::BTreeSet::new(),
             repair_rerouted: false,
             repair_draining: false,
             repair_batch: None,
+            repair_transaction: None,
             demoted: None,
         }
     }
@@ -2368,7 +2371,49 @@ impl DirectSetRouter {
         self.par2_available = available;
     }
 
-    /// Volumes carrying a recorded part-checksum mismatch, awaiting PAR2's
+    pub(crate) fn note_par3_available(&mut self, available: bool) {
+        self.par3_verification_pending = available;
+    }
+
+    pub(crate) fn awaits_par3_verdict(&self) -> bool {
+        self.par3_verification_pending
+    }
+
+    /// Native verification has settled all protected sources. Re-run archive
+    /// checks once; disagreement must now fail rather than defer indefinitely.
+    pub(crate) fn settle_par3_verification(&mut self) -> Result<(), DemotionReason> {
+        if let Some(reason) = self.demoted {
+            return Err(reason);
+        }
+        if self.repair_batch_in_progress() {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        self.par3_verification_pending = false;
+        self.damaged_volumes.clear();
+        self.settle_repair_gates()
+            .map_err(|reason| self.fail(reason))
+    }
+
+    fn record_member_checksum_damage(&mut self, member_id: u32) -> bool {
+        if !self.par3_verification_pending || self.repair_rerouted {
+            return false;
+        }
+        let Some(index) = self.layout_index_for_member(member_id) else {
+            return false;
+        };
+        let volumes: Vec<_> = self.layout_members()[index]
+            .parts
+            .iter()
+            .map(|part| part.volume)
+            .collect();
+        self.damaged_volumes.extend(volumes);
+        if let Some(member) = self.member_mut(member_id) {
+            member.verified = false;
+        }
+        true
+    }
+
+    /// Volumes carrying an archive-checksum mismatch, awaiting native recovery's
     /// answer. See [`Self::damaged_volumes`].
     pub(crate) fn damaged_volumes(&self) -> &std::collections::BTreeSet<u32> {
         &self.damaged_volumes
@@ -2394,7 +2439,7 @@ impl DirectSetRouter {
         member_id: u32,
         part_position: u32,
     ) -> bool {
-        if !self.par2_available || self.repair_rerouted {
+        if !(self.par2_available || self.par3_verification_pending) || self.repair_rerouted {
             return false;
         }
         self.damaged_volumes.insert(volume_index);

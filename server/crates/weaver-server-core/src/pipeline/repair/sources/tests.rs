@@ -8,6 +8,57 @@ fn backing(bytes: &[u8]) -> Arc<dyn SourceAccess> {
 }
 
 #[test]
+fn unchanged_backing_arrival_rechecks_both_generations_before_publication() {
+    let sources = PublishedSources::default();
+    let access = backing(b"abcdefgh");
+    let physical = access.snapshot(SourceId(0)).unwrap().unwrap();
+    let published = sources
+        .replace(SourceId(0), Arc::clone(&access), 8, vec![0..2, 6..8])
+        .unwrap();
+    let ranges: Vec<_> = std::iter::once(0..8).collect();
+    assert!(
+        sources
+            .can_extend_publication(SourceId(0), published, physical, &ranges)
+            .unwrap()
+    );
+    let revision = sources.revision(SourceId(0)).unwrap();
+    let mut changed = MemorySourceAccess::default();
+    changed.insert(SourceId(0), 2, Arc::from(&b"ABcdefgh"[..]));
+    assert!(matches!(
+        sources.arrive_unchanged(
+            SourceId(0),
+            Arc::new(changed),
+            8,
+            ranges.clone(),
+            published,
+            physical
+        ),
+        Err(EngineError::SourceChanged(SourceId(0)))
+    ));
+    assert_eq!(sources.revision(SourceId(0)).unwrap(), revision);
+    assert_eq!(sources.next_available(SourceId(0), 2).unwrap(), Some(6..8));
+    assert_eq!(
+        sources
+            .arrive_unchanged(
+                SourceId(0),
+                Arc::clone(&access),
+                8,
+                ranges.clone(),
+                published,
+                physical
+            )
+            .unwrap(),
+        published
+    );
+    sources.withdraw(SourceId(0)).unwrap();
+    assert!(matches!(
+        sources.arrive_unchanged(SourceId(0), access, 8, ranges, published, physical),
+        Err(EngineError::SourceChanged(SourceId(0)))
+    ));
+    assert_eq!(sources.next_available(SourceId(0), 0).unwrap(), None);
+}
+
+#[test]
 fn withdrawing_coverage_fences_open_readers_and_keeps_generation_history() {
     let sources = PublishedSources::default();
     let before = sources

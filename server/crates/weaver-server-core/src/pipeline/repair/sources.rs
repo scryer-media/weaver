@@ -11,6 +11,15 @@ use std::sync::{Arc, RwLock};
 const MAX_SOURCES: usize = 16_384;
 const MAX_RANGES: usize = 262_144;
 
+enum PublicationMode {
+    Replace,
+    Arrival,
+    UnchangedBacking {
+        published: SourceSnapshot,
+        backing: SourceSnapshot,
+    },
+}
+
 struct Publication {
     access: Arc<dyn SourceAccess>,
     backing: SourceSnapshot,
@@ -40,7 +49,7 @@ impl PublishedSources {
         len: u64,
         ranges: Vec<Range<u64>>,
     ) -> EngineResult<SourceSnapshot> {
-        self.publish(source, access, len, ranges, false)
+        self.publish(source, access, len, ranges, PublicationMode::Replace)
     }
 
     pub(in crate::pipeline) fn arrive(
@@ -50,7 +59,28 @@ impl PublishedSources {
         len: u64,
         ranges: Vec<Range<u64>>,
     ) -> EngineResult<SourceSnapshot> {
-        self.publish(source, access, len, ranges, true)
+        self.publish(source, access, len, ranges, PublicationMode::Arrival)
+    }
+
+    /// Extend visibility only if both generations still match at publication.
+    /// Unlike a writer's `arrive` assertion, this cannot accept changed backing
+    /// bytes between the caller's continuity check and this registry update.
+    pub(in crate::pipeline) fn arrive_unchanged(
+        &self,
+        source: SourceId,
+        access: Arc<dyn SourceAccess>,
+        len: u64,
+        ranges: Vec<Range<u64>>,
+        published: SourceSnapshot,
+        backing: SourceSnapshot,
+    ) -> EngineResult<SourceSnapshot> {
+        self.publish(
+            source,
+            access,
+            len,
+            ranges,
+            PublicationMode::UnchangedBacking { published, backing },
+        )
     }
 
     fn publish(
@@ -59,7 +89,7 @@ impl PublishedSources {
         access: Arc<dyn SourceAccess>,
         len: u64,
         ranges: Vec<Range<u64>>,
-        arrival: bool,
+        mode: PublicationMode,
     ) -> EngineResult<SourceSnapshot> {
         if ranges.len() > MAX_RANGES {
             return Err(EngineError::ResourceLimit("published source ranges"));
@@ -83,6 +113,16 @@ impl PublishedSources {
             .write()
             .map_err(|_| io::Error::other("source registry poisoned"))?;
         let old = registry.sources.get(&source);
+        let arrival = !matches!(mode, PublicationMode::Replace);
+        if let PublicationMode::UnchangedBacking {
+            published,
+            backing: expected,
+        } = mode
+            && (backing != expected
+                || old.is_none_or(|old| old.snapshot != published || old.backing != expected))
+        {
+            return Err(EngineError::SourceChanged(source));
+        }
         if old.is_none() && registry.sources.len() >= MAX_SOURCES {
             return Err(EngineError::ResourceLimit("published source count"));
         }
@@ -122,6 +162,33 @@ impl PublishedSources {
         );
         registry.ranges = total;
         Ok(snapshot)
+    }
+
+    /// Compare an existing publication after the caller independently checked
+    /// the same backing identity. A withdrawn source has a newer logical
+    /// generation and can never match its previous publication.
+    pub(in crate::pipeline) fn matches_publication(
+        &self,
+        source: SourceId,
+        snapshot: SourceSnapshot,
+        backing: SourceSnapshot,
+        ranges: &[Range<u64>],
+    ) -> io::Result<bool> {
+        Ok(self.entry(source)?.is_some_and(|entry| {
+            entry.snapshot == snapshot && entry.backing == backing && entry.ranges == ranges
+        }))
+    }
+
+    pub(in crate::pipeline) fn can_extend_publication(
+        &self,
+        source: SourceId,
+        snapshot: SourceSnapshot,
+        backing: SourceSnapshot,
+        ranges: &[Range<u64>],
+    ) -> io::Result<bool> {
+        Ok(self.entry(source)?.is_some_and(|entry| {
+            entry.snapshot == snapshot && entry.backing == backing && covers(ranges, &entry.ranges)
+        }))
     }
 
     pub(in crate::pipeline) fn revision(&self, source: SourceId) -> io::Result<Option<u64>> {

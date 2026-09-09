@@ -933,6 +933,7 @@ impl Pipeline {
             DirectSetPlan::discover(&state.spec, &state.working_dir, &destination_dir);
         let password = state.spec.password.clone();
         let par2_available = super::plan::spec_carries_par2(&state.spec);
+        let par3_available = !par2_available && self.par3_direct_checks_available(job_id);
         for (set_name, refusal) in refused {
             crate::runtime::perf_probe::record_owned(
                 format!("direct_store.refused.{}", refusal.metric()),
@@ -1020,6 +1021,7 @@ impl Pipeline {
                 // arrives later. Held in memory only.
                 set.router.set_password(password.as_deref());
                 set.router.note_par2_available(par2_available);
+                set.router.note_par3_available(par3_available);
                 set
             })
             .collect();
@@ -1661,10 +1663,12 @@ impl Pipeline {
             .jobs
             .get(&job_id)
             .is_some_and(|state| super::plan::spec_carries_par2(&state.spec));
+        let par3_available = !par2_available && self.par3_direct_checks_available(job_id);
         let mut set = DirectSet::new(job_id, plan);
         self.direct_store.apply_ceilings(&mut set);
         set.router.set_password(password);
         set.router.note_par2_available(par2_available);
+        set.router.note_par3_available(par3_available);
         let sets = self.direct_store.sets.entry(job_id).or_default();
         sets.push(set);
         sets.len() - 1

@@ -2399,6 +2399,19 @@ impl Pipeline {
         }
         let set_names: Vec<String> = set_names.into_iter().collect();
         for set_name in &set_names {
+            if self.direct_store.sets_for(job_id).iter().any(|set| {
+                set.set_name() == set_name
+                    && set.was_restored()
+                    && !set.is_demoted()
+                    && !set.is_finalized()
+            }) {
+                // Direct restore already validated these facts against its
+                // durable coverage. Its source volumes need not exist as files.
+                // Conventional discovery must neither discard that cache nor
+                // build a second extraction owner from a partial disk image.
+                self.rar_sets.remove(&(job_id, set_name.clone()));
+                continue;
+            }
             let password_candidates = self.archive_password_candidates_for_set(job_id, set_name);
             let volume_files = {
                 let Some(state) = self.jobs.get(&job_id) else {

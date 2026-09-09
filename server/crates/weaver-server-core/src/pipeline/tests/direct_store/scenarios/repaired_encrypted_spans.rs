@@ -830,3 +830,69 @@ fn repair_two_slices(batched: bool, encrypted: bool) {
         "the member must verify against the repaired image"
     );
 }
+
+#[tokio::test]
+async fn replacement_edges_include_unrouted_neighbour_tails() {
+    let payload: Vec<u8> = (0..16_000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        REPAIR_MEMBER,
+        &payload,
+        4,
+        REPAIR_PASSWORD,
+        Some(REPAIR_PASSWORD),
+        true,
+    );
+    let mut router = encrypted_router(&volumes, REPAIR_PASSWORD);
+    for (index, (_, bytes)) in volumes.iter().enumerate() {
+        if index < 2 {
+            router
+                .route(index as u32, 0, &bytes[..bytes.len() / 2])
+                .unwrap();
+        } else {
+            router.route(index as u32, 0, bytes).unwrap();
+            router.note_volume_complete(index as u32).unwrap();
+        }
+    }
+    let plans: Vec<_> = (0..2)
+        .map(|volume| {
+            router
+                .cipher_replacement_edge_reads_bounded(volume, 16)
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        plans[1].iter().any(|(volume, offset, _)| {
+            *volume == 0 && *offset >= (volumes[0].1.len() / 2) as u64
+        }),
+        "the second rewrite needs CBC bytes the first volume never routed"
+    );
+    assert!(
+        router
+            .cipher_replacement_edge_reads_bounded(1, plans[1].len() - 1)
+            .is_none()
+    );
+    router.begin_repair_transaction(vec![0, 1]).unwrap();
+    for volume in 0..2usize {
+        let edges: Vec<_> = plans[volume]
+            .iter()
+            .map(|&(index, offset, len)| {
+                (
+                    index,
+                    offset,
+                    std::sync::Arc::from(
+                        &volumes[index as usize].1[offset as usize..(offset + len) as usize],
+                    ),
+                )
+            })
+            .collect();
+        let bytes = std::sync::Arc::from(volumes[volume].1.as_slice());
+        router
+            .route_repaired_batch(volume as u32, &[(0, bytes)], &edges, true, true)
+            .unwrap();
+        router.note_volume_complete(volume as u32).unwrap();
+        assert!(!router.all_members_verified());
+    }
+    router.finish_repair_transaction().unwrap();
+    close_stale_gaps(&mut router, &payload);
+    assert!(router.all_members_verified());
+}

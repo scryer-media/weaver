@@ -45,10 +45,19 @@ fn disk_source(
 
 struct Carrier {
     backing: SourceSnapshot,
+    published: SourceSnapshot,
+    path: Option<PathBuf>,
     scanner: PacketScanner,
     revision: u64,
     needed: Option<u64>,
     resume: Option<u64>,
+}
+
+struct DiskPublication {
+    path: PathBuf,
+    name: String,
+    backing: SourceSnapshot,
+    published: SourceSnapshot,
 }
 
 pub(in crate::pipeline) struct Par3Job {
@@ -57,6 +66,7 @@ pub(in crate::pipeline) struct Par3Job {
     carriers: BTreeMap<SourceId, Carrier>,
     sets: BTreeMap<par3_rs::InputSetId, assessment::SetSession>,
     bindings: BTreeMap<String, SourceId>,
+    disk_publications: BTreeMap<SourceId, DiskPublication>,
     publication_memory: BTreeMap<SourceId, assessment::ViewReservation>,
     virtual_readers: Arc<virtual_source::ReaderCache>,
 }
@@ -69,6 +79,7 @@ impl Default for Par3Job {
             carriers: BTreeMap::new(),
             sets: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            disk_publications: BTreeMap::new(),
             publication_memory: BTreeMap::new(),
             virtual_readers: Arc::default(),
         }
@@ -83,8 +94,49 @@ impl Par3Job {
         name: String,
         ranges: Vec<std::ops::Range<u64>>,
     ) -> EngineResult<()> {
-        let access = disk_source(source, path, &self.options)?;
-        self.publish_access(source, access, name, ranges)
+        if !self.disk_publications.contains_key(&source)
+            && self.disk_publications.len() >= MAX_CARRIERS
+        {
+            return Err(EngineError::ResourceLimit("PAR3 disk publications"));
+        }
+        let access = disk_source(source, path.clone(), &self.options)?;
+        let backing = access.snapshot(source)?.ok_or(EngineError::Unavailable {
+            source_id: source,
+            offset: 0,
+        })?;
+        let mut continuity = None;
+        if let Some(old) = self.disk_publications.get(&source)
+            && old.path == path
+            && old.name == name
+            && old.backing == backing
+            && self.bindings.get(&name) == Some(&source)
+        {
+            if self
+                .sources
+                .matches_publication(source, old.published, backing, &ranges)?
+            {
+                return Ok(());
+            }
+            if self
+                .sources
+                .can_extend_publication(source, old.published, backing, &ranges)?
+            {
+                continuity = Some((old.published, backing));
+            }
+        }
+        // Queue/publication leases already charge twice for paths and names:
+        // the source/binding owns one copy and this identity record the other.
+        let published = self.publish_access(source, access, name.clone(), ranges, continuity)?;
+        self.disk_publications.insert(
+            source,
+            DiskPublication {
+                path,
+                name,
+                backing,
+                published,
+            },
+        );
+        Ok(())
     }
 
     fn publish_access(
@@ -93,7 +145,8 @@ impl Par3Job {
         access: Arc<dyn SourceAccess>,
         name: String,
         ranges: Vec<std::ops::Range<u64>>,
-    ) -> EngineResult<()> {
+        continuity: Option<(SourceSnapshot, SourceSnapshot)>,
+    ) -> EngineResult<SourceSnapshot> {
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
             return Err(EngineError::ResourceLimit("PAR3 source bindings"));
         }
@@ -103,14 +156,31 @@ impl Par3Job {
         })?;
         // Only decoded placements committed by assembly are published. A file's
         // apparent length, including sparse zeroes, supplies no coverage proof.
-        self.sources.replace(source, access, snapshot.len, ranges)?;
+        let published = if let Some((published, backing)) = continuity {
+            self.sources.arrive_unchanged(
+                source,
+                access,
+                snapshot.len,
+                ranges,
+                published,
+                backing,
+            )?
+        } else {
+            self.sources.replace(source, access, snapshot.len, ranges)?
+        };
+        self.disk_publications.remove(&source);
         for set in self.sets.values_mut() {
-            set.invalidate(source);
+            if continuity.is_some() {
+                set.view = None;
+                set.native.source_arrived(source)?;
+            } else {
+                set.invalidate(source);
+            }
         }
         // Retire an old filename when this stable source has been rebound.
         self.bindings.retain(|_, bound| *bound != source);
         self.bindings.insert(name, source);
-        Ok(())
+        Ok(published)
     }
 
     fn publish_virtual(
@@ -131,7 +201,8 @@ impl Par3Job {
             self.options.clone(),
             Arc::clone(&self.virtual_readers),
         )?;
-        self.publish_access(source, Arc::new(access), name, ranges)
+        self.publish_access(source, Arc::new(access), name, ranges, None)
+            .map(|_| ())
     }
 
     fn assess(&mut self) -> EngineResult<()> {
@@ -166,27 +237,20 @@ impl Par3Job {
         })
     }
 
-    /// Disk carrier publication. Callers supply committed ranges; only tests
-    /// with complete official files use the full-carrier convenience path.
+    /// Disk carrier publication. Live downloads supply committed ranges.
+    /// Completed carriers restored without placements use their actual disk
+    /// extent; every admitted packet still requires authentication.
     fn scan_file(
         &mut self,
         source: SourceId,
         path: PathBuf,
         ranges: Option<Vec<std::ops::Range<u64>>>,
     ) -> EngineResult<()> {
-        let access = disk_source(source, path, &self.options)?;
+        let access = disk_source(source, path.clone(), &self.options)?;
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
             offset: 0,
         })?;
-        if ranges.is_none()
-            && self
-                .carriers
-                .get(&source)
-                .is_some_and(|carrier| carrier.backing == snapshot)
-        {
-            return Ok(());
-        }
         let ranges = ranges.unwrap_or_else(|| {
             if snapshot.len == 0 {
                 Vec::new()
@@ -194,7 +258,36 @@ impl Par3Job {
                 std::iter::once(0..snapshot.len).collect()
             }
         });
+        if let Some(carrier) = self.carriers.get(&source)
+            && carrier.path.as_ref() == Some(&path)
+            && carrier.backing == snapshot
+        {
+            if self
+                .sources
+                .matches_publication(source, carrier.published, snapshot, &ranges)?
+            {
+                return self.scan(source);
+            }
+            if self
+                .sources
+                .can_extend_publication(source, carrier.published, snapshot, &ranges)?
+            {
+                self.sources.arrive_unchanged(
+                    source,
+                    access,
+                    snapshot.len,
+                    ranges,
+                    carrier.published,
+                    snapshot,
+                )?;
+                return self.scan(source);
+            }
+        }
         self.publish_carrier(source, access, snapshot.len, ranges, false)?;
+        self.carriers
+            .get_mut(&source)
+            .expect("published carrier")
+            .path = Some(path);
         self.scan(source)
     }
 
@@ -213,14 +306,18 @@ impl Par3Job {
             source_id: source,
             offset: 0,
         })?;
-        if arrival {
-            self.sources.arrive(source, access, len, ranges)?;
+        let published = if arrival {
+            self.sources.arrive(source, access, len, ranges)?
         } else {
-            self.sources.replace(source, access, len, ranges)?;
+            let published = self.sources.replace(source, access, len, ranges)?;
             self.carriers.remove(&source);
-        }
+            published
+        };
+        self.disk_publications.remove(&source);
         if let Some(carrier) = self.carriers.get_mut(&source) {
             carrier.backing = backing;
+            carrier.published = published;
+            carrier.path = None;
         } else {
             let scanner = PacketScanner::new(
                 Arc::new(self.sources.clone()),
@@ -232,6 +329,8 @@ impl Par3Job {
                 source,
                 Carrier {
                     backing,
+                    published,
+                    path: None,
                     scanner,
                     revision: 0,
                     needed: None,
@@ -281,12 +380,15 @@ impl Par3Job {
                         .merge(packet)?;
                 }
                 ScanEvent::NeedData { offset } => {
-                    let position = carrier.scanner.position();
-                    carrier.resume = Some(carrier.resume.map_or(position, |old| old.min(position)));
                     carrier.needed = Some(carrier.needed.map_or(offset, |old| old.min(offset)));
                     if let Some(next) = self.sources.next_available(source, offset)?
                         && next.start > offset
                     {
+                        // Seeking past a hole discards the pending packet hash.
+                        // Otherwise leave it intact for the next arrival.
+                        let position = carrier.scanner.position();
+                        carrier.resume =
+                            Some(carrier.resume.map_or(position, |old| old.min(position)));
                         carrier.scanner.seek(next.start)?;
                         continue;
                     }
@@ -435,14 +537,24 @@ impl Pipeline {
         } else {
             self.par3_virtual_volume(file_id)
         };
+        // Completed-file restore deliberately omits article placements. Its
+        // disk image remains a candidate, with its actual length read by the
+        // worker and every protected byte verified afresh. Never apply this
+        // fallback to an incomplete source or to a virtual volume's holes.
+        let complete_disk_image =
+            file.is_complete() && ranges.is_empty() && virtual_volume.is_none();
         tracing::trace!(job_id = job_id.0, source = ?source, complete = file.is_complete(),
-            virtual_volume = virtual_volume.is_some(), ranges = ?ranges,
+            virtual_volume = virtual_volume.is_some(), complete_disk_image, ranges = ?ranges,
             "PAR3 committed source publication queued");
         let coordinator = self.par3_runtime.as_mut().expect("admitted PAR3 job");
-        if carrier {
+        if carrier && complete_disk_image {
+            coordinator.enqueue_complete_carrier(job_id, source, path)?;
+        } else if carrier {
             coordinator.enqueue_carrier_ranges(job_id, source, path, ranges)?;
         } else if let Some(volume) = virtual_volume {
             coordinator.enqueue_virtual(job_id, source, volume, name)?;
+        } else if complete_disk_image {
+            coordinator.enqueue_complete_file(job_id, source, path, name)?;
         } else {
             coordinator.enqueue_file(job_id, source, path, name, ranges)?;
         }
@@ -478,67 +590,17 @@ impl Pipeline {
             .find(|volume| volume.volume_index == index)
     }
 
-    async fn prepare_direct_store_for_par3_repair(
-        &mut self,
-        job_id: JobId,
-        input_set: par3_rs::InputSetId,
-    ) -> bool {
-        let damaged: std::collections::BTreeSet<_> = self
-            .par3_runtime
-            .as_ref()
-            .into_iter()
-            .flat_map(|runtime| runtime.assessments(job_id))
-            .filter(|(id, _)| *id == input_set)
-            .flat_map(|(_, view)| view.files.iter())
-            .filter(|file| !file.complete)
-            .filter_map(|file| {
-                file.source
-                    .and_then(|source| u32::try_from(source.0).ok())
-                    .or_else(|| {
-                        self.jobs
-                            .get(&job_id)?
-                            .assembly
-                            .files()
-                            .find(|candidate| {
-                                self.current_filename_for_file(job_id, candidate) == file.path
-                            })
-                            .map(|candidate| candidate.file_id().file_index)
-                    })
-            })
-            .collect();
-        let sets: Vec<_> = self
-            .direct_store
-            .sets_for(job_id)
-            .iter()
-            .enumerate()
-            .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
-            .filter(|(_, set)| {
-                set.plan()
-                    .volumes
-                    .values()
-                    .filter(|file| damaged.contains(file))
-                    .take(2)
-                    .count()
-                    > 1
-            })
-            .map(|(index, _)| index)
-            .collect();
-        if sets.is_empty() {
-            return false;
-        }
-        // Several damaged volumes still need a set-wide replacement boundary.
-        // A single damaged volume, plain or encrypted, receives bounded stripes.
-        for index in sets {
-            self.invalidate_par3_direct_set(job_id, index);
-            self.demote_direct_set(
-                job_id,
-                index,
-                crate::pipeline::direct_store::router::DemotionReason::Par3Damaged,
-            )
-            .await;
-        }
-        self.schedule_job_completion_check(job_id);
-        true
+    /// Both declared carriers and authenticated late discovery can defer an
+    /// archive gate. Preserve the existing PAR2 policy for mixed jobs.
+    pub(in crate::pipeline) fn par3_direct_checks_available(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|state| {
+            !crate::pipeline::direct_store::plan::spec_carries_par2(&state.spec)
+                && (crate::pipeline::direct_store::plan::spec_defers_to_par3(&state.spec)
+                    || self
+                        .par3_runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.authenticated_set_count(job_id) != 0))
+        })
     }
 
     pub(in crate::pipeline) fn par3_verification_pending(&self, job_id: JobId) -> bool {
@@ -692,6 +754,16 @@ impl Pipeline {
                 sets = coordinator.authenticated_set_count(job_id),
                 "PAR3 carrier worker settled"
             );
+            if self.par3_direct_checks_available(job_id) {
+                for index in 0..self.direct_store.sets_for(job_id).len() {
+                    if let Some(set) = self.direct_store.set_mut(job_id, index)
+                        && !set.is_demoted()
+                        && !set.is_finalized()
+                    {
+                        set.router.note_par3_available(true);
+                    }
+                }
+            }
             self.schedule_job_completion_check(job_id);
         }
         if let (Some(job_id), Some(result)) = (job_id, repair) {

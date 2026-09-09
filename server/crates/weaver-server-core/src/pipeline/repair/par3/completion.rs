@@ -65,14 +65,11 @@ impl Pipeline {
                 );
                 return true;
             }
-            return false;
+            return self.settle_par3_archive_checks(job_id).await;
         };
         match status {
             RepairStatus::Complete => false,
             RepairStatus::Ready => {
-                if self.prepare_direct_store_for_par3_repair(job_id, set).await {
-                    return true;
-                }
                 self.prepare_direct_unpack_for_par3_repair(job_id);
                 if self.job_has_active_extraction_tasks(job_id) {
                     return true;
@@ -126,6 +123,50 @@ impl Pipeline {
                 true
             }
         }
+    }
+
+    /// Resolve a deferred archive check only after all native PAR3 assessments
+    /// are complete. PAR3 verification does not override an archive checksum.
+    async fn settle_par3_archive_checks(&mut self, job_id: JobId) -> bool {
+        let sets: Vec<_> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                !set.is_demoted() && !set.is_finalized() && set.router.awaits_par3_verdict()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let settled = !sets.is_empty();
+        for index in sets {
+            let set = self
+                .direct_store
+                .set_mut(job_id, index)
+                .expect("selected set");
+            let repaired = set.repair_attempted();
+            if let Err(reason) = set.router.settle_par3_verification() {
+                if repaired {
+                    let error = format!(
+                        "PAR3 verified sources failed the archive checksum: {}",
+                        reason.metric()
+                    );
+                    self.fail_direct_unpack_after_repair(job_id, &error);
+                    self.fail_job(job_id, error);
+                } else {
+                    self.invalidate_par3_direct_set(job_id, index);
+                    self.demote_direct_set(job_id, index, reason).await;
+                    self.schedule_job_completion_check(job_id);
+                }
+                return true;
+            }
+        }
+        if settled {
+            // Finalization precedes this gate in the completion pass. Re-enter
+            // it before conventional extraction can consume the direct set.
+            self.schedule_job_completion_check(job_id);
+        }
+        settled
     }
 
     pub(super) async fn complete_par3_repair(
@@ -296,7 +337,7 @@ impl Pipeline {
         self.par3_runtime
             .as_mut()
             .expect("admitted job")
-            .enqueue_installed(job_id, SourceId(u64::from(id.file_index)), path, name)?;
+            .enqueue_complete_file(job_id, SourceId(u64::from(id.file_index)), path, name)?;
         Ok(())
     }
 

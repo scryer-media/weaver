@@ -869,6 +869,9 @@ impl Pipeline {
                 !set.is_demoted()
                     && !set.is_finalized()
                     && set.all_volumes_complete()
+                    // Native completion and router settlement are separate
+                    // actor steps. The latter still owns this damage verdict.
+                    && !set.router.awaits_par3_verdict()
                     && !set.router.damaged_volumes().is_empty()
             })
             .map(|(index, _)| index)

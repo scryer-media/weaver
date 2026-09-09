@@ -2,9 +2,11 @@
 
 use super::*;
 use crate::pipeline::direct_store::repair::{RepairedSpan, read_repaired_range};
+use crate::pipeline::direct_store::router::RestartReadRun;
 
 pub(super) const STRIPE_BYTES: u64 = 256 * 1024;
 pub(super) const STRIPE_RESERVATION: usize = 2 * STRIPE_BYTES as usize + 4096;
+const MAX_GAP_PATH_BYTES: usize = 8192;
 const MAX_EDGES: usize = 4096;
 const EDGE_RESERVATION: usize = MAX_EDGES * 256;
 
@@ -90,18 +92,91 @@ pub(super) struct Target {
     pub edges: Vec<CipherEdge>,
 }
 
+pub(super) struct GapRead {
+    run: RestartReadRun,
+    path: PathBuf,
+}
+
+impl GapRead {
+    fn read(&self, options: &ExecutionOptions) -> EngineResult<u32> {
+        options.cancel.check()?;
+        if self.run.len == 0 || self.run.len > STRIPE_BYTES {
+            return Err(EngineError::InvalidState("invalid PAR3 gap stripe"));
+        }
+        let access = disk_source(SourceId(0), self.path.clone(), options)?;
+        let snapshot = access
+            .snapshot(SourceId(0))?
+            .ok_or(EngineError::Unavailable {
+                source_id: SourceId(0),
+                offset: self.run.logical_offset,
+            })?;
+        let end = self
+            .run
+            .logical_offset
+            .checked_add(self.run.len)
+            .filter(|end| *end <= snapshot.len)
+            .ok_or(EngineError::Unavailable {
+                source_id: SourceId(0),
+                offset: self.run.logical_offset,
+            })?;
+        let mut bytes = vec![0; 64 * 1024];
+        let mut offset = self.run.logical_offset;
+        let mut crc = 0;
+        while offset < end {
+            options.cancel.check()?;
+            let count = bytes.len().min((end - offset) as usize);
+            let read = access.read_at(SourceId(0), offset, &mut bytes[..count])?;
+            if read == 0 {
+                return Err(EngineError::Unavailable {
+                    source_id: SourceId(0),
+                    offset,
+                });
+            }
+            crc = weaver_yenc::crc32_combine(
+                crc,
+                par2_rs::checksum::crc32(&bytes[..read]),
+                read as u64,
+            );
+            offset += read as u64;
+        }
+        options.cancel.check()?;
+        if access.snapshot(SourceId(0))? != Some(snapshot) {
+            return Err(EngineError::SourceChanged(SourceId(0)));
+        }
+        Ok(crc)
+    }
+}
+
+pub(super) enum ReadbackUnit {
+    Stripe(RepairedSpan),
+    Gap(u32),
+}
+
 pub(super) struct Installation {
     pub completion: work::RepairCompletion,
     pub targets: Vec<Target>,
     pub current: usize,
     pub offset: u64,
     pub crc32: u32,
+    pub settling_set: Option<usize>,
+    pub pending_gap: Option<GapRead>,
     pub edge_reads: Vec<EdgeRead>,
     pub preflight_failed: bool,
     pub _edge_reservation: Option<assessment::ViewReservation>,
 }
 
 impl Installation {
+    pub fn read_unit(
+        &mut self,
+        sources: &PublishedSources,
+        options: &ExecutionOptions,
+    ) -> EngineResult<ReadbackUnit> {
+        if let Some(gap) = &self.pending_gap {
+            return gap.read(options).map(ReadbackUnit::Gap);
+        }
+        self.read(sources, options).map(ReadbackUnit::Stripe)
+    }
+
     pub fn read(
         &mut self,
         sources: &PublishedSources,
@@ -189,7 +264,7 @@ impl Installation {
 
 pub(super) struct ReadbackDone {
     pub installation: Box<Installation>,
-    pub result: EngineResult<RepairedSpan>,
+    pub result: EngineResult<ReadbackUnit>,
     pub _reservation: assessment::ViewReservation,
 }
 
@@ -274,11 +349,11 @@ impl Pipeline {
                 .expect("matched set");
             let Some(reads) = set
                 .router
-                .cipher_edge_reads_bounded(target.volume, MAX_EDGES - edge_reads.len())
+                .cipher_replacement_edge_reads_bounded(target.volume, MAX_EDGES - edge_reads.len())
             else {
                 self.fail_job(
                     job_id,
-                    "PAR3 cipher edge plan exceeds the host budget".into(),
+                    "PAR3 cipher edge plan is incomplete or exceeds the host budget".into(),
                 );
                 return;
             };
@@ -307,6 +382,8 @@ impl Pipeline {
             current: 0,
             offset: 0,
             crc32: 0,
+            settling_set: None,
+            pending_gap: None,
             edge_reads,
             preflight_failed: false,
             _edge_reservation: edge_reservation,
@@ -347,7 +424,53 @@ impl Pipeline {
             result,
             _reservation,
         } = done.map_err(|error| error.to_string())?;
-        let span = result.map_err(|error| format!("PAR3 readback failed: {error}"))?;
+        let unit = result.map_err(|error| format!("PAR3 readback failed: {error}"))?;
+        let span = match unit {
+            ReadbackUnit::Stripe(span) => {
+                if installation.pending_gap.is_some() || installation.settling_set.is_some() {
+                    return Err("PAR3 stripe arrived during gap settlement".into());
+                }
+                span
+            }
+            ReadbackUnit::Gap(crc) => {
+                let gap = installation
+                    .pending_gap
+                    .take()
+                    .ok_or("missing PAR3 gap read")?;
+                let set_index = installation.settling_set.ok_or("missing PAR3 gap set")?;
+                let set = self
+                    .direct_store
+                    .set_mut(job_id, set_index)
+                    .ok_or("missing PAR3 direct set")?;
+                if set.is_demoted()
+                    || set.is_finalized()
+                    || set
+                        .router
+                        .next_stale_gap(STRIPE_BYTES, MAX_GAP_PATH_BYTES)
+                        .map_err(|reason| reason.metric().to_string())?
+                        .as_ref()
+                        != Some(&gap.run)
+                {
+                    return Err("PAR3 gap layout changed before handback".into());
+                }
+                set.router
+                    .note_restored_member_crc(
+                        gap.run.member_id,
+                        gap.run.logical_offset,
+                        gap.run.len,
+                        crc,
+                    )
+                    .map_err(|reason| {
+                        format!("PAR3 gap verification failed: {}", reason.metric())
+                    })?;
+                crate::runtime::perf_probe::record_value(
+                    "direct_store.repair.gap_reread_bytes",
+                    gap.run.len,
+                );
+                drop(_reservation);
+                return self.advance_par3_installation(job_id, installation).await;
+            }
+        };
         let target = &installation.targets[installation.current];
         let set_index = target.set;
         let volume = target.volume;
@@ -371,12 +494,23 @@ impl Pipeline {
             if first && set.repair_attempted() {
                 return Err("PAR3 direct set already repaired".into());
             }
-            let mut persist = crate::pipeline::direct_store::barrier::DatabaseCoveragePersist::new(
-                self.db.clone(),
-            );
-            set.delete_checkpoint_row(&mut persist)
-                .map_err(|error| format!("PAR3 checkpoint retirement failed: {error}"))?;
-            set.note_repair_attempted();
+            if first {
+                let mut persist =
+                    crate::pipeline::direct_store::barrier::DatabaseCoveragePersist::new(
+                        self.db.clone(),
+                    );
+                set.delete_checkpoint_row(&mut persist)
+                    .map_err(|error| format!("PAR3 checkpoint retirement failed: {error}"))?;
+                let volumes = installation.targets[installation.current..]
+                    .iter()
+                    .take_while(|target| target.set == set_index)
+                    .map(|target| target.volume)
+                    .collect();
+                set.begin_repair_transaction(volumes).map_err(|reason| {
+                    format!("PAR3 replacement setup failed: {}", reason.metric())
+                })?;
+                set.note_repair_attempted();
+            }
             self.block_crcs.forget_file(target.file);
         }
         if span.source_offset != installation.offset
@@ -418,8 +552,62 @@ impl Pipeline {
                 .await
                 .map_err(|error| format!("PAR3 volume confirmation placement failed: {error:?}"))?;
             installation.current += 1;
+            if installation
+                .targets
+                .get(installation.current)
+                .is_none_or(|next| next.set != set_index)
+            {
+                installation.settling_set = Some(set_index);
+            }
             installation.offset = 0;
             installation.crc32 = 0;
+        }
+        self.advance_par3_installation(job_id, installation).await
+    }
+
+    async fn advance_par3_installation(
+        &mut self,
+        job_id: JobId,
+        mut installation: Box<Installation>,
+    ) -> Result<(), String> {
+        if let Some(set_index) = installation.settling_set {
+            let set = self
+                .direct_store
+                .set_mut(job_id, set_index)
+                .ok_or("missing PAR3 direct set")?;
+            if set.is_demoted() || set.is_finalized() {
+                return Err("PAR3 direct set changed during gap settlement".into());
+            }
+            if let Some(run) = set
+                .router
+                .next_stale_gap(STRIPE_BYTES, MAX_GAP_PATH_BYTES)
+                .map_err(|reason| format!("PAR3 gap planning failed: {}", reason.metric()))?
+            {
+                if set
+                    .plan()
+                    .destination_dir
+                    .as_os_str()
+                    .len()
+                    .saturating_add(run.relative_partial.len())
+                    > MAX_GAP_PATH_BYTES
+                {
+                    return Err("PAR3 gap path exceeds retained budget".into());
+                }
+                installation.pending_gap = Some(GapRead {
+                    path: set.plan().destination_dir.join(&run.relative_partial),
+                    run,
+                });
+                return self
+                    .par3_runtime
+                    .as_mut()
+                    .expect("admitted job")
+                    .queue_readback(job_id, installation)
+                    .map_err(|error| error.to_string());
+            }
+            set.finish_repair_transaction().map_err(|reason| {
+                format!("PAR3 replacement verification failed: {}", reason.metric())
+            })?;
+            installation.settling_set = None;
         }
         if installation.current == installation.targets.len() {
             for set in installation
@@ -460,6 +648,73 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gap_readback_streams_exact_crc_and_enforces_io_bounds() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("member.partial");
+        let bytes: Vec<u8> = (0..STRIPE_BYTES + 29).map(|i| (i * 31) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut options = execution_options();
+        options.handles = HandleBudget::new(1);
+        let mut gap = GapRead {
+            path: path.clone(),
+            run: RestartReadRun {
+                member_id: 1,
+                relative_partial: "member.partial".into(),
+                logical_offset: 17,
+                len: STRIPE_BYTES,
+            },
+        };
+        assert_eq!(
+            gap.read(&options).unwrap(),
+            par2_rs::checksum::crc32(&bytes[17..17 + STRIPE_BYTES as usize])
+        );
+        let handle = options.handles.acquire().unwrap();
+        assert!(matches!(
+            gap.read(&options),
+            Err(EngineError::ResourceLimit(_))
+        ));
+        drop(handle);
+        gap.run.len += 1;
+        assert!(matches!(
+            gap.read(&options),
+            Err(EngineError::InvalidState(_))
+        ));
+        gap.run.len = STRIPE_BYTES;
+        std::fs::write(&path, &bytes[..31]).unwrap();
+        assert!(matches!(
+            gap.read(&options),
+            Err(EngineError::Unavailable { .. })
+        ));
+        options.cancel.cancel();
+        assert!(matches!(gap.read(&options), Err(EngineError::Cancelled)));
+    }
+
+    #[test]
+    fn gap_worker_continues_after_the_last_replacement_stripe() {
+        let root = tempfile::tempdir().unwrap();
+        let options = execution_options();
+        let mut installation = encrypted_installation(root.path(), &options);
+        let path = root.path().join("member.partial");
+        std::fs::write(&path, [37; 71]).unwrap();
+        installation.current = installation.targets.len();
+        installation.settling_set = Some(0);
+        installation.pending_gap = Some(GapRead {
+            path,
+            run: RestartReadRun {
+                member_id: 1,
+                relative_partial: "member.partial".into(),
+                logical_offset: 3,
+                len: 61,
+            },
+        });
+        assert!(matches!(
+            installation.read_unit(&PublishedSources::default(), &options).unwrap(),
+            ReadbackUnit::Gap(crc) if crc == par2_rs::checksum::crc32(&[37; 61])
+        ));
+        assert_eq!(installation.current, installation.targets.len());
+    }
 
     #[test]
     fn verified_output_readback_is_bounded_and_exact() {
@@ -568,6 +823,8 @@ mod tests {
             current: 0,
             offset: 0,
             crc32: 0,
+            settling_set: None,
+            pending_gap: None,
             edge_reads: vec![EdgeRead {
                 target: 0,
                 source: SourceId(1),

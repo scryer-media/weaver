@@ -383,6 +383,57 @@ impl DirectSetRouter {
         self.reread_plan(|member| &member.stale_gaps)
     }
 
+    /// Select one stale run without allocating a plan or a part-boundary list.
+    /// The caller supplies both the I/O stripe and retained path ceilings.
+    pub(crate) fn next_stale_gap(
+        &self,
+        max_bytes: u64,
+        max_path_bytes: usize,
+    ) -> Result<Option<RestartReadRun>, DemotionReason> {
+        if max_bytes == 0 {
+            return Err(DemotionReason::RepairGapUnreadable);
+        }
+        for member_id in &self.member_order {
+            let Some(member) = self.members.get(member_id) else {
+                continue;
+            };
+            let Some(&(start, end)) = member.stale_gaps.ranges().first() else {
+                continue;
+            };
+            if member.relative_partial.len() > max_path_bytes {
+                return Err(DemotionReason::RepairGapUnreadable);
+            }
+            let layout = self
+                .layout_index_for_member(*member_id)
+                .and_then(|index| self.layout_members().get(index))
+                .ok_or(DemotionReason::RepairGapUnreadable)?;
+            let boundary = layout
+                .parts
+                .iter()
+                .filter_map(|part| {
+                    let low = part.logical_offset?;
+                    let high = low.checked_add(part.data_size)?;
+                    (start >= low && start < high).then_some(high)
+                })
+                .next()
+                .ok_or(DemotionReason::RepairGapUnreadable)?;
+            let stop = end.min(boundary).min(start.saturating_add(max_bytes));
+            if stop <= start {
+                return Err(DemotionReason::RepairGapUnreadable);
+            }
+            return Ok(Some(RestartReadRun {
+                member_id: *member_id,
+                relative_partial: member.relative_partial.clone(),
+                logical_offset: start,
+                len: stop - start,
+            }));
+        }
+        if self.has_stale_gaps() {
+            return Err(DemotionReason::RepairGapUnreadable);
+        }
+        Ok(None)
+    }
+
     pub(super) fn reread_plan(
         &self,
         pick: impl Fn(&MemberRouting) -> &ByteRanges,

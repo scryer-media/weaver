@@ -586,6 +586,25 @@ impl DirectSet {
         }
     }
 
+    pub(crate) fn begin_repair_transaction(
+        &mut self,
+        volumes: Vec<u32>,
+    ) -> Result<(), DemotionReason> {
+        self.router
+            .begin_repair_transaction(volumes)
+            .inspect_err(|reason| {
+                self.demote(*reason);
+            })
+    }
+
+    pub(crate) fn finish_repair_transaction(&mut self) -> Result<(), DemotionReason> {
+        self.router
+            .finish_repair_transaction()
+            .inspect_err(|reason| {
+                self.demote(*reason);
+            })
+    }
+
     /// Apply one bounded replacement batch; the caller must place its spans
     /// before advancing and retire the job on any placement failure.
     pub(crate) fn route_repaired_batch(
@@ -647,12 +666,13 @@ impl DirectSet {
         }
     }
 
-    /// Every volume the set plans has completed and every member has passed the
-    /// whole-member gate.
+    /// Every volume has completed, every member has passed its archive gate,
+    /// and any deferred PAR3 verdict has been applied to the router.
     pub(crate) fn ready_to_finalize(&self) -> bool {
         !self.is_demoted()
             && !self.is_finalized()
             && self.all_volumes_complete()
+            && !self.router.awaits_par3_verdict()
             && self.router.all_members_verified()
     }
 
