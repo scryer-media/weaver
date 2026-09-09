@@ -41,7 +41,7 @@ func TestPar3ArchiveE2E(t *testing.T) {
 			}
 			files, payload, member, password := par3ArchiveFixture(t, dir, format)
 			par3ArchiveParity(t, reference, dir, files)
-			modes := []string{"clean", "corrupt", "missing", "mixed-prefer-par2", "mixed-fallback"}
+			modes := []string{"clean", "renamed", "corrupt", "missing", "mixed-prefer-par2", "mixed-fallback"}
 			if strings.HasPrefix(format, "rar-") {
 				modes = append(modes, "disguised-carrier")
 			}
@@ -114,6 +114,15 @@ func TestPar3ArchiveE2E(t *testing.T) {
 							}
 						}
 						posted["000.metadata.bin"] = carrier
+					}
+					if mode == "renamed" {
+						for _, name := range unpackSortedNames(posted) {
+							if !strings.HasSuffix(name, ".par3") {
+								posted["obfuscated.dat"] = posted[name]
+								delete(posted, name)
+								break
+							}
+						}
 					}
 					articleMode := "clean"
 					if strings.HasPrefix(mode, "missing") {
@@ -224,7 +233,7 @@ func TestPar3ArchiveE2E(t *testing.T) {
 					if err != nil || !bytes.Equal(actual, payload) {
 						t.Fatalf("extracted member mismatch: %v got=%x want=%x", err, sha256.Sum256(actual), sha256.Sum256(payload))
 					}
-					if strings.HasPrefix(format, "rar-") {
+					if strings.HasPrefix(format, "rar-") && mode != "renamed" {
 						log, err := os.ReadFile(logPath)
 						if err != nil {
 							t.Fatal(err)
@@ -246,9 +255,9 @@ func TestPar3ArchiveE2E(t *testing.T) {
 							t.Fatal("two-volume repair did not limit installation to the damaged files")
 						}
 					}
-					if mode == "clean" || mode == "corrupt" || mixed || (mode == "missing" && format == "rar-store") {
+					if mode == "clean" || mode == "renamed" || mode == "corrupt" || mixed || (mode == "missing" && format == "rar-store") {
 						for index, name := range unpackSortedNames(posted) {
-							if (mode == "clean" || mode == "mixed-prefer-par2" || name != "repair.vol0+1.par3") && strings.Contains(name, ".vol") && strings.HasSuffix(name, ".par3") {
+							if (mode == "clean" || mode == "renamed" || mode == "mixed-prefer-par2" || name != "repair.vol0+1.par3") && strings.Contains(name, ".vol") && strings.HasSuffix(name, ".par3") {
 								for id, count := range requests {
 									if strings.HasPrefix(id, fmt.Sprintf("%s-%d-", slug, index)) && count != 0 {
 										t.Fatalf("archive requested unneeded recovery: %s", name)

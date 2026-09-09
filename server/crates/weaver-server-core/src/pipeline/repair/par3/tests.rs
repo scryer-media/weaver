@@ -1,8 +1,8 @@
 use super::*;
 use par3_rs::source::MemorySourceAccess;
 
-const INDEX: &[u8] = include_bytes!("../backend/fixtures/set.par3");
-const RECOVERY: &[u8] = include_bytes!("../backend/fixtures/set.vol0+1.par3");
+pub(super) const INDEX: &[u8] = include_bytes!("../backend/fixtures/set.par3");
+pub(super) const RECOVERY: &[u8] = include_bytes!("../backend/fixtures/set.vol0+1.par3");
 
 #[test]
 fn retired_binding_identity_cannot_be_published() {
@@ -272,7 +272,7 @@ fn source(bytes: &[u8]) -> Arc<dyn SourceAccess> {
     Arc::new(memory)
 }
 
-fn inputs() -> [(String, Vec<u8>); 3] {
+pub(super) fn inputs() -> [(String, Vec<u8>); 3] {
     [
         (
             "a.bin".into(),

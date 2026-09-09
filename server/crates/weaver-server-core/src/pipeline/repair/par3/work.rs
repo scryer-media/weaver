@@ -566,6 +566,34 @@ impl Coordinator {
         Ok(())
     }
 
+    pub(super) fn name_match_source(&self, job_id: JobId) -> Option<SourceId> {
+        if self.has_work(job_id) {
+            return None;
+        }
+        self.jobs
+            .get(&job_id)
+            .filter(|job| job.errors.is_empty())
+            .and_then(|job| job.runtime.as_ref())
+            .and_then(|runtime| runtime.name_search.source())
+    }
+
+    pub(super) fn take_name_match(
+        &mut self,
+        job_id: JobId,
+    ) -> EngineResult<Option<placement::NameMatch>> {
+        if self.has_work(job_id) {
+            return Ok(None);
+        }
+        match self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|job| job.runtime.as_mut())
+        {
+            Some(runtime) => runtime.take_name_match(),
+            None => Ok(None),
+        }
+    }
+
     pub(in crate::pipeline) fn assessments(
         &self,
         job_id: JobId,

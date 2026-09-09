@@ -31,6 +31,7 @@ pub enum FileIdentitySource {
     Declared,
     Probe,
     Par2,
+    Par3,
     Nested,
 }
 
@@ -40,6 +41,7 @@ impl FileIdentitySource {
             Self::Declared => "declared",
             Self::Probe => "probe",
             Self::Par2 => "par2",
+            Self::Par3 => "par3",
             Self::Nested => "nested",
         }
     }
@@ -49,6 +51,7 @@ impl FileIdentitySource {
             "declared" => Some(Self::Declared),
             "probe" => Some(Self::Probe),
             "par2" => Some(Self::Par2),
+            "par3" => Some(Self::Par3),
             "nested" => Some(Self::Nested),
             _ => None,
         }

@@ -62,6 +62,32 @@ impl Pipeline {
             self.fail_job(job_id, format!("PAR3 assessment failed: {error}"));
             return true;
         }
+        if let Some(source) = runtime.name_match_source(job_id) {
+            let direct = self.direct_store.sets_for(job_id).iter().position(|set| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && u32::try_from(source.0)
+                        .ok()
+                        .is_some_and(|index| set.plan().volume_for_file(index).is_some())
+            });
+            if let Some(index) = direct {
+                self.demote_direct_set(
+                    job_id,
+                    index,
+                    crate::pipeline::direct_store::router::DemotionReason::IdentityRosterUnfillable,
+                )
+                .await;
+                return true;
+            }
+            self.prepare_direct_unpack_for_par3_repair(job_id);
+            if self.job_has_active_extraction_tasks(job_id) {
+                return true;
+            }
+            if let Err(error) = self.apply_par3_content_identity(job_id).await {
+                self.fail_job(job_id, format!("PAR3 content placement failed: {error}"));
+            }
+            return true;
+        }
         self.note_par3_verification(job_id);
         let runtime = self.par3_runtime.as_ref().expect("admitted PAR3 job");
         let next = runtime

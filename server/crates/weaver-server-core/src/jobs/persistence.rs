@@ -3391,6 +3391,56 @@ mod tests {
     }
 
     #[test]
+    fn par3_content_identity_and_completed_name_survive_reopen() {
+        use crate::jobs::ids::NzbFileId;
+        use crate::jobs::record::FileIdentitySource;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("content-identity.db");
+        let job = sample_active_job(1);
+        let identity = ActiveFileIdentity {
+            file_index: 0,
+            source_filename: "obfuscated.dat".into(),
+            current_filename: "archive.zip".into(),
+            canonical_filename: Some("archive.zip".into()),
+            classification: None,
+            classification_source: FileIdentitySource::Par3,
+        };
+        {
+            let db = Database::open(&path).unwrap();
+            db.create_active_job(&job).unwrap();
+            db.complete_files(
+                job.job_id,
+                &[(0, "obfuscated.dat".into(), None)],
+                CompletedHashProvenance::Verified,
+            )
+            .unwrap();
+            db.save_file_identity(job.job_id, &identity).unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        let jobs = db.load_active_jobs().unwrap();
+        let restored = &jobs[&job.job_id];
+        assert_eq!(restored.file_identities[&0], identity);
+        assert!(restored.complete_files.contains(&NzbFileId {
+            job_id: job.job_id,
+            file_index: 0
+        }));
+        let datastore = db.datastore();
+        let name = db
+            .run_sql_blocking_read(async move {
+                SqlRuntime::fetch_optional(
+                    datastore.read_exec(),
+                    "SELECT filename FROM active_files WHERE job_id = {} AND file_index = {}",
+                    &[SqlArg::I64(1), SqlArg::I64(0)],
+                )
+                .await?
+                .unwrap()
+                .opt_text("filename")
+            })
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("archive.zip"));
+    }
+
+    #[test]
     fn archive_password_persistence_requires_the_same_key_after_reopen() {
         use crate::persistence::encryption::EncryptionKey;
         let root = tempfile::tempdir().unwrap();

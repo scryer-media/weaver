@@ -47,7 +47,7 @@ func TestPar3E2E(t *testing.T) {
 	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []string{"clean", "corrupt", "missing", "missing-index", "indexless", "late-index", "unrecoverable"} {
+	for _, mode := range []string{"clean", "renamed", "renamed-collision", "corrupt", "missing", "missing-index", "indexless", "late-index", "unrecoverable"} {
 		t.Run(mode, func(t *testing.T) {
 			files := map[string][]byte{"payload.bin": bytes.Clone(payload)}
 			paths, err := filepath.Glob(filepath.Join(fixtureDir, "*.par3"))
@@ -79,10 +79,14 @@ func TestPar3E2E(t *testing.T) {
 			if mode == "missing" {
 				articleMode = "missing"
 			}
+			if strings.HasPrefix(mode, "renamed") {
+				files["obfuscated.dat"] = files["payload.bin"]
+				delete(files, "payload.bin")
+			}
 			slug := "par3-" + mode
 			nzb := nntp.publishUnpack(slug, articleMode, files, nil)
 			var indexGate *unpackGate
-			if mode == "missing-index" || mode == "late-index" {
+			if mode == "missing-index" || mode == "late-index" || mode == "renamed-collision" {
 				nntp.mu.Lock()
 				id := fmt.Sprintf("%s-1-0@direct-unpack.test", slug)
 				article := nntp.articles[id]
@@ -106,7 +110,11 @@ func TestPar3E2E(t *testing.T) {
 				deadline := time.Now().Add(10 * time.Second)
 				landed := false
 				for time.Now().Before(deadline) {
-					info, err := os.Stat(filepath.Join(root, "intermediate", slug, "payload.bin"))
+					name := "payload.bin"
+					if mode == "renamed-collision" {
+						name = "obfuscated.dat"
+					}
+					info, err := os.Stat(filepath.Join(root, "intermediate", slug, name))
 					if err == nil && info.Size() == int64(len(payload)) && indexGate.held.Load() > 0 {
 						landed = true
 						break
@@ -114,6 +122,12 @@ func TestPar3E2E(t *testing.T) {
 					time.Sleep(10 * time.Millisecond)
 				}
 				before := api.status(job)
+				if mode == "renamed-collision" {
+					if err := os.WriteFile(filepath.Join(root, "intermediate", slug, "payload.bin"), []byte("existing unrelated output"), 0644); err != nil {
+						close(indexGate.released)
+						t.Fatal(err)
+					}
+				}
 				close(indexGate.released)
 				if !landed || before == "COMPLETED" || before == "FAILED" {
 					t.Fatalf("late metadata barrier: landed=%v status=%s", landed, before)
@@ -129,11 +143,27 @@ func TestPar3E2E(t *testing.T) {
 				time.Sleep(50 * time.Millisecond)
 			}
 			wantStatus := "COMPLETED"
-			if mode == "unrecoverable" {
+			if mode == "unrecoverable" || mode == "renamed-collision" {
 				wantStatus = "FAILED"
 			}
 			if status != wantStatus {
 				t.Fatalf("job=%d status=%s want=%s log=%s", job, status, wantStatus, logPath)
+			}
+			if mode == "renamed-collision" {
+				for name, expected := range map[string][]byte{"obfuscated.dat": payload, "payload.bin": []byte("existing unrelated output")} {
+					actual, err := os.ReadFile(filepath.Join(root, "intermediate", slug, name))
+					if err != nil || !bytes.Equal(actual, expected) {
+						t.Fatalf("collision changed %s: %v", name, err)
+					}
+				}
+				var history struct{ HistoryItem *struct{ Error *string } }
+				if err := api.query(`query($id:Int!) {historyItem(id:$id) {error}}`, map[string]any{"id": job}, &history); err != nil {
+					t.Fatal(err)
+				}
+				if history.HistoryItem == nil || history.HistoryItem.Error == nil || !strings.Contains(*history.HistoryItem.Error, "PAR3 content placement failed: cannot place") {
+					t.Fatalf("expected persisted placement collision: %+v", history.HistoryItem)
+				}
+				return
 			}
 			if status == "COMPLETED" {
 				actual, err := os.ReadFile(filepath.Join(root, "complete", slug, "payload.bin"))
@@ -166,7 +196,7 @@ func TestPar3E2E(t *testing.T) {
 						count += hits
 					}
 				}
-				if (mode == "clean" || name == "set.vol3+1.par3") && count != 0 {
+				if (mode == "clean" || mode == "renamed" || name == "set.vol3+1.par3") && count != 0 {
 					t.Fatalf("unneeded recovery carrier downloaded: %s (%d requests)", name, count)
 				}
 				if mode == "missing" && name == "set.vol1+2.par3" && count != 1 {
@@ -182,7 +212,11 @@ func TestPar3E2E(t *testing.T) {
 			if err := api.query(`query($id:Int!) {historyItem(id:$id) {failedBytes health}}`, map[string]any{"id": job}, &history); err != nil {
 				t.Fatal(err)
 			}
-			verificationEvents := api.assertPar3VerificationHistory(t, job, mode)
+			verificationMode := mode
+			if mode == "renamed" {
+				verificationMode = "clean"
+			}
+			verificationEvents := api.assertPar3VerificationHistory(t, job, verificationMode)
 			evidence, err := json.MarshalIndent(map[string]any{"jobId": job, "status": status, "requests": requests, "expectedBlake3": blake3.Sum256(payload), "history": history.HistoryItem, "verificationEvents": verificationEvents}, "", "  ")
 			if err != nil {
 				t.Fatal(err)

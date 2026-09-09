@@ -444,6 +444,34 @@ Validation passed all 178 native scenarios, 3,867 Rust tests (13 existing skips)
 three doctests, formatting, and all-target/all-feature Clippy. This uses
 prospective 0.11.3 without dependency changes.
 
+Whole-file content identity now locates clean renamed/obfuscated sources using
+PAR3's authenticated BLAKE3 file fingerprints, with a 64 KiB read buffer and
+host-budgeted digest caching keyed by source generation and availability revision.
+Unavailable ranges are never hashed as zeroes; matching and nonmatching sources
+are not reread on unchanged assessment or recovery-only arrivals. Identity
+proposals never count as native verification evidence. The actor first retires
+conflicting extraction work, materializes an affected virtual RAR set through the
+existing demotion path, then links the verified source to its authenticated flat
+name without overwriting another destination. Identity and completed-file naming
+are persisted together before the old name is removed. Native sessions rebind and
+verify the new source generation; PAR3 filenames also update ZIP/split extraction
+roles and rebuild affected rosters. Conventional RAR eager deletion now also waits
+for PAR3, including content placement: the combined E2E sweep exposed a race in
+which extraction removed a freshly materialized source before identity handback.
+A deterministic deletion-policy regression covers that lifetime requirement.
+No dependency or PAR2 policy changes are needed; this remains covered by
+prospective 0.11.3. Validation passed all 185 native scenarios, the full 3,871-test
+Rust sweep (13 existing skips), 54 focused tests after the source-lifetime fix
+(including its additional regression), three doctests, formatting, and all-target/
+all-feature Clippy. Full sweeps are batched by capability; targeted checks resolve
+failures found within that cycle.
+
+Content placement is not complete: damaged/shifted donors need extent placement,
+shared aliases need separate output mappings, and authenticated nested paths need
+safe mapping into Weaver's download identities. Interrupted filesystem placement
+and unsupported hard-link filesystems also need explicit reconciliation. These
+remain MVP gates; a clean filename match does not close them.
+
 Standalone mixed-format coordination now gives PAR2 its first repair attempt and
 excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence
 only affected PAR3 source evidence, then republish installed bytes for native

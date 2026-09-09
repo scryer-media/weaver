@@ -3141,6 +3141,56 @@ async fn eager_delete_preserves_later_member_volumes_after_out_of_order_completi
 }
 
 #[tokio::test]
+async fn eager_delete_keeps_rar_sources_while_par3_identity_is_unresolved() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30021);
+    let files = build_multifile_multivolume_rar_set();
+    let mut spec = rar_job_spec("RAR Sources Await PAR3", &files);
+    let carrier = include_bytes!("../../repair/backend/fixtures/set.par3");
+    spec.total_bytes += carrier.len() as u64;
+    spec.files.push(FileSpec {
+        filename: "repair.par3".into(),
+        role: FileRole::from_filename("repair.par3"),
+        groups: vec!["alt.binaries.test".into()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: carrier.len() as u32,
+            message_id: "pending-native-index@example.com".into(),
+        }],
+    });
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_rar_volume(&mut pipeline, job_id, index as u32, name, bytes).await;
+    }
+    pipeline
+        .extracted_members
+        .insert(job_id, HashSet::from(["E01.mkv".into()]));
+    pipeline
+        .recompute_rar_set_state(job_id, "show")
+        .await
+        .unwrap();
+    let state = pipeline.rar_sets.get_mut(&(job_id, "show".into())).unwrap();
+    state.active_workers = 0;
+    state.in_flight_members.clear();
+    let plan = state.plan.as_ref().unwrap();
+    assert!(plan.deletion_eligible.contains(&0));
+    assert!(plan.deletion_eligible.contains(&1));
+    assert!(pipeline.par3_verification_pending(job_id));
+    pipeline.try_delete_volumes(job_id, "show");
+    assert!(working_dir.join("show.part01.rar").exists());
+    assert!(working_dir.join("show.part02.rar").exists());
+    assert!(
+        pipeline
+            .eagerly_deleted
+            .get(&job_id)
+            .is_none_or(HashSet::is_empty)
+    );
+}
+
+#[tokio::test]
 async fn eager_delete_waits_for_par2_verification_before_removing_rar_sources() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

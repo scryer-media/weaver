@@ -69,6 +69,7 @@ pub(in crate::pipeline) struct Par3Job {
     sets: BTreeMap<par3_rs::InputSetId, assessment::SetSession>,
     bindings: BTreeMap<String, SourceId>,
     disk_publications: BTreeMap<SourceId, DiskPublication>,
+    name_search: placement::NameSearch,
     publication_memory: BTreeMap<SourceId, assessment::ViewReservation>,
     virtual_readers: Arc<virtual_source::ReaderCache>,
 }
@@ -82,6 +83,7 @@ impl Default for Par3Job {
             sets: BTreeMap::new(),
             bindings: BTreeMap::new(),
             disk_publications: BTreeMap::new(),
+            name_search: placement::NameSearch::default(),
             publication_memory: BTreeMap::new(),
             virtual_readers: Arc::default(),
         }
@@ -222,7 +224,7 @@ impl Par3Job {
             }
             set.assess()?;
         }
-        Ok(())
+        self.discover_name()
     }
 
     fn repair(
@@ -971,7 +973,9 @@ mod completion;
 mod coordination;
 #[cfg(windows)]
 mod disk_windows;
+mod identity;
 pub(in crate::pipeline) mod inside;
+mod placement;
 mod readback;
 pub(in crate::pipeline) mod virtual_source;
 pub(in crate::pipeline) mod work;

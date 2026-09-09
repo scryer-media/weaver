@@ -2165,6 +2165,10 @@ impl Pipeline {
                 && !self.par2_bypassed.contains(&job_id)
                 && !self.par2_verified.contains(&job_id)
         });
+        // PAR3 may still need this physical source for verification, content
+        // identity, or a different file's repair even after archive extraction
+        // has consumed it. Keep it until the native job verdict settles.
+        let par3_verification_pending = self.par3_verification_pending(job_id);
         let mut deleted_now = Vec::new();
         let mut ownership_ready = Vec::new();
 
@@ -2183,8 +2187,9 @@ impl Pipeline {
             };
 
             let claim_clean = Self::claim_clean_rar_volume(decision);
-            let verification_blocked =
-                par2_verification_pending || verified_suspect.contains(&volume);
+            let verification_blocked = par2_verification_pending
+                || par3_verification_pending
+                || verified_suspect.contains(&volume);
             let solid_blocked = plan.is_solid;
             let waiting_on_retry = plan.waiting_on_volumes.contains(&volume);
             let failed_member_claim = !decision.failed_owners.is_empty();
