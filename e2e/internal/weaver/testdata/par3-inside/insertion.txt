@@ -1,0 +1,13 @@
+Total file size = 8312
+Max file size = 8312
+
+Computing hash:
+done in 0.0 seconds.
+
+Number of chunk description = 4 (max 4)
+Actual block count = 17, Tail packing = 0, Deduplication = 0
+
+Computing recovery blocks:
+done in 0.0 seconds.
+
+Done

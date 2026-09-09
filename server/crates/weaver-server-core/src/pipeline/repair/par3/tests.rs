@@ -5,6 +5,76 @@ const INDEX: &[u8] = include_bytes!("../backend/fixtures/set.par3");
 const RECOVERY: &[u8] = include_bytes!("../backend/fixtures/set.vol0+1.par3");
 
 #[test]
+fn embedded_late_metadata_rewinds_once_and_preserves_hole_continuity() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../e2e/internal/weaver/testdata/par3-inside/archive.zip"
+    ));
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("archive.zip");
+    // Change only a stored member byte, well before the original ZIP footer
+    // and all official packets, so assessment exposes its recovery requirement.
+    let mut damaged = bytes.to_vec();
+    damaged[1024] ^= 1;
+    std::fs::write(&path, damaged).unwrap();
+    let source = SourceId(0);
+    // Locate a complete official metadata suffix with no recovery packets.
+    // Packet signatures only select candidates; the native parser admits them.
+    let (mut job, start) = bytes
+        .windows(par3_rs::MAGIC.len())
+        .enumerate()
+        .rev()
+        .filter(|(_, marker)| *marker == par3_rs::MAGIC)
+        .find_map(|(at, _)| {
+            let mut job = Par3Job::default();
+            job.scan_file_from(source, path.clone(), None, at as u64)
+                .unwrap();
+            let complete = job
+                .sets
+                .values_mut()
+                .any(|set| set.native.layout().unwrap().is_some());
+            (complete && available_recovery(&mut job) == 0).then_some((job, at as u64))
+        })
+        .expect("official fixture has late metadata after recovery");
+    job.scan_embedded(source, path.clone(), "archive.zip".into(), None, start)
+        .unwrap();
+    assert!(job.carriers[&source].scan_start < start);
+    assert!(available_recovery(&mut job) > 0);
+    let read = job.options.diagnostics.source_io().read_bytes;
+    let scanned = job.options.scan_work.used();
+    for _ in 0..3 {
+        job.scan_embedded(source, path.clone(), "archive.zip".into(), None, start)
+            .unwrap();
+    }
+    assert_eq!(job.options.diagnostics.source_io().read_bytes, read);
+    assert_eq!(job.options.scan_work.used(), scanned);
+
+    // The same rewind must preserve the retry point for an unavailable prefix
+    // of the first packet; no unavailable carrier bytes become implicit zeroes.
+    let floor = job.carriers[&source].scan_start;
+    let len = bytes.len() as u64;
+    let mut missing = Par3Job::default();
+    missing
+        .scan_embedded(
+            source,
+            path.clone(),
+            "archive.zip".into(),
+            Some(vec![0..floor, floor + 16..len]),
+            start,
+        )
+        .unwrap();
+    assert!(missing.carriers[&source].resume.is_some());
+    missing
+        .scan_embedded(source, path, "archive.zip".into(), None, start)
+        .unwrap();
+    assert_eq!(
+        available_recovery(&mut missing),
+        available_recovery(&mut job)
+    );
+    assert!(missing.carriers[&source].needed.is_none());
+}
+
+#[test]
 fn retained_sessions_share_the_process_memory_pool_and_release_their_charge() {
     let mut first = Par3Job::default();
     let second = Par3Job::default();

@@ -107,6 +107,25 @@ func (a unpackAPI) query(query string, variables any, out any) error {
 	return json.Unmarshal(envelope.Data, out)
 }
 
+// Failed scenarios must not keep retrying or repairing while later cases run
+// against the same isolated server. Preserve the original failure and artifacts.
+func (a unpackAPI) cancelOnFailure(t *testing.T, job int) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		switch a.status(job) {
+		case "COMPLETED", "FAILED", "CANCELLED":
+			return
+		}
+		var result struct{ CancelJob bool }
+		if err := a.query(`mutation($id:Int!) {cancelJob(id:$id)}`, map[string]any{"id": job}, &result); err != nil || !result.CancelJob {
+			t.Errorf("cancel unfinished fixture job %d: cancelled=%v error=%v", job, result.CancelJob, err)
+		}
+	})
+}
+
 func (a unpackAPI) submit(nzb []byte, slug string) (int, error) {
 	return a.submitWithPassword(nzb, slug, "")
 }

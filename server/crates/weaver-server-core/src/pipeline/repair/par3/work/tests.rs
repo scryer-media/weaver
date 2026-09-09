@@ -63,11 +63,24 @@ fn writes_retire_queued_publications_and_unknown_sources_do_not_allocate() {
     coordinator
         .enqueue(JobId(1), SourceId(0), PathBuf::from("old.par3"))
         .unwrap();
+    assert!(coordinator.has_complete_disk_image(JobId(1), SourceId(0)));
     coordinator
         .invalidate_source(JobId(1), SourceId(0))
         .unwrap();
     assert!(coordinator.jobs[&JobId(1)].pending.is_empty());
     assert_eq!(coordinator.dirty_sources(JobId(1)), [SourceId(0)]);
+    assert!(!coordinator.has_complete_disk_image(JobId(1), SourceId(0)));
+    coordinator
+        .enqueue_complete_file(
+            JobId(1),
+            SourceId(0),
+            PathBuf::from("installed.bin"),
+            "installed.bin".into(),
+        )
+        .unwrap();
+    assert!(coordinator.has_complete_disk_image(JobId(1), SourceId(0)));
+    coordinator.invalidate_bindings(JobId(1)).unwrap();
+    assert!(!coordinator.has_complete_disk_image(JobId(1), SourceId(0)));
 }
 
 #[tokio::test]
@@ -350,6 +363,7 @@ fn discovery_hint_cannot_authorize_rewriting_a_clean_standalone_set() {
         KnownSource {
             carrier: true,
             embedded_start: Some(0),
+            complete_disk_image: false,
             promoted: BTreeMap::new(),
             _reservation: assessment::ViewReservation::acquire(512).unwrap(),
         },

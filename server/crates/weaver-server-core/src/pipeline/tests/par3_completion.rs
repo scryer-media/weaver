@@ -3,6 +3,41 @@ use super::*;
 const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
 
 #[tokio::test]
+async fn embedded_discovery_cache_is_withdrawn_before_admission_on_writes_and_rebinding() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let first = NzbFileId {
+        job_id: JobId(3114),
+        file_index: 0,
+    };
+    let sibling = NzbFileId {
+        file_index: 1,
+        ..first
+    };
+    let other = NzbFileId {
+        job_id: JobId(3115),
+        ..first
+    };
+    for file in [first, sibling, other] {
+        pipeline.par3_inside_probes.insert(file).unwrap();
+    }
+    assert!(pipeline.par3_runtime.is_none());
+    pipeline.invalidate_par3_source_write(first);
+    assert!(!pipeline.par3_inside_probes.contains(first));
+    assert!(pipeline.par3_inside_probes.contains(sibling));
+    assert!(pipeline.par3_inside_probes.contains(other));
+    pipeline.par3_inside_probes.insert(first).unwrap();
+    pipeline.invalidate_par3_bindings(first.job_id);
+    assert!(!pipeline.par3_inside_probes.contains(first));
+    assert!(!pipeline.par3_inside_probes.contains(sibling));
+    assert!(pipeline.par3_inside_probes.contains(other));
+    assert!(
+        pipeline.par3_runtime.is_none(),
+        "ordinary source changes must not allocate an engine"
+    );
+}
+
+#[tokio::test]
 async fn missing_par2_metadata_requires_current_par3_evidence_for_every_payload() {
     for unprotected in [false, true] {
         let root = TempDir::new().unwrap();
@@ -527,6 +562,30 @@ async fn assert_par3_repairs_from_status(status: JobStatus) {
             .unwrap(),
         clean_stamp
     );
+    let repaired = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let verifications = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .source_verifications(job_id);
+    // Discovery can run again after repair invalidates an earlier negative
+    // probe. It must not republish the old article hole over the installed file.
+    for _ in 0..3 {
+        pipeline.try_load_par3_metadata(job_id, repaired).await;
+        settle_par3(&mut pipeline, job_id).await;
+        assert!(pipeline.par3_runtime.as_ref().unwrap().verified(job_id));
+        assert_eq!(
+            pipeline
+                .par3_runtime
+                .as_ref()
+                .unwrap()
+                .source_verifications(job_id),
+            verifications
+        );
+    }
     assert!(!pipeline.check_par3_completion(job_id).await);
     assert!(!pipeline.par2_verified.contains(&job_id));
 }

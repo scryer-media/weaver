@@ -23,6 +23,9 @@ impl Probes {
     pub(in crate::pipeline) fn remove(&mut self, file: NzbFileId) {
         self.0.remove(&file);
     }
+    pub(super) fn remove_job(&mut self, job: JobId) {
+        self.0.retain(|file, _| file.job_id != job);
+    }
 }
 
 /// Container framing supplies a scan hint, never authentication. Ordinary
@@ -75,8 +78,14 @@ pub(super) fn probe(path: PathBuf) -> EngineResult<Option<u64>> {
             }
             let mut end =
                 u64::from(le32(&footer[16..])).checked_add(u64::from(le32(&footer[12..])));
-            if at >= 20 && tail[at - 20..].starts_with(b"PK\x06\x07") {
-                let record = le64(&tail[at - 12..]);
+            // A maximum-length comment puts the locator just before the
+            // tail window. Read it by absolute offset instead of missing ZIP64.
+            let mut locator = [0; 20];
+            if let Some(offset) = (start + at as u64).checked_sub(20) {
+                read(offset, &mut locator)?;
+            }
+            if locator.starts_with(b"PK\x06\x07") {
+                let record = le64(&locator[8..]);
                 if record.checked_add(12).is_some_and(|end| end <= len) {
                     let mut header = [0; 12];
                     read(record, &mut header)?;
@@ -199,6 +208,25 @@ mod tests {
             zip.finish().unwrap();
             assert_eq!(probe(path).unwrap(), None);
         }
+    }
+
+    #[test]
+    fn maximum_zip64_comment_keeps_the_locator_outside_the_probe_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comment.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("member", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"ordinary archive").unwrap();
+        let mut comment = vec![b'x'; u16::MAX as usize];
+        comment[..par3_rs::MAGIC.len()].copy_from_slice(par3_rs::MAGIC);
+        zip.set_raw_comment(comment.into_boxed_slice()).unwrap();
+        zip.set_raw_zip64_extensible_data_sector(Box::new([]));
+        zip.finish().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let footer = bytes.len() - 65_557;
+        assert_eq!(&bytes[footer - 20..footer - 16], b"PK\x06\x07");
+        assert_eq!(probe(path).unwrap(), None);
     }
 
     #[test]

@@ -330,9 +330,9 @@ additional parity requested solely for completeness. Replacement emits an
 operator warning rather than claiming byte-for-byte restoration. A hole confined
 to the unprotected packet gap takes the same verified replacement path before
 assembly completion. Ordinary intact archives are not rewritten. Nested embedded
-destinations are currently refused explicitly; renamed placement, larger damaged
-framing fallback, embedded restart/cancellation and durable warning surfaces
-remain part of the open MVP gates.
+destinations are currently refused explicitly; renamed placement, embedded
+restart/cancellation and durable warning surfaces remain part of the open MVP
+gates.
 
 The new official-reference insertion harness covers each of the three containers
 with clean bytes, corrupt body, corrupt header, a recoverable interior article
@@ -350,6 +350,37 @@ all-target/all-feature workspace Clippy, all 3,859 workspace Nextest cases
 checks that authenticated matrix identity survives a clean assessment with
 no recovery requirements. This remains correctness evidence rather than
 throughput acceptance or completion of the remaining MVP gates.
+
+The embedded boundary follow-up uses late authenticated layout metadata to
+rewind to an earlier packet gap when damaged framing initially skips the start of
+a large recovery packet. The carrier retains that floor per source generation,
+so unchanged replay performs no additional packet reads or scanning work; holes
+retain their retry position. ZIP64 locators are read by absolute position even
+when a 65,535-byte comment puts them outside the bounded tail window. Source
+writes and identity changes withdraw negative discovery results before engine
+admission, without allocating an engine for ordinary jobs. A repaired disk image
+retains its explicit complete availability across later probes; old article-hole
+ranges cannot replace that publication and trigger repeated repairs. Later
+source writes and identity changes withdraw this availability fact as well as
+native evidence. Repeated discovery tests require unchanged verification counts.
+
+Fourteen added native cases pass on 16 MiB stored ZIP, ZIP64 and 7z archives,
+covering clean inputs, damaged headers, interior missing articles, missing
+protection, and damaged duplicated ZIP footers. A small checked-in official
+insertion fixture has a deterministic regeneration recipe and provenance for
+scanner replay tests. No third-party dependency or PAR2 budget changed; these
+fixes remain covered by prospective workspace version 0.11.3.
+The pinned reference rejected insertion into regenerated ZIP/ZIP64 sources with
+65,535-byte comments, and a smaller standalone probe also rejected a 1,024-byte
+comment (a 16-byte comment succeeded). No embedded long-comment fixture or
+compatibility claim is fabricated; the ordinary ZIP64 maximum-comment regression
+still validates discovery without a false carrier admission.
+
+Final boundary-slice validation passes all 174 native scenarios, all 3,862
+workspace Nextest tests (13 existing skips), all three doctests, formatting and
+all-target/all-feature workspace Clippy. The fixture regeneration is byte-exact.
+Native archive harnesses now cancel their own unfinished job after a failed
+scenario, preserving its failure and artifacts without starving subsequent cases.
 
 Standalone mixed-format coordination now gives PAR2 its first repair attempt and
 excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence

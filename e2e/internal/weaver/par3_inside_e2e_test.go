@@ -33,14 +33,21 @@ func TestPar3InsideE2E(t *testing.T) {
 	url, logPath := startUnpackWeaver(t, bin, root, nntp.listener.Addr().(*net.TCPAddr).Port,
 		"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
 	api := provisionUnpackAPI(t, root, url)
-	for _, format := range []string{"zip", "zip64", "7z"} {
+	for _, format := range []string{"zip", "zip64", "7z", "zip-large", "zip64-large", "7z-large"} {
 		t.Run(format, func(t *testing.T) {
 			dir := filepath.Join(root, "sources", format)
 			if err := os.MkdirAll(dir, 0755); err != nil {
 				t.Fatal(err)
 			}
 			name, original, inserted, payload := par3InsideFixture(t, reference, dir, format)
-			for _, mode := range []string{"clean", "corrupt-body", "corrupt-header", "missing", "protection-only", "insufficient"} {
+			modes := []string{"clean", "corrupt-body", "corrupt-header", "missing", "protection-only", "insufficient"}
+			if strings.HasSuffix(format, "-large") {
+				modes = []string{"clean", "corrupt-header", "missing", "protection-only"}
+				if strings.HasPrefix(format, "zip") {
+					modes = append(modes, "corrupt-footer")
+				}
+			}
+			for _, mode := range modes {
 				t.Run(mode, func(t *testing.T) {
 					posted := bytes.Clone(inserted)
 					switch mode {
@@ -48,6 +55,15 @@ func TestPar3InsideE2E(t *testing.T) {
 						posted[len(original)/2] ^= 0x80
 					case "corrupt-header":
 						posted[12] ^= 0x80
+					case "corrupt-footer":
+						// Official insertion duplicates the original EOCD after
+						// the PAR3 packets. Damage only that container footer.
+						originalFooter := bytes.LastIndex(original, []byte("PK\x05\x06"))
+						footer := bytes.LastIndex(posted, []byte("PK\x05\x06"))
+						if originalFooter < 0 || footer < len(original) || !bytes.Equal(original[originalFooter:], posted[footer:]) {
+							t.Fatal("expected official duplicated ZIP footer")
+						}
+						posted[footer] ^= 0x80
 					case "insufficient":
 						for at := 65536; at < len(original)-65536; at += 65536 {
 							posted[at] ^= 0x80
@@ -62,6 +78,7 @@ func TestPar3InsideE2E(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
+					api.cancelOnFailure(t, job)
 					status := ""
 					deadline := time.Now().Add(45 * time.Second)
 					for time.Now().Before(deadline) {
@@ -129,19 +146,42 @@ func TestPar3InsideE2E(t *testing.T) {
 
 func par3InsideFixture(t *testing.T, reference, dir, format string) (string, []byte, []byte, []byte) {
 	t.Helper()
+	large := strings.HasSuffix(format, "-large")
+	format = strings.TrimSuffix(format, "-large")
 	fixtureFormat := format
 	if format == "7z" {
 		fixtureFormat = "zip"
 	}
 	files, payload := unpackFixture(t, dir, fixtureFormat)
 	name := unpackSortedNames(files)[0]
-	if format == "7z" {
-		name = "archive.7z"
-		cmd := exec.Command("7zz", "a", "-t7z", "-mx=0", name, "payload.bin")
+	if large {
+		payload = bytes.Repeat(payload, 4)
+		if err := os.WriteFile(filepath.Join(dir, "payload.bin"), payload, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if format == "7z" || large {
+		var cmd *exec.Cmd
+		if format == "7z" {
+			name = "archive.7z"
+			cmd = exec.Command("7zz", "a", "-t7z", "-mx=0", name, "payload.bin")
+		} else {
+			// Rebuild the enlarged stored ZIP instead of updating an archive
+			// whose member timestamp may compare equal within this test.
+			if err := os.Remove(filepath.Join(dir, name)); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"-0"}
+			if format == "zip64" {
+				args = append(args, "-fz")
+			}
+			args = append(args, name, "payload.bin")
+			cmd = exec.Command("zip", args...)
+		}
 		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf("7z fixture: %v: %s", err, out)
+			t.Fatalf("%s fixture: %v: %s", format, err, out)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "archive-creation.txt"), out, 0644); err != nil {
 			t.Fatal(err)
@@ -189,13 +229,14 @@ func (s *unpackNNTP) publishInside(slug, mode, name string, data []byte, origina
 	nzb.WriteString(`<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">`)
 	count := (len(data) + segment - 1) / segment
 	fmt.Fprintf(&nzb, `<file poster="fixture" date="1" subject="%s"><groups><group>alt.test</group></groups><segments>`, xmlUnpackText(fmt.Sprintf(`"%s" yEnc (%d/%d)`, name, 1, count)))
+	wholeCRC := crc32.ChecksumIEEE(data)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for index := 0; index < count; index++ {
 		start, end := index*segment, min((index+1)*segment, len(data))
 		id := fmt.Sprintf("%s-%d@par3-inside.test", slug, index)
 		article := unpackArticle{missing: (mode == "missing" && index == count/2) || (mode == "protection-only" && index == (originalLength+segment-1)/segment)}
-		article.body = unpackYenc(name, data[start:end], index+1, count, start+1, len(data), crc32.ChecksumIEEE(data))
+		article.body = unpackYenc(name, data[start:end], index+1, count, start+1, len(data), wholeCRC)
 		s.articles[id] = article
 		fmt.Fprintf(&nzb, `<segment bytes="%d" number="%d">%s</segment>`, len(article.body), index+1, id)
 	}

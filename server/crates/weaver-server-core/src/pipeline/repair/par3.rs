@@ -49,6 +49,7 @@ struct Carrier {
     published: SourceSnapshot,
     path: Option<PathBuf>,
     scanner: PacketScanner,
+    scan_start: u64,
     revision: u64,
     needed: Option<u64>,
     resume: Option<u64>,
@@ -274,8 +275,40 @@ impl Par3Job {
             return Err(EngineError::ResourceLimit("PAR3 source bindings"));
         }
         self.bindings.retain(|_, bound| *bound != source);
-        self.bindings.insert(name, source);
-        self.scan_file_from(source, path, ranges, start)
+        self.bindings.insert(name.clone(), source);
+        self.scan_file_from(source, path, ranges, start)?;
+        // Damaged framing may find only the metadata following a large
+        // recovery packet. Its authenticated unprotected extent tells us
+        // where the carrier really begins, without scanning archive payloads.
+        let mut earliest = start;
+        for set in self.sets.values_mut() {
+            if let Some(layout) = set.native.layout()? {
+                for file in layout.files().iter().filter(|file| file.path == name) {
+                    for extent in &file.extents {
+                        if matches!(extent.kind, par3_rs::layout::ExtentKind::Unprotected) {
+                            earliest = earliest.min(extent.range.start);
+                        }
+                    }
+                }
+            }
+        }
+        let carrier = self
+            .carriers
+            .get_mut(&source)
+            .expect("published embedded carrier");
+        if earliest < carrier.scan_start {
+            // Remember the authenticated floor for unchanged publications. A
+            // source generation change creates a new carrier and drops it.
+            let rewind = carrier
+                .resume
+                .take()
+                .map_or(earliest, |old| old.min(earliest));
+            carrier.scanner.seek(rewind)?;
+            carrier.scan_start = earliest;
+            carrier.revision = 0;
+            self.scan(source)?;
+        }
+        Ok(())
     }
 
     fn scan_file_from(
@@ -326,6 +359,7 @@ impl Par3Job {
         let carrier = self.carriers.get_mut(&source).expect("published carrier");
         carrier.path = Some(path);
         carrier.scanner.seek(start)?;
+        carrier.scan_start = start;
         self.scan(source)
     }
 
@@ -370,6 +404,7 @@ impl Par3Job {
                     published,
                     path: None,
                     scanner,
+                    scan_start: 0,
                     revision: 0,
                     needed: None,
                     resume: None,
@@ -668,8 +703,13 @@ impl Pipeline {
         // disk image remains a candidate, with its actual length read by the
         // worker and every protected byte verified afresh. Never apply this
         // fallback to an incomplete source or to a virtual volume's holes.
-        let complete_disk_image =
-            file.is_complete() && ranges.is_empty() && virtual_volume.is_none();
+        let complete_disk_image = file.is_complete()
+            && virtual_volume.is_none()
+            && (ranges.is_empty()
+                || self
+                    .par3_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.has_complete_disk_image(job_id, source)));
         tracing::trace!(job_id = job_id.0, source = ?source, complete = file.is_complete(),
             virtual_volume = virtual_volume.is_some(), complete_disk_image, ranges = ?ranges,
             "PAR3 committed source publication queued");
@@ -755,6 +795,9 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn invalidate_par3_source_write(&mut self, file_id: NzbFileId) {
+        // A negative framing probe is valid only until the next source write,
+        // including jobs where no PAR3 runtime has been admitted yet.
+        self.par3_inside_probes.remove(file_id);
         if !self
             .par3_runtime
             .as_ref()
@@ -812,6 +855,7 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn invalidate_par3_bindings(&mut self, job_id: JobId) {
+        self.par3_inside_probes.remove_job(job_id);
         if let Some(coordinator) = self.par3_runtime.as_mut()
             && let Err(error) = coordinator.invalidate_bindings(job_id)
         {

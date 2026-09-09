@@ -117,6 +117,7 @@ struct QueuedInput {
 struct KnownSource {
     carrier: bool,
     embedded_start: Option<u64>,
+    complete_disk_image: bool,
     promoted: BTreeMap<u32, assessment::ViewReservation>,
     // Retained source, dirty and error bookkeeping outlives queued work,
     // including failed publications which never entered the engine.
@@ -275,6 +276,13 @@ impl Coordinator {
 
     pub(super) fn embedded_start(&self, job_id: JobId, source: SourceId) -> Option<u64> {
         self.jobs.get(&job_id)?.known.get(&source)?.embedded_start
+    }
+
+    pub(super) fn has_complete_disk_image(&self, job_id: JobId, source: SourceId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.known.get(&source))
+            .is_some_and(|known| known.complete_disk_image)
     }
 
     pub(super) fn enqueue_file(
@@ -467,6 +475,7 @@ impl Coordinator {
                 KnownSource {
                     carrier: true,
                     embedded_start: None,
+                    complete_disk_image: false,
                     promoted: BTreeMap::new(),
                     _reservation: assessment::ViewReservation::acquire(512)?,
                 },
@@ -522,6 +531,10 @@ impl Coordinator {
             .checked_add(1)
             .ok_or(EngineError::ResourceLimit("PAR3 source epochs"))?;
         job.sources.withdraw(source)?;
+        job.known
+            .get_mut(&source)
+            .expect("known source")
+            .complete_disk_image = false;
         job.epoch = epoch;
         job.pending.remove(&WorkKey::Source(source));
         job.pending
@@ -624,6 +637,15 @@ impl Coordinator {
             input,
             PendingInput::Carrier { .. } | PendingInput::Embedded { .. }
         );
+        // This records byte availability, never a hash verdict. Explicit full
+        // disk publications supersede article holes until a later source write
+        // or identity rebind withdraws the publication.
+        let complete_disk_image = matches!(
+            input,
+            PendingInput::CompleteFile { .. }
+                | PendingInput::Carrier { ranges: None, .. }
+                | PendingInput::Embedded { ranges: None, .. }
+        );
         let embedded_start = match &input {
             PendingInput::Embedded { start, .. } => Some(*start),
             _ => None,
@@ -631,6 +653,7 @@ impl Coordinator {
         if let Some(known) = job.known.get_mut(&source) {
             known.carrier = carrier;
             known.embedded_start = embedded_start;
+            known.complete_disk_image = complete_disk_image;
         } else {
             let reservation = assessment::ViewReservation::acquire(512)?;
             job.known.insert(
@@ -638,6 +661,7 @@ impl Coordinator {
                 KnownSource {
                     carrier,
                     embedded_start,
+                    complete_disk_image,
                     promoted: BTreeMap::new(),
                     _reservation: reservation,
                 },

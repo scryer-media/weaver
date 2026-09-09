@@ -157,6 +157,7 @@ func TestPar3ArchiveE2E(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
+					api.cancelOnFailure(t, job)
 					if release != nil {
 						authenticated := false
 						deadline := time.Now().Add(15 * time.Second)
