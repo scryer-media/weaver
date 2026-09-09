@@ -16,7 +16,14 @@ enum WorkKey {
 
 enum WorkOutput {
     Published,
-    Repaired(par3_rs::session_repair::SessionRepairReport),
+    Repaired(RepairCompletion),
+}
+
+/// Keep output-path accounting alive through channel handback, partial-error
+/// handling and asynchronous assembly/database reconciliation.
+pub(super) struct RepairCompletion {
+    pub result: EngineResult<par3_rs::session_repair::SessionRepairReport>,
+    pub _reservation: Option<assessment::ViewReservation>,
 }
 
 enum PendingInput {
@@ -90,7 +97,7 @@ struct JobSlot {
     pending: BTreeMap<WorkKey, QueuedInput>,
     ticket: Option<u64>,
     errors: BTreeMap<SourceId, EngineError>,
-    completed_repair: Option<EngineResult<par3_rs::session_repair::SessionRepairReport>>,
+    completed_repair: Option<RepairCompletion>,
 }
 
 impl Default for JobSlot {
@@ -233,14 +240,33 @@ impl Coordinator {
         set: par3_rs::InputSetId,
         path: PathBuf,
     ) -> EngineResult<()> {
-        if !self
+        let Some((_, view)) = self
             .assessments(job_id)
-            .any(|(id, view)| id == set && view.status == par3_rs::session::RepairStatus::Ready)
-        {
+            .find(|(id, view)| *id == set && view.status == par3_rs::session::RepairStatus::Ready)
+        else {
             return Err(EngineError::InvalidState("PAR3 repair is not ready"));
-        }
+        };
+        // Reserve before execution can install anything. Include the native
+        // report, partial-error temporary paths, and reconciliation copies.
+        let outputs =
+            view.files
+                .iter()
+                .filter(|file| !file.complete)
+                .try_fold(2048usize, |bytes, file| {
+                    bytes
+                        .checked_add(4096)?
+                        .checked_add(path.capacity().checked_mul(16)?)?
+                        .checked_add(file.path.len().checked_mul(16)?)
+                });
+        let outputs = outputs.ok_or(EngineError::ResourceLimit("PAR3 repair result paths"))?;
+        self.check_pending_capacity(job_id, WorkKey::Repair(set))?;
         let input = PendingInput::Repair { set, path };
-        let reservation = assessment::ViewReservation::acquire(input.retained_cost()?)?;
+        let reservation = assessment::ViewReservation::acquire(
+            input
+                .retained_cost()?
+                .checked_add(outputs)
+                .ok_or(EngineError::ResourceLimit("PAR3 repair result paths"))?,
+        )?;
         self.jobs
             .get_mut(&job_id)
             .expect("assessed job")
@@ -249,10 +275,7 @@ impl Coordinator {
         self.dispatch()
     }
 
-    pub(super) fn take_repair_result(
-        &mut self,
-        job_id: JobId,
-    ) -> Option<EngineResult<par3_rs::session_repair::SessionRepairReport>> {
+    pub(super) fn take_repair_result(&mut self, job_id: JobId) -> Option<RepairCompletion> {
         self.jobs.get_mut(&job_id)?.completed_repair.take()
     }
 
@@ -427,20 +450,7 @@ impl Coordinator {
         if !self.jobs.contains_key(&job_id) && self.jobs.len() >= MAX_JOBS {
             return Err(EngineError::ResourceLimit("PAR3 job count"));
         }
-        let already_pending = self
-            .jobs
-            .get(&job_id)
-            .is_some_and(|job| job.pending.contains_key(&WorkKey::Source(source)));
-        if !already_pending
-            && self
-                .jobs
-                .values()
-                .map(|job| job.pending.len())
-                .sum::<usize>()
-                >= MAX_PENDING
-        {
-            return Err(EngineError::ResourceLimit("pending PAR3 carriers"));
-        }
+        self.check_pending_capacity(job_id, WorkKey::Source(source))?;
         let reservation = assessment::ViewReservation::acquire(input.retained_cost()?)?;
         let job = self.jobs.entry(job_id).or_default();
         if !job.known.contains_key(&source) && job.known.len() >= MAX_PENDING {
@@ -462,6 +472,24 @@ impl Coordinator {
         }
         job.pending
             .insert(WorkKey::Source(source), QueuedInput { input, reservation });
+        Ok(())
+    }
+
+    fn check_pending_capacity(&self, job_id: JobId, key: WorkKey) -> EngineResult<()> {
+        let already_pending = self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|job| job.pending.contains_key(&key));
+        if !already_pending
+            && self
+                .jobs
+                .values()
+                .map(|job| job.pending.len())
+                .sum::<usize>()
+                >= MAX_PENDING
+        {
+            return Err(EngineError::ResourceLimit("pending PAR3 work"));
+        }
         Ok(())
     }
 
@@ -505,8 +533,14 @@ impl Coordinator {
                 // Keep the queue lease live while the worker owns its input;
                 // successful publication transfers it into retained state.
                 if let PendingInput::Repair { set, path } = input.input {
-                    let result = runtime.repair(set, &path).map(WorkOutput::Repaired);
-                    return (runtime, result);
+                    let result = runtime.repair(set, &path);
+                    return (
+                        runtime,
+                        Ok(WorkOutput::Repaired(RepairCompletion {
+                            result,
+                            _reservation: Some(input.reservation),
+                        })),
+                    );
                 }
                 let WorkKey::Source(source) = key else {
                     return (
@@ -612,20 +646,26 @@ impl Coordinator {
             if matches!(done.key, WorkKey::Repair(_)) {
                 // Installation may have finished before the racing write. The
                 // caller must not certify its outputs against the newer epoch.
-                job.completed_repair = Some(Err(EngineError::InvalidState(
-                    "PAR3 repair output changed before handback",
-                )));
+                job.completed_repair = Some(RepairCompletion {
+                    result: Err(EngineError::InvalidState(
+                        "PAR3 repair output changed before handback",
+                    )),
+                    _reservation: None,
+                });
             }
             return Some(done.job_id);
         }
         match (done.key, done.result) {
             (WorkKey::Repair(_), result) => {
-                job.completed_repair = Some(result.and_then(|output| match output {
-                    WorkOutput::Repaired(report) => Ok(report),
-                    WorkOutput::Published => {
-                        Err(EngineError::InvalidState("missing PAR3 repair report"))
-                    }
-                }));
+                job.completed_repair = Some(match result {
+                    Ok(WorkOutput::Repaired(completion)) => completion,
+                    other => RepairCompletion {
+                        result: Err(other
+                            .err()
+                            .unwrap_or(EngineError::InvalidState("missing PAR3 repair report"))),
+                        _reservation: None,
+                    },
+                });
             }
             (WorkKey::Source(source), Ok(_)) => {
                 job.errors.remove(&source);

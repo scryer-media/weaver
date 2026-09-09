@@ -218,6 +218,10 @@ fn queued_carriers_and_jobs_have_explicit_limits_and_deduplicate_replays() {
         coordinator.enqueue(JobId(0), SourceId(MAX_PENDING as u64), PathBuf::new()),
         Err(EngineError::ResourceLimit(_))
     ));
+    assert!(matches!(
+        coordinator.check_pending_capacity(JobId(1), WorkKey::Repair(par3_rs::InputSetId([0; 8]))),
+        Err(EngineError::ResourceLimit(_))
+    ));
     coordinator.forget(JobId(0));
     for id in 0..MAX_JOBS {
         coordinator
@@ -228,4 +232,107 @@ fn queued_carriers_and_jobs_have_explicit_limits_and_deduplicate_replays() {
         coordinator.enqueue(JobId(MAX_JOBS as u64), SourceId(0), PathBuf::new()),
         Err(EngineError::ResourceLimit(_))
     ));
+}
+
+fn ready_inline_repair(root: &std::path::Path) -> (Coordinator, par3_rs::InputSetId) {
+    let mut runtime = Par3Job::default();
+    for (id, name, bytes) in [
+        (
+            1,
+            "a.bin",
+            (0..5000u32).map(|i| (i * 7 + 3) as u8).collect::<Vec<_>>(),
+        ),
+        (
+            2,
+            "sub/c.bin",
+            (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+        ),
+    ] {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        runtime
+            .publish_file(
+                SourceId(id),
+                path,
+                name.into(),
+                std::iter::once(0..bytes.len() as u64).collect(),
+            )
+            .unwrap();
+    }
+    runtime
+        .scan_file(SourceId(99), carrier(root), None)
+        .unwrap();
+    runtime.assess().unwrap();
+    let (&set, session) = runtime.sets.first_key_value().unwrap();
+    assert_eq!(
+        session.view.as_ref().unwrap().status,
+        par3_rs::session::RepairStatus::Ready
+    );
+    let mut coordinator = Coordinator::default();
+    coordinator.jobs.insert(
+        JobId(1),
+        JobSlot {
+            sources: runtime.sources.clone(),
+            runtime: Some(runtime),
+            ..JobSlot::default()
+        },
+    );
+    (coordinator, set)
+}
+
+#[tokio::test]
+async fn repair_results_keep_their_path_lease_through_handback_and_partial_failure() {
+    for block_installation in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        if block_installation {
+            std::fs::create_dir(output.join("b.txt")).unwrap();
+        }
+        let (mut coordinator, set) = ready_inline_repair(root.path());
+        coordinator
+            .request_repair(JobId(1), set, output.clone())
+            .unwrap();
+        let done = next(&mut coordinator).await;
+        assert!(
+            matches!(&done.result, Ok(WorkOutput::Repaired(result)) if result._reservation.is_some())
+        );
+        coordinator.settle(done);
+        let completion = coordinator.take_repair_result(JobId(1)).unwrap();
+        coordinator.forget(JobId(1));
+        assert!(
+            completion._reservation.is_some(),
+            "consumer owns the lease independently of the forgotten session"
+        );
+        if block_installation {
+            assert!(
+                matches!(&completion.result, Err(EngineError::RepairInterrupted { temporary, .. }) if !temporary.is_empty())
+            );
+            assert!(output.join("b.txt").is_dir());
+        } else {
+            let report = completion.result.as_ref().unwrap();
+            assert_eq!(report.installed.len(), 1);
+            assert_eq!(std::fs::read(output.join("b.txt")).unwrap(), b"qrstuvwxyz");
+            assert!(!output.join("a.bin").exists());
+        }
+    }
+}
+
+#[test]
+fn excessive_repair_result_paths_are_rejected_before_dispatch_or_installation() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut coordinator, set) = ready_inline_repair(root.path());
+    let output = PathBuf::from("x".repeat(1 << 20));
+    assert!(matches!(
+        coordinator.request_repair(JobId(1), set, output),
+        Err(EngineError::ResourceLimit(_))
+    ));
+    assert!(coordinator.in_flight.is_empty());
+    assert!(!coordinator.has_work(JobId(1)));
+    assert!(!root.path().join("b.txt").exists());
+    assert_eq!(
+        coordinator.assessments(JobId(1)).next().unwrap().1.status,
+        par3_rs::session::RepairStatus::Ready
+    );
 }

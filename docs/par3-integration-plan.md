@@ -42,6 +42,9 @@ until handback and preserve unrelated native evidence. Once writers drain, dirty
 sources are republished through the same bounded queue; carriers also use only
 committed assembly ranges. Source/error/dirty bookkeeping retains its own host
 budget lease, and failed scans retain leases for any publication they installed.
+Repair requests reserve output-path memory before dispatch and retain that lease
+through successful or partial-error handback and database reconciliation. Repair
+requests and source publications use the same aggregate pending-work ceiling.
 
 Conventional PAR3 jobs now enter a completion gate and execute native staged
 repair on the shared completion transport. The gate requests one recovery article

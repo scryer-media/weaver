@@ -3,7 +3,7 @@
 use super::*;
 use crate::pipeline::JobStatus;
 use par3_rs::session::RepairStatus;
-use par3_rs::session_repair::{InstalledFile, SessionRepairReport};
+use par3_rs::session_repair::InstalledFile;
 
 impl Pipeline {
     /// Return true when PAR3 owns the next completion step. PAR2 keeps its
@@ -113,8 +113,12 @@ impl Pipeline {
     pub(super) async fn finish_par3_repair(
         &mut self,
         job_id: JobId,
-        result: EngineResult<SessionRepairReport>,
+        completion: work::RepairCompletion,
     ) {
+        let work::RepairCompletion {
+            result,
+            _reservation,
+        } = completion;
         if !self.jobs.contains_key(&job_id) {
             return;
         }
