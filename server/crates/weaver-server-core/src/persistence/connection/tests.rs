@@ -2149,6 +2149,7 @@ async fn postgres_runtime_smoke_when_configured() {
             weekly_reset_weekday: IspBandwidthCapWeekday::Mon,
             monthly_reset_day: 7,
         }),
+        propagation_delay_secs: Some(0),
         ip_replacement_trial_extra_connections: Some(1),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),

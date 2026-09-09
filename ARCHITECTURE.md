@@ -331,6 +331,12 @@ Weaver should keep explicit homes for:
 
 These areas may interact, but they should not collapse into one generic config bucket or one giant `config.rs`.
 
+Propagation delay is a persisted General setting in seconds and defaults to
+zero. A saved value takes precedence over `WEAVER_PROPAGATION_DELAY_SECS`.
+Changes recalculate waiting jobs immediately. A propagation hold is projected
+as queued with a download-wait reason and deadline, so clients can distinguish
+it from active downloading without changing the persisted job lifecycle.
+
 ### History, Metrics, and Logs Are Projections, Not Alternate Truth
 
 Operator-facing history, metrics, and logs are important, but they are projections over authoritative backend state and runtime behavior.

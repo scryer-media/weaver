@@ -1178,6 +1178,15 @@ impl Pipeline {
                 })
                 .count() as u32;
             let download_wait = self.download_wait_by_job.get(&state.job_id);
+            let propagation_retry_at = self
+                .propagation_ready_at
+                .get(&state.job_id)
+                .filter(|(deadline, _)| *deadline > Instant::now())
+                .filter(|_| matches!(state.status, JobStatus::Queued | JobStatus::Downloading))
+                .map(|(_, retry_at_epoch_ms)| *retry_at_epoch_ms as f64);
+            if propagation_retry_at.is_some() {
+                download_state = crate::jobs::model::DownloadState::Queued;
+            }
             list.push(JobInfo {
                 job_id: state.job_id,
                 job_hash: Some(state.job_hash),
@@ -1187,8 +1196,11 @@ impl Pipeline {
                 } else {
                     None
                 },
-                download_wait_reason: download_wait.map(|wait| wait.reason.to_owned()),
-                download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
+                download_wait_reason: propagation_retry_at
+                    .map(|_| crate::jobs::handle::PROPAGATION_WAIT_REASON.to_owned())
+                    .or_else(|| download_wait.map(|wait| wait.reason.to_owned())),
+                download_retry_at_epoch_ms: propagation_retry_at
+                    .or_else(|| download_wait.and_then(|wait| wait.retry_at_epoch_ms)),
                 status: state.status.clone(),
                 download_state,
                 finalizing_download: self.jobs_finalizing_download.contains(&state.job_id),

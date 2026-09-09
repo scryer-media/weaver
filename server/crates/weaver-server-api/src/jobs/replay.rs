@@ -22,6 +22,8 @@ type DetailSignature = (
     QueueDownloadState,
     QueuePostState,
     Option<QueueWaitReason>,
+    Option<String>,
+    Option<i64>,
 );
 type AttentionSignature = Option<(String, String)>;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,7 +377,9 @@ async fn queue_event_records_from_pipeline_event(
     let attention_signature = queue_event_attention_signature(&item);
     let previous_item = caches.last_items.insert(job_id, item.clone());
     let previous_state = previous_item.as_ref().map(|value| value.state);
-    let previous_detail = caches.last_item_details.insert(job_id, detail_signature);
+    let previous_detail = caches
+        .last_item_details
+        .insert(job_id, detail_signature.clone());
     let previous_progress = caches
         .last_progress_buckets
         .insert(job_id, progress_signature.clone());
@@ -462,6 +466,8 @@ fn queue_event_detail_signature(item: &QueueItem) -> DetailSignature {
         item.download_state,
         item.post_state,
         item.wait_reason,
+        item.download_wait_reason.clone(),
+        item.download_retry_at_epoch_ms.map(|at| at as i64),
     )
 }
 
@@ -520,6 +526,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
+            propagation_delay_secs: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
@@ -578,6 +585,44 @@ mod tests {
         state.publish_jobs(Vec::new());
 
         (handle, test_config(), caches)
+    }
+
+    #[tokio::test]
+    async fn propagation_wait_changes_emit_live_item_updates() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(4);
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let mut job = JobInfo {
+            status: JobStatus::Queued,
+            download_state: DownloadState::Queued,
+            post_state: PostState::Idle,
+            ..finalizing_job_info()
+        };
+        let state = SharedPipelineState::new(PipelineMetrics::new(), vec![job.clone()]);
+        let handle = SchedulerHandle::new(cmd_tx, event_tx, state.clone());
+        let config = test_config();
+        let mut caches = QueueEventCaches::default();
+        caches.seed_from_handle(&handle);
+        let event = PipelineEvent::PhaseProgressUpdated { job_id: job.job_id };
+
+        for deadline in [Some(1_900_000_000_000.0), Some(1_900_000_300_000.0), None] {
+            job.download_wait_reason = deadline.map(|_| "propagation_delay".to_owned());
+            job.download_retry_at_epoch_ms = deadline;
+            state.publish_jobs(vec![job.clone()]);
+            let records =
+                queue_event_records_from_pipeline_event(&event, &handle, &config, &mut caches)
+                    .await;
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(records[0].kind, QueueEventKind::ItemStateChanged);
+            let item = records[0].item.as_ref().unwrap();
+            assert_eq!(item.download_wait_reason, job.download_wait_reason);
+            assert_eq!(item.download_retry_at_epoch_ms, deadline);
+            assert!(
+                queue_event_records_from_pipeline_event(&event, &handle, &config, &mut caches,)
+                    .await
+                    .is_empty(),
+                "unchanged waits must not repeat notifications"
+            );
+        }
     }
 
     fn completed_job_info() -> JobInfo {

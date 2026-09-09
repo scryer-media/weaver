@@ -458,6 +458,11 @@ export function JobDetail() {
           <div className="flex items-start justify-between gap-4">
             <div className="flex min-w-0 flex-1 flex-wrap items-center gap-3">
               <JobStatusBadgeGroup statuses={getJobStages(job)} />
+              {job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null ? (
+                <span className="text-xs text-muted-foreground">
+                  {t("status.propagationUntil", { time: new Date(job.downloadRetryAtEpochMs).toLocaleString() })}
+                </span>
+              ) : null}
               {job.hasPassword ? (
                 <span className="text-xs text-status-paused">{t("job.passwordProtected")}</span>
               ) : null}
