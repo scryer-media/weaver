@@ -373,6 +373,7 @@ type GeneralSettings {
 	cleanupAfterExtract: Boolean!
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
+	propagationDelaySecs: Int!
 	ipReplacementTrialExtraConnections: Int!
 	enableSrrdbLookup: Boolean!
 	ispBandwidthCap: IspBandwidthCapSettings
@@ -386,6 +387,7 @@ input GeneralSettingsInput {
 	cleanupAfterExtract: Boolean
 	maxDownloadSpeed: Int
 	maxRetries: Int
+	propagationDelaySecs: Int
 	ipReplacementTrialExtraConnections: Int
 	enableSrrdbLookup: Boolean
 	ispBandwidthCap: IspBandwidthCapSettingsInput
