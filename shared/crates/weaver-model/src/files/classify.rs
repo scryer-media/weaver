@@ -15,6 +15,10 @@ pub enum FileRole {
         is_index: bool,
         recovery_block_count: u32,
     },
+    /// Standalone PAR3 carrier. The name selects discovery priority only;
+    /// authenticated packets determine sets, matrices, and recovery capacity.
+    /// Embedded protection keeps its archive role.
+    Par3 { is_index: bool },
     /// 7z archive (single file, not split).
     SevenZipArchive,
     /// 7z split file: `.7z.001`, `.7z.002`, etc. (0-indexed).
@@ -65,6 +69,12 @@ impl FileRole {
             return FileRole::Par2 {
                 is_index: true,
                 recovery_block_count: 0,
+            };
+        }
+
+        if lower.ends_with(".par3") {
+            return FileRole::Par3 {
+                is_index: !is_par3_volume_name(&lower),
             };
         }
 
@@ -138,7 +148,7 @@ impl FileRole {
     /// Download priority: lower number = download first.
     pub fn download_priority(&self) -> u32 {
         match self {
-            FileRole::Par2 { is_index: true, .. } => 0,
+            FileRole::Par2 { is_index: true, .. } | FileRole::Par3 { is_index: true } => 0,
             FileRole::RarVolume { volume_number: 0 } => 1,
             FileRole::SevenZipArchive => 2,
             FileRole::ZipArchive => 3,
@@ -159,7 +169,8 @@ impl FileRole {
             FileRole::Unknown => 50,
             FileRole::Par2 {
                 is_index: false, ..
-            } => 1000,
+            }
+            | FileRole::Par3 { is_index: false } => 1000,
         }
     }
 
@@ -171,13 +182,13 @@ impl FileRole {
             FileRole::Par2 {
                 is_index: false,
                 ..
-            }
+            } | FileRole::Par3 { is_index: false }
         )
     }
 
     /// Whether missing segments for this file should reduce computed job health.
     pub fn counts_toward_health(&self) -> bool {
-        !matches!(self, FileRole::Par2 { .. })
+        !matches!(self, FileRole::Par2 { .. } | FileRole::Par3 { .. })
     }
 }
 
@@ -210,6 +221,22 @@ fn parse_par2_vol_blocks(lower: &str) -> Option<u32> {
     let sep_pos = between.find('+').or_else(|| between.find('-'))?;
     let count_str = &between[sep_pos + 1..];
     count_str.parse().ok()
+}
+
+fn is_par3_volume_name(lower: &str) -> bool {
+    let Some((_, suffix)) = lower
+        .strip_suffix(".par3")
+        .and_then(|name| name.rsplit_once(".vol"))
+    else {
+        return false;
+    };
+    let Some((start, count)) = suffix.split_once('+') else {
+        return false;
+    };
+    !start.is_empty()
+        && !count.is_empty()
+        && start.bytes().all(|byte| byte.is_ascii_digit())
+        && count.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn parse_rar_volume(lower: &str) -> Option<u32> {

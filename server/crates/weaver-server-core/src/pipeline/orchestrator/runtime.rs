@@ -141,7 +141,7 @@ impl Pipeline {
             mpsc::channel(32);
         let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
-        let (par2_analysis_done_tx, par2_analysis_done_rx) = mpsc::channel(32);
+        let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
         let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
         let post_processing_settings = db.post_processing_settings().unwrap_or_else(|error| {
             warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
@@ -384,6 +384,8 @@ impl Pipeline {
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
+            par3_runtime: None,
+            par3_inside_probes: Default::default(),
             #[cfg(test)]
             par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
@@ -428,8 +430,8 @@ impl Pipeline {
             next_par2_analysis_work_id: 0,
             par2_analysis_in_flight: HashMap::new(),
             par2_analysis_results: HashMap::new(),
-            par2_analysis_done_tx,
-            par2_analysis_done_rx,
+            repair_work_done_tx,
+            repair_work_done_rx,
             next_direct_demotion_work_id: 0,
             direct_demotion_in_flight: HashMap::new(),
             direct_demotion_done_tx,
@@ -1042,8 +1044,8 @@ impl Pipeline {
                     Some(done) = self.direct_tolerated_done_rx.recv() => {
                         self.handle_direct_tolerated_done(done).await;
                     }
-                    Some(done) = self.par2_analysis_done_rx.recv() => {
-                        self.handle_par2_analysis_done(done).await;
+                    Some(done) = self.repair_work_done_rx.recv() => {
+                        self.handle_repair_work_done(done).await;
                     }
                     Some(done) = self.direct_demotion_done_rx.recv() => {
                         self.handle_direct_demotion_done(done).await;

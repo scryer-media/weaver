@@ -19,6 +19,7 @@ weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false 
 par2-rs = { workspace = true, features = [
     "native-crypto",
 ] }
+par3-rs = { workspace = true }
 unrar-rs = { workspace = true, features = [
     "crypto-aws-lc",
 ] }

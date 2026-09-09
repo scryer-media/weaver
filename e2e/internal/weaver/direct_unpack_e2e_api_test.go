@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -29,15 +28,27 @@ func provisionUnpackAPI(t *testing.T, root, url string) unpackAPI {
 		t.Fatal(err)
 	}
 	hash := sha256.Sum256([]byte(key))
-	db, err := sql.Open("sqlite", filepath.Join(root, "weaver.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	// Startup creates the schema. Provision only this test's newly created DB.
+	// The API listener starts after database initialization. Writing as soon as
+	// api_keys exists races the remaining startup migrations on the same DB.
 	deadline := time.Now().Add(30 * time.Second)
+	client := &http.Client{Timeout: time.Second}
 	for {
-		_, err = db.Exec("INSERT INTO api_keys (name,key_hash,scope,created_at) VALUES (?,?,?,?)", "direct-unpack-e2e", hash[:], "admin", time.Now().UnixMilli())
+		resp, err := client.Get(url + "/graphql")
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	db := openNativeUnpackDB(t, root, false)
+	var err error
+	defer db.Close()
+	// Provision only this test's newly created DB after startup has settled.
+	for {
+		_, err = db.Exec("INSERT INTO api_keys (name,key_hash,scope,created_at) VALUES ($1,$2,$3,$4)", "direct-unpack-e2e", hash[:], "admin", time.Now().UnixMilli())
 		if err == nil {
 			break
 		}
@@ -93,14 +104,41 @@ func (a unpackAPI) query(query string, variables any, out any) error {
 	return json.Unmarshal(envelope.Data, out)
 }
 
+// Failed scenarios must not keep retrying or repairing while later cases run
+// against the same isolated server. Preserve the original failure and artifacts.
+func (a unpackAPI) cancelOnFailure(t *testing.T, job int) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		switch a.status(job) {
+		case "COMPLETED", "FAILED", "CANCELLED":
+			return
+		}
+		var result struct{ CancelJob bool }
+		if err := a.query(`mutation($id:Int!) {cancelJob(id:$id)}`, map[string]any{"id": job}, &result); err != nil || !result.CancelJob {
+			t.Errorf("cancel unfinished fixture job %d: cancelled=%v error=%v", job, result.CancelJob, err)
+		}
+	})
+}
+
 func (a unpackAPI) submit(nzb []byte, slug string) (int, error) {
+	return a.submitWithPassword(nzb, slug, "")
+}
+
+func (a unpackAPI) submitWithPassword(nzb []byte, slug, password string) (int, error) {
 	var result struct {
 		SubmitNzb struct {
 			Accepted bool
 			Item     struct{ ID int }
 		}
 	}
-	err := a.query(`mutation($input: SubmitNzbInput!) {submitNzb(input:$input) {accepted item {id}}}`, map[string]any{"input": map[string]any{"nzbBase64": base64.StdEncoding.EncodeToString(nzb), "filename": slug + ".nzb"}}, &result)
+	input := map[string]any{"nzbBase64": base64.StdEncoding.EncodeToString(nzb), "filename": slug + ".nzb"}
+	if password != "" {
+		input["password"] = password
+	}
+	err := a.query(`mutation($input: SubmitNzbInput!) {submitNzb(input:$input) {accepted item {id}}}`, map[string]any{"input": input}, &result)
 	if err != nil {
 		return 0, err
 	}

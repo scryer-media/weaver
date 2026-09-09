@@ -324,6 +324,8 @@ struct PgoCollectArgs {
 
 #[derive(Subcommand)]
 enum PerfCommand {
+    /// Compare matched PAR2 verification and repair workloads.
+    Par2Compare(perf::compare::Options),
     #[command(name = "par2-x86", disable_help_flag = true)]
     Par2X86(ForwardArgs),
     #[command(name = "real-download", disable_help_flag = true)]
@@ -433,6 +435,7 @@ fn main() -> Result<()> {
             ProfileCommand::Local(args) => profile_local::run(&ctx, args),
         },
         Commands::Perf(args) => match args.command {
+            PerfCommand::Par2Compare(args) => perf::compare::run(args),
             PerfCommand::Par2X86(args) => perf::run_par2_x86(&ctx, args.args),
             PerfCommand::RealDownload(args) => perf::run_real_download(&ctx, args.args),
         },

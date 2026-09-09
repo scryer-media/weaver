@@ -95,59 +95,83 @@ impl Pipeline {
         handoff: Option<SegmentId>,
         spans: &[RoutedSpan],
     ) -> bool {
-        if spans.is_empty() {
-            return true;
-        }
-        let batches = self.direct_write_batches(job_id, set_index, spans);
-        if let Err(path) = self.prepare_direct_destinations(job_id, &batches).await {
-            // A destination that could not be marked sparse is refused *before*
-            // it holds a hole, so nothing has been allocated for it yet. Demote
-            // and let the conventional path own the bytes.
-            warn!(
-                job_id = job_id.0,
-                path = %path.display(),
-                "could not mark a direct-store destination sparse; demoting the set"
-            );
-            self.demote_direct_set_with_handoff(
-                job_id,
-                set_index,
-                DemotionReason::SparseMarkFailed,
-                handoff,
-            )
-            .await;
-            return false;
-        }
-        if let Err(error) = crate::pipeline::orchestrator::write_direct_batches(batches).await {
-            // A destination write failure is a demotion, not a job failure: the
-            // conventional path writes the same bytes to a different file, and
-            // only if *that* also fails is the job genuinely unfinishable.
-            warn!(
-                job_id = job_id.0,
-                error = %error,
-                "direct-store destination write failed; demoting the set"
-            );
-            self.demote_direct_set_with_handoff(
-                job_id,
-                set_index,
-                DemotionReason::DestinationWriteFailed,
-                handoff,
-            )
-            .await;
-            if !self
-                .direct_store
-                .set(job_id, set_index)
-                .is_some_and(DirectSet::is_demoted)
-            {
-                self.fail_job(
-                    job_id,
-                    format!(
-                        "direct-store destination write failed for job {}: {error}",
-                        job_id.0
-                    ),
+        let failure = match self.try_place_direct_spans(job_id, set_index, spans).await {
+            Ok(()) => return true,
+            Err(failure) => failure,
+        };
+        match failure {
+            DirectPlacementError::Sparse { path, error } => {
+                // A destination that could not be marked sparse is refused *before*
+                // it holds a hole, so nothing has been allocated for it yet. Demote
+                // and let the conventional path own the bytes.
+                warn!(
+                    job_id = job_id.0,
+                    path = %path.display(),
+                    error = %error,
+                    "could not mark a direct-store destination sparse; demoting the set"
                 );
+                self.demote_direct_set_with_handoff(
+                    job_id,
+                    set_index,
+                    DemotionReason::SparseMarkFailed,
+                    handoff,
+                )
+                .await;
+                false
             }
-            return false;
+            DirectPlacementError::Write(error) => {
+                // A destination write failure is a demotion, not a job failure: the
+                // conventional path writes the same bytes to a different file, and
+                // only if *that* also fails is the job genuinely unfinishable.
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "direct-store destination write failed; demoting the set"
+                );
+                self.demote_direct_set_with_handoff(
+                    job_id,
+                    set_index,
+                    DemotionReason::DestinationWriteFailed,
+                    handoff,
+                )
+                .await;
+                if !self
+                    .direct_store
+                    .set(job_id, set_index)
+                    .is_some_and(DirectSet::is_demoted)
+                {
+                    self.fail_job(
+                        job_id,
+                        format!(
+                            "direct-store destination write failed for job {}: {error}",
+                            job_id.0
+                        ),
+                    );
+                }
+                false
+            }
         }
+    }
+
+    /// Places bytes and admits coverage only after every destination write
+    /// succeeds. It does not choose a demotion policy: a repair caller may
+    /// already own verified materialized outputs that reconstruction must not
+    /// overwrite. Filesystem errors retain their original error values.
+    pub(in crate::pipeline) async fn try_place_direct_spans(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        spans: &[RoutedSpan],
+    ) -> Result<(), DirectPlacementError> {
+        if spans.is_empty() {
+            return Ok(());
+        }
+        self.invalidate_par3_direct_set(job_id, set_index);
+        let batches = self.direct_write_batches(job_id, set_index, spans);
+        self.prepare_direct_destinations(job_id, &batches).await?;
+        crate::pipeline::orchestrator::write_direct_batches(batches)
+            .await
+            .map_err(DirectPlacementError::Write)?;
         // Where the bytes went, split by destination kind. Two counters answer
         // the question the disk acceptance target is stated in: how much of
         // a set landed at its final offset versus how much rode the envelope
@@ -170,7 +194,7 @@ impl Pipeline {
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
             set.record_writes(spans, Instant::now());
         }
-        true
+        Ok(())
     }
 
     /// Caches whatever volume facts the set's parse just accepted, so a restart
@@ -182,7 +206,11 @@ impl Pipeline {
     /// to parse and it is suppressed for direct volumes, so for a live direct
     /// set this is the only writer, and after a demotion the conventional path
     /// upserts the same facts over the materialized volumes.
-    pub(super) async fn cache_direct_volume_facts(&mut self, job_id: JobId, set_index: usize) {
+    pub(in crate::pipeline) async fn cache_direct_volume_facts(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+    ) {
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
@@ -467,13 +495,13 @@ impl Pipeline {
         claimed
     }
 
-    /// `Err(path)` names the first destination that could not be marked. The
-    /// caller demotes; nothing has a hole yet.
+    /// A sparse-marking refusal includes its path and underlying I/O error.
+    /// The caller chooses how to handle it before any hole is introduced.
     pub(super) async fn prepare_direct_destinations(
         &mut self,
         job_id: JobId,
         batches: &crate::pipeline::orchestrator::DirectWriteBatches,
-    ) -> Result<(), PathBuf> {
+    ) -> Result<(), DirectPlacementError> {
         // The choke point every direct write passes through, and the one place
         // that reliably runs for a **restored** set as well as a freshly
         // admitted one (`install_restored` marks the job examined, so
@@ -531,14 +559,17 @@ impl Pipeline {
                     );
                     continue;
                 }
-                Ok(Err(error @ super::super::sparse::SparseCreateError::Mark(_))) => {
+                Ok(Err(super::super::sparse::SparseCreateError::Mark(error))) => {
                     warn!(
                         job_id = job_id.0,
                         path = %path.display(),
                         error = %error,
                         "a direct-store destination could not be marked sparse"
                     );
-                    return Err(path.clone());
+                    return Err(DirectPlacementError::Sparse {
+                        path: path.clone(),
+                        error,
+                    });
                 }
                 Err(error) => {
                     warn!(
@@ -547,7 +578,10 @@ impl Pipeline {
                         error = %error,
                         "the sparse-marking task did not complete"
                     );
-                    return Err(path.clone());
+                    return Err(DirectPlacementError::Sparse {
+                        path: path.clone(),
+                        error: std::io::Error::other(error),
+                    });
                 }
             }
             // Keyed on the destination itself rather than its directory: the
@@ -812,7 +846,8 @@ impl Pipeline {
         for set_index in seeded {
             self.rearm_restart_seeded_gates(job_id, set_index).await;
         }
-        if self.direct_finalization_waits_for_par2(job_id) {
+        if self.direct_finalization_waits_for_par2(job_id) || self.par3_verification_pending(job_id)
+        {
             return;
         }
         // Damage on record and no PAR2 verdict left to answer it.
@@ -834,6 +869,9 @@ impl Pipeline {
                 !set.is_demoted()
                     && !set.is_finalized()
                     && set.all_volumes_complete()
+                    // Native completion and router settlement are separate
+                    // actor steps. The latter still owns this damage verdict.
+                    && !set.router.awaits_par3_verdict()
                     && !set.router.damaged_volumes().is_empty()
             })
             .map(|(index, _)| index)
@@ -955,7 +993,7 @@ impl Pipeline {
         }
     }
 
-    pub(super) async fn run_direct_barrier(
+    pub(in crate::pipeline) async fn run_direct_barrier(
         &mut self,
         job_id: JobId,
         set_index: usize,
@@ -964,6 +1002,9 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
+        if set.router.repair_batch_in_progress() {
+            return;
+        }
         // Read before the barrier runs, which resets it. Two numbers, because
         // the interesting one is the second: the barrier's 256 MiB trigger is
         // checked per routed batch, so anything above it is the overshoot the

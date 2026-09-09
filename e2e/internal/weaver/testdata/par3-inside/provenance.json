@@ -1,0 +1,12 @@
+{
+  "referenceRevision": "2971702e501f1350b1c7b9d11369af9157d6ed56",
+  "referenceSHA256": "8b718420ad68d78c6e4f4ac607e7e8502776f8ddc39b506013e609ca43d2ac62",
+  "arguments": [
+    "insert",
+    "archive.zip"
+  ],
+  "payloadSHA256": "e92f8ddbf116a3a24442cec6461ecd1af3bdb6b4b95dcc787ba2739891e322a4",
+  "originalSHA256": "c7d77a4f5ddfecd38da0dc2419e5b7044930daeee1b3bec33abac42a78369836",
+  "insertedSHA256": "212138565f2060af915738ef14e516bf392e3f98a6a208687a14c7907cb22b11",
+  "protectedLength": 8312
+}

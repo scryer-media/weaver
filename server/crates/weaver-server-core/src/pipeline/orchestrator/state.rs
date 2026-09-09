@@ -225,6 +225,7 @@ impl Pipeline {
             self.uu_park_requeues
                 .retain(|segment_id, _| segment_id.file_id != file_id);
             self.file_prefix_16k.remove(&file_id);
+            self.par3_inside_probes.remove(file_id);
             self.file_declared_size.remove(&file_id);
         }
 
@@ -298,7 +299,7 @@ impl Pipeline {
             tracing::info!(
                 job_id = job_id.0,
                 set_name = %set_name,
-                "archive set damage on record — PAR2 rules before this job extracts"
+                "archive set damage on record — recovery must settle before this job extracts"
             );
         }
     }
@@ -306,6 +307,8 @@ impl Pipeline {
     /// Whether extraction for this job must wait for the recovery set's
     /// verdict because damage is already on record.
     ///
+    /// PAR3 publications must settle before known damaged sources are extracted.
+    /// PAR2 keeps its existing four release conditions below.
     /// Four releases, and a job with none of them would never extract at all,
     /// which is why each is checked rather than assumed: no recovery set to
     /// ask, a set the job has bypassed, a verdict already in hand
@@ -327,6 +330,9 @@ impl Pipeline {
             .is_some_and(|sets| !sets.is_empty())
         {
             return false;
+        }
+        if self.par3_verification_pending(job_id) {
+            return true;
         }
         if self.par2_set(job_id).is_none()
             || self.par2_bypassed.contains(&job_id)

@@ -31,6 +31,7 @@ type unpackNNTP struct {
 	listener    net.Listener
 	mu          sync.Mutex
 	articles    map[string]unpackArticle
+	requests    map[string]int
 	connections map[net.Conn]bool
 	stopped     bool
 	wg          sync.WaitGroup
@@ -43,7 +44,7 @@ func startUnpackNNTP(t *testing.T) *unpackNNTP {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &unpackNNTP{listener: l, articles: map[string]unpackArticle{}, connections: map[net.Conn]bool{}, done: make(chan struct{})}
+	s := &unpackNNTP{listener: l, articles: map[string]unpackArticle{}, requests: map[string]int{}, connections: map[net.Conn]bool{}, done: make(chan struct{})}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -121,6 +122,9 @@ func (s *unpackNNTP) serve(conn net.Conn) {
 			id := strings.Trim(fields[1], "<>")
 			s.mu.Lock()
 			article, ok := s.articles[id]
+			if fields[0] == "BODY" || fields[0] == "ARTICLE" {
+				s.requests[id]++
+			}
 			s.mu.Unlock()
 			// STAT must not wait behind BODY requests: it only reports presence.
 			if ok && article.gate != nil && fields[0] != "STAT" {

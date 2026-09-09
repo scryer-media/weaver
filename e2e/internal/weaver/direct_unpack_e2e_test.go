@@ -206,8 +206,15 @@ func unpackJobLog(raw string, job int) string {
 	return strings.Join(lines, "\n")
 }
 
-func startUnpackWeaver(t *testing.T, bin, root string, nntpPort int) (string, string) {
+func startUnpackWeaver(t *testing.T, bin, root string, nntpPort int, extraEnv ...string) (string, string) {
 	t.Helper()
+	url, logPath, _ := startManagedUnpackWeaver(t, bin, root, "weaver.log", nntpPort, extraEnv...)
+	return url, logPath
+}
+
+func startManagedUnpackWeaver(t *testing.T, bin, root, logName string, nntpPort int, extraEnv ...string) (string, string, func()) {
+	t.Helper()
+	databaseURL := nativeUnpackPostgresURL(t, root)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +239,7 @@ priority = 0
 	if err := os.WriteFile(path, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
-	logPath := filepath.Join(root, "weaver.log")
+	logPath := filepath.Join(root, logName)
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatal(err)
@@ -244,6 +251,10 @@ priority = 0
 		}
 	}
 	cmd.Env = append(cmd.Env, "WEAVER_FORCE_KEY_FILE=1", "WEAVER_DIRECT_UNPACK=true", "RUST_LOG=info,weaver_server_core::pipeline::completion=debug", "NO_COLOR=1")
+	cmd.Env = append(cmd.Env, extraEnv...)
+	if databaseURL != "" {
+		cmd.Env = append(cmd.Env, "WEAVER_DATABASE_URL="+databaseURL)
+	}
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
@@ -251,7 +262,7 @@ priority = 0
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
-	t.Cleanup(func() {
+	stop := sync.OnceFunc(func() {
 		_ = cmd.Process.Signal(os.Interrupt)
 		select {
 		case <-done:
@@ -261,6 +272,7 @@ priority = 0
 		}
 		logFile.Close()
 	})
+	t.Cleanup(stop)
 	url := fmt.Sprintf("http://127.0.0.1:%d", port)
-	return url, logPath
+	return url, logPath, stop
 }

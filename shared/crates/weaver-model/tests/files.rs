@@ -166,6 +166,43 @@ fn file_role_ignores_duplicate_marker() {
 }
 
 #[test]
+fn par3_carrier_names_are_only_scheduling_hints() {
+    for name in [
+        "movie.par3",
+        "MOVIE.PAR3",
+        "movie.volbad+3.par3",
+        "movie.vol1+.par3",
+    ] {
+        let role = FileRole::from_filename(name);
+        assert_eq!(role, FileRole::Par3 { is_index: true });
+        assert_eq!(role.download_priority(), 0);
+        assert!(!role.is_recovery());
+        assert!(!role.counts_toward_health());
+    }
+    for name in [
+        "movie.vol00+01.par3",
+        "MOVIE.VOL3+5.PAR3",
+        "movie.duplicate1.vol00+02.par3",
+        "movie.vol999999999999999999999999+1.par3",
+    ] {
+        let role = FileRole::from_filename(name);
+        assert_eq!(role, FileRole::Par3 { is_index: false });
+        assert_eq!(role.download_priority(), 1000);
+        assert!(role.is_recovery());
+        assert!(!role.counts_toward_health());
+    }
+    assert_eq!(
+        FileRole::from_filename("movie.par3.zip"),
+        FileRole::ZipArchive
+    );
+    assert_eq!(
+        FileRole::from_filename("movie.par3.7z"),
+        FileRole::SevenZipArchive
+    );
+    assert_eq!(FileRole::from_filename("movie.par3.exe"), FileRole::Unknown);
+}
+
+#[test]
 fn par2_index() {
     assert_eq!(
         FileRole::from_filename("movie.par2"),

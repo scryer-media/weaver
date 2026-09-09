@@ -81,6 +81,7 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     // discarded with every other `active_*` table. `Export`
     // would be actively wrong here.
     table!("active_direct_coverage", ResetOnRestore, RequireEmpty),
+    table!("active_repair_outputs", ResetOnRestore, RequireEmpty),
     table!("integration_events", ResetOnRestore, Replace),
     table!("metrics_history_chunks", ResetOnRestore, Replace),
     table!("async_operations", ResetOnRestore, Replace),

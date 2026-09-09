@@ -2221,6 +2221,23 @@ impl Pipeline {
         }
     }
 
+    pub(in crate::pipeline) fn prepare_direct_unpack_for_par3_repair(&mut self, job_id: JobId) {
+        self.direct_unpack.repairing_jobs.insert(job_id);
+        let sets: Vec<_> = self
+            .direct_unpack
+            .armed
+            .keys()
+            .chain(self.direct_unpack.outcomes.keys())
+            .filter(|(id, _)| *id == job_id)
+            .map(|(_, name)| name.clone())
+            .collect();
+        // A PAR2 grid cannot certify bytes against a PAR3 mutation. Until the
+        // PAR3 coverage view vouches for a chase, retire its staged extraction.
+        for name in sets {
+            self.taint_direct_unpack_set(job_id, &name);
+        }
+    }
+
     /// Whether the recovery set positively vouches for every byte this set's
     /// chase has consumed.
     ///

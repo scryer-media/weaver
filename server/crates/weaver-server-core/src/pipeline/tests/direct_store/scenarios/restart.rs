@@ -144,6 +144,22 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
     let working_dir =
         direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
 
+    let pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &volumes,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    let retained_facts = pipeline.db.load_all_rar_volume_facts(job_id).unwrap();
+    assert!(
+        retained_facts.values().any(|rows| !rows.is_empty()),
+        "conventional restore must retain facts owned by the accepted direct checkpoint"
+    );
+    drop(pipeline);
     let mut pipeline = direct_store_after_restart(
         &temp_dir,
         DirectStoreGate::Enabled,
@@ -153,6 +169,11 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
         &working_dir,
     )
     .await;
+    assert_eq!(
+        pipeline.db.load_all_rar_volume_facts(job_id).unwrap(),
+        retained_facts,
+        "a second restart must preserve the authenticated direct layout"
+    );
 
     // The set came back from its checkpoint rather than from zero.
     let set = pipeline

@@ -161,6 +161,14 @@ pub(crate) fn spec_carries_par2(spec: &JobSpec) -> bool {
         .any(|file| matches!(file.role, FileRole::Par2 { .. }))
 }
 
+/// A declared PAR3 carrier earns time for native verification before an
+/// archive checksum failure demotes the set. Repair ordering still prefers PAR2.
+pub(crate) fn spec_defers_to_par3(spec: &JobSpec) -> bool {
+    spec.files
+        .iter()
+        .any(|file| matches!(file.role, FileRole::Par3 { .. }))
+}
+
 impl DirectSetPlan {
     /// Every RAR set the spec declares, admitted or refused.
     pub(crate) fn discover(

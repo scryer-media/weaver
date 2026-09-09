@@ -348,6 +348,19 @@ impl Pipeline {
             )
         };
 
+        if health <= critical
+            && self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| state.assembly.has_par3_candidates())
+        {
+            // PAR3 filenames carry no usable capacity proof. Let authenticated
+            // metadata and the finite recovery frontier decide the deficit,
+            // including when the first missing article beats index decoding.
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
+
         if health <= critical && par2_bytes > 0 {
             info!(
                 job_id = job_id.0,

@@ -665,6 +665,16 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                     "verification found damage".into()
                 },
             },
+            PipelineEvent::Par3VerificationComplete { job_id, passed } => Self {
+                kind: EventKind::JobVerificationComplete,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: if *passed {
+                    "PAR3 verification passed".into()
+                } else {
+                    "PAR3 verification found incomplete protected data".into()
+                },
+            },
             PipelineEvent::RepairStarted { job_id } => Self {
                 kind: EventKind::RepairStarted,
                 job_id: Some(job_id.0),
@@ -679,6 +689,17 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 job_id: Some(job_id.0),
                 file_id: None,
                 message: format!("{slices_repaired} slices repaired"),
+            },
+            PipelineEvent::EmbeddedProtectionReplaced {
+                job_id,
+                blocks_repaired,
+            } => Self {
+                kind: EventKind::RepairComplete,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: format!(
+                    "{blocks_repaired} blocks repaired. Embedded PAR3 protection replaced after verified repair. Available authenticated packets were preserved; the original carrier could not be restored byte for byte."
+                ),
             },
             PipelineEvent::RepairFailed { job_id, error } => Self {
                 kind: EventKind::RepairFailed,

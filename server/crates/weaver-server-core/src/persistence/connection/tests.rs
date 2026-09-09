@@ -73,6 +73,7 @@ fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     }
 }
 
@@ -625,6 +626,7 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
             | ("servers", "supports_pipelining")
             | ("servers", "backfill")
             | ("servers", "download_quota_enabled")
+            | ("server_tls_diagnostics", "honors_client_cipher_order")
             | ("active_jobs", "normalization_retried")
             | ("active_par2_files", "promoted")
             | ("active_extraction_chunks", "verified")
@@ -2341,6 +2343,7 @@ async fn postgres_runtime_smoke_when_configured() {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     })
     .unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {

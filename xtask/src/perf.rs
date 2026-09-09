@@ -1,3 +1,5 @@
+pub(crate) mod compare;
+
 use crate::TaskContext;
 use anyhow::{Context, Result, bail};
 use chrono::Local;

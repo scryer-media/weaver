@@ -1776,6 +1776,7 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     })
     .unwrap();
     db.upsert_file_progress_batch(&[weaver_server_core::ActiveFileProgress {
@@ -3219,6 +3220,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     })
     .unwrap();
     db.archive_job(

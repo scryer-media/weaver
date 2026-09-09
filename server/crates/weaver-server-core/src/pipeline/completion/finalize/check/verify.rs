@@ -1026,7 +1026,7 @@ impl Pipeline {
                         weaver_model::files::FileRole::Par2 {
                             is_index: false,
                             ..
-                        }
+                        } | weaver_model::files::FileRole::Par3 { .. }
                     )
                     // A part of a split set the verdict already joined is a
                     // spent input, not an outstanding file: its bytes are

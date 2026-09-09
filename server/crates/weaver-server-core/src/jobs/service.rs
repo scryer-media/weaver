@@ -716,6 +716,7 @@ impl Pipeline {
             paused_resume_post_state: options
                 .initially_paused
                 .then_some(crate::jobs::model::PostState::Idle.as_str()),
+            password_override: Some(spec.password.clone().unwrap_or_default()),
         };
         // Biggest single write on the add-job path: keep it off the
         // orchestrator loop, but never create an in-memory job without durable
@@ -861,7 +862,7 @@ impl Pipeline {
         let mut assembly = JobAssembly::new(job_id);
         let mut download_queue = DownloadQueue::new();
         let mut recovery_queue = DownloadQueue::new();
-        let mut has_par2_index = false;
+        let mut has_recovery_index = false;
         let mut recovery_files: Vec<(u32, u64)> = Vec::new();
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
@@ -882,8 +883,9 @@ impl Pipeline {
             if matches!(
                 file_spec.role,
                 weaver_model::files::FileRole::Par2 { is_index: true, .. }
+                    | weaver_model::files::FileRole::Par3 { is_index: true }
             ) {
-                has_par2_index = true;
+                has_recovery_index = true;
             }
 
             let priority = file_spec.role.download_priority();
@@ -981,7 +983,7 @@ impl Pipeline {
             assembly.add_file(file_assembly);
         }
 
-        if !has_par2_index && !recovery_files.is_empty() {
+        if !has_recovery_index && !recovery_files.is_empty() {
             recovery_files.sort_by_key(|&(_, size)| size);
             let promoted_file_index = recovery_files[0].0;
 
@@ -1496,6 +1498,8 @@ impl Pipeline {
         } else {
             file_identities
         };
+        self.restore_pending_par3_content_names(job_id, &working_dir, &mut file_identities)
+            .map_err(crate::SchedulerError::Internal)?;
         let (stale_rar_sets, refreshed_rar_files) =
             Self::scrub_restored_par2_file_identities(&mut file_identities);
         let mut restore_skip_plan = Self::build_restore_skip_plan(
@@ -1529,8 +1533,21 @@ impl Pipeline {
                 .or_insert(*floor);
             *slot = (*slot).max(*floor);
         }
-        let (assembly, download_queue, recovery_queue) =
+        let (mut assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
+        let repair_outputs = self
+            .db
+            .load_repair_outputs(job_id)
+            .map_err(crate::SchedulerError::State)?;
+        let repair_output_indices = super::repair_outputs::restore_assembly(
+            job_id,
+            &repair_outputs,
+            &working_dir,
+            &mut assembly,
+            &mut file_identities,
+        )
+        .await
+        .map_err(crate::SchedulerError::Internal)?;
         // A restored job resumes mid-download; its unsplit archives are still
         // candidates, and their persisted floor is what they will arm from.
         self.register_direct_unpack_singles(job_id, &spec);
@@ -1748,6 +1765,7 @@ impl Pipeline {
         }
         self.reload_metadata_from_disk(job_id).await;
         let mut archive_refresh_file_indices = refreshed_rar_files;
+        archive_refresh_file_indices.extend(repair_output_indices);
         archive_refresh_file_indices.extend(
             complete_files
                 .iter()

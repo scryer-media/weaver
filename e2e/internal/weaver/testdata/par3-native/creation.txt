@@ -1,0 +1,25 @@
+Number of input file = 1, directory = 0
+Total file size = 262144
+Max file size = 262144
+Possible block count = 8
+
+input file = "payload.bin" 0 / 262144
+
+
+Computing hash:
+done in 0.0 seconds.
+
+Number of chunk description = 1 (max 1)
+Actual block count = 8, Tail packing = 0
+Cauchy Reed-Solomon Codes
+Recovery block count = 4
+
+Wrote index file, set.par3
+
+Computing recovery blocks:
+done in 0.0 seconds.
+
+Wrote recovery file, set.vol0+1.par3
+Wrote recovery file, set.vol1+2.par3
+Wrote recovery file, set.vol3+1.par3
+Done

@@ -1632,9 +1632,14 @@ pub(super) struct Par2SetRuntime {
     /// and reconciliation latch therefore live with the set rather than with
     /// the job.
     pub(super) settled: bool,
+    /// Integrity was deferred to archive extraction instead of a PAR2 hash pass.
+    pub(in crate::pipeline) settled_via_strong_decode: bool,
     /// A final answer that could not verify or repair this set.  The gate keeps
     /// processing later sets before turning these failures into the job result.
     pub(super) failure: Option<String>,
+    /// A native recoverability verdict can permit another format to try. I/O,
+    /// cancellation and other unclassified failures keep this empty.
+    pub(in crate::pipeline) alternate_repair: Option<repair::backend::AlternateRepairReason>,
     /// Damage observed while deciding this set.  The aggregate reports one
     /// job-level verification metric after every servable set has settled.
     pub(super) missing_blocks: u32,
@@ -1793,6 +1798,17 @@ pub(super) struct Par2AnalysisWorkDone {
     pub(super) work_id: u64,
     pub(super) recovery_set_id: par2_rs::RecoverySetId,
     pub(super) outcome: completion::finalize::check::Par2AnalysisTicketOutcome,
+}
+
+/// Native outcomes share the existing repair completion queue. Dispatch occurs
+/// once per operation; block reads and native evidence stay format-specific.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keep the existing PAR2 result inline without adding a per-operation allocation"
+)]
+pub(super) enum RepairWorkDone {
+    Par2(Par2AnalysisWorkDone),
+    Par3(Box<repair::par3::work::WorkDone>),
 }
 
 /// One demoted set's reconstruction sweep, detached from the actor.
@@ -3129,8 +3145,8 @@ pub struct Pipeline {
             Result<par2_rs::Par2RepairOutcome, String>,
         ),
     >,
-    pub(super) par2_analysis_done_tx: mpsc::Sender<Par2AnalysisWorkDone>,
-    pub(super) par2_analysis_done_rx: mpsc::Receiver<Par2AnalysisWorkDone>,
+    pub(super) repair_work_done_tx: mpsc::Sender<RepairWorkDone>,
+    pub(super) repair_work_done_rx: mpsc::Receiver<RepairWorkDone>,
     /// Monotonic fence for demotion sweeps detached from the actor.
     pub(super) next_direct_demotion_work_id: u64,
     /// The demotion sweeps a job has outstanding, keyed by the set each one
@@ -3260,6 +3276,10 @@ pub struct Pipeline {
     pub(super) uu_park_requeues: HashMap<SegmentId, u32>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
+    /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.
+    par3_runtime: Option<Box<repair::par3::work::Coordinator>>,
+    /// Bounded archive framing probes, retired with each job and rebuilt on restore.
+    par3_inside_probes: repair::par3::inside::Probes,
     #[cfg(test)]
     pub(super) par2_binding_resolver_calls: std::sync::atomic::AtomicU64,
     /// Direct-store routing state: admitted archive sets, their routers and

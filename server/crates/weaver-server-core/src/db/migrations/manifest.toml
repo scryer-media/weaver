@@ -420,3 +420,20 @@ scope = "all"
 through_version = 25
 file = "postgres/baselines/0025_baseline.sql"
 engine = "postgres"
+
+[[migration]]
+version = 47
+description = "durable reconstructed output identities"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0047_repair_outputs/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0047_repair_outputs/schema.sql"
+engine = "postgres"
+scope = "all"

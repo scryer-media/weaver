@@ -385,6 +385,7 @@ impl Pipeline {
     ) -> Result<par2_rs::Par2RepairOutcome, String> {
         let set_id = par2_set.recovery_set_id;
         if repair {
+            self.fence_par3_before_par2_repair(job_id, set_id, verification)?;
             // The repairer is about to rewrite damaged sources in place. A
             // chase that consumed only bytes the recovery set positively found
             // Intact is safe to leave parked through that — repair cannot
@@ -1043,7 +1044,7 @@ impl Pipeline {
             "par2 damaged-path analysis started"
         );
 
-        let done_tx = self.par2_analysis_done_tx.clone();
+        let done_tx = self.repair_work_done_tx.clone();
         tokio::spawn(async move {
             let joined = tokio::task::spawn_blocking(move || run_par2_analysis_work(plan)).await;
             let outcome = joined.unwrap_or_else(|error| {
@@ -1052,12 +1053,12 @@ impl Pipeline {
                 ))
             });
             let _ = done_tx
-                .send(Par2AnalysisWorkDone {
+                .send(RepairWorkDone::Par2(Par2AnalysisWorkDone {
                     job_id,
                     work_id,
                     recovery_set_id: set_id,
                     outcome,
-                })
+                }))
                 .await;
         });
         Ok(())
@@ -1698,7 +1699,7 @@ impl Pipeline {
 
     /// Whether every servable set has reached a final answer and no later
     /// index can add one. A failed set is settled, but not verified.
-    pub(super) fn par2_gate_settlement_complete(&self, job_id: JobId) -> bool {
+    pub(in crate::pipeline) fn par2_gate_settlement_complete(&self, job_id: JobId) -> bool {
         let set_ids = self.par2_servable_set_ids(job_id);
         !set_ids.is_empty()
             && self.par2_metadata_discovery_closed(job_id)
@@ -1747,7 +1748,15 @@ impl Pipeline {
             return SetGateOutcome::Waiting;
         };
         set_runtime.settled = true;
+        set_runtime.settled_via_strong_decode = matches!(
+            &reason,
+            Par2SetSettlementReason::Clean {
+                verification_mode: CleanPar2VerificationMode::StrongDecode,
+                ..
+            }
+        );
         set_runtime.failure = None;
+        set_runtime.alternate_repair = None;
         set_runtime.post_verdict_reconcile_attempts = 0;
         // A settled set owes no repair.
         set_runtime.pending_repair = None;
@@ -1785,6 +1794,7 @@ impl Pipeline {
         if let Some(set_runtime) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id) {
             set_runtime.settled = true;
             set_runtime.failure = Some(message.clone());
+            set_runtime.alternate_repair = None;
             set_runtime.post_verdict_reconcile_attempts = 0;
             // A failed set owes no repair.
             set_runtime.pending_repair = None;
@@ -1811,12 +1821,26 @@ impl Pipeline {
         self.finish_or_rearm_after_par2_set_failure(job_id);
     }
 
-    /// A failed set must leave its siblings time to settle, but once the last
-    /// one has answered the job failure belongs to this same gate entry.  In
-    /// particular, a one-set job must retain the immediate failure behaviour
-    /// it had before the aggregate existed.
+    pub(super) async fn finish_par2_set_with_alternate(
+        &mut self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        message: String,
+        reason: crate::pipeline::repair::backend::AlternateRepairReason,
+    ) {
+        let _ = self.mark_par2_set_failed(job_id, set_id, message);
+        if let Some(set) = self.ensure_par2_runtime(job_id).set_runtime_mut(set_id) {
+            set.alternate_repair = Some(reason);
+        }
+        self.finish_or_rearm_after_par2_set_failure(job_id);
+    }
+
+    /// Sibling PAR2 sets and explicitly eligible alternate work get their own
+    /// attempt. A PAR2-only job retains its immediate terminal failure behavior.
     pub(super) fn finish_or_rearm_after_par2_set_failure(&mut self, job_id: JobId) {
-        if let Some(message) = self.aggregate_par2_failure_message(job_id) {
+        if let Some(message) = self.aggregate_par2_failure_message(job_id)
+            && !self.par3_has_work_after_par2_failure(job_id)
+        {
             self.fail_job(job_id, message);
         } else {
             self.schedule_job_completion_check(job_id);
@@ -1862,7 +1886,7 @@ impl Pipeline {
     /// path has nothing this job can verify or repair.  The binding condition
     /// is deliberately conservative: an empty but known assembly file still
     /// takes the ordinary pass, because it may be waiting for recoverable data.
-    pub(super) fn par2_set_is_absent_from_job(
+    pub(in crate::pipeline) fn par2_set_is_absent_from_job(
         &self,
         job_id: JobId,
         set_id: par2_rs::RecoverySetId,
@@ -1874,8 +1898,8 @@ impl Pipeline {
             return false;
         };
         let has_assembly_binding = state.assembly.files().any(|file| {
-            self.resolve_par2_file_binding(file.file_id())
-                .is_some_and(|binding| binding.recovery_set_id == set_id)
+            self.resolve_par2_file_binding_in_set(file.file_id(), set_id)
+                .is_some()
         });
         if has_assembly_binding {
             return false;
@@ -1980,7 +2004,9 @@ impl Pipeline {
         let runtime = self.par2_runtime(job_id)?;
         let set_ids = runtime.ordered_set_ids();
         if set_ids.is_empty() {
-            return (!self.par2_metadata_candidate_indices(job_id).is_empty()).then(|| {
+            return (!self.par2_metadata_candidate_indices(job_id).is_empty()
+                && !self.par3_verifies_all_payloads(job_id))
+            .then(|| {
                 "PAR2 metadata discovery exhausted without finding a recovery set".to_string()
             });
         }
@@ -2065,7 +2091,7 @@ impl Pipeline {
         self.note_stage_finished(job_id, JobStageKind::Verify);
     }
 
-    /// Record that this job ended with no PAR2 verdict to be had.
+    /// Record that this job ended with no verification verdict to be had.
     ///
     /// A job with no recovery set can never produce `intact`, `damaged` or
     /// `missing`: there is nothing to verify the payload against. Without
@@ -2089,6 +2115,7 @@ impl Pipeline {
     /// Called at the two terminal transitions — the final move and job failure
     /// — to attribute a job that never had a recovery set.
     pub(in crate::pipeline) fn note_job_unverifiable_if_no_par2_set(&mut self, job_id: JobId) {
+        self.note_par3_verification(job_id);
         if self.par2_set(job_id).is_none() {
             self.note_job_verification_unavailable(job_id);
         }

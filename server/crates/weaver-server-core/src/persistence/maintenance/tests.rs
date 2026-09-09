@@ -101,6 +101,7 @@ fn sample_active_job(id: u64) -> ActiveJob {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     }
 }
 

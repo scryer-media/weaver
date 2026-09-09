@@ -2526,6 +2526,78 @@ fn retiring_a_set_that_never_built_a_barrier_still_deletes_its_row() {
 }
 
 #[test]
+fn repair_batches_do_not_recreate_a_checkpoint_between_replacement_stripes() {
+    repair_batch_checkpoint(false);
+}
+
+#[test]
+fn repair_batches_keep_checkpoints_fenced_after_a_failed_closing_stripe() {
+    repair_batch_checkpoint(true);
+}
+
+fn repair_batch_checkpoint(corrupt: bool) {
+    use super::super::set::DirectSet;
+
+    let image = vec![42; 400];
+    let (router, _) = straddle_router(&image, 64);
+    let mut set = DirectSet::new(JOB, router.plan().clone());
+    set.router = router;
+    set.router.stage_for_test(0, 64, &image);
+    let spans = set.router.drain_for_test(0).unwrap();
+    set.record_writes(&spans, Instant::now());
+    let recorder = Recorder::default();
+    let checkpoint = |set: &mut DirectSet| {
+        set.run_barrier(
+            BarrierTrigger::Demand(BarrierDemand::RepairRecreate),
+            Instant::now(),
+            &mut recorder.clone(),
+            &mut recorder.clone(),
+            &mut recorder.clone(),
+        )
+    };
+    checkpoint(&mut set).unwrap().unwrap();
+    assert!(recorder.committed().is_some());
+    set.delete_checkpoint_row(&mut recorder.clone()).unwrap();
+    assert!(recorder.committed().is_none());
+
+    let spans = set
+        .router
+        .route_repaired_batch(0, &[(64, Arc::from(&image[..200]))], &[], false, false)
+        .unwrap();
+    set.record_writes(&spans, Instant::now());
+    let operations = recorder.ops();
+    assert!(checkpoint(&mut set).is_none());
+    assert_eq!(
+        recorder.ops(),
+        operations,
+        "no drain, sync or persist during the replacement"
+    );
+    assert!(recorder.committed().is_none());
+
+    let mut tail = image[200..].to_vec();
+    if corrupt {
+        tail[0] ^= 1;
+    }
+    let result = set
+        .router
+        .route_repaired_batch(0, &[(264, Arc::from(tail))], &[], false, true);
+    if corrupt {
+        assert!(result.is_err());
+        assert!(set.router.repair_batch_in_progress());
+        assert!(!set.router.all_members_verified());
+        assert!(checkpoint(&mut set).is_none());
+        assert_eq!(recorder.ops(), operations);
+        assert!(recorder.committed().is_none());
+        return;
+    }
+    let spans = result.unwrap();
+    set.record_writes(&spans, Instant::now());
+    assert!(set.router.all_members_verified());
+    checkpoint(&mut set).unwrap().unwrap();
+    assert!(recorder.committed().is_some());
+}
+
+#[test]
 fn a_finalized_set_refuses_to_be_demoted() {
     // The two terminal states are mutually exclusive, and finalization is the
     // one that already renamed members onto their destinations. Demoting after

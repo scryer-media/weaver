@@ -223,6 +223,7 @@ impl Database {
 
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
         let datastore = self.datastore();
+        let key = self.encryption_key().cloned();
         self.run_sql_blocking_read(async move {
             let mut jobs = HashMap::new();
 
@@ -265,7 +266,10 @@ impl Database {
                     category: row.opt_text("category")?,
                     metadata: metadata_from_json(row.opt_text("metadata")?),
                     queue_position: row.opt_i64("queue_position")?,
-                    password_override: row.opt_text("password")?,
+                    password_override: super::persistence::decrypt_archive_password(
+                        key.as_ref(),
+                        row.opt_text("password")?,
+                    )?,
                 };
                 jobs.insert(job_id, job);
             }

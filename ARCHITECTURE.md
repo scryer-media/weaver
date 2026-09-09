@@ -359,6 +359,49 @@ takes precedence over a chase of its source parts.
 
 ### Engine Boundaries Stay Explicit
 
+`pipeline/repair/backend` is the operation boundary for retained PAR2 and PAR3
+engines. It preserves native assessments, evidence, source invalidation, errors,
+and repair requests. Calls are statically dispatched above block I/O; PAR2's
+readers, checksum substitutions, and buffer limits remain native. PAR3 carrier
+roles control discovery priority; authenticated packets alone establish set
+membership and recovery availability. Carrier scans run on blocking workers and
+retain lazy payload references. Extending visibility over unchanged disk backing
+preserves the scanner and pending packet hash; replay checks the path and logical
+generation before reusing progress. Published coverage keeps holes unavailable.
+Visibility extensions over unchanged backing retain source evidence, while
+actual writes withdraw it. Completed conventional files bind through committed
+decoded placements; restored complete disk images without placements are candidates
+for fresh verification. Native
+sessions retain their evidence, while bounded actor views carry file-coordinate
+damage and matrix/cohort requirements. Pending publications hide prior views;
+the shared worker queue rotates between PAR3 jobs. Conventional writes withdraw
+coverage before disk mutation, and worker epochs reject stale handbacks. Identity
+rebindings retire the corresponding source publications for fresh binding.
+`pipeline/repair/par3/coordination` keeps cross-format handoffs above block I/O.
+PAR2 recovery estimates exclude PAR3 carriers. PAR2 gets the first repair attempt;
+its writes fence the affected PAR3 sources and republish the installed images for
+fresh verification, retaining clean sibling evidence. After PAR2 exhausts its
+recovery, admitted PAR3 work can repair the shared files; affected PAR2 sets then
+verify the new bytes themselves. Conflicting native verdicts refuse delivery.
+Temporary handoff lists use the PAR3 host budget; PAR2-only jobs allocate none.
+Conventional PAR3 completion requests individual recovery articles and dispatches native
+staged repairs. Verified installed files reconcile assembly and persistence without
+translating PAR3 fingerprints into PAR2 MD5. PAR3 reads direct volume images through
+a separately bounded reader, retaining cipher frontiers and checking backing
+generations. Direct finalization waits for verification and application of the
+native verdict to the router's deferred archive checks. A verified native session
+alone cannot demote or finalize a set with those checks still pending. Live direct sets receive
+verified replacement volumes in bounded, generation-checked readback tickets.
+Set-wide transactions defer integrity checks and checkpoints until every affected
+volume is placed. Encrypted readback captures neighbour CBC edges from the known
+part layout before shared partials change, including bytes in other repaired
+volumes that never arrived. Coverage is admitted after placement and conventional
+completed-file rows are suppressed for those virtual sources. Earlier
+archive-checksum demotions still use conventional repair.
+Shared mutation views and restart evidence remain under integration. The implementation
+record and remaining acceptance gates live in
+[the PAR3 integration plan](docs/par3-integration-plan.md).
+
 Engine crates should remain sharp and focused:
 
 - NNTP

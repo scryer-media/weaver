@@ -125,6 +125,7 @@ fn active_backfill_job(job_id: u64, nzb_zstd: Vec<u8>) -> ActiveJob {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     }
 }
 
@@ -473,10 +474,9 @@ fn promotable_failure_claims_and_releases_best_parked_candidate() {
             .unwrap(),
     )
     .0;
-    let fallback_job = match db
-        .admit_duplicate_submission(&score_request(&fallback, 42, "group-promote", 90))
-        .unwrap()
-    {
+    let mut fallback_request = score_request(&fallback, 42, "group-promote", 90);
+    fallback_request.semantic_source.as_mut().unwrap().password = Some("fallback-password".into());
+    let fallback_job = match db.admit_duplicate_submission(&fallback_request).unwrap() {
         DuplicateAdmission::Parked { job_id, .. } => job_id,
         outcome => panic!("expected parked fallback, got {outcome:?}"),
     };
@@ -501,6 +501,14 @@ fn promotable_failure_claims_and_releases_best_parked_candidate() {
         .expect("promotable failure should claim fallback");
     assert_eq!(claim.job_id, fallback_job);
     assert_eq!(claim.source.nzb_zstd, vec![42]);
+    assert_eq!(claim.source.password.as_deref(), Some("fallback-password"));
+    assert!(db.has_encrypted_credentials().unwrap());
+    assert!(
+        db.validate_encrypted_credentials(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate()
+        )
+        .is_err()
+    );
     let claimed = db
         .semantic_candidate_snapshot(fallback_job)
         .unwrap()

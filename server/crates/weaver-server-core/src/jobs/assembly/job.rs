@@ -9,6 +9,7 @@ use super::file::FileAssembly;
 pub struct JobAssembly {
     job_id: JobId,
     files: HashMap<NzbFileId, FileAssembly>,
+    has_par3_candidates: bool,
 
     /// Archive topologies keyed by archive set name (e.g., "Show.S01E01.7z").
     /// Supports multiple independent archive sets per job (e.g., season packs).
@@ -92,13 +93,21 @@ impl JobAssembly {
         Self {
             job_id,
             files: HashMap::new(),
+            has_par3_candidates: false,
             archive_topologies: HashMap::new(),
         }
     }
 
     /// Add a file to track.
     pub fn add_file(&mut self, assembly: FileAssembly) {
+        self.has_par3_candidates |= matches!(assembly.role(), FileRole::Par3 { .. });
         self.files.insert(assembly.file_id(), assembly);
+    }
+
+    /// Whether admission saw a declared PAR3 carrier. This is a discovery hint,
+    /// retained across renaming; it does not establish a set or its capacity.
+    pub fn has_par3_candidates(&self) -> bool {
+        self.has_par3_candidates
     }
 
     /// Get a file assembly by id (mutable).
@@ -363,26 +372,20 @@ impl JobAssembly {
         weighted_progress / total_bytes as f64
     }
 
-    /// Total optional PAR2 recovery bytes and how many of those bytes were received.
+    /// Total optional recovery bytes and how many of those bytes were received.
     ///
-    /// PAR2-only jobs treat recovery bytes as required, so both values return 0.
+    /// Protection-only jobs treat recovery bytes as required, so both values return 0.
     pub fn optional_recovery_bytes(&self) -> (u64, u64) {
         let has_payload_files = self
             .files
             .values()
-            .any(|file| !matches!(file.role(), FileRole::Par2 { .. }));
+            .any(|file| file.role().counts_toward_health());
         if !has_payload_files {
             return (0, 0);
         }
 
         self.files.values().fold((0u64, 0u64), |acc, file| {
-            if matches!(
-                file.role(),
-                FileRole::Par2 {
-                    is_index: false,
-                    ..
-                }
-            ) {
+            if file.role().is_recovery() {
                 (
                     acc.0.saturating_add(file.total_bytes()),
                     acc.1.saturating_add(file.received_bytes()),
@@ -403,36 +406,20 @@ impl JobAssembly {
         self.files.len()
     }
 
-    /// Number of data files (excludes PAR2 recovery volumes).
-    /// Includes PAR2 index, archive volumes, standalone files.
+    /// Number of data files (excludes recovery volumes).
+    /// Includes protection indexes, archive volumes, and standalone files.
     pub fn data_file_count(&self) -> usize {
         self.files
             .values()
-            .filter(|f| {
-                !matches!(
-                    f.role(),
-                    FileRole::Par2 {
-                        is_index: false,
-                        ..
-                    }
-                )
-            })
+            .filter(|f| !f.role().is_recovery())
             .count()
     }
 
-    /// Number of complete data files (excludes PAR2 recovery volumes).
+    /// Number of complete data files (excludes recovery volumes).
     pub fn complete_data_file_count(&self) -> usize {
         self.files
             .values()
-            .filter(|f| {
-                !matches!(
-                    f.role(),
-                    FileRole::Par2 {
-                        is_index: false,
-                        ..
-                    }
-                ) && f.is_complete()
-            })
+            .filter(|f| !f.role().is_recovery() && f.is_complete())
             .count()
     }
 

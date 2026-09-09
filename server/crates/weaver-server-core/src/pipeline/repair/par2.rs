@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::backend::RepairBackend;
 use super::*;
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::runtime::fs as runtime_fs;
@@ -2128,7 +2129,7 @@ impl Pipeline {
                 .values()
                 .flat_map(|runtime| runtime.sets.values())
                 .filter_map(|set_runtime| set_runtime.session.as_ref())
-                .map(par2_rs::Par2RepairSession::estimated_retained_bytes)
+                .map(RepairBackend::retained_bytes)
                 .sum::<usize>();
             if retained_bytes <= PAR2_RETAINED_SESSION_BUDGET_BYTES {
                 return;
@@ -2173,6 +2174,7 @@ impl Pipeline {
     /// retained repair session. Drop source locations before that write is
     /// allowed to become observable; parsed PAR2 packets remain reusable.
     pub(crate) fn invalidate_par2_session_for_file_write(&mut self, file_id: NzbFileId) {
+        self.invalidate_par3_source_write(file_id);
         // A damaged-path analysis reading right now is reading the bytes this
         // write replaces, so its verdict would name a file state that no longer
         // exists. Drop the ticket; the completion check submits a fresh read.
@@ -2184,7 +2186,7 @@ impl Pipeline {
         for set_runtime in runtime.sets.values_mut() {
             set_runtime.session_evidence_file_ids.clear();
             if let Some(session) = set_runtime.session.as_mut() {
-                session.invalidate_all_sources();
+                session.invalidate(());
             }
         }
     }
@@ -2193,6 +2195,7 @@ impl Pipeline {
     /// downloaded bytes. A retained location must nevertheless be discarded:
     /// repair always derives a fresh location from the current identity.
     pub(crate) fn invalidate_par2_session_for_identity_rebind(&mut self, job_id: JobId) {
+        self.invalidate_par3_bindings(job_id);
         // Same reason a retained location is discarded here: an analysis in
         // flight was handed the paths the old identities produced, and the
         // verdict it brings back would decide a repair against names that have
@@ -2202,7 +2205,7 @@ impl Pipeline {
             for set_runtime in runtime.sets.values_mut() {
                 set_runtime.session_evidence_file_ids.clear();
                 if let Some(session) = set_runtime.session.as_mut() {
-                    session.invalidate_all_sources();
+                    session.invalidate(());
                 }
             }
         }
@@ -2339,6 +2342,11 @@ impl Pipeline {
 
         let state = self.jobs.get(&job_id)?;
         let role = recovery_file_role(&state.spec, file_index)?;
+        if matches!(role, weaver_model::files::FileRole::Par3 { .. }) {
+            // PAR3 packet sizes and volume indices do not predict PAR2 rows.
+            // Validated PAR2 packet ownership above remains authoritative.
+            return None;
+        }
 
         if matches!(
             role,

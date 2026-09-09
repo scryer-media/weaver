@@ -23,9 +23,15 @@
 
 ## What is Weaver?
 
-Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2 verification and repair, and extraction (RAR, 7z, etc) — all within a single self-contained binary. No need to install `unrar`, `par2repair`, or any other external tools.
+Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2/PAR3 verification and repair, and extraction (RAR, 7z, etc) — all within a single self-contained binary. No need to install `unrar`, `par2repair`, or any other external tools.
 
-Built on [rarpar](https://github.com/scryer-media/rarpar), the world's fastest Rust libraries for RAR extraction and PAR2 repair.
+Built on [rarpar](https://github.com/scryer-media/rarpar), Rust libraries for RAR extraction and PAR2/PAR3 repair.
+
+PAR3 support includes selective recovery downloads, virtual and renamed sources,
+Cauchy and low-rate FFT sets, deduplicated blocks, Data packets, and protection
+embedded in ZIP/ZIP64 and 7z. Weaver verifies, repairs and extracts existing sets;
+it does not create them. See the [native scenarios](e2e/docs/par3.md) and
+[integration record](docs/par3-integration-plan.md) for resource limits and validation.
 
 Instead of the traditional sequential approach (download everything, then repair, then extract), Weaver can run downloading and extraction concurrently*. Extraction begins as soon as the first archive volume finishes downloading, so files appear on disk while the rest of the job is still in progress.
 

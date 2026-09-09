@@ -9,6 +9,7 @@ pub mod persistence;
 pub mod phase_progress;
 pub mod queries;
 pub mod record;
+pub(crate) mod repair_outputs;
 pub mod repository;
 pub mod service;
 pub mod working_dir;
