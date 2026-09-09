@@ -221,6 +221,7 @@ impl Pipeline {
         let work::RepairCompletion {
             result,
             outputs: _outputs,
+            embedded_replacement,
             _reservation,
         } = completion;
         if !self.jobs.contains_key(&job_id) {
@@ -250,13 +251,19 @@ impl Pipeline {
                     crate::operations::instrumentation::StageOutcomeKind::Complete,
                     report.reconstructed_blocks,
                 );
-                let _ = self
-                    .event_tx
-                    .send(crate::events::model::PipelineEvent::RepairComplete {
+                let event = if embedded_replacement {
+                    crate::events::model::PipelineEvent::EmbeddedProtectionReplaced {
+                        job_id,
+                        blocks_repaired: report.reconstructed_blocks,
+                    }
+                } else {
+                    crate::events::model::PipelineEvent::RepairComplete {
                         job_id,
                         slices_repaired: u32::try_from(report.reconstructed_blocks)
                             .unwrap_or(u32::MAX),
-                    });
+                    }
+                };
+                let _ = self.event_tx.send(event);
                 self.release_direct_unpack_after_repair(job_id);
                 self.transition_postprocessing_status(
                     job_id,

@@ -680,6 +680,17 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 file_id: None,
                 message: format!("{slices_repaired} slices repaired"),
             },
+            PipelineEvent::EmbeddedProtectionReplaced {
+                job_id,
+                blocks_repaired,
+            } => Self {
+                kind: EventKind::RepairComplete,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: format!(
+                    "{blocks_repaired} blocks repaired. Embedded PAR3 protection replaced after verified repair. Available authenticated packets were preserved; the original carrier could not be restored byte for byte."
+                ),
+            },
             PipelineEvent::RepairFailed { job_id, error } => Self {
                 kind: EventKind::RepairFailed,
                 job_id: Some(job_id.0),

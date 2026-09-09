@@ -42,7 +42,8 @@ discovery on blocking workers, retained authenticated packet locations, and a
 source publication adapter separating availability revisions from content
 generations. PAR3-specific state is lazy. Engine allocations share a process-wide
 256 MiB budget and 128 handles; each job uses one codec worker and each native
-set has the approved 128 MiB retained ceiling. Source publication tables bound sources and ranges.
+set has the approved 128 MiB retained ceiling. Source publication tables bound
+sources and ranges.
 Official-fixture tests cover split headers/payloads, interior holes, duplicate
 arrivals, evidence reuse, selective output staging, and typed cancellation.
 
@@ -398,6 +399,19 @@ source placement and remaining lifecycle/product gates are still open.
 Validation passes all 178 native scenarios, 3,863 workspace Nextest tests
 (13 existing skips), three doctests, formatting, and all-target/all-feature
 workspace Clippy.
+
+Successful embedded replacements now carry their native repaired-block count and
+an explicit original-carrier limitation into the persisted repair-completion
+history entry. The existing GraphQL event enum and job-detail rendering remain
+compatible. Clean archives, insufficient recovery, stale handbacks and failed
+reconciliation cannot emit a successful replacement warning. All 32 official
+ZIP/ZIP64/7z scenarios check warning presence or absence through persisted
+GraphQL history; an isolated SQLite regression checks the warning after reopening.
+This uses prospective 0.11.3 without dependency changes. Source placement,
+remaining lifecycle scenarios and native verification metrics remain open.
+Validation passes all 178 native scenarios, 3,864 workspace Nextest tests
+(13 existing skips), three doctests, formatting and workspace Clippy. The runtime
+GraphQL schema remains byte-for-byte identical to the checked-in schema.
 
 Standalone mixed-format coordination now gives PAR2 its first repair attempt and
 excludes PAR3 volumes from its size-based recovery predictions. PAR2 writes fence

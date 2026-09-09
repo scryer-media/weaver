@@ -404,6 +404,7 @@ fn readback_installation(path: PathBuf, options: &ExecutionOptions) -> Box<readb
         completion: RepairCompletion {
             result: Ok(Default::default()),
             outputs: Ok(vec![output]),
+            embedded_replacement: false,
             _reservation: Some(assessment::ViewReservation::acquire(4096).unwrap()),
         },
         targets: vec![readback::Target {

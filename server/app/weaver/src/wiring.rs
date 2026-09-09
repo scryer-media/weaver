@@ -262,6 +262,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedded_repair_warning_survives_database_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("events.db");
+        let db = Database::open(&path).unwrap();
+        let (tx, rx) = broadcast::channel(8);
+        let task = tokio::spawn(persist_events(
+            rx,
+            db.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        let warning = PipelineEvent::EmbeddedProtectionReplaced {
+            job_id: JobId(7),
+            blocks_repaired: 3,
+        };
+        assert_eq!(
+            weaver_server_core::events::publish::pipeline_job_id(&warning),
+            Some(7)
+        );
+        tx.send(warning).unwrap();
+        tx.send(PipelineEvent::JobCompleted { job_id: JobId(7) })
+            .unwrap();
+        drop(tx);
+        task.await.unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        let events = reopened.get_job_events(7).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "RepairComplete");
+        assert!(events[0].message.starts_with("3 blocks repaired."));
+        assert!(
+            events[0]
+                .message
+                .contains("original carrier could not be restored byte for byte")
+        );
+        assert_eq!(events[1].kind, "JobCompleted");
+        assert!(events[0].file_id.is_none());
+    }
+
+    #[tokio::test]
     async fn persist_events_flushes_partial_batches_while_events_continue() {
         let db = Database::open_in_memory().unwrap();
         let (tx, rx) = broadcast::channel(64);

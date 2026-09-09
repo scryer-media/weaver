@@ -106,6 +106,7 @@ func TestPar3InsideE2E(t *testing.T) {
 						"jobId": job, "status": status, "error": failure, "history": history.HistoryItem,
 						"expectedSHA256": fmt.Sprintf("%x", sha256.Sum256(payload)),
 					})
+					api.assertEmbeddedRepairWarning(t, job, mode != "clean" && mode != "insufficient")
 					if mode == "insufficient" {
 						if status != "FAILED" || !strings.Contains(failure, "PAR3") {
 							t.Fatalf("expected native insufficient-recovery failure, got %s: %s; log=%s", status, failure, logPath)
@@ -142,6 +143,43 @@ func TestPar3InsideE2E(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Query persisted history, waiting for its terminal event to avoid mistaking
+// an unflushed warning for an absent warning on clean or failed jobs.
+func (a unpackAPI) assertEmbeddedRepairWarning(t *testing.T, job int, expected bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var result struct {
+			JobEvents []struct{ Kind, Message string }
+		}
+		if err := a.query(`query($id:Int!) {jobEvents(jobId:$id) {kind message}}`, map[string]any{"id": job}, &result); err != nil {
+			t.Fatal(err)
+		}
+		warnings, terminal := 0, false
+		for _, event := range result.JobEvents {
+			if event.Kind == "REPAIR_COMPLETE" && strings.Contains(event.Message, "Embedded PAR3 protection replaced") {
+				warnings++
+				if !strings.Contains(event.Message, "original carrier could not be restored byte for byte") {
+					t.Fatalf("unexpected repair warning: %s", event.Message)
+				}
+			}
+			terminal = terminal || event.Kind == "JOB_COMPLETED" || event.Kind == "JOB_FAILED"
+		}
+		if terminal {
+			want := 0
+			if expected {
+				want = 1
+			}
+			if warnings != want {
+				t.Fatalf("job=%d: got %d persisted repair warnings, want %d", job, warnings, want)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("job=%d: terminal event was not persisted", job)
 }
 
 func par3InsideFixture(t *testing.T, reference, dir, format string) (string, []byte, []byte, []byte) {

@@ -161,13 +161,17 @@ pub enum PipelineEvent {
     },
 
     // ---- Repair stage ----
-    /// PAR2 repair started.
+    /// Recovery repair started.
     RepairStarted { job_id: JobId },
 
-    /// PAR2 repair completed.
+    /// Recovery repair completed.
     RepairComplete { job_id: JobId, slices_repaired: u32 },
 
-    /// PAR2 repair failed.
+    /// Embedded protection was replaced after verified repair; the original
+    /// carrier could not be restored byte for byte.
+    EmbeddedProtectionReplaced { job_id: JobId, blocks_repaired: u64 },
+
+    /// Recovery repair failed.
     RepairFailed { job_id: JobId, error: String },
 
     // ---- Extraction stage ----

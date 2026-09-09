@@ -64,6 +64,7 @@ pub fn pipeline_job_id(event: &PipelineEvent) -> Option<u64> {
         | PipelineEvent::RepairStarted { job_id }
         | PipelineEvent::RepairComplete { job_id, .. }
         | PipelineEvent::RepairFailed { job_id, .. }
+        | PipelineEvent::EmbeddedProtectionReplaced { job_id, .. }
         | PipelineEvent::ExtractionReady { job_id }
         | PipelineEvent::ExtractionMemberStarted { job_id, .. }
         | PipelineEvent::ExtractionMemberWaitingStarted { job_id, .. }

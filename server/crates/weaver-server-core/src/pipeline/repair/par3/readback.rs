@@ -804,6 +804,7 @@ mod tests {
         Installation {
             completion: work::RepairCompletion {
                 result: Ok(Default::default()),
+                embedded_replacement: false,
                 outputs: Ok(vec![
                     VerifiedOutput::capture(path, STRIPE_BYTES + 17, options).unwrap(),
                 ]),

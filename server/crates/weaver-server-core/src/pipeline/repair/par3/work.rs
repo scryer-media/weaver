@@ -26,6 +26,8 @@ enum WorkOutput {
 pub(super) struct RepairCompletion {
     pub result: EngineResult<par3_rs::session_repair::SessionRepairReport>,
     pub outputs: EngineResult<Vec<readback::VerifiedOutput>>,
+    /// True only when the embedded repair path installed a replacement.
+    pub embedded_replacement: bool,
     pub _reservation: Option<assessment::ViewReservation>,
 }
 
@@ -773,6 +775,7 @@ impl Coordinator {
                                 Ok(WorkOutput::Repaired(RepairCompletion {
                                     result: Err(error),
                                     outputs: Ok(Vec::new()),
+                                    embedded_replacement: false,
                                     _reservation: Some(input.reservation),
                                 })),
                             );
@@ -786,6 +789,12 @@ impl Coordinator {
                         }
                         _ => &[],
                     };
+                    let embedded_replacement = !installed.is_empty()
+                        && layout.files().iter().any(|file| {
+                            file.extents.iter().any(|extent| {
+                                matches!(extent.kind, par3_rs::layout::ExtentKind::Unprotected)
+                            })
+                        });
                     let outputs = installed
                         .iter()
                         .map(|output| {
@@ -808,6 +817,7 @@ impl Coordinator {
                         Ok(WorkOutput::Repaired(RepairCompletion {
                             result,
                             outputs,
+                            embedded_replacement,
                             _reservation: Some(input.reservation),
                         })),
                     );
@@ -932,6 +942,7 @@ impl Coordinator {
                         "PAR3 repair output changed before handback",
                     )),
                     outputs: Ok(Vec::new()),
+                    embedded_replacement: false,
                     _reservation: None,
                 });
             } else if done.key == WorkKey::Readback {
@@ -956,6 +967,7 @@ impl Coordinator {
                             .err()
                             .unwrap_or(EngineError::InvalidState("missing PAR3 repair report"))),
                         outputs: Ok(Vec::new()),
+                        embedded_replacement: false,
                         _reservation: None,
                     },
                 });
