@@ -1496,3 +1496,116 @@ async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
     harness.shutdown().await;
     server.abort();
 }
+
+#[tokio::test]
+async fn repeated_articles_fetch_once_and_preserve_every_admitted_file() {
+    repeated_article_case(false).await;
+}
+
+#[tokio::test]
+async fn repeated_uuencode_articles_preserve_each_file_and_wire_accounting() {
+    repeated_article_case(true).await;
+}
+
+async fn repeated_article_case(uuencode: bool) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let payload: &[u8] = if uuencode {
+        b"abc"
+    } else {
+        b"one article, several independent file placements"
+    };
+    let mut body = Vec::new();
+    if uuencode {
+        body.extend_from_slice(b"begin 644 shared.bin\r\n#86)C\r\n`\r\nend\r\n");
+    } else {
+        weaver_yenc::encode(payload, &mut body, 128, "shared.bin").unwrap();
+    }
+    let expected_wire = body.len() as u64;
+    let body = Arc::new(body);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    let body = body.clone(); let counted = counted.clone();
+                    connections.spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        write.write_all(b"200 fixture ready\r\n").await.unwrap();
+                        let mut lines = BufReader::new(read).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let response: &[u8] = if line == "CAPABILITIES" {
+                                b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+                            } else if line.starts_with("GROUP ") {
+                                b"211 1 1 1 alt.binaries.test\r\n"
+                            } else if line == "BODY <shared@example.com>" {
+                                counted.fetch_add(1, Ordering::SeqCst);
+                                if write.write_all(b"222 0 <shared@example.com> body\r\n").await.is_err() { break; }
+                                if write.write_all(&body).await.is_err() { break; }
+                                b".\r\n"
+                            } else if line == "QUIT" { break; }
+                            else { b"500 unsupported\r\n" };
+                            if write.write_all(response).await.is_err() { break; }
+                        }
+                    });
+                }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
+    let harness = TestHarness::new_with_nntp(capacity_test_client(port, 4), 4).await;
+    let id = JobId(80031);
+    let mut spec = standalone_job_spec(
+        "Repeated Article",
+        &(0..4)
+            .map(|n| (format!("copy-{n}.bin"), payload.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.segments[0].message_id = "shared@example.com".to_string();
+    }
+    harness
+        .handle
+        .add_job(id, spec, PathBuf::from("repeat.nzb"), sample_nzb_zstd())
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        let job = harness.handle.get_job(id).unwrap();
+        if matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. })
+            || Instant::now() >= deadline
+        {
+            break job.status;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let output = harness._temp_dir.path().join("complete/Repeated Article");
+    let files: Vec<_> = std::fs::read_dir(&output)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().unwrap().is_file())
+        .map(|entry| std::fs::read(entry.path()).unwrap())
+        .collect();
+    let wire_bytes = harness.handle.get_live_metrics().bytes_downloaded;
+    harness.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    assert_eq!(status, JobStatus::Complete);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        files
+            .iter()
+            .filter(|bytes| bytes.as_slice() == payload)
+            .count(),
+        4
+    );
+    assert_eq!(
+        wire_bytes, expected_wire,
+        "cached placements must not count as new network transfers"
+    );
+}

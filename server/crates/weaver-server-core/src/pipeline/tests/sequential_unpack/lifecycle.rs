@@ -5,7 +5,7 @@ use crate::pipeline::direct_unpack::wiring::{AbortLatch, DemotionReason};
 async fn pausing_a_chase_waiting_for_memory_does_not_wait_for_another_download() {
     let temp = TempDir::new().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
-    pipeline.direct_unpack_process_memory = Arc::new(
+    pipeline.process_memory_budget = Arc::new(
         crate::pipeline::extraction::ProcessMemoryBudget::new(1024 * 1024),
     );
     let (name, bytes, members) = fixture(SimpleArchiveKind::Gz);
@@ -45,14 +45,28 @@ async fn pausing_a_chase_waiting_for_memory_does_not_wait_for_another_download()
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let cancelled_without_first = !second_staging.exists();
-    assert!(pipeline.direct_unpack.is_armed(first, &name));
-    pipeline
-        .direct_unpack_shutdown("memory cancellation test cleanup")
-        .await;
+    let first_file = NzbFileId {
+        job_id: first,
+        file_index: 0,
+    };
+    assert!(
+        !pipeline.jobs[&first]
+            .assembly
+            .file(first_file)
+            .unwrap()
+            .is_complete()
+    );
     assert!(
         cancelled_without_first,
         "a cancelled memory waiter must not depend on another download finishing"
     );
+    // The first chase may yield under contention. Its job must still extract
+    // correctly when the remaining bytes arrive, through the normal fallback.
+    for number in bytes.len().div_ceil(ARTICLE) / 2..bytes.len().div_ceil(ARTICLE) {
+        land(&mut pipeline, first_file, &name, &bytes, number).await;
+    }
+    finish(&mut pipeline, first, &name).await;
+    extracted(&mut pipeline, first, &members).await;
 }
 
 #[tokio::test]

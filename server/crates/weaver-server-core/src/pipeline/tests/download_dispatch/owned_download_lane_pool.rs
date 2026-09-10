@@ -1288,7 +1288,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         .download_queue
         .pop()
         .expect("transport retry should remain in the batched infrastructure queue");
-    assert_eq!(retry.retry_count, 1);
+    assert_eq!(retry.retry_count, 0);
 
     pipeline.active_downloads = 1;
     pipeline.active_download_passes.insert(job_id);
@@ -1311,25 +1311,34 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         })
         .await;
 
-    assert!(matches!(
+    assert_eq!(
         job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Failed { .. })
-    ));
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(pipeline.jobs[&job_id].failed_bytes, 0);
     assert_eq!(
         pipeline
             .metrics
             .segments_failed_permanent
             .load(Ordering::Relaxed),
-        1
+        0
     );
-    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
     assert_eq!(
         pipeline
             .metrics
             .parked_infrastructure_work
             .load(Ordering::Relaxed),
-        0
+        1
     );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
 }
 
 /// A transport-failure retry must point away from the server that just
@@ -1394,7 +1403,7 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
         retry.exclude_servers.is_empty(),
         "rotation must not enter the article-not-found exhaustion ledger"
     );
-    assert_eq!(retry.retry_count, 1);
+    assert_eq!(retry.retry_count, 0);
 }
 
 /// With a single configured server there is nowhere to rotate to: the retry
@@ -1548,10 +1557,10 @@ fn lane_acquire_failure_preserves_retry_semantics() {
         weaver_nntp::NntpError::TruncatedMultilineBody,
         weaver_nntp::NntpError::MalformedMultilineTerminator,
     ] {
-        assert_eq!(
-            DownloadFailure::from_nntp(error).kind,
-            DownloadFailureKind::ContentOrProtocol
-        );
+        let failure = DownloadFailure::from_nntp(error);
+        assert_eq!(failure.kind, DownloadFailureKind::EstablishedTransport);
+        assert!(failure.kind.preserves_article_retry_budget());
+        assert!(failure.kind.infrastructure_wait_reason().is_some());
     }
     let unavailable = DownloadFailure::from_lane_acquire_failure(None);
     assert_eq!(unavailable.kind, DownloadFailureKind::LaneUnavailable);
@@ -1652,10 +1661,11 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
 }
 
 #[test]
-fn only_pre_body_infrastructure_failures_preserve_article_retry_budget() {
+fn infrastructure_failures_preserve_article_retry_budget() {
     for kind in [
         DownloadFailureKind::CapacityUnavailable,
         DownloadFailureKind::ConnectionEstablishment,
+        DownloadFailureKind::EstablishedTransport,
         DownloadFailureKind::Auth,
         DownloadFailureKind::ServerQuota,
         DownloadFailureKind::LaneUnavailable,
@@ -1664,7 +1674,6 @@ fn only_pre_body_infrastructure_failures_preserve_article_retry_budget() {
         assert!(kind.preserves_article_retry_budget(), "kind={kind:?}");
     }
     for kind in [
-        DownloadFailureKind::EstablishedTransport,
         DownloadFailureKind::ArticleNotFound,
         DownloadFailureKind::ContentOrProtocol,
     ] {

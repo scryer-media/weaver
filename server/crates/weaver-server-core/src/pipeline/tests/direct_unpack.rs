@@ -3084,7 +3084,7 @@ async fn parked_chases_share_the_decoder_memory_pool() {
     let pool = std::sync::Arc::new(crate::pipeline::extraction::ProcessMemoryBudget::new(
         256 * MIB,
     ));
-    pipeline.direct_unpack_process_memory = std::sync::Arc::clone(&pool);
+    pipeline.process_memory_budget = std::sync::Arc::clone(&pool);
     let set_name = "silver_horizon.7z";
 
     let archive = std::fs::read(

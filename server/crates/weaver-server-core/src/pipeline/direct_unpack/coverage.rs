@@ -152,6 +152,7 @@ pub struct SetCoverage {
     /// immediately do not count, so a test can tell parking apart from
     /// spinning without timing anything.
     parks: AtomicU64,
+    memory: std::sync::OnceLock<std::sync::Arc<crate::pipeline::extraction::ProcessMemoryBudget>>,
 }
 
 impl SetCoverage {
@@ -169,7 +170,19 @@ impl SetCoverage {
             }),
             advanced: Condvar::new(),
             parks: AtomicU64::new(0),
+            memory: std::sync::OnceLock::new(),
         }
+    }
+
+    /// A codec parked with a live dictionary must unwind before giving its
+    /// memory back. Under contention the chase yields to ordinary extraction;
+    /// finalization retries from the original archive under a fresh permit.
+    /// Reads with available coverage do not consult the memory pool.
+    pub(crate) fn yield_to_memory_pressure(
+        &self,
+        memory: std::sync::Arc<crate::pipeline::extraction::ProcessMemoryBudget>,
+    ) {
+        let _ = self.memory.set(memory);
     }
 
     /// Number of parts this set was created with.
@@ -760,6 +773,21 @@ impl SetCoverage {
         state: std::sync::MutexGuard<'a, CoverageState>,
     ) -> std::sync::MutexGuard<'a, CoverageState> {
         self.parks.fetch_add(1, Ordering::Relaxed);
+        if let Some(memory) = self.memory.get() {
+            let mut state = state;
+            if memory.has_waiters() {
+                state.aborted.get_or_insert_with(|| {
+                    "direct unpack yielded its decoder to process memory pressure".to_string()
+                });
+                self.advanced.notify_all();
+                return state;
+            }
+            return self
+                .advanced
+                .wait_timeout(state, std::time::Duration::from_millis(250))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
         self.advanced
             .wait(state)
             .unwrap_or_else(|poisoned| poisoned.into_inner())

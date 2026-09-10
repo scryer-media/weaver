@@ -151,20 +151,20 @@ struct ActiveState {
 /// ordinary contention.
 const PROCESS_MEMORY_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
 
-/// Decoder-window bytes reserved by every extraction job in this pipeline.
+/// Shared reservations for scheduling state, PAR2 packet metadata, and archive
+/// decoders in this pipeline. Normal extraction and direct chases use one pool.
 ///
-/// Decoder dictionaries are allocated inside third-party codecs, outside the
-/// ordinary output budgets. Keep one charge for the whole process so several
-/// jobs cannot each consume the configured memory allowance concurrently.
-///
-/// The limit is `ExtractionLimits::max_memory_bytes` — the same number a 7z
-/// extraction reserves in full — so 7z extractions are serialised across the
-/// whole process, and a holder that blocks blocks all of them. See
-/// `one_full_ceiling_reservation_serialises_every_job_in_the_process`.
+/// Retained allocations cannot be freed merely by waiting for another decoder,
+/// so codec ceilings exclude that state. A direct chase parked on unavailable
+/// input yields under contention by unwinding its decoder and releasing its
+/// permit. These estimates do not cover allocations made by archive parsers
+/// before their metadata is available for inspection.
 #[derive(Debug)]
 pub(crate) struct ProcessMemoryBudget {
     limit: u64,
     reserved: AtomicU64,
+    retained: AtomicU64,
+    waiting: AtomicU64,
     idle: Mutex<()>,
     released: Condvar,
 }
@@ -174,14 +174,63 @@ impl ProcessMemoryBudget {
         Self {
             limit,
             reserved: AtomicU64::new(0),
+            retained: AtomicU64::new(0),
+            waiting: AtomicU64::new(0),
             idle: Mutex::new(()),
             released: Condvar::new(),
         }
     }
 
+    /// Admission never blocks the actor behind an extraction worker. The lease
+    /// follows the retained allocation until its owning job or session drops.
+    pub(crate) fn try_reserve_retained(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<ProcessMemoryPermit, String> {
+        let _guard = self.idle.lock().expect("process memory state poisoned");
+        reserve_atomic(&self.reserved, bytes, self.limit).map_err(|requested| format!(
+            "WEAVER_RESOURCE_LIMIT[memory]: reservation would reach {requested} bytes; process limit is {}", self.limit
+        ))?;
+        self.retained.fetch_add(bytes, Ordering::AcqRel);
+        Ok(ProcessMemoryPermit {
+            budget: Arc::clone(self),
+            bytes,
+            retained: true,
+        })
+    }
+
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) != 0
+    }
+
     fn reserve_wait<F>(
         self: &Arc<Self>,
         bytes: u64,
+        check_active: F,
+    ) -> Result<ProcessMemoryPermit, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        self.reserve_wait_kind(bytes, false, check_active)
+    }
+
+    /// Blocking metadata workers may wait for decoders to release memory.
+    /// Actor admission uses the nonblocking reservation instead.
+    pub(crate) fn reserve_retained_wait<F>(
+        self: &Arc<Self>,
+        bytes: u64,
+        check_active: F,
+    ) -> Result<ProcessMemoryPermit, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        self.reserve_wait_kind(bytes, true, check_active)
+    }
+
+    fn reserve_wait_kind<F>(
+        self: &Arc<Self>,
+        bytes: u64,
+        retained: bool,
         mut check_active: F,
     ) -> Result<ProcessMemoryPermit, String>
     where
@@ -194,12 +243,31 @@ impl ProcessMemoryBudget {
             ));
         }
 
+        struct Waiting<'a>(&'a AtomicU64);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let mut waiting = None;
         let mut wait_guard = self.idle.lock().expect("process memory state poisoned");
         let started = Instant::now();
         let mut announced = false;
         loop {
             check_active()?;
+            // Retained job metadata cannot be released by a decoder finishing.
+            // Waiting for impossible capacity would strand the same job forever.
+            if bytes
+                > self
+                    .limit
+                    .saturating_sub(self.retained.load(Ordering::Acquire))
+            {
+                return Err("WEAVER_RESOURCE_LIMIT[memory]: decoder and retained job state exceed the process limit".to_string());
+            }
             if reserve_atomic(&self.reserved, bytes, self.limit).is_ok() {
+                if retained {
+                    self.retained.fetch_add(bytes, Ordering::AcqRel);
+                }
                 if announced {
                     info!(
                         requested_bytes = bytes,
@@ -210,7 +278,12 @@ impl ProcessMemoryBudget {
                 return Ok(ProcessMemoryPermit {
                     budget: Arc::clone(self),
                     bytes,
+                    retained,
                 });
+            }
+            if waiting.is_none() {
+                self.waiting.fetch_add(1, Ordering::AcqRel);
+                waiting = Some(Waiting(&self.waiting));
             }
             // This wait has no deadline, by design: the holder will finish. But
             // an extraction that reserves the whole process allowance and then
@@ -247,6 +320,7 @@ impl ProcessMemoryBudget {
 pub(crate) struct JobExtractionBudget {
     limits: Arc<ExtractionLimits>,
     process_memory: Arc<ProcessMemoryBudget>,
+    decoder_memory_limit: u64,
     root_path: PathBuf,
     ratio_limit_bytes: u64,
     effective_job_limit_bytes: u64,
@@ -300,9 +374,17 @@ impl JobExtractionBudget {
         let estimated_available = initial_disk_space
             .map(|space| space.available_bytes)
             .unwrap_or(0);
+        // Freeze the codec ceiling so releasing another job's metadata cannot
+        // increase a decoder's limit after its reservation was taken.
+        let decoder_memory_limit = limits.max_memory_bytes.min(
+            process_memory
+                .limit
+                .saturating_sub(process_memory.retained.load(Ordering::Acquire)),
+        );
         let budget = Arc::new(Self {
             limits,
             process_memory,
+            decoder_memory_limit,
             root_path,
             ratio_limit_bytes,
             effective_job_limit_bytes,
@@ -458,7 +540,7 @@ impl JobExtractionBudget {
     }
 
     pub(crate) fn max_memory_bytes(&self) -> u64 {
-        self.limits.max_memory_bytes
+        self.decoder_memory_limit
     }
 
     pub(crate) fn check_member_metadata(&self, member: &str, bytes: u64) -> Result<(), String> {
@@ -792,14 +874,40 @@ impl Drop for MemoryPermit {
 }
 
 #[derive(Debug)]
-struct ProcessMemoryPermit {
+pub(crate) struct ProcessMemoryPermit {
     budget: Arc<ProcessMemoryBudget>,
     bytes: u64,
+    retained: bool,
+}
+
+impl ProcessMemoryPermit {
+    pub(crate) fn grow_retained_wait<F>(
+        &mut self,
+        bytes: u64,
+        check_active: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        assert!(self.retained);
+        let mut extra = self.budget.reserve_retained_wait(bytes, check_active)?;
+        self.bytes += extra.bytes;
+        extra.bytes = 0;
+        Ok(())
+    }
 }
 
 impl Drop for ProcessMemoryPermit {
     fn drop(&mut self) {
+        let _guard = self
+            .budget
+            .idle
+            .lock()
+            .expect("process memory state poisoned");
         self.budget.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.retained {
+            self.budget.retained.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
         self.budget.released.notify_all();
     }
 }
@@ -1562,6 +1670,129 @@ mod tests {
         drop(first);
         waiter.join().unwrap();
         assert_eq!(process_memory.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn decoder_ceiling_stays_with_its_reservation_when_metadata_is_released() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = Arc::new(ProcessMemoryBudget::new(8 * MIB));
+        let metadata = process.try_reserve_retained(2 * MIB).unwrap();
+        let budget = JobExtractionBudget::new_with_process_memory(
+            Arc::new(ExtractionLimits {
+                max_memory_bytes: 8 * MIB,
+                ..(*limits()).clone()
+            }),
+            Arc::clone(&process),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        assert_eq!(budget.max_memory_bytes(), 6 * MIB);
+        let decoder = budget
+            .reserve_memory_wait(budget.max_memory_bytes())
+            .unwrap();
+        assert_eq!(process.reserved_bytes(), 8 * MIB);
+        assert!(process.try_reserve_retained(1).is_err());
+        drop(metadata);
+        assert_eq!(budget.max_memory_bytes(), 6 * MIB);
+        assert_eq!(process.reserved_bytes(), 6 * MIB);
+        drop(decoder);
+        assert_eq!(process.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn parked_chase_yields_its_memory_to_a_waiting_extraction() {
+        assert_parked_chase_yields_memory(false);
+    }
+
+    #[test]
+    fn parked_chase_yields_its_memory_to_waiting_metadata() {
+        assert_parked_chase_yields_memory(true);
+    }
+
+    fn assert_parked_chase_yields_memory(retained: bool) {
+        use crate::pipeline::direct_unpack::coverage::SetCoverage;
+
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let coverage = Arc::new(SetCoverage::new(1));
+        coverage.yield_to_memory_pressure(Arc::clone(&pool));
+        let permit = pool.reserve_wait(1024, || Ok(())).unwrap();
+        let chase_coverage = Arc::clone(&coverage);
+        let chase = std::thread::spawn(move || {
+            let _permit = permit;
+            chase_coverage.resolve_position(0, 0)
+        });
+        let waiter_pool = Arc::clone(&pool);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let waiter = std::thread::spawn(move || {
+            let check_active = || {
+                if Instant::now() >= deadline {
+                    Err("wait timed out".to_string())
+                } else {
+                    Ok(())
+                }
+            };
+            let result = if retained {
+                waiter_pool.reserve_retained_wait(1024, check_active)
+            } else {
+                waiter_pool.reserve_wait(1024, check_active)
+            };
+            if result.is_ok() {
+                assert_eq!(waiter_pool.reserved_bytes(), 1024);
+                assert_eq!(
+                    waiter_pool.retained.load(Ordering::Acquire),
+                    if retained { 1024 } else { 0 }
+                );
+            }
+            done_tx.send(result.map(drop)).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(6));
+        coverage.abort("test teardown");
+        let chase_result = chase.join().unwrap();
+        waiter.join().unwrap();
+        result.expect("memory waiter should finish").unwrap();
+        assert!(
+            chase_result
+                .unwrap_err()
+                .to_string()
+                .contains("memory pressure")
+        );
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert!(!pool.has_waiters());
+    }
+
+    #[test]
+    fn cancelled_metadata_scan_leaves_memory_wait_and_releases_waiter() {
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let holder = pool.reserve_wait(1024, || Ok(())).unwrap();
+        let cancellation = par2_rs::CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker_pool = Arc::clone(&pool);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let worker = std::thread::spawn(move || {
+            worker_pool.reserve_retained_wait(128, || {
+                if worker_cancellation.is_cancelled() || Instant::now() >= deadline {
+                    Err("metadata scan cancelled".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        while !pool.has_waiters() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(pool.has_waiters());
+        cancellation.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert!(!pool.has_waiters());
+        assert_eq!(pool.reserved_bytes(), 1024);
+        assert_eq!(pool.retained.load(Ordering::Acquire), 0);
+        drop(holder);
+        assert_eq!(pool.reserved_bytes(), 0);
     }
 
     #[test]

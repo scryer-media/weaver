@@ -18,7 +18,7 @@ impl Pipeline {
     pub(crate) async fn history_cleanup_dirs_for_job(
         &self,
         job_id: JobId,
-    ) -> Result<BTreeSet<PathBuf>, crate::SchedulerError> {
+    ) -> Result<BTreeSet<(JobId, PathBuf)>, crate::SchedulerError> {
         let mut dirs = BTreeSet::new();
         if let Some(state) = self.jobs.get(&job_id)
             && is_terminal_status(&state.status)
@@ -30,7 +30,7 @@ impl Pipeline {
                 job_id,
             )
             .await?;
-            dirs.insert(path);
+            dirs.insert((job_id, path));
         }
 
         let db = self.db.clone();
@@ -56,7 +56,7 @@ impl Pipeline {
                 job_id,
             )
             .await?;
-            dirs.insert(path);
+            dirs.insert((job_id, path));
         }
 
         Ok(dirs)
@@ -64,7 +64,7 @@ impl Pipeline {
 
     pub(crate) async fn all_history_cleanup_dirs(
         &self,
-    ) -> Result<BTreeSet<PathBuf>, crate::SchedulerError> {
+    ) -> Result<BTreeSet<(JobId, PathBuf)>, crate::SchedulerError> {
         let mut dirs = BTreeSet::new();
         for (job_id, state) in &self.jobs {
             if is_terminal_status(&state.status)
@@ -76,7 +76,7 @@ impl Pipeline {
                     *job_id,
                 )
                 .await?;
-                dirs.insert(path);
+                dirs.insert((*job_id, path));
             }
         }
 
@@ -100,7 +100,7 @@ impl Pipeline {
                     JobId(row.job_id),
                 )
                 .await?;
-                dirs.insert(path);
+                dirs.insert((JobId(row.job_id), path));
             }
         }
 
@@ -109,17 +109,18 @@ impl Pipeline {
 
     pub(crate) async fn cleanup_history_intermediate_dirs(
         &self,
-        dirs: &BTreeSet<PathBuf>,
+        dirs: &BTreeSet<(JobId, PathBuf)>,
     ) -> Result<(), crate::SchedulerError> {
-        for dir in dirs {
+        for (job_id, dir) in dirs {
             // Failed jobs never pass through the finalize close, so drop any
             // cached write handles before their dirs (and paths) are freed
             // for reuse.
             crate::pipeline::close_cached_write_handles_under(dir).await;
             let root = self.intermediate_dir.clone();
             let target = dir.clone();
+            let expected_job = *job_id;
             let removal = tokio::task::spawn_blocking(move || {
-                crate::jobs::working_dir::remove_weaver_owned_working_dir(&root, &target)
+                crate::jobs::working_dir::remove_job_working_dir(&root, &target, expected_job)
             })
             .await
             .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?;
@@ -234,6 +235,8 @@ impl Pipeline {
 
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.jobs.remove(&job_id);
+        self.job_scheduling_memory.remove(&job_id);
+        self.repeated_articles.remove(&job_id);
         self.job_order.retain(|id| *id != job_id);
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);

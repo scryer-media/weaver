@@ -15,14 +15,19 @@ fn par2_scan_budget_is_shared_across_metadata_carriers() {
         crate::pipeline::tests::build_test_par2_index("small.bin", b"small", 4),
     )
     .unwrap();
-    let baseline = std::sync::Arc::new(std::sync::Mutex::new(par2_rs::PacketScanBudget::new(
+    let process = std::sync::Arc::new(crate::pipeline::ProcessMemoryBudget::new(8 << 20));
+    let baseline = std::sync::Arc::new(std::sync::Mutex::new(super::Par2ScanBudget::new(
         par2_rs::PacketScanLimits::default(),
+        process.clone(),
+        par2_rs::CancellationToken::new(),
     )));
     let count = super::scan_job_par2_packets(&path, &baseline)
         .unwrap()
         .len();
-    let budget = std::sync::Arc::new(std::sync::Mutex::new(par2_rs::PacketScanBudget::new(
+    let budget = std::sync::Arc::new(std::sync::Mutex::new(super::Par2ScanBudget::new(
         par2_rs::PacketScanLimits::default().with_max_retained_packets(count * 2),
+        process.clone(),
+        par2_rs::CancellationToken::new(),
     )));
     assert_eq!(
         super::scan_job_par2_packets(&path, &budget).unwrap().len(),
@@ -36,6 +41,12 @@ fn par2_scan_budget_is_shared_across_metadata_carriers() {
         super::scan_job_par2_packets(&path, &budget),
         Err(par2_rs::Par2Error::ResourceLimitExceeded { .. })
     ));
+    let retained = process.reserved_bytes();
+    assert!(retained > 0);
+    drop(baseline);
+    assert!(process.reserved_bytes() < retained);
+    drop(budget);
+    assert_eq!(process.reserved_bytes(), 0);
 }
 
 #[test]

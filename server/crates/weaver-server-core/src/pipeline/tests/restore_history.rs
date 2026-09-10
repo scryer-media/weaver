@@ -10,30 +10,40 @@ async fn scheduling_memory_admission_preserves_placements_and_counts_other_jobs(
     spec.files.push(repeated);
     assert_eq!(spec.scheduling_memory_estimate(), single * 2);
     let required = spec.scheduling_memory_estimate();
-    Arc::make_mut(&mut pipeline.extraction_limits).max_memory_bytes = required;
-    assert!(
-        pipeline
-            .check_job_memory_admission(JobId(31001), &spec)
-            .is_ok()
-    );
-    Arc::make_mut(&mut pipeline.extraction_limits).max_memory_bytes = required - 1;
+    pipeline.process_memory_budget = Arc::new(ProcessMemoryBudget::new(required));
+    let first = pipeline
+        .check_job_memory_admission(JobId(31001), &spec)
+        .unwrap();
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), required);
     assert!(matches!(
         pipeline.check_job_memory_admission(JobId(31001), &spec),
         Err(crate::SchedulerError::InvalidInput(_))
     ));
-    Arc::make_mut(&mut pipeline.extraction_limits).max_memory_bytes = required * 2;
+    drop(first);
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
+    pipeline.process_memory_budget = Arc::new(ProcessMemoryBudget::new(required * 2));
     insert_active_job(&mut pipeline, JobId(31001), spec.clone()).await;
+    let first = pipeline
+        .check_job_memory_admission(JobId(31001), &spec)
+        .unwrap();
+    pipeline.job_scheduling_memory.insert(JobId(31001), first);
     assert!(
         pipeline
             .check_job_memory_admission(JobId(31002), &spec)
             .is_ok()
     );
-    Arc::make_mut(&mut pipeline.extraction_limits).max_memory_bytes = required * 2 - 1;
+    let competing_work = pipeline
+        .process_memory_budget
+        .try_reserve_retained(1)
+        .unwrap();
     assert!(
         pipeline
             .check_job_memory_admission(JobId(31002), &spec)
             .is_err()
     );
+    drop(competing_work);
+    pipeline.purge_terminal_job_runtime(JobId(31001));
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
     assert!(
         pipeline
             .check_job_memory_admission(JobId(31001), &spec)

@@ -596,30 +596,16 @@ impl Pipeline {
 
     pub(crate) fn check_job_memory_admission(
         &mut self,
-        job_id: JobId,
+        _job_id: JobId,
         spec: &JobSpec,
-    ) -> Result<(), crate::SchedulerError> {
-        self.job_scheduling_memory
-            .retain(|id, _| self.jobs.contains_key(id));
-        let proposed = spec.scheduling_memory_estimate();
-        let mut required = proposed;
-        for (id, state) in &self.jobs {
-            if *id != job_id {
-                let bytes = self
-                    .job_scheduling_memory
-                    .entry(*id)
-                    .or_insert_with(|| state.spec.scheduling_memory_estimate());
-                required = required.saturating_add(*bytes);
-            }
-        }
-        if required > self.extraction_limits.max_memory_bytes {
-            return Err(crate::SchedulerError::InvalidInput(format!(
-                "WEAVER_RESOURCE_LIMIT[nzb_metadata]: scheduling metadata requires approximately {required} bytes; memory budget is {}",
-                self.extraction_limits.max_memory_bytes,
-            )));
-        }
-        self.job_scheduling_memory.insert(job_id, proposed);
-        Ok(())
+    ) -> Result<crate::pipeline::ProcessMemoryPermit, crate::SchedulerError> {
+        self.process_memory_budget
+            .try_reserve_retained(spec.scheduling_memory_estimate())
+            .map_err(|error| {
+                crate::SchedulerError::InvalidInput(format!(
+                    "WEAVER_RESOURCE_LIMIT[nzb_metadata]: {error}"
+                ))
+            })
     }
 
     pub(crate) async fn add_job(
@@ -637,7 +623,7 @@ impl Pipeline {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
 
-        self.check_job_memory_admission(job_id, &spec)?;
+        let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
         if let Some(generation) = options.semantic_materialization_generation {
             let db = self.db.clone();
             let current = tokio::task::spawn_blocking(move || {
@@ -864,6 +850,8 @@ impl Pipeline {
             category_bytes: Some(category_bytes),
         };
         state.refresh_runtime_lanes_from_status();
+        self.install_repeated_articles(&state)?;
+        self.job_scheduling_memory.insert(job_id, scheduling_memory);
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
@@ -1140,7 +1128,7 @@ impl Pipeline {
                 };
 
             let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
-            self.check_job_memory_admission(job_id, &spec)?;
+            let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
 
             let working_dir = output_dir
                 .as_ref()
@@ -1213,6 +1201,8 @@ impl Pipeline {
                 category_bytes: Some(category_bytes),
             };
             state.refresh_runtime_lanes_from_status();
+            self.install_repeated_articles(&state)?;
+            self.job_scheduling_memory.insert(job_id, scheduling_memory);
             self.jobs.insert(job_id, state);
             if let Some(file_identities) = self
                 .jobs
@@ -1528,7 +1518,7 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
-        self.check_job_memory_admission(job_id, &spec)?;
+        let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
         if working_dir.starts_with(&self.intermediate_dir)
             && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
             && let Err(error) =
@@ -1771,6 +1761,8 @@ impl Pipeline {
             category_bytes: Some(category_bytes),
         };
         state.refresh_runtime_lanes_from_status();
+        self.install_repeated_articles(&state)?;
+        self.job_scheduling_memory.insert(job_id, scheduling_memory);
         self.jobs.insert(job_id, state);
         // After the job state exists, and before anything can decode a segment
         // for it: `install_restored` marks the job examined, so the lazy

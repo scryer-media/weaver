@@ -1147,10 +1147,9 @@ impl Pipeline {
 
         crate::pipeline::extraction::JobExtractionBudget::new_with_process_memory(
             Arc::clone(&self.extraction_limits),
-            // The chase's own pool, never the shared one: this permit is held
-            // across every park, and a parked chase must not be able to stop
-            // the extractions that are actually on a job's critical path.
-            Arc::clone(&self.direct_unpack_process_memory),
+            // Coverage waits yield the decoder under contention, so speculative
+            // chases can safely share the normal extraction allowance.
+            Arc::clone(&self.process_memory_budget),
             staging.to_path_buf(),
             declared_archive_bytes,
             initial_entries,
@@ -1226,6 +1225,7 @@ impl Pipeline {
         // The chase's own pool, never the shared post-processing one: `install`
         // holds a worker for as long as the closure runs, and this closure parks.
         let pp_pool = self.chase_pool.clone();
+        coverage.yield_to_memory_pressure(Arc::clone(&self.process_memory_budget));
         tokio::task::spawn_blocking(move || {
             // Between here and the line below sits `install`, which queues
             // behind occupied workers with no logging, no timeout, and no
@@ -1246,6 +1246,11 @@ impl Pipeline {
                 );
                 let started_at = Instant::now();
                 let outcome = (|| {
+                    // No decoder exists yet, so the initial coverage wait holds
+                    // no dictionary reservation at all.
+                    coverage
+                        .resolve_position(0, 0)
+                        .map_err(|error| error.to_string())?;
                     if let ChaseFormat::Sequential(kind) = format {
                         use crate::pipeline::completion::finalize::extract::sequential::{
                             SequentialExtractionContext, decoder_memory_bytes,

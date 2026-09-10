@@ -121,8 +121,6 @@ impl Pipeline {
         let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
         let process_memory_budget =
             Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
-        let direct_unpack_process_memory =
-            Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
 
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
         let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
@@ -191,7 +189,6 @@ impl Pipeline {
             tuner,
             metrics,
             jobs: HashMap::new(),
-            job_scheduling_memory: HashMap::new(),
             semantic_terminal_causes: HashMap::new(),
             archive_password_winners: HashMap::new(),
             job_order: Vec::new(),
@@ -399,8 +396,9 @@ impl Pipeline {
                 ),
             extraction_limits,
             process_memory_budget,
+            job_scheduling_memory: HashMap::new(),
+            repeated_articles: HashMap::new(),
             chase_pool,
-            direct_unpack_process_memory,
             extraction_budgets: HashMap::new(),
             unacceptable_extension_policies: HashMap::new(),
             extracted_members: HashMap::new(),

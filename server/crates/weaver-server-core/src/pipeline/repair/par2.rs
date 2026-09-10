@@ -130,15 +130,71 @@ struct ParsedPar2Set {
 const MAX_PAR2_RECOVERY_SETS: usize = weaver_nzb::parser::MAX_NZB_FILES;
 const MAX_PAR2_INPUT_SLICES: u64 = 32_768;
 
-type SharedPar2ScanBudget = Arc<std::sync::Mutex<par2_rs::PacketScanBudget>>;
+pub(crate) struct Par2ScanBudget {
+    native: par2_rs::PacketScanBudget,
+    process: Arc<ProcessMemoryBudget>,
+    retained: crate::pipeline::extraction::safety::ProcessMemoryPermit,
+    cancellation: par2_rs::CancellationToken,
+}
+
+impl Par2ScanBudget {
+    fn new(
+        limits: par2_rs::PacketScanLimits,
+        process: Arc<ProcessMemoryBudget>,
+        cancellation: par2_rs::CancellationToken,
+    ) -> Self {
+        Self {
+            native: par2_rs::PacketScanBudget::new(limits),
+            retained: process
+                .try_reserve_retained(0)
+                .expect("zero-byte reservation"),
+            process,
+            cancellation,
+        }
+    }
+}
+
+type SharedPar2ScanBudget = Arc<std::sync::Mutex<Par2ScanBudget>>;
 
 fn scan_job_par2_packets(
     path: &Path,
     budget: &SharedPar2ScanBudget,
 ) -> par2_rs::Result<Vec<par2_rs::ScannedPacket>> {
-    let budget = budget
+    let mut state = budget
         .lock()
         .map_err(|_| par2_resource_error("scan budget unavailable"))?;
+    // The locked parser buffers at most 655,376 bytes for one IFSC packet;
+    // its other metadata packets are smaller. Cover both wire and parsed
+    // forms before opening the scanner. Recovery bodies remain file-backed.
+    let file_len = std::fs::metadata(path)?.len();
+    let scratch_bytes = file_len
+        .min(655_376)
+        .saturating_mul(2)
+        .saturating_add(64 * 1024);
+    let cancellation = state.cancellation.clone();
+    let check_active = || {
+        if cancellation.is_cancelled() {
+            Err("PAR2 metadata scan cancelled".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    let reservation_error = |error: String| {
+        if cancellation.is_cancelled() {
+            par2_rs::Par2Error::Cancelled
+        } else {
+            par2_resource_error(&error)
+        }
+    };
+    let _scratch = state
+        .process
+        .reserve_retained_wait(scratch_bytes, check_active)
+        .map_err(reservation_error)?;
+    let Par2ScanBudget {
+        native: budget,
+        retained,
+        ..
+    } = &mut *state;
     let mut packets = Vec::new();
     let mut sink = |packet: par2_rs::Packet, offset, recovery_set_id| {
         // Charge variable metadata plus conservative container/allocation
@@ -158,9 +214,13 @@ fn scan_job_par2_packets(
             par2_rs::Packet::Unknown { body, .. } => body.len(),
             par2_rs::Packet::RecoverySlice(_) => 0,
         };
-        budget.charge_retained(
-            variable.saturating_add(2 * std::mem::size_of::<par2_rs::ScannedPacket>() + 128),
-        )?;
+        let bytes = variable
+            .saturating_mul(2)
+            .saturating_add(2 * std::mem::size_of::<par2_rs::ScannedPacket>() + 256);
+        budget.charge_retained(bytes)?;
+        retained
+            .grow_retained_wait(bytes as u64, check_active)
+            .map_err(reservation_error)?;
         packets
             .try_reserve(1)
             .map_err(|_| par2_resource_error("packet allocation refused"))?;
@@ -171,7 +231,7 @@ fn scan_job_par2_packets(
         });
         Ok(())
     };
-    par2_rs::scan_packets_from_path_bounded(path, &budget, &mut sink)?;
+    par2_rs::scan_packets_from_path_bounded(path, budget, &mut sink)?;
     Ok(packets)
 }
 
@@ -517,14 +577,18 @@ pub(crate) struct Par2FileBinding {
 
 impl Pipeline {
     fn par2_scan_budget(&mut self, job_id: JobId) -> SharedPar2ScanBudget {
+        let process = Arc::clone(&self.process_memory_budget);
+        let cancellation = self.par2_cancellation_token(job_id);
         self.ensure_par2_runtime(job_id)
             .scan_budget
             .get_or_insert_with(|| {
-                Arc::new(std::sync::Mutex::new(par2_rs::PacketScanBudget::new(
+                Arc::new(std::sync::Mutex::new(Par2ScanBudget::new(
                     par2_rs::PacketScanLimits::default()
                         .with_max_examined_packets(1_048_576)
                         .with_max_retained_packets(262_144)
                         .with_max_retained_metadata_bytes(256 * 1024 * 1024),
+                    process,
+                    cancellation,
                 )))
             })
             .clone()
