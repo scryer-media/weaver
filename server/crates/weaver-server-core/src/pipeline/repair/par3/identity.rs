@@ -19,21 +19,39 @@ impl Pipeline {
             .collect();
         for index in pending {
             let mut identity = identities[&index].clone();
-            let name = identity
-                .canonical_filename
-                .clone()
-                .ok_or("missing PAR3 move target")?;
-            if identities.values().any(|other| {
-                other.file_index != index
-                    && (other.current_filename == name
-                        || other.current_filename == identity.current_filename)
-            }) {
-                return Err("PAR3 move collides with another job file".into());
+            let replay = (|| {
+                let name = identity
+                    .canonical_filename
+                    .clone()
+                    .ok_or("missing PAR3 move target")?;
+                if identities.values().any(|other| {
+                    other.file_index != index
+                        && (other.current_filename == name
+                            || other.current_filename == identity.current_filename)
+                }) {
+                    return Err("PAR3 move collides with another job file".to_string());
+                }
+                finish_content_move(directory, &identity.current_filename, &name)
+                    .map_err(|error| format!("cannot resume PAR3 content move: {error}"))?;
+                Ok(name)
+            })();
+            match replay {
+                Ok(name) => {
+                    sync_content_directory(directory).map_err(|error| error.to_string())?;
+                    identity.classification = Self::canonical_archive_identity_from_filename(&name)
+                        .or(identity.classification);
+                    identity.current_filename = name;
+                    identity.classification_source = FileIdentitySource::Par3;
+                }
+                Err(error) => {
+                    tracing::warn!(job_id = job_id.0, file_index = index, %error,
+                        "reverting unreplayable PAR3 name intent; source will be rediscovered");
+                    identity.canonical_filename = None;
+                    identity.classification =
+                        Self::canonical_archive_identity_from_filename(&identity.current_filename);
+                    identity.classification_source = FileIdentitySource::Declared;
+                }
             }
-            finish_content_move(directory, &identity.current_filename, &name)
-                .map_err(|error| format!("cannot resume PAR3 content move: {error}"))?;
-            identity.current_filename = name;
-            identity.classification_source = FileIdentitySource::Par3;
             self.db
                 .save_file_identity(job_id, &identity)
                 .map_err(|error| {
@@ -42,6 +60,65 @@ impl Pipeline {
             identities.insert(index, identity);
         }
         Ok(())
+    }
+
+    /// Persist and install one validated name proposal. A failed exclusive
+    /// move restores the exact previous identity before returning its error.
+    pub(in crate::pipeline) fn install_par3_content_name(
+        &mut self,
+        job_id: JobId,
+        mut identity: crate::jobs::record::ActiveFileIdentity,
+        name: &str,
+        directory: &std::path::Path,
+    ) -> Result<(), String> {
+        // All source IDs still designate the same files across this synchronous
+        // rename. Keep their committed availability while identity changes fence
+        // native generations and verification evidence as usual.
+        let materialized = self
+            .par3_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.take_materialized_sources(job_id));
+        let result = (|| {
+            let old_name = identity.current_filename.clone();
+            // Persist both names before changing the directory. Atomic exclusive
+            // rename needs neither hard-link support nor a copy of the clean file.
+            // A failed final database write leaves the durable intent replayable.
+            let previous_identity = identity.clone();
+            identity.canonical_filename = Some(name.to_owned());
+            identity.classification_source = FileIdentitySource::Par3Pending;
+            self.set_file_identity(job_id, identity.clone())?;
+            crate::e2e_failpoint::maybe_trip("par3.content_name.intent");
+            if let Err(error) = finish_content_move(directory, &old_name, name) {
+                self.set_file_identity(job_id, previous_identity)
+                .map_err(|rollback| {
+                    format!(
+                        "cannot place {}: {error}; cannot restore previous identity: {rollback}",
+                        directory.join(name).display()
+                    )
+                })?;
+                return Err(format!(
+                    "cannot place {}: {error}",
+                    directory.join(name).display()
+                ));
+            }
+            // If durability fails after a successful move, keep the intent so a
+            // restart can still find the actual target. Only a failed move rolls back.
+            sync_content_directory(directory).map_err(|error| error.to_string())?;
+            crate::e2e_failpoint::maybe_trip("par3.content_name.moved");
+            identity.current_filename = name.to_owned();
+            identity.classification =
+                Self::canonical_archive_identity_from_filename(name).or(identity.classification);
+            identity.classification_source = FileIdentitySource::Par3;
+            self.set_file_identity(job_id, identity)?;
+            crate::e2e_failpoint::maybe_trip("par3.content_name.persisted");
+            Ok(())
+        })();
+        if let Some(materialized) = materialized
+            && let Some(runtime) = self.par3_runtime.as_mut()
+        {
+            runtime.restore_materialized_sources(job_id, materialized);
+        }
+        result
     }
 
     pub(super) async fn apply_par3_content_identity(
@@ -71,7 +148,7 @@ impl Pipeline {
         if weaver_model::files::sanitize_download_filename(&found.name) != found.name {
             return Err("nested PAR3 content placement requires an output mapping".into());
         }
-        let mut identity = self
+        let identity = self
             .effective_file_identity(job_id, id)
             .ok_or("missing file identity")?;
         let old_name = identity.current_filename.clone();
@@ -112,26 +189,12 @@ impl Pipeline {
             .map(|(name, _)| name.clone())
             .collect();
         let old_sets = self.rar_set_names_for_files(job_id, &[id]);
-        // Persist both names before changing the directory. Atomic exclusive
-        // rename needs neither hard-link support nor a copy of the clean file.
-        // A failed final database write leaves the durable intent replayable.
-        identity.canonical_filename = Some(found.name.clone());
-        identity.classification =
-            Self::canonical_archive_identity_from_filename(&found.name).or(identity.classification);
-        identity.classification_source = FileIdentitySource::Par3Pending;
-        self.set_file_identity(job_id, identity.clone())?;
-        crate::e2e_failpoint::maybe_trip("par3.content_name.intent");
-        finish_content_move(
-            old_path.parent().ok_or("missing content directory")?,
-            &old_name,
+        self.install_par3_content_name(
+            job_id,
+            identity,
             &found.name,
-        )
-        .map_err(|error| format!("cannot place {}: {error}", target.display()))?;
-        crate::e2e_failpoint::maybe_trip("par3.content_name.moved");
-        identity.current_filename = found.name.clone();
-        identity.classification_source = FileIdentitySource::Par3;
-        self.set_file_identity(job_id, identity)?;
-        crate::e2e_failpoint::maybe_trip("par3.content_name.persisted");
+            old_path.parent().ok_or("missing content directory")?,
+        )?;
         let touched = std::collections::HashSet::from([old_name]);
         for set in &old_sets {
             self.invalidate_archive_set_for_identity_rebind(job_id, set, &touched);
@@ -213,9 +276,15 @@ fn finish_content_move(
         }
         Err(error) => return Err(error),
     }
-    // Flush the directory before declaring the database identity complete.
+    Ok(())
+}
+
+fn sync_content_directory(directory: &std::path::Path) -> std::io::Result<()> {
+    // Keep post-move durability failures separate from failed exclusive moves.
     #[cfg(unix)]
     std::fs::File::open(directory)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = directory;
     Ok(())
 }
 

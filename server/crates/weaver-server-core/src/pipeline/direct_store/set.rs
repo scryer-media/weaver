@@ -338,9 +338,8 @@ impl DirectSet {
     /// — and it is preferred, because it is right even before every byte has been
     /// routed.
     ///
-    /// After restore or repair, the progress count can be **too large**.
-    /// Repair reconciliation marks completion in declared units. Likewise,
-    /// restore commits the skipped segments into the assembly with the spec's
+    /// For a volume restored from a checkpoint it is **wrong and too large**.
+    /// Restore commits the skipped segments into the assembly with the spec's
     /// `<segment bytes>`, which is the yEnc-*encoded* size, about 3% larger
     /// than the payload. Presenting a virtual volume at that length hands PAR2
     /// a file 3% longer than the one its descriptions cover, and the verifier
@@ -361,7 +360,7 @@ impl DirectSet {
     /// them from parity it did not need to spend.
     pub(crate) fn virtual_volume_len(&self, volume_index: u32, received_bytes: u64) -> u64 {
         let covered_end = self.volume_coverage_with_holds(volume_index).end();
-        if self.restart_seeded_volumes.contains(&volume_index) || self.repair_attempted() {
+        if self.restart_seeded_volumes.contains(&volume_index) {
             return covered_end;
         }
         received_bytes.max(covered_end)

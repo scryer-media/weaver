@@ -917,19 +917,6 @@ impl Pipeline {
                 // the byte counters land where they were.
                 if let Some(file_asm) = state.assembly.file_mut(file_id) {
                     file_asm.reset();
-                    if let Some(buffer) = self.write_buffers.get(&file_id) {
-                        // Articles decoded while the sweep ran still belong
-                        // to the reorder buffer. Reset must preserve their
-                        // offsets for the later commit, without admitting
-                        // their bytes before the writer actually drains them.
-                        for (offset, segment) in buffer.buffered_chunks() {
-                            file_asm.record_placement(
-                                segment.segment_id.segment_number,
-                                offset,
-                                segment.decoded_size,
-                            );
-                        }
-                    }
                 }
                 let mut kept_bytes = 0u64;
                 let mut materialized_extents = Vec::with_capacity(kept.len());
@@ -942,15 +929,33 @@ impl Pipeline {
                         && file_asm.commit_segment(*segment_number, len as u32).is_ok()
                     {
                         kept_bytes = kept_bytes.saturating_add(len);
-                        // Reset erased both ordinary write placements and the
-                        // extents the reconstruction just restored. Preserve
-                        // both so readers can distinguish those bytes from
-                        // holes and duplicate arrivals retain their offsets.
-                        file_asm.record_placement(*segment_number, offset, len as u32);
                         if verified.contains(segment_number) {
                             materialized_extents.push((offset, len));
+                        } else {
+                            // A handed-off article arrived through the ordinary
+                            // writer, which recorded where it landed; the blanket
+                            // reset above erased that record. Put it back from the
+                            // set's own geometry — the same offset the writer used,
+                            // since both derive it from the volume's article
+                            // extents — so a later duplicate re-places at the copy
+                            // already on disk instead of at a cursor-derived offset.
+                            file_asm.record_placement(*segment_number, offset, len as u32);
                         }
                     }
+                }
+                // Native PAR3 availability is independent of PAR2's placement
+                // bookkeeping. Only an admitted coordinator retains these
+                // already-materialized extents; no buffered bytes are exposed.
+                if let Some(coordinator) = self
+                    .par3_runtime
+                    .as_mut()
+                    .filter(|coordinator| coordinator.contains_job(job_id))
+                {
+                    coordinator.note_materialized_ranges(
+                        job_id,
+                        par3_rs::source::SourceId(u64::from(*file_index)),
+                        &materialized_extents,
+                    );
                 }
                 lost_bytes =
                     lost_bytes.saturating_add(previously_received.saturating_sub(kept_bytes));

@@ -268,7 +268,7 @@ impl Pipeline {
     ) {
         let work::RepairCompletion {
             result,
-            outputs: _outputs,
+            outputs,
             embedded_replacement,
             _reservation,
         } = completion;
@@ -280,9 +280,19 @@ impl Pipeline {
             Err(EngineError::RepairInterrupted { installed, .. }) => installed.as_slice(),
             Err(_) => &[],
         };
+        let outputs = match outputs {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                self.fail_job(job_id, format!("PAR3 output capture failed: {error}"));
+                return;
+            }
+        };
         // Reconcile independently verified installations even on a later
         // failure. Never turn an engine error into a successful job verdict.
-        if let Err(error) = self.reconcile_par3_installations(job_id, installed).await {
+        if let Err(error) = self
+            .reconcile_par3_installations(job_id, installed, &outputs)
+            .await
+        {
             self.fail_direct_unpack_after_repair(job_id, &error);
             self.fail_job(job_id, error);
             return;
@@ -332,10 +342,14 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         installed: &[InstalledFile],
+        outputs: &[super::readback::VerifiedOutput],
     ) -> Result<(), String> {
         let state = &self.jobs[&job_id];
         let mut files = Vec::with_capacity(installed.len());
         for output in installed {
+            if !outputs.iter().any(|image| image.path == output.path) {
+                return Err("PAR3 installed output has no verified decoded length".into());
+            }
             let Some(file) = state.assembly.files().find(|file| {
                 state
                     .working_dir
@@ -370,7 +384,12 @@ impl Pipeline {
         let ids: Vec<_> = files.iter().map(|(id, _)| *id).collect();
         let sets = self.rar_set_names_for_files(job_id, &ids);
         self.rearm_par2_after_par3_installations(job_id, &files);
-        for (id, _) in files {
+        for ((id, _), output) in files.into_iter().zip(installed) {
+            let decoded_len = outputs
+                .iter()
+                .find(|image| image.path == output.path)
+                .expect("validated output image")
+                .len;
             self.block_crcs.forget_file(id);
             self.invalidate_par2_session_for_file_write(id);
             self.jobs
@@ -379,7 +398,7 @@ impl Pipeline {
                 .assembly
                 .file_mut(id)
                 .expect("matched file")
-                .mark_complete();
+                .mark_complete_decoded(decoded_len);
             self.pending_file_progress.remove(&id);
             self.persisted_file_progress.remove(&id);
             self.file_hash_states.remove(&id);

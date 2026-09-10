@@ -6,25 +6,24 @@ use par3_rs::session_repair::{InstalledFile, SessionRepairReport};
 use std::path::{Component, Path};
 
 #[derive(Default)]
-pub(in crate::pipeline) struct Probes(
-    std::collections::HashMap<NzbFileId, assessment::ViewReservation>,
-);
+// Entries are bounded by the admitted jobs' file counts, not engine payloads.
+pub(in crate::pipeline) struct Probes(std::collections::HashSet<NzbFileId>);
 
 impl Probes {
     pub(in crate::pipeline) fn contains(&self, file: NzbFileId) -> bool {
-        self.0.contains_key(&file)
+        self.0.contains(&file)
     }
-    pub(in crate::pipeline) fn insert(&mut self, file: NzbFileId) -> EngineResult<()> {
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.0.entry(file) {
-            entry.insert(assessment::ViewReservation::acquire(128)?);
-        }
-        Ok(())
+    pub(in crate::pipeline) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub(in crate::pipeline) fn insert(&mut self, file: NzbFileId) {
+        self.0.insert(file);
     }
     pub(in crate::pipeline) fn remove(&mut self, file: NzbFileId) {
         self.0.remove(&file);
     }
     pub(super) fn remove_job(&mut self, job: JobId) {
-        self.0.retain(|file, _| file.job_id != job);
+        self.0.retain(|file| file.job_id != job);
     }
 }
 
@@ -164,11 +163,29 @@ pub(super) fn repair(
         ));
     }
     let plan = SelfRepairPlan::replacement(session, matrix, &[], ContainerLimits::default())?;
+    // The job's private scratch tree is excluded from final delivery and
+    // retired with the working directory even after an interrupted repair.
+    let scratch_root = output.join(".weaver-chunks");
+    match std::fs::create_dir(&scratch_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !std::fs::symlink_metadata(&scratch_root)?
+                .file_type()
+                .is_dir()
+            {
+                return Err(EngineError::Unsupported(
+                    "embedded scratch is not a directory",
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
     let scratch = tempfile::Builder::new()
-        .prefix(".par3-inside-")
-        .tempdir_in(output)?;
+        .prefix("par3-inside-")
+        .tempdir_in(&scratch_root)?;
     let staged = scratch.path().join("archive");
     let report = plan.execute(session, &staged, scratch.path())?;
+    crate::e2e_failpoint::maybe_trip("par3.inside.staged");
     options.cancel.check()?;
     std::fs::rename(&staged, &destination)?;
     tracing::warn!(path = %destination.display(), restoration = ?report.restoration,

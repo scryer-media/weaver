@@ -164,8 +164,8 @@ fn complete_direct_set_waits_for_native_verdict_application() {
     for volume in 0..2 {
         assert_eq!(
             set.virtual_volume_len(volume, 600),
-            464,
-            "declared encoded progress must not extend a repaired decoded image"
+            600,
+            "the repair latch must not change PAR2 volume length policy"
         );
     }
     assert!(set.router.all_members_verified());

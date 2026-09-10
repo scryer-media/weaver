@@ -36,7 +36,7 @@ bounds. Positioned hashing, evidence replay and faster repair are optimization
 work; they cannot substitute for the gates above. Preserve the existing PAR2
 non-regression requirement and measured baseline throughout this work.
 
-## Final macOS/ARM64 capstone — 2026-09-09
+## Initial macOS/ARM64 capstone — 2026-09-09
 
 The completed implementation passed the full available local validation batch:
 
@@ -66,13 +66,9 @@ for `server_tls_diagnostics.honors_client_cipher_order`. Its existing SQLite
 integer and PostgreSQL Boolean columns now compare semantically; production
 schemas and the drift-detection assertion remain unchanged.
 
-Evidence logs are `/private/tmp/weaver-par3-final-full-rust.log`,
-`weaver-par3-final-doc.log`, `weaver-par3-final-clippy.log`,
-`weaver-par3-final-windows-branch-clippy.log`,
-`weaver-par3-final-sqlite-native.log`, `weaver-par3-final-postgres-native.log`,
-and the preceding unchanged Go consumer run `weaver-par3-capstone-go2.log`.
-All log basenames in this paragraph are under `/private/tmp`. Native logs name
-preserved per-scenario artifacts with hashes, source provenance and process logs.
+The totals above record the local capstone. Temporary machine-local log paths
+are intentionally omitted; they are not durable review artifacts. Native harness
+runs emit per-scenario hashes, source provenance and process logs for archival.
 The owned PostgreSQL container was stopped and retained; no existing service was
 stopped and container deletion was not authorized.
 
@@ -83,6 +79,71 @@ size warning remains visible. Final-candidate pipeline throughput, x86-64 native
 measurements and full PAR3 codec performance acceptance are also outstanding;
 correctness results do not replace those measurements. Publication and deployment
 remain separate operator actions. These changes retain prospective 0.11.3.
+
+## PAR2 isolation corrections — 2026-09-09
+
+PAR2 takes priority whenever shared behavior or performance conflicts with PAR3.
+The correction batch restores the base virtual-volume length rule, conventional
+restored-set discovery, verified/unverified demotion placement split, PAR2 indexless
+volume promotion and critical-health capacity handling. A PAR3 index or smaller
+PAR3 volume cannot change PAR2 promotion. Embedded ZIP/7z framing probes are skipped
+when the NZB declares any PAR2 file, including a zero-byte index. Jobs with neither
+probe state nor an admitted coordinator return immediately from the decode hook.
+
+PAR3 reconciliation now commits verified decoded output lengths. Its coordinator
+retains demotion materialized extents separately, only after admission, and combines
+them with committed write frontiers and persisted sparse ranges. Buffered chunks
+are never availability evidence. PAR2 placement and write-buffer mutation rules
+remain unchanged. Native generation checks still invalidate verification evidence
+when source content or bindings change. Completed files restored with encoded
+progress counters keep the existing actual-disk-image publication path. A native
+direct-restart failure exposed accidental use of those counters as decoded ranges;
+the new frontier handling is now restricted to recorded demotion handbacks, and
+a regression supplies deliberately larger encoded counters. Committed demotion
+ranges survive the synchronous PAR3 rename transaction without copying their data
+or releasing their budget leases. Native verification evidence is still invalidated;
+other binding changes discard those ranges. This prevents renamed encrypted RAR
+sources from losing availability and downloading unnecessary recovery.
+
+Optional embedded probe failures warn and yield no carrier hint; probe entries no
+longer consume a per-entry engine-view lease. Failed exclusive name moves restore
+the previous identity; unreplayable restart intents revert for rediscovery. Embedded
+replacement staging lives under the job's private `.weaver-chunks` tree, which is
+excluded from delivered output even after a process crash.
+
+The prior PAR3 change had extended the base PAR2 restart test to require cached
+conventional facts across a second immediate restart. Base discovery deliberately
+discards facts for absent source volumes, so that extension is removed. The base
+checkpoint-floor, source ownership and byte-identical extraction assertions remain,
+with an explicit check that PAR2 discovery runs. PAR3 retains its gated facts and
+native multi-process restart coverage. Two demotion assertions introduced by the
+PAR3 arc now check that verified reconstruction and parked buffers do not synthesize
+PAR2 placements. Their existing byte-exact reconstruction, CRC, completion and sparse
+hole checks are preserved.
+
+Local correction validation:
+
+- The 54 PAR2 native archive scenarios passed in 29.366 seconds, followed by
+  all 26 direct-store restart regressions.
+- The full 196-case PAR3 SQLite matrix includes three new embedded staging-crash
+  cases. Its final broad run passed 195 cases and exposed the renamed encrypted
+  RAR availability loss described above. After that fix, all 58 affected archive
+  and name-transaction restart cases passed in 36.505 seconds. The other native
+  scenarios were not repeated after this localized rename fix.
+- The complete Go consumer suite passed with `go test -mod=readonly ./...`.
+- The final filtered Rust sweep passed all 485 PAR3, repair-output and direct-store
+  tests in 14.222 seconds. It used workspace/all-feature Nextest with `--locked`,
+  `--no-fail-fast`, four test threads and the filter
+  `test(direct_store) | test(par3) | test(repair_outputs)`; 3,420 unrelated tests
+  were not selected. This was not a full workspace/platform sweep.
+- Workspace formatting, Go formatting and the single all-target/all-feature
+  workspace Clippy pass with `--locked` and `-D warnings` passed. The existing
+  macOS linker unwind-table warning remains visible during test/binary linking.
+
+Full Linux/Windows platform gates are deferred by operator instruction. This batch
+uses local macOS/ARM64 validation and does not rerun PostgreSQL qualification or
+claim throughput acceptance. The existing prospective 0.11.3 covers the corrections;
+no dependency requirements or lockfile entries change.
 
 ## Implementation record
 

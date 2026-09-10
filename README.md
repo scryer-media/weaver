@@ -30,7 +30,8 @@ Built on [rarpar](https://github.com/scryer-media/rarpar), Rust libraries for RA
 PAR3 support includes selective recovery downloads, virtual and renamed sources,
 Cauchy and low-rate FFT sets, deduplicated blocks, Data packets, and protection
 embedded in ZIP/ZIP64 and 7z. Weaver verifies, repairs and extracts existing sets;
-it does not create them. See the [native scenarios](e2e/docs/par3.md) and
+it does not create them. Embedded discovery runs only for jobs without PAR2;
+PAR2 takes priority in mixed jobs. See the [native scenarios](e2e/docs/par3.md) and
 [integration record](docs/par3-integration-plan.md) for resource limits and validation.
 
 Instead of the traditional sequential approach (download everything, then repair, then extract), Weaver can run downloading and extraction concurrently*. Extraction begins as soon as the first archive volume finishes downloading, so files appear on disk while the rest of the job is still in progress.
