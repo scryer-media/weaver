@@ -126,12 +126,22 @@ struct KnownSource {
     _reservation: assessment::ViewReservation,
 }
 
+struct MaterializedRanges {
+    ranges: Vec<std::ops::Range<u64>>,
+    _reservation: assessment::ViewReservation,
+}
+
+/// Committed availability held across a synchronous content-preserving rename.
+/// Verification evidence is deliberately not part of this handoff.
+pub(super) struct MaterializedSources(BTreeMap<SourceId, EngineResult<MaterializedRanges>>);
+
 struct JobSlot {
     runtime: Option<Par3Job>,
     sources: PublishedSources,
     epoch: u64,
     last_used: u64,
     known: BTreeMap<SourceId, KnownSource>,
+    materialized: BTreeMap<SourceId, EngineResult<MaterializedRanges>>,
     dirty: std::collections::BTreeSet<SourceId>,
     pending: BTreeMap<WorkKey, QueuedInput>,
     ticket: Option<u64>,
@@ -151,6 +161,7 @@ impl Default for JobSlot {
             epoch: 0,
             last_used: 0,
             known: BTreeMap::new(),
+            materialized: BTreeMap::new(),
             dirty: std::collections::BTreeSet::new(),
             pending: BTreeMap::new(),
             ticket: None,
@@ -309,7 +320,7 @@ impl Coordinator {
         self.enqueue_input(job_id, source, PendingInput::File { path, name, ranges })
     }
 
-    pub(super) fn contains_job(&self, job_id: JobId) -> bool {
+    pub(in crate::pipeline) fn contains_job(&self, job_id: JobId) -> bool {
         self.jobs.contains_key(&job_id)
     }
 
@@ -562,7 +573,29 @@ impl Coordinator {
         Ok(())
     }
 
+    pub(super) fn take_materialized_sources(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<MaterializedSources> {
+        self.jobs
+            .get_mut(&job_id)
+            .map(|job| MaterializedSources(std::mem::take(&mut job.materialized)))
+    }
+
+    pub(super) fn restore_materialized_sources(
+        &mut self,
+        job_id: JobId,
+        sources: MaterializedSources,
+    ) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.materialized = sources.0;
+        }
+    }
+
     pub(super) fn invalidate_bindings(&mut self, job_id: JobId) -> EngineResult<()> {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.materialized.clear();
+        }
         let sources: Vec<_> = self
             .jobs
             .get(&job_id)
@@ -573,6 +606,57 @@ impl Coordinator {
             self.invalidate_source(job_id, source)?;
         }
         Ok(())
+    }
+
+    pub(in crate::pipeline) fn note_materialized_ranges(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        extents: &[(u64, u64)],
+    ) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        job.materialized.remove(&source);
+        let result = (|| {
+            let bytes = extents
+                .len()
+                .checked_mul(32)
+                .and_then(|bytes| bytes.checked_add(256))
+                .ok_or(EngineError::ResourceLimit("PAR3 materialized ranges"))?;
+            let reservation = assessment::ViewReservation::acquire(bytes)?;
+            let ranges = extents
+                .iter()
+                .filter(|(_, len)| *len != 0)
+                .map(|&(offset, len)| {
+                    offset
+                        .checked_add(len)
+                        .map(|end| offset..end)
+                        .ok_or(EngineError::ResourceLimit("PAR3 materialized offsets"))
+                })
+                .collect::<EngineResult<Vec<_>>>()?;
+            Ok(MaterializedRanges {
+                ranges,
+                _reservation: reservation,
+            })
+        })();
+        job.materialized.insert(source, result);
+    }
+
+    pub(super) fn materialized_ranges(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Option<&[std::ops::Range<u64>]>> {
+        match self
+            .jobs
+            .get(&job_id)
+            .and_then(|job| job.materialized.get(&source))
+        {
+            Some(Ok(entry)) => Ok(Some(entry.ranges.as_slice())),
+            Some(Err(_)) => Err(EngineError::ResourceLimit("PAR3 materialized ranges")),
+            None => Ok(None),
+        }
     }
 
     pub(super) fn name_match_source(&self, job_id: JobId) -> Option<SourceId> {

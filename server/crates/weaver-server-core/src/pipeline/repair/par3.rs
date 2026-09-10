@@ -549,29 +549,28 @@ impl Pipeline {
                 || matches!(
                     file.role(),
                     FileRole::ZipArchive | FileRole::SevenZipArchive
-                )) {
+                ))
+            && !state
+                .spec
+                .files
+                .iter()
+                .any(|file| matches!(file.role, FileRole::Par2 { .. }))
+        {
             let path = state
                 .working_dir
                 .join(self.current_filename_for_file(job_id, file));
-            if let Err(error) = self.par3_inside_probes.insert(file_id) {
-                self.fail_job(
-                    job_id,
-                    format!("Embedded PAR3 discovery budget exhausted: {error}"),
-                );
-                return;
-            }
+            self.par3_inside_probes.insert(file_id);
             match tokio::task::spawn_blocking(move || inside::probe(path)).await {
                 Ok(Ok(start)) => start,
                 Ok(Err(error)) => {
-                    self.fail_job(job_id, format!("Embedded PAR3 discovery failed: {error}"));
-                    return;
+                    tracing::warn!(job_id = job_id.0, file_index = file_id.file_index, %error,
+                        "embedded PAR3 probe unavailable; continuing without a carrier hint");
+                    None
                 }
                 Err(error) => {
-                    self.fail_job(
-                        job_id,
-                        format!("Embedded PAR3 discovery worker failed: {error}"),
-                    );
-                    return;
+                    tracing::warn!(job_id = job_id.0, file_index = file_id.file_index, %error,
+                        "embedded PAR3 probe worker failed; continuing without a carrier hint");
+                    None
                 }
             }
         } else {
@@ -643,6 +642,15 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) {
+        if self.jobs.get(&job_id).is_none_or(|state| {
+            state
+                .spec
+                .files
+                .iter()
+                .any(|file| matches!(file.role, FileRole::Par2 { .. }))
+        }) {
+            return;
+        }
         if self.job_has_pending_download_pipeline_work(job_id) {
             return;
         }
@@ -665,7 +673,7 @@ impl Pipeline {
                 return;
             };
             self.try_load_par3_metadata(job_id, file).await;
-            // Budget errors must not turn completion into a retry loop.
+            // A source still awaiting publication must not cause a retry loop.
             if !self.par3_inside_probes.contains(file) {
                 return;
             }
@@ -752,6 +760,53 @@ impl Pipeline {
         } else {
             self.par3_virtual_volume(file_id)
         };
+        if virtual_volume.is_none()
+            && let Some(materialized) = self
+                .par3_runtime
+                .as_ref()
+                .expect("admitted PAR3 job")
+                .materialized_ranges(job_id, source)?
+        {
+            // These frontiers belong to a completed demotion handback. Restore
+            // progress for other files can use encoded units, so it must never
+            // be treated as decoded source availability.
+            let persisted = self
+                .write_buffers
+                .get(&file_id)
+                .into_iter()
+                .flat_map(|buffer| buffer.persisted_ranges());
+            let floor = self
+                .pending_file_progress
+                .get(&file_id)
+                .copied()
+                .unwrap_or(0)
+                .max(
+                    self.persisted_file_progress
+                        .get(&file_id)
+                        .copied()
+                        .unwrap_or(0),
+                );
+            for range in materialized
+                .iter()
+                .cloned()
+                .chain((floor != 0).then_some(0..floor))
+                .chain(persisted.map(|(offset, len)| offset..offset.saturating_add(len as u64)))
+            {
+                if ranges.len() >= 262_144 {
+                    return Err(EngineError::ResourceLimit("PAR3 source ranges"));
+                }
+                ranges.push(range);
+            }
+            ranges.sort_unstable_by_key(|range| range.start);
+            ranges.dedup_by(|right, left| {
+                if right.start <= left.end {
+                    left.end = left.end.max(right.end);
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         // Completed-file restore deliberately omits article placements. Its
         // disk image remains a candidate, with its actual length read by the
         // worker and every protected byte verified afresh. Never apply this
@@ -848,14 +903,17 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn invalidate_par3_source_write(&mut self, file_id: NzbFileId) {
+        let admitted = self
+            .par3_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.contains_job(file_id.job_id));
+        if self.par3_inside_probes.is_empty() && !admitted {
+            return;
+        }
         // A negative framing probe is valid only until the next source write,
         // including jobs where no PAR3 runtime has been admitted yet.
         self.par3_inside_probes.remove(file_id);
-        if !self
-            .par3_runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.contains_job(file_id.job_id))
-        {
+        if !admitted {
             return;
         }
         if let Some(index) = self

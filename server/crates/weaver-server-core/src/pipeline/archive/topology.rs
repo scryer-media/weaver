@@ -2402,6 +2402,7 @@ impl Pipeline {
             if self.direct_store.sets_for(job_id).iter().any(|set| {
                 set.set_name() == set_name
                     && set.was_restored()
+                    && set.router.awaits_par3_verdict()
                     && !set.is_demoted()
                     && !set.is_finalized()
             }) {

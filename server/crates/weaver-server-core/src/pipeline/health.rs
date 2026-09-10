@@ -349,6 +349,7 @@ impl Pipeline {
         };
 
         if health <= critical
+            && par2_bytes == 0
             && self
                 .jobs
                 .get(&job_id)

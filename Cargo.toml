@@ -157,5 +157,3 @@ incremental = false
 # repository: the e2e harness's Weaver image build refuses such a manifest, and
 # any build without that exact checkout cannot compile the workspace. When a
 # rarpar change is needed, publish it and bump the requirement here instead.
-# The pinned PAR3 Git dependency above is explicitly allowed during integration
-# development; replace it with a registry requirement before integration ends.

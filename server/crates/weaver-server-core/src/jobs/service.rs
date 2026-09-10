@@ -891,8 +891,10 @@ impl Pipeline {
         let mut assembly = JobAssembly::new(job_id);
         let mut download_queue = DownloadQueue::new();
         let mut recovery_queue = DownloadQueue::new();
-        let mut has_recovery_index = false;
-        let mut recovery_files: Vec<(u32, u64)> = Vec::new();
+        let mut has_par2_index = false;
+        let mut has_par3_index = false;
+        let mut par2_files: Vec<(u32, u64)> = Vec::new();
+        let mut par3_files: Vec<(u32, u64)> = Vec::new();
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
             let file_id = NzbFileId {
@@ -909,12 +911,10 @@ impl Pipeline {
                 segment_sizes,
             );
 
-            if matches!(
-                file_spec.role,
-                weaver_model::files::FileRole::Par2 { is_index: true, .. }
-                    | weaver_model::files::FileRole::Par3 { is_index: true }
-            ) {
-                has_recovery_index = true;
+            match file_spec.role {
+                weaver_model::files::FileRole::Par2 { is_index: true, .. } => has_par2_index = true,
+                weaver_model::files::FileRole::Par3 { is_index: true } => has_par3_index = true,
+                _ => {}
             }
 
             let priority = file_spec.role.download_priority();
@@ -922,7 +922,11 @@ impl Pipeline {
 
             if is_recovery {
                 let total: u64 = file_spec.segments.iter().map(|s| s.bytes as u64).sum();
-                recovery_files.push((file_index as u32, total));
+                if matches!(file_spec.role, weaver_model::files::FileRole::Par2 { .. }) {
+                    par2_files.push((file_index as u32, total));
+                } else {
+                    par3_files.push((file_index as u32, total));
+                }
             }
 
             let target_queue = if is_recovery {
@@ -1012,7 +1016,20 @@ impl Pipeline {
             assembly.add_file(file_assembly);
         }
 
-        if !has_recovery_index && !recovery_files.is_empty() {
+        // PAR2 keeps its original indexless-volume promotion, regardless of
+        // PAR3 indexes or smaller PAR3 volumes in the same job.
+        let recovery_files = if !has_par2_index && !par2_files.is_empty() {
+            Some(&mut par2_files)
+        } else if !has_par2_index
+            && par2_files.is_empty()
+            && !has_par3_index
+            && !par3_files.is_empty()
+        {
+            Some(&mut par3_files)
+        } else {
+            None
+        };
+        if let Some(recovery_files) = recovery_files {
             recovery_files.sort_by_key(|&(_, size)| size);
             let promoted_file_index = recovery_files[0].0;
 

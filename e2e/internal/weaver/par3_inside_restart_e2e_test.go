@@ -151,3 +151,94 @@ func TestPar3InsideRestartE2E(t *testing.T) {
 		})
 	}
 }
+
+// An interrupted replacement stays in private job scratch and never becomes a
+// delivered archive/member when repair starts again after process restart.
+func TestPar3InsideStagingRestartE2E(t *testing.T) {
+	bin, reference := os.Getenv("WEAVER_PAR3_E2E_BIN"), os.Getenv("WEAVER_PAR3_REFERENCE_BIN")
+	if bin == "" || reference == "" {
+		t.Skip("set native Weaver and official PAR3 reference binaries")
+	}
+	if !filepath.IsAbs(bin) || !filepath.IsAbs(reference) {
+		t.Fatal("binaries must use absolute paths")
+	}
+	for _, format := range []string{"zip", "zip64", "7z"} {
+		t.Run(format, func(t *testing.T) {
+			root, err := os.MkdirTemp("", "weaver-par3-staging-restart-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("preserved artifacts: %s", root)
+			dir := filepath.Join(root, "sources")
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			name, _, inserted, payload := par3InsideFixture(t, reference, dir, format)
+			posted := map[string][]byte{name: bytes.Clone(inserted)}
+			posted[name][12] ^= 0x80
+			nntp := startUnpackNNTP(t)
+			port := nntp.listener.Addr().(*net.TCPAddr).Port
+			const failpoint = "par3.inside.staged"
+			url, firstLog, stop := startManagedUnpackWeaver(t, bin, root, "before.log", port,
+				"WEAVER_E2E_FAILPOINT="+failpoint, "RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+			api := provisionUnpackAPI(t, root, url)
+			slug := "par3-staging-restart-" + format
+			job, err := api.submit(nntp.publishUnpack(slug, "clean", posted, nil), slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tripped := false
+			deadline := time.Now().Add(30 * time.Second)
+			for time.Now().Before(deadline) {
+				log, _ := os.ReadFile(firstLog)
+				if bytes.Contains(log, []byte("tripping e2e failpoint")) && bytes.Contains(log, []byte(failpoint)) {
+					tripped = true
+					break
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+			if !tripped {
+				t.Fatalf("staging boundary not reached: %s", firstLog)
+			}
+			stop()
+			working := filepath.Join(root, "intermediate", slug)
+			partials, err := filepath.Glob(filepath.Join(working, ".weaver-chunks", "par3-inside-*", "archive"))
+			if err != nil || len(partials) != 1 {
+				t.Fatalf("expected one private staged replacement: %v %v", partials, err)
+			}
+			actual, err := os.ReadFile(filepath.Join(working, name))
+			if err != nil || !bytes.Equal(actual, posted[name]) {
+				t.Fatalf("staging changed the original carrier: %v", err)
+			}
+			url, secondLog, _ := startManagedUnpackWeaver(t, bin, root, "after.log", port,
+				"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+			api.url = url
+			status := ""
+			deadline = time.Now().Add(90 * time.Second)
+			for time.Now().Before(deadline) {
+				status = api.status(job)
+				if status == "COMPLETED" || status == "FAILED" {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if status != "COMPLETED" {
+				t.Fatalf("staging restart failed: %s log=%s", status, secondLog)
+			}
+			delivered := filepath.Join(root, "complete", slug)
+			actual, err = os.ReadFile(filepath.Join(delivered, "payload.bin"))
+			if err != nil || !bytes.Equal(actual, payload) {
+				t.Fatalf("wrong repaired member: %v", err)
+			}
+			entries, err := os.ReadDir(delivered)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if entry.Name() != "payload.bin" && entry.Name() != ".weaver-output-dir" {
+					t.Fatalf("delivered scratch or protection instead of only the member: %s", entry.Name())
+				}
+			}
+		})
+	}
+}

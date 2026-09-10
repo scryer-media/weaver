@@ -157,6 +157,9 @@ go test -mod=readonly ./internal/weaver -run '^TestPar3MixedE2E$' -count=1 -v -t
 it while stopped, then requires fresh repair after restoring its durable ownership.
 `TestPar3InsideRestartE2E` does the equivalent for ZIP, ZIP64 and 7z, preserving
 one warning per actual embedded replacement.
+`TestPar3InsideStagingRestartE2E` interrupts each container after its replacement
+has been staged. Restart must repair and extract correctly while keeping abandoned
+replacement files inside private `.weaver-chunks` scratch, outside final delivery.
 
 `TestPar3NameRestartE2E` crashes after durable rename intent, atomic move and
 identity commit. Payloads, case-only filenames and embedded ZIP/ZIP64/7z must
@@ -173,7 +176,7 @@ PAR2 regression binary variable:
 ```sh
 WEAVER_DIRECT_UNPACK_E2E_BIN=/absolute/path/to/weaver \
   go test -mod=readonly ./internal/weaver \
-  -run '^Test(Par3(Archive|Geometry|Mixed|DirectRestart|OutputRestart|Restart|Inside|InsideRestart|NameRestart|Concurrent)?E2E|DirectUnpackE2E)$' \
+  -run '^Test(Par3(Archive|Geometry|Mixed|DirectRestart|OutputRestart|Restart|Inside|InsideRestart|InsideStagingRestart|NameRestart|Concurrent)?E2E|DirectUnpackE2E)$' \
   -count=1 -v -timeout 20m
 ```
 

@@ -2,6 +2,156 @@ use super::*;
 
 const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
 
+#[test]
+fn par3_indexes_and_smaller_volumes_do_not_change_par2_promotion() {
+    for (names, promoted) in [
+        (
+            vec![
+                ("set.vol0+8.par2", 1000),
+                ("set.par3", 10),
+                ("set.vol0+1.par3", 1),
+            ],
+            Some(0),
+        ),
+        (
+            vec![
+                ("set.vol1+8.par2", 1000),
+                ("set.vol0+1.par2", 300),
+                ("set.vol0+1.par3", 1),
+            ],
+            Some(1),
+        ),
+        (vec![("set.par2", 0), ("set.vol0+1.par3", 1)], None),
+        (
+            vec![("set.vol0+4.par3", 400), ("set.vol4+1.par3", 100)],
+            Some(1),
+        ),
+        (vec![("set.par3", 1), ("set.vol0+1.par3", 100)], None),
+    ] {
+        let files: Vec<_> = names
+            .iter()
+            .map(|(name, len)| ((*name).into(), *len))
+            .collect();
+        let mut spec = standalone_job_spec("recovery promotion", &files);
+        for file in &mut spec.files {
+            file.role = FileRole::from_filename(&file.filename);
+        }
+        let (_, mut downloads, _) =
+            Pipeline::build_job_assembly(JobId(3190), &spec, &HashSet::new());
+        let mut actual = Vec::new();
+        while let Some(work) = downloads.pop() {
+            let index = work.segment_id.file_id.file_index;
+            if spec.files[index as usize].role.is_recovery() {
+                assert!(!work.is_recovery);
+                assert_eq!(work.priority, 0);
+                actual.push(index);
+            }
+        }
+        assert_eq!(
+            actual,
+            promoted.into_iter().collect::<Vec<_>>(),
+            "{names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn par3_embedded_probe_is_optional_and_absent_when_par2_is_declared() {
+    for par2 in [false, true] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job = JobId(3191);
+        let mut files = vec![("archive.zip".into(), 32)];
+        if par2 {
+            files.push(("set.par2".into(), 0));
+        }
+        let mut spec = standalone_job_spec("optional probe", &files);
+        for file in &mut spec.files {
+            file.role = FileRole::from_filename(&file.filename);
+        }
+        let working = insert_active_job(&mut pipeline, job, spec).await;
+        let id = NzbFileId {
+            job_id: job,
+            file_index: 0,
+        };
+        pipeline
+            .jobs
+            .get_mut(&job)
+            .unwrap()
+            .assembly
+            .file_mut(id)
+            .unwrap()
+            .mark_complete();
+        // A directory causes an actual read error if discovery reaches the probe.
+        std::fs::create_dir(working.join("archive.zip")).unwrap();
+        pipeline.try_load_par3_metadata(job, id).await;
+        pipeline.discover_embedded_par3_at_completion(job).await;
+        assert_eq!(pipeline.par3_inside_probes.contains(id), !par2);
+        assert!(!matches!(
+            pipeline.jobs[&job].status,
+            JobStatus::Failed { .. }
+        ));
+        assert!(pipeline.par3_runtime.is_none());
+    }
+}
+
+#[tokio::test]
+async fn par3_failed_name_move_rolls_back_live_and_restored_identity() {
+    use crate::jobs::record::FileIdentitySource;
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job = JobId(3192);
+    let working = insert_active_job(
+        &mut pipeline,
+        job,
+        standalone_job_spec("name rollback", &[("opaque.dat".into(), 4)]),
+    )
+    .await;
+    write_and_complete_file(&mut pipeline, job, 0, "opaque.dat", b"data").await;
+    std::fs::write(working.join("target.bin"), b"unrelated").unwrap();
+    let id = NzbFileId {
+        job_id: job,
+        file_index: 0,
+    };
+    let previous = pipeline.effective_file_identity(job, id).unwrap();
+    assert!(
+        pipeline
+            .install_par3_content_name(job, previous.clone(), "target.bin", &working)
+            .is_err()
+    );
+    assert_eq!(pipeline.effective_file_identity(job, id).unwrap(), previous);
+    assert_eq!(
+        pipeline.db.load_active_jobs().unwrap()[&job].file_identities[&0],
+        previous
+    );
+    let mut intent = previous.clone();
+    intent.classification_source = FileIdentitySource::Par3Pending;
+    intent.canonical_filename = Some("target.bin".into());
+    pipeline.db.save_file_identity(job, &intent).unwrap();
+    let mut identities = HashMap::from([(0, intent)]);
+    pipeline
+        .restore_pending_par3_content_names(job, &working, &mut identities)
+        .unwrap();
+    assert_eq!(identities[&0].current_filename, previous.current_filename);
+    assert_eq!(identities[&0].canonical_filename, None);
+    assert_eq!(
+        identities[&0].classification_source,
+        FileIdentitySource::Declared
+    );
+    assert_eq!(
+        pipeline.db.load_active_jobs().unwrap()[&job].file_identities[&0],
+        identities[&0]
+    );
+    pipeline
+        .restore_pending_par3_content_names(job, &working, &mut identities)
+        .unwrap();
+    assert_eq!(std::fs::read(working.join("opaque.dat")).unwrap(), b"data");
+    assert_eq!(
+        std::fs::read(working.join("target.bin")).unwrap(),
+        b"unrelated"
+    );
+}
+
 #[tokio::test]
 async fn embedded_discovery_cache_is_withdrawn_before_admission_on_writes_and_rebinding() {
     let root = TempDir::new().unwrap();
@@ -19,14 +169,14 @@ async fn embedded_discovery_cache_is_withdrawn_before_admission_on_writes_and_re
         ..first
     };
     for file in [first, sibling, other] {
-        pipeline.par3_inside_probes.insert(file).unwrap();
+        pipeline.par3_inside_probes.insert(file);
     }
     assert!(pipeline.par3_runtime.is_none());
     pipeline.invalidate_par3_source_write(first);
     assert!(!pipeline.par3_inside_probes.contains(first));
     assert!(pipeline.par3_inside_probes.contains(sibling));
     assert!(pipeline.par3_inside_probes.contains(other));
-    pipeline.par3_inside_probes.insert(first).unwrap();
+    pipeline.par3_inside_probes.insert(first);
     pipeline.invalidate_par3_bindings(first.job_id);
     assert!(!pipeline.par3_inside_probes.contains(first));
     assert!(!pipeline.par3_inside_probes.contains(sibling));
@@ -418,17 +568,22 @@ async fn settle_par3(pipeline: &mut Pipeline, job_id: JobId) {
 
 #[tokio::test]
 async fn par3_repairs_an_interior_article_hole_and_reconciles_completion() {
-    assert_par3_repairs_from_status(JobStatus::Downloading).await;
+    assert_par3_repairs_from_status(JobStatus::Downloading, false).await;
 }
 
 #[tokio::test]
 async fn par3_repair_can_follow_retired_extraction_work() {
     for status in [JobStatus::Extracting, JobStatus::QueuedExtract] {
-        assert_par3_repairs_from_status(status).await;
+        assert_par3_repairs_from_status(status, false).await;
     }
 }
 
-async fn assert_par3_repairs_from_status(status: JobStatus) {
+#[tokio::test]
+async fn par3_demoted_materialized_ranges_repair_without_par2_placements() {
+    assert_par3_repairs_from_status(JobStatus::Downloading, true).await;
+}
+
+async fn assert_par3_repairs_from_status(status: JobStatus, materialized: bool) {
     let root = TempDir::new().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
     let job_id = JobId(3103);
@@ -451,7 +606,7 @@ async fn assert_par3_repairs_from_status(status: JobStatus) {
             .map(|(name, bytes)| ((*name).into(), bytes.len() as u32))
             .collect::<Vec<_>>(),
     );
-    spec.files[0].segments = [2000, 2000, 1000]
+    spec.files[0].segments = [2100, 2100, 1100]
         .into_iter()
         .enumerate()
         .map(|(number, bytes)| {
@@ -481,9 +636,13 @@ async fn assert_par3_repairs_from_status(status: JobStatus) {
                 file_index: 0,
             })
             .unwrap();
-        file.record_placement(0, 0, 2000);
+        if !materialized {
+            file.record_placement(0, 0, 2000);
+        }
         file.commit_segment(0, 2000).unwrap();
-        file.record_placement(2, 4000, 1000);
+        if !materialized {
+            file.record_placement(2, 4000, 1000);
+        }
         file.commit_segment(2, 1000).unwrap();
     }
     for (index, (name, bytes)) in files.iter().enumerate().skip(1) {
@@ -494,6 +653,27 @@ async fn assert_par3_repairs_from_status(status: JobStatus) {
                 NzbFileId {
                     job_id,
                     file_index: index as u32,
+                },
+            )
+            .await;
+    }
+    if materialized {
+        pipeline
+            .par3_runtime
+            .as_mut()
+            .unwrap()
+            .note_materialized_ranges(
+                job_id,
+                par3_rs::source::SourceId(0),
+                &[(0, 2000), (4000, 1000)],
+            );
+        pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
                 },
             )
             .await;
@@ -566,6 +746,12 @@ async fn assert_par3_repairs_from_status(status: JobStatus) {
         job_id,
         file_index: 0,
     };
+    let repaired_file = pipeline.jobs[&job_id].assembly.file(repaired).unwrap();
+    assert_eq!(
+        repaired_file.received_bytes(),
+        expected.len() as u64,
+        "PAR3 completion must preserve decoded length despite encoded declarations"
+    );
     let verifications = pipeline
         .par3_runtime
         .as_ref()
@@ -882,6 +1068,15 @@ async fn restored_completed_images_are_reverified_without_article_placements() {
                 .unwrap();
             file.mark_complete();
             assert!(file.placement_of(0).is_none());
+            // Ordinary restore progress may use the NZB's encoded units.
+            // Native availability must still come from the actual disk image.
+            pipeline.persisted_file_progress.insert(
+                NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                },
+                bytes.len() as u64 + 333,
+            );
         }
         pipeline
             .try_load_par3_metadata(

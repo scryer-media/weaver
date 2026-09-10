@@ -2029,15 +2029,14 @@ async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
     assert_eq!(reconstructed, volumes[1].1);
     assert_eq!(checksum::crc32(&reconstructed), expected_crc);
     for ordinal in 0..2 {
-        let (start, end) = article_extent(volumes[1].1.len(), ordinal, 2);
         assert_eq!(
             pipeline.jobs[&job_id]
                 .assembly
                 .file(protected_file)
                 .unwrap()
                 .placement_of(ordinal),
-            Some((start as u64, (end - start) as u32)),
-            "both reconstructed and buffered articles keep their placement after handback"
+            None,
+            "base demotion must not seed placements for reconstructed or parked articles"
         );
     }
     assert!(
@@ -2673,15 +2672,14 @@ async fn a_malformed_chain_demotion_leaves_a_partial_crc_atom_provisional() {
         "the provisional article is targeted for conventional ownership without refetching its complete neighbours"
     );
     for (file_index, segment_number) in [(0, 0), (0, 1), (1, 0)] {
-        let (start, end) = article_extent(volumes[file_index as usize].1.len(), segment_number, 2);
         assert_eq!(
             pipeline.jobs[&job_id]
                 .assembly
                 .file(NzbFileId { job_id, file_index })
                 .unwrap()
                 .placement_of(segment_number),
-            Some((start as u64, (end - start) as u32)),
-            "reconstructed articles retain their exact readable placement"
+            None,
+            "verified reconstruction belongs to materialized extents, not PAR2 placements"
         );
     }
     assert_eq!(

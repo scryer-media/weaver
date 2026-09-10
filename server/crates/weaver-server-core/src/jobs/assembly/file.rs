@@ -257,6 +257,14 @@ impl FileAssembly {
         self.received_bytes = self.total_bytes;
     }
 
+    /// Complete an independently verified PAR3 image while preserving its
+    /// authenticated decoded length for virtual source readers. The ordinary
+    /// PAR2 completion/progress policy continues to use `mark_complete`.
+    pub(crate) fn mark_complete_decoded(&mut self, decoded_len: u64) {
+        self.mark_complete();
+        self.received_bytes = decoded_len;
+    }
+
     /// Whether one specific segment has been received.
     ///
     /// Out-of-range segment numbers read as not received rather than panicking:
