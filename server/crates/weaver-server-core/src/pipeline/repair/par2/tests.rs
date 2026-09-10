@@ -7,6 +7,48 @@ use crate::{JobId, JobStatus};
 use std::time::{Duration, Instant};
 
 #[test]
+fn par2_scan_budget_is_shared_across_metadata_carriers() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("small.par2");
+    std::fs::write(
+        &path,
+        crate::pipeline::tests::build_test_par2_index("small.bin", b"small", 4),
+    )
+    .unwrap();
+    let baseline = std::sync::Arc::new(std::sync::Mutex::new(par2_rs::PacketScanBudget::new(
+        par2_rs::PacketScanLimits::default(),
+    )));
+    let count = super::scan_job_par2_packets(&path, &baseline)
+        .unwrap()
+        .len();
+    let budget = std::sync::Arc::new(std::sync::Mutex::new(par2_rs::PacketScanBudget::new(
+        par2_rs::PacketScanLimits::default().with_max_retained_packets(count * 2),
+    )));
+    assert_eq!(
+        super::scan_job_par2_packets(&path, &budget).unwrap().len(),
+        count
+    );
+    assert_eq!(
+        super::scan_job_par2_packets(&path, &budget).unwrap().len(),
+        count
+    );
+    assert!(matches!(
+        super::scan_job_par2_packets(&path, &budget),
+        Err(par2_rs::Par2Error::ResourceLimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn par2_geometry_admission_obeys_the_output_budget_boundary() {
+    let bytes = crate::pipeline::tests::build_test_par2_index("small.bin", b"bounded payload", 4);
+    let set = par2_rs::Par2FileSet::from_files(&[&bytes]).unwrap();
+    let length = b"bounded payload".len() as u64;
+    assert!(super::validate_par2_geometry(&set, length - 1).is_err());
+    assert!(super::validate_par2_geometry(&set, length).is_ok());
+    assert!(super::validate_par2_geometry(&set, length + 1).is_ok());
+}
+
+#[test]
 fn par2_file_binding_requires_one_matching_description() {
     let first = par2_rs::FileId::from_bytes([1; 16]);
     let second = par2_rs::FileId::from_bytes([2; 16]);

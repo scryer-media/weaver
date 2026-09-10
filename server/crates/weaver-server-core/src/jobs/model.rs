@@ -127,6 +127,30 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
+    /// Conservative admission estimate for the spec, queue entries, assembly
+    /// indexes, and their cloned strings. Count placements even when message
+    /// IDs repeat: each placement still owns scheduling and output state.
+    pub(crate) fn scheduling_memory_estimate(&self) -> u64 {
+        let per_file = (8 * std::mem::size_of::<crate::jobs::assembly::FileAssembly>()
+            + 4 * std::mem::size_of::<FileSpec>()) as u64;
+        let per_segment = (4 * std::mem::size_of::<crate::DownloadWork>()
+            + 2 * std::mem::size_of::<SegmentSpec>()
+            + 64) as u64;
+        self.files.iter().fold(0u64, |total, file| {
+            let file_bytes = file.groups.iter().fold(
+                per_file.saturating_add((file.filename.len() as u64).saturating_mul(4)),
+                |bytes, group| bytes.saturating_add((group.len() as u64).saturating_mul(4)),
+            );
+            file.segments
+                .iter()
+                .fold(total.saturating_add(file_bytes), |bytes, segment| {
+                    bytes
+                        .saturating_add(per_segment)
+                        .saturating_add((segment.message_id.len() as u64).saturating_mul(4))
+                })
+        })
+    }
+
     /// Total bytes of PAR2 recovery files in this spec.
     pub fn par2_bytes(&self) -> u64 {
         self.files

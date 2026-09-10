@@ -1543,6 +1543,16 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
 
 #[test]
 fn lane_acquire_failure_preserves_retry_semantics() {
+    for error in [
+        weaver_nntp::NntpError::SoftTimeout(15),
+        weaver_nntp::NntpError::TruncatedMultilineBody,
+        weaver_nntp::NntpError::MalformedMultilineTerminator,
+    ] {
+        assert_eq!(
+            DownloadFailure::from_nntp(error).kind,
+            DownloadFailureKind::ContentOrProtocol
+        );
+    }
     let unavailable = DownloadFailure::from_lane_acquire_failure(None);
     assert_eq!(unavailable.kind, DownloadFailureKind::LaneUnavailable);
 

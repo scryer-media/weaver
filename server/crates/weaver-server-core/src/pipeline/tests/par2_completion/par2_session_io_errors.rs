@@ -2,6 +2,28 @@
 
 use super::*;
 
+#[test]
+fn bounded_repair_reconstructs_a_missing_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"complete";
+    let set = build_repairable_par2_set("payload.bin", payload, 4, 2);
+    let outcome = run_file_descriptor_bounded_par2_repair(
+        temp.path().to_path_buf(),
+        set,
+        HashMap::new(),
+        Vec::new(),
+        64 * 1024 * 1024,
+        par2_rs::CancellationToken::new(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.status, par2_rs::Par2RepairStatus::Repaired);
+    assert_eq!(
+        std::fs::read(temp.path().join("payload.bin")).unwrap(),
+        payload
+    );
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn par2_session_io_errors_preserve_file_descriptor_exhaustion() {

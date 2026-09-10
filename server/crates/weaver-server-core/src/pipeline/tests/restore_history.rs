@@ -1,6 +1,47 @@
 use super::*;
 
 #[tokio::test]
+async fn scheduling_memory_admission_preserves_placements_and_counts_other_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let mut spec = standalone_job_spec("Memory admission", &[("small.bin".to_string(), 16)]);
+    let single = spec.scheduling_memory_estimate();
+    let repeated = spec.files[0].clone();
+    spec.files.push(repeated);
+    assert_eq!(spec.scheduling_memory_estimate(), single * 2);
+    let required = spec.scheduling_memory_estimate();
+    Arc::make_mut(&mut pipeline.extraction_limits).max_memory_bytes = required;
+    assert!(
+        pipeline
+            .check_job_memory_admission(JobId(31001), &spec)
+            .is_ok()
+    );
+    Arc::make_mut(&mut pipeline.extraction_limits).max_memory_bytes = required - 1;
+    assert!(matches!(
+        pipeline.check_job_memory_admission(JobId(31001), &spec),
+        Err(crate::SchedulerError::InvalidInput(_))
+    ));
+    Arc::make_mut(&mut pipeline.extraction_limits).max_memory_bytes = required * 2;
+    insert_active_job(&mut pipeline, JobId(31001), spec.clone()).await;
+    assert!(
+        pipeline
+            .check_job_memory_admission(JobId(31002), &spec)
+            .is_ok()
+    );
+    Arc::make_mut(&mut pipeline.extraction_limits).max_memory_bytes = required * 2 - 1;
+    assert!(
+        pipeline
+            .check_job_memory_admission(JobId(31002), &spec)
+            .is_err()
+    );
+    assert!(
+        pipeline
+            .check_job_memory_admission(JobId(31001), &spec)
+            .is_ok()
+    );
+}
+
+#[tokio::test]
 async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
@@ -107,6 +148,14 @@ async fn delete_history_removes_intermediate_output_dir() {
     let job_id = JobId(30020);
     let output_dir = intermediate_dir.join("history-cleanup-job");
     tokio::fs::create_dir_all(&output_dir).await.unwrap();
+    // Historical versions wrote an empty marker; deletion upgrades it from
+    // the durable job record without changing the existing history action.
+    tokio::fs::write(
+        crate::jobs::working_dir::working_dir_marker_path(&output_dir),
+        [],
+    )
+    .await
+    .unwrap();
     tokio::fs::write(output_dir.join("leftover.bin"), b"leftover")
         .await
         .unwrap();
@@ -146,6 +195,12 @@ async fn delete_history_removes_db_only_history_row() {
     let job_id = JobId(30023);
     let output_dir = intermediate_dir.join("history-db-only-job");
     tokio::fs::create_dir_all(&output_dir).await.unwrap();
+    tokio::fs::write(
+        crate::jobs::working_dir::working_dir_marker_path(&output_dir),
+        [],
+    )
+    .await
+    .unwrap();
 
     let row = history_row_with_output_dir(job_id, "History DB NZB", "failed", output_dir);
     pipeline.db.insert_job_history(&row).unwrap();
@@ -177,6 +232,12 @@ async fn delete_all_history_keeps_complete_output_dir() {
     let complete_output_dir = complete_dir.join("complete-history-job");
 
     tokio::fs::create_dir_all(&failed_output_dir).await.unwrap();
+    tokio::fs::write(
+        crate::jobs::working_dir::working_dir_marker_path(&failed_output_dir),
+        [],
+    )
+    .await
+    .unwrap();
     tokio::fs::create_dir_all(&complete_output_dir)
         .await
         .unwrap();

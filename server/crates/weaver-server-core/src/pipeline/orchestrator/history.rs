@@ -7,7 +7,11 @@ impl Pipeline {
         output_dir
             .strip_prefix(&self.intermediate_dir)
             .ok()
-            .filter(|suffix| !suffix.as_os_str().is_empty())
+            .filter(|suffix| {
+                let mut components = suffix.components();
+                matches!(components.next(), Some(std::path::Component::Normal(_)))
+                    && components.next().is_none()
+            })
             .map(|_| output_dir.to_path_buf())
     }
 
@@ -20,6 +24,12 @@ impl Pipeline {
             && is_terminal_status(&state.status)
             && let Some(path) = self.cleanupable_history_output_dir(&state.working_dir)
         {
+            crate::jobs::working_dir::prepare_history_working_dir(
+                &self.intermediate_dir,
+                &path,
+                job_id,
+            )
+            .await?;
             dirs.insert(path);
         }
 
@@ -40,6 +50,12 @@ impl Pipeline {
             && let Some(path) =
                 self.cleanupable_history_output_dir(std::path::Path::new(&output_dir))
         {
+            crate::jobs::working_dir::prepare_history_working_dir(
+                &self.intermediate_dir,
+                &path,
+                job_id,
+            )
+            .await?;
             dirs.insert(path);
         }
 
@@ -50,10 +66,16 @@ impl Pipeline {
         &self,
     ) -> Result<BTreeSet<PathBuf>, crate::SchedulerError> {
         let mut dirs = BTreeSet::new();
-        for state in self.jobs.values() {
+        for (job_id, state) in &self.jobs {
             if is_terminal_status(&state.status)
                 && let Some(path) = self.cleanupable_history_output_dir(&state.working_dir)
             {
+                crate::jobs::working_dir::prepare_history_working_dir(
+                    &self.intermediate_dir,
+                    &path,
+                    *job_id,
+                )
+                .await?;
                 dirs.insert(path);
             }
         }
@@ -72,6 +94,12 @@ impl Pipeline {
                 && let Some(path) =
                     self.cleanupable_history_output_dir(std::path::Path::new(&output_dir))
             {
+                crate::jobs::working_dir::prepare_history_working_dir(
+                    &self.intermediate_dir,
+                    &path,
+                    JobId(row.job_id),
+                )
+                .await?;
                 dirs.insert(path);
             }
         }
@@ -88,7 +116,14 @@ impl Pipeline {
             // cached write handles before their dirs (and paths) are freed
             // for reuse.
             crate::pipeline::close_cached_write_handles_under(dir).await;
-            match tokio::fs::remove_dir_all(dir).await {
+            let root = self.intermediate_dir.clone();
+            let target = dir.clone();
+            let removal = tokio::task::spawn_blocking(move || {
+                crate::jobs::working_dir::remove_weaver_owned_working_dir(&root, &target)
+            })
+            .await
+            .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?;
+            match removal {
                 Ok(()) => {
                     info!(dir = %dir.display(), "removed historical intermediate directory");
                 }

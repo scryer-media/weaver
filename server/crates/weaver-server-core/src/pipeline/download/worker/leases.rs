@@ -597,7 +597,9 @@ impl Pipeline {
         job_id: JobId,
         server_idx: usize,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
-        if self.refresh_download_pressure().uu_spool_admission_capped {
+        if self.refresh_download_pressure().uu_spool_admission_capped
+            && self.uu_files.keys().any(|file_id| file_id.job_id == job_id)
+        {
             return Ok(None);
         }
         let par2_metadata_bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
@@ -903,7 +905,9 @@ impl Pipeline {
         refill: bool,
         article_bytes: u32,
     ) -> usize {
-        if pressure.uu_spool_admission_capped {
+        if pressure.uu_spool_admission_capped
+            && self.uu_files.keys().any(|file_id| file_id.job_id == job_id)
+        {
             return 1;
         }
         if self.hot_dispatch_job == Some(job_id) {

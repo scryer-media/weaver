@@ -378,7 +378,7 @@ fn cleanup_unreferenced_intermediate_dirs(
         if referenced_dirs.contains(&path) {
             continue;
         }
-        std::fs::remove_dir_all(&path)?;
+        crate::jobs::working_dir::remove_weaver_owned_working_dir(intermediate_dir, &path)?;
         removed += 1;
     }
 
@@ -479,7 +479,12 @@ mod tests {
         std::fs::create_dir_all(&unrelated_output_dir).unwrap();
         std::fs::write(working_dir_marker_path(&active_output_dir), []).unwrap();
         std::fs::write(working_dir_marker_path(&history_output_dir), []).unwrap();
-        std::fs::write(working_dir_marker_path(&orphan_output_dir), []).unwrap();
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(
+            &intermediate_dir,
+            &orphan_output_dir,
+            JobId(3),
+        )
+        .unwrap();
 
         let nzb_path = data_dir.join("active-job.nzb");
         std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();

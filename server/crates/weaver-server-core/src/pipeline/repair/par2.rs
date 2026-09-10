@@ -127,24 +127,123 @@ struct ParsedPar2Set {
     packets: Vec<par2_rs::Packet>,
 }
 
+const MAX_PAR2_RECOVERY_SETS: usize = weaver_nzb::parser::MAX_NZB_FILES;
+const MAX_PAR2_INPUT_SLICES: u64 = 32_768;
+
+type SharedPar2ScanBudget = Arc<std::sync::Mutex<par2_rs::PacketScanBudget>>;
+
+fn scan_job_par2_packets(
+    path: &Path,
+    budget: &SharedPar2ScanBudget,
+) -> par2_rs::Result<Vec<par2_rs::ScannedPacket>> {
+    let budget = budget
+        .lock()
+        .map_err(|_| par2_resource_error("scan budget unavailable"))?;
+    let mut packets = Vec::new();
+    let mut sink = |packet: par2_rs::Packet, offset, recovery_set_id| {
+        // Charge variable metadata plus conservative container/allocation
+        // overhead. Recovery payloads remain file-backed and are not copied.
+        let variable = match &packet {
+            par2_rs::Packet::Main(main) => {
+                (main.recovery_file_ids.len() + main.non_recovery_file_ids.len()).saturating_mul(16)
+            }
+            par2_rs::Packet::FileDescription(file) => {
+                file.filename.len().saturating_add(file.par2_name.len())
+            }
+            par2_rs::Packet::InputFileSliceChecksum(ifsc) => ifsc
+                .checksums
+                .len()
+                .saturating_mul(std::mem::size_of::<par2_rs::SliceChecksum>()),
+            par2_rs::Packet::Creator(creator) => creator.creator_id.len(),
+            par2_rs::Packet::Unknown { body, .. } => body.len(),
+            par2_rs::Packet::RecoverySlice(_) => 0,
+        };
+        budget.charge_retained(
+            variable.saturating_add(2 * std::mem::size_of::<par2_rs::ScannedPacket>() + 128),
+        )?;
+        packets
+            .try_reserve(1)
+            .map_err(|_| par2_resource_error("packet allocation refused"))?;
+        packets.push(par2_rs::ScannedPacket {
+            packet,
+            offset,
+            recovery_set_id,
+        });
+        Ok(())
+    };
+    par2_rs::scan_packets_from_path_bounded(path, &budget, &mut sink)?;
+    Ok(packets)
+}
+
+fn par2_resource_error(reason: &str) -> par2_rs::Par2Error {
+    par2_rs::Par2Error::ResourceLimitExceeded {
+        reason: format!("WEAVER_RESOURCE_LIMIT[par2_metadata]: {reason}"),
+    }
+}
+
+/// Admit declared geometry before constructing checkpoints, bindings, or repair
+/// targets. This runs when metadata changes, never for individual articles.
+fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Result<()> {
+    if set.slice_size == 0 {
+        return Err(par2_resource_error("zero slice size"));
+    }
+    if set.slice_size > output_limit {
+        return Err(par2_resource_error("slice size exceeds the output budget"));
+    }
+    let mut described_bytes = 0u64;
+    let mut tracked_slices = 0u64;
+    for description in set.files.values() {
+        described_bytes = described_bytes
+            .checked_add(description.length)
+            .filter(|bytes| *bytes <= output_limit)
+            .ok_or_else(|| par2_resource_error("described output exceeds the admitted job size"))?;
+        // Non-recovery descriptions also reach host verification bitmaps.
+        // Bound those allocations independently of PAR2's repair-input cap.
+        tracked_slices = tracked_slices
+            .checked_add(description.length.div_ceil(set.slice_size))
+            .filter(|slices| *slices <= 1_048_576)
+            .ok_or_else(|| {
+                par2_resource_error("verification bitmap exceeds the metadata budget")
+            })?;
+    }
+    let mut input_slices = 0u64;
+    for description in set
+        .recovery_file_ids
+        .iter()
+        .filter_map(|id| set.files.get(id))
+    {
+        input_slices = input_slices
+            .checked_add(description.length.div_ceil(set.slice_size))
+            .filter(|slices| *slices <= MAX_PAR2_INPUT_SLICES)
+            .ok_or_else(|| par2_resource_error("input slice count exceeds the repair limit"))?;
+    }
+    Ok(())
+}
+
 /// Scan a completed PAR2 carrier into per-set packet groups. The packet scan
 /// authenticates metadata, but intentionally defers recovery-payload hashes;
 /// validate those here before any caller can merge or count a slice.
-fn scan_completed_par2_packet_groups(path: &Path) -> par2_rs::Result<Vec<ParsedPar2Set>> {
-    let scanned = par2_rs::scan_packets_from_path_with_set_ids(path)?;
+fn scan_completed_par2_packet_groups(
+    path: &Path,
+    budget: &SharedPar2ScanBudget,
+) -> par2_rs::Result<Vec<ParsedPar2Set>> {
+    let scanned = scan_job_par2_packets(path, budget)?;
     let mut groups: Vec<ParsedPar2Set> = Vec::new();
+    let mut group_indices = HashMap::new();
     for scanned_packet in scanned {
-        let group = if let Some(group) = groups
-            .iter_mut()
-            .find(|group| group.set_id == scanned_packet.recovery_set_id)
-        {
-            group
+        let index = if let Some(index) = group_indices.get(&scanned_packet.recovery_set_id) {
+            *index
         } else {
+            if groups.len() >= MAX_PAR2_RECOVERY_SETS {
+                return Err(par2_resource_error("too many recovery sets"));
+            }
+            let index = groups.len();
+            group_indices.insert(scanned_packet.recovery_set_id, index);
             groups.push(ParsedPar2Set {
                 set_id: scanned_packet.recovery_set_id,
                 packets: Vec::new(),
             });
-            groups.last_mut().expect("just pushed a PAR2 packet group")
+            index
         };
         let packet_is_valid = match &scanned_packet.packet {
             par2_rs::Packet::RecoverySlice(recovery) => {
@@ -160,7 +259,7 @@ fn scan_completed_par2_packet_groups(path: &Path) -> par2_rs::Result<Vec<ParsedP
             _ => true,
         };
         if packet_is_valid {
-            group.packets.push(scanned_packet.packet);
+            groups[index].packets.push(scanned_packet.packet);
         }
     }
     Ok(groups)
@@ -417,6 +516,52 @@ pub(crate) struct Par2FileBinding {
 }
 
 impl Pipeline {
+    fn par2_scan_budget(&mut self, job_id: JobId) -> SharedPar2ScanBudget {
+        self.ensure_par2_runtime(job_id)
+            .scan_budget
+            .get_or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(par2_rs::PacketScanBudget::new(
+                    par2_rs::PacketScanLimits::default()
+                        .with_max_examined_packets(1_048_576)
+                        .with_max_retained_packets(262_144)
+                        .with_max_retained_metadata_bytes(256 * 1024 * 1024),
+                )))
+            })
+            .clone()
+    }
+
+    fn admit_par2_set_ids(&mut self, job_id: JobId, ids: &[par2_rs::RecoverySetId]) -> bool {
+        let count = self.par2_runtime(job_id).map_or(ids.len(), |runtime| {
+            runtime.sets.len()
+                + ids
+                    .iter()
+                    .filter(|id| !runtime.sets.contains_key(id))
+                    .count()
+        });
+        if count > MAX_PAR2_RECOVERY_SETS {
+            self.fail_job(
+                job_id,
+                par2_resource_error("too many recovery sets for one job").to_string(),
+            );
+            return false;
+        }
+        true
+    }
+
+    fn admit_par2_geometry(&mut self, job_id: JobId, set: &Par2FileSet) -> bool {
+        if !self.jobs.contains_key(&job_id) {
+            return false;
+        }
+        // A valid repair-only posting can contain fewer encoded bytes than
+        // its missing payload. Use the existing output budget, not NZB size.
+        let output_limit = self.extraction_limits.max_job_bytes;
+        if let Err(error) = validate_par2_geometry(set, output_limit) {
+            self.fail_job(job_id, error.to_string());
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn canonical_archive_identity_from_filename(
         filename: &str,
     ) -> Option<crate::jobs::assembly::DetectedArchiveIdentity> {
@@ -833,6 +978,9 @@ impl Pipeline {
 
         let set_ids = par2_prefix_set_ids(&prefix);
         if !set_ids.is_empty() {
+            if !self.admit_par2_set_ids(file_id.job_id, &set_ids) {
+                return;
+            }
             self.note_foreign_recovery_set_sightings(file_id.job_id, file_id.file_index, &set_ids);
         }
         let entry = self

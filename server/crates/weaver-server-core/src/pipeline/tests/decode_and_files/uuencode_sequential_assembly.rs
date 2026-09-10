@@ -271,22 +271,22 @@ async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
         (parts[1].len() + parts[2].len()) as u64
     );
 
-    // Spooling affects pacing but cannot turn disk bytes into a hard resident
-    // stall, so the missing prefix remains eligible for dispatch.
+    // Durable spool bytes do not pace unrelated downloads. The resident
+    // backlog is below its threshold, so global pressure stays clear.
     pipeline.refresh_download_pressure();
     assert_eq!(
         pipeline
             .metrics
             .download_pressure_state
             .load(Ordering::Relaxed),
-        DownloadPressureState::Soft.as_code()
+        DownloadPressureState::Clear.as_code()
     );
     assert_eq!(
         pipeline
             .metrics
             .download_pressure_reason
             .load(Ordering::Relaxed),
-        DownloadPressureReason::Write.as_code()
+        DownloadPressureReason::None.as_code()
     );
 
     submit_uu_segment(&mut pipeline, file_id, 0, &parts[0], false, false).await;

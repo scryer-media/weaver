@@ -30,12 +30,17 @@ impl Pipeline {
             (filename, file_path)
         };
         let parse_path = file_path.clone();
+        let budget = self.par2_scan_budget(job_id);
         let parsed = match tokio::task::spawn_blocking(move || {
-            scan_completed_par2_packet_groups(&parse_path)
+            scan_completed_par2_packet_groups(&parse_path, &budget)
         })
         .await
         {
             Ok(Ok(parsed)) => parsed,
+            Ok(Err(error @ par2_rs::Par2Error::ResourceLimitExceeded { .. })) => {
+                self.fail_job(job_id, error.to_string());
+                return;
+            }
             Ok(Err(e)) => {
                 warn!(filename = %filename, error = %e, "failed to parse PAR2 metadata candidate");
                 let entry = self
@@ -83,6 +88,9 @@ impl Pipeline {
         };
 
         let observed_set_ids = parsed.iter().map(|group| group.set_id).collect::<Vec<_>>();
+        if !self.admit_par2_set_ids(job_id, &observed_set_ids) {
+            return;
+        }
         self.note_foreign_recovery_set_sightings(job_id, file_id.file_index, &observed_set_ids);
         let mut accepted_recovery_blocks = HashMap::new();
 
@@ -113,6 +121,10 @@ impl Pipeline {
                         )
                     }
                     Some(Err(error)) => {
+                        if matches!(error, par2_rs::Par2Error::ResourceLimitExceeded { .. }) {
+                            self.fail_job(job_id, error.to_string());
+                            return;
+                        }
                         warn!(
                             job_id = job_id.0,
                             filename = %filename,
@@ -130,6 +142,10 @@ impl Pipeline {
                         let recovery_blocks = set.recovery_block_count();
                         (Some(Arc::new(set)), recovery_blocks)
                     }
+                    Err(error @ par2_rs::Par2Error::ResourceLimitExceeded { .. }) => {
+                        self.fail_job(job_id, error.to_string());
+                        return;
+                    }
                     Err(error) => {
                         warn!(
                             job_id = job_id.0,
@@ -145,6 +161,9 @@ impl Pipeline {
             let Some(par2_set) = par2_set else {
                 continue;
             };
+            if !self.admit_par2_geometry(job_id, &par2_set) {
+                return;
+            }
             accepted_recovery_blocks.insert(set_id, new_recovery_blocks);
 
             if let Err(error) = self
@@ -623,12 +642,17 @@ impl Pipeline {
         }
 
         let parse_path = file_path.clone();
+        let budget = self.par2_scan_budget(job_id);
         let groups = match tokio::task::spawn_blocking(move || {
-            scan_completed_par2_packet_groups(&parse_path)
+            scan_completed_par2_packet_groups(&parse_path, &budget)
         })
         .await
         {
             Ok(Ok(scanned)) => scanned,
+            Ok(Err(error @ par2_rs::Par2Error::ResourceLimitExceeded { .. })) => {
+                self.fail_job(job_id, error.to_string());
+                return;
+            }
             Ok(Err(e)) => {
                 warn!(filename = %filename, error = %e, "failed to parse PAR2 recovery volume");
                 self.ensure_par2_runtime(job_id)
@@ -649,6 +673,9 @@ impl Pipeline {
             }
         };
         let observed_set_ids = groups.iter().map(|group| group.set_id).collect::<Vec<_>>();
+        if !self.admit_par2_set_ids(job_id, &observed_set_ids) {
+            return;
+        }
         self.note_foreign_recovery_set_sightings(job_id, file_id.file_index, &observed_set_ids);
         {
             let entry = self
@@ -681,6 +708,9 @@ impl Pipeline {
                         .expect("a PAR2 packet group is consumed once"),
                 ) {
                     Ok(set) => {
+                        if !self.admit_par2_geometry(job_id, &set) {
+                            return;
+                        }
                         let recovery_blocks = set.recovery_block_count();
                         let par2_set = Arc::new(set);
                         if let Err(error) = self
@@ -707,6 +737,10 @@ impl Pipeline {
                         self.refresh_par2_checkpoint_plan(job_id);
                         bootstrapped_set_ids.push(set_id);
                         Some(recovery_blocks)
+                    }
+                    Err(error @ par2_rs::Par2Error::ResourceLimitExceeded { .. }) => {
+                        self.fail_job(job_id, error.to_string());
+                        return;
                     }
                     Err(error) => {
                         // Recovery-slice-only volumes cannot describe a usable
@@ -753,6 +787,10 @@ impl Pipeline {
                 };
                 match merge_result {
                     (Ok(result), total_recovery) => (result.new_recovery_slices, total_recovery),
+                    (Err(error @ par2_rs::Par2Error::ResourceLimitExceeded { .. }), _) => {
+                        self.fail_job(job_id, error.to_string());
+                        return;
+                    }
                     (Err(error), _) => {
                         warn!(
                             job_id = job_id.0,
@@ -765,6 +803,11 @@ impl Pipeline {
                     }
                 }
             };
+            if let Some(set) = self.par2_set_for(job_id, set_id).cloned()
+                && !self.admit_par2_geometry(job_id, &set)
+            {
+                return;
+            }
             // Volume replays re-offer packets the set already holds: every
             // file-complete pass parses a volume twice, once here and once as
             // metadata, so the arrival that hands a waiting set's session its
@@ -1024,8 +1067,9 @@ impl Pipeline {
         }
 
         let scan_path = file_path.clone();
+        let budget = self.par2_scan_budget(job_id);
         let packet_list = match tokio::task::spawn_blocking(move || {
-            par2_rs::scan_packets_from_path_with_set_ids(&scan_path).map(|packets| {
+            scan_job_par2_packets(&scan_path, &budget).map(|packets| {
                 packets
                     .into_iter()
                     .filter(|scanned| scanned.recovery_set_id == expected_set_id)
@@ -1060,6 +1104,10 @@ impl Pipeline {
                 let entry = runtime.files.entry(file_index).or_default();
                 entry.salvaged_at_received_bytes = Some(received_bytes);
                 packet_list
+            }
+            Ok(Err(error @ par2_rs::Par2Error::ResourceLimitExceeded { .. })) => {
+                self.fail_job(job_id, error.to_string());
+                return;
             }
             Ok(Err(error)) => {
                 warn!(
@@ -1107,6 +1155,11 @@ impl Pipeline {
             let total_recovery = par2_set.recovery_block_count();
             (merge, total_recovery)
         };
+        if let Some(set) = self.par2_set_for(job_id, expected_set_id).cloned()
+            && !self.admit_par2_geometry(job_id, &set)
+        {
+            return;
+        }
         match merge_result {
             (Ok(merge), total_recovery) => {
                 self.evict_par2_repair_session(job_id, expected_set_id);
@@ -1138,6 +1191,9 @@ impl Pipeline {
                     total_recovery,
                     "read back recovery blocks from a PAR2 volume that cannot complete"
                 );
+            }
+            (Err(error @ par2_rs::Par2Error::ResourceLimitExceeded { .. }), _) => {
+                self.fail_job(job_id, error.to_string());
             }
             (Err(error), _) => {
                 warn!(
