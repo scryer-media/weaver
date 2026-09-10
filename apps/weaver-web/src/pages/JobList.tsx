@@ -31,7 +31,7 @@ import {
   type ReactNode,
 } from "react";
 import { Link } from "react-router";
-import { useClient, useMutation, useQuery, useSubscription } from "urql";
+import { useClient, useMutation, useQuery } from "urql";
 import { BulkEditModal } from "@/components/BulkEditModal";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { DataTable } from "@/components/data-table/DataTable";
@@ -703,13 +703,6 @@ export function JobList() {
     },
     [graphqlConnection.status, polledQueuePage, queuePageData?.queuePage, queueQueryKey],
   );
-  const [{ data: queueEventData, error: queueEventError }] = useSubscription<{
-    queueEvents: QueueEventPayload;
-  }>({
-    query: QUEUE_EVENTS_SUBSCRIPTION,
-    variables: { after: queuePage?.latestCursor },
-    pause: !queuePage?.latestCursor,
-  });
   const [eventItems, setEventItems] = useState<Record<number, QueueItemEventOverlay>>({});
   const [optimisticallyRemovedJobIds, setOptimisticallyRemovedJobIds] = useState<Set<number>>(
     () => new Set(),
@@ -910,61 +903,67 @@ export function JobList() {
   }, [graphqlConnection.lastConnectedAt, graphqlConnection.status, refreshQueuePageNow]);
 
   useEffect(() => {
-    if (queueEventError) {
-      const errorKey = queueEventError.message;
-      if (lastQueueEventErrorRef.current !== errorKey) {
-        lastQueueEventErrorRef.current = errorKey;
-        refreshQueuePageNow();
-      }
-    } else {
-      lastQueueEventErrorRef.current = null;
-    }
-    const event = queueEventData?.queueEvents;
-    if (!event) {
+    if (!queuePage?.latestCursor) {
       return;
     }
-    const eventCursor = decodeQueueEventCursor(event.cursor);
-    if (eventCursor === null) {
-      refreshQueuePageNow();
-      return;
-    }
-    if (lastQueueEventSequenceRef.current !== null && eventCursor <= lastQueueEventSequenceRef.current) {
-      return;
-    }
-    lastQueueEventSequenceRef.current = eventCursor;
-    if (event.kind === "ITEM_REMOVED" && event.itemId != null) {
-      hideQueueJobs([event.itemId]);
-    }
-    const eventItemIsVisible =
-      event.item !== null && queuePageItems.some((item) => item.id === event.item!.id);
-    if (event.item && eventItemIsVisible) {
-      setEventItems((current) => {
-        const currentOverlay = current[event.item!.id];
-        if (currentOverlay && currentOverlay.cursor >= eventCursor) {
-          return current;
+    // Consume every notification before React batches renders. Reading only a
+    // subscription's latest result in an effect loses other jobs in the burst.
+    const subscription = client.subscription<{ queueEvents: QueueEventPayload }>(
+      QUEUE_EVENTS_SUBSCRIPTION,
+      { after: queuePage.latestCursor },
+    ).subscribe(({ data, error }) => {
+      if (error) {
+        if (lastQueueEventErrorRef.current !== error.message) {
+          lastQueueEventErrorRef.current = error.message;
+          refreshQueuePageNow();
         }
-        return { ...current, [event.item!.id]: { item: event.item!, cursor: eventCursor } };
-      });
-    }
-    if (event.item && !eventItemIsVisible) {
-      refreshQueuePageNow();
-      return;
-    }
-    if (event.kind === "ITEM_PROGRESS") {
-      if (!event.item) {
-        scheduleQueuePageRefresh();
+      } else {
+        lastQueueEventErrorRef.current = null;
+      }
+      const event = data?.queueEvents;
+      if (!event) {
         return;
       }
-      if (queuePreferences.sorting[0]?.id === "progress") {
-        scheduleQueuePageRefresh();
+      const eventCursor = decodeQueueEventCursor(event.cursor);
+      if (eventCursor === null) {
+        refreshQueuePageNow();
+        return;
       }
-      return;
-    }
-    scheduleQueuePageRefresh();
+      if (lastQueueEventSequenceRef.current !== null && eventCursor <= lastQueueEventSequenceRef.current) {
+        return;
+      }
+      lastQueueEventSequenceRef.current = eventCursor;
+      if (event.kind === "ITEM_REMOVED" && event.itemId != null) {
+        hideQueueJobs([event.itemId]);
+      }
+      const eventItemIsVisible =
+        event.item !== null && queuePageItems.some((item) => item.id === event.item!.id);
+      if (event.item && eventItemIsVisible) {
+        setEventItems((current) => {
+          const currentOverlay = current[event.item!.id];
+          if (currentOverlay && currentOverlay.cursor >= eventCursor) {
+            return current;
+          }
+          return { ...current, [event.item!.id]: { item: event.item!, cursor: eventCursor } };
+        });
+      }
+      if (event.item && !eventItemIsVisible) {
+        refreshQueuePageNow();
+        return;
+      }
+      if (event.kind === "ITEM_PROGRESS") {
+        if (!event.item || queuePreferences.sorting[0]?.id === "progress") {
+          scheduleQueuePageRefresh();
+        }
+        return;
+      }
+      scheduleQueuePageRefresh();
+    });
+    return () => subscription.unsubscribe();
   }, [
+    client,
     hideQueueJobs,
-    queueEventData,
-    queueEventError,
+    queuePage?.latestCursor,
     queuePageItems,
     queuePreferences.sorting,
     refreshQueuePageNow,
@@ -2158,7 +2157,7 @@ export function JobList() {
               {queueLayout === "table" && !showQueueCards ? (
                 <DataTable
                   table={queueTable}
-                  tableClassName="table-auto"
+                  tableClassName="table-fixed"
                   wrapperClassName="max-h-[70vh]"
                   rowClassName={queueRowClassName}
                   virtualization={queueTableVirtualization}
