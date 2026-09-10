@@ -1160,13 +1160,16 @@ impl DownloadFailure {
             | NntpError::AuthenticationRejected
             | NntpError::AuthenticationRequired
             | NntpError::AccessDenied => Some(DownloadFailureKind::Auth),
+            // BODY framing and active-transfer deadlines spend the existing
+            // article retry budget. Setup timeouts still describe capacity.
+            NntpError::SoftTimeout(_)
+                if transport_kind == DownloadFailureKind::EstablishedTransport => None,
+            NntpError::TruncatedMultilineBody | NntpError::MalformedMultilineTerminator => None,
             NntpError::ServiceUnavailable
             | NntpError::Timeout
             | NntpError::SoftTimeout(_)
             | NntpError::ConnectionClosed
             | NntpError::ServerDisconnectedMidBody
-            | NntpError::TruncatedMultilineBody
-            | NntpError::MalformedMultilineTerminator
             | NntpError::Io(_) => Some(transport_kind),
             _ => None,
         }
@@ -1874,6 +1877,7 @@ pub(super) struct DirectPostRepairCarry {
 
 #[derive(Default)]
 pub(super) struct Par2RuntimeState {
+    pub(super) scan_budget: Option<Arc<std::sync::Mutex<par2_rs::PacketScanBudget>>>,
     /// Every recovery set this job has met. Each parsed, described entry gets
     /// its own completion-gate pass; entries without an index remain only for
     /// attribution and an operator warning.
@@ -2753,6 +2757,7 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     /// Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
+    pub(super) job_scheduling_memory: HashMap<JobId, u64>,
     /// Typed terminal provenance retained until the ordered history archive has
     /// durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,

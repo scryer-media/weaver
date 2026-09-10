@@ -838,6 +838,55 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
 }
 
 #[tokio::test]
+async fn capped_uu_spool_keeps_unrelated_yenc_ordinals_eligible() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp,
+        BufferPoolConfig {
+            small_count: 1,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let uu_job = JobId(20150);
+    let yenc_job = JobId(20151);
+    let mut spec = standalone_job_spec("Spool isolation", &[("small.bin".to_string(), 16)]);
+    insert_active_job(&mut pipeline, uu_job, spec.clone()).await;
+    let mut second = spec.files[0].segments[0].clone();
+    second.ordinal = 1;
+    second.article_number = 2;
+    second.message_id = "second@example.invalid".to_string();
+    spec.files[0].segments.push(second);
+    spec.total_bytes *= 2;
+    insert_active_job(&mut pipeline, yenc_job, spec).await;
+    let first = pipeline
+        .jobs
+        .get_mut(&yenc_job)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(first.segment_id.segment_number, 0);
+    pipeline.uu_files.insert(
+        NzbFileId {
+            job_id: uu_job,
+            file_index: 0,
+        },
+        UuFileAssembly::default(),
+    );
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(0));
+    let pressure = pipeline.refresh_download_pressure();
+    assert!(pipeline.uu_spool_admission_capped(0));
+    let lease = pipeline
+        .try_lease_initial_download_batch_for_test(yenc_job, pressure)
+        .expect("yEnc beyond ordinal zero must keep progressing during UU disk pressure");
+    assert_eq!(lease.works[0].segment_id.segment_number, 1);
+    assert_eq!(lease.works[0].segment_id.file_id.job_id, yenc_job);
+}
+
+#[tokio::test]
 async fn refresh_download_pressure_reports_combined_hard_byte_pressure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

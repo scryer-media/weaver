@@ -320,9 +320,19 @@ where
             .archive()
             .files
             .iter()
-            .filter(|entry| !entry.is_directory())
+            .filter(|entry| !entry.is_directory() && !entry.is_anti_item())
             .map(|entry| entry.size())
-            .sum::<u64>();
+            .try_fold(0u64, |total, size| total.checked_add(size))
+            .ok_or_else(|| {
+                "WEAVER_RESOURCE_LIMIT[job_bytes]: declared 7z output size overflow".to_string()
+            })?;
+        let entry_count = archive_reader
+            .archive()
+            .files
+            .iter()
+            .filter(|entry| !entry.is_anti_item())
+            .count();
+        budget.check_archive_metadata(entry_count as u64, Some(known_total))?;
         // Sized here, while the parsed archive is in hand; reserved below,
         // once the header permit has been given back.
         let decode_reservation = match decode_memory {
@@ -756,6 +766,12 @@ pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
     let file = BudgetedReader::new(file, Arc::clone(budget));
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
+    budget.check_archive_metadata(
+        archive.len() as u64,
+        archive
+            .decompressed_size()
+            .and_then(|size| u64::try_from(size).ok()),
+    )?;
     let mut extracted = Vec::new();
     // Names come from the central directory without seeking to every local
     // header. Opening all members here would block the first extraction on

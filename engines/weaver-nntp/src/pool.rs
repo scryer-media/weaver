@@ -107,6 +107,67 @@ pub struct NntpPool {
     blocking_connect_failures_since_warning: Vec<AtomicU64>,
     retired_ips: Arc<SyncMutex<HashSet<(usize, IpAddr)>>>,
     connect_cursors: Vec<AtomicUsize>,
+    // Cold connection admission only; established BODY lanes never touch it.
+    auth_admission: Vec<AuthAdmission>,
+}
+
+struct AuthAdmission {
+    // 0 = unverified, 1 = verified, >=2 = monotonic retry deadline plus 2.
+    state: AtomicU64,
+    first_connection: Mutex<()>,
+    cooldown: Duration,
+    epoch: Instant,
+}
+
+impl AuthAdmission {
+    fn elapsed_ms(&self) -> u64 {
+        self.epoch
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn check(&self) -> Result<()> {
+        let mut state = self.state.load(Ordering::Acquire);
+        while state >= 2 {
+            if self.elapsed_ms() < state - 2 {
+                return Err(NntpError::AuthenticationRejected);
+            }
+            match self
+                .state
+                .compare_exchange(state, 0, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(current) => state = current,
+            }
+        }
+        Ok(())
+    }
+
+    fn finish<T>(&self, result: &Result<T>) {
+        match result {
+            Ok(_) => {
+                let _ = self
+                    .state
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+            }
+            Err(
+                NntpError::AuthenticationFailed
+                | NntpError::AuthenticationRejected
+                | NntpError::AuthenticationRequired
+                | NntpError::AccessDenied,
+            ) => {
+                self.state.store(
+                    self.elapsed_ms()
+                        .saturating_add(self.cooldown.as_millis().try_into().unwrap_or(u64::MAX))
+                        .saturating_add(2),
+                    Ordering::Release,
+                );
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 pub struct BlockingConnectionPermit {
@@ -256,6 +317,7 @@ impl NntpPool {
             last_connect_failure.push(Arc::new(Mutex::new(None)));
         }
 
+        let auth_cooldown = config.health_config.auth_disable_duration;
         let health = Arc::new(Mutex::new(HealthTracker::new_with_backfill(
             server_count,
             config.health_config,
@@ -283,6 +345,14 @@ impl NntpPool {
             blocking_connect_failures_since_warning,
             retired_ips: Arc::new(SyncMutex::new(HashSet::new())),
             connect_cursors,
+            auth_admission: (0..server_count)
+                .map(|_| AuthAdmission {
+                    state: AtomicU64::new(0),
+                    first_connection: Mutex::new(()),
+                    cooldown: auth_cooldown,
+                    epoch: Instant::now(),
+                })
+                .collect(),
         }
     }
 
@@ -304,11 +374,24 @@ impl NntpPool {
         initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
         self.check_over_limit(idx)?;
-        match self
+        let admission = &self.auth_admission[idx];
+        admission.check()?;
+        let _first = if admission.state.load(Ordering::Acquire) == 0 {
+            let guard = admission.first_connection.lock().await;
+            (admission.state.load(Ordering::Acquire) == 0).then_some(guard)
+        } else {
+            None
+        };
+        admission.check()?;
+        let result = self
             .connect_server_excluding_untracked(idx, excluded_ips, initial_group)
-            .await
-        {
-            Ok(connection) => Ok(connection),
+            .await;
+        admission.finish(&result);
+        match result {
+            Ok(connection) => {
+                admission.check()?;
+                Ok(connection)
+            }
             Err(error) => {
                 if matches!(error, NntpError::TooManyConnections) {
                     // The provider is refusing new sockets, not answering for
@@ -1000,6 +1083,31 @@ impl NntpPool {
         Ok(BlockingConnectionPermit { _permit: permit })
     }
 
+    pub(crate) fn with_blocking_connect_admission<T>(
+        &self,
+        server: ServerId,
+        connect: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let admission = self
+            .auth_admission
+            .get(server.0)
+            .ok_or(NntpError::PoolExhausted)?;
+        admission.check()?;
+        let _first = if admission.state.load(Ordering::Acquire) == 0 {
+            let guard = admission.first_connection.blocking_lock();
+            (admission.state.load(Ordering::Acquire) == 0).then_some(guard)
+        } else {
+            None
+        };
+        admission.check()?;
+        let result = connect();
+        admission.finish(&result);
+        if result.is_ok() {
+            admission.check()?;
+        }
+        result
+    }
+
     pub fn blocking_connect_plan(
         &self,
         server: ServerId,
@@ -1165,6 +1273,36 @@ impl Drop for PooledConnection {
 mod tests {
     use super::*;
     use crate::health::{HealthConfig, ServerState};
+
+    #[test]
+    fn rejected_auth_admission_bounds_connects_and_allows_recovery() {
+        let pool = NntpPool::new(test_pool_config(4));
+        let attempts = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let result: Result<()> =
+                        pool.with_blocking_connect_admission(ServerId(0), || {
+                            attempts.fetch_add(1, Ordering::Relaxed);
+                            Err(NntpError::AuthenticationRejected)
+                        });
+                    assert!(matches!(result, Err(NntpError::AuthenticationRejected)));
+                });
+            }
+        });
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        pool.auth_admission[0].state.store(2, Ordering::Release);
+        assert!(
+            pool.with_blocking_connect_admission(ServerId(0), || Ok(()))
+                .is_ok()
+        );
+        let rebuilt = NntpPool::new(test_pool_config(4));
+        assert!(
+            rebuilt
+                .with_blocking_connect_admission(ServerId(0), || Ok(()))
+                .is_ok()
+        );
+    }
 
     fn test_pool_config(max_per_server: usize) -> PoolConfig {
         PoolConfig {

@@ -191,6 +191,7 @@ impl Pipeline {
             tuner,
             metrics,
             jobs: HashMap::new(),
+            job_scheduling_memory: HashMap::new(),
             semantic_terminal_causes: HashMap::new(),
             archive_password_winners: HashMap::new(),
             job_order: Vec::new(),

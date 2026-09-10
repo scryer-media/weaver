@@ -10,7 +10,7 @@ use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
-use crate::jobs::working_dir::{compute_working_dir, working_dir_marker_path};
+use crate::jobs::working_dir::{compute_working_dir, stamp_working_dir};
 use crate::pipeline::{Pipeline, check_disk_space};
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
@@ -594,6 +594,34 @@ impl Pipeline {
         state.detected_archives = detected_archives.clone();
     }
 
+    pub(crate) fn check_job_memory_admission(
+        &mut self,
+        job_id: JobId,
+        spec: &JobSpec,
+    ) -> Result<(), crate::SchedulerError> {
+        self.job_scheduling_memory
+            .retain(|id, _| self.jobs.contains_key(id));
+        let proposed = spec.scheduling_memory_estimate();
+        let mut required = proposed;
+        for (id, state) in &self.jobs {
+            if *id != job_id {
+                let bytes = self
+                    .job_scheduling_memory
+                    .entry(*id)
+                    .or_insert_with(|| state.spec.scheduling_memory_estimate());
+                required = required.saturating_add(*bytes);
+            }
+        }
+        if required > self.extraction_limits.max_memory_bytes {
+            return Err(crate::SchedulerError::InvalidInput(format!(
+                "WEAVER_RESOURCE_LIMIT[nzb_metadata]: scheduling metadata requires approximately {required} bytes; memory budget is {}",
+                self.extraction_limits.max_memory_bytes,
+            )));
+        }
+        self.job_scheduling_memory.insert(job_id, proposed);
+        Ok(())
+    }
+
     pub(crate) async fn add_job(
         &mut self,
         job_id: JobId,
@@ -609,6 +637,7 @@ impl Pipeline {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
 
+        self.check_job_memory_admission(job_id, &spec)?;
         if let Some(generation) = options.semantic_materialization_generation {
             let db = self.db.clone();
             let current = tokio::task::spawn_blocking(move || {
@@ -644,7 +673,7 @@ impl Pipeline {
         tokio::fs::create_dir_all(&working_dir)
             .await
             .map_err(crate::SchedulerError::Io)?;
-        tokio::fs::write(working_dir_marker_path(&working_dir), [])
+        stamp_working_dir(&self.intermediate_dir, &working_dir, job_id)
             .await
             .map_err(crate::SchedulerError::Io)?;
         crate::runtime::perf_probe::record(
@@ -1094,6 +1123,7 @@ impl Pipeline {
                 };
 
             let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+            self.check_job_memory_admission(job_id, &spec)?;
 
             let working_dir = output_dir
                 .as_ref()
@@ -1102,7 +1132,7 @@ impl Pipeline {
             if working_dir.starts_with(&self.intermediate_dir)
                 && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
                 && let Err(error) =
-                    tokio::fs::write(working_dir_marker_path(&working_dir), []).await
+                    stamp_working_dir(&self.intermediate_dir, &working_dir, job_id).await
             {
                 warn!(
                     job_id = job_id.0,
@@ -1481,9 +1511,11 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
+        self.check_job_memory_admission(job_id, &spec)?;
         if working_dir.starts_with(&self.intermediate_dir)
             && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
-            && let Err(error) = tokio::fs::write(working_dir_marker_path(&working_dir), []).await
+            && let Err(error) =
+                stamp_working_dir(&self.intermediate_dir, &working_dir, job_id).await
         {
             tracing::warn!(
                 job_id = job_id.0,

@@ -162,10 +162,11 @@ impl ServerHealth {
         // at the trip threshold most attempts still succeed. Those stragglers
         // must not lift the quarantine whose whole purpose is shifting work
         // away from a server that keeps succeeding most of the time.
-        if let ServerState::Disabled {
-            until,
-            reason: DisableReason::FailureRatio,
-        } = self.state
+        if let ServerState::Disabled { until, reason } = self.state
+            && matches!(
+                reason,
+                DisableReason::AuthFailure | DisableReason::FailureRatio
+            )
             && Instant::now() < until
         {
             return;
@@ -237,6 +238,16 @@ impl ServerHealth {
         self.failure_count += 1;
         self.consecutive_failures += 1;
 
+        if matches!(
+            self.state,
+            ServerState::Disabled {
+                reason: DisableReason::AuthFailure,
+                ..
+            }
+        ) {
+            return;
+        }
+
         if is_auth {
             self.disable_count += 1;
             self.state = ServerState::Disabled {
@@ -278,6 +289,16 @@ impl ServerHealth {
     /// (see [`Self::record_failure_gated`]).
     pub fn record_cooldown_gated(&mut self, reason: CooldownReason, allow_ratio_trip: bool) {
         self.failure_count += 1;
+
+        if matches!(
+            self.state,
+            ServerState::Disabled {
+                reason: DisableReason::AuthFailure,
+                ..
+            }
+        ) {
+            return;
+        }
 
         // Ratio accounting runs first: when sustained transport flake trips
         // the window, the resulting disable subsumes the short cooldown.
@@ -874,6 +895,27 @@ mod tests {
 
         health.record_failure(true);
         assert_eq!(health.disable_count(), 1);
+    }
+
+    #[test]
+    fn auth_rejection_survives_inflight_results_during_cooldown() {
+        let config = test_config();
+        let mut health = ServerHealth::new(config.clone());
+        health.record_failure(true);
+        health.check_reenable();
+        health.record_success();
+        health.record_failure(false);
+        health.record_cooldown(CooldownReason::Transport);
+        health.record_cooldown(CooldownReason::Capacity);
+        assert!(matches!(
+            health.state(),
+            ServerState::Disabled {
+                reason: DisableReason::AuthFailure,
+                ..
+            }
+        ));
+        assert!(!health.is_available());
+        assert!(ServerHealth::new(config).is_available());
     }
 
     #[test]

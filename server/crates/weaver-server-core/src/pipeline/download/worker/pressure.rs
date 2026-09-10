@@ -15,7 +15,7 @@ impl DownloadPressure {
     }
 
     pub(in crate::pipeline::download::worker) fn suppresses_spillover(self) -> bool {
-        self.state == DownloadPressureState::Soft || self.uu_spool_admission_capped
+        self.state == DownloadPressureState::Soft
     }
 }
 
@@ -79,11 +79,11 @@ impl Pipeline {
         cursors: &HashMap<NzbFileId, u32>,
         work: &DownloadWork,
     ) -> bool {
-        // Before a file's first UU part identifies its encoding, ordinal zero
-        // is the only work that could establish its cursor. Permitting it also
-        // leaves yEnc's ordinary ordering unchanged while the UU cache pauses.
-        cursors.get(&work.segment_id.file_id).copied().unwrap_or(0)
-            == work.segment_id.segment_number
+        // Only known UU files need cursor ordering. Unrelated yEnc work keeps
+        // its normal admission even while the UU spool cannot accept writes.
+        cursors
+            .get(&work.segment_id.file_id)
+            .is_none_or(|cursor| *cursor == work.segment_id.segment_number)
     }
 
     pub(in crate::pipeline::download::worker) fn download_pressure_limits(
@@ -437,16 +437,11 @@ impl Pipeline {
             .load(Ordering::Relaxed)
             .saturating_add(self.metrics.decode_active_bytes.load(Ordering::Relaxed))
             .saturating_add(released_result_bytes);
-        // Keep hard pressure tied to resident memory. The total pending gauge
-        // includes transient UU spill files and is deliberately soft-only so
-        // a missing prefix can still dispatch and make the spool drain.
+        // UU spill files are already durable and have their own admission
+        // limits. Only resident bytes contribute to global write pressure.
         let write_bytes = self.metrics.write_buffered_bytes.load(Ordering::Relaxed);
-        let write_pending_bytes = self
-            .metrics
-            .write_pending_bytes
-            .load(Ordering::Relaxed)
-            .max(write_bytes);
-        let uu_spool_admission_capped = self.uu_spool_admission_capped(0);
+        let uu_spool_admission_capped =
+            !self.uu_files.is_empty() && self.uu_spool_admission_capped(0);
 
         if decode_bytes >= decode_hard {
             self.download_decode_hard_pressure_latched = true;
@@ -462,7 +457,7 @@ impl Pipeline {
         let decode_hard_pressure = self.download_decode_hard_pressure_latched;
         let write_hard_pressure = self.download_write_hard_pressure_latched;
         let decode_soft_pressure = decode_bytes >= decode_soft;
-        let write_soft_pressure = write_pending_bytes >= write_soft;
+        let write_soft_pressure = write_bytes >= write_soft;
 
         let (state, reason) = if decode_hard_pressure || write_hard_pressure {
             (
@@ -503,7 +498,11 @@ impl Pipeline {
             reason,
             decode_backlog_bytes: decode_bytes,
             write_buffered_bytes: write_bytes,
-            write_pending_bytes,
+            write_pending_bytes: self
+                .metrics
+                .write_pending_bytes
+                .load(Ordering::Relaxed)
+                .max(write_bytes),
             uu_spool_admission_capped,
             decode_hard_limit_bytes: decode_hard,
             write_hard_limit_bytes: write_hard,

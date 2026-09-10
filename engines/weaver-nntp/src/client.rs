@@ -2331,17 +2331,19 @@ impl NntpClient {
                 continue;
             }
             let started = Instant::now();
-            match crate::blocking::BlockingBodyLane::connect(
-                server,
-                self.pool.stable_server_id(server).unwrap_or_default(),
-                self.pool.server_transfer_control(server),
-                &config,
-                &excluded_ips,
-                address_offset,
-                groups,
-                self.soft_timeout,
-                permit,
-            ) {
+            match self.pool.with_blocking_connect_admission(server, || {
+                crate::blocking::BlockingBodyLane::connect(
+                    server,
+                    self.pool.stable_server_id(server).unwrap_or_default(),
+                    self.pool.server_transfer_control(server),
+                    &config,
+                    &excluded_ips,
+                    address_offset,
+                    groups,
+                    self.soft_timeout,
+                    permit,
+                )
+            }) {
                 Ok(lane) => return Ok(lane),
                 Err(error) => {
                     self.record_blocking_connect_failure(server.0, &error);
@@ -2559,6 +2561,7 @@ impl NntpClient {
             error,
             NntpError::AuthenticationFailed
                 | NntpError::AuthenticationRejected
+                | NntpError::AuthenticationRequired
                 | NntpError::AccessDenied
         ) {
             self.pool

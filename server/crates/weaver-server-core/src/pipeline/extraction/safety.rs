@@ -477,6 +477,41 @@ impl JobExtractionBudget {
         Ok(())
     }
 
+    /// Preflight formats with a member table. Writers still reserve atomically
+    /// before mutation, including implicit directories and concurrent siblings.
+    pub(crate) fn check_archive_metadata(
+        &self,
+        entries: u64,
+        bytes: Option<u64>,
+    ) -> Result<(), String> {
+        self.check_active().map_err(|error| error.to_string())?;
+        if self
+            .entry_count
+            .load(Ordering::Acquire)
+            .checked_add(entries)
+            .is_none_or(|count| count > self.limits.max_entries)
+        {
+            return Err(self
+                .reject(
+                    ExtractionRejectionReason::Entries,
+                    "declared archive entries exceed the remaining job budget".to_string(),
+                )
+                .to_string());
+        }
+        if let Some(bytes) = bytes {
+            let total = self
+                .total_written
+                .load(Ordering::Acquire)
+                .checked_add(bytes);
+            if total.is_none_or(|total| total > self.effective_job_limit_bytes) {
+                return Err(self
+                    .reject_job_bytes(total.unwrap_or(u64::MAX), "declared archive output")
+                    .to_string());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn note_entry(&self, name: &Path) -> Result<(), String> {
         self.check_active().map_err(|error| error.to_string())?;
         reserve_atomic(&self.entry_count, 1, self.limits.max_entries).map_err(|requested| {
@@ -1359,6 +1394,23 @@ mod tests {
                 .unwrap_err()
                 .contains("entries")
         );
+    }
+
+    #[test]
+    fn archive_preflight_uses_the_remaining_shared_budget() {
+        for (entries, bytes, accepted) in [(7, 16, true), (8, 16, false), (7, 17, false)] {
+            let (_temp, root, budget) = root_and_budget();
+            let mut writer = root
+                .create_file(Path::new("existing.bin"), &budget)
+                .unwrap();
+            writer.write_all(&[0; 16]).unwrap();
+            drop(writer);
+            assert_eq!(
+                budget.check_archive_metadata(entries, Some(bytes)).is_ok(),
+                accepted
+            );
+            assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 1);
+        }
     }
 
     #[test]
