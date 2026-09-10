@@ -597,6 +597,9 @@ impl Pipeline {
         job_id: JobId,
         server_idx: usize,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
+        if self.repeated_articles.contains_key(&job_id) {
+            return Ok(None);
+        }
         if self.refresh_download_pressure().uu_spool_admission_capped
             && self.uu_files.keys().any(|file_id| file_id.job_id == job_id)
         {

@@ -134,6 +134,18 @@ pub fn remove_weaver_owned_working_dir(root: &Path, path: &Path) -> std::io::Res
     owned_working_directory(root, path)?.remove_open_dir_all()
 }
 
+/// Delete only the directory still owned by the job selected for cleanup.
+/// Validation and removal use the same opened directory capability.
+pub fn remove_job_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<()> {
+    let dir = open_working_directory(root, path)?;
+    if read_working_marker(&dir)? != working_marker_value(&dir, path, job_id)? {
+        return Err(std::io::Error::other(
+            "working directory no longer belongs to the expected job",
+        ));
+    }
+    dir.remove_open_dir_all()
+}
+
 pub async fn stamp_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<()> {
     let root = root.to_path_buf();
     let path = path.to_path_buf();
@@ -224,6 +236,25 @@ mod tests {
         assert!(other.exists());
         remove_weaver_owned_working_dir(temp.path(), &owned).unwrap();
         assert!(!owned.exists());
+    }
+
+    #[tokio::test]
+    async fn history_cleanup_rejects_a_valid_marker_for_a_replacement_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("job");
+        std::fs::create_dir(&path).unwrap();
+        mark_weaver_owned_working_dir(temp.path(), &path, JobId(7)).unwrap();
+        prepare_history_working_dir(temp.path(), &path, JobId(7))
+            .await
+            .unwrap();
+        std::fs::rename(&path, temp.path().join("previous")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        mark_weaver_owned_working_dir(temp.path(), &path, JobId(8)).unwrap();
+        std::fs::write(path.join("payload"), b"replacement").unwrap();
+        assert!(remove_job_working_dir(temp.path(), &path, JobId(7)).is_err());
+        assert_eq!(std::fs::read(path.join("payload")).unwrap(), b"replacement");
+        remove_job_working_dir(temp.path(), &path, JobId(8)).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

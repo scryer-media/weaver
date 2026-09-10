@@ -226,8 +226,17 @@ fn embedded_late_metadata_rewinds_once_and_preserves_hole_continuity() {
 
 #[test]
 fn retained_sessions_share_the_process_memory_pool_and_release_their_charge() {
-    let mut first = Par3Job::default();
-    let second = Par3Job::default();
+    // Share one isolated pool between these sessions; concurrent tests must
+    // not affect the baseline or the post-drop accounting assertion.
+    let options = ExecutionOptions::default();
+    let mut first = Par3Job {
+        options: options.clone(),
+        ..Par3Job::default()
+    };
+    let second = Par3Job {
+        options,
+        ..Par3Job::default()
+    };
     let before = second.options.memory.used();
     first
         .publish_carrier(

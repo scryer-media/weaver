@@ -354,7 +354,9 @@ impl Pipeline {
         let actual_raw_bytes = match &result.data {
             Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
             Ok(DownloadPayload::Decoded(decoded)) => Some(decoded.raw_size),
-            Err(DownloadError::Decode { raw_size, .. }) => Some(*raw_size),
+            Err(DownloadError::Decode { raw_size, .. } | DownloadError::Local { raw_size, .. }) => {
+                Some(*raw_size)
+            }
             Err(_) => None,
         };
         if result.origin.counts_for_hot_primary()
@@ -683,6 +685,13 @@ impl Pipeline {
                     &excluded_servers,
                     source_server_idx,
                 );
+            }
+            Err(DownloadError::Local { raw_size, error }) => {
+                self.metrics
+                    .bytes_downloaded
+                    .fetch_add(raw_size, Ordering::Relaxed);
+                self.note_job_wire_bytes(result.segment_id, raw_size);
+                self.fail_job(job_id, error);
             }
             Err(DownloadError::Fetch(failure)) => {
                 if matches!(
