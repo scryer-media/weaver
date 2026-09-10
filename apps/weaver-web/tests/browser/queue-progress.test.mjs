@@ -32,7 +32,7 @@ after(async () => {
   await server?.close();
 });
 
-async function openQueue(width = 1700) {
+async function openQueue(width = 1700, query = "") {
   const page = await browser.newPage({ viewport: { width, height: 1000 } });
   page.on("pageerror", (error) => console.error(error));
   await page.route("**/*", (route) => {
@@ -40,7 +40,7 @@ async function openQueue(width = 1700) {
     return url.origin === baseUrl && !url.pathname.startsWith("/graphql")
       ? route.continue() : route.abort();
   });
-  await page.goto(`${baseUrl}/tests/browser/queue-progress.html`);
+  await page.goto(`${baseUrl}/tests/browser/queue-progress.html${query}`);
   await page.waitForFunction(() => window.queueFixture?.ready());
   await page.getByRole("link", { name: "Moving fixture", exact: true }).waitFor();
   await page.evaluate(() => document.fonts.ready);
@@ -63,6 +63,33 @@ test("moving and downloading progress both survive a burst before a render", asy
       await page.waitForFunction((value) => {
         const link = [...document.querySelectorAll("a")].find((node) => node.textContent === "Download fixture");
         return link?.closest("tr")?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === String(value + 1);
+      }, percent, { timeout: 2000 });
+    }
+  } finally {
+    await page.close();
+  }
+});
+
+test("a nine-job queue stays live without refreshes, including an initially blank download phase", async () => {
+  const page = await openQueue(2000, "?crowded");
+  try {
+    assert.equal(await page.getByRole("table").locator("tbody tr").count(), 9);
+    assert.equal(await row(page, "Download fixture").getByRole("progressbar").getAttribute("aria-valuenow"), "0");
+    for (let percent = 10; percent <= 90; percent += 5) {
+      await page.evaluate((value) => window.queueFixture.mixedBurst(value, value % 10 !== 0), percent);
+      await page.waitForFunction((value) => {
+        const link = [...document.querySelectorAll("tbody a")].find((node) => node.textContent === "Download fixture");
+        return link?.closest("tr")?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === String(value + 1);
+      }, percent, { timeout: 2000 });
+      await page.waitForFunction((value) => {
+        const links = [...document.querySelectorAll("tbody a")];
+        for (let id = 1; id <= 8; id += 1) {
+          const name = id === 1 ? "Download fixture" : `Moving fixture${id > 2 ? ` ${id}` : ""}`;
+          const link = links.find((node) => node.textContent === name);
+          const progress = link?.closest("tr")?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow");
+          if (progress !== String(value + Number(id === 1))) return false;
+        }
+        return true;
       }, percent, { timeout: 2000 });
     }
   } finally {

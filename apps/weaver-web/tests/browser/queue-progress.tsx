@@ -26,7 +26,7 @@ function LiveFixture({ children }: { children: React.ReactNode }) {
 }
 
 function job(id: number, phase: "MOVING" | "DOWNLOADING", percent = 0, rate = 0) {
-  const name = phase === "MOVING" ? "Moving fixture" : "Download fixture";
+  const name = phase === "MOVING" ? `Moving fixture${id > 2 ? ` ${id}` : ""}` : "Download fixture";
   return {
     id, name, displayTitle: name, originalTitle: name,
     status: phase === "MOVING" ? "FINALIZING" : phase,
@@ -41,7 +41,15 @@ function job(id: number, phase: "MOVING" | "DOWNLOADING", percent = 0, rate = 0)
   };
 }
 
-const items = [job(1, "DOWNLOADING", 5, 9_000_000), job(2, "MOVING")];
+const crowded = new URLSearchParams(location.search).has("crowded");
+const movingIds = crowded ? [2, 3, 4, 5, 6, 7, 8] : [2];
+const items = [job(1, "DOWNLOADING", 5, 9_000_000), ...movingIds.map((id) => job(id, "MOVING"))];
+if (crowded) {
+  // A job can enter the queue before its first sampled phase has arrived.
+  items[0].phaseProgress = [];
+  items.push({ ...job(9, "DOWNLOADING"), name: "Queued fixture", displayTitle: "Queued fixture",
+    originalTitle: "Queued fixture", status: "QUEUED", phaseProgress: [] });
+}
 const client = new Client({
   url: "http://fixture.invalid/graphql",
   exchanges: [() => (operations) => pipe(operations, mergeMap((operation) => {
@@ -56,7 +64,7 @@ const client = new Client({
       hasConfiguredServers: true, categories: [{ id: 1, name: "anime" }],
       queuePage: {
         items: [...items], totalCount: items.length, categories: ["anime"], latestCursor: cursor(sequence),
-        summary: { totalItems: items.length, activeItems: items.length, queuedItems: 0, pausedItems: 0 },
+        summary: { totalItems: items.length, activeItems: items.length - Number(crowded), queuedItems: Number(crowded), pausedItems: 0 },
       },
     } });
   }))],
@@ -83,6 +91,12 @@ Object.assign(window, {
       emit(1, "DOWNLOADING", downloading, rate);
     },
     download: (percent: number, rate: number) => emit(1, "DOWNLOADING", percent, rate),
+    mixedBurst: (percent: number, reverse: boolean) => {
+      const ids = [1, ...movingIds];
+      for (const id of reverse ? ids.reverse() : ids) {
+        emit(id, id === 1 ? "DOWNLOADING" : "MOVING", percent + Number(id === 1), 75_300_000);
+      }
+    },
   },
 });
 
