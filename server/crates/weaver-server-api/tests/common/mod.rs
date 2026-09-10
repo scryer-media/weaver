@@ -791,7 +791,24 @@ fn spawn_test_scheduler(
                         .expect("failed to delete history events from test db");
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::DeleteAllHistory { reply, .. } => {
+                SchedulerCommand::DeleteAllHistory {
+                    delete_files,
+                    reply,
+                } => {
+                    if delete_files {
+                        for row in db
+                            .list_job_history(&weaver_server_core::HistoryFilter::default())
+                            .expect("failed to load history rows from test db")
+                        {
+                            if let Some(output_dir) = row.output_dir {
+                                let output_dir = PathBuf::from(output_dir);
+                                if output_dir.exists() {
+                                    std::fs::remove_dir_all(&output_dir)
+                                        .expect("failed to remove test history output directory");
+                                }
+                            }
+                        }
+                    }
                     jobs.retain(|_, state| {
                         !matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
                     });

@@ -960,10 +960,7 @@ async fn history_page_remains_paged_after_deleting_the_first_page() {
 
 fn assert_file_delete_forbidden(response: &async_graphql::Response) {
     assert_has_errors(response);
-    assert_eq!(
-        response.errors[0].message,
-        "admin scope required to delete completed files"
-    );
+    assert_eq!(response.errors[0].message, "control scope required");
     assert_eq!(
         response.errors[0]
             .extensions
@@ -977,12 +974,15 @@ fn assert_file_delete_forbidden(response: &async_graphql::Response) {
     );
 }
 
-#[tokio::test]
-async fn control_scope_cannot_delete_completed_files_through_any_history_mutation() {
-    let mutations = [
+fn file_delete_mutations() -> [(&'static str, &'static str); 6] {
+    [
         (
             "acceptHistoryDelete",
             "mutation { acceptHistoryDelete(input: { mode: IDS, ids: [1, 2], deleteFiles: true }) { operationId } }",
+        ),
+        (
+            "acceptHistoryDeleteAll",
+            "mutation { acceptHistoryDelete(input: { mode: ALL_HISTORY, deleteFiles: true }) { operationId } }",
         ),
         (
             "deleteHistory",
@@ -1000,9 +1000,12 @@ async fn control_scope_cannot_delete_completed_files_through_any_history_mutatio
             "removeHistoryItems",
             "mutation { removeHistoryItems(ids: [1, 2], deleteFiles: true) { success } }",
         ),
-    ];
+    ]
+}
 
-    for (name, mutation) in mutations {
+#[tokio::test]
+async fn read_scope_cannot_delete_completed_files_through_any_history_mutation() {
+    for (name, mutation) in file_delete_mutations() {
         let h = TestHarness::new_without_history_delete_worker().await;
         let output_root = tempfile::tempdir().unwrap();
         for id in [1, 2] {
@@ -1016,7 +1019,7 @@ async fn control_scope_cannot_delete_completed_files_through_any_history_mutatio
         }
 
         let response = h
-            .execute_as(mutation, weaver_server_core::auth::CallerScope::Control)
+            .execute_as(mutation, weaver_server_core::auth::CallerScope::Read)
             .await;
         assert_file_delete_forbidden(&response);
         assert!(
@@ -1044,6 +1047,55 @@ async fn control_scope_cannot_delete_completed_files_through_any_history_mutatio
                 .is_empty(),
             "{name} must not lock history rows"
         );
+    }
+}
+
+#[tokio::test]
+async fn control_scope_deletes_completed_files_through_every_history_mutation() {
+    for (name, mutation) in file_delete_mutations() {
+        let h = TestHarness::new().await;
+        let output_root = tempfile::tempdir().unwrap();
+        for id in [1, 2] {
+            let output_dir = output_root.path().join(format!("job-{id}"));
+            std::fs::create_dir(&output_dir).unwrap();
+            std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
+            let mut row =
+                sample_history_row(id, &format!("history-{id}"), "complete", 100 + id as i64);
+            row.output_dir = Some(output_dir.to_string_lossy().to_string());
+            h.insert_history_row(&row);
+        }
+
+        let response = h
+            .execute_as(mutation, weaver_server_core::auth::CallerScope::Control)
+            .await;
+        assert_no_errors(&response);
+
+        // Durable acceptance returns before the worker deletes the output.
+        let deleted_ids: &[u64] = if name == "deleteHistory" {
+            &[1]
+        } else {
+            &[1, 2]
+        };
+        for _ in 0..40 {
+            if deleted_ids.iter().all(|id| {
+                h.db.get_job_history(*id).unwrap().is_none()
+                    && !output_root.path().join(format!("job-{id}")).exists()
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        for id in deleted_ids {
+            assert!(h.db.get_job_history(*id).unwrap().is_none(), "{name}: {id}");
+            assert!(
+                !output_root.path().join(format!("job-{id}")).exists(),
+                "{name}: {id}"
+            );
+        }
+        if name == "deleteHistory" {
+            assert!(h.db.get_job_history(2).unwrap().is_some());
+            assert!(output_root.path().join("job-2/payload.bin").is_file());
+        }
     }
 }
 
