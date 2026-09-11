@@ -22,11 +22,30 @@ impl DownloadPressure {
 impl Pipeline {
     /// The cache avoids turning every dispatch decision into a filesystem
     /// query while still making low-space admission responsive.
-    const UU_SPOOL_DISK_SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+    pub(in crate::pipeline) const UU_SPOOL_DISK_SPACE_CHECK_INTERVAL: Duration =
+        Duration::from_secs(1);
 
+    /// Whether ahead-of-cursor UU parking is at one of its aggregate limits.
+    ///
+    /// This is the predicate the memory park consults, so it
+    /// only ever caps on evidence: the byte cap, the segment cap, or a
+    /// free-space reading (fresh or held from the last good probe) that shows
+    /// the reserve gone. A filesystem that has never produced a reading does
+    /// not cap here; it only refuses to *spill* (see
+    /// [`Self::admit_uu_spill`]), because memory parking never touches it and
+    /// a probe outage must not stall every UU job's dispatch.
     pub(in crate::pipeline) fn uu_spool_admission_capped(
         &mut self,
         additional_spooled_bytes: usize,
+    ) -> bool {
+        let available = self.uu_spool_capacity().best_available_bytes();
+        self.uu_spool_limits_reached(additional_spooled_bytes, available)
+    }
+
+    fn uu_spool_limits_reached(
+        &self,
+        additional_spooled_bytes: usize,
+        available: Option<u64>,
     ) -> bool {
         let byte_limit_reached = self
             .uu_spooled_bytes
@@ -36,34 +55,66 @@ impl Pipeline {
         let required_free = self
             .uu_spool_min_free_bytes
             .saturating_add(additional_spooled_bytes as u64);
-        let free_space_too_low = self
-            .uu_spool_available_bytes()
-            .is_none_or(|available| available < required_free);
+        let free_space_too_low = available.is_some_and(|available| available < required_free);
 
         byte_limit_reached || segment_limit_reached || free_space_too_low
     }
 
-    fn uu_spool_available_bytes(&mut self) -> Option<u64> {
+    /// After a refused spill, fetch only known UU cursors until parking can
+    /// retain the refused bytes. Memory parking remains available to arrivals
+    /// already in flight, and yEnc retains its ordinary dispatch path.
+    pub(in crate::pipeline) fn uu_spool_dispatch_capped(&mut self) -> bool {
+        let available = self.uu_spool_capacity().best_available_bytes();
+        if let Some(bytes) = self.uu_spool_blocked_spill_bytes {
+            let fits_memory =
+                self.write_buffered_bytes.saturating_add(bytes) < self.write_backlog_budget_bytes;
+            let fits_spool = available.is_some() && !self.uu_spool_limits_reached(bytes, available);
+            if fits_memory || fits_spool {
+                self.uu_spool_blocked_spill_bytes = None;
+            }
+        }
+        self.uu_spool_limits_reached(0, available) || self.uu_spool_blocked_spill_bytes.is_some()
+    }
+
+    /// Admit `spilled_bytes` of UU spool to disk, debiting the cached
+    /// free-space reading so a burst of spills inside one probe interval
+    /// cannot each see the same headroom.
+    ///
+    /// Unlike the memory park, a spill needs a reading to be judged: without
+    /// one the bytes are refused and the part is requeued, which keeps the
+    /// spool from writing blind into a filesystem it cannot measure.
+    pub(in crate::pipeline) fn admit_uu_spill(&mut self, spilled_bytes: usize) -> bool {
+        let available = self.uu_spool_capacity().best_available_bytes();
+        let admitted =
+            available.is_some() && !self.uu_spool_limits_reached(spilled_bytes, available);
+        if admitted {
+            self.uu_spool_capacity.debit(spilled_bytes as u64);
+        } else {
+            self.uu_spool_blocked_spill_bytes = Some(
+                self.uu_spool_blocked_spill_bytes
+                    .unwrap_or(0)
+                    .max(spilled_bytes),
+            );
+        }
+        admitted
+    }
+
+    fn uu_spool_capacity(&mut self) -> crate::operations::Capacity {
         #[cfg(test)]
         if let Some(available) = self.uu_spool_available_bytes_for_test {
-            return available;
+            use crate::operations::{Capacity, CapacityReading};
+            return match available {
+                Some(available_bytes) => Capacity::Known(CapacityReading {
+                    available_bytes,
+                    total_bytes: u64::MAX,
+                    sampled_at: Instant::now(),
+                    stale: false,
+                }),
+                None => Capacity::Unknown,
+            };
         }
 
-        let now = Instant::now();
-        if self
-            .uu_spool_last_free_space_check
-            .is_some_and(|checked_at| {
-                now.saturating_duration_since(checked_at) < Self::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL
-            })
-        {
-            return self.uu_spool_available_bytes;
-        }
-
-        let available = crate::operations::disk_space(&self.intermediate_dir)
-            .map(|space| space.available_bytes);
-        self.uu_spool_last_free_space_check = Some(now);
-        self.uu_spool_available_bytes = available;
-        available
+        self.uu_spool_capacity.sample()
     }
 
     pub(in crate::pipeline::download::worker) fn uu_spool_cursor_ordinals(
@@ -79,16 +130,15 @@ impl Pipeline {
         cursors: &HashMap<NzbFileId, u32>,
         work: &DownloadWork,
     ) -> bool {
-        // Only known UU files need cursor ordering. Unrelated yEnc work keeps
-        // its normal admission even while the UU spool cannot accept writes.
+        // Only identified UU files have a sequential cursor. yEnc and files
+        // whose encoding is not yet known retain ordinary dispatch; if an
+        // unknown article proves to be UU, decode enforces park admission.
         cursors
             .get(&work.segment_id.file_id)
-            .is_none_or(|cursor| *cursor == work.segment_id.segment_number)
+            .is_none_or(|next| *next == work.segment_id.segment_number)
     }
 
-    pub(in crate::pipeline::download::worker) fn download_pressure_limits(
-        &self,
-    ) -> (u64, u64, u64, u64) {
+    pub(in crate::pipeline) fn download_pressure_limits(&self) -> (u64, u64, u64, u64) {
         let decode_hard = (self.decode_backlog_budget_bytes as u64).max(1);
         let decode_soft = (decode_hard.saturating_mul(DOWNLOAD_PRESSURE_SOFT_PERCENT) / 100)
             .max(1)
@@ -335,7 +385,7 @@ impl Pipeline {
         let decode_delay =
             Self::soft_pressure_delay_for(pressure.decode_backlog_bytes, decode_soft, decode_hard);
         let write_delay =
-            Self::soft_pressure_delay_for(pressure.write_pending_bytes, write_soft, write_hard);
+            Self::soft_pressure_delay_for(pressure.write_buffered_bytes, write_soft, write_hard);
         decode_delay.max(write_delay)
     }
 
@@ -437,11 +487,11 @@ impl Pipeline {
             .load(Ordering::Relaxed)
             .saturating_add(self.metrics.decode_active_bytes.load(Ordering::Relaxed))
             .saturating_add(released_result_bytes);
-        // UU spill files are already durable and have their own admission
-        // limits. Only resident bytes contribute to global write pressure.
+        // Shared memory pressure counts resident bytes. UU spill files have
+        // their own admission limits and must not pace unrelated yEnc work.
         let write_bytes = self.metrics.write_buffered_bytes.load(Ordering::Relaxed);
         let uu_spool_admission_capped =
-            !self.uu_files.is_empty() && self.uu_spool_admission_capped(0);
+            !self.uu_files.is_empty() && self.uu_spool_dispatch_capped();
 
         if decode_bytes >= decode_hard {
             self.download_decode_hard_pressure_latched = true;
@@ -498,11 +548,6 @@ impl Pipeline {
             reason,
             decode_backlog_bytes: decode_bytes,
             write_buffered_bytes: write_bytes,
-            write_pending_bytes: self
-                .metrics
-                .write_pending_bytes
-                .load(Ordering::Relaxed)
-                .max(write_bytes),
             uu_spool_admission_capped,
             decode_hard_limit_bytes: decode_hard,
             write_hard_limit_bytes: write_hard,

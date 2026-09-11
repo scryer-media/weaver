@@ -10,6 +10,8 @@ const FACADE_QUEUE_ITEM_FIELDS = `
       ...ParsedReleaseFields
     }
     status: state
+    downloadWaitReason
+    downloadRetryAtEpochMs
     progressPercent
     totalBytes
     downloadedBytes
@@ -43,6 +45,8 @@ const QUEUE_TABLE_ITEM_FIELDS = `
     displayTitle
     originalTitle
     status: state
+    downloadWaitReason
+    downloadRetryAtEpochMs
     progressPercent
     totalBytes
     downloadedBytes
@@ -303,6 +307,7 @@ const GENERAL_SETTINGS_FIELDS = `
     cleanupAfterExtract
     maxDownloadSpeed
     maxRetries
+    propagationDelaySecs
     ipReplacementTrialExtraConnections
     enableSrrdbLookup
     duplicatePolicy {

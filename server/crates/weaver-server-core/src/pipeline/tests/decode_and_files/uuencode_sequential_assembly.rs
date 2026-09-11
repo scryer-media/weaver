@@ -271,8 +271,8 @@ async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
         (parts[1].len() + parts[2].len()) as u64
     );
 
-    // Durable spool bytes do not pace unrelated downloads. The resident
-    // backlog is below its threshold, so global pressure stays clear.
+    // Disk-spooled UU bytes must not become shared pressure on yEnc. The
+    // resident 300 bytes are below the shared soft threshold of 420 bytes.
     pipeline.refresh_download_pressure();
     assert_eq!(
         pipeline
@@ -346,6 +346,152 @@ async fn uu_park_admission_requeues_ahead_parts_at_byte_segment_and_disk_limits(
             "{case} admission cap must not create a spool directory"
         );
     }
+}
+
+#[tokio::test]
+async fn uu_park_holds_ahead_parts_in_memory_when_free_space_is_unknown() {
+    // A filesystem that has never produced a reading is not evidence of low
+    // space. Memory parking never touches the disk, so it must proceed; the
+    // dispatch cap must stay clear for the same reason.
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90]];
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.uu_spool_available_bytes_for_test = Some(None);
+    let job_id = JobId(20183);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], false, true).await;
+
+    assert_eq!(
+        pipeline.uu_files.get(&file_id).map(|uu| uu.parked.len()),
+        Some(1),
+        "an unknown reading must not refuse a memory park"
+    );
+    assert_eq!(pipeline.uu_spooled_segments, 0);
+    assert_eq!(pipeline.uu_parked_segments, 1);
+    assert!(!pipeline.uu_spool_admission_capped(0));
+}
+
+#[tokio::test]
+async fn uu_park_refuses_to_spill_when_free_space_is_unknown() {
+    // Spilling writes to the filesystem, so it needs a reading to judge the
+    // reserve against. Without one the part is requeued rather than written
+    // blind.
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90]];
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.write_backlog_budget_bytes = 1;
+    pipeline.uu_spool_available_bytes_for_test = Some(None);
+    let job_id = JobId(20184);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], false, true).await;
+
+    assert_eq!(
+        pipeline.uu_files.get(&file_id).map(|uu| uu.parked.len()),
+        Some(0)
+    );
+    assert_eq!(pipeline.uu_spooled_segments, 0);
+    assert_eq!(pipeline.uu_parked_segments, 0);
+    assert!(!pipeline.uu_spool_root.join(job_id.0.to_string()).exists());
+    assert!(
+        !pipeline.uu_spool_admission_capped(0),
+        "an unknown reading must not refuse memory parking"
+    );
+    assert!(
+        pipeline.uu_spool_dispatch_capped(),
+        "a refused spill must stop speculative refetches"
+    );
+
+    pipeline.write_backlog_budget_bytes = parts[1].len() + 1;
+    assert!(
+        !pipeline.uu_spool_dispatch_capped(),
+        "freeing memory restores parallel UU dispatch"
+    );
+
+    pipeline.write_backlog_budget_bytes = 1;
+    assert!(!pipeline.admit_uu_spill(parts[1].len()));
+    assert!(pipeline.uu_spool_dispatch_capped());
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(
+        pipeline.uu_spool_min_free_bytes + parts[1].len() as u64,
+    ));
+    assert!(
+        !pipeline.uu_spool_dispatch_capped(),
+        "a recovered capacity reading restores dispatch"
+    );
+}
+
+#[tokio::test]
+async fn uu_spill_admission_debits_the_cached_free_space_reading() {
+    // Two spills inside one probe interval must not both see the headroom
+    // the single reading reported.
+    use crate::operations::{CapacitySampler, DiskSpace};
+
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90], vec![b'c'; 85]];
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.write_backlog_budget_bytes = 1;
+    let headroom = pipeline.uu_spool_min_free_bytes + 100;
+    pipeline.uu_spool_capacity = CapacitySampler::with_probe(
+        pipeline.intermediate_dir.clone(),
+        Duration::from_secs(3600),
+        Box::new(move |_| {
+            Ok(DiskSpace {
+                total_bytes: u64::MAX,
+                available_bytes: headroom,
+            })
+        }),
+    );
+    let job_id = JobId(20185);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        uu_job_spec(&parts.iter().map(|part| part.len()).collect::<Vec<_>>()),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], false, false).await;
+    assert_eq!(
+        pipeline.uu_spooled_segments, 1,
+        "the first spill fits the headroom"
+    );
+    assert_eq!(
+        pipeline.uu_spool_capacity.current().best_available_bytes(),
+        Some(headroom - parts[1].len() as u64),
+        "the admitted spill is debited from the cached reading"
+    );
+
+    submit_uu_segment(&mut pipeline, file_id, 2, &parts[2], false, true).await;
+    assert_eq!(
+        pipeline.uu_spooled_segments, 1,
+        "the second spill must see the debited reading and be requeued"
+    );
+    assert_eq!(
+        pipeline.uu_files.get(&file_id).map(|uu| uu.parked.len()),
+        Some(1)
+    );
 }
 
 #[tokio::test]

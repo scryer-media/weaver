@@ -18,6 +18,7 @@ use crate::jobs::model::{JobSpec, JobStatus, JobUpdate};
 use crate::operations::metrics::{MetricsSnapshot, PipelineMetrics};
 
 pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
+pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
 
 type JobCancellationCallback = Arc<dyn Fn() + Send + Sync>;
 
@@ -631,6 +632,11 @@ pub enum SchedulerCommand {
         bytes_per_sec: u64,
         reply: oneshot::Sender<()>,
     },
+    /// Change the minimum post age and recalculate pending propagation holds.
+    SetPropagationDelay {
+        seconds: u32,
+        reply: oneshot::Sender<()>,
+    },
     /// Set global over-max latent-IP replacement burst budget. v1 allows 0 or 1.
     SetIpReplacementTrialExtraConnections {
         extra_connections: u8,
@@ -688,6 +694,14 @@ pub enum SchedulerCommand {
     DeleteAllHistory {
         delete_files: bool,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
+    /// Copy a read-only diagnostics snapshot out of the pipeline actor.
+    ///
+    /// Answered from the same command loop as everything else, so the snapshot
+    /// is coherent with the turn it lands in rather than being stitched
+    /// together from fields read while the actor was running.
+    PipelineDiagnostics {
+        reply: oneshot::Sender<Box<crate::pipeline::diagnostics::PipelineDiagnostics>>,
     },
     /// Shutdown the scheduler gracefully.
     Shutdown,
@@ -1106,6 +1120,20 @@ impl SchedulerHandle {
         self.state.note_server_probe_latency(server_id, latency);
     }
 
+    /// Read-only pipeline internals for the diagnostics package.
+    pub async fn pipeline_diagnostics(
+        &self,
+    ) -> Result<crate::pipeline::diagnostics::PipelineDiagnostics, SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::PipelineDiagnostics { reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await
+            .map(|diagnostics| *diagnostics)
+            .map_err(|_| SchedulerError::ChannelClosed)
+    }
+
     /// Pause all download dispatch globally.
     pub async fn pause_all(&self) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
@@ -1186,6 +1214,16 @@ impl SchedulerHandle {
                 bytes_per_sec,
                 reply: tx,
             })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
+    }
+
+    pub async fn set_propagation_delay(&self, seconds: u32) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::SetPropagationDelay { seconds, reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?;

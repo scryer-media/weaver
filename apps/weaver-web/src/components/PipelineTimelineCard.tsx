@@ -802,8 +802,10 @@ function memberRows(
 
 export function PipelineTimelineCard({
   timeline,
+  propagating = false,
 }: {
   timeline: JobTimelineData | null | undefined;
+  propagating?: boolean;
 }) {
   const t = useTranslate();
   const [membersExpanded, setMembersExpanded] = useState(false);
@@ -846,10 +848,13 @@ export function PipelineTimelineCard({
 
   const stageRows: PlotRow[] = timeline.lanes.map((lane) => {
     const detail = stageDetail(t, lane.stage);
+    const title = propagating && lane.stage === "PENDING_DOWNLOAD"
+      ? t("status.propagating")
+      : t(JOB_STAGE_KEYS[lane.stage]);
 
     return {
       key: `stage:${lane.stage}`,
-      title: t(JOB_STAGE_KEYS[lane.stage]),
+      title,
       tone: "stage",
       details: [
         {
@@ -875,7 +880,7 @@ export function PipelineTimelineCard({
         endedAt: span.endedAt,
         state: span.state,
         colorClass: laneColor(lane.stage),
-        title: span.label ?? t(JOB_STAGE_KEYS[lane.stage]),
+        title: span.label ?? title,
         subtitle: stageSpanSubtitle(t, lane.stage, span),
         dashed: lane.stage === "INTERRUPTED",
         details: [],
@@ -904,8 +909,8 @@ export function PipelineTimelineCard({
                 )}
               </Badge>
             ) : null}
-            <Badge variant={outcomeVariant(timeline.outcome)}>
-              {formatOutcome(timeline.outcome)}
+            <Badge variant={propagating ? "muted" : outcomeVariant(timeline.outcome)}>
+              {propagating ? t("status.propagating") : formatOutcome(timeline.outcome)}
             </Badge>
           </div>
         </div>

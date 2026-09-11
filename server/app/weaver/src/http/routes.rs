@@ -100,7 +100,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let nzbget_context = super::nzbget::NzbgetFacadeContext::new(
         db.clone(),
         handle.clone(),
-        config,
+        config.clone(),
         auth_cache.clone(),
         api_key_cache.clone(),
         session_token.clone(),
@@ -143,6 +143,10 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         )
         .nest("/api/backup", backup_upload_routes)
         .route("/api/system/restart", post(super::system::restart_handler))
+        .route(
+            "/api/system/diagnostics",
+            get(super::diagnostics::diagnostics_package_handler),
+        )
         .route("/api/auth/setup", post(super::auth::setup_handler))
         .route("/api/login", post(super::auth::login_handler))
         .route("/api/logout", post(super::auth::logout_handler))
@@ -158,6 +162,10 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .layer(Extension(api_key_cache))
         .layer(Extension(request_auth))
         .layer(Extension(metrics_exporter))
+        // The diagnostics package reads the configured storage roots, so the
+        // shared config is published alongside the collectors below rather than
+        // being consumed by the NZBGet facade alone.
+        .layer(Extension(config))
         // `build_router` consumes the `ServerRuntime`, so the two scrape-time
         // collectors are re-published as extensions; that is how the metrics
         // handler reaches them.

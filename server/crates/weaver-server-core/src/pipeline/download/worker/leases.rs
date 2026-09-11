@@ -224,7 +224,10 @@ impl Pipeline {
         selection: DownloadWorkSelection,
         uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
     ) -> Option<DownloadWork> {
-        if bootstrap_files.is_none() {
+        // Sweep-owned files take the scanning path below, which looks past
+        // their work the way it looks past non-bootstrap work.
+        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
+        if bootstrap_files.is_none() && sweep_held.is_none() {
             if let Some(uu_cursor_ordinals) = uu_cursor_ordinals {
                 return self.jobs.get_mut(&job_id).and_then(|state| {
                     let matches = |work: &DownloadWork| {
@@ -270,6 +273,9 @@ impl Pipeline {
             let matches = |work: &DownloadWork| {
                 bootstrap_files
                     .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
+                    && sweep_held
+                        .as_deref()
+                        .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
                     && selector.is_none_or(|selector| selector.matches(work))
                     && selection.matches(work)
                     && uu_cursor_ordinals
@@ -600,18 +606,17 @@ impl Pipeline {
         if self.repeated_articles.contains_key(&job_id) {
             return Ok(None);
         }
-        if self.refresh_download_pressure().uu_spool_admission_capped
-            && self.uu_files.keys().any(|file_id| file_id.job_id == job_id)
-        {
-            return Ok(None);
-        }
+        let uu_cursor_ordinals = self
+            .refresh_download_pressure()
+            .uu_spool_admission_capped
+            .then(|| self.uu_spool_cursor_ordinals());
         let par2_metadata_bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
         let Some(first) = self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
             None,
             DownloadWorkSelection::NonCritical,
-            None,
+            uu_cursor_ordinals.as_ref(),
         ) else {
             return Ok(None);
         };
@@ -661,7 +666,7 @@ impl Pipeline {
                 par2_metadata_bootstrap_files.as_deref(),
                 Some(DownloadBatchSelector::initial(&compatibility)),
                 DownloadWorkSelection::NonCritical,
-                None,
+                uu_cursor_ordinals.as_ref(),
             ) else {
                 break;
             };
@@ -757,13 +762,18 @@ impl Pipeline {
         // under the initial rule would stop at the first priority change, which
         // is precisely the boundary it exists to cross.
         let selector = DownloadBatchSelector::new(&compatibility, rule);
+        // Keep capped UU files at their next required ordinal throughout the
+        // batch. Other files retain the ordinary runway and can share a lease.
+        let uu_cursor_ordinals = pressure
+            .uu_spool_admission_capped
+            .then(|| self.uu_spool_cursor_ordinals());
         while works.len() < work_limit {
             let Some(next) = self.pop_download_work_for_par2_bootstrap(
                 job_id,
                 par2_metadata_bootstrap_files,
                 Some(selector),
                 selection,
-                None,
+                uu_cursor_ordinals.as_ref(),
             ) else {
                 break;
             };
@@ -908,11 +918,6 @@ impl Pipeline {
         refill: bool,
         article_bytes: u32,
     ) -> usize {
-        if pressure.uu_spool_admission_capped
-            && self.uu_files.keys().any(|file_id| file_id.job_id == job_id)
-        {
-            return 1;
-        }
         if self.hot_dispatch_job == Some(job_id) {
             match pressure.state {
                 DownloadPressureState::Clear => {

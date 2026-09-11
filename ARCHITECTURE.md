@@ -202,6 +202,29 @@ That means:
 
 If memory growth is unbounded, the feature is not done.
 
+UU spool admission limits apply only to files identified as UU. A capped UU
+file may still fetch the article that advances its sequential assembly cursor.
+yEnc and files of unknown encoding retain normal dispatch, batching, refill,
+and spillover behavior; decode enforces the UU park limits when an article
+first identifies a file as UU. Disk-spooled UU bytes do not count toward shared
+memory pressure. Resident bytes remain subject to the shared memory budgets.
+
+Free-space gates (UU spool, direct-store scratch, extraction reserve) share
+one rule: a filesystem that cannot be measured is not evidence that it is
+full. UU and extraction use the operations capacity sampler; holds scratch
+maintains its own cached estimate. Both keep and debit the last good reading
+across probe failures. The operations sampler logs outage/recovery transitions
+and starts each probe's TTL when the attempt finishes, so a slow syscall cannot
+expire its own cache lifetime. Active storage checks probe the exact root;
+ancestor capacity is only an advisory startup estimate. A fresh reading that confirms
+the reserve is gone refuses; a stale or unknown reading never fails a job on
+its own. The only place "unknown" refuses is a write that needs a reading to be
+judged at all (a UU spill), and that refusal is a requeue, not a failure.
+After a spill is refused, known UU files dispatch cursor work until the refused
+bytes fit in memory or the spool. This prevents successful tail articles from
+being repeatedly fetched and discarded during an outage. Memory parking for
+in-flight arrivals remains available; yEnc keeps its normal batching/refill path.
+
 ### 8. Shared Mutable Runtime State Must Be Explicit
 
 Shared mutable runtime coordination must stay explicit and centrally owned.
@@ -323,6 +346,12 @@ Weaver should keep explicit homes for:
 - schedules and bandwidth caps
 
 These areas may interact, but they should not collapse into one generic config bucket or one giant `config.rs`.
+
+Propagation delay is a persisted General setting in seconds and defaults to
+zero. A saved value takes precedence over `WEAVER_PROPAGATION_DELAY_SECS`.
+Changes recalculate waiting jobs immediately. A propagation hold is projected
+as queued with a download-wait reason and deadline, so clients can distinguish
+it from active downloading without changing the persisted job lifecycle.
 
 ### History, Metrics, and Logs Are Projections, Not Alternate Truth
 

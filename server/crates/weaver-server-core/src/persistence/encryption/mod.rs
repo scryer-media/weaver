@@ -195,6 +195,15 @@ pub fn key_store_description(data_dir: Option<PathBuf>) -> String {
     }
 }
 
+/// Delete the master key Weaver keeps for `data_dir` in the Windows Credential
+/// Manager. Only the desktop app's uninstaller should call this: every secret
+/// encrypted under the key is unreadable afterwards.
+#[cfg(target_os = "windows")]
+pub fn delete_windows_credential_key(data_dir: &std::path::Path) -> Result<(), String> {
+    use keystore::KeyStore as _;
+    windows::WindowsCredentialManager::for_data_dir(Some(data_dir)).delete_key()
+}
+
 /// Ensure a key is available without ever replacing a missing key when
 /// encrypted credentials already exist. A fresh instance may create a key;
 /// an existing encrypted instance must recover the original key or fail.

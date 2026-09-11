@@ -37,6 +37,7 @@ impl SettingsMutation {
         let cleanup_after_extract = input.cleanup_after_extract;
         let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
+        let propagation_delay_secs = input.propagation_delay_secs;
         let ip_replacement_trial_extra_connections = input.ip_replacement_trial_extra_connections;
         let enable_srrdb_lookup = input.enable_srrdb_lookup;
         let isp_bandwidth_cap = input.isp_bandwidth_cap.clone();
@@ -72,6 +73,7 @@ impl SettingsMutation {
             watch_folder_update.clone(),
             duplicate_policy_update.clone(),
             enable_srrdb_lookup,
+            propagation_delay_secs,
         );
         let settings_persist = {
             let db = db.clone();
@@ -214,6 +216,9 @@ impl SettingsMutation {
                                 )?;
                             }
                         }
+                        if let Some(seconds) = persist_input.10 {
+                            db.set_setting("propagation_delay_secs", &seconds.to_string())?;
+                        }
                         if let Some(enabled) = persist_input.9 {
                             db.set_setting(
                                 "delivery_naming.enable_srrdb_lookup",
@@ -251,6 +256,9 @@ impl SettingsMutation {
                 }
                 if let Some(speed) = max_download_speed {
                     cfg.max_download_speed = Some(speed);
+                }
+                if let Some(seconds) = propagation_delay_secs {
+                    cfg.propagation_delay_secs = Some(seconds);
                 }
                 if let Some(retries) = max_retries {
                     let retry =
@@ -293,6 +301,7 @@ impl SettingsMutation {
                     complete_dir: cfg.complete_dir(),
                     cleanup_after_extract: cfg.cleanup_after_extract(),
                     max_download_speed: cfg.max_download_speed.unwrap_or(0),
+                    propagation_delay_secs: cfg.propagation_delay_secs(),
                     max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
                     ip_replacement_trial_extra_connections: cfg
                         .ip_replacement_trial_extra_connections(),
@@ -306,6 +315,9 @@ impl SettingsMutation {
         )
         .await?;
 
+        if let Some(seconds) = propagation_delay_secs {
+            handle.set_propagation_delay(seconds).await?;
+        }
         // Apply speed limit immediately.
         if let Some(speed) = max_download_speed {
             let _ = handle.set_speed_limit(speed).await;
@@ -576,13 +588,13 @@ mod tests {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: vec![],
             categories: vec![],
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
+            propagation_delay_secs: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),

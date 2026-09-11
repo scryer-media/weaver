@@ -1,6 +1,7 @@
 mod assets;
 mod auth;
 mod backup;
+mod diagnostics;
 mod graphql;
 mod health;
 mod jobs;

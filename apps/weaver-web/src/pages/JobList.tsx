@@ -442,15 +442,21 @@ const QueueNameCell = memo(function QueueNameCell({
 
 const QueueStatusCell = memo(function QueueStatusCell({
   status,
+  downloadRetryAtEpochMs,
   phaseProgress,
   blockedByIspCap,
   bandwidthCapLabel,
 }: {
   status: JobData["status"];
+  downloadRetryAtEpochMs?: number | null;
   phaseProgress: JobData["phaseProgress"];
   blockedByIspCap: boolean;
   bandwidthCapLabel: string;
 }) {
+  const t = useTranslate();
+  const propagationLabel = status === "PROPAGATING" && downloadRetryAtEpochMs != null
+    ? t("status.propagationUntil", { time: new Date(downloadRetryAtEpochMs).toLocaleString() })
+    : undefined;
   const extractionVisible = useExtractionVisibility(phaseProgress);
   const visibleStatus = extractionPresentationStatus(
     status,
@@ -458,7 +464,7 @@ const QueueStatusCell = memo(function QueueStatusCell({
     extractionVisible,
   );
   return (
-    <div className="flex flex-col items-center gap-1 text-center">
+    <div className="flex flex-col items-center gap-1 text-center" title={propagationLabel}>
       <JobStatusBadgeGroup
         statuses={getJobStages({ status: visibleStatus })}
         compact
@@ -602,7 +608,7 @@ function resolveJobCategory(
 }
 
 function isBlockedByGlobalPause(job: { status: string }, isPaused: boolean) {
-  return isPaused && (job.status === "DOWNLOADING" || job.status === "QUEUED");
+  return isPaused && (job.status === "DOWNLOADING" || job.status === "QUEUED" || job.status === "PROPAGATING");
 }
 
 function isBlockedByDownloadPolicy(
@@ -611,7 +617,7 @@ function isBlockedByDownloadPolicy(
 ) {
   return (
     (downloadBlock.kind === "ISP_CAP" || downloadBlock.kind === "SERVER_QUOTA")
-    && (job.status === "DOWNLOADING" || job.status === "QUEUED")
+    && (job.status === "DOWNLOADING" || job.status === "QUEUED" || job.status === "PROPAGATING")
   );
 }
 
@@ -1341,6 +1347,7 @@ export function JobList() {
         cell: ({ row }) => (
           <QueueStatusCell
             status={row.original.status}
+            downloadRetryAtEpochMs={row.original.downloadRetryAtEpochMs}
             phaseProgress={row.original.phaseProgress}
             blockedByIspCap={row.original.blockedByIspCap}
             bandwidthCapLabel={t("jobs.bandwidthCapShort")}

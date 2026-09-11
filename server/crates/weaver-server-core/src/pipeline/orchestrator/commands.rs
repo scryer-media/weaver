@@ -455,6 +455,16 @@ impl Pipeline {
                 }
                 let _ = reply.send(());
             }
+            SchedulerCommand::SetPropagationDelay { seconds, reply } => {
+                let delay = Duration::from_secs(u64::from(seconds));
+                if self.propagation_delay != delay {
+                    self.propagation_delay = delay;
+                    self.propagation_ready_at.clear();
+                    self.dispatch_downloads();
+                    self.publish_snapshot();
+                }
+                let _ = reply.send(());
+            }
             SchedulerCommand::SetIpReplacementTrialExtraConnections {
                 extra_connections,
                 reply,
@@ -781,6 +791,9 @@ impl Pipeline {
                 self.finished_jobs.clear();
                 self.publish_snapshot();
                 let _ = reply.send(cleanup_error.map_or(Ok(()), Err));
+            }
+            SchedulerCommand::PipelineDiagnostics { reply } => {
+                let _ = reply.send(Box::new(self.diagnostics_snapshot()));
             }
             SchedulerCommand::Shutdown => unreachable!("handled in select"),
         }

@@ -2828,6 +2828,17 @@ async fn a_freshly_posted_job_defers_until_its_articles_have_propagated() {
     // `dispatch_downloads` never reaches per-job dispatch, so a status or queue
     // assertion here would hold whether or not the gate exists.
 
+    let snapshot = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .unwrap();
+    assert_eq!(
+        snapshot.download_wait_reason.as_deref(),
+        Some(crate::jobs::handle::PROPAGATION_WAIT_REASON)
+    );
+    assert!(snapshot.download_retry_at_epoch_ms.is_some());
+
     // The run loop is told when to wake, rather than rediscovering this by
     // polling.
     let wake = pipeline
@@ -2835,6 +2846,116 @@ async fn a_freshly_posted_job_defers_until_its_articles_have_propagated() {
         .expect("a deferred job must expose its wakeup");
     assert!(wake <= Duration::from_secs(3600));
     assert!(wake > Duration::from_secs(3500));
+}
+
+#[tokio::test]
+async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immediately() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+    pipeline.propagation_delay = Duration::from_secs(600);
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(20220);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        posted_job_spec("Propagation setting", Some(now_epoch_secs() + 60)),
+    )
+    .await;
+    pipeline.dispatch_downloads();
+    pipeline.publish_snapshot();
+    let held = pipeline.shared_state.get_job(job_id).unwrap();
+    assert_eq!(held.download_state, crate::DownloadState::Queued);
+    assert_eq!(
+        held.download_wait_reason.as_deref(),
+        Some(crate::jobs::handle::PROPAGATION_WAIT_REASON)
+    );
+    let initial_deadline = held.download_retry_at_epoch_ms.unwrap();
+    let initial_hold = pipeline.propagation_ready_at[&job_id];
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetPropagationDelay {
+            seconds: 600,
+            reply,
+        })
+        .await;
+    done.await.unwrap();
+    assert_eq!(
+        pipeline.propagation_ready_at[&job_id], initial_hold,
+        "saving unchanged settings must preserve the timer"
+    );
+    assert_eq!(pipeline.active_downloads, 0);
+    let drain_wait_updates = |events: &mut broadcast::Receiver<PipelineEvent>| {
+        let mut count = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, PipelineEvent::PhaseProgressUpdated { job_id: id } if id == job_id) {
+                count += 1;
+            }
+        }
+        count
+    };
+    assert_eq!(drain_wait_updates(&mut events), 1);
+    pipeline.publish_snapshot();
+    assert_eq!(drain_wait_updates(&mut events), 0);
+    assert_eq!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .download_retry_at_epoch_ms,
+        Some(initial_deadline)
+    );
+
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetPropagationDelay {
+            seconds: 1200,
+            reply,
+        })
+        .await;
+    done.await.unwrap();
+    let held = pipeline.shared_state.get_job(job_id).unwrap();
+    assert!(held.download_retry_at_epoch_ms.unwrap() > initial_deadline + 500_000.0);
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(drain_wait_updates(&mut events), 1);
+
+    set_job_status_for_test(&mut pipeline, job_id, JobStatus::Paused);
+    let paused = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .unwrap();
+    assert_eq!(paused.status, JobStatus::Paused);
+    assert!(paused.download_wait_reason.is_none());
+    set_job_status_for_test(&mut pipeline, job_id, JobStatus::Downloading);
+    assert!(
+        pipeline
+            .list_jobs()
+            .iter()
+            .any(|job| job.job_id == job_id && job.download_wait_reason.is_some())
+    );
+
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetPropagationDelay { seconds: 0, reply })
+        .await;
+    done.await.unwrap();
+    assert_eq!(pipeline.active_downloads, 1);
+    assert!(pipeline.propagation_ready_at.is_empty());
+    assert!(pipeline.next_propagation_delay().is_none());
+    let released = pipeline.shared_state.get_job(job_id).unwrap();
+    assert!(released.download_wait_reason.is_none());
+    assert!(released.download_retry_at_epoch_ms.is_none());
+    assert_eq!(released.download_state, crate::DownloadState::Downloading);
+    assert_eq!(drain_wait_updates(&mut events), 1);
 }
 
 #[tokio::test]

@@ -200,13 +200,13 @@ impl TestHarness {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: vec![],
             categories: vec![],
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
+            propagation_delay_secs: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
@@ -668,7 +668,8 @@ fn spawn_test_scheduler(
                     scheduler_state.set_paused(false);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetSpeedLimit { reply, .. } => {
+                SchedulerCommand::SetPropagationDelay { reply, .. }
+                | SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetIpReplacementTrialExtraConnections { reply, .. } => {
@@ -789,7 +790,24 @@ fn spawn_test_scheduler(
                         .expect("failed to delete history events from test db");
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::DeleteAllHistory { reply, .. } => {
+                SchedulerCommand::DeleteAllHistory {
+                    delete_files,
+                    reply,
+                } => {
+                    if delete_files {
+                        for row in db
+                            .list_job_history(&weaver_server_core::HistoryFilter::default())
+                            .expect("failed to load history rows from test db")
+                        {
+                            if let Some(output_dir) = row.output_dir {
+                                let output_dir = PathBuf::from(output_dir);
+                                if output_dir.exists() {
+                                    std::fs::remove_dir_all(&output_dir)
+                                        .expect("failed to remove test history output directory");
+                                }
+                            }
+                        }
+                    }
                     jobs.retain(|_, state| {
                         !matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
                     });
@@ -878,6 +896,10 @@ fn spawn_test_scheduler(
                 SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
                     let _ = reply.send(());
                 }
+                // Dropping the reply is the answer: the diagnostics request
+                // reports a pipeline that did not respond, which is what a
+                // mock scheduler is.
+                SchedulerCommand::PipelineDiagnostics { .. } => {}
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.

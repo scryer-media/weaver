@@ -36,7 +36,16 @@ pub(crate) fn build_job_timeline(
         .map(|event| (event.timestamp as f64).min(current_attempt_started_at))
         .unwrap_or(current_attempt_started_at);
 
-    let outcome = JobStatusGql::from(&job.status);
+    let outcome = if job.download_wait_reason.as_deref()
+        == Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON)
+        && matches!(
+            job.status,
+            weaver_server_core::JobStatus::Queued | weaver_server_core::JobStatus::Downloading
+        ) {
+        JobStatusGql::Queued
+    } else {
+        JobStatusGql::from(&job.status)
+    };
     let now = epoch_ms_now();
     let terminal_event_at =
         events
@@ -56,7 +65,7 @@ pub(crate) fn build_job_timeline(
     });
 
     let download_spans =
-        synthesize_active_download_span(collect_download_spans(events), job, started_at);
+        synthesize_active_download_span(collect_download_spans(events), job, started_at, outcome);
     let finalizing_download_spans = collect_finalizing_download_spans(events);
     let pause_spans = collect_pause_spans(events);
     let verify_spans = collect_verify_spans(events);
@@ -545,13 +554,14 @@ fn synthesize_active_download_span(
     mut spans: Vec<JobTimelineSpan>,
     job: &JobInfo,
     started_at: f64,
+    outcome: JobStatusGql,
 ) -> Vec<JobTimelineSpan> {
     if spans.iter().any(|span| span.ended_at.is_none()) {
         return spans;
     }
 
     if spans.is_empty()
-        && matches!(job.status, weaver_server_core::JobStatus::Downloading)
+        && matches!(outcome, JobStatusGql::Downloading)
         && matches!(job.run_state, weaver_server_core::RunState::Active)
     {
         spans.push(JobTimelineSpan {

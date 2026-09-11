@@ -12,7 +12,10 @@ export function findSchemaCompatibilityChanges(oldSdl, newSdl) {
   const newSchema = buildSchema(newSdl);
   return {
     breaking: findBreakingChanges(oldSchema, newSchema),
-    dangerous: findDangerousChanges(oldSchema, newSchema),
+    // Existing callers can omit newly added optional input fields.
+    dangerous: findDangerousChanges(oldSchema, newSchema).filter(
+      (change) => change.type !== "OPTIONAL_INPUT_FIELD_ADDED",
+    ),
   };
 }
 

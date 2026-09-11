@@ -129,14 +129,12 @@ const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
-    state: DownloadPressureState,
+    pub(in crate::pipeline) state: DownloadPressureState,
     reason: DownloadPressureReason,
     decode_backlog_bytes: u64,
-    /// Resident bytes: this alone controls hard write pressure.
+    /// Resident bytes control shared write pressure.
     write_buffered_bytes: u64,
-    /// Resident plus UU-spooled bytes: this controls soft pacing.
-    write_pending_bytes: u64,
-    /// Aggregate UU spool admission is capped; only cursor-closing work may run.
+    /// Known UU files may dispatch only their cursor-closing work while capped.
     uu_spool_admission_capped: bool,
     decode_hard_limit_bytes: u64,
     write_hard_limit_bytes: u64,

@@ -10,10 +10,10 @@
     reason = "the Windows and macOS wrappers each use a subset of this module, and neither is compiled on other platforms"
 )]
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -644,6 +644,9 @@ pub(crate) struct ServerSupervisor {
     profile_dir: PathBuf,
     port: u16,
     server: Option<Child>,
+    /// How long the log was when the owned server was started, so a failed
+    /// start is reported with its own error rather than an earlier run's.
+    log_offset: u64,
 }
 
 impl ServerSupervisor {
@@ -652,6 +655,7 @@ impl ServerSupervisor {
             profile_dir,
             port,
             server: None,
+            log_offset: 0,
         }
     }
 
@@ -661,6 +665,10 @@ impl ServerSupervisor {
 
     pub(crate) fn logs_dir(&self) -> PathBuf {
         self.profile_dir.join("logs")
+    }
+
+    fn log_file(&self) -> PathBuf {
+        self.logs_dir().join("weaver.log")
     }
 
     pub(crate) fn port(&self) -> u16 {
@@ -709,7 +717,8 @@ impl ServerSupervisor {
         }
 
         let server_executable = self.server_executable()?;
-        let log_file = self.logs_dir().join("weaver.log");
+        let log_file = self.log_file();
+        self.log_offset = std::fs::metadata(&log_file).map_or(0, |metadata| metadata.len());
         let mut command = Command::new(&server_executable);
         command
             .arg("--config")
@@ -760,12 +769,50 @@ impl ServerSupervisor {
         self.wait_until_ready()
     }
 
-    pub(crate) fn wait_until_ready(&self) -> Result<(), String> {
-        if wait_for_server(self.port, SERVER_READY_TIMEOUT) {
-            Ok(())
-        } else {
-            Err("timed out waiting for Weaver after restart".to_string())
+    /// Wait for the server to answer. An owned server that exits first is
+    /// reported with the error it logged: a server that cannot start says why
+    /// in its log, and waiting out the timeout would only hide it.
+    pub(crate) fn wait_until_ready(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + SERVER_READY_TIMEOUT;
+        loop {
+            if server_ready(self.port) {
+                return Ok(());
+            }
+            if let Some(status) = self.exited_server()? {
+                return Err(self.start_failure(status));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for Weaver to become ready at {}",
+                    app_origin(self.port)
+                ));
+            }
+            thread::sleep(Duration::from_millis(250));
         }
+    }
+
+    /// How the owned server exited, once it has.
+    fn exited_server(&mut self) -> Result<Option<ExitStatus>, String> {
+        let Some(child) = self.server.as_mut() else {
+            return Ok(None);
+        };
+        let status = child
+            .try_wait()
+            .map_err(|error| format!("failed to check Weaver server status: {error}"))?;
+        if status.is_some() {
+            self.server = None;
+        }
+        Ok(status)
+    }
+
+    fn start_failure(&self, status: ExitStatus) -> String {
+        let log_file = self.log_file();
+        let reason = last_logged_error(&log_file, self.log_offset)
+            .unwrap_or_else(|| format!("the server exited ({status})"));
+        format!(
+            "Weaver could not start: {reason}\n\nThe log is at {}",
+            log_file.display()
+        )
     }
 
     /// Wait for the running server to disappear, bounded so a process that
@@ -809,6 +856,97 @@ impl ServerSupervisor {
             ));
         }
         Ok(server)
+    }
+}
+
+/// How much of the end of the log a failed start reads. The error that
+/// stopped the server is the last thing it wrote.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The last error the server logged at or after `offset` in `log_file`.
+fn last_logged_error(log_file: &Path, offset: u64) -> Option<String> {
+    let mut file = std::fs::File::open(log_file).ok()?;
+    let len = file.metadata().ok()?.len();
+    // A log the server rotated as it opened it starts again at zero.
+    let offset = if offset > len { 0 } else { offset };
+    file.seek(SeekFrom::Start(
+        offset.max(len.saturating_sub(LOG_TAIL_BYTES)),
+    ))
+    .ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    String::from_utf8_lossy(&tail)
+        .lines()
+        .rev()
+        .find_map(logged_error_message)
+}
+
+/// The message of a log line written at ERROR, without its timestamp, level
+/// and target.
+fn logged_error_message(line: &str) -> Option<String> {
+    let (timestamp, rest) = line.split_once(" ERROR ")?;
+    // The level follows the timestamp; a line whose message mentions ERROR
+    // has more than a timestamp before it.
+    if timestamp.contains(' ') {
+        return None;
+    }
+    // The target is a module path, so it has no spaces.
+    let message = match rest.split_once(": ") {
+        Some((target, message)) if !target.contains(' ') => message,
+        _ => rest,
+    };
+    Some(message.trim().to_string())
+}
+
+/// Folders an uninstall keeps while they hold anything: the download and
+/// script folders default to living in the profile, and what is in them is
+/// the user's.
+const KEPT_PROFILE_FOLDERS: [&str; 3] = ["complete", "intermediate", "scripts"];
+
+/// Remove the desktop profile — the database, logs, WebView2 data and every
+/// other file Weaver keeps there — except download and script folders that
+/// hold anything. The profile and its vendor folder go too once empty.
+/// Returns what could not be removed.
+pub(crate) fn remove_desktop_profile(profile_dir: &Path) -> Vec<String> {
+    let entries = match std::fs::read_dir(profile_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => return vec![format!("cannot read {}: {error}", profile_dir.display())],
+    };
+    let mut problems = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let kept = entry.file_name().to_str().is_some_and(|name| {
+            KEPT_PROFILE_FOLDERS
+                .iter()
+                .any(|kept| name.eq_ignore_ascii_case(kept))
+        });
+        if kept {
+            // Refused, as intended, while the folder holds anything.
+            let _ = std::fs::remove_dir(&path);
+            continue;
+        }
+        match remove_path(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => problems.push(format!("cannot remove {}: {error}", path.display())),
+        }
+    }
+    let _ = std::fs::remove_dir(profile_dir);
+    if let Some(vendor_dir) = profile_dir.parent() {
+        let _ = std::fs::remove_dir(vendor_dir);
+    }
+    problems
+}
+
+/// Remove a file, or a folder and everything below it. A link is removed
+/// itself, never what it points at.
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)?.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        // Windows removes a link to a folder as a folder.
+        std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
     }
 }
 
@@ -908,8 +1046,9 @@ mod tests {
     use super::{
         HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
         decode_chunked, desktop_profile_dir_from, format_bytes, format_speed, http_origin,
-        is_weaver_document, opens_in_external_browser, parse_http_response,
-        popover_content_from_graphql, row_detail, set_cookie_value,
+        is_weaver_document, last_logged_error, logged_error_message, opens_in_external_browser,
+        parse_http_response, popover_content_from_graphql, remove_desktop_profile, row_detail,
+        set_cookie_value,
     };
 
     #[test]
@@ -924,6 +1063,126 @@ mod tests {
             desktop_profile_dir_from(&local_app_data),
             local_app_data.join("ScryerMedia").join("Weaver")
         );
+    }
+
+    const EARLIER_RUN: &str =
+        "2026-09-11T09:00:00.000-04:00 ERROR weaver: an earlier run's failure\n";
+
+    #[test]
+    fn a_failed_start_reports_the_error_it_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_file = dir.path().join("weaver.log");
+        let this_run = concat!(
+            "2026-09-11T10:00:00.000-04:00  INFO weaver: opening database\n",
+            r"2026-09-11T10:00:00.100-04:00 ERROR weaver: failed to open database (C:\Weaver\weaver.db): database is locked",
+            "\n",
+            "2026-09-11T10:00:00.200-04:00  INFO weaver: shutting down\n",
+        );
+        std::fs::write(&log_file, format!("{EARLIER_RUN}{this_run}")).unwrap();
+
+        assert_eq!(
+            last_logged_error(&log_file, EARLIER_RUN.len() as u64).as_deref(),
+            Some(r"failed to open database (C:\Weaver\weaver.db): database is locked")
+        );
+    }
+
+    #[test]
+    fn a_failed_start_that_logged_no_error_is_not_blamed_on_an_earlier_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_file = dir.path().join("weaver.log");
+        let this_run = "2026-09-11T10:00:00.000-04:00  INFO weaver: opening database\n";
+        std::fs::write(&log_file, format!("{EARLIER_RUN}{this_run}")).unwrap();
+
+        assert_eq!(last_logged_error(&log_file, EARLIER_RUN.len() as u64), None);
+    }
+
+    #[test]
+    fn a_log_rotated_by_the_failed_start_is_read_from_its_beginning() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_file = dir.path().join("weaver.log");
+        std::fs::write(
+            &log_file,
+            "2026-09-11T10:00:00.000-04:00 ERROR weaver: the port is in use\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            last_logged_error(&log_file, 10 * 1024 * 1024).as_deref(),
+            Some("the port is in use")
+        );
+    }
+
+    #[test]
+    fn only_error_lines_carry_a_start_failure() {
+        assert_eq!(
+            logged_error_message("2026-09-11T10:00:00.000-04:00  WARN weaver: slow disk"),
+            None
+        );
+        assert_eq!(
+            logged_error_message(
+                "2026-09-11T10:00:00.000-04:00  INFO weaver: the server said ERROR and went on"
+            ),
+            None
+        );
+        assert_eq!(
+            logged_error_message(
+                r"2026-09-11T10:00:00.000-04:00 ERROR weaver::bootstrap: cannot create data_dir directory (D:\Weaver): access is denied"
+            )
+            .as_deref(),
+            Some(r"cannot create data_dir directory (D:\Weaver): access is denied")
+        );
+    }
+
+    #[test]
+    fn uninstall_keeps_download_folders_that_hold_files() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = desktop_profile_dir_from(root.path());
+        let download = profile
+            .join("complete")
+            .join("Example Title")
+            .join("example.mkv");
+        std::fs::create_dir_all(download.parent().unwrap()).unwrap();
+        std::fs::write(&download, b"media").unwrap();
+        std::fs::create_dir_all(profile.join("logs")).unwrap();
+        std::fs::create_dir_all(profile.join("WebView2").join("EBWebView")).unwrap();
+        std::fs::create_dir_all(profile.join("intermediate")).unwrap();
+        for file in [
+            "weaver.db",
+            "weaver.db-wal",
+            "weaver.db-shm",
+            "encryption.key",
+        ] {
+            std::fs::write(profile.join(file), b"state").unwrap();
+        }
+        std::fs::write(profile.join("logs").join("weaver.log"), b"log").unwrap();
+
+        assert!(remove_desktop_profile(&profile).is_empty());
+
+        assert!(download.is_file());
+        let left = std::fs::read_dir(&profile)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(left, vec!["complete".to_string()]);
+    }
+
+    #[test]
+    fn uninstall_removes_an_emptied_profile_and_its_vendor_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = desktop_profile_dir_from(root.path());
+        std::fs::create_dir_all(profile.join("complete")).unwrap();
+        std::fs::write(profile.join("weaver.db"), b"state").unwrap();
+
+        assert!(remove_desktop_profile(&profile).is_empty());
+
+        assert!(!root.path().join("ScryerMedia").exists());
+        assert!(root.path().is_dir());
+    }
+
+    #[test]
+    fn uninstall_without_a_profile_has_nothing_to_do() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(remove_desktop_profile(&desktop_profile_dir_from(root.path())).is_empty());
     }
 
     #[test]

@@ -705,18 +705,9 @@ impl WeaverDelegate {
 
     /// Used by the menu items that only need a server, not a window.
     fn ensure_server_ready(&self) -> Result<(), String> {
-        self.ivars().supervisor.borrow_mut().start()?;
-        if shared::wait_for_server(
-            self.ivars().supervisor.borrow().port(),
-            SERVER_READY_TIMEOUT,
-        ) {
-            Ok(())
-        } else {
-            Err(format!(
-                "timed out waiting for Weaver to become ready at {}",
-                self.ivars().origin
-            ))
-        }
+        let mut supervisor = self.ivars().supervisor.borrow_mut();
+        supervisor.start()?;
+        supervisor.wait_until_ready()
     }
 
     fn show_window(&self) {

@@ -96,12 +96,12 @@ impl TestHarness {
             intermediate_dir: Some(intermediate_dir.display().to_string()),
             complete_dir: Some(complete_dir.display().to_string()),
             buffer_pool: None,
-            tuner: None,
             servers: vec![],
             categories: vec![],
             retry: None,
             max_download_speed: None,
             isp_bandwidth_cap: None,
+            propagation_delay_secs: None,
             ip_replacement_trial_extra_connections: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -397,18 +397,21 @@ async fn new_direct_pipeline_at_roots(
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
 ) -> (Pipeline, PathBuf, PathBuf) {
-    let db = Database::open(&db_path).unwrap();
+    let mut db = Database::open(&db_path).unwrap();
+    // Jobs added through the handle persist their archive password, which
+    // needs a key, exactly as a running server has one.
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let config: SharedConfig = Arc::new(RwLock::new(Config {
         data_dir: data_dir.display().to_string(),
         intermediate_dir: Some(intermediate_dir.display().to_string()),
         complete_dir: Some(complete_dir.display().to_string()),
         buffer_pool: None,
-        tuner: None,
         servers: vec![],
         categories: vec![],
         retry: None,
         max_download_speed: None,
         isp_bandwidth_cap: None,
+        propagation_delay_secs: None,
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

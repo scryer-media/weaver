@@ -66,6 +66,7 @@ impl Pipeline {
             ip_replacement_trial_extra_connections,
             direct_store_settings,
             direct_unpack_settings,
+            propagation_delay,
         ) = {
             let cfg = config.read().await;
             (
@@ -85,6 +86,7 @@ impl Pipeline {
                 // Same contract, same reason: resolved once so a set admitted
                 // under an enabled gate cannot find it disabled mid-chase.
                 crate::pipeline::direct_unpack::DirectUnpackSettings::resolve(&cfg),
+                Duration::from_secs(u64::from(cfg.propagation_delay_secs())),
             )
         };
         metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
@@ -113,11 +115,20 @@ impl Pipeline {
         }
 
         tokio::fs::create_dir_all(&data_dir).await?;
-        tokio::fs::create_dir_all(&intermediate_dir).await?;
-        tokio::fs::create_dir_all(&complete_dir).await?;
+        // A download folder on a drive that is gone must not stop Weaver from
+        // starting, or it could never be pointed at another one.
+        for dir in [&intermediate_dir, &complete_dir] {
+            if let Err(error) = tokio::fs::create_dir_all(dir).await {
+                warn!(path = %dir.display(), error = %error, "download folder unavailable");
+            }
+        }
         let uu_spool_root = intermediate_dir.join(".uu-park");
         let cleanup_root = uu_spool_root.clone();
-        tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await??;
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await?
+        {
+            warn!(path = %uu_spool_root.display(), error = %error, "failed to clear the stale UU spool");
+        }
         let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
         let process_memory_budget =
             Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
@@ -209,7 +220,6 @@ impl Pipeline {
             hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
             hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
-            deferred_lane_refills: std::collections::VecDeque::new(),
             download_dispatch_wake: false,
             nntp_handoff_draining: false,
             ip_replacement_trial_extra_connections,
@@ -237,6 +247,11 @@ impl Pipeline {
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
+            uu_spool_capacity: crate::operations::CapacitySampler::new(
+                intermediate_dir.clone(),
+                Pipeline::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL,
+            ),
+            uu_spool_blocked_spill_bytes: None,
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
@@ -244,8 +259,6 @@ impl Pipeline {
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
-            uu_spool_last_free_space_check: None,
-            uu_spool_available_bytes: None,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
             pending_file_progress: HashMap::new(),
@@ -365,6 +378,9 @@ impl Pipeline {
             snapshot_publish_pending: false,
             download_restart_durable_lead_retry_after: HashMap::new(),
             propagation_ready_at: HashMap::new(),
+            published_propagation_holds: HashMap::new(),
+            propagation_delay,
+            #[cfg(test)]
             propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
             last_owned_lane_acquire_failure_log_at: None,
@@ -1066,9 +1082,6 @@ impl Pipeline {
                         self.sample_phase_progress();
                         self.shared_state.refresh_metrics_snapshot();
                         self.flush_pending_snapshot();
-                        // Fallback wake for refills held under hard pressure, in
-                        // case the backlog drained without a download event.
-                        self.maybe_service_deferred_lane_refills();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
@@ -1078,6 +1091,7 @@ impl Pipeline {
                     }
                     _ = tune_interval.tick() => {
                         self.flush_quiescent_write_backlog().await;
+                        self.relieve_latched_write_backlog().await;
                         self.refresh_download_pressure();
                         self.publish_download_transport_health();
 
@@ -1132,13 +1146,6 @@ impl Pipeline {
                             health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                             "pipeline tick"
                         );
-
-                        if self.tuner.adjust(&snapshot) {
-                            info!(
-                                max_downloads = self.tuner.params().max_concurrent_downloads,
-                                "tuner adjusted parameters"
-                            );
-                        }
                     }
                     _ = stalled_download_interval.tick() => {
                         self.auto_pause_stalled_downloads();
@@ -1205,7 +1212,32 @@ impl Pipeline {
         self.snapshot_published_at = Some(Instant::now());
         self.snapshot_publish_pending = false;
         let _ = self.refresh_bandwidth_cap_window();
-        self.shared_state.publish_jobs(self.list_jobs());
+        let jobs = self.list_jobs();
+        let holds: HashMap<_, _> = jobs
+            .iter()
+            .filter(|job| {
+                job.download_wait_reason.as_deref()
+                    == Some(crate::jobs::handle::PROPAGATION_WAIT_REASON)
+            })
+            .filter_map(|job| {
+                job.download_retry_at_epoch_ms
+                    .map(|at| (job.job_id, at as i64))
+            })
+            .collect();
+        let changed: HashSet<_> = holds
+            .keys()
+            .chain(self.published_propagation_holds.keys())
+            .copied()
+            .filter(|job_id| holds.get(job_id) != self.published_propagation_holds.get(job_id))
+            .collect();
+        self.published_propagation_holds = holds;
+        self.shared_state.publish_jobs(jobs);
+        // Publish the updated payload before notifying live queue subscribers.
+        for job_id in changed {
+            let _ = self
+                .event_tx
+                .send(PipelineEvent::PhaseProgressUpdated { job_id });
+        }
     }
 
     /// Publish the job snapshot unless one was already published inside the
@@ -1410,7 +1442,6 @@ impl Pipeline {
         self.direct_unpack_shutdown("pipeline shutting down").await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
-        self.deferred_lane_refills.clear();
         self.drain_inflight_download_and_decode_work().await;
         self.flush_quiescent_write_backlog().await;
 
@@ -2318,8 +2349,8 @@ fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
 }
 
 pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {
-    match crate::operations::disk_space(output_dir) {
-        Some(space) => {
+    match crate::operations::probe_nearest_disk_space(output_dir) {
+        Ok(space) => {
             let available = space.available_bytes;
             if available < needed_bytes {
                 let avail_mb = available / (1024 * 1024);
@@ -2334,7 +2365,11 @@ pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) 
                 debug!(available_mb = avail_mb, "disk space check passed");
             }
         }
-        None => debug!("could not check free disk space"),
+        Err(error) => debug!(
+            path = %output_dir.display(),
+            error = %error,
+            "could not check free disk space"
+        ),
     }
 }
 

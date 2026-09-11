@@ -249,6 +249,8 @@ fn make_executable(path: &Path) -> Result<()> {
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions)?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

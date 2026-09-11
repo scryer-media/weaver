@@ -89,7 +89,6 @@ fn config_roundtrip() {
         intermediate_dir: Some("/tmp/intermediate".to_string()),
         complete_dir: Some("/tmp/complete".to_string()),
         buffer_pool: None,
-        tuner: None,
         servers: vec![ServerConfig {
             id: 1,
             host: "news.test.com".to_string(),
@@ -125,6 +124,7 @@ fn config_roundtrip() {
         retry: None,
         max_download_speed: Some(1_000_000),
         isp_bandwidth_cap: None,
+        propagation_delay_secs: None,
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(false),
         watch_folder: crate::watch_folder::WatchFolderConfig {

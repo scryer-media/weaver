@@ -1,25 +1,6 @@
 use super::*;
 
 impl Pipeline {
-    pub(crate) fn maybe_service_deferred_lane_refills(&mut self) {
-        if self.deferred_lane_refills.is_empty() {
-            return;
-        }
-        if self.refresh_download_pressure().state == DownloadPressureState::Hard {
-            return;
-        }
-        let mut pending = std::mem::take(&mut self.deferred_lane_refills);
-        while let Some(request) = pending.pop_front() {
-            self.handle_download_lane_refill_request(request);
-            if !self.deferred_lane_refills.is_empty() {
-                // Granting re-latched hard pressure and the handler re-deferred
-                // this request; stop and keep the rest queued in arrival order.
-                break;
-            }
-        }
-        self.deferred_lane_refills.append(&mut pending);
-    }
-
     pub(crate) fn handle_download_lane_refill_request(
         &mut self,
         request: DownloadLaneRefillRequest,
@@ -81,26 +62,17 @@ impl Pipeline {
 
         let pressure = self.refresh_download_pressure();
         // Soft pressure shrinks the lease (see download_lane_lease_work_limit) instead of
-        // idling the lane. Hard pressure holds the request until the backlog drains: the
-        // lane blocks on its oneshot either way, and answering on the pressure transition
-        // avoids a park/redispatch round-trip per stall.
+        // idling the lane. Hard pressure parks the lane instead of holding the request:
+        // a lane blocked on its refill answer keeps its socket and its pool permit for
+        // as long as the backlog takes to drain, and nothing bounds that wait. Parking
+        // releases the permit; the dispatch wake once pressure clears redispatches.
         if allow_refill && pressure.state == DownloadPressureState::Hard {
-            self.deferred_lane_refills
-                .push_back(DownloadLaneRefillRequest {
-                    job_id,
-                    runtime_generation,
-                    server_idx,
-                    remote_ip,
-                    supports_pipelining,
-                    current_mode,
-                    spillover_loan_kind,
-                    compatibility,
-                    response_tx,
-                });
             self.metrics
                 .download_lane_refill_deferred_total
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            self.hot_share_yield_signal.clear();
+            allow_refill = false;
+            park_reason = LaneParkReason::Pressure;
         }
 
         if allow_refill {

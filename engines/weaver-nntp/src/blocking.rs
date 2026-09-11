@@ -355,6 +355,19 @@ impl BlockingBodyLane {
         !self.conn.poisoned
     }
 
+    /// Whether the server has closed its side of the connection.
+    ///
+    /// A non-blocking peek at the socket: a closed peer answers end-of-file
+    /// or an error, a live one has nothing to read yet. Meant for a cached
+    /// lane between leases, where the socket is otherwise silent; an idle
+    /// connection the server timed out would otherwise fail its first BODY
+    /// only after a full read timeout, holding its permit the whole while.
+    pub fn peer_closed(&self) -> bool {
+        // A tunnelled lane has no socket to peek at; it stays cached and a
+        // dead tunnel surfaces on its next read like any other transport error.
+        self.conn.transport.tcp().is_some_and(tcp_peer_closed)
+    }
+
     /// Answer an existence probe on this lane's connection.
     ///
     /// The lane must be between leases: the ring is checked rather than
@@ -2060,7 +2073,36 @@ impl BlockingNntpConnection {
     }
 }
 
+/// Whether the peer has closed an otherwise idle TCP stream, without
+/// blocking and without consuming anything it may have sent.
+pub(crate) fn tcp_peer_closed(tcp: &TcpStream) -> bool {
+    if tcp.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut probe = [0u8; 1];
+    let closed = match tcp.peek(&mut probe) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(err) => !matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ),
+    };
+    let _ = tcp.set_nonblocking(false);
+    closed
+}
+
 impl BlockingTransport {
+    /// The direct TCP socket under this transport, if it is not tunnelled.
+    fn tcp(&self) -> Option<&TcpStream> {
+        match self {
+            BlockingTransport::Plain(tcp) => tcp.tcp(),
+            BlockingTransport::Rustls(inner) => inner.tcp.tcp(),
+            #[cfg(not(windows))]
+            BlockingTransport::S2n(inner) => inner.tcp.tcp(),
+        }
+    }
+
     fn read_into_buf(
         &mut self,
         dst: &mut BytesMut,

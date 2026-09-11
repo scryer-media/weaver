@@ -29,7 +29,6 @@ fn sample_config() -> Config {
         intermediate_dir: Some("/old/data/intermediate".into()),
         complete_dir: Some("/old/data/complete".into()),
         buffer_pool: None,
-        tuner: None,
         servers: vec![ServerConfig {
             id: 1,
             host: "news.example.com".into(),
@@ -69,6 +68,7 @@ fn sample_config() -> Config {
         }),
         max_download_speed: Some(42),
         isp_bandwidth_cap: None,
+        propagation_delay_secs: None,
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -81,6 +81,7 @@ fn sample_config() -> Config {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn backup_temp_directory_is_owner_only() {
     let directory = create_backup_temp_dir().unwrap();

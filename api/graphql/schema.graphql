@@ -373,6 +373,7 @@ type GeneralSettings {
 	cleanupAfterExtract: Boolean!
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
+	propagationDelaySecs: Int!
 	ipReplacementTrialExtraConnections: Int!
 	enableSrrdbLookup: Boolean!
 	ispBandwidthCap: IspBandwidthCapSettings
@@ -386,6 +387,7 @@ input GeneralSettingsInput {
 	cleanupAfterExtract: Boolean
 	maxDownloadSpeed: Int
 	maxRetries: Int
+	propagationDelaySecs: Int
 	ipReplacementTrialExtraConnections: Int
 	enableSrrdbLookup: Boolean
 	ispBandwidthCap: IspBandwidthCapSettingsInput
@@ -1032,13 +1034,13 @@ type MutationRoot {
 	redownloadJob(id: Int!): Boolean!
 	"""
 	Delete completed/failed/cancelled jobs from history.
-	`deleteFiles: true` requires admin scope.
+	Integration (control) scope may also delete completed output with `deleteFiles: true`.
 	Returns the remaining history jobs after deletion.
 	"""
 	acceptHistoryDelete(input: AcceptHistoryDeleteInput!): HistoryDeleteAcceptance!
 	"""
 	Delete a completed/failed/cancelled job from history.
-	`deleteFiles: true` requires admin scope.
+	Integration (control) scope may also delete completed output with `deleteFiles: true`.
 	Returns the remaining history jobs after deletion.
 	"""
 	deleteHistory(id: Int!, deleteFiles: Boolean! = false): [HistoryItem!]!
@@ -1051,13 +1053,13 @@ type MutationRoot {
 	promoteDuplicateCandidate(id: Int!): SemanticPromotionResult!
 	"""
 	Delete multiple completed/failed/cancelled jobs from history by ID.
-	`deleteFiles: true` requires admin scope.
+	Integration (control) scope may also delete completed output with `deleteFiles: true`.
 	Returns the remaining history jobs after deletion.
 	"""
 	deleteHistoryBatch(ids: [Int!]!, deleteFiles: Boolean! = false): [HistoryItem!]!
 	"""
 	Delete all completed/failed/cancelled jobs from history.
-	`deleteFiles: true` requires admin scope.
+	Integration (control) scope may also delete completed output with `deleteFiles: true`.
 	"""
 	deleteAllHistory(deleteFiles: Boolean! = false): [HistoryItem!]!
 	"""
@@ -1111,7 +1113,7 @@ type MutationRoot {
 	"""
 	redownloadQueueItem(id: Int!): QueueCommandResult!
 	"""
-	Remove history items by ID. `deleteFiles: true` requires admin scope.
+	Remove history items by ID. Integration (control) scope may also delete completed output with `deleteFiles: true`.
 	"""
 	removeHistoryItems(ids: [Int!]!, deleteFiles: Boolean! = false): HistoryCommandResult!
 	"""

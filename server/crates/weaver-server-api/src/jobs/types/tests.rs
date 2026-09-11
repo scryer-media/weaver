@@ -129,6 +129,23 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
 }
 
 #[test]
+fn propagation_hold_projects_through_table_and_detail_with_a_deadline() {
+    let mut info = base_job(JobStatus::Downloading);
+    info.download_state = weaver_server_core::DownloadState::Queued;
+    info.download_wait_reason =
+        Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON.to_string());
+    info.download_retry_at_epoch_ms = Some(1_800_000_000_000.0);
+    for item in [queue_item_from_job(&info), queue_table_item_from_job(&info)] {
+        assert_eq!(item.state, QueueItemState::Queued);
+        assert_eq!(item.download_wait_reason, info.download_wait_reason);
+        assert_eq!(
+            item.download_retry_at_epoch_ms,
+            info.download_retry_at_epoch_ms
+        );
+    }
+}
+
+#[test]
 fn queue_item_collapses_internal_waiting_states() {
     let repair = queue_item_from_job(&base_job(JobStatus::QueuedRepair));
     assert_eq!(repair.state, QueueItemState::Queued);

@@ -628,6 +628,12 @@ const fr: LocaleDictionary = {
   "upload.duplicateScore": "Score de doublon",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "Les scores les plus élevés gagnent pour la même clé ; en cas d'égalité, le candidat existant est conservé.",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "Télécharger le paquet de diagnostic",
+  "systemInfo.diagnosticsBusy": "Collecte des diagnostics…",
+  "systemInfo.diagnosticsHint": "La collecte prend environ 15 secondes : les métriques sont échantillonnées deux fois, à dix secondes d'intervalle. Les mots de passe, clés d'API et autres secrets sont supprimés.",
+  "systemInfo.diagnosticsFailed": "Le paquet de diagnostic n'a pas pu être créé.",
   ...duplicateLocaleEntries.fra,
 };
 

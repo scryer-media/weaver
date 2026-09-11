@@ -260,7 +260,7 @@ impl Pipeline {
         }
 
         self.phase_progress_snapshots = by_job;
-        self.shared_state.publish_jobs(self.list_jobs());
+        self.publish_snapshot();
         self.emit_phase_progress_update_events(now);
     }
 

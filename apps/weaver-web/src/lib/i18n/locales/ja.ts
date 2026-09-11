@@ -625,6 +625,12 @@ const ja: LocaleDictionary = {
   "upload.duplicateScore": "重複スコア",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "同じ重複キーでは高いスコアが優先され、同点の場合は既存の候補が維持されます。",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "診断パッケージをダウンロード",
+  "systemInfo.diagnosticsBusy": "診断情報を収集しています…",
+  "systemInfo.diagnosticsHint": "収集には約15秒かかります。メトリクスは10秒間隔で2回サンプリングされます。パスワードやAPIキーなどの秘密情報は削除されます。",
+  "systemInfo.diagnosticsFailed": "診断パッケージを作成できませんでした。",
   ...duplicateLocaleEntries.jpn,
 };
 

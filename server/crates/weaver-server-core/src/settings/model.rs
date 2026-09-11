@@ -25,8 +25,6 @@ pub struct Config {
     #[serde(default)]
     pub buffer_pool: Option<BufferPoolOverrides>,
     #[serde(default)]
-    pub tuner: Option<TunerOverrides>,
-    #[serde(default)]
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub categories: Vec<CategoryConfig>,
@@ -35,6 +33,9 @@ pub struct Config {
     /// Maximum download speed in bytes/sec. 0 or absent means unlimited.
     #[serde(default)]
     pub max_download_speed: Option<u64>,
+    /// Minimum post age before downloading. Zero disables the hold.
+    #[serde(default)]
+    pub propagation_delay_secs: Option<u32>,
     /// Whether to delete intermediate files (NZB articles, PAR2, RAR volumes)
     /// after successful extraction. Defaults to true.
     #[serde(default)]
@@ -122,6 +123,17 @@ impl Config {
         self.ip_replacement_trial_extra_connections
             .unwrap_or(0)
             .min(1)
+    }
+
+    /// A saved setting takes precedence over the legacy environment override.
+    pub fn propagation_delay_secs(&self) -> u32 {
+        self.propagation_delay_secs
+            .or_else(|| {
+                std::env::var("WEAVER_PROPAGATION_DELAY_SECS")
+                    .ok()
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .unwrap_or(0)
     }
 
     /// Validate the configuration, returning any issues found.
@@ -341,15 +353,6 @@ pub struct RetryOverrides {
     pub multiplier: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TunerOverrides {
-    pub max_concurrent_downloads: Option<usize>,
-    pub decode_thread_count: Option<usize>,
-    /// Number of threads in the post-processing pool (extraction, PAR2 verify/repair).
-    /// Defaults to `(physical_cores / 2).max(1)`.
-    pub extract_thread_count: Option<usize>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,7 +364,6 @@ mod tests {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: vec![ServerConfig {
                 id: 1,
                 host: "news.example.com".to_string(),
@@ -386,6 +388,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
+            propagation_delay_secs: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),

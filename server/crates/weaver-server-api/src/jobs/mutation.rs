@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use async_graphql::{Context, Object, Result, UploadValue};
 use base64::Engine;
 
-use crate::auth::{CallerIdentity, ControlGuard, graphql_error, require_admin_for_file_delete};
+use crate::auth::{CallerIdentity, ControlGuard, graphql_error};
 use crate::history::types::{
     AcceptHistoryDeleteInput, HistoryCommandResult, HistoryDeleteAcceptance, HistoryItem,
     history_delete_row_state_from_core, history_item_from_row,
@@ -331,7 +331,7 @@ impl JobsMutation {
         Ok(true)
     }
     /// Delete completed/failed/cancelled jobs from history.
-    /// `deleteFiles: true` requires admin scope.
+    /// Integration (control) scope may also delete completed output with `deleteFiles: true`.
     /// Returns the remaining history jobs after deletion.
     #[graphql(guard = "ControlGuard")]
     async fn accept_history_delete(
@@ -339,7 +339,7 @@ impl JobsMutation {
         ctx: &Context<'_>,
         input: AcceptHistoryDeleteInput,
     ) -> Result<HistoryDeleteAcceptance> {
-        require_admin_for_file_delete(ctx, input.delete_files)?;
+        // ControlGuard authorizes integration callers before durable acceptance.
         let file_delete_authorized = input.delete_files;
         let manager = ctx.data::<crate::history::delete_ops::HistoryDeleteManager>()?;
         manager
@@ -347,7 +347,7 @@ impl JobsMutation {
             .await
     }
     /// Delete a completed/failed/cancelled job from history.
-    /// `deleteFiles: true` requires admin scope.
+    /// Integration (control) scope may also delete completed output with `deleteFiles: true`.
     /// Returns the remaining history jobs after deletion.
     #[graphql(guard = "ControlGuard")]
     async fn delete_history(
@@ -356,7 +356,6 @@ impl JobsMutation {
         id: u64,
         #[graphql(default = false)] delete_files: bool,
     ) -> Result<Vec<HistoryItem>> {
-        require_admin_for_file_delete(ctx, delete_files)?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?.clone();
         handle.delete_history(JobId(id), delete_files).await?;
@@ -469,7 +468,7 @@ impl JobsMutation {
         materialize_claim_for_api(&db, handle, JobId(id)).await
     }
     /// Delete multiple completed/failed/cancelled jobs from history by ID.
-    /// `deleteFiles: true` requires admin scope.
+    /// Integration (control) scope may also delete completed output with `deleteFiles: true`.
     /// Returns the remaining history jobs after deletion.
     #[graphql(guard = "ControlGuard")]
     async fn delete_history_batch(
@@ -478,7 +477,6 @@ impl JobsMutation {
         ids: Vec<u64>,
         #[graphql(default = false)] delete_files: bool,
     ) -> Result<Vec<HistoryItem>> {
-        require_admin_for_file_delete(ctx, delete_files)?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?.clone();
         for &id in &ids {
@@ -487,14 +485,13 @@ impl JobsMutation {
         history_items_from_db(db).await
     }
     /// Delete all completed/failed/cancelled jobs from history.
-    /// `deleteFiles: true` requires admin scope.
+    /// Integration (control) scope may also delete completed output with `deleteFiles: true`.
     #[graphql(guard = "ControlGuard")]
     async fn delete_all_history(
         &self,
         ctx: &Context<'_>,
         #[graphql(default = false)] delete_files: bool,
     ) -> Result<Vec<HistoryItem>> {
-        require_admin_for_file_delete(ctx, delete_files)?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?.clone();
         handle.delete_all_history(delete_files).await?;
@@ -707,7 +704,7 @@ impl JobsMutation {
             global_state: None,
         })
     }
-    /// Remove history items by ID. `deleteFiles: true` requires admin scope.
+    /// Remove history items by ID. Integration (control) scope may also delete completed output with `deleteFiles: true`.
     #[graphql(guard = "ControlGuard")]
     async fn remove_history_items(
         &self,
@@ -715,7 +712,6 @@ impl JobsMutation {
         ids: Vec<u64>,
         #[graphql(default = false)] delete_files: bool,
     ) -> Result<HistoryCommandResult> {
-        require_admin_for_file_delete(ctx, delete_files)?;
         let handle = ctx.data::<SchedulerHandle>()?;
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         for id in &ids {
