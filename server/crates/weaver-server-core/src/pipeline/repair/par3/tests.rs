@@ -107,7 +107,10 @@ fn embedded_name_rebinding_withdraws_old_native_identity_without_rescanning() {
             .status,
         par3_rs::session::RepairStatus::Complete
     );
-    assert_eq!(job.options.scan_work.used(), scanned);
+    assert_eq!(
+        job.options.scan_work.used(),
+        scanned + 2 * replay_open_cost(bytes.len())
+    );
 }
 
 #[test]

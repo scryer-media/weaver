@@ -1333,7 +1333,7 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
 
     let target_root = tempfile::tempdir().unwrap();
     let restored_root = target_root.path().join("restored");
-    let movies_root = target_root.path().join("media/movies");
+    let movies_root = target_root.path().join("media").join("movies");
     let mut bootstrap = sample_config();
     bootstrap.data_dir = target_root.path().to_string_lossy().into_owned();
     bootstrap.intermediate_dir = None;
