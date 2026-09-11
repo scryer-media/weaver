@@ -69,7 +69,6 @@ struct IdleOwnedLane {
     /// whose client is gone simply matches nothing.
     nntp: std::sync::Weak<weaver_nntp::NntpClient>,
     server: weaver_nntp::pool::ServerId,
-    groups: Arc<[String]>,
 }
 
 impl IdleOwnedLane {
@@ -77,19 +76,19 @@ impl IdleOwnedLane {
         Self {
             nntp: Arc::downgrade(&cached.nntp),
             server: cached.lane.server_id(),
-            groups: Arc::clone(&cached.groups),
         }
     }
 
     /// Whether this connection could take `run` without redialling.
     ///
     /// Deliberately cheap and deliberately advisory: it asks only what can be
-    /// answered from the published marker — same client, a server the lease
-    /// does not exclude, and the groups the connection was opened for. Quota
-    /// and health are the worker's own `CachedOwnedLane::matches` check, which
-    /// runs against live state a moment later; guessing wrong here costs a
-    /// park and a dial on a worker that had nothing better to do, never a
-    /// wrong fetch.
+    /// answered from the published marker — same client and a server the
+    /// lease does not exclude. The newsgroups the connection was opened for do
+    /// not matter: the worker re-points its socket at the lease's groups when
+    /// they differ. Quota and health are the worker's own
+    /// `CachedOwnedLane::matches` check, which runs against live state a
+    /// moment later; guessing wrong here costs a park and a dial on a worker
+    /// that had nothing better to do, never a wrong fetch.
     fn serves(&self, run: &OwnedLaneRun) -> bool {
         self.nntp
             .upgrade()
@@ -98,8 +97,6 @@ impl IdleOwnedLane {
                 .initial_lease
                 .effective_exclude_servers
                 .contains(&self.server.0)
-            && (Arc::ptr_eq(&self.groups, &run.initial_lease.compatibility.groups)
-                || self.groups == run.initial_lease.compatibility.groups)
     }
 }
 
@@ -740,13 +737,16 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
 }
 
 impl CachedOwnedLane {
+    /// Whether this connection can carry `lease` without redialling.
+    ///
+    /// The lease's newsgroups are not a condition: a socket opened for one
+    /// job's groups serves the next job's after [`Self::adopt_groups`], which
+    /// on most servers sends nothing at all. Dropping the connection at every
+    /// job boundary instead is what turned a provider's momentary refusal of
+    /// new sockets into a stall of every lane.
     fn matches(&self, nntp: &Arc<weaver_nntp::NntpClient>, lease: &DownloadBatchLease) -> bool {
         let server = self.lane.server_id();
-        if !Arc::ptr_eq(&self.nntp, nntp)
-            || !(Arc::ptr_eq(&self.groups, &lease.compatibility.groups)
-                || self.groups == lease.compatibility.groups)
-            || lease.effective_exclude_servers.contains(&server.0)
-        {
+        if !Arc::ptr_eq(&self.nntp, nntp) || lease.effective_exclude_servers.contains(&server.0) {
             return false;
         }
 
@@ -772,6 +772,18 @@ impl CachedOwnedLane {
             return true;
         };
         cached_lane_matches_selection(server, true, &selection)
+    }
+
+    /// Re-point the cached socket at `groups` when they differ from the ones
+    /// it was opened for. `Err` means the socket could not be re-pointed and
+    /// is no longer worth keeping.
+    fn adopt_groups(&mut self, groups: &Arc<[String]>) -> weaver_nntp::Result<()> {
+        if Arc::ptr_eq(&self.groups, groups) || self.groups == *groups {
+            return Ok(());
+        }
+        self.lane.adopt_groups(groups)?;
+        self.groups = Arc::clone(groups);
+        Ok(())
     }
 }
 
@@ -991,6 +1003,19 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     // A cached connection the server closed while it sat idle serves nothing:
     // its first BODY would fail only after a read timeout and burn a retry.
     discard_closed_cached_lane(cached_lane);
+    // A connection opened for another job's newsgroups is kept and re-pointed
+    // rather than redialled; only a socket that cannot be re-pointed is let
+    // go, and the dial below then replaces it.
+    if let Some(cached) = cached_lane.as_mut()
+        && let Err(error) = cached.adopt_groups(&lease.compatibility.groups)
+    {
+        debug!(
+            server = cached.lane.server_id().0,
+            error = %error,
+            "cached owned lane could not adopt the lease's newsgroups; redialling"
+        );
+        park_cached_lane(cached_lane);
+    }
 
     if cached_lane.is_none() {
         let initial_estimate = Pipeline::bandwidth_reservation_estimate(
@@ -1616,7 +1641,6 @@ fn test_idle_lane(server: usize) -> IdleOwnedLane {
     IdleOwnedLane {
         nntp: std::sync::Weak::new(),
         server: weaver_nntp::pool::ServerId(server),
-        groups: Arc::from(vec!["alt.binaries.test".to_string()]),
     }
 }
 
@@ -2159,20 +2183,10 @@ mod routing_tests {
         })
     }
 
-    fn idle_lane(
-        nntp: &Arc<weaver_nntp::NntpClient>,
-        server: usize,
-        groups: &[&str],
-    ) -> IdleOwnedLane {
+    fn idle_lane(nntp: &Arc<weaver_nntp::NntpClient>, server: usize) -> IdleOwnedLane {
         IdleOwnedLane {
             nntp: Arc::downgrade(nntp),
             server: weaver_nntp::pool::ServerId(server),
-            groups: Arc::from(
-                groups
-                    .iter()
-                    .map(|group| (*group).to_string())
-                    .collect::<Vec<_>>(),
-            ),
         }
     }
 
@@ -2204,16 +2218,16 @@ mod routing_tests {
     #[test]
     fn a_lease_goes_to_the_worker_that_can_start_it_soonest() {
         let nntp = test_client();
-        let run = test_run(&nntp, Vec::new());
+        let run = test_run(&nntp, vec![3]);
         let mut shared = shared_with(vec![
             // 0: busy on a lease.
             None,
-            // 1: idle holding a connection this lease cannot use.
-            idle_with(Some(idle_lane(&nntp, 3, &["alt.binaries.other"]))),
+            // 1: idle holding a connection on a server this lease excludes.
+            idle_with(Some(idle_lane(&nntp, 3))),
             // 2: idle with no connection at all.
             idle_with(None),
-            // 3: idle holding exactly the connection this lease wants.
-            idle_with(Some(idle_lane(&nntp, 1, &["alt.binaries.test"]))),
+            // 3: idle holding a connection this lease can use.
+            idle_with(Some(idle_lane(&nntp, 1))),
         ]);
 
         assert_eq!(
@@ -2244,11 +2258,7 @@ mod routing_tests {
     fn claiming_a_worker_takes_it_out_of_the_running() {
         let nntp = test_client();
         let run = test_run(&nntp, Vec::new());
-        let mut shared = shared_with(vec![idle_with(Some(idle_lane(
-            &nntp,
-            0,
-            &["alt.binaries.test"],
-        )))]);
+        let mut shared = shared_with(vec![idle_with(Some(idle_lane(&nntp, 0)))]);
 
         assert_eq!(shared.claim_worker_for(&run), Some(0));
         assert_eq!(shared.claim_worker_for(&run), None);
@@ -2260,10 +2270,28 @@ mod routing_tests {
     fn an_excluded_server_is_not_a_match() {
         let nntp = test_client();
         let run = test_run(&nntp, vec![1]);
-        let lane = idle_lane(&nntp, 1, &["alt.binaries.test"]);
+        let lane = idle_lane(&nntp, 1);
 
         assert!(!lane.serves(&run));
-        assert!(idle_lane(&nntp, 0, &["alt.binaries.test"]).serves(&run));
+        assert!(idle_lane(&nntp, 0).serves(&run));
+    }
+
+    /// The newsgroups a connection was opened for are no reason to redial:
+    /// the worker re-points the socket at the next lease's groups, so a job
+    /// boundary keeps every warm connection in play.
+    #[test]
+    fn a_connection_opened_for_other_newsgroups_still_serves() {
+        let nntp = test_client();
+        let mut run = test_run(&nntp, Vec::new());
+        run.initial_lease.compatibility.groups = Arc::from(vec!["alt.binaries.other".to_string()]);
+
+        assert!(idle_lane(&nntp, 0).serves(&run));
+        let mut shared = shared_with(vec![idle_with(None), idle_with(Some(idle_lane(&nntp, 0)))]);
+        assert_eq!(
+            shared.claim_worker_for(&run),
+            Some(1),
+            "the warm connection is preferred over a fresh dial whatever its groups"
+        );
     }
 
     /// A connection belonging to a client that has been retired matches
@@ -2274,7 +2302,7 @@ mod routing_tests {
         let other = test_client();
         let run = test_run(&nntp, Vec::new());
 
-        assert!(!idle_lane(&other, 0, &["alt.binaries.test"]).serves(&run));
+        assert!(!idle_lane(&other, 0).serves(&run));
         assert!(!test_idle_lane(0).serves(&run));
     }
 
@@ -2351,7 +2379,7 @@ mod routing_tests {
         let nntp = test_client();
         let shared = shared_with(vec![
             None,
-            idle_with(Some(idle_lane(&nntp, 0, &["alt.binaries.test"]))),
+            idle_with(Some(idle_lane(&nntp, 0))),
             idle_with(None),
             idle_with(None),
         ]);
@@ -2382,7 +2410,7 @@ mod routing_tests {
                 .is_some_and(|idle| idle.lane.is_none())
         );
 
-        shared.note_idle_lane(0, Some(idle_lane(&nntp, 0, &["alt.binaries.test"])));
+        shared.note_idle_lane(0, Some(idle_lane(&nntp, 0)));
 
         assert_eq!(
             shared.claim_worker_for(&run),
@@ -2400,7 +2428,7 @@ mod routing_tests {
         let run = test_run(&nntp, Vec::new());
 
         assert_eq!(shared.claim_worker_for(&run), Some(0));
-        shared.note_idle_lane(0, Some(idle_lane(&nntp, 0, &["alt.binaries.test"])));
+        shared.note_idle_lane(0, Some(idle_lane(&nntp, 0)));
 
         assert!(
             shared.workers[0].idle.is_none(),

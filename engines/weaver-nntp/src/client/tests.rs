@@ -1016,7 +1016,11 @@ async fn blocking_tls_capacity_rejection_parks_connects_without_health_poisoning
         soft_timeout: Duration::from_secs(15),
     });
 
-    client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::TooManyConnections,
+    );
 
     assert_eq!(client.pool().configured_connections(ServerId(0)), Some(8));
     assert!(client.pool().is_over_limit(ServerId(0)));
@@ -1034,8 +1038,16 @@ async fn blocking_capacity_holdoff_never_cools_healthy_server() {
         soft_timeout: Duration::from_secs(15),
     });
 
-    client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
-    client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::TooManyConnections,
+    );
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::TooManyConnections,
+    );
 
     assert_eq!(client.pool().configured_connections(ServerId(0)), Some(2));
     assert!(client.pool().is_over_limit(ServerId(0)));
