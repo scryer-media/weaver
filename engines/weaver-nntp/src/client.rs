@@ -2351,9 +2351,7 @@ impl NntpClient {
                 permit,
             ) {
                 Ok(lane) => {
-                    if admission == FreshConnectAdmission::Probe {
-                        self.pool.note_provider_admitted(server);
-                    }
+                    self.pool.note_provider_admitted(server, admission);
                     return Ok(lane);
                 }
                 Err(error) => {
@@ -2576,9 +2574,8 @@ impl NntpClient {
         }
         // Any other failure says nothing about the provider's limit; if this
         // connect was the post-holdoff probe, let the next caller ask.
-        if admission == FreshConnectAdmission::Probe {
-            self.pool.release_over_limit_probe(ServerId(server_idx));
-        }
+        self.pool
+            .release_over_limit_probe(ServerId(server_idx), admission);
         if matches!(
             error,
             NntpError::AuthenticationFailed
