@@ -178,7 +178,11 @@ impl Pipeline {
                         .copied()
                         .unwrap_or(0),
                     active_decodes: self.active_decodes_by_job.get(job_id).copied().unwrap_or(0),
-                    pending_retries: self.pending_retries_by_job.get(job_id).copied().unwrap_or(0),
+                    pending_retries: self
+                        .pending_retries_by_job
+                        .get(job_id)
+                        .copied()
+                        .unwrap_or(0),
                     pending_released_results: self
                         .pending_released_download_results_by_job
                         .get(job_id)
@@ -248,8 +252,7 @@ impl Pipeline {
                 write_buf_max_pending: self.write_buf_max_pending,
                 decode_backlog_budget_bytes: self.decode_backlog_budget_bytes,
                 write_backlog_budget_bytes: self.write_backlog_budget_bytes,
-                download_decode_hard_pressure_latched: self
-                    .download_decode_hard_pressure_latched,
+                download_decode_hard_pressure_latched: self.download_decode_hard_pressure_latched,
                 download_write_hard_pressure_latched: self.download_write_hard_pressure_latched,
                 hard_stall_seconds: self
                     .download_pressure_hard_stall_started_at

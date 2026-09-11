@@ -241,10 +241,7 @@ pub(super) async fn run_root_field(
 
     let data = serde_json::to_value(&response.data)
         .map_err(|error| format!("`{field}` result is not representable: {error}"))?;
-    let value = data
-        .get(field)
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let value = data.get(field).cloned().unwrap_or(serde_json::Value::Null);
     Ok((value, errors))
 }
 
@@ -315,7 +312,10 @@ mod tests {
 
     #[test]
     fn recursive_types_terminate() {
-        assert_eq!(shape().root_selection("cyclic"), Some("{ name }".to_string()));
+        assert_eq!(
+            shape().root_selection("cyclic"),
+            Some("{ name }".to_string())
+        );
     }
 
     #[test]

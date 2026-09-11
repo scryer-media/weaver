@@ -137,16 +137,16 @@ pub(super) async fn diagnostics_package_handler(
     )
     .await;
 
-    let archive = match archive::build_archive(components, env!("CARGO_PKG_VERSION"), &generated_at_utc)
-    {
-        Ok(archive) => archive,
-        Err(error) => {
-            return super::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to write diagnostics archive: {error}"),
-            );
-        }
-    };
+    let archive =
+        match archive::build_archive(components, env!("CARGO_PKG_VERSION"), &generated_at_utc) {
+            Ok(archive) => archive,
+            Err(error) => {
+                return super::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to write diagnostics archive: {error}"),
+                );
+            }
+        };
 
     (
         [
@@ -492,7 +492,10 @@ async fn collect_config_files(data_dir: &Path) -> Vec<Component> {
         match entries.next_entry().await {
             Ok(Some(entry)) => {
                 let path = entry.path();
-                if path.extension().is_some_and(|extension| extension == "toml") {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "toml")
+                {
                     paths.push(path);
                 }
             }

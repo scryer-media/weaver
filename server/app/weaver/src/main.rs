@@ -111,9 +111,7 @@ async fn async_main() {
                     // Record the path the resolution above actually picked, so
                     // the diagnostics package copies the real log files rather
                     // than re-deriving the rules and guessing.
-                    weaver_server_core::runtime::log_buffer::set_log_file_path(
-                        config.path.clone(),
-                    );
+                    weaver_server_core::runtime::log_buffer::set_log_file_path(config.path.clone());
                     Some(writer)
                 }
                 Err(error) if config.explicit => {

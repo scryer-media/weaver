@@ -124,8 +124,9 @@ pub(super) fn build_archive(
         name: MANIFEST_NAME.to_string(),
         bytes: 0,
     });
-    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)
-        .map_err(|error| std::io::Error::other(format!("manifest serialization failed: {error}")))?;
+    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        std::io::Error::other(format!("manifest serialization failed: {error}"))
+    })?;
     for _ in 0..4 {
         let measured = manifest_bytes.len() as u64;
         if let Some(entry) = manifest
