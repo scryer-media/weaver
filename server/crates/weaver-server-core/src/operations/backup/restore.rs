@@ -806,8 +806,7 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        PathRemap, absolute_restore_path, job_info_from_history, rewrite_path_with_roots,
-        stored_path_has_prefix,
+        PathRemap, job_info_from_history, rewrite_path_with_roots, stored_path_has_prefix,
     };
     use std::path::PathBuf;
 
@@ -871,6 +870,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restore_targets_reject_parent_traversal() {
+        use super::absolute_restore_path;
+
         assert!(absolute_restore_path("data_dir", "/safe/../escape").is_err());
         assert_eq!(
             absolute_restore_path("data_dir", "/safe/./target").unwrap(),

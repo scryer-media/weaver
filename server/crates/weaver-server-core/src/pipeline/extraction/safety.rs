@@ -1262,14 +1262,6 @@ fn scan_capability_directory(
 }
 
 #[cfg(target_os = "windows")]
-fn is_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-        != 0
-}
-
-#[cfg(target_os = "windows")]
 fn is_windows_cap_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
     use cap_std::fs::MetadataExt;
     metadata.file_attributes()

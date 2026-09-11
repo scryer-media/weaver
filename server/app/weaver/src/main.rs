@@ -413,12 +413,12 @@ fn resolve_log_file_config(
 fn default_windows_log_file_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        return std::env::var_os("LOCALAPPDATA").map(|base| {
+        std::env::var_os("LOCALAPPDATA").map(|base| {
             PathBuf::from(base)
                 .join("weaver")
                 .join("logs")
                 .join("weaver.log")
-        });
+        })
     }
 
     #[cfg(not(windows))]

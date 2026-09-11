@@ -825,16 +825,20 @@ fn append_regular_file<W: Write>(
     let mut file = File::open(source)?;
     let mut header = tar::Header::new_gnu();
     header.set_size(metadata.len());
-    let mut mode = 0o600;
     #[cfg(unix)]
-    if preserve_executable {
+    let mode = {
         use std::os::unix::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o111 != 0 {
-            mode = 0o700;
+        if preserve_executable && metadata.permissions().mode() & 0o111 != 0 {
+            0o700
+        } else {
+            0o600
         }
-    }
+    };
     #[cfg(not(unix))]
-    let _ = preserve_executable;
+    let mode = {
+        let _ = preserve_executable;
+        0o600
+    };
     header.set_mode(mode);
     header.set_entry_type(tar::EntryType::Regular);
     header.set_cksum();
