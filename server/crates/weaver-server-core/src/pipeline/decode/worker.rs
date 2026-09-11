@@ -2652,7 +2652,61 @@ impl Pipeline {
     }
 
     async fn relieve_global_write_backlog(&mut self) -> Result<(), SegmentWriteError> {
-        while self.write_buffered_bytes > self.write_backlog_budget_bytes {
+        self.relieve_global_write_backlog_to(self.write_backlog_budget_bytes)
+            .await
+    }
+
+    /// Spill the write backlog off the hard-pressure latch without waiting
+    /// for a decode landing.
+    ///
+    /// The landing path's relief runs only when an article lands, and under
+    /// a hard latch none does: dispatch is stopped until the backlog falls
+    /// below the soft limit, while the landing relief stops at the budget.
+    /// Bytes left between the two limits by the last landing, or parked for a
+    /// demotion sweep and handed back after it, would otherwise sit there with
+    /// nothing to move them. Runs from the tune tick and from the sweep
+    /// handback, and wakes dispatch once the latch is gone.
+    pub(crate) async fn relieve_latched_write_backlog(&mut self) {
+        if !self.download_write_hard_pressure_latched {
+            return;
+        }
+        let (_, _, write_soft, _) = self.download_pressure_limits();
+        let target = usize::try_from(write_soft.saturating_sub(1)).unwrap_or(usize::MAX);
+        if let Err(error) = self.relieve_global_write_backlog_to(target).await {
+            self.fail_job_for_disk_write(error, "failed to relieve latched write backlog");
+            return;
+        }
+        if self.refresh_download_pressure().state != DownloadPressureState::Hard {
+            self.download_dispatch_wake = true;
+        }
+    }
+
+    /// Spill the articles a demotion sweep parked, now that the files are
+    /// ordinary again.
+    ///
+    /// The handback drained what was contiguous; whatever landed out of order
+    /// while the sweep owned the files is still resident, and the per-file and
+    /// global relief both skipped these files for as long as it ran. The hold
+    /// on their queued work lifts here too, so dispatch is owed a pass.
+    pub(crate) async fn relieve_handed_back_write_backlog(&mut self, volume_files: &[NzbFileId]) {
+        for file_id in volume_files {
+            if let Err(error) = self.enforce_file_write_backlog(*file_id).await {
+                self.fail_job_for_disk_write(
+                    error,
+                    "failed to relieve a handed-back volume's write backlog",
+                );
+                return;
+            }
+        }
+        self.relieve_latched_write_backlog().await;
+        self.download_dispatch_wake = true;
+    }
+
+    async fn relieve_global_write_backlog_to(
+        &mut self,
+        target_bytes: usize,
+    ) -> Result<(), SegmentWriteError> {
+        while self.write_buffered_bytes > target_bytes {
             let candidate_file = self
                 .write_buffers
                 .iter()

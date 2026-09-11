@@ -2738,3 +2738,72 @@ async fn a_split_archive_volume_without_a_recovery_set_defers_its_md5() {
     assert_eq!(checksum.crc32, par2_rs::checksum::crc32(payload));
     assert!(checksum.all_parts_crc_verified);
 }
+
+#[tokio::test]
+async fn latched_write_backlog_spills_without_a_landing_and_wakes_dispatch() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline
+        .direct_store
+        .set_gate(crate::pipeline::direct_store::DirectStoreGate::Disabled);
+    let job_id = JobId(20009);
+    let filename = "parked-backlog.bin";
+    let segment_len = 4096usize;
+    let spec = segmented_job_spec("Latched Backlog", filename, &[segment_len as u32; 4]);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    // Hard limit = the budget; the soft limit is 70% of it. Two parked
+    // articles land exactly on the hard limit, which the landing path's own
+    // relief (which stops at the budget) leaves untouched.
+    pipeline.write_backlog_budget_bytes = 2 * segment_len;
+    let (_, _, write_soft, write_hard) = pipeline.download_pressure_limits();
+    assert_eq!(write_hard as usize, 2 * segment_len);
+
+    let payloads: Vec<Vec<u8>> = (2u8..4).map(|seed| vec![seed; segment_len]).collect();
+    for (index, payload) in payloads.iter().enumerate() {
+        let segment_number = 2 + index as u32;
+        submit_decoded_segment(
+            &mut pipeline,
+            file_id,
+            segment_number,
+            segment_number as u64 * segment_len as u64,
+            payload,
+            filename,
+            None,
+        )
+        .await;
+    }
+    assert_eq!(pipeline.write_buffered_bytes, 2 * segment_len);
+    assert_eq!(
+        pipeline.refresh_download_pressure().state,
+        DownloadPressureState::Hard
+    );
+    assert!(pipeline.download_write_hard_pressure_latched);
+    pipeline.download_dispatch_wake = false;
+
+    // No article lands under the latch. The tick relief is what moves the
+    // parked bytes to disk and lets dispatch resume.
+    pipeline.relieve_latched_write_backlog().await;
+
+    assert!(
+        (pipeline.write_buffered_bytes as u64) < write_soft,
+        "resident {} must drop below the soft limit {write_soft}",
+        pipeline.write_buffered_bytes
+    );
+    assert!(!pipeline.download_write_hard_pressure_latched);
+    assert_eq!(
+        pipeline.refresh_download_pressure().state,
+        DownloadPressureState::Clear
+    );
+    assert!(pipeline.take_download_dispatch_wake());
+    let written = tokio::fs::read(working_dir.join(filename)).await.unwrap();
+    assert_eq!(&written[2 * segment_len..3 * segment_len], &payloads[0][..]);
+    assert_eq!(&written[3 * segment_len..4 * segment_len], &payloads[1][..]);
+
+    // A second pass with nothing latched is a no-op and owes no wake.
+    pipeline.relieve_latched_write_backlog().await;
+    assert!(!pipeline.take_download_dispatch_wake());
+}

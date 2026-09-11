@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::system_profile::SystemProfile;
 
-use crate::operations::metrics::{DownloadPressureState, MetricsSnapshot};
+use crate::operations::metrics::MetricsSnapshot;
 
 /// IOPS threshold for "fast" storage (SSD/NVMe). Above this, disk is not the
 /// bottleneck and we can use all configured connections. Below this, we
@@ -31,10 +31,6 @@ pub struct RuntimeTuner {
     max_concurrent_extractions_override: Option<usize>,
     /// Total connections across all configured servers (hard ceiling).
     total_connections: usize,
-    /// Number of consecutive snapshots under hard byte-pressure backpressure.
-    decode_pressure_streak: u32,
-    /// Number of consecutive snapshots where download_queue_depth == 0.
-    download_idle_streak: u32,
     /// Exponential moving average of download speed (bytes/sec).
     bandwidth_ema: f64,
 }
@@ -54,10 +50,11 @@ impl RuntimeTuner {
             env::var(MAX_CONCURRENT_EXTRACTIONS_ENV).ok().as_deref(),
         );
 
-        // Start with all configured connections — the adaptive tuner will
-        // reduce if decode pressure builds or disk can't keep up. Never cap
-        // below what the user configured; if throttling is needed, the
-        // decode_pressure_streak mechanism handles it automatically.
+        // Every configured connection is a download connection. Memory
+        // pressure changes where decoded bytes go (the write backlog spills
+        // to disk), never how many articles are requested: a connection
+        // count that ratchets down on pressure turns a transient backlog
+        // into a lasting speed loss that only a restart undoes.
         let max_concurrent_downloads = total_connections;
 
         let repair_threads = cores.max(1);
@@ -77,8 +74,6 @@ impl RuntimeTuner {
             current,
             max_concurrent_extractions_override,
             total_connections,
-            decode_pressure_streak: 0,
-            download_idle_streak: 0,
             bandwidth_ema: 0.0,
         }
     }
@@ -96,10 +91,11 @@ impl RuntimeTuner {
         &self.current
     }
 
-    /// Adjust parameters based on a metrics snapshot.
-    /// Returns true if any parameter changed.
-    pub fn adjust(&mut self, metrics: &MetricsSnapshot) -> bool {
-        // --- Bandwidth tracking ---
+    /// Fold a metrics snapshot into the bandwidth estimate.
+    ///
+    /// The connection count is not adjusted here. It is the configured total,
+    /// and only [`Self::set_connection_limit`] moves it.
+    pub fn observe(&mut self, metrics: &MetricsSnapshot) {
         // EMA with α=0.3 gives ~15-second effective window at 5s intervals.
         //
         // No connections are held back for recovery work. Recovery blocks are
@@ -111,39 +107,6 @@ impl RuntimeTuner {
         const ALPHA: f64 = 0.3;
         self.bandwidth_ema =
             ALPHA * metrics.current_download_speed as f64 + (1.0 - ALPHA) * self.bandwidth_ema;
-
-        // --- Byte-pressure / idle streaks ---
-        if metrics.download_pressure_state == DownloadPressureState::Hard {
-            self.decode_pressure_streak += 1;
-            self.download_idle_streak = 0;
-        } else if metrics.download_queue_depth == 0 {
-            self.download_idle_streak += 1;
-            self.decode_pressure_streak = 0;
-        } else {
-            self.decode_pressure_streak = 0;
-            self.download_idle_streak = 0;
-        }
-
-        const STREAK_THRESHOLD: u32 = 3;
-
-        if self.decode_pressure_streak >= STREAK_THRESHOLD
-            && self.current.max_concurrent_downloads > 1
-        {
-            self.current.max_concurrent_downloads -= 1;
-            self.decode_pressure_streak = 0;
-            return true;
-        }
-
-        if self.download_idle_streak >= STREAK_THRESHOLD {
-            let limit = self.max_downloads_limit();
-            if self.current.max_concurrent_downloads < limit {
-                self.current.max_concurrent_downloads += 1;
-                self.download_idle_streak = 0;
-                return true;
-            }
-        }
-
-        false
     }
 
     /// Upper limit for max_concurrent_downloads based on system profile

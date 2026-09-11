@@ -224,7 +224,10 @@ impl Pipeline {
         selection: DownloadWorkSelection,
         uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
     ) -> Option<DownloadWork> {
-        if bootstrap_files.is_none() {
+        // Sweep-owned files take the scanning path below, which looks past
+        // their work the way it looks past non-bootstrap work.
+        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
+        if bootstrap_files.is_none() && sweep_held.is_none() {
             if let Some(uu_cursor_ordinals) = uu_cursor_ordinals {
                 return self.jobs.get_mut(&job_id).and_then(|state| {
                     let matches = |work: &DownloadWork| {
@@ -270,6 +273,9 @@ impl Pipeline {
             let matches = |work: &DownloadWork| {
                 bootstrap_files
                     .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
+                    && sweep_held
+                        .as_deref()
+                        .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
                     && selector.is_none_or(|selector| selector.matches(work))
                     && selection.matches(work)
                     && uu_cursor_ordinals

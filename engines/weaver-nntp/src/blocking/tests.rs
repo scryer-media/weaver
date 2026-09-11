@@ -1675,3 +1675,48 @@ fn ring_abandon_reports_the_dropped_requests_and_poisons_the_lane() {
     drop(handle);
     let _ = std::fs::remove_file(ca_path);
 }
+
+#[test]
+fn tcp_peer_closed_sees_a_server_side_close_on_an_idle_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::net::TcpStream::connect(addr).unwrap();
+    let (server, _) = listener.accept().unwrap();
+
+    assert!(
+        !tcp_peer_closed(&client),
+        "an open idle socket is not closed"
+    );
+    // Bytes the server sent but the client has not read yet do not mean the
+    // server is gone, and the probe must not consume them.
+    {
+        use std::io::Write;
+        (&server).write_all(b"200 hello\r\n").unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!tcp_peer_closed(&client));
+    let mut probe = [0u8; 1];
+    assert_eq!(client.peek(&mut probe).unwrap(), 1);
+
+    drop(server);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        // The unread greeting keeps the peek answering "data": drain it, as
+        // the lane's own reads would have, then the close is visible.
+        let mut sink = [0u8; 64];
+        let _ = (&client).read(&mut sink);
+        if tcp_peer_closed(&client) {
+            closed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(closed, "a server-closed socket reports closed");
+    // The probe leaves the socket in blocking mode for the lane's own reads.
+    let mut byte = [0u8; 1];
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    assert_eq!((&client).read(&mut byte).unwrap(), 0);
+}
