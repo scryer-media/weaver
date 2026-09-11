@@ -264,11 +264,15 @@ async fn async_main() {
 
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
     let complete_dir = PathBuf::from(config.complete_dir());
-    if let Err(error) = bootstrap::ensure_runtime_directories(&[
-        ("data_dir", &data_dir),
-        ("intermediate_dir", &intermediate_dir),
-        ("complete_dir", &complete_dir),
-    ]) {
+    // Only the data folder is required to serve: a saved download folder on a
+    // drive that is gone must not stop Weaver from starting, or it could never
+    // be pointed at another one. A one-shot download needs them up front.
+    let mut required_directories = vec![("data_dir", data_dir.as_path())];
+    if matches!(command, Command::Download { .. }) {
+        required_directories.push(("intermediate_dir", intermediate_dir.as_path()));
+        required_directories.push(("complete_dir", complete_dir.as_path()));
+    }
+    if let Err(error) = bootstrap::ensure_runtime_directories(&required_directories) {
         error!("{error}");
         std::process::exit(1);
     }
