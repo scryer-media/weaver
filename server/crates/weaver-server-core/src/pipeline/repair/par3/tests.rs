@@ -4,6 +4,13 @@ use par3_rs::source::MemorySourceAccess;
 pub(super) const INDEX: &[u8] = include_bytes!("../backend/fixtures/set.par3");
 pub(super) const RECOVERY: &[u8] = include_bytes!("../backend/fixtures/set.vol0+1.par3");
 
+/// Scan work a replayed open of an unchanged disk source charges. Windows has
+/// no inode identity, so each open hashes the whole source once to establish
+/// its generation; Unix identifies it from metadata for free.
+fn replay_open_cost(len: usize) -> u64 {
+    if cfg!(windows) { len as u64 + 1 } else { 0 }
+}
+
 #[test]
 fn retired_binding_identity_cannot_be_published() {
     let mut job = Par3Job::default();
@@ -66,7 +73,10 @@ fn embedded_name_rebinding_withdraws_old_native_identity_without_rescanning() {
     assert!(view.files[0].source.is_none());
     assert!(view.embedded_source.is_none());
     assert!(view.verified_sources.is_empty());
-    assert_eq!(job.options.scan_work.used(), scanned);
+    assert_eq!(
+        job.options.scan_work.used(),
+        scanned + replay_open_cost(bytes.len())
+    );
     let matched_read = job.options.diagnostics.source_io().read_bytes;
     assert!(
         matched_read > read,
@@ -197,7 +207,10 @@ fn embedded_late_metadata_rewinds_once_and_preserves_hole_continuity() {
             .unwrap();
     }
     assert_eq!(job.options.diagnostics.source_io().read_bytes, read);
-    assert_eq!(job.options.scan_work.used(), scanned);
+    assert_eq!(
+        job.options.scan_work.used(),
+        scanned + 3 * replay_open_cost(bytes.len())
+    );
 
     // The same rewind must preserve the retry point for an unavailable prefix
     // of the first packet; no unavailable carrier bytes become implicit zeroes.
@@ -733,12 +746,13 @@ fn disk_carrier_replays_validate_identity_and_logical_generation() {
     assert_eq!(available_recovery(&mut job), 1);
     let snapshot = job.sources.snapshot(id).unwrap();
     let revision = job.sources.revision(id).unwrap();
-    let scanned = job.options.scan_work.used();
+    let mut scanned = job.options.scan_work.used();
     for ranges in [
         None,
         Some(std::iter::once(0..RECOVERY.len() as u64).collect()),
     ] {
         job.scan_file(id, path.clone(), ranges).unwrap();
+        scanned += replay_open_cost(RECOVERY.len());
         assert_eq!(job.sources.snapshot(id).unwrap(), snapshot);
         assert_eq!(job.sources.revision(id).unwrap(), revision);
         assert_eq!(job.options.scan_work.used(), scanned);

@@ -338,11 +338,6 @@ impl Socks5Front {
         if request[0] != SOCKS5_VERSION {
             return Err(Socks5Failure::Protocol("request is not SOCKS5"));
         }
-        if request[1] != CMD_CONNECT {
-            let _ = reply(stream, REPLY_COMMAND_NOT_SUPPORTED).await;
-            return Err(Socks5Failure::Protocol("only CONNECT is supported"));
-        }
-
         let host = match request[3] {
             ATYP_IPV4 => {
                 let mut octets = [0u8; 4];
@@ -379,6 +374,13 @@ impl Socks5Front {
 
         let mut port = [0u8; 2];
         stream.read_exact(&mut port).await?;
+        // Refuse the command only once the whole request has been consumed:
+        // closing a socket with unread bytes turns into a reset on some
+        // platforms, and the peer would never see the reply.
+        if request[1] != CMD_CONNECT {
+            let _ = reply(stream, REPLY_COMMAND_NOT_SUPPORTED).await;
+            return Err(Socks5Failure::Protocol("only CONNECT is supported"));
+        }
         Ok((host, u16::from_be_bytes(port)))
     }
 }

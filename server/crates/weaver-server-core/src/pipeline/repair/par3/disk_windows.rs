@@ -26,6 +26,14 @@ impl Stamp {
     fn read(path: &Path, options: &ExecutionOptions) -> io::Result<Self> {
         // Declare the lease first so the file closes before capacity is released.
         let _lease = options.handles.acquire().map_err(io::Error::other)?;
+        // Opening a directory is refused outright here; report it the way the
+        // engine's own source access does so callers see one error kind.
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "PAR3 source is not a regular file",
+            ));
+        }
         let file = File::open(path)?;
         let mut identity = BY_HANDLE_FILE_INFORMATION::default();
         let mut basic = FILE_BASIC_INFO::default();

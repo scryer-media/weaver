@@ -147,7 +147,11 @@ fn idle_maintenance_runs_full_vacuum_for_large_freelist() {
     assert!(!report.incremental_vacuum_ran);
     assert!(report.after.freelist_count < before.freelist_count);
     assert!(report.after.page_count < before.page_count);
-    assert!(report.after.db_size_bytes.unwrap_or(u64::MAX) < before.db_size_bytes.unwrap());
+    assert!(
+        report.after.db_size_bytes.unwrap_or(u64::MAX) < before.db_size_bytes.unwrap(),
+        "before {before:?} after {:?}",
+        report.after
+    );
 }
 
 #[test]

@@ -165,7 +165,8 @@ password = "pass"
 connections = 10
 active = true
 "#,
-            data_dir.display()
+            // A TOML basic string escapes the backslashes of a Windows path.
+            data_dir.display().to_string().replace('\\', "\\\\")
         )
         .unwrap();
     }
