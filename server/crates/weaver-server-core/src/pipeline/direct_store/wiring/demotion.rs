@@ -608,8 +608,9 @@ impl Pipeline {
             refetched_bytes = summary.refetched_bytes,
             "direct-store set materialized from its own routed bytes"
         );
-        self.finish_demoted_set_handback(done.job_id, volume_files)
+        self.finish_demoted_set_handback(done.job_id, volume_files.clone())
             .await;
+        self.relieve_handed_back_write_backlog(&volume_files).await;
         self.schedule_job_completion_check(done.job_id);
     }
 

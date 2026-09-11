@@ -213,7 +213,6 @@ impl Pipeline {
             hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
             hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
-            deferred_lane_refills: std::collections::VecDeque::new(),
             download_dispatch_wake: false,
             nntp_handoff_draining: false,
             ip_replacement_trial_extra_connections,
@@ -1073,9 +1072,6 @@ impl Pipeline {
                         self.sample_phase_progress();
                         self.shared_state.refresh_metrics_snapshot();
                         self.flush_pending_snapshot();
-                        // Fallback wake for refills held under hard pressure, in
-                        // case the backlog drained without a download event.
-                        self.maybe_service_deferred_lane_refills();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
@@ -1085,6 +1081,7 @@ impl Pipeline {
                     }
                     _ = tune_interval.tick() => {
                         self.flush_quiescent_write_backlog().await;
+                        self.relieve_latched_write_backlog().await;
                         self.refresh_download_pressure();
                         self.publish_download_transport_health();
 
@@ -1140,12 +1137,7 @@ impl Pipeline {
                             "pipeline tick"
                         );
 
-                        if self.tuner.adjust(&snapshot) {
-                            info!(
-                                max_downloads = self.tuner.params().max_concurrent_downloads,
-                                "tuner adjusted parameters"
-                            );
-                        }
+                        self.tuner.observe(&snapshot);
                     }
                     _ = stalled_download_interval.tick() => {
                         self.auto_pause_stalled_downloads();
@@ -1442,7 +1434,6 @@ impl Pipeline {
         self.direct_unpack_shutdown("pipeline shutting down").await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
-        self.deferred_lane_refills.clear();
         self.drain_inflight_download_and_decode_work().await;
         self.flush_quiescent_write_backlog().await;
 

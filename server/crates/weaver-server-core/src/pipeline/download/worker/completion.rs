@@ -384,7 +384,6 @@ impl Pipeline {
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
         self.release_download_result(&result);
         self.process_download_done(result).await;
-        self.maybe_service_deferred_lane_refills();
     }
 
     pub(crate) fn released_download_result_lead_bytes(result: &DownloadResult) -> u64 {
@@ -461,7 +460,6 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) {
             self.maybe_finish_download_pass(job_id);
         }
-        self.maybe_service_deferred_lane_refills();
     }
 
     pub(crate) async fn process_download_done(&mut self, result: DownloadResult) {

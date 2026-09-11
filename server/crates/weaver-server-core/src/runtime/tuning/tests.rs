@@ -1,5 +1,5 @@
-use crate::DownloadPressureReason;
 use crate::runtime::system_profile::*;
+use crate::{DownloadPressureReason, DownloadPressureState};
 
 use super::*;
 
@@ -199,63 +199,17 @@ fn initial_params_hdd() {
     assert_eq!(p.decode_thread_count, 8);
 }
 
+/// Hard byte pressure never moves the connection count. Pressure is flow
+/// control on where decoded bytes go, not on how many articles are asked for.
 #[test]
-fn adjust_reduces_downloads() {
+fn hard_pressure_never_reduces_downloads() {
     let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(4), TEST_CONNECTIONS);
-    let initial = tuner.params().max_concurrent_downloads;
-
-    // Simulate hard byte pressure.
     let mut m = empty_metrics();
     m.download_pressure_state = DownloadPressureState::Hard;
-
-    // Need 3 consecutive observations before adjustment.
-    assert!(!tuner.adjust(&m));
-    assert!(!tuner.adjust(&m));
-    assert!(tuner.adjust(&m));
-    assert_eq!(tuner.params().max_concurrent_downloads, initial - 1);
-}
-
-#[test]
-fn adjust_increases_downloads() {
-    let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(4), TEST_CONNECTIONS);
-
-    // First reduce downloads so there's room to increase.
-    let mut pressure = empty_metrics();
-    pressure.download_pressure_state = DownloadPressureState::Hard;
-    for _ in 0..3 {
-        tuner.adjust(&pressure);
+    for _ in 0..50 {
+        tuner.observe(&m);
     }
-    let reduced = tuner.params().max_concurrent_downloads;
-
-    // Now simulate idle download queue.
-    let mut idle = empty_metrics();
-    idle.download_queue_depth = 0;
-
-    assert!(!tuner.adjust(&idle));
-    assert!(!tuner.adjust(&idle));
-    assert!(tuner.adjust(&idle));
-    assert_eq!(tuner.params().max_concurrent_downloads, reduced + 1);
-}
-
-#[test]
-fn adjust_respects_minimums() {
-    let mut tuner = RuntimeTuner::with_connection_limit(ssd_profile(1), 2);
-    // With 1 core, 2 connections on SSD: max_concurrent_downloads = 2.
-
-    let mut pressure = empty_metrics();
-    pressure.download_pressure_state = DownloadPressureState::Hard;
-
-    // Reduce from 2 to 1.
-    for _ in 0..3 {
-        tuner.adjust(&pressure);
-    }
-    assert_eq!(tuner.params().max_concurrent_downloads, 1);
-
-    // Try to reduce further -- should stay at 1.
-    for _ in 0..6 {
-        tuner.adjust(&pressure);
-    }
-    assert_eq!(tuner.params().max_concurrent_downloads, 1);
+    assert_eq!(tuner.params().max_concurrent_downloads, TEST_CONNECTIONS);
 }
 
 #[test]
@@ -303,7 +257,7 @@ fn no_bandwidth_band_reserves_connections_for_recovery() {
         m.current_download_speed = speed_mb_s * 1024 * 1024;
 
         for _ in 0..10 {
-            tuner.adjust(&m);
+            tuner.observe(&m);
         }
 
         assert_eq!(

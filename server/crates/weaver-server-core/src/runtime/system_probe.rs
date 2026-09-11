@@ -275,10 +275,40 @@ fn detect_memory_bytes() -> Option<(u64, u64)> {
         Some((total?, available?))
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        windows_memory_bytes()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         None
     }
+}
+
+/// Windows: `GlobalMemoryStatusEx` reports physical total and available.
+#[cfg(windows)]
+fn windows_memory_bytes() -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    // SAFETY: `status` is a properly sized, initialized MEMORYSTATUSEX and
+    // outlives the call.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 || status.ullTotalPhys == 0 {
+        return None;
+    }
+    Some((status.ullTotalPhys, status.ullAvailPhys))
 }
 
 /// Parse a `/proc/meminfo` value like `"  16384000 kB"` into bytes.
@@ -643,7 +673,12 @@ fn detect_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
         linux_disk_info(output_dir)
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        windows_disk_info(output_dir)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = output_dir;
         (
@@ -651,6 +686,173 @@ fn detect_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
             FilesystemType::Unknown(String::new()),
         )
     }
+}
+
+/// Windows: the volume behind the directory answers the filesystem name, the
+/// drive type says whether it is a network share, and the storage device
+/// behind the volume says whether it incurs a seek penalty (rotational).
+#[cfg(windows)]
+fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DRIVE_REMOTE, GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
+    };
+
+    let target = std::fs::canonicalize(output_dir)
+        .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("."))))
+        .unwrap_or_else(|_| output_dir.to_path_buf());
+    let wide: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut volume_root = [0u16; 260];
+    // SAFETY: both buffers are valid for the lengths passed.
+    let ok = unsafe {
+        GetVolumePathNameW(
+            wide.as_ptr(),
+            volume_root.as_mut_ptr(),
+            volume_root.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return (
+            StorageClass::Unknown,
+            FilesystemType::Unknown(String::new()),
+        );
+    }
+    let root_len = volume_root
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(volume_root.len());
+    let root_wide = &volume_root[..root_len];
+
+    let mut fs_name = [0u16; 64];
+    // SAFETY: `volume_root` is NUL-terminated; the name buffer is sized as passed.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            volume_root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    };
+    let filesystem = if ok == 0 {
+        FilesystemType::Unknown(String::new())
+    } else {
+        let len = fs_name
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(fs_name.len());
+        let name = std::ffi::OsString::from_wide(&fs_name[..len])
+            .to_string_lossy()
+            .into_owned();
+        parse_filesystem_type(&name)
+    };
+
+    // SAFETY: `volume_root` is NUL-terminated.
+    let drive_type = unsafe { GetDriveTypeW(volume_root.as_ptr()) };
+    if drive_type == DRIVE_REMOTE {
+        return (StorageClass::Network, filesystem);
+    }
+
+    let storage_class = windows_seek_penalty(root_wide)
+        .map(|incurs_seek_penalty| {
+            if incurs_seek_penalty {
+                StorageClass::Hdd
+            } else {
+                StorageClass::Ssd
+            }
+        })
+        .unwrap_or(StorageClass::Unknown);
+    (storage_class, filesystem)
+}
+
+/// Ask the storage device behind a volume root like `C:\` whether it incurs a
+/// seek penalty. `None` when the volume has no drive letter (a mounted folder)
+/// or the device does not answer the query.
+#[cfg(windows)]
+fn windows_seek_penalty(volume_root: &[u16]) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{
+        DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
+        STORAGE_PROPERTY_QUERY, StorageDeviceSeekPenaltyProperty,
+    };
+
+    // `X:\` → `\\.\X:`; anything without a drive letter is not addressable
+    // as a volume device this way.
+    let letter = match volume_root {
+        [letter, colon, ..]
+            if *colon == u16::from(b':')
+                && u8::try_from(*letter).is_ok_and(|c| c.is_ascii_alphabetic()) =>
+        {
+            *letter
+        }
+        _ => return None,
+    };
+    let device: Vec<u16> = "\\\\.\\"
+        .encode_utf16()
+        .chain([letter, u16::from(b':'), 0])
+        .collect();
+
+    // SAFETY: `device` is NUL-terminated; zero desired access is enough for
+    // a property query and needs no privilege.
+    let handle = unsafe {
+        CreateFileW(
+            device.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR {
+        Version: 0,
+        Size: 0,
+        IncursSeekPenalty: false,
+    };
+    let mut returned: u32 = 0;
+    // SAFETY: the in/out buffers are properly sized structs that outlive the call.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&query as *const STORAGE_PROPERTY_QUERY).cast(),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            (&mut descriptor as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR).cast(),
+            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: `handle` came from a successful CreateFileW and is closed once.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 || (returned as usize) < std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() {
+        return None;
+    }
+    Some(descriptor.IncursSeekPenalty)
 }
 
 /// macOS: use `diskutil info` to detect storage class and filesystem.
@@ -830,7 +1032,7 @@ fn linux_filesystem_type(path: &Path) -> FilesystemType {
 }
 
 /// Map a filesystem name string to our enum.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn parse_filesystem_type(s: &str) -> FilesystemType {
     let lower = s.to_lowercase();
     if lower.contains("apfs") {

@@ -129,7 +129,7 @@ const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
-    state: DownloadPressureState,
+    pub(in crate::pipeline) state: DownloadPressureState,
     reason: DownloadPressureReason,
     decode_backlog_bytes: u64,
     /// Resident bytes control shared write pressure.
