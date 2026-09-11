@@ -200,7 +200,6 @@ impl TestHarness {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: vec![],
             categories: vec![],
             retry: None,

@@ -29,7 +29,6 @@ fn sample_config() -> Config {
         intermediate_dir: Some("/old/data/intermediate".into()),
         complete_dir: Some("/old/data/complete".into()),
         buffer_pool: None,
-        tuner: None,
         servers: vec![ServerConfig {
             id: 1,
             host: "news.example.com".into(),

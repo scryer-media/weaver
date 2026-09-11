@@ -775,7 +775,6 @@ mod tests {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: vec![ServerConfig {
                 id: 1,
                 host: "ui.example.com".to_string(),

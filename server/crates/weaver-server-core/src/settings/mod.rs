@@ -9,5 +9,4 @@ pub mod service;
 pub use model::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
     DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SharedConfig,
-    TunerOverrides,
 };

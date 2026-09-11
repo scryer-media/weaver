@@ -1136,8 +1136,6 @@ impl Pipeline {
                             health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                             "pipeline tick"
                         );
-
-                        self.tuner.observe(&snapshot);
                     }
                     _ = stalled_download_interval.tick() => {
                         self.auto_pause_stalled_downloads();
