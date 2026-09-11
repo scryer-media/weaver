@@ -121,3 +121,32 @@ fn startup_profile_defers_random_read_measurement() {
     let profile = detect_startup_profile(Path::new("/tmp"));
     assert_eq!(profile.disk.random_read_iops, 0.0);
 }
+
+/// The Windows arms read the machine, not the defaults the other arms fall
+/// back to: real memory figures, and a storage class and filesystem for the
+/// temp directory that the seek-penalty and volume queries actually answered.
+#[cfg(windows)]
+#[test]
+fn windows_probes_read_real_memory_and_disk() {
+    let (total, available) = windows_memory_bytes().expect("GlobalMemoryStatusEx answers");
+    assert!(total > 0, "total memory must be reported");
+    assert!(available > 0 && available <= total, "{available} of {total}");
+    assert_eq!(detect_total_memory_bytes(), Some(total));
+
+    let dir = std::env::temp_dir();
+    let (storage_class, filesystem) = windows_disk_info(&dir);
+    assert!(
+        matches!(
+            storage_class,
+            StorageClass::Ssd | StorageClass::Hdd | StorageClass::Network
+        ),
+        "temp dir storage class must be probed, got {storage_class:?}"
+    );
+    assert!(
+        !matches!(&filesystem, FilesystemType::Unknown(name) if name.is_empty()),
+        "temp dir filesystem must be named, got {filesystem:?}"
+    );
+    let (class_again, fs_again) = detect_disk_info(&dir);
+    assert_eq!(class_again, storage_class);
+    assert_eq!(fs_again, filesystem);
+}
