@@ -130,7 +130,10 @@ fn startup_profile_defers_random_read_measurement() {
 fn windows_probes_read_real_memory_and_disk() {
     let (total, available) = windows_memory_bytes().expect("GlobalMemoryStatusEx answers");
     assert!(total > 0, "total memory must be reported");
-    assert!(available > 0 && available <= total, "{available} of {total}");
+    assert!(
+        available > 0 && available <= total,
+        "{available} of {total}"
+    );
     assert_eq!(detect_total_memory_bytes(), Some(total));
 
     let dir = std::env::temp_dir();
