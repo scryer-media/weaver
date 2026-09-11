@@ -455,6 +455,12 @@ fn spawn_blocking_probe_server(
                 } else {
                     head_reply.to_vec()
                 }
+            } else if let Some(group) = upper.strip_prefix("GROUP ") {
+                if matches!(group.trim(), "ALT.TEST" | "ALT.OTHER") {
+                    format!("211 1 1 1 {}\r\n", group.trim().to_ascii_lowercase()).into_bytes()
+                } else {
+                    b"411 no such newsgroup\r\n".to_vec()
+                }
             } else if upper.starts_with("QUIT") {
                 let _ = socket.write_all(b"205 closing\r\n");
                 break;
@@ -467,6 +473,92 @@ fn spawn_blocking_probe_server(
         }
     });
     (port, seen, handle)
+}
+
+fn group_lines(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.to_ascii_uppercase().starts_with("GROUP "))
+        .cloned()
+        .collect()
+}
+
+fn probe_server_lane(config: &ServerConfig, groups: &[&str]) -> BlockingBodyLane {
+    let groups: Vec<String> = groups.iter().map(|group| (*group).to_string()).collect();
+    BlockingBodyLane::connect(
+        ServerId(0),
+        StableServerId(9001),
+        None,
+        config,
+        &[],
+        0,
+        &groups,
+        Duration::from_secs(30),
+        crate::pool::BlockingConnectionPermit::for_tests(),
+    )
+    .expect("lane connects to the probe server")
+}
+
+/// On a server that has never demanded a selected group, moving a lane to
+/// another job's newsgroups sends nothing: BODY by message-id needs no group.
+#[test]
+fn adopting_groups_on_an_ordinary_server_sends_nothing() {
+    let (port, seen, handle) =
+        spawn_blocking_probe_server(&[], b"430 no such article\r\n", b"430 no such article\r\n");
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut lane = probe_server_lane(&config, &["alt.test"]);
+    lane.adopt_groups(&["alt.other".to_string()]).unwrap();
+    lane.adopt_groups(&[]).unwrap();
+    lane.park();
+    handle.join().unwrap();
+
+    assert!(
+        group_lines(&seen).is_empty(),
+        "no GROUP should have gone out; saw {:?}",
+        seen.lock().unwrap()
+    );
+}
+
+/// On a server that insists on a selected group, the lane walks the next
+/// job's candidates on the socket it already holds, the same way a fresh
+/// connect would, and skips the round trip when the group is unchanged.
+#[test]
+fn adopting_groups_on_a_group_requiring_server_selects_them_in_place() {
+    let (port, seen, handle) =
+        spawn_blocking_probe_server(&[], b"430 no such article\r\n", b"430 no such article\r\n");
+    let config = probe_config(port);
+    crate::server_caps::forget(&config.host, config.port);
+    crate::server_caps::note_group_required(&config.host, config.port);
+
+    let mut lane = probe_server_lane(&config, &["alt.test"]);
+    assert_eq!(group_lines(&seen), vec!["GROUP alt.test".to_string()]);
+
+    lane.adopt_groups(&["alt.missing".to_string(), "alt.other".to_string()])
+        .unwrap();
+    assert_eq!(
+        group_lines(&seen),
+        vec![
+            "GROUP alt.test".to_string(),
+            "GROUP alt.missing".to_string(),
+            "GROUP alt.other".to_string(),
+        ],
+        "a 411 candidate is skipped and the next one selected"
+    );
+
+    // Already selected: nothing goes out.
+    lane.adopt_groups(&["alt.other".to_string()]).unwrap();
+    assert_eq!(group_lines(&seen).len(), 3);
+
+    // No candidate the server holds: the lane says so rather than pretending.
+    let error = lane.adopt_groups(&["alt.missing".to_string()]).unwrap_err();
+    assert!(matches!(error, NntpError::NoSuchGroup), "{error:?}");
+
+    lane.park();
+    handle.join().unwrap();
+    crate::server_caps::forget(&config.host, config.port);
 }
 
 fn probe_config(port: u16) -> ServerConfig {

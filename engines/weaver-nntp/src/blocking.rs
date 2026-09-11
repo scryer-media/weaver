@@ -311,6 +311,28 @@ impl BlockingBodyLane {
         }
     }
 
+    /// Point an established lane at another job's newsgroups.
+    ///
+    /// A body lane fetches by message-id, which needs no selected group on
+    /// most servers, so on those this costs nothing. A server that has proven
+    /// it insists on one gets the same GROUP walk a fresh connect runs, on
+    /// the socket already open — which is the point: a job boundary no longer
+    /// costs the lane its connection. Call it only between leases, with no
+    /// BODY outstanding.
+    pub fn adopt_groups(&mut self, groups: &[String]) -> Result<()> {
+        if !self.conn.needs_group_prologue() || groups.is_empty() {
+            return Ok(());
+        }
+        for group in groups {
+            match self.conn.select_group(group) {
+                Ok(()) => return Ok(()),
+                Err(NntpError::NoSuchGroup) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(NntpError::NoSuchGroup)
+    }
+
     pub fn server_id(&self) -> ServerId {
         self.server_id
     }
