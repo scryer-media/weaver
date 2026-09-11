@@ -628,6 +628,12 @@ const ko: LocaleDictionary = {
   "upload.duplicateScore": "중복 점수",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "같은 중복 키에서는 점수가 높은 후보가 이기며, 동점이면 기존 후보를 유지합니다.",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "진단 패키지 다운로드",
+  "systemInfo.diagnosticsBusy": "진단 정보를 수집하는 중…",
+  "systemInfo.diagnosticsHint": "수집에는 약 15초가 걸립니다. 메트릭은 10초 간격으로 두 번 샘플링됩니다. 비밀번호, API 키 등의 비밀 정보는 제거됩니다.",
+  "systemInfo.diagnosticsFailed": "진단 패키지를 만들 수 없습니다.",
   ...duplicateLocaleEntries.kor,
 };
 

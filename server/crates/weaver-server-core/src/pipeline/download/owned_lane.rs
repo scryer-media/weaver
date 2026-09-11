@@ -505,7 +505,6 @@ impl OwnedDownloadLanePool {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn worker_count(&self) -> usize {
         lock_pool(&self.shared).workers.len()
     }

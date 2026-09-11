@@ -24,6 +24,17 @@ pub fn detect(output_dir: &Path) -> SystemProfile {
     profile
 }
 
+/// Classify the storage behind one directory without measuring it.
+///
+/// The startup profile only ever describes a single directory, so a caller that
+/// wants the class and filesystem of a *second* configured root (the
+/// intermediate or complete directory, say) has no way to ask for it. This is
+/// the same classification the startup profile uses, with no benchmark attached:
+/// it runs the platform's filesystem lookup and nothing else.
+pub fn classify_storage(path: &Path) -> (StorageClass, FilesystemType) {
+    detect_disk_info(path)
+}
+
 /// Collect the fast system facts needed to start the runtime.
 ///
 /// Random-read IOPS is intentionally left at zero until
