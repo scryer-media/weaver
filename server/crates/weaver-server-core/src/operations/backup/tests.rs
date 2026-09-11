@@ -81,6 +81,7 @@ fn sample_config() -> Config {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn backup_temp_directory_is_owner_only() {
     let directory = create_backup_temp_dir().unwrap();
