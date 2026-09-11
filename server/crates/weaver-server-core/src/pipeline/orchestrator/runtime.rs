@@ -115,11 +115,20 @@ impl Pipeline {
         }
 
         tokio::fs::create_dir_all(&data_dir).await?;
-        tokio::fs::create_dir_all(&intermediate_dir).await?;
-        tokio::fs::create_dir_all(&complete_dir).await?;
+        // A download folder on a drive that is gone must not stop Weaver from
+        // starting, or it could never be pointed at another one.
+        for dir in [&intermediate_dir, &complete_dir] {
+            if let Err(error) = tokio::fs::create_dir_all(dir).await {
+                warn!(path = %dir.display(), error = %error, "download folder unavailable");
+            }
+        }
         let uu_spool_root = intermediate_dir.join(".uu-park");
         let cleanup_root = uu_spool_root.clone();
-        tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await??;
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await?
+        {
+            warn!(path = %uu_spool_root.display(), error = %error, "failed to clear the stale UU spool");
+        }
         let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
         let process_memory_budget =
             Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));

@@ -149,7 +149,7 @@ fn winget_installer_manifest_uses_weaver_msi_contract() {
     assert!(manifest.contains("PackageIdentifier: ScryerMedia.Weaver"));
     assert!(manifest.contains("PackageVersion: 0.6.6"));
     assert!(manifest.contains("InstallerType: msi"));
-    assert!(manifest.contains("UpgradeBehavior: uninstallPrevious"));
+    assert!(manifest.contains("UpgradeBehavior: install"));
     assert!(manifest.contains("ProductCode: '{694CA1CE-CB74-486A-BB1A-005D1D2051A2}'"));
     assert!(manifest.contains("ProductCode: '{AD8E9924-5148-4052-9A91-E4B7B47C9CD7}'"));
     assert!(manifest.contains("Architecture: x64"));

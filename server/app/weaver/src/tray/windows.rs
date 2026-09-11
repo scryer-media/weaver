@@ -83,8 +83,8 @@ use super::tray_ipc::{
 };
 
 use super::shared::{
-    self, DEFAULT_PORT, PopoverContent, QueueRow, SERVER_READY_TIMEOUT, SMOKE_SUCCESS_LINE,
-    SMOKE_TIMEOUT, ServerSupervisor,
+    self, DEFAULT_PORT, PopoverContent, QueueRow, SMOKE_SUCCESS_LINE, SMOKE_TIMEOUT,
+    ServerSupervisor,
 };
 
 const MUTEX_NAMESPACE: &str = "Global\\ScryerMedia.Weaver.Desktop.v1.Tray.";
@@ -182,6 +182,7 @@ enum LaunchMode {
     Login,
     Shutdown,
     UnregisterStartup,
+    UninstallCleanup,
     WebviewSmoke,
 }
 
@@ -189,6 +190,10 @@ pub(super) fn run() -> Result<(), String> {
     match launch_mode()? {
         LaunchMode::UnregisterStartup => return unregister_startup(),
         LaunchMode::Shutdown => return shutdown_existing_instance(),
+        LaunchMode::UninstallCleanup => {
+            uninstall_cleanup();
+            return Ok(());
+        }
         LaunchMode::WebviewSmoke => return smoke::run(),
         LaunchMode::Interactive | LaunchMode::Login => {}
     }
@@ -304,6 +309,7 @@ fn launch_mode() -> Result<LaunchMode, String> {
         Some(value) if value == "--login-start" => Ok(LaunchMode::Login),
         Some(value) if value == "--shutdown" => Ok(LaunchMode::Shutdown),
         Some(value) if value == "--unregister-startup" => Ok(LaunchMode::UnregisterStartup),
+        Some(value) if value == "--uninstall-cleanup" => Ok(LaunchMode::UninstallCleanup),
         Some(value) if value == "--webview-smoke" => Ok(LaunchMode::WebviewSmoke),
         Some(value) if value == "--version" || value == "-V" => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -419,6 +425,44 @@ fn shutdown_existing_instance() -> Result<(), String> {
     Err("timed out waiting for the existing Weaver tray to stop".to_string())
 }
 
+/// How often, and how far apart, an uninstall tries to remove the profile.
+/// WebView2's browser processes outlive the tray by a moment and hold its
+/// data open until they exit.
+const PROFILE_REMOVAL_ATTEMPTS: u32 = 20;
+const PROFILE_REMOVAL_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Remove what Weaver keeps for this Windows user: the Credential Manager
+/// key, and the profile's database, logs and WebView2 data. The MSI runs this
+/// on uninstall once the tray has stopped. The uninstall may be silent, so
+/// nothing here may raise a dialog, and a leftover file must not fail it.
+fn uninstall_cleanup() {
+    let profile_dir = match shared::desktop_profile_dir() {
+        Ok(profile_dir) => profile_dir,
+        Err(error) => {
+            eprintln!("Weaver: {error}");
+            return;
+        }
+    };
+    if let Err(error) =
+        weaver_server_core::persistence::encryption::delete_windows_credential_key(&profile_dir)
+    {
+        eprintln!("Weaver: {error}");
+    }
+    for attempt in 1..=PROFILE_REMOVAL_ATTEMPTS {
+        let problems = shared::remove_desktop_profile(&profile_dir);
+        if problems.is_empty() {
+            return;
+        }
+        if attempt == PROFILE_REMOVAL_ATTEMPTS {
+            for problem in problems {
+                eprintln!("Weaver: {problem}");
+            }
+            return;
+        }
+        thread::sleep(PROFILE_REMOVAL_RETRY_DELAY);
+    }
+}
+
 struct TrayState {
     supervisor: ServerSupervisor,
     login_start: bool,
@@ -489,11 +533,24 @@ impl TrayState {
     unsafe fn initialize(&mut self, window: HWND) -> Result<(), String> {
         // SAFETY: The window is live for the duration of tray initialization.
         unsafe { self.add_icon(window)? };
-        if self.login_start {
-            self.supervisor.start()?;
+        let started = if self.login_start {
+            self.supervisor.start()
         } else {
-            self.enable_startup()?;
-            self.open_weaver(window)?;
+            if let Err(error) = self.enable_startup() {
+                show_error("Weaver", &error);
+            }
+            self.open_weaver(window)
+        };
+        // A server that cannot start leaves the tray up: its menu is how the
+        // user tries again and finds the log, and a tray that vanished would
+        // leave them neither.
+        if let Err(error) = started {
+            show_error(
+                "Weaver",
+                &format!(
+                    "{error}\n\nWeaver is still in the notification area: choose Open Weaver to try again, or Open Logs."
+                ),
+            );
         }
         Ok(())
     }
@@ -600,13 +657,7 @@ impl TrayState {
 
     fn wait_for_ready_server(&mut self) -> Result<(), String> {
         self.supervisor.start()?;
-        if !shared::wait_for_server(self.supervisor.port(), SERVER_READY_TIMEOUT) {
-            return Err(format!(
-                "timed out waiting for Weaver to become ready at {}",
-                shared::app_origin(self.supervisor.port())
-            ));
-        }
-        Ok(())
+        self.supervisor.wait_until_ready()
     }
 
     /// Create the app window and start WebView2 in it.

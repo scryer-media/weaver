@@ -1624,7 +1624,7 @@ PackageVersion: {version}\n\
 InstallerType: msi\n\
 InstallModes:\n\
 - silent\n\
-UpgradeBehavior: uninstallPrevious\n\
+UpgradeBehavior: install\n\
 ReleaseDate: {release_date}\n\
 Installers:\n\
 {installers}\n\
