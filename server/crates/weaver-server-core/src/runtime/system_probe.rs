@@ -5,7 +5,7 @@
 //! since this only executes once during initialization.
 
 use std::path::Path;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 use std::path::{Component, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
@@ -392,14 +392,14 @@ fn detect_cgroup_memory_limit() -> Option<u64> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 #[derive(Debug, Clone)]
 struct CgroupMount {
     root: PathBuf,
     mount_point: PathBuf,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn cgroup_memory_limit_from(
     cgroups: &str,
     mountinfo: &str,
@@ -423,7 +423,7 @@ fn cgroup_memory_limit_from(
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn cgroup_path_for_controller<'a>(cgroups: &'a str, controller: Option<&str>) -> Option<&'a str> {
     cgroups.lines().find_map(|line| {
         let mut fields = line.splitn(3, ':');
@@ -438,7 +438,7 @@ fn cgroup_path_for_controller<'a>(cgroups: &'a str, controller: Option<&str>) ->
     })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn cgroup_mount_for(
     mountinfo: &str,
     filesystem: &str,
@@ -471,7 +471,7 @@ fn cgroup_mount_for(
     })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn cgroup_limit_in_hierarchy(
     mount: &CgroupMount,
     cgroup_path: &str,
@@ -497,7 +497,7 @@ fn cgroup_limit_in_hierarchy(
     limit
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn cgroup_directory(mount: &CgroupMount, cgroup_path: &str) -> Option<PathBuf> {
     let group = Path::new(cgroup_path).strip_prefix("/").ok()?;
     let root = mount.root.strip_prefix("/").ok()?;
@@ -517,7 +517,7 @@ fn cgroup_directory(mount: &CgroupMount, cgroup_path: &str) -> Option<PathBuf> {
     Some(directory)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn parse_cgroup_memory_limit(value: &str) -> Option<u64> {
     let value = value.trim();
     if value == "max" {
