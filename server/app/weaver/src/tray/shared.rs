@@ -884,7 +884,12 @@ fn last_logged_error(log_file: &Path, offset: u64) -> Option<String> {
 /// The message of a log line written at ERROR, without its timestamp, level
 /// and target.
 fn logged_error_message(line: &str) -> Option<String> {
-    let (_, rest) = line.split_once(" ERROR ")?;
+    let (timestamp, rest) = line.split_once(" ERROR ")?;
+    // The level follows the timestamp; a line whose message mentions ERROR
+    // has more than a timestamp before it.
+    if timestamp.contains(' ') {
+        return None;
+    }
     // The target is a module path, so it has no spaces.
     let message = match rest.split_once(": ") {
         Some((target, message)) if !target.contains(' ') => message,
@@ -1111,6 +1116,12 @@ mod tests {
     fn only_error_lines_carry_a_start_failure() {
         assert_eq!(
             logged_error_message("2026-09-11T10:00:00.000-04:00  WARN weaver: slow disk"),
+            None
+        );
+        assert_eq!(
+            logged_error_message(
+                "2026-09-11T10:00:00.000-04:00  INFO weaver: the server said ERROR and went on"
+            ),
             None
         );
         assert_eq!(

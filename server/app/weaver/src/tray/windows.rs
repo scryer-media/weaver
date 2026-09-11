@@ -431,8 +431,8 @@ fn shutdown_existing_instance() -> Result<(), String> {
 const PROFILE_REMOVAL_ATTEMPTS: u32 = 20;
 const PROFILE_REMOVAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-/// Remove what Weaver keeps for this Windows user: the Credential Manager
-/// key, and the profile's database, logs and WebView2 data. The MSI runs this
+/// Remove what Weaver keeps for this Windows user: the profile's database,
+/// logs and WebView2 data, and the Credential Manager key. The MSI runs this
 /// on uninstall once the tray has stopped. The uninstall may be silent, so
 /// nothing here may raise a dialog, and a leftover file must not fail it.
 fn uninstall_cleanup() {
@@ -443,23 +443,31 @@ fn uninstall_cleanup() {
             return;
         }
     };
-    if let Err(error) =
-        weaver_server_core::persistence::encryption::delete_windows_credential_key(&profile_dir)
-    {
-        eprintln!("Weaver: {error}");
-    }
     for attempt in 1..=PROFILE_REMOVAL_ATTEMPTS {
         let problems = shared::remove_desktop_profile(&profile_dir);
         if problems.is_empty() {
-            return;
+            break;
         }
         if attempt == PROFILE_REMOVAL_ATTEMPTS {
             for problem in problems {
                 eprintln!("Weaver: {problem}");
             }
-            return;
+            break;
         }
         thread::sleep(PROFILE_REMOVAL_RETRY_DELAY);
+    }
+    // The key goes only once the database it encrypts is gone. A database
+    // that could not be removed would otherwise be unreadable after a
+    // reinstall, and the server refuses to start rather than replace a lost
+    // key.
+    if profile_dir.join("weaver.db").exists() {
+        eprintln!("Weaver: the database is still present, keeping its Credential Manager key");
+        return;
+    }
+    if let Err(error) =
+        weaver_server_core::persistence::encryption::delete_windows_credential_key(&profile_dir)
+    {
+        eprintln!("Weaver: {error}");
     }
 }
 
