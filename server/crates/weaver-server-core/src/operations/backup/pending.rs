@@ -814,7 +814,13 @@ fn write_promotion_phase(
 }
 
 fn sync_file(path: &Path) -> Result<(), BackupServiceError> {
-    std::fs::File::open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Flushing a file's buffers on Windows is refused on a read-only handle.
+    #[cfg(windows)]
+    options.write(true);
+    options
+        .open(path)
         .and_then(|file| file.sync_all())
         .map_err(io_err)
 }
