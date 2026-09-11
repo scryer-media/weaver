@@ -7,6 +7,10 @@ with every connection shown as in use, until Weaver was restarted. It also stops
 Weaver from lowering its own connection count after a stall, and adds a
 one-click diagnostics package to System Info for problem reports.
 
+On Windows, Weaver now starts even when a saved download folder is on a drive
+that is gone, the desktop app reports why a start failed instead of timing out,
+and uninstalling removes Weaver's data while keeping downloaded files.
+
 ## What changed
 
 ### Download reliability
@@ -51,8 +55,32 @@ one-click diagnostics package to System Info for problem reports.
 - The archive is served by `GET /api/system/diagnostics`, which requires an
   administrator.
 
+### Startup
+
+- **A missing download folder no longer stops Weaver from starting.** Only the
+  data folder is required to serve. When the saved intermediate or completed
+  download folder cannot be created, for example because it is on a drive that
+  is no longer attached, Weaver starts, logs a warning, and the folder can be
+  changed in Settings. Previously Weaver exited at startup, so a folder on a
+  lost drive could never be pointed anywhere else. A one-shot `weaver download`
+  still requires both folders up front.
+
 ### Windows
 
+- **A failed start says why.** When the server the desktop app starts cannot
+  come up, because of a locked database, a port in use or a folder that cannot
+  be created, the app now reports the error the server logged, with the
+  location of the log, instead of waiting 30 seconds and reporting a timeout.
+  On Windows the tray stays in the notification area, so **Open Weaver** can
+  try again and **Open Logs** leads to the log.
+- **Uninstall removes Weaver's data, and upgrades keep it.** Uninstalling the
+  MSI now deletes the uninstalling user's Weaver profile: the database, logs,
+  WebView2 data and the Credential Manager key that protects stored passwords.
+  The `complete`, `intermediate` and `scripts` folders inside the profile are
+  kept while they hold anything, so downloaded files survive. A version
+  upgrade, including through winget, keeps settings and the queue: the winget
+  manifest now installs over the previous version instead of uninstalling it
+  first.
 - **Memory and storage are measured instead of assumed.** Weaver now reads
   physical and available memory on Windows and classifies its storage
   (filesystem, network share, and whether the drive has a seek penalty, as a
@@ -76,3 +104,7 @@ one-click diagnostics package to System Info for problem reports.
 - Stored `tuner.*` override settings are now ignored. They never affected the
   running tuner, so behavior does not change; existing values stay in the
   database untouched.
+- **Windows:** uninstalling 0.11.6 or later removes the database, history,
+  settings and stored passwords of the user who uninstalls. Take a backup from
+  Settings first if you want to keep them. Upgrading from an earlier version,
+  by running the new MSI or through winget, keeps everything.
