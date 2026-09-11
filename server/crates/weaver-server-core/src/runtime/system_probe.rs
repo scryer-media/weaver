@@ -706,8 +706,11 @@ fn detect_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
 fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use windows_sys::Win32::Storage::FileSystem::{
-        DRIVE_REMOTE, GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
+        GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
     };
+    // `GetDriveTypeW` result for a network drive. The constant lives in a
+    // windows-sys module this crate does not otherwise pull in.
+    const DRIVE_REMOTE: u32 = 4;
 
     let target = std::fs::canonicalize(output_dir)
         .or_else(|_| std::fs::canonicalize(output_dir.parent().unwrap_or(Path::new("."))))

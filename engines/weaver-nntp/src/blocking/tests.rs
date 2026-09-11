@@ -2,9 +2,9 @@ use super::*;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::net::TcpListener;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 #[cfg(not(windows))]
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
