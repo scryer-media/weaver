@@ -15,7 +15,8 @@ use crate::error::{NntpError, Result};
 use crate::fused_yenc::{FusedArticleBody, FusedYencArticleStats, FusedYencError};
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{
-    BodyServerAvailability, NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig,
+    BodyServerAvailability, FreshConnectAdmission, NntpPool, PoolConfig, PooledConnection,
+    ServerId, ServerPoolConfig,
 };
 use crate::tls::TransportReadStats;
 use crate::transfer::{
@@ -2311,13 +2312,6 @@ impl NntpClient {
         let mut provider_capacity_error = None;
         let mut other_error = None;
         for server in selection.eligible {
-            // Blocking lanes always open a fresh socket, so a held-off server
-            // can only answer with the holdoff error. Skipping it here keeps
-            // surplus lanes parked instead of re-attempting every dispatch.
-            if let Some(until_epoch_ms) = self.pool.over_limit_until_epoch_ms(server) {
-                provider_capacity_error = Some(NntpError::ServerOverLimit { until_epoch_ms });
-                continue;
-            }
             let permit = match self.pool.try_acquire_blocking_permit(server) {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -2332,6 +2326,18 @@ impl NntpClient {
             if !supports_blocking_body_lane(&config) {
                 continue;
             }
+            // Blocking lanes always open a fresh socket, so a held-off server
+            // can only answer with the holdoff error. Skipping it here keeps
+            // surplus lanes parked instead of re-attempting every dispatch.
+            // Asked with the permit in hand so that the one caller admitted
+            // as the post-holdoff probe is a caller that will actually dial.
+            let admission = match self.pool.admit_fresh_connect(server) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    provider_capacity_error = Some(error);
+                    continue;
+                }
+            };
             let started = Instant::now();
             match crate::blocking::BlockingBodyLane::connect(
                 server,
@@ -2344,9 +2350,14 @@ impl NntpClient {
                 self.soft_timeout,
                 permit,
             ) {
-                Ok(lane) => return Ok(lane),
+                Ok(lane) => {
+                    if admission == FreshConnectAdmission::Probe {
+                        self.pool.note_provider_admitted(server);
+                    }
+                    return Ok(lane);
+                }
                 Err(error) => {
-                    self.record_blocking_connect_failure(server.0, &error);
+                    self.record_blocking_connect_failure(server.0, admission, &error);
                     // Debug for every failure, and one WARN per server per
                     // window carrying how many it stands for. A lane that
                     // cannot connect is invisible otherwise: the work is
@@ -2550,13 +2561,25 @@ impl NntpClient {
         })
     }
 
-    fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
+    fn record_blocking_connect_failure(
+        &self,
+        server_idx: usize,
+        admission: FreshConnectAdmission,
+        error: &NntpError,
+    ) {
         if matches!(error, NntpError::TooManyConnections) {
             // Provider admission pressure parks new sockets, it does not make
             // the server unhealthy. Cooling the whole server here would also
             // block already-established healthy lanes from refilling.
             self.pool.note_provider_over_limit(ServerId(server_idx));
-        } else if matches!(
+            return;
+        }
+        // Any other failure says nothing about the provider's limit; if this
+        // connect was the post-holdoff probe, let the next caller ask.
+        if admission == FreshConnectAdmission::Probe {
+            self.pool.release_over_limit_probe(ServerId(server_idx));
+        }
+        if matches!(
             error,
             NntpError::AuthenticationFailed
                 | NntpError::AuthenticationRejected
