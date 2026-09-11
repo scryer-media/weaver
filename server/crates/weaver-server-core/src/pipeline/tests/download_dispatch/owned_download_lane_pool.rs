@@ -3399,11 +3399,10 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
     );
     assert!(pipeline.pending_completion_checks.is_empty());
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let work = pipeline
-        .retry_rx
-        .try_recv()
+    let work = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+        .await
         .expect("source miss should requeue against another server")
+        .expect("retry channel must stay open")
         .work;
     assert_eq!(work.exclude_servers, vec![0]);
     assert_eq!(work.retry_count, 0);

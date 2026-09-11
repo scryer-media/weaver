@@ -1399,7 +1399,13 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
         .unwrap();
     assert_eq!(
         tv.dest_dir.as_deref(),
-        Some(restored_root.join("complete/tv").to_string_lossy().as_ref())
+        Some(
+            restored_root
+                .join("complete")
+                .join("tv")
+                .to_string_lossy()
+                .as_ref()
+        )
     );
     let movies = restored
         .categories

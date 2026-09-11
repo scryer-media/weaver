@@ -236,8 +236,17 @@ pub fn apply_pending_restore(
 ) -> Result<(Database, Option<PendingRestoreOutcome>), BackupServiceError> {
     cleanup_completed_restores(data_dir)?;
     let root = pending_restore_path(data_dir);
-    let result = apply_pending_restore_inner(db, data_dir, &root);
+    let mut live_db = Some(db);
+    let result = apply_pending_restore_inner(&mut live_db, data_dir, &root);
     if let Err(error) = &result {
+        if let Some(db) = live_db.take() {
+            // A failed promotion hands nothing back to the caller, so close the
+            // handle deterministically instead of leaving its connections to
+            // shut down in the background: Windows refuses to replace or delete
+            // the database files while any of them are still open, which would
+            // make the next attempt fail on a sharing violation.
+            let _ = db.close();
+        }
         if read_promotion_journal(&root)
             .ok()
             .flatten()
@@ -326,19 +335,30 @@ fn cleanup_restore_location_pointers(root: &Path) -> Result<(), BackupServiceErr
     Ok(())
 }
 
+/// Runs the promotion with the live handle parked in `live_db`; the slot is
+/// emptied only when the handle is handed back or consumed by the promotion,
+/// so the caller can close whatever is still open when a step fails.
 fn apply_pending_restore_inner(
-    db: Database,
+    live_db: &mut Option<Database>,
     data_dir: &Path,
     root: &Path,
 ) -> Result<(Database, Option<PendingRestoreOutcome>), BackupServiceError> {
+    let take_db = |live_db: &mut Option<Database>| {
+        live_db
+            .take()
+            .expect("live database handle stays parked until the restore finishes")
+    };
     if !root.exists() {
-        return Ok((db, None));
+        return Ok((take_db(live_db), None));
     }
     if !root.join(READY_MARKER).is_file() {
         cleanup_restore_location_pointers(root)?;
         std::fs::remove_dir_all(root).map_err(io_err)?;
-        return Ok((db, None));
+        return Ok((take_db(live_db), None));
     }
+    let db = live_db
+        .as_ref()
+        .expect("live database handle stays parked until the restore finishes");
     let metadata = read_pending_metadata(root)?;
     let ready_restore_id = std::fs::read_to_string(root.join(READY_MARKER)).map_err(io_err)?;
     if ready_restore_id.trim() != metadata.restore_id {
@@ -405,7 +425,7 @@ fn apply_pending_restore_inner(
             &std::fs::read(root.join("instance-secrets.json")).map_err(io_err)?,
         )
         .map_err(|error| BackupServiceError::Validation(error.to_string()))?;
-        revalidate_logical_pending(&db, root, &manifest)?;
+        revalidate_logical_pending(db, root, &manifest)?;
         let key = crate::persistence::encryption::EncryptionKey::from_base64(
             &secrets.encryption_master_key,
         )
@@ -419,7 +439,7 @@ fn apply_pending_restore_inner(
         .map_err(|error| BackupServiceError::Io(error.to_string()))?;
     let db = if let Some(live_path) = sqlite_path {
         apply_sqlite_restore(
-            db,
+            live_db,
             root,
             &metadata,
             manifest.as_ref().map(|(manifest, _)| manifest),
@@ -429,7 +449,7 @@ fn apply_pending_restore_inner(
         )?
     } else {
         apply_postgres_restore(
-            db,
+            take_db(live_db),
             root,
             &metadata,
             manifest.as_ref().map(|(manifest, _)| manifest),
@@ -452,9 +472,11 @@ fn apply_pending_restore_inner(
     ))
 }
 
+/// Runs the sqlite promotion with the live handle parked in `live_db`, so the
+/// caller can close whichever handle is still open when a step fails.
 #[allow(clippy::too_many_arguments)]
 fn apply_sqlite_restore(
-    mut db: Database,
+    live_db: &mut Option<Database>,
     root: &Path,
     metadata: &PendingRestoreMetadata,
     manifest: Option<&BackupManifest>,
@@ -524,32 +546,41 @@ fn apply_sqlite_restore(
         sync_file(&prepared)?;
     }
 
+    let mut db = live_db
+        .take()
+        .expect("sqlite restore steps start with the live database handle");
     let target = db.database_target().clone();
     if journal_phase(journal) < PromotionPhase::DatabaseInstalled {
         if prepared.exists() {
-            db.checkpoint_sqlite()
-                .map_err(|error| BackupServiceError::Io(error.to_string()))?;
-            db.close()
-                .map_err(|error| BackupServiceError::Io(error.to_string()))?;
+            let checkpoint = db.checkpoint_sqlite();
+            let closed = db.close();
+            checkpoint.map_err(|error| BackupServiceError::Io(error.to_string()))?;
+            closed.map_err(|error| BackupServiceError::Io(error.to_string()))?;
             remove_sqlite_sidecars(live_path)?;
             replace_sqlite_database(&prepared, live_path)?;
         } else {
             if !live_path.is_file() {
+                *live_db = Some(db);
                 return Err(BackupServiceError::Validation(
                     "prepared restore database disappeared before promotion".into(),
                 ));
             }
             db.set_encryption_key(restored_key.clone());
-            require_database_restore_marker(&db, &metadata.restore_id).map_err(|_| {
-                BackupServiceError::Validation(
-                    "prepared restore database disappeared before it was installed".into(),
-                )
-            })?;
-            validate_restored_database(&db, manifest)?;
-            db.checkpoint_sqlite()
-                .map_err(|error| BackupServiceError::Io(error.to_string()))?;
-            db.close()
-                .map_err(|error| BackupServiceError::Io(error.to_string()))?;
+            let validated = require_database_restore_marker(&db, &metadata.restore_id)
+                .map_err(|_| {
+                    BackupServiceError::Validation(
+                        "prepared restore database disappeared before it was installed".into(),
+                    )
+                })
+                .and_then(|()| validate_restored_database(&db, manifest));
+            if let Err(error) = validated {
+                *live_db = Some(db);
+                return Err(error);
+            }
+            let checkpoint = db.checkpoint_sqlite();
+            let closed = db.close();
+            checkpoint.map_err(|error| BackupServiceError::Io(error.to_string()))?;
+            closed.map_err(|error| BackupServiceError::Io(error.to_string()))?;
             remove_sqlite_sidecars(live_path)?;
         }
         *journal = Some(write_promotion_phase(
@@ -574,12 +605,15 @@ fn apply_sqlite_restore(
     let mut restored =
         Database::open_target(target).map_err(|error| BackupServiceError::Io(error.to_string()))?;
     restored.set_encryption_key(restored_key.clone());
-    validate_restored_database(&restored, manifest)?;
-    clear_database_restore_marker(&restored, &metadata.restore_id)?;
+    let restored = live_db.insert(restored);
+    validate_restored_database(restored, manifest)?;
+    clear_database_restore_marker(restored, &metadata.restore_id)?;
     restored
         .checkpoint_sqlite()
         .map_err(|error| BackupServiceError::Io(error.to_string()))?;
-    Ok(restored)
+    Ok(live_db
+        .take()
+        .expect("restored database handle is parked until promotion completes"))
 }
 
 fn apply_postgres_restore(

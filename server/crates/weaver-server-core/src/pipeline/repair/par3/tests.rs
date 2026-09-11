@@ -89,7 +89,10 @@ fn embedded_name_rebinding_withdraws_old_native_identity_without_rescanning() {
         job.assess().unwrap();
     }
     assert_eq!(job.options.diagnostics.source_io().read_bytes, matched_read);
-    assert_eq!(job.options.scan_work.used(), scanned);
+    assert_eq!(
+        job.options.scan_work.used(),
+        scanned + replay_open_cost(bytes.len())
+    );
     job.scan_embedded(SourceId(0), path, "archive.zip".into(), None, 0)
         .unwrap();
     job.assess().unwrap();
