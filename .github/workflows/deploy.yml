@@ -333,6 +333,133 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.rust-test-sccache-restore.outputs.cache-primary-key }}
 
+  rust-clippy-windows:
+    name: rust-clippy-windows-x86_64
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 90
+    needs: [changes, verify-release-tag, web-build]
+    env:
+      CARGO_INCREMENTAL: "0"
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
+      # cfg(not(windows)) dependency and is never compiled here.
+      CC_x86_64_pc_windows_msvc: clang-cl
+      CXX_x86_64_pc_windows_msvc: clang-cl
+    steps:
+      - name: Keep checked-out line endings as committed
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
+          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
+          Invoke-WebRequest $url -OutFile nasm.zip
+          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive nasm.zip -DestinationPath C:\nasm
+          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Exclude build dir from Windows Defender
+        shell: pwsh
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+          } catch {
+            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
+          }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          key: clippy-windows-x86_64
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Run clippy
+        run: cargo clippy --workspace --locked --lib --bins --tests --examples --benches -- -D warnings
+
+  rust-test-windows:
+    name: rust-test-windows-x86_64
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+    needs: [changes, verify-release-tag, web-build]
+    env:
+      CARGO_INCREMENTAL: "0"
+      AWS_LC_SYS_USE_SYSTEM: "0"
+      AWS_LC_SYS_STATIC: "1"
+      AWS_LC_SYS_SMALL: "0"
+      AWS_LC_SYS_CMAKE_BUILDER: "0"
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
+      # cfg(not(windows)) dependency and is never compiled here.
+      CC_x86_64_pc_windows_msvc: clang-cl
+      CXX_x86_64_pc_windows_msvc: clang-cl
+    steps:
+      - name: Keep checked-out line endings as committed
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Hydrate Rust test fixtures
+        shell: bash
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_RUST_TEST_INCLUDE" --exclude=""
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip"
+          $expectedSha256 = "e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4"
+          Invoke-WebRequest $url -OutFile nasm.zip
+          $actualSha256 = (Get-FileHash nasm.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "NASM checksum mismatch: expected $expectedSha256, got $actualSha256"
+          }
+          Expand-Archive nasm.zip -DestinationPath C:\nasm
+          $dir = (Get-ChildItem C:\nasm -Directory | Select-Object -First 1).FullName
+          $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Exclude build dir from Windows Defender
+        shell: pwsh
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+          } catch {
+            Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
+          }
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          key: test-windows-x86_64
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+        with:
+          tool: nextest
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Run Rust tests
+        run: cargo nextest run --workspace --locked --no-fail-fast
+
   rust-test-arm:
     name: rust-test-arm-yenc
     needs: [changes]
