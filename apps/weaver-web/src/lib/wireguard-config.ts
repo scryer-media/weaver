@@ -187,3 +187,27 @@ function joinConfigList(values: readonly string[]): string {
     .filter((entry) => entry !== "")
     .join("\n");
 }
+
+/**
+ * Take the value out of a `Key = value` line when the key is one this field
+ * answers to, and hand back anything else untouched, so a line copied out of a
+ * configuration is worth exactly as much as the bare value.
+ *
+ * Matching the key by name is what makes this safe: a base64 key ends in `=` as
+ * well, but `xJ4…` is not an attribute name, so such a value is kept whole. A
+ * multi-line value is a PEM block rather than an assignment, and is returned as
+ * it arrived.
+ */
+export function stripConfigAssignment(raw: string, keys: readonly string[]): string {
+  const trimmed = raw.trim();
+  if (trimmed.includes("\n")) {
+    return trimmed;
+  }
+  const value = stripTrailingComment(trimmed);
+  const separator = value.indexOf("=");
+  if (separator === -1) {
+    return value;
+  }
+  const name = value.slice(0, separator).trim().toLowerCase();
+  return keys.includes(name) ? value.slice(separator + 1).trim() : value;
+}
