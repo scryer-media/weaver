@@ -830,17 +830,31 @@ mod tests {
             },
         ];
 
+        // Rewritten paths are rebuilt one component at a time under the new
+        // root, so the expected values use the host's own separator.
         assert_eq!(
             rewrite_path_with_roots("/old/complete/movie/file.mkv", &roots),
-            new_complete.join("movie/file.mkv").display().to_string()
+            new_complete
+                .join("movie")
+                .join("file.mkv")
+                .display()
+                .to_string()
         );
         assert_eq!(
             rewrite_path_with_roots("/old/intermediate/job/file.part", &roots),
-            new_intermediate.join("job/file.part").display().to_string()
+            new_intermediate
+                .join("job")
+                .join("file.part")
+                .display()
+                .to_string()
         );
         assert_eq!(
             rewrite_path_with_roots("/old/complete-ish/file", &roots),
-            "/new/complete-ish/file"
+            PathBuf::from("/new")
+                .join("complete-ish")
+                .join("file")
+                .display()
+                .to_string()
         );
     }
 
@@ -853,7 +867,9 @@ mod tests {
 
         assert_eq!(
             rewrite_path_with_roots(r"c:\weaver\data\complete\Movie\Feature.mkv", &roots),
-            PathBuf::from("/library/Movie/Feature.mkv")
+            PathBuf::from("/library")
+                .join("Movie")
+                .join("Feature.mkv")
                 .display()
                 .to_string()
         );

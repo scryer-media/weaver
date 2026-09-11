@@ -6,7 +6,6 @@
 
 pub(crate) mod keystore;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod key_file;
 #[cfg(target_os = "linux")]
 mod linux;

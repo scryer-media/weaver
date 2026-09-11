@@ -422,11 +422,14 @@ async fn logical_backup_rejects_a_master_key_that_cannot_decrypt_its_data() {
         serde_json::to_vec_pretty(&manifest).unwrap(),
     )
     .unwrap();
-    let tampered = tempfile::NamedTempFile::new().unwrap();
-    archive::write_bundle_archive(tampered.path(), "secret-pass", unpacked.path()).unwrap();
+    // The archive writer renames its staging file over the destination, which
+    // Windows refuses while another handle holds that destination open.
+    let tampered_dir = tempfile::tempdir().unwrap();
+    let tampered = tampered_dir.path().join("tampered.enc");
+    archive::write_bundle_archive(&tampered, "secret-pass", unpacked.path()).unwrap();
 
     let error = service
-        .inspect_backup(tampered.path(), Some("secret-pass".into()))
+        .inspect_backup(&tampered, Some("secret-pass".into()))
         .await
         .unwrap_err();
     assert!(
@@ -1212,12 +1215,14 @@ async fn restore_requires_category_remap_for_external_paths() {
         },
     );
 
+    // The restore target has to be absolute on the host running the test.
+    let new_data = tempfile::tempdir().unwrap();
     let err = target_service
         .restore_backup(
             archive.path(),
             Some("backup-secret".into()),
             RestoreOptions {
-                data_dir: "/new/data".into(),
+                data_dir: new_data.path().to_string_lossy().into_owned(),
                 intermediate_dir: None,
                 complete_dir: None,
                 category_remaps: vec![],

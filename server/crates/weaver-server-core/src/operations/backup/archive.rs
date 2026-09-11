@@ -1247,10 +1247,16 @@ mod bundle_envelope_tests {
             "tables/com1.txt",
             "tables/name:stream",
             "tables/trailing.",
-            r"tables\settings.ndjson",
         ] {
             assert!(!is_portable_archive_path(Path::new(path)), "{path}");
         }
+        // A backslash inside a component is what a Unix host would write for
+        // this name; on Windows the same string is an ordinary two-component
+        // path, so only Unix hosts can observe the rejection.
+        #[cfg(not(windows))]
+        assert!(!is_portable_archive_path(Path::new(
+            r"tables\settings.ndjson"
+        )));
         assert!(is_portable_archive_path(Path::new(
             "tables/settings.ndjson"
         )));

@@ -41,8 +41,22 @@ fn local_agent_key_generation_uses_weaver_key_shape() {
     assert_eq!(key.len(), 36);
 }
 
+/// Provisioning shells out to the `sqlite3` CLI, which not every host has.
+fn sqlite3_cli_available() -> bool {
+    Command::new("sqlite3")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[test]
 fn local_agent_key_provisioning_is_admin_and_rotates_the_previous_dev_key() {
+    if !sqlite3_cli_available() {
+        eprintln!("skipping: the sqlite3 CLI is not installed on this host");
+        return;
+    }
     let state = tempfile::tempdir().unwrap();
     let db_path = state.path().join("weaver.db");
     let mut schema = Command::new("sqlite3");
