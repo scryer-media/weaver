@@ -802,6 +802,13 @@ fn windows_seek_penalty(volume_root: &[u16]) -> Option<bool> {
         STORAGE_PROPERTY_QUERY, StorageDeviceSeekPenaltyProperty,
     };
 
+    // A root derived from a canonicalized path carries the verbatim prefix
+    // (`\\?\C:\`); the drive letter follows it.
+    let verbatim: Vec<u16> = "\\\\?\\".encode_utf16().collect();
+    let volume_root = volume_root
+        .strip_prefix(verbatim.as_slice())
+        .unwrap_or(volume_root);
+
     // `X:\` → `\\.\X:`; anything without a drive letter is not addressable
     // as a volume device this way.
     let letter = match volume_root {

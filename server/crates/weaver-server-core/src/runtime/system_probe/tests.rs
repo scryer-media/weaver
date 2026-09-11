@@ -38,6 +38,7 @@ fn startup_and_extraction_memory_consumers_share_cached_process_facts() {
     assert_eq!(cgroup_probes.load(Ordering::Relaxed), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn nested_cgroup_v2_memory_limits_include_systemd_ancestors() {
     let limit = cgroup_memory_limit_from(
@@ -56,6 +57,7 @@ fn nested_cgroup_v2_memory_limits_include_systemd_ancestors() {
     assert_eq!(limit, Some(2_u64 << 30));
 }
 
+#[cfg(unix)]
 #[test]
 fn cgroup_v1_memory_limit_ignores_unlimited_ancestors() {
     let limit = cgroup_memory_limit_from(
