@@ -1,5 +1,12 @@
 [profile.default]
 # A test that leaves a child holding stdout or stderr open is a test failure.
-# The same-binary supervisor needs a bounded grace to drain its relays under
-# parallel suite load before nextest judges the inherited handles leaked.
 leak-timeout = { period = "2s", result = "fail" }
+
+# macOS has no pipe2, so the standard library creates a test's stdio pipes and
+# sets close-on-exec in two steps. A sibling test spawned inside that window
+# inherits the pipe and keeps it open after the test it belongs to has exited,
+# which the leak detector then reports against the innocent test. Linux creates
+# the pipes atomically and keeps the strict policy.
+[[profile.default.overrides]]
+platform = { host = 'cfg(target_os = "macos")' }
+leak-timeout = { period = "2s", result = "pass" }
