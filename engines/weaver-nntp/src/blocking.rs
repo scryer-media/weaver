@@ -323,6 +323,22 @@ impl BlockingBodyLane {
         if !self.conn.needs_group_prologue() || groups.is_empty() {
             return Ok(());
         }
+        // A GROUP written behind an unread BODY response would read that
+        // article's payload as its own status line; a poisoned socket cannot
+        // be re-pointed at all. Either way the lane is not worth keeping.
+        if self.conn.poisoned
+            || !self.ring.outstanding.is_empty()
+            || !self.conn.body_accounting.is_empty()
+        {
+            return Err(NntpError::ConnectionClosed);
+        }
+        // Already on one of the candidates: the walk would only get there
+        // after a 411 for each candidate ahead of it.
+        if let Some(current) = self.conn.current_group()
+            && groups.iter().any(|group| group == current)
+        {
+            return Ok(());
+        }
         for group in groups {
             match self.conn.select_group(group) {
                 Ok(()) => return Ok(()),

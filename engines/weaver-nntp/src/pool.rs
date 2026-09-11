@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::OwnedSemaphorePermit;
@@ -86,15 +86,11 @@ pub struct NntpPool {
     /// Per-server deadline (unix epoch ms, `0` = none) before which fresh
     /// connects are skipped because the provider refused the last one.
     over_limit_until: Vec<AtomicU64>,
-    /// Per-server count of consecutive refused connects in the current
-    /// over-limit episode; each one doubles the next holdoff. `0` means no
-    /// episode is running.
-    over_limit_refusals: Vec<AtomicU32>,
-    /// Per-server epoch ms at which one caller was let through to probe the
-    /// provider after a holdoff ended (`0` = nobody probing). One socket at a
-    /// time asks whether the provider will accept again; the rest keep
-    /// waiting until that answer is in.
-    over_limit_probe_started: Vec<AtomicU64>,
+    /// Per-server state of the episode behind `over_limit_until`: how many
+    /// connects in a row the provider has refused, and whether one caller is
+    /// out probing it. Only episode transitions take this lock; the steady
+    /// state reads the atomic deadline alone.
+    over_limit_episodes: Vec<SyncMutex<OverLimitEpisode>>,
     /// Per-server epoch-ms floor for the next blocking-connect warning, and the
     /// failures suppressed since the last one was emitted. A server that cannot
     /// be connected to fails on every dispatch pass, so an unthrottled warning
@@ -165,8 +161,25 @@ pub enum FreshConnectAdmission {
     /// that it accepts again.
     Open,
     /// The one connect allowed out after a holdoff to ask whether the
-    /// provider accepts new sockets again. Its outcome settles the episode.
-    Probe,
+    /// provider accepts new sockets again. Its outcome settles the episode —
+    /// unless the slot has changed hands since it was admitted, in which
+    /// case the later word stands. The token names this probe among those
+    /// the server has issued.
+    Probe { token: u64 },
+}
+
+/// One server's over-limit episode. `over_limit_until` is the lock-free
+/// mirror of whether an episode exists at all; this holds the rest.
+#[derive(Debug, Default)]
+struct OverLimitEpisode {
+    /// Consecutive refused connects; each one doubles the next holdoff.
+    refusals: u32,
+    /// Epoch ms at which one caller was let through to probe the provider
+    /// after the pause ended, `0` when nobody is probing.
+    probe_started: u64,
+    /// Which probe holds the slot: the count of probes ever admitted for
+    /// this server, so a late report from an earlier one is told apart.
+    probe_token: u64,
 }
 
 /// How often one server's blocking-lane connect failures may be warned about.
@@ -253,8 +266,7 @@ impl NntpPool {
         let mut retention_days = Vec::with_capacity(server_count);
         let mut max_connections = Vec::with_capacity(server_count);
         let mut over_limit_until = Vec::with_capacity(server_count);
-        let mut over_limit_refusals = Vec::with_capacity(server_count);
-        let mut over_limit_probe_started = Vec::with_capacity(server_count);
+        let mut over_limit_episodes = Vec::with_capacity(server_count);
         let mut blocking_connect_warn_after = Vec::with_capacity(server_count);
         let mut blocking_connect_failures_since_warning = Vec::with_capacity(server_count);
         let mut connect_cursors = Vec::with_capacity(server_count);
@@ -281,8 +293,7 @@ impl NntpPool {
             retention_days.push(spc.retention_days);
             max_connections.push(spc.max_connections);
             over_limit_until.push(AtomicU64::new(0));
-            over_limit_refusals.push(AtomicU32::new(0));
-            over_limit_probe_started.push(AtomicU64::new(0));
+            over_limit_episodes.push(SyncMutex::new(OverLimitEpisode::default()));
             blocking_connect_warn_after.push(AtomicU64::new(0));
             blocking_connect_failures_since_warning.push(AtomicU64::new(0));
             connect_cursors.push(AtomicUsize::new(0));
@@ -320,8 +331,7 @@ impl NntpPool {
             retention_days,
             max_connections,
             over_limit_until,
-            over_limit_refusals,
-            over_limit_probe_started,
+            over_limit_episodes,
             blocking_connect_warn_after,
             blocking_connect_failures_since_warning,
             retired_ips: Arc::new(SyncMutex::new(HashSet::new())),
@@ -726,18 +736,28 @@ impl NntpPool {
         }
         // The pause is over but the episode is not: while one caller's probe
         // is out, everyone else is still held, until that probe answers.
-        let probe_started = self.over_limit_probe_started[server.0].load(Ordering::Acquire);
+        let probe_started = self.over_limit_episode(server.0)?.probe_started;
         let probe_until =
             probe_started.saturating_add(duration_to_epoch_ms(OVER_LIMIT_PROBE_WINDOW));
         (probe_started != 0 && probe_until > now).then_some(probe_until)
     }
 
+    /// This server's episode state, readable through a poisoned lock: the
+    /// state is plain data, and refusing to connect because some thread
+    /// panicked elsewhere would be the worse outcome.
+    fn over_limit_episode(&self, idx: usize) -> Option<SyncMutexGuard<'_, OverLimitEpisode>> {
+        let slot = self.over_limit_episodes.get(idx)?;
+        Some(match slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        })
+    }
+
     /// Consecutive refused connects in this server's current over-limit
     /// episode, `0` when none is running.
     pub fn over_limit_refusals(&self, server: ServerId) -> u32 {
-        self.over_limit_refusals
-            .get(server.0)
-            .map(|count| count.load(Ordering::Acquire))
+        self.over_limit_episode(server.0)
+            .map(|episode| episode.refusals)
             .unwrap_or(0)
     }
 
@@ -753,41 +773,48 @@ impl NntpPool {
     /// [`OVER_LIMIT_PROBE_WINDOW`].
     pub fn admit_fresh_connect(&self, server: ServerId) -> Result<FreshConnectAdmission> {
         let idx = server.0;
-        let deadline = self
+        let deadline_slot = self
             .over_limit_until
             .get(idx)
-            .ok_or(NntpError::PoolExhausted)?
-            .load(Ordering::Acquire);
-        if deadline == 0 {
+            .ok_or(NntpError::PoolExhausted)?;
+        // One atomic load on the steady-state path.
+        if deadline_slot.load(Ordering::Acquire) == 0 {
             return Ok(FreshConnectAdmission::Open);
         }
         let now = unix_epoch_ms();
+        let mut episode = self
+            .over_limit_episode(idx)
+            .ok_or(NntpError::PoolExhausted)?;
+        // Re-read under the lock: the episode may have moved on meanwhile.
+        let deadline = deadline_slot.load(Ordering::Acquire);
+        if deadline == 0 {
+            return Ok(FreshConnectAdmission::Open);
+        }
         if deadline > now {
             return Err(NntpError::ServerOverLimit {
                 until_epoch_ms: deadline,
             });
         }
-        let window = duration_to_epoch_ms(OVER_LIMIT_PROBE_WINDOW);
-        let slot = &self.over_limit_probe_started[idx];
-        let probe_started = slot.load(Ordering::Acquire);
-        if probe_started != 0 && probe_started.saturating_add(window) > now {
-            return Err(NntpError::ServerOverLimit {
-                until_epoch_ms: probe_started.saturating_add(window),
-            });
-        }
-        match slot.compare_exchange(probe_started, now, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => {
-                debug!(
-                    server = idx,
-                    refusals = self.over_limit_refusals(server),
-                    "holdoff ended; probing the provider with one connect"
-                );
-                Ok(FreshConnectAdmission::Probe)
+        if episode.probe_started != 0 {
+            let probe_until = episode
+                .probe_started
+                .saturating_add(duration_to_epoch_ms(OVER_LIMIT_PROBE_WINDOW));
+            if probe_until > now {
+                return Err(NntpError::ServerOverLimit {
+                    until_epoch_ms: probe_until,
+                });
             }
-            Err(_) => Err(NntpError::ServerOverLimit {
-                until_epoch_ms: now.saturating_add(window),
-            }),
         }
+        episode.probe_started = now;
+        episode.probe_token = episode.probe_token.wrapping_add(1);
+        debug!(
+            server = idx,
+            refusals = episode.refusals,
+            "holdoff ended; probing the provider with one connect"
+        );
+        Ok(FreshConnectAdmission::Probe {
+            token: episode.probe_token,
+        })
     }
 
     /// Book the result of a connect that passed [`Self::admit_fresh_connect`].
@@ -802,44 +829,57 @@ impl NntpPool {
         admission: FreshConnectAdmission,
         result: &Result<T>,
     ) {
-        match (admission, result) {
-            (_, Err(NntpError::TooManyConnections)) => self.note_provider_over_limit(server),
-            (FreshConnectAdmission::Probe, Ok(_)) => self.note_provider_admitted(server),
-            (FreshConnectAdmission::Probe, Err(_)) => self.release_over_limit_probe(server),
-            (FreshConnectAdmission::Open, _) => {}
+        match result {
+            Err(NntpError::TooManyConnections) => self.note_provider_over_limit(server),
+            Ok(_) => self.note_provider_admitted(server, admission),
+            Err(_) => self.release_over_limit_probe(server, admission),
         }
     }
 
     /// The provider accepted the probe: whatever over-limit episode was
     /// running is over, and the next refusal starts a new one from the
-    /// shortest pause. Only for a connect admitted as the probe; see
-    /// [`Self::note_fresh_connect_outcome`].
-    pub fn note_provider_admitted(&self, server: ServerId) {
-        let idx = server.0;
-        let Some(refusals) = self.over_limit_refusals.get(idx) else {
+    /// shortest pause. Nothing happens for an [`FreshConnectAdmission::Open`]
+    /// connect, or for a probe whose slot has since been reset by a newer
+    /// refusal or taken over by a later probe.
+    pub fn note_provider_admitted(&self, server: ServerId, admission: FreshConnectAdmission) {
+        let FreshConnectAdmission::Probe { token } = admission else {
             return;
         };
-        // One load on the steady-state path: no episode, nothing to clear.
-        let count = refusals.swap(0, Ordering::AcqRel);
-        if count == 0 {
+        let idx = server.0;
+        let Some(deadline_slot) = self.over_limit_until.get(idx) else {
+            return;
+        };
+        let Some(mut episode) = self.over_limit_episode(idx) else {
+            return;
+        };
+        if episode.probe_started == 0 || episode.probe_token != token {
             return;
         }
-        self.over_limit_until[idx].store(0, Ordering::Release);
-        self.over_limit_probe_started[idx].store(0, Ordering::Release);
+        let refusals = episode.refusals;
+        episode.refusals = 0;
+        episode.probe_started = 0;
+        deadline_slot.store(0, Ordering::Release);
+        drop(episode);
         info!(
             server = idx,
             server_address = %self.server_address(server),
-            refusals = count,
+            refusals,
             "provider accepts new connections again; over-limit holdoff cleared"
         );
     }
 
     /// A probe that failed for some reason other than a refusal (a timeout, a
     /// TLS fault) has answered nothing about the provider's limit. Free the
-    /// probe slot so the next caller can ask instead of waiting out the window.
-    pub fn release_over_limit_probe(&self, server: ServerId) {
-        if let Some(slot) = self.over_limit_probe_started.get(server.0) {
-            slot.store(0, Ordering::Release);
+    /// probe slot so the next caller can ask instead of waiting out the
+    /// window — if it is still this probe's slot.
+    pub fn release_over_limit_probe(&self, server: ServerId, admission: FreshConnectAdmission) {
+        let FreshConnectAdmission::Probe { token } = admission else {
+            return;
+        };
+        if let Some(mut episode) = self.over_limit_episode(server.0)
+            && episode.probe_token == token
+        {
+            episode.probe_started = 0;
         }
     }
 
@@ -895,36 +935,38 @@ impl NntpPool {
     /// from [`OVER_LIMIT_HOLDOFF_INITIAL`] up to [`OVER_LIMIT_HOLDOFF_MAX`].
     pub fn note_provider_over_limit(&self, server: ServerId) {
         let idx = server.0;
-        let Some(slot) = self.over_limit_until.get(idx) else {
+        let Some(deadline_slot) = self.over_limit_until.get(idx) else {
+            return;
+        };
+        let Some(mut episode) = self.over_limit_episode(idx) else {
             return;
         };
         let now = unix_epoch_ms();
-        let refusals = self.over_limit_refusals[idx]
-            .load(Ordering::Acquire)
-            .saturating_add(1);
-        let holdoff = over_limit_holdoff(refusals);
-        let deadline = now.saturating_add(duration_to_epoch_ms(holdoff));
-        if slot
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current <= now).then_some(deadline)
-            })
-            .is_err()
-        {
+        let current = deadline_slot.load(Ordering::Acquire);
+        if current > now {
+            // One of the burst the running pause already stands for.
             trace!(server = idx, "provider refused a connection while held off");
             return;
         }
-        // The window's winner owns the count; a refusal that lost the race
-        // above is one of the burst this window already stands for.
-        self.over_limit_refusals[idx].store(refusals, Ordering::Release);
-        self.over_limit_probe_started[idx].store(0, Ordering::Release);
-        let address = self
-            .configs
-            .get(idx)
-            .map(|config| format!("{}:{}", config.host, config.port))
-            .unwrap_or_default();
+        // A pause that ended longer ago than the longest holdoff, with nothing
+        // asking since, is history: this refusal is a new episode and starts
+        // again from the shortest pause.
+        let stale = current != 0
+            && now.saturating_sub(current) > duration_to_epoch_ms(OVER_LIMIT_HOLDOFF_MAX);
+        let refusals = if stale {
+            1
+        } else {
+            episode.refusals.saturating_add(1)
+        };
+        let holdoff = over_limit_holdoff(refusals);
+        let deadline = now.saturating_add(duration_to_epoch_ms(holdoff));
+        episode.refusals = refusals;
+        episode.probe_started = 0;
+        deadline_slot.store(deadline, Ordering::Release);
+        drop(episode);
         warn!(
             server = idx,
-            server_address = %address,
+            server_address = %self.server_address(server),
             configured_connections = self.max_connections.get(idx).copied().unwrap_or(0),
             refusals,
             holdoff_secs = holdoff.as_secs(),
@@ -1861,7 +1903,7 @@ mod tests {
         ));
         // A socket failure is not a refusal: the probe slot is released, so
         // the next caller may ask again instead of waiting out the window.
-        assert_eq!(pool.over_limit_probe_started[0].load(Ordering::Acquire), 0);
+        assert_eq!(pool.over_limit_episode(0).unwrap().probe_started, 0);
         assert!(!matches!(
             pool.acquire(ServerId(0)).await,
             Err(NntpError::ServerOverLimit { .. })
@@ -1921,7 +1963,7 @@ mod tests {
         assert_eq!(pool.over_limit_refusals(ServerId(0)), 2);
         let second = pool.over_limit_until_epoch_ms(ServerId(0)).unwrap();
         assert!(second >= unix_epoch_ms() + 59_000 && second <= unix_epoch_ms() + 60_000);
-        assert_eq!(pool.over_limit_probe_started[0].load(Ordering::Acquire), 0);
+        assert_eq!(pool.over_limit_episode(0).unwrap().probe_started, 0);
 
         // A third window is longer again.
         pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
@@ -1944,16 +1986,14 @@ mod tests {
         assert_eq!(pool.over_limit_refusals(ServerId(0)), 2);
 
         pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
-        assert!(matches!(
-            pool.admit_fresh_connect(ServerId(0)),
-            Ok(FreshConnectAdmission::Probe)
-        ));
-        pool.note_fresh_connect_outcome::<()>(ServerId(0), FreshConnectAdmission::Probe, &Ok(()));
+        let probe = pool.admit_fresh_connect(ServerId(0)).unwrap();
+        assert!(matches!(probe, FreshConnectAdmission::Probe { .. }));
+        pool.note_fresh_connect_outcome::<()>(ServerId(0), probe, &Ok(()));
 
         assert!(!pool.is_over_limit(ServerId(0)));
         assert_eq!(pool.over_limit_until_epoch_ms(ServerId(0)), None);
         assert_eq!(pool.over_limit_refusals(ServerId(0)), 0);
-        assert_eq!(pool.over_limit_probe_started[0].load(Ordering::Acquire), 0);
+        assert_eq!(pool.over_limit_episode(0).unwrap().probe_started, 0);
         // Two callers in a row are admitted: nothing is probing any more.
         assert!(matches!(
             pool.admit_fresh_connect(ServerId(0)),
@@ -1996,7 +2036,7 @@ mod tests {
         pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
         assert!(matches!(
             pool.admit_fresh_connect(ServerId(0)),
-            Ok(FreshConnectAdmission::Probe)
+            Ok(FreshConnectAdmission::Probe { .. })
         ));
         pool.note_fresh_connect_outcome::<()>(
             ServerId(0),
@@ -2004,6 +2044,66 @@ mod tests {
             &Err(NntpError::Timeout),
         );
         assert!(pool.admit_fresh_connect(ServerId(0)).is_err());
+    }
+
+    /// A probe only settles the episode while the slot is still its own. A
+    /// refusal booked after it went out resets the slot and starts a longer
+    /// pause; the probe's late success neither clears that pause nor does
+    /// its late failure free the slot a later probe holds.
+    #[test]
+    fn a_superseded_probe_neither_clears_nor_frees_anything() {
+        let pool = NntpPool::new(test_pool_config(4));
+        pool.note_provider_over_limit(ServerId(0));
+        pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
+        let first = pool.admit_fresh_connect(ServerId(0)).unwrap();
+        assert!(matches!(first, FreshConnectAdmission::Probe { .. }));
+
+        // A connect that was already dialling is refused meanwhile.
+        pool.note_provider_over_limit(ServerId(0));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 2);
+        let deadline = pool.over_limit_until_epoch_ms(ServerId(0)).unwrap();
+
+        pool.note_provider_admitted(ServerId(0), first);
+        assert_eq!(pool.over_limit_until_epoch_ms(ServerId(0)), Some(deadline));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 2);
+
+        // The pause ends and a second probe goes out; the first probe's late
+        // failure report leaves that slot alone.
+        pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
+        let second = pool.admit_fresh_connect(ServerId(0)).unwrap();
+        assert!(matches!(second, FreshConnectAdmission::Probe { .. }));
+        pool.release_over_limit_probe(ServerId(0), first);
+        assert!(pool.admit_fresh_connect(ServerId(0)).is_err());
+        pool.release_over_limit_probe(ServerId(0), second);
+        assert!(pool.admit_fresh_connect(ServerId(0)).is_ok());
+    }
+
+    /// An episode nobody probed — the queue drained during the pause — does
+    /// not carry its refusal count into the next one. A refusal long after
+    /// the last pause ended starts again from the shortest pause.
+    #[test]
+    fn a_refusal_long_after_the_last_pause_starts_a_new_episode() {
+        let pool = NntpPool::new(test_pool_config(4));
+        pool.note_provider_over_limit(ServerId(0));
+        pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
+        assert!(pool.admit_fresh_connect(ServerId(0)).is_ok());
+        pool.note_provider_over_limit(ServerId(0));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 2);
+
+        // The 60 s pause ended more than the longest holdoff ago.
+        pool.over_limit_until[0].store(
+            unix_epoch_ms() - duration_to_epoch_ms(OVER_LIMIT_HOLDOFF_MAX) - 1_000,
+            Ordering::Release,
+        );
+        assert!(!pool.is_over_limit(ServerId(0)));
+        assert!(matches!(
+            pool.admit_fresh_connect(ServerId(0)),
+            Ok(FreshConnectAdmission::Probe { .. })
+        ));
+        pool.note_provider_over_limit(ServerId(0));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 1);
+        let deadline = pool.over_limit_until_epoch_ms(ServerId(0)).unwrap();
+        assert!(deadline <= unix_epoch_ms() + 30_000);
     }
 
     /// A probe whose caller never reported back does not hold the server
@@ -2016,10 +2116,8 @@ mod tests {
         assert!(pool.admit_fresh_connect(ServerId(0)).is_ok());
         assert!(pool.admit_fresh_connect(ServerId(0)).is_err());
 
-        pool.over_limit_probe_started[0].store(
-            unix_epoch_ms() - duration_to_epoch_ms(OVER_LIMIT_PROBE_WINDOW) - 1,
-            Ordering::Release,
-        );
+        pool.over_limit_episode(0).unwrap().probe_started =
+            unix_epoch_ms() - duration_to_epoch_ms(OVER_LIMIT_PROBE_WINDOW) - 1;
         assert!(!pool.is_over_limit(ServerId(0)));
         assert!(pool.admit_fresh_connect(ServerId(0)).is_ok());
         assert!(pool.admit_fresh_connect(ServerId(0)).is_err());

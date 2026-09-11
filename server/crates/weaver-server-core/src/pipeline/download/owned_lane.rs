@@ -366,7 +366,6 @@ enum OwnedLanePoolCommand {
 
 struct CachedOwnedLane {
     nntp: Arc<weaver_nntp::NntpClient>,
-    groups: Arc<[String]>,
     lane: weaver_nntp::blocking::BlockingBodyLane,
 }
 
@@ -726,7 +725,7 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
         byte_estimate,
     ) {
         Ok(lane) => {
-            *cached_lane = Some(CachedOwnedLane { nntp, groups, lane });
+            *cached_lane = Some(CachedOwnedLane { nntp, lane });
         }
         Err(error) => {
             // A refused warm costs nothing: the worker is simply still
@@ -774,16 +773,14 @@ impl CachedOwnedLane {
         cached_lane_matches_selection(server, true, &selection)
     }
 
-    /// Re-point the cached socket at `groups` when they differ from the ones
-    /// it was opened for. `Err` means the socket could not be re-pointed and
-    /// is no longer worth keeping.
-    fn adopt_groups(&mut self, groups: &Arc<[String]>) -> weaver_nntp::Result<()> {
-        if Arc::ptr_eq(&self.groups, groups) || self.groups == *groups {
-            return Ok(());
-        }
-        self.lane.adopt_groups(groups)?;
-        self.groups = Arc::clone(groups);
-        Ok(())
+    /// Re-point the cached socket at `groups`. The lane itself knows which
+    /// group the socket has selected, so this is asked for every lease: on
+    /// most servers it is one capability lookup, and on one that requires a
+    /// selected group a socket that already sits on a candidate sends
+    /// nothing. `Err` means the socket could not be re-pointed and is no
+    /// longer worth keeping.
+    fn adopt_groups(&mut self, groups: &[String]) -> weaver_nntp::Result<()> {
+        self.lane.adopt_groups(groups)
     }
 }
 
@@ -1034,7 +1031,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             Ok(lane) => {
                 *cached_lane = Some(CachedOwnedLane {
                     nntp: Arc::clone(&nntp),
-                    groups: lease.compatibility.groups.clone(),
                     lane,
                 });
             }

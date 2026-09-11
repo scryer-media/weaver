@@ -548,8 +548,11 @@ fn adopting_groups_on_a_group_requiring_server_selects_them_in_place() {
         "a 411 candidate is skipped and the next one selected"
     );
 
-    // Already selected: nothing goes out.
+    // Already selected: nothing goes out, even when the selected group is
+    // not the first candidate.
     lane.adopt_groups(&["alt.other".to_string()]).unwrap();
+    lane.adopt_groups(&["alt.missing".to_string(), "alt.other".to_string()])
+        .unwrap();
     assert_eq!(group_lines(&seen).len(), 3);
 
     // No candidate the server holds: the lane says so rather than pretending.
