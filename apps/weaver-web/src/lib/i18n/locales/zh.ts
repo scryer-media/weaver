@@ -209,7 +209,7 @@ const zh: LocaleDictionary = {
   "settings.generalPageDesc": "在此集中调整下载速度、存储路径、清理行为和重试策略。",
   "settings.language": "语言",
   "settings.languageDesc": "选择 Weaver 界面的显示语言。",
-  "settings.bandwidthCap": "ISP 流量限额",
+  "settings.bandwidthCap": "带宽",
   "settings.bandwidthCapDesc": "当前 ISP 配额用尽时阻止新的下载调度。排队中的任务仍保持位置，已在进行中的后处理可继续。",
   "settings.bandwidthCapEnabled": "启用 ISP 限额",
   "settings.bandwidthCapEnabledDesc": "持续跟踪用量，仅在当前窗口配额耗尽时阻止新的文章下载。",

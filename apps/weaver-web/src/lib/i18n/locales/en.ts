@@ -262,7 +262,7 @@ const en: LocaleDictionary = {
   "settings.generalPageDesc": "Tune download speed, storage paths, cleanup behavior, and retry policy from one place.",
   "settings.language": "Language",
   "settings.languageDesc": "Choose the display language for the Weaver interface.",
-  "settings.bandwidthCap": "ISP Bandwidth Cap",
+  "settings.bandwidthCap": "Bandwidth",
   "settings.bandwidthCapDesc": "Block new download dispatch once the current ISP allowance is used. Queued jobs still hold position and post-processing already in flight can continue.",
   "settings.bandwidthCapConfiguration": "Configuration",
   "settings.bandwidthCapEnabled": "Enable ISP cap",

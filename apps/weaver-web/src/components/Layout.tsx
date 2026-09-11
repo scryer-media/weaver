@@ -443,8 +443,9 @@ export function Layout() {
                     </Link>
 
                     {item.to === "/settings" && settingsOpen ? (
-                      <div className="mt-1 mb-1 ml-5 space-y-0.5 border-l border-border pl-3">
+                      <div className="mt-1 mb-1 ml-5 space-y-0.5 border-l border-border pl-2">
                         {settingsNav.map((entry) => {
+                          const EntryIcon = entry.icon;
                           const childActive = location.pathname === entry.to;
                           return (
                             <Link
@@ -457,7 +458,10 @@ export function Layout() {
                                   : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
                               )}
                             >
-                              <span>{t(entry.labelKey)}</span>
+                              <span className="flex items-center gap-2">
+                                <EntryIcon className="size-4 shrink-0" />
+                                <span>{t(entry.labelKey)}</span>
+                              </span>
                               {entry.beta ? (
                                 <Badge variant="secondary" className="px-1 py-0 text-[9px] uppercase tracking-[0.08em]">
                                   Beta
@@ -561,26 +565,30 @@ export function Layout() {
                       {item.to === "/settings" && settingsOpen ? (
                         <div className="mt-1 mb-1 ml-5 space-y-0.5 border-l border-border pl-4">
                           {settingsNav.map((entry) => {
+                            const EntryIcon = entry.icon;
                             const childActive = location.pathname === entry.to;
                             return (
                               <Link
                                 key={entry.to}
-                              to={entry.to}
-                              onClick={() => setMobileNavOpen(false)}
-                              className={cn(
-                                "flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-[13px] transition-colors",
-                                childActive
-                                  ? "bg-accent font-semibold text-foreground"
-                                  : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
-                              )}
-                            >
-                              <span>{t(entry.labelKey)}</span>
-                              {entry.beta ? (
-                                <Badge variant="secondary" className="px-1 py-0 text-[9px] uppercase tracking-[0.08em]">
-                                  Beta
-                                </Badge>
-                              ) : null}
-                            </Link>
+                                to={entry.to}
+                                onClick={() => setMobileNavOpen(false)}
+                                className={cn(
+                                  "flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-[13px] transition-colors",
+                                  childActive
+                                    ? "bg-accent font-semibold text-foreground"
+                                    : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
+                                )}
+                              >
+                                <span className="flex items-center gap-2">
+                                  <EntryIcon className="size-4 shrink-0" />
+                                  <span>{t(entry.labelKey)}</span>
+                                </span>
+                                {entry.beta ? (
+                                  <Badge variant="secondary" className="px-1 py-0 text-[9px] uppercase tracking-[0.08em]">
+                                    Beta
+                                  </Badge>
+                                ) : null}
+                              </Link>
                             );
                           })}
                         </div>

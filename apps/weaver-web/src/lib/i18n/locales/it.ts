@@ -209,7 +209,7 @@ const it: LocaleDictionary = {
   "settings.generalPageDesc": "Regola velocità di download, percorsi di archiviazione, comportamento di pulizia e politica di riprova da un unico posto.",
   "settings.language": "Lingua",
   "settings.languageDesc": "Scegli la lingua di visualizzazione dell'interfaccia di Weaver.",
-  "settings.bandwidthCap": "Limite Banda ISP",
+  "settings.bandwidthCap": "Larghezza di banda",
   "settings.bandwidthCapDesc": "Blocca l'invio di nuovi download quando la quota ISP è esaurita. I job in coda mantengono la posizione e il post-processing già in corso può continuare.",
   "settings.bandwidthCapEnabled": "Abilita limite ISP",
   "settings.bandwidthCapEnabledDesc": "Traccia l'utilizzo continuamente e blocca solo i nuovi download di articoli quando la finestra attiva è esaurita.",

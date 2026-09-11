@@ -209,7 +209,7 @@ const pt: LocaleDictionary = {
   "settings.generalPageDesc": "Ajuste velocidade de download, caminhos de armazenamento, comportamento de limpeza e política de retentativas em um só lugar.",
   "settings.language": "Idioma",
   "settings.languageDesc": "Escolha o idioma de exibição da interface do Weaver.",
-  "settings.bandwidthCap": "Limite de Banda do Provedor",
+  "settings.bandwidthCap": "Largura de banda",
   "settings.bandwidthCapDesc": "Bloquear o envio de novos downloads quando a franquia do provedor for consumida. Jobs na fila mantêm posição e pós-processamento já em andamento pode continuar.",
   "settings.bandwidthCapEnabled": "Ativar limite do provedor",
   "settings.bandwidthCapEnabledDesc": "Rastrear uso continuamente e bloquear apenas novos downloads de artigos quando a janela ativa for esgotada.",

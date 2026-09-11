@@ -209,7 +209,7 @@ const es: LocaleDictionary = {
   "settings.generalPageDesc": "Ajusta la velocidad de descarga, rutas de almacenamiento, comportamiento de limpieza y política de reintentos desde un solo lugar.",
   "settings.language": "Idioma",
   "settings.languageDesc": "Elige el idioma de la interfaz de Weaver.",
-  "settings.bandwidthCap": "Límite de ancho de banda del ISP",
+  "settings.bandwidthCap": "Ancho de banda",
   "settings.bandwidthCapDesc": "Bloquea el envío de nuevas descargas cuando se agote la cuota del ISP. Las tareas en cola mantienen su posición y el posprocesamiento en curso puede continuar.",
   "settings.bandwidthCapEnabled": "Activar límite del ISP",
   "settings.bandwidthCapEnabledDesc": "Controla el uso continuamente y bloquea solo las nuevas descargas de artículos cuando se agote la ventana activa.",
