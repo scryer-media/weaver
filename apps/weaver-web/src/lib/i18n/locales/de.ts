@@ -629,6 +629,12 @@ const de: LocaleDictionary = {
   "upload.duplicateScore": "Duplikatbewertung",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "Höhere Bewertungen gewinnen innerhalb desselben Duplikatschlüssels; bei Gleichstand bleibt der vorhandene Kandidat.",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "Diagnosepaket herunterladen",
+  "systemInfo.diagnosticsBusy": "Diagnosedaten werden erfasst…",
+  "systemInfo.diagnosticsHint": "Die Erfassung dauert etwa 15 Sekunden: Metriken werden zweimal im Abstand von zehn Sekunden erfasst. Passwörter, API-Schlüssel und andere Geheimnisse werden entfernt.",
+  "systemInfo.diagnosticsFailed": "Das Diagnosepaket konnte nicht erstellt werden.",
   ...duplicateLocaleEntries.deu,
 };
 

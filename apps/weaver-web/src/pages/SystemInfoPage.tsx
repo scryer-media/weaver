@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { Download, RefreshCw } from "lucide-react";
 import { useQuery } from "urql";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { Button } from "@/components/ui/button";
+import { authHeaders } from "@/graphql/client";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { cn } from "@/lib/utils";
 
 interface DiskCapacity {
@@ -67,6 +69,8 @@ export function SystemInfoPage() {
   });
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [uptimeAnchor, setUptimeAnchor] = useState<UptimeAnchor | null>(null);
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
 
   useEffect(() => {
     if (data?.systemInfo.uptimeSeconds == null) return;
@@ -85,22 +89,73 @@ export function SystemInfoPage() {
     : 0;
   const info = data?.systemInfo;
 
+  // The package is streamed straight off the endpoint rather than assembled in
+  // the browser: the request holds open for the ten-second gap between the two
+  // metrics samples, so the button stays busy for the whole collection.
+  async function downloadDiagnostics() {
+    setDiagnosticsBusy(true);
+    setDiagnosticsError(null);
+    try {
+      const response = await fetch(new URL("api/system/diagnostics", document.baseURI).href, {
+        headers: authHeaders(),
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        throw new Error(
+          await readDownloadErrorMessage(response, t("systemInfo.diagnosticsFailed")),
+        );
+      }
+      await saveResponseAsDownload(response, `weaver-diagnostics-${Date.now()}.tar.zst`);
+    } catch (error) {
+      setDiagnosticsError(
+        error instanceof Error ? error.message : t("systemInfo.diagnosticsFailed"),
+      );
+    } finally {
+      setDiagnosticsBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
         title={t("systemInfo.title")}
         description={t("systemInfo.description")}
         actions={
-          <Button
-            variant="outline"
-            onClick={() => refresh({ requestPolicy: "network-only" })}
-            disabled={fetching}
-          >
-            <RefreshCw className={cn("size-4", fetching && "animate-spin")} />
-            {t("action.refresh")}
-          </Button>
+          <>
+            <Button
+              variant="outline"
+              onClick={() => void downloadDiagnostics()}
+              disabled={diagnosticsBusy}
+              title={t("systemInfo.diagnosticsHint")}
+            >
+              <Download className={cn("size-4", diagnosticsBusy && "animate-pulse")} />
+              {diagnosticsBusy
+                ? t("systemInfo.diagnosticsBusy")
+                : t("systemInfo.downloadDiagnostics")}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => refresh({ requestPolicy: "network-only" })}
+              disabled={fetching}
+            >
+              <RefreshCw className={cn("size-4", fetching && "animate-spin")} />
+              {t("action.refresh")}
+            </Button>
+          </>
         }
       />
+
+      {diagnosticsBusy ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          {t("systemInfo.diagnosticsHint")}
+        </p>
+      ) : null}
+
+      {diagnosticsError ? (
+        <p role="alert" className="text-sm text-status-failed">
+          {diagnosticsError}
+        </p>
+      ) : null}
 
       {error && !info ? (
         <SectionCard title={t("systemInfo.unavailable")}>

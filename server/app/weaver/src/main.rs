@@ -107,7 +107,15 @@ async fn async_main() {
     let log_file_writer = match log_file_config.as_ref() {
         Some(config) => {
             match weaver_server_core::runtime::log_buffer::open_log_file(&config.path) {
-                Ok(writer) => Some(writer),
+                Ok(writer) => {
+                    // Record the path the resolution above actually picked, so
+                    // the diagnostics package copies the real log files rather
+                    // than re-deriving the rules and guessing.
+                    weaver_server_core::runtime::log_buffer::set_log_file_path(
+                        config.path.clone(),
+                    );
+                    Some(writer)
+                }
                 Err(error) if config.explicit => {
                     eprintln!(
                         "failed to open Weaver log file at {}: {error}",

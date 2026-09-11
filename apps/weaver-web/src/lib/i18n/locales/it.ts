@@ -628,6 +628,12 @@ const it: LocaleDictionary = {
   "upload.duplicateScore": "Punteggio duplicato",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "I punteggi più alti vincono nella stessa chiave; a parità resta il candidato esistente.",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "Scarica il pacchetto diagnostico",
+  "systemInfo.diagnosticsBusy": "Raccolta dei dati diagnostici…",
+  "systemInfo.diagnosticsHint": "La raccolta richiede circa 15 secondi: le metriche vengono campionate due volte, a dieci secondi di distanza. Password, chiavi API e altri segreti vengono rimossi.",
+  "systemInfo.diagnosticsFailed": "Non è stato possibile creare il pacchetto diagnostico.",
   ...duplicateLocaleEntries.ita,
 };
 

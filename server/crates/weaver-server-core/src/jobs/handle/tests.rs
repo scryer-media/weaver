@@ -545,6 +545,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
                     let _ = reply.send(());
                 }
+                // This stub has no pipeline behind it, so the reply channel is
+                // dropped and the caller sees the command go unanswered.
+                SchedulerCommand::PipelineDiagnostics { .. } => {}
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
