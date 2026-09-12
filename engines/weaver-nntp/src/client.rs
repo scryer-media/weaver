@@ -15,7 +15,8 @@ use crate::error::{NntpError, Result};
 use crate::fused_yenc::{FusedArticleBody, FusedYencArticleStats, FusedYencError};
 use crate::health::{CooldownReason, ServerState};
 use crate::pool::{
-    BodyServerAvailability, NntpPool, PoolConfig, PooledConnection, ServerId, ServerPoolConfig,
+    BodyServerAvailability, FreshConnectAdmission, NntpPool, PoolConfig, PooledConnection,
+    ServerId, ServerPoolConfig,
 };
 use crate::tls::TransportReadStats;
 use crate::transfer::{
@@ -144,6 +145,16 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
 }
 
 impl std::error::Error for BlockingBodyLaneAcquireError {}
+
+/// How a server selection asks each server's quota.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuotaCheck {
+    /// A dispatch choosing its server: a server skipped for headroom has
+    /// turned the work away, and its blocked signal says so.
+    Dispatch,
+    /// A question about the servers: reads the quota, changes nothing.
+    ReadOnly,
+}
 
 /// Whether the synchronous owned lanes can be given a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2282,7 +2293,7 @@ impl NntpClient {
         exclude: &[usize],
         requested_body_bytes: u64,
     ) -> Option<BodyServerSelection> {
-        self.try_blocking_body_server_selection(exclude, requested_body_bytes)
+        self.try_blocking_body_server_selection(exclude, requested_body_bytes, QuotaCheck::Dispatch)
     }
 
     pub fn try_acquire_blocking_body_lane_with_estimate(
@@ -2291,9 +2302,11 @@ impl NntpClient {
         exclude: &[usize],
         requested_body_bytes: u64,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
-        let Some(selection) =
-            self.try_blocking_body_server_selection(exclude, requested_body_bytes)
-        else {
+        let Some(selection) = self.try_blocking_body_server_selection(
+            exclude,
+            requested_body_bytes,
+            QuotaCheck::Dispatch,
+        ) else {
             return Err(BlockingBodyLaneAcquireError::SelectionContended);
         };
         if selection.eligible.is_empty() {
@@ -2309,13 +2322,6 @@ impl NntpClient {
         let mut provider_capacity_error = None;
         let mut other_error = None;
         for server in selection.eligible {
-            // Blocking lanes always open a fresh socket, so a held-off server
-            // can only answer with the holdoff error. Skipping it here keeps
-            // surplus lanes parked instead of re-attempting every dispatch.
-            if let Some(until_epoch_ms) = self.pool.over_limit_until_epoch_ms(server) {
-                provider_capacity_error = Some(NntpError::ServerOverLimit { until_epoch_ms });
-                continue;
-            }
             let permit = match self.pool.try_acquire_blocking_permit(server) {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -2330,6 +2336,18 @@ impl NntpClient {
             if !supports_blocking_body_lane(&config) {
                 continue;
             }
+            // Blocking lanes always open a fresh socket, so a held-off server
+            // can only answer with the holdoff error. Skipping it here keeps
+            // surplus lanes parked instead of re-attempting every dispatch.
+            // Asked with the permit in hand so that the one caller admitted
+            // as the post-holdoff probe is a caller that will actually dial.
+            let admission = match self.pool.admit_fresh_connect(server) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    provider_capacity_error = Some(error);
+                    continue;
+                }
+            };
             let started = Instant::now();
             match self.pool.with_blocking_connect_admission(server, || {
                 crate::blocking::BlockingBodyLane::connect(
@@ -2344,9 +2362,12 @@ impl NntpClient {
                     permit,
                 )
             }) {
-                Ok(lane) => return Ok(lane),
+                Ok(lane) => {
+                    self.pool.note_provider_admitted(server, admission);
+                    return Ok(lane);
+                }
                 Err(error) => {
-                    self.record_blocking_connect_failure(server.0, &error);
+                    self.record_blocking_connect_failure(server.0, admission, &error);
                     // Debug for every failure, and one WARN per server per
                     // window carrying how many it stands for. A lane that
                     // cannot connect is invisible otherwise: the work is
@@ -2404,7 +2425,14 @@ impl NntpClient {
     /// connection permits the idle owned lanes are holding and wait out the
     /// whole acquire deadline for it.
     pub fn blocking_body_lane_candidacy(&self, exclude: &[usize]) -> BlockingBodyLaneCandidacy {
-        let Some(selection) = self.try_blocking_body_server_selection(exclude, 0) else {
+        // A question, not a dispatch: it asks for no bytes, so every server
+        // with any headroom "fits", and letting that fit clear a server's
+        // blocked latch erased the refusal the last real dispatch recorded —
+        // a capped server read as open until something else asked it for
+        // real bytes.
+        let Some(selection) =
+            self.try_blocking_body_server_selection(exclude, 0, QuotaCheck::ReadOnly)
+        else {
             return BlockingBodyLaneCandidacy::Contended;
         };
         let has_candidate = selection.eligible.into_iter().any(|server| {
@@ -2474,6 +2502,7 @@ impl NntpClient {
         &self,
         exclude: &[usize],
         requested_body_bytes: u64,
+        quota_check: QuotaCheck,
     ) -> Option<BodyServerSelection> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
@@ -2508,10 +2537,15 @@ impl NntpClient {
             if backfill_flags[idx] && !backfill_unlocked {
                 continue;
             }
-            if let Some(rejection) = self
-                .pool
-                .server_transfer_control(ServerId(idx))
-                .and_then(|control| control.quota_rejection_for_dispatch(requested_body_bytes))
+            if let Some(rejection) =
+                self.pool
+                    .server_transfer_control(ServerId(idx))
+                    .and_then(|control| match quota_check {
+                        QuotaCheck::Dispatch => {
+                            control.quota_rejection_for_dispatch(requested_body_bytes)
+                        }
+                        QuotaCheck::ReadOnly => control.quota_rejection_for(requested_body_bytes),
+                    })
             {
                 retain_earliest_quota_rejection(&mut quota_blocked, rejection);
                 continue;
@@ -2551,13 +2585,24 @@ impl NntpClient {
         })
     }
 
-    fn record_blocking_connect_failure(&self, server_idx: usize, error: &NntpError) {
+    fn record_blocking_connect_failure(
+        &self,
+        server_idx: usize,
+        admission: FreshConnectAdmission,
+        error: &NntpError,
+    ) {
         if matches!(error, NntpError::TooManyConnections) {
             // Provider admission pressure parks new sockets, it does not make
             // the server unhealthy. Cooling the whole server here would also
             // block already-established healthy lanes from refilling.
             self.pool.note_provider_over_limit(ServerId(server_idx));
-        } else if matches!(
+            return;
+        }
+        // Any other failure says nothing about the provider's limit; if this
+        // connect was the post-holdoff probe, let the next caller ask.
+        self.pool
+            .release_over_limit_probe(ServerId(server_idx), admission);
+        if matches!(
             error,
             NntpError::AuthenticationFailed
                 | NntpError::AuthenticationRejected

@@ -1019,7 +1019,11 @@ async fn blocking_tls_capacity_rejection_parks_connects_without_health_poisoning
         soft_timeout: Duration::from_secs(15),
     });
 
-    client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::TooManyConnections,
+    );
 
     assert_eq!(client.pool().configured_connections(ServerId(0)), Some(8));
     assert!(client.pool().is_over_limit(ServerId(0)));
@@ -1037,8 +1041,16 @@ async fn blocking_capacity_holdoff_never_cools_healthy_server() {
         soft_timeout: Duration::from_secs(15),
     });
 
-    client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
-    client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::TooManyConnections,
+    );
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::TooManyConnections,
+    );
 
     assert_eq!(client.pool().configured_connections(ServerId(0)), Some(2));
     assert!(client.pool().is_over_limit(ServerId(0)));
@@ -1800,7 +1812,7 @@ async fn outage_disabled_fill_server_keeps_backfill_locked_with_peers_excluded()
         "a consecutive-failure disable is an outage, not a config error: {order:?}"
     );
     let selection = client
-        .try_blocking_body_server_selection(&[1], 0)
+        .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
         .expect("the health state is uncontended in this test");
     assert!(
         selection.eligible.is_empty(),
@@ -1839,7 +1851,7 @@ async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
     client.pool.health().lock().await.record_failure(0, true);
 
     let selection = client
-        .try_blocking_body_server_selection(&[1], 0)
+        .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
         .expect("the health state is uncontended in this test");
     assert_eq!(
         selection.eligible,
@@ -1855,7 +1867,7 @@ async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
         .await
         .record_cooldown(0, CooldownReason::Transport);
     let selection = cooling
-        .try_blocking_body_server_selection(&[1], 0)
+        .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
         .expect("the health state is uncontended in this test");
     assert!(
         selection.eligible.is_empty(),
@@ -3300,4 +3312,80 @@ async fn the_head_recheck_of_stat_misses_is_one_pipelined_batch() {
         },
         "the batch's answers land on the ids they were asked about"
     );
+}
+
+/// The owned-lane candidacy probe asks whether any server could take work at
+/// all. It is not a dispatch, so it must leave a server's blocked signal
+/// exactly as the last real dispatch left it — the zero-byte question it
+/// asks fits any server with a byte of headroom.
+#[test]
+fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
+    let transfers = crate::transfer::ServerTransferRegistry::new();
+    let limited_id = StableServerId(2_100);
+    let limited = transfers.configure(
+        limited_id,
+        crate::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(crate::transfer::QuotaRuntimeConfig {
+                limit_bytes: 100,
+                generation: 1,
+                retry_at: None,
+            }),
+        },
+    );
+    let mut used = limited.try_reserve(60).unwrap();
+    used.record_blocking(60);
+    used.finish();
+    assert!(!limited.snapshot().quota_blocked);
+
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![
+            ServerPoolConfig {
+                server: ServerConfig {
+                    host: "limited.example.com".into(),
+                    ..Default::default()
+                },
+                stable_id: limited_id,
+                transfer_control: Some(Arc::clone(&limited)),
+                max_connections: 1,
+                group: 0,
+                ..ServerPoolConfig::default()
+            },
+            ServerPoolConfig {
+                server: ServerConfig {
+                    host: "unlimited.example.com".into(),
+                    ..Default::default()
+                },
+                stable_id: StableServerId(2_101),
+                max_connections: 1,
+                group: 1,
+                ..ServerPoolConfig::default()
+            },
+        ],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    });
+
+    // A dispatch that skips the limited server for headroom is the server
+    // turning work away, and the signal latches.
+    let selection = client
+        .try_blocking_body_server_selection_with_estimate(&[], 41)
+        .expect("the health state is uncontended in this test");
+    assert_eq!(selection.eligible, vec![ServerId(1)]);
+    assert!(limited.snapshot().quota_blocked);
+
+    // The probe still sees the limited server as a candidate (zero bytes fit)
+    // and the latch stands.
+    let candidacy = client.blocking_body_lane_candidacy(&[]);
+    assert!(
+        !matches!(candidacy, BlockingBodyLaneCandidacy::Contended),
+        "the health state is uncontended in this test"
+    );
+    assert!(
+        limited.snapshot().quota_blocked,
+        "a candidacy question must not clear the blocked signal a dispatch latched"
+    );
+    assert!(client.server_quota_rejection(ServerId(0), 41).is_some());
+    assert!(limited.snapshot().quota_blocked);
 }

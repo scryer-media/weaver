@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,15 @@ import (
 )
 
 // --- chaos ---
+
+// errNntpConnectionsSaturated is the provider turning a session away because
+// its chaos connection cap is already spoken for.
+//
+// Worth naming because the cap counts the refused connection itself, so the
+// harness meets it whenever every slot is held — including by sockets a
+// stopped Weaver has not handed back yet. Callers that can afford to wait for
+// a slot need to tell that apart from a provider that is actually broken.
+var errNntpConnectionsSaturated = errors.New("NNTP provider connection cap saturated")
 
 func sendNntpCommand(cmd string) string {
 	return sendNntpCommandTo(nntpHost(), nntpPort(), cmd)
@@ -41,6 +51,9 @@ func sendNntpCommandToWithRetry(host, port, cmd string, attempts int) (string, e
 			return resp, nil
 		}
 		lastErr = err
+		if attempt == attempts {
+			break
+		}
 		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 	}
 	return "", lastErr
@@ -69,6 +82,10 @@ func openNntpCommandSession(host, port string, authenticate bool) (*nntpCommandS
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("read greeting from %s: %w", addr, err)
+	}
+	if strings.HasPrefix(greeting, "502") {
+		conn.Close()
+		return nil, fmt.Errorf("%w: %s answered %s", errNntpConnectionsSaturated, addr, strings.TrimSpace(greeting))
 	}
 	if !strings.HasPrefix(greeting, "200") && !strings.HasPrefix(greeting, "201") {
 		conn.Close()
@@ -534,6 +551,24 @@ func cmdChaos(config string) {
 
 type submitNZBOptions struct {
 	force bool
+	// newsgroup, when set, replaces every <group> element of the fixture NZB
+	// before submission. The seeded fixtures all post to one newsgroup, so a
+	// round that wants each job leased for a different group rewrites it here.
+	newsgroup string
+}
+
+var nzbGroupElementPattern = regexp.MustCompile(`<group>[^<]*</group>`)
+
+// overrideNzbNewsgroup points every <group> element of an NZB at newsgroup.
+func overrideNzbNewsgroup(nzb []byte, newsgroup string) ([]byte, error) {
+	newsgroup = strings.TrimSpace(newsgroup)
+	if newsgroup == "" {
+		return nzb, nil
+	}
+	if !nzbGroupElementPattern.Match(nzb) {
+		return nil, fmt.Errorf("NZB has no <group> element to override")
+	}
+	return nzbGroupElementPattern.ReplaceAllLiteral(nzb, []byte("<group>"+newsgroup+"</group>")), nil
 }
 
 func submitOneNZB(weaverURL string, scenario *Scenario) (int, error) {
@@ -546,6 +581,12 @@ func submitOneNZBWithOptions(weaverURL string, scenario *Scenario, options submi
 	nzbData, err := os.ReadFile(nzbPath)
 	if err != nil {
 		return 0, fmt.Errorf("read NZB: %w", err)
+	}
+	if options.newsgroup != "" {
+		nzbData, err = overrideNzbNewsgroup(nzbData, options.newsgroup)
+		if err != nil {
+			return 0, fmt.Errorf("override NZB newsgroup for %s: %w", slug, err)
+		}
 	}
 
 	nzbB64 := base64.StdEncoding.EncodeToString(nzbData)
