@@ -146,6 +146,16 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
 
 impl std::error::Error for BlockingBodyLaneAcquireError {}
 
+/// How a server selection asks each server's quota.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuotaCheck {
+    /// A dispatch choosing its server: a server skipped for headroom has
+    /// turned the work away, and its blocked signal says so.
+    Dispatch,
+    /// A question about the servers: reads the quota, changes nothing.
+    ReadOnly,
+}
+
 /// Whether the synchronous owned lanes can be given a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockingBodyLaneCandidacy {
@@ -2285,7 +2295,7 @@ impl NntpClient {
         exclude: &[usize],
         requested_body_bytes: u64,
     ) -> Option<BodyServerSelection> {
-        self.try_blocking_body_server_selection(exclude, requested_body_bytes)
+        self.try_blocking_body_server_selection(exclude, requested_body_bytes, QuotaCheck::Dispatch)
     }
 
     pub fn try_acquire_blocking_body_lane_with_estimate(
@@ -2294,9 +2304,11 @@ impl NntpClient {
         exclude: &[usize],
         requested_body_bytes: u64,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
-        let Some(selection) =
-            self.try_blocking_body_server_selection(exclude, requested_body_bytes)
-        else {
+        let Some(selection) = self.try_blocking_body_server_selection(
+            exclude,
+            requested_body_bytes,
+            QuotaCheck::Dispatch,
+        ) else {
             return Err(BlockingBodyLaneAcquireError::SelectionContended);
         };
         if selection.eligible.is_empty() {
@@ -2413,7 +2425,14 @@ impl NntpClient {
     /// connection permits the idle owned lanes are holding and wait out the
     /// whole acquire deadline for it.
     pub fn blocking_body_lane_candidacy(&self, exclude: &[usize]) -> BlockingBodyLaneCandidacy {
-        let Some(selection) = self.try_blocking_body_server_selection(exclude, 0) else {
+        // A question, not a dispatch: it asks for no bytes, so every server
+        // with any headroom "fits", and letting that fit clear a server's
+        // blocked latch erased the refusal the last real dispatch recorded —
+        // a capped server read as open until something else asked it for
+        // real bytes.
+        let Some(selection) =
+            self.try_blocking_body_server_selection(exclude, 0, QuotaCheck::ReadOnly)
+        else {
             return BlockingBodyLaneCandidacy::Contended;
         };
         let has_candidate = selection.eligible.into_iter().any(|server| {
@@ -2482,6 +2501,7 @@ impl NntpClient {
         &self,
         exclude: &[usize],
         requested_body_bytes: u64,
+        quota_check: QuotaCheck,
     ) -> Option<BodyServerSelection> {
         let server_count = self.pool.server_count();
         let server_groups = self.pool.server_groups();
@@ -2516,10 +2536,15 @@ impl NntpClient {
             if backfill_flags[idx] && !backfill_unlocked {
                 continue;
             }
-            if let Some(rejection) = self
-                .pool
-                .server_transfer_control(ServerId(idx))
-                .and_then(|control| control.quota_rejection_for_dispatch(requested_body_bytes))
+            if let Some(rejection) =
+                self.pool
+                    .server_transfer_control(ServerId(idx))
+                    .and_then(|control| match quota_check {
+                        QuotaCheck::Dispatch => {
+                            control.quota_rejection_for_dispatch(requested_body_bytes)
+                        }
+                        QuotaCheck::ReadOnly => control.quota_rejection_for(requested_body_bytes),
+                    })
             {
                 retain_earliest_quota_rejection(&mut quota_blocked, rejection);
                 continue;
