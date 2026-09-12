@@ -895,6 +895,21 @@ func holdNntpChaosOnServer(host, port, config string) (func() error, error) {
 	}, nil
 }
 
+func fetchNntpConnectionMetricsFrom(host, port string) (weaverReleaseNntpConnections, error) {
+	resp, err := sendNntpCommandToWithRetry(host, port, "METRICS CONNECTIONS", 5)
+	if err != nil {
+		return weaverReleaseNntpConnections{}, err
+	}
+	if !strings.HasPrefix(resp, "290 ") {
+		return weaverReleaseNntpConnections{}, fmt.Errorf("unexpected connection metrics response: %s", resp)
+	}
+	var metrics weaverReleaseNntpConnections
+	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(resp, "290 "))), &metrics); err != nil {
+		return weaverReleaseNntpConnections{}, err
+	}
+	return metrics, nil
+}
+
 func fetchNntpStatMetricsFrom(host, port, prefix string) (restartNntpMetrics, error) {
 	cmd := "METRICS STAT"
 	if strings.TrimSpace(prefix) != "" {

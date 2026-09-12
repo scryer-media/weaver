@@ -534,6 +534,24 @@ func cmdChaos(config string) {
 
 type submitNZBOptions struct {
 	force bool
+	// newsgroup, when set, replaces every <group> element of the fixture NZB
+	// before submission. The seeded fixtures all post to one newsgroup, so a
+	// round that wants each job leased for a different group rewrites it here.
+	newsgroup string
+}
+
+var nzbGroupElementPattern = regexp.MustCompile(`<group>[^<]*</group>`)
+
+// overrideNzbNewsgroup points every <group> element of an NZB at newsgroup.
+func overrideNzbNewsgroup(nzb []byte, newsgroup string) ([]byte, error) {
+	newsgroup = strings.TrimSpace(newsgroup)
+	if newsgroup == "" {
+		return nzb, nil
+	}
+	if !nzbGroupElementPattern.Match(nzb) {
+		return nil, fmt.Errorf("NZB has no <group> element to override")
+	}
+	return nzbGroupElementPattern.ReplaceAllLiteral(nzb, []byte("<group>"+newsgroup+"</group>")), nil
 }
 
 func submitOneNZB(weaverURL string, scenario *Scenario) (int, error) {
@@ -546,6 +564,12 @@ func submitOneNZBWithOptions(weaverURL string, scenario *Scenario, options submi
 	nzbData, err := os.ReadFile(nzbPath)
 	if err != nil {
 		return 0, fmt.Errorf("read NZB: %w", err)
+	}
+	if options.newsgroup != "" {
+		nzbData, err = overrideNzbNewsgroup(nzbData, options.newsgroup)
+		if err != nil {
+			return 0, fmt.Errorf("override NZB newsgroup for %s: %w", slug, err)
+		}
 	}
 
 	nzbB64 := base64.StdEncoding.EncodeToString(nzbData)
