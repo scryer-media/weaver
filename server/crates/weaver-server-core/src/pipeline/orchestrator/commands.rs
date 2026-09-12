@@ -792,6 +792,9 @@ impl Pipeline {
                 self.publish_snapshot();
                 let _ = reply.send(cleanup_error.map_or(Ok(()), Err));
             }
+            SchedulerCommand::PipelineDiagnostics { reply } => {
+                let _ = reply.send(Box::new(self.diagnostics_snapshot()));
+            }
             SchedulerCommand::Shutdown => unreachable!("handled in select"),
         }
     }

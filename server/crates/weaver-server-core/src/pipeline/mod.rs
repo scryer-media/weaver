@@ -4,6 +4,7 @@ pub(crate) use archive::rar_state;
 mod capacity;
 mod completion;
 mod decode;
+pub mod diagnostics;
 mod direct_store;
 pub mod direct_unpack;
 pub mod download;
@@ -2737,9 +2738,6 @@ pub struct Pipeline {
     /// Runtime-only per-server BODY depth explorers. Seeded from the persisted
     /// depth on first observation; the measurements themselves never persist.
     pub(super) download_lane_runtime: DownloadLaneRuntimeState,
-    /// Lane refill requests held under hard download pressure, answered as the
-    /// backlog drains so lanes resume without a park/redispatch round-trip.
-    pub(super) deferred_lane_refills: VecDeque<DownloadLaneRefillRequest>,
     /// A lane parked and its connection slot came back; the run loop owes a
     /// dispatch pass.
     ///

@@ -45,6 +45,10 @@ const en: LocaleDictionary = {
   "systemInfo.capacityUnavailable": "Filesystem capacity is unavailable for this path.",
   "systemInfo.notLimited": "Not limited",
   "systemInfo.noneDetected": "None detected",
+  "systemInfo.downloadDiagnostics": "Download diagnostics package",
+  "systemInfo.diagnosticsBusy": "Collecting diagnostics…",
+  "systemInfo.diagnosticsHint": "Collection takes about 15 seconds: metrics are sampled twice, ten seconds apart. Passwords, API keys and other secrets are removed.",
+  "systemInfo.diagnosticsFailed": "The diagnostics package could not be created.",
 
   // Status labels
   "status.queued": "Queued",

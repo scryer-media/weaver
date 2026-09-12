@@ -200,7 +200,6 @@ impl TestHarness {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: vec![],
             categories: vec![],
             retry: None,
@@ -897,6 +896,10 @@ fn spawn_test_scheduler(
                 SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
                     let _ = reply.send(());
                 }
+                // Dropping the reply is the answer: the diagnostics request
+                // reports a pipeline that did not respond, which is what a
+                // mock scheduler is.
+                SchedulerCommand::PipelineDiagnostics { .. } => {}
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.

@@ -25,8 +25,6 @@ pub struct Config {
     #[serde(default)]
     pub buffer_pool: Option<BufferPoolOverrides>,
     #[serde(default)]
-    pub tuner: Option<TunerOverrides>,
-    #[serde(default)]
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub categories: Vec<CategoryConfig>,
@@ -355,15 +353,6 @@ pub struct RetryOverrides {
     pub multiplier: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TunerOverrides {
-    pub max_concurrent_downloads: Option<usize>,
-    pub decode_thread_count: Option<usize>,
-    /// Number of threads in the post-processing pool (extraction, PAR2 verify/repair).
-    /// Defaults to `(physical_cores / 2).max(1)`.
-    pub extract_thread_count: Option<usize>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,7 +364,6 @@ mod tests {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: vec![ServerConfig {
                 id: 1,
                 host: "news.example.com".to_string(),

@@ -47,7 +47,6 @@ impl Harness {
             intermediate_dir: Some(intermediate_dir.display().to_string()),
             complete_dir: Some(complete_dir.display().to_string()),
             buffer_pool: None,
-            tuner: None,
             servers: vec![],
             categories: vec![],
             retry: None,

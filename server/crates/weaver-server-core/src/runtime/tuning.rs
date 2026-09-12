@@ -4,39 +4,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::system_profile::SystemProfile;
 
-use crate::operations::metrics::{DownloadPressureState, MetricsSnapshot};
-
 /// IOPS threshold for "fast" storage (SSD/NVMe). Above this, disk is not the
 /// bottleneck and we can use all configured connections. Below this, we
 /// throttle to avoid disk contention.
 const FAST_STORAGE_IOPS: f64 = 1_000.0;
 const MAX_CONCURRENT_EXTRACTIONS_ENV: &str = "WEAVER_MAX_CONCURRENT_EXTRACTIONS";
 
-/// Runtime-tunable parameters. The tuner adjusts these based on observed performance.
+/// Runtime limits derived from the system profile and the configured servers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunedParameters {
     pub max_concurrent_downloads: usize,
-    pub max_write_queue: usize,
-    pub min_free_buffers: usize,
     pub decode_thread_count: usize,
-    pub repair_thread_count: usize,
     pub extract_thread_count: usize,
 }
 
-/// The runtime tuner. Holds system profile and current parameters.
-/// Adjusts parameters conservatively based on metrics.
+/// Holds the system profile and the limits derived from it. The only value
+/// that moves at runtime is the extraction concurrency, which follows the
+/// measured disk once the startup benchmark lands.
 pub struct RuntimeTuner {
     profile: SystemProfile,
     current: TunedParameters,
     max_concurrent_extractions_override: Option<usize>,
     /// Total connections across all configured servers (hard ceiling).
     total_connections: usize,
-    /// Number of consecutive snapshots under hard byte-pressure backpressure.
-    decode_pressure_streak: u32,
-    /// Number of consecutive snapshots where download_queue_depth == 0.
-    download_idle_streak: u32,
-    /// Exponential moving average of download speed (bytes/sec).
-    bandwidth_ema: f64,
 }
 
 impl RuntimeTuner {
@@ -54,21 +44,17 @@ impl RuntimeTuner {
             env::var(MAX_CONCURRENT_EXTRACTIONS_ENV).ok().as_deref(),
         );
 
-        // Start with all configured connections — the adaptive tuner will
-        // reduce if decode pressure builds or disk can't keep up. Never cap
-        // below what the user configured; if throttling is needed, the
-        // decode_pressure_streak mechanism handles it automatically.
+        // Every configured connection is a download connection. Memory
+        // pressure changes where decoded bytes go (the write backlog spills
+        // to disk), never how many articles are requested: a connection
+        // count that ratchets down on pressure turns a transient backlog
+        // into a lasting speed loss that only a restart undoes.
         let max_concurrent_downloads = total_connections;
-
-        let repair_threads = cores.max(1);
         let extract_threads = (cores / 2).max(1);
 
         let current = TunedParameters {
             max_concurrent_downloads,
-            max_write_queue: max_concurrent_downloads * 2,
-            min_free_buffers: 4,
             decode_thread_count: cores,
-            repair_thread_count: repair_threads,
             extract_thread_count: extract_threads,
         };
 
@@ -77,9 +63,6 @@ impl RuntimeTuner {
             current,
             max_concurrent_extractions_override,
             total_connections,
-            decode_pressure_streak: 0,
-            download_idle_streak: 0,
-            bandwidth_ema: 0.0,
         }
     }
 
@@ -96,56 +79,6 @@ impl RuntimeTuner {
         &self.current
     }
 
-    /// Adjust parameters based on a metrics snapshot.
-    /// Returns true if any parameter changed.
-    pub fn adjust(&mut self, metrics: &MetricsSnapshot) -> bool {
-        // --- Bandwidth tracking ---
-        // EMA with α=0.3 gives ~15-second effective window at 5s intervals.
-        //
-        // No connections are held back for recovery work. Recovery blocks are
-        // promoted into the job's own queue as completion-critical work and
-        // ride the same lanes as the payload, so a reserved slot could only
-        // ever be an idle connection: the reserve was subtracted from the
-        // ordinary lease budget while the work it was reserved for was still
-        // parked, waiting for a checkpoint that had not run yet.
-        const ALPHA: f64 = 0.3;
-        self.bandwidth_ema =
-            ALPHA * metrics.current_download_speed as f64 + (1.0 - ALPHA) * self.bandwidth_ema;
-
-        // --- Byte-pressure / idle streaks ---
-        if metrics.download_pressure_state == DownloadPressureState::Hard {
-            self.decode_pressure_streak += 1;
-            self.download_idle_streak = 0;
-        } else if metrics.download_queue_depth == 0 {
-            self.download_idle_streak += 1;
-            self.decode_pressure_streak = 0;
-        } else {
-            self.decode_pressure_streak = 0;
-            self.download_idle_streak = 0;
-        }
-
-        const STREAK_THRESHOLD: u32 = 3;
-
-        if self.decode_pressure_streak >= STREAK_THRESHOLD
-            && self.current.max_concurrent_downloads > 1
-        {
-            self.current.max_concurrent_downloads -= 1;
-            self.decode_pressure_streak = 0;
-            return true;
-        }
-
-        if self.download_idle_streak >= STREAK_THRESHOLD {
-            let limit = self.max_downloads_limit();
-            if self.current.max_concurrent_downloads < limit {
-                self.current.max_concurrent_downloads += 1;
-                self.download_idle_streak = 0;
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// Upper limit for max_concurrent_downloads based on system profile
     /// and configured connection count.
     fn max_downloads_limit(&self) -> usize {
@@ -160,12 +93,6 @@ impl RuntimeTuner {
         // Re-derive max_concurrent_downloads the same way as initial construction,
         // so adding a server immediately makes those connections available.
         self.current.max_concurrent_downloads = limit;
-        self.current.max_write_queue = limit * 2;
-    }
-
-    /// The system profile.
-    pub fn profile(&self) -> &SystemProfile {
-        &self.profile
     }
 
     /// Apply the asynchronous startup disk measurement without disrupting
@@ -196,11 +123,6 @@ impl RuntimeTuner {
                 1
             }
         }
-    }
-
-    /// Current bandwidth estimate (bytes/sec, exponential moving average).
-    pub fn bandwidth_ema(&self) -> f64 {
-        self.bandwidth_ema
     }
 }
 

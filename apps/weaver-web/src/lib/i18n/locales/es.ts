@@ -629,6 +629,12 @@ const es: LocaleDictionary = {
   "upload.duplicateScore": "Puntuación de duplicado",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "Las puntuaciones más altas ganan dentro de la misma clave de duplicado; en empate se conserva el candidato existente.",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "Descargar paquete de diagnóstico",
+  "systemInfo.diagnosticsBusy": "Recopilando diagnósticos…",
+  "systemInfo.diagnosticsHint": "La recopilación tarda unos 15 segundos: las métricas se muestrean dos veces, con diez segundos de diferencia. Las contraseñas, claves de API y otros secretos se eliminan.",
+  "systemInfo.diagnosticsFailed": "No se pudo crear el paquete de diagnóstico.",
   ...duplicateLocaleEntries.spa,
 };
 

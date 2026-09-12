@@ -127,7 +127,6 @@ mod tests {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: Vec::new(),
             categories: Vec::new(),
             retry: None,

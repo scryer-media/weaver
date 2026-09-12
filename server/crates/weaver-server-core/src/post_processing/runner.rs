@@ -924,7 +924,7 @@ async fn terminate_supervisor(
         let _ = child.wait().await?;
         return Ok(());
     }
-    let _ = pid;
+    let _ = (pid, grace);
     child.kill().await?;
     let _ = child.wait().await?;
     Ok(())

@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::broadcast;
 
@@ -11,6 +11,45 @@ const DEFAULT_CAPACITY: usize = 1000;
 const BROADCAST_CAPACITY: usize = 256;
 const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ROTATED_LOG_FILES: usize = 5;
+
+/// The log file path the process actually resolved at startup.
+///
+/// The resolution rules (CLI flag, environment, platform default) live in the
+/// binary, so anything that needs the *real* path — the diagnostics package, in
+/// particular — would otherwise have to guess at them a second time and get it
+/// wrong. Recorded once, read-only afterwards.
+static RESOLVED_LOG_FILE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Records the resolved log file path. The first call wins; later calls are
+/// ignored so a test or a second subscriber cannot move the recorded path.
+pub fn set_log_file_path(path: PathBuf) {
+    let _ = RESOLVED_LOG_FILE_PATH.set(path);
+}
+
+/// The resolved log file path, or `None` when this process writes no log file.
+pub fn log_file_path() -> Option<&'static Path> {
+    RESOLVED_LOG_FILE_PATH.get().map(PathBuf::as_path)
+}
+
+/// The active log file followed by every rotated generation that exists on
+/// disk, in newest-first order. Entries that do not exist are skipped, so the
+/// result is exactly the set of files a collector can read.
+pub fn existing_log_files() -> Vec<PathBuf> {
+    let Some(path) = log_file_path() else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    if path.is_file() {
+        files.push(path.to_path_buf());
+    }
+    for generation in 1..=MAX_ROTATED_LOG_FILES {
+        let rotated = rotated_log_path(path, generation);
+        if rotated.is_file() {
+            files.push(rotated);
+        }
+    }
+    files
+}
 
 /// Thread-safe ring buffer that captures log lines for live viewing.
 ///

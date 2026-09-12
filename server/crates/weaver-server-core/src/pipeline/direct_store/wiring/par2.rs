@@ -92,6 +92,29 @@ impl Pipeline {
             })
     }
 
+    /// File indices whose queued articles are held back while a demotion
+    /// sweep owns them, or `None` when no sweep is in flight for the job.
+    ///
+    /// An article for a sweep-owned file cannot be written when it lands: the
+    /// decode seam parks it in the write buffer, and neither relief path may
+    /// spill it, since a flush would commit over the image the sweep is
+    /// still rebuilding. Fetching more of them while the sweep runs only
+    /// grows that parked backlog toward the write-pressure latch, which then
+    /// stops every other file too. Dispatch skips them until the handback.
+    pub(crate) fn demotion_sweep_held_file_indices(&self, job_id: JobId) -> Option<Vec<u32>> {
+        let sets = self.direct_demotion_in_flight.get(&job_id)?;
+        let held: Vec<u32> = sets
+            .values()
+            .flat_map(|work| {
+                work.plan
+                    .volume_files
+                    .iter()
+                    .map(|file_id| file_id.file_index)
+            })
+            .collect();
+        (!held.is_empty()).then_some(held)
+    }
+
     /// The virtual volume behind one direct source file, as a **one-volume**
     /// provider plus its logical length.
     ///

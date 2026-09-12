@@ -505,7 +505,6 @@ impl OwnedDownloadLanePool {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn worker_count(&self) -> usize {
         lock_pool(&self.shared).workers.len()
     }
@@ -647,8 +646,19 @@ fn run_owned_lane_worker(
         // commands are answered in place and leave the worker idle, so the
         // idle marker is only re-published after a run.
         loop {
-            let Ok(command) = rx.recv() else {
-                break 'work;
+            let command = match rx.recv_timeout(CACHED_LANE_LIVENESS_INTERVAL) {
+                Ok(command) => command,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    // A server that times out an idle connection leaves the
+                    // socket half-closed on this side, and the worker would
+                    // keep the pool permit for it until a lease was routed
+                    // here. Give the permit back as soon as that is noticed.
+                    if discard_closed_cached_lane(&mut cached_lane) {
+                        lock_pool(shared).note_idle_lane(index, None);
+                    }
+                    continue;
+                }
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break 'work,
             };
             match command {
                 // The submit that sent this already claimed the worker, so
@@ -783,6 +793,28 @@ fn park_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) {
     if let Some(cached) = cached_lane.take() {
         cached.lane.park();
     }
+}
+
+/// How often an idle worker checks that the server still holds its cached
+/// connection open.
+const CACHED_LANE_LIVENESS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Drop a cached connection the server has already closed. There is nothing
+/// to QUIT; what matters is that its permit goes back to the pool now rather
+/// than when the next lease finds the socket dead.
+fn discard_closed_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) -> bool {
+    if !cached_lane
+        .as_ref()
+        .is_some_and(|cached| cached.lane.peer_closed())
+    {
+        return false;
+    }
+    cached_lane.take();
+    crate::runtime::perf_probe::record(
+        "download.owned_lane.peer_closed",
+        std::time::Duration::from_nanos(1),
+    );
+    true
 }
 
 /// Everything a downloaded article needs from the lease its work came from.
@@ -956,6 +988,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     {
         park_cached_lane(cached_lane);
     }
+    // A cached connection the server closed while it sat idle serves nothing:
+    // its first BODY would fail only after a read timeout and burn a retry.
+    discard_closed_cached_lane(cached_lane);
 
     if cached_lane.is_none() {
         let initial_estimate = Pipeline::bandwidth_reservation_estimate(

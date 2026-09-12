@@ -5,7 +5,7 @@ use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
-    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, TunerOverrides,
+    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -122,27 +122,6 @@ impl Database {
                     small_count: small,
                     medium_count: medium,
                     large_count: large,
-                })
-            } else {
-                None
-            }
-        };
-
-        let tuner = {
-            let max_dl = settings
-                .get("tuner.max_concurrent_downloads")
-                .and_then(|v| v.parse().ok());
-            let decode_threads = settings
-                .get("tuner.decode_thread_count")
-                .and_then(|v| v.parse().ok());
-            let extract_threads = settings
-                .get("tuner.extract_thread_count")
-                .and_then(|v| v.parse().ok());
-            if max_dl.is_some() || decode_threads.is_some() || extract_threads.is_some() {
-                Some(TunerOverrides {
-                    max_concurrent_downloads: max_dl,
-                    decode_thread_count: decode_threads,
-                    extract_thread_count: extract_threads,
                 })
             } else {
                 None
@@ -271,7 +250,6 @@ impl Database {
             intermediate_dir,
             complete_dir,
             buffer_pool,
-            tuner,
             servers,
             categories,
             retry,
@@ -389,15 +367,6 @@ impl Database {
             }
             if let Some(v) = bp.large_count {
                 self.set_setting("buffer_pool.large_count", &v.to_string())?;
-            }
-        }
-
-        if let Some(ref tuner) = config.tuner {
-            if let Some(v) = tuner.max_concurrent_downloads {
-                self.set_setting("tuner.max_concurrent_downloads", &v.to_string())?;
-            }
-            if let Some(v) = tuner.decode_thread_count {
-                self.set_setting("tuner.decode_thread_count", &v.to_string())?;
             }
         }
 

@@ -693,6 +693,14 @@ pub enum SchedulerCommand {
         delete_files: bool,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
+    /// Copy a read-only diagnostics snapshot out of the pipeline actor.
+    ///
+    /// Answered from the same command loop as everything else, so the snapshot
+    /// is coherent with the turn it lands in rather than being stitched
+    /// together from fields read while the actor was running.
+    PipelineDiagnostics {
+        reply: oneshot::Sender<Box<crate::pipeline::diagnostics::PipelineDiagnostics>>,
+    },
     /// Shutdown the scheduler gracefully.
     Shutdown,
 }
@@ -1108,6 +1116,20 @@ impl SchedulerHandle {
     /// Record a connection test's first-byte latency for the download lanes.
     pub fn note_server_probe_latency(&self, server_id: u32, latency: Duration) {
         self.state.note_server_probe_latency(server_id, latency);
+    }
+
+    /// Read-only pipeline internals for the diagnostics package.
+    pub async fn pipeline_diagnostics(
+        &self,
+    ) -> Result<crate::pipeline::diagnostics::PipelineDiagnostics, SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::PipelineDiagnostics { reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await
+            .map(|diagnostics| *diagnostics)
+            .map_err(|_| SchedulerError::ChannelClosed)
     }
 
     /// Pause all download dispatch globally.

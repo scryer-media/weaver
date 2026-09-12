@@ -58,6 +58,7 @@ use crate::DownloadWork;
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::pipeline::diagnostics::DirectSetCounts;
 use crate::pipeline::{
     BufferedDecodedSegment, DecodedChunk, DirectDemotionWork, DirectDemotionWorkDone,
     DirectPostRepairCarry, DirectPostRepairWork, DirectPostRepairWorkDone, DirectToleratedWork,
@@ -290,6 +291,35 @@ impl DirectStoreRuntime {
             )),
             ..Self::default()
         }
+    }
+
+    /// Per-job counts of the sets this runtime is carrying, for the read-only
+    /// diagnostics snapshot.
+    ///
+    /// Deliberately counts rather than set state: the snapshot is copied out of
+    /// the actor while it is blocked on the reply, so everything it reads has
+    /// to be cheap and allocation-bounded.
+    pub(crate) fn set_counts_by_job(&self) -> Vec<(JobId, DirectSetCounts)> {
+        let mut counts: Vec<(JobId, DirectSetCounts)> = self
+            .sets
+            .iter()
+            .map(|(job_id, sets)| {
+                let mut row = DirectSetCounts::default();
+                for set in sets {
+                    row.total += 1;
+                    if set.is_demoted() {
+                        row.demoted += 1;
+                    } else if set.is_finalized() {
+                        row.finalized += 1;
+                    } else {
+                        row.admitted += 1;
+                    }
+                }
+                (*job_id, row)
+            })
+            .collect();
+        counts.sort_by_key(|(job_id, _)| job_id.0);
+        counts
     }
 
     /// The process-wide holds accountant.

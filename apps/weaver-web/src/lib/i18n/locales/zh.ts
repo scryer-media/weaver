@@ -628,6 +628,12 @@ const zh: LocaleDictionary = {
   "upload.duplicateScore": "重复评分",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "同一重复键内分数较高者胜出；分数相同则保留现有候选。",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "下载诊断包",
+  "systemInfo.diagnosticsBusy": "正在收集诊断信息…",
+  "systemInfo.diagnosticsHint": "收集大约需要 15 秒：指标会间隔十秒采样两次。密码、API 密钥等机密信息会被移除。",
+  "systemInfo.diagnosticsFailed": "无法创建诊断包。",
   ...duplicateLocaleEntries.zho,
 };
 

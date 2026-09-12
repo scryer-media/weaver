@@ -115,11 +115,20 @@ impl Pipeline {
         }
 
         tokio::fs::create_dir_all(&data_dir).await?;
-        tokio::fs::create_dir_all(&intermediate_dir).await?;
-        tokio::fs::create_dir_all(&complete_dir).await?;
+        // A download folder on a drive that is gone must not stop Weaver from
+        // starting, or it could never be pointed at another one.
+        for dir in [&intermediate_dir, &complete_dir] {
+            if let Err(error) = tokio::fs::create_dir_all(dir).await {
+                warn!(path = %dir.display(), error = %error, "download folder unavailable");
+            }
+        }
         let uu_spool_root = intermediate_dir.join(".uu-park");
         let cleanup_root = uu_spool_root.clone();
-        tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await??;
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await?
+        {
+            warn!(path = %uu_spool_root.display(), error = %error, "failed to clear the stale UU spool");
+        }
         let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
         let process_memory_budget =
             Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
@@ -213,7 +222,6 @@ impl Pipeline {
             hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
             hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
-            deferred_lane_refills: std::collections::VecDeque::new(),
             download_dispatch_wake: false,
             nntp_handoff_draining: false,
             ip_replacement_trial_extra_connections,
@@ -1073,9 +1081,6 @@ impl Pipeline {
                         self.sample_phase_progress();
                         self.shared_state.refresh_metrics_snapshot();
                         self.flush_pending_snapshot();
-                        // Fallback wake for refills held under hard pressure, in
-                        // case the backlog drained without a download event.
-                        self.maybe_service_deferred_lane_refills();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
@@ -1085,6 +1090,7 @@ impl Pipeline {
                     }
                     _ = tune_interval.tick() => {
                         self.flush_quiescent_write_backlog().await;
+                        self.relieve_latched_write_backlog().await;
                         self.refresh_download_pressure();
                         self.publish_download_transport_health();
 
@@ -1139,13 +1145,6 @@ impl Pipeline {
                             health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                             "pipeline tick"
                         );
-
-                        if self.tuner.adjust(&snapshot) {
-                            info!(
-                                max_downloads = self.tuner.params().max_concurrent_downloads,
-                                "tuner adjusted parameters"
-                            );
-                        }
                     }
                     _ = stalled_download_interval.tick() => {
                         self.auto_pause_stalled_downloads();
@@ -1442,7 +1441,6 @@ impl Pipeline {
         self.direct_unpack_shutdown("pipeline shutting down").await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
-        self.deferred_lane_refills.clear();
         self.drain_inflight_download_and_decode_work().await;
         self.flush_quiescent_write_backlog().await;
 

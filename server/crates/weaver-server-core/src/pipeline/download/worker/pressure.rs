@@ -138,9 +138,7 @@ impl Pipeline {
             .is_none_or(|next| *next == work.segment_id.segment_number)
     }
 
-    pub(in crate::pipeline::download::worker) fn download_pressure_limits(
-        &self,
-    ) -> (u64, u64, u64, u64) {
+    pub(in crate::pipeline) fn download_pressure_limits(&self) -> (u64, u64, u64, u64) {
         let decode_hard = (self.decode_backlog_budget_bytes as u64).max(1);
         let decode_soft = (decode_hard.saturating_mul(DOWNLOAD_PRESSURE_SOFT_PERCENT) / 100)
             .max(1)

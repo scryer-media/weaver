@@ -1918,7 +1918,6 @@ fn settings_resolve_reads_the_config_table() {
         intermediate_dir: None,
         complete_dir: None,
         buffer_pool: None,
-        tuner: None,
         servers: Vec::new(),
         categories: Vec::new(),
         retry: None,
