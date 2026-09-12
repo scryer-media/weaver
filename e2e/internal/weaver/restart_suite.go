@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -908,6 +909,36 @@ func fetchNntpConnectionMetricsFrom(host, port string) (weaverReleaseNntpConnect
 		return weaverReleaseNntpConnections{}, err
 	}
 	return metrics, nil
+}
+
+// How long the provider may go on holding a stopped Weaver's connection
+// slots before the harness calls it a fault rather than a teardown.
+const nntpConnectionDrainBudget = 60 * time.Second
+
+// waitForFreeNntpConnectionMetrics reads the provider's connection counters
+// once it has a slot to spare for the read itself.
+//
+// A capped round ends with every slot held by Weaver's lanes, and stopping
+// Weaver does not hand them back at once: the provider goes on seeing those
+// sockets established for seconds after the process is gone, and its cap
+// counts the harness's own connection, so the read is refused until the last
+// one drains. Waiting costs the assertions nothing — the counters this
+// returns only ever climb, and a refused connection never records a peak.
+func waitForFreeNntpConnectionMetrics(host, port string) (weaverReleaseNntpConnections, error) {
+	deadline := time.Now().Add(nntpConnectionDrainBudget)
+	for {
+		metrics, err := fetchNntpConnectionMetricsFrom(host, port)
+		if err == nil {
+			return metrics, nil
+		}
+		// Only a saturated cap is worth waiting out. Anything else is the
+		// provider itself being wrong, and sitting on it for a minute would
+		// only delay the report.
+		if !errors.Is(err, errNntpConnectionsSaturated) || !time.Now().Before(deadline) {
+			return weaverReleaseNntpConnections{}, err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func fetchNntpStatMetricsFrom(host, port, prefix string) (restartNntpMetrics, error) {

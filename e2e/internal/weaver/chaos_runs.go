@@ -379,11 +379,13 @@ func cmdChaosTest() {
 		}
 
 		if round.providerCap > 0 {
-			// Weaver's cached lanes hold the capped slots; stop it so the
-			// provider answers the harness again, then read the round's
-			// connection counters before the cap is lifted.
+			// Weaver's cached lanes hold the capped slots, so stop it and
+			// wait for the provider to take those sockets off its own books
+			// before reading the round's counters — the process exiting is
+			// not the moment the slots come back. Read before the cap is
+			// lifted so the configured limit is still the round's.
 			killWeaver()
-			connections, err := fetchNntpConnectionMetricsFrom(nntpHost(), nntpPort())
+			connections, err := waitForFreeNntpConnectionMetrics(nntpHost(), nntpPort())
 			if err != nil {
 				log.Printf("  FAIL: fetch connection metrics for round %q: %v", round.name, err)
 				roundFail++

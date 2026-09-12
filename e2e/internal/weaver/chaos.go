@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,15 @@ import (
 )
 
 // --- chaos ---
+
+// errNntpConnectionsSaturated is the provider turning a session away because
+// its chaos connection cap is already spoken for.
+//
+// Worth naming because the cap counts the refused connection itself, so the
+// harness meets it whenever every slot is held — including by sockets a
+// stopped Weaver has not handed back yet. Callers that can afford to wait for
+// a slot need to tell that apart from a provider that is actually broken.
+var errNntpConnectionsSaturated = errors.New("NNTP provider connection cap saturated")
 
 func sendNntpCommand(cmd string) string {
 	return sendNntpCommandTo(nntpHost(), nntpPort(), cmd)
@@ -41,6 +51,9 @@ func sendNntpCommandToWithRetry(host, port, cmd string, attempts int) (string, e
 			return resp, nil
 		}
 		lastErr = err
+		if attempt == attempts {
+			break
+		}
 		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 	}
 	return "", lastErr
@@ -69,6 +82,10 @@ func openNntpCommandSession(host, port string, authenticate bool) (*nntpCommandS
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("read greeting from %s: %w", addr, err)
+	}
+	if strings.HasPrefix(greeting, "502") {
+		conn.Close()
+		return nil, fmt.Errorf("%w: %s answered %s", errNntpConnectionsSaturated, addr, strings.TrimSpace(greeting))
 	}
 	if !strings.HasPrefix(greeting, "200") && !strings.HasPrefix(greeting, "201") {
 		conn.Close()
