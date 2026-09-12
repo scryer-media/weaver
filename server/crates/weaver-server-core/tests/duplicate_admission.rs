@@ -105,6 +105,7 @@ fn history(job_id: u64, status: &str) -> JobHistoryRow {
         created_at: 1,
         completed_at: 2,
         metadata: None,
+        server_attribution: None,
     }
 }
 

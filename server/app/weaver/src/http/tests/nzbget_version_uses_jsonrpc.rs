@@ -790,6 +790,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: Some(metadata),
+        server_attribution: None,
     })
     .unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
@@ -810,6 +811,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_200,
         metadata: None,
+        server_attribution: None,
     })
     .unwrap();
     let app = nzbget_test_router(
@@ -3249,6 +3251,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
                 )])
                 .unwrap(),
             ),
+            server_attribution: None,
         },
     )
     .unwrap();
@@ -3322,6 +3325,7 @@ async fn job_output_file_download_handler_streams_history_file() {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: None,
+        server_attribution: None,
     })
     .unwrap();
     let app = job_nzb_test_router(db, handle);

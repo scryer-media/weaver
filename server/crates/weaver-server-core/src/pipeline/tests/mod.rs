@@ -250,6 +250,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         downloaded_bytes: 0,
         restored_download_floor_bytes: 0,
         downloaded_wire_bytes: 0,
+        server_attribution: Default::default(),
         failed_bytes: 0,
         probe_projected_failed_bytes: 0,
         par2_bytes: 0,
@@ -300,6 +301,7 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         category: None,
         metadata: vec![],
         output_dir: None,
+        server_attribution: Vec::new(),
         created_at_epoch_ms: job_id.0 as f64,
     }
 }
@@ -328,6 +330,7 @@ fn history_row_with_output_dir(
         created_at: 1,
         completed_at: 2,
         metadata: None,
+        server_attribution: None,
     }
 }
 
@@ -1827,6 +1830,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
             downloaded_wire_bytes: 0,
+            server_attribution: Default::default(),
             failed_bytes: 0,
             probe_projected_failed_bytes: 0,
             par2_bytes,

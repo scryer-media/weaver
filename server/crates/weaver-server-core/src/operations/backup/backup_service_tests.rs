@@ -224,6 +224,7 @@ fn populate_source_db(db: &Database) {
         created_at: 1,
         completed_at: 2,
         metadata: None,
+        server_attribution: None,
     })
     .unwrap();
 }
@@ -721,6 +722,7 @@ async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() 
                     created_at: 1,
                     completed_at: 2,
                     metadata: None,
+                    server_attribution: None,
                 })
                 .unwrap();
             writer_db

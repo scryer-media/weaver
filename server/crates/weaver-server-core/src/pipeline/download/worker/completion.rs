@@ -594,6 +594,15 @@ impl Pipeline {
             (excluded_servers, source_server_idx)
         };
 
+        // Per-job attribution reads the same runtime index the per-server
+        // counters above do, and carries the same caveat: after a pool rebuild
+        // the index may name a different server, so a result dispatched under a
+        // superseded generation is left uncounted rather than charged to
+        // whoever now holds its slot. One integer compare per result.
+        let attributed_server_idx = (result.runtime_generation == self.pool_generation)
+            .then_some(source_server_idx)
+            .flatten();
+
         if result.data.is_ok() {
             self.refresh_server_quota_block_presentation();
         }
@@ -609,7 +618,7 @@ impl Pipeline {
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
 
-                self.note_job_wire_bytes(result.segment_id, raw_size_bytes);
+                self.note_job_wire_bytes(result.segment_id, raw_size_bytes, attributed_server_idx);
 
                 self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                     segment_id: result.segment_id,
@@ -638,7 +647,7 @@ impl Pipeline {
                     self.metrics
                         .segments_downloaded
                         .fetch_add(1, Ordering::Relaxed);
-                    self.note_job_wire_bytes(result.segment_id, raw_size_bytes);
+                    self.note_job_wire_bytes(result.segment_id, raw_size_bytes, attributed_server_idx);
                     self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                         segment_id: result.segment_id,
                         raw_size,
@@ -666,7 +675,7 @@ impl Pipeline {
                 self.metrics
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
-                self.note_job_wire_bytes(result.segment_id, raw_size);
+                self.note_job_wire_bytes(result.segment_id, raw_size, attributed_server_idx);
                 if crc_mismatch {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
                 }
@@ -688,7 +697,7 @@ impl Pipeline {
                 self.metrics
                     .bytes_downloaded
                     .fetch_add(raw_size, Ordering::Relaxed);
-                self.note_job_wire_bytes(result.segment_id, raw_size);
+                self.note_job_wire_bytes(result.segment_id, raw_size, attributed_server_idx);
                 self.fail_job(job_id, error);
             }
             Err(DownloadError::Fetch(failure)) => {

@@ -1244,6 +1244,7 @@ impl Pipeline {
                 category: state.spec.category.clone(),
                 metadata: state.spec.metadata.clone(),
                 output_dir: Some(state.working_dir.display().to_string()),
+                server_attribution: state.server_attribution.contributions().to_vec(),
                 created_at_epoch_ms: state.created_at_epoch_ms,
             });
         };

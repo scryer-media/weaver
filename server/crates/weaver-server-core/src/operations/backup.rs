@@ -773,6 +773,21 @@ impl Database {
                             // Legacy v1 bundles predate the script model, so a
                             // restored history row starts with no summary.
                             let src_post_processing_summary = "'not_run'";
+                            // A bundle taken before per-job server attribution
+                            // existed has no such column; its rows restore with
+                            // no attribution rather than failing the import.
+                            let src_server_attribution = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "job_history",
+                                "server_attribution",
+                            )
+                            .await?
+                            {
+                                "server_attribution"
+                            } else {
+                                "NULL"
+                            };
                             let src_server_backfill =
                                 if table_has_column(&mut conn, "src", "servers", "backfill")
                                     .await?
@@ -956,7 +971,8 @@ impl Database {
                                      (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                                       optional_recovery_bytes, optional_recovery_downloaded_bytes,
                                       failed_bytes, health, category, output_dir, nzb_path, created_at,
-                                      completed_at, metadata, post_processing_summary)
+                                      completed_at, metadata, post_processing_summary,
+                                      server_attribution)
                                      SELECT job_id, {src_job_hash}, name, status, error_message, total_bytes, downloaded_bytes,
                                             {src_optional_recovery_bytes}, {src_optional_recovery_downloaded_bytes},
                                             failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at,
@@ -971,7 +987,8 @@ impl Database {
                                                      )
                                                 )
                                             END AS metadata,
-                                            {src_post_processing_summary}
+                                            {src_post_processing_summary},
+                                            {src_server_attribution}
                                      FROM src.job_history;
                                  INSERT INTO job_events (id, job_id, timestamp, kind, message, file_id)
                                      SELECT id, job_id, timestamp, kind, message, file_id FROM src.job_events;

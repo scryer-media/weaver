@@ -147,14 +147,37 @@ impl Pipeline {
         }
     }
 
-    /// Credit one landed article's wire bytes to its job's download rate.
+    /// Credit one landed article's wire bytes to its job's download rate, and
+    /// to the server that served it.
     ///
     /// Called on the completion path right beside the global `bytes_downloaded`
     /// counter it must stay in lockstep with: one map lookup, no lock, no
     /// allocation. A job that has already been removed simply drops the credit.
-    pub(crate) fn note_job_wire_bytes(&mut self, segment_id: SegmentId, raw_size: u64) {
+    ///
+    /// `source_server_idx` is the runtime index of the serving server, already
+    /// in hand at every call site. Naming it costs one vector index, and the
+    /// per-job ledger costs a walk of a handful of entries, so attribution
+    /// rides along on the lookup this function already performs. An article
+    /// whose server cannot be named is credited to the job's bytes and left
+    /// out of the ledger: an uncounted article is recoverable from the totals,
+    /// a misattributed one is not.
+    pub(crate) fn note_job_wire_bytes(
+        &mut self,
+        segment_id: SegmentId,
+        raw_size: u64,
+        source_server_idx: Option<usize>,
+    ) {
+        let server_id = source_server_idx.and_then(|idx| {
+            self.nntp
+                .pool()
+                .stable_server_id(weaver_nntp::pool::ServerId(idx))
+                .map(|stable| stable.0)
+        });
         if let Some(state) = self.jobs.get_mut(&segment_id.file_id.job_id) {
             state.downloaded_wire_bytes = state.downloaded_wire_bytes.saturating_add(raw_size);
+            if let Some(server_id) = server_id {
+                state.server_attribution.note_article(server_id, raw_size);
+            }
         }
     }
 

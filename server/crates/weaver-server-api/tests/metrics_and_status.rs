@@ -171,6 +171,7 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 0.0,
+        server_attribution: Vec::new(),
     }
 }
 

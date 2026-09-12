@@ -38,6 +38,11 @@ impl HistorySubscription {
     ) -> Result<impl Stream<Item = JobDetailSnapshot>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<Database>()?.clone();
+        // Resolved once per subscription: a server rename mid-stream is a
+        // cosmetic staleness that the next page load corrects, and re-reading
+        // the config on every 500 ms heartbeat is not worth that.
+        let server_hosts =
+            crate::schema::history_query::server_hosts_by_id(ctx.data::<SharedConfig>()?).await;
         let event_rx = handle.subscribe_events();
 
         // Only events for THIS job should force a database reload; an unrelated
@@ -94,6 +99,7 @@ impl HistorySubscription {
                     handle.clone(),
                     db.clone(),
                     job_id,
+                    server_hosts.clone(),
                 ).await {
                     Ok(snapshot) => {
                         // A job with no live queue entry has settled to the slow
