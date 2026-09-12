@@ -23,6 +23,8 @@ import { useGraphqlConnectionState } from "@/graphql/client";
 import {
   LIVE_METRICS_QUERY,
   LIVE_METRICS_SUBSCRIPTION,
+  UPDATE_STATUS_QUERY,
+  UPDATE_STATUS_SUBSCRIPTION,
   VERSION_QUERY,
 } from "@/graphql/queries";
 import { formatSpeed } from "@/components/SpeedDisplay";
@@ -39,6 +41,8 @@ import { usePwa } from "@/lib/context/pwa-context";
 import { settingsNav } from "@/pages/settings/settings-nav";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
+import { UpdateNotificationLink } from "@/features/updates/update-notification-link";
 import {
   Sheet,
   SheetContent,
@@ -78,6 +82,14 @@ interface LiveMetricsSnapshot {
    * on their queue item.
    */
   jobDownloadRates?: JobDownloadRate[];
+}
+
+interface UpdateStatusQueryPayload {
+  updateStatus: UpdateStatus;
+}
+
+interface UpdateStatusSubscriptionPayload {
+  updateStatusUpdates: UpdateStatus;
 }
 
 const EMPTY_JOBS: JobData[] = [];
@@ -201,11 +213,19 @@ export function Layout() {
   const [{ data: versionData }] = useQuery<{ version: string }>({
     query: VERSION_QUERY,
   });
+  const [{ data: updateStatusData }] = useQuery<UpdateStatusQueryPayload>({
+    query: UPDATE_STATUS_QUERY,
+  });
   const [{ data: metricsSubscriptionData, error: metricsSubscriptionError }] = useSubscription<{
     systemMetricsUpdates: LiveMetricsSnapshot;
   }>({
     query: LIVE_METRICS_SUBSCRIPTION,
   });
+  const [{ data: updateStatusSubscriptionData }] =
+    useSubscription<UpdateStatusSubscriptionPayload>({
+      query: UPDATE_STATUS_SUBSCRIPTION,
+      pause: connectionState.status === "disconnected",
+    });
 
   const reconnectMetricsPolling = useReconnectPolling<LiveMetricsSnapshot>({
     enabled: connectionState.status === "disconnected",
@@ -400,6 +420,9 @@ export function Layout() {
       ? location.pathname === "/" || location.pathname.startsWith("/jobs")
       : location.pathname.startsWith(to);
   const settingsOpen = location.pathname.startsWith("/settings");
+  const updateNotification = releaseNotification(
+    updateStatusSubscriptionData?.updateStatusUpdates ?? updateStatusData?.updateStatus,
+  );
 
   return (
     <LiveDataProvider
@@ -495,7 +518,16 @@ export function Layout() {
             </Button>
             <div className="flex flex-col gap-1">
               <SponsorLink label={t("nav.sponsor")} />
-              {versionData?.version ? (
+              {updateNotification ? (
+                <UpdateNotificationLink
+                  notification={updateNotification}
+                  placement="desktop"
+                  label={t("update.newVersion", { version: updateNotification.version })}
+                  ariaLabel={t("update.newVersionAria", {
+                    version: updateNotification.version,
+                  })}
+                />
+              ) : versionData?.version ? (
                 <div className="text-center text-[11px] tracking-wide text-muted-foreground/70">
                   v{versionData.version}
                 </div>
@@ -528,6 +560,21 @@ export function Layout() {
           </div>
         </main>
       </div>
+
+      <UpdateNotificationLink
+        notification={updateNotification}
+        placement="mobile"
+        label={
+          updateNotification
+            ? t("update.newVersion", { version: updateNotification.version })
+            : ""
+        }
+        ariaLabel={
+          updateNotification
+            ? t("update.newVersionAria", { version: updateNotification.version })
+            : ""
+        }
+      />
 
       <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
         <SheetContent side="left" className="w-[280px] border-border bg-card sm:max-w-[280px]">

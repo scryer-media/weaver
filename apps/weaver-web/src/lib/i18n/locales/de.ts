@@ -9,6 +9,8 @@ const de: LocaleDictionary = {
   "nav.upload": "Hochladen",
   "nav.settings": "Einstellungen",
   "nav.sponsor": "Sponsern",
+  "update.newVersion": "Neue Version v{{version}}",
+  "update.newVersionAria": "Weaver v{{version}} auf GitHub in einem neuen Tab öffnen",
 
   // Status labels
   "status.queued": "Eingereiht",

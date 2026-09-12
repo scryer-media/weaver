@@ -22,6 +22,7 @@ pub mod servers;
 pub mod settings;
 /// Transitional, removed in 0.9.1. See the module docs.
 pub mod upgrade_compat;
+pub mod update_check;
 pub mod watch_folder;
 
 pub use auth::{ApiKeyRow, AuthCredentials};
