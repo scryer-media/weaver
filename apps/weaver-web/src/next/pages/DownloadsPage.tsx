@@ -382,7 +382,7 @@ export function DownloadsPage() {
                             <Bar
                               percent={percent}
                               color={color}
-                              height={7}
+                              height={10}
                               className="max-w-[196px] min-w-[56px] flex-1"
                             />
                             <span className="w-[34px] flex-none font-wv-mono text-[11.5px] text-wv-muted">

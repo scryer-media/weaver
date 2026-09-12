@@ -1,5 +1,5 @@
 import { cn } from "@/lib/utils";
-import { blockFill } from "./chrome";
+import { blockFill, blockPeriod } from "./chrome";
 import { COLS_CLASS, columnStyle } from "./columns";
 import { WV } from "../data/palette";
 
@@ -36,6 +36,12 @@ const COLUMNS = {
 };
 /** The gridlines are the track: one hairline every quarter, under every row. */
 const GRIDLINES = `repeating-linear-gradient(90deg, ${WV.gridline} 0 1px, transparent 1px 25%)`;
+/**
+ * A span's height, which has to be stated twice: once here, for the cell period
+ * it earns, and once as a literal `h-[13px]` below, because Tailwind reads the
+ * class out of the source and cannot be handed a number.
+ */
+const SPAN_HEIGHT = 13;
 
 export function Waterfall({
   stages,
@@ -122,16 +128,16 @@ function StageRow({ stage }: { stage: WaterfallStage }) {
       <div className="relative min-w-0" style={{ backgroundImage: GRIDLINES }}>
         {stage.pending ? null : (
           <div
-            className="absolute top-[11px] h-[10px] min-w-[3px] overflow-hidden"
+            className="absolute top-[10px] h-[13px] min-w-[3px] overflow-hidden"
             style={{
               left: `${start}%`,
               width: `${end - start}%`,
-              backgroundImage: blockFill(stage.color, 7),
+              backgroundImage: blockFill(stage.color, blockPeriod(SPAN_HEIGHT)),
             }}
           />
         )}
         <span
-          className="absolute top-[11px] h-[10px] px-1.5 font-wv-mono text-[10px] leading-[10px] whitespace-nowrap"
+          className="absolute top-[10px] h-[13px] px-1.5 font-wv-mono text-[10px] leading-[13px] whitespace-nowrap"
           style={{
             left: after ? `${end}%` : before ? "auto" : `${start}%`,
             right: after || !before ? "auto" : `${100 - start}%`,

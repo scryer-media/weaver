@@ -444,14 +444,14 @@ function useSteppedValue(target: number, quantum: number): number {
  * value itself is walked up in those same quarter steps, so every level gets
  * drawn instead of being skipped over by a smooth slide.
  *
- * Sizes in the system: 7-8px in rows and gauges, 10px for a pipeline span,
- * 12px for a job's hero bar. The two larger ones take the wider 7px period the
- * design gives them.
+ * Sizes in the system: 10-11px in rows and gauges, 13px for a pipeline span,
+ * 16px for a job's hero bar. The cell grows with them, but more slowly, so a
+ * cell of a bigger bar is a taller rectangle rather than a scaled copy.
  */
 export function Bar({
   percent,
   color,
-  height = 8,
+  height = 11,
   period,
   className,
   style,
@@ -459,7 +459,7 @@ export function Bar({
   percent: number;
   color: string;
   height?: number;
-  /** Cell width in px. Defaults to 6, or 7 once the bar is 10px or taller. */
+  /** Cell width in px. Defaults to the period `blockPeriod` gives this height. */
   period?: number;
   className?: string;
   style?: CSSProperties;
@@ -549,9 +549,16 @@ export function Pie({
   );
 }
 
-/** The cell period a bar of this height takes. */
+/**
+ * The cell period a bar of this height takes.
+ *
+ * Deliberately coarser than the height it serves: the steps are wide enough
+ * apart that a bar has to grow a good deal before its cells widen, which is
+ * what keeps a big bar's cells reading as blocks standing up rather than as
+ * the small bar's cells enlarged.
+ */
 export function blockPeriod(height: number): number {
-  return height >= 10 ? 7 : 6;
+  return height >= 12 ? 8 : height >= 9 ? 7 : 6;
 }
 
 /** The dashed ground a block bar is measured against. */
