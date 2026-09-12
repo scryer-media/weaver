@@ -246,8 +246,8 @@ export function BackupPanel() {
       )) as RestoreReport;
       setNote(
         report.restart_required
-          ? `Restore staged · ${report.history_jobs} transfers in history · restart weaver to apply it`
-          : `Restored ${report.history_jobs} transfers from history`,
+          ? `Restore staged · ${report.history_jobs} downloads in history · restart weaver to apply it`
+          : `Restored ${report.history_jobs} downloads from history`,
       );
       await loadStatus();
     } catch (failure) {

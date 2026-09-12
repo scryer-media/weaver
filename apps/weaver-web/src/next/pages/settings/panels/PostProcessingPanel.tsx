@@ -23,7 +23,7 @@ import {
 } from "../framework";
 
 /**
- * Post-processing: the scripts weaver runs when a transfer finishes.
+ * Post-processing: the scripts weaver runs when a download finishes.
  *
  * Three things live here that save in three different ways, which is the
  * daemon's own shape rather than a choice: the execution settings are a draft
@@ -376,7 +376,7 @@ export function PostProcessingPanel() {
     };
   };
 
-  const scopeLabel = scope === GLOBAL ? "every transfer" : `the ${scope} category`;
+  const scopeLabel = scope === GLOBAL ? "every download" : `the ${scope} category`;
 
   const blocks: (SettingsBlock | null)[] = [
     {
@@ -398,7 +398,7 @@ export function PostProcessingPanel() {
         {
           id: "concurrency",
           label: "Concurrent scripts",
-          help: "How many transfers may be in post-processing at once.",
+          help: "How many downloads may be in post-processing at once.",
           control: {
             kind: "number",
             value: values.concurrency,
@@ -423,7 +423,7 @@ export function PostProcessingPanel() {
         {
           id: "unacceptableExtensions",
           label: "Unacceptable extensions",
-          help: "Comma-separated. A finished transfer holding one of these is refused.",
+          help: "Comma-separated. A finished download holding one of these is refused.",
           keywords: values.unacceptableExtensions,
           control: {
             kind: "text",
@@ -685,11 +685,11 @@ export function PostProcessingPanel() {
     <>
       <PanelControls>
         <Select
-          label="Which transfers this run list applies to"
+          label="Which downloads this run list applies to"
           value={scope}
           className="min-w-0 sm:min-w-[180px]"
           options={[
-            { value: GLOBAL, label: "Every transfer" },
+            { value: GLOBAL, label: "Every download" },
             ...categories.map((category) => ({ value: category.name, label: category.name })),
           ]}
           onChange={setScope}

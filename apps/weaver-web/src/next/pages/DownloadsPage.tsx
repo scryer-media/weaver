@@ -5,7 +5,7 @@ import {
   RESUME_ALL_MUTATION,
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
-import type { JobData } from "@/lib/job-types";
+import { formatJobReleaseName, type JobData } from "@/lib/job-types";
 import {
   formatEtaFromRemainingBytes,
   useStableEtaSpeed,
@@ -15,19 +15,20 @@ import { statusToken } from "@/lib/status-tokens";
 import { Bar, EmptyState, MetricCell, SectionHeader, Square } from "../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
 import { Menu, MenuItem } from "../components/Menu";
+import { StorageMounts, type StorageVolume } from "../components/storage";
 import { ListRow, ValueCell } from "../components/rows";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
-import { EM_DASH, formatSize, splitBytes } from "../data/format";
+import { EM_DASH, formatSize } from "../data/format";
 import { categoryColor, statusColor, UNCATEGORISED_COLOR } from "../data/palette";
 import {
-  TRANSFER_GROUP_LABEL,
-  TRANSFER_GROUP_NOTE,
-  TRANSFER_GROUP_ORDER,
+  DOWNLOAD_GROUP_LABEL,
+  DOWNLOAD_GROUP_NOTE,
+  DOWNLOAD_GROUP_ORDER,
   currentPhase,
-  transferGroup,
+  downloadGroup,
   useStatusLabel,
-  type TransferGroup,
+  type DownloadGroup,
 } from "../data/status";
 import { NextShell } from "../shell/NextShell";
 import {
@@ -37,7 +38,7 @@ import {
   type CategoryEntry,
 } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
-import { TransferInspector } from "./transfers/TransferInspector";
+import { DownloadInspector } from "./downloads/DownloadInspector";
 
 type TabId = "all" | "active" | "queued" | "paused";
 type SortId = "priority" | "name" | "size" | "progress" | "eta";
@@ -52,15 +53,8 @@ const SORT_OPTIONS: { value: SortId; label: string }[] = [
 
 const UNCATEGORISED = "uncategorised";
 
-interface StorageVolume {
-  labels: string[];
-  path: string;
-  error: string | null;
-  capacity: { totalBytes: number; usedBytes: number; freeBytes: number } | null;
-}
-
 /** Group → the tab that shows it. "All" shows everything. */
-const TAB_FOR_GROUP: Record<TransferGroup, TabId> = {
+const TAB_FOR_GROUP: Record<DownloadGroup, TabId> = {
   active: "active",
   paused: "paused",
   queued: "queued",
@@ -76,7 +70,7 @@ function sortJobs(jobs: JobData[], sort: SortId, etaById: Map<number, string>): 
   switch (sort) {
     case "name":
       sorted.sort((left, right) =>
-        (left.displayTitle || left.name).localeCompare(right.displayTitle || right.name),
+        formatJobReleaseName(left).localeCompare(formatJobReleaseName(right)),
       );
       break;
     case "size":
@@ -100,7 +94,7 @@ function sortJobs(jobs: JobData[], sort: SortId, etaById: Map<number, string>): 
   return sorted;
 }
 
-export function TransfersPage() {
+export function DownloadsPage() {
   const { queue, speed, isPaused } = useNextData();
   const statusLabel = useStatusLabel();
 
@@ -110,8 +104,6 @@ export function TransfersPage() {
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [sortOpen, setSortOpen] = useState(false);
-  const [mountOpen, setMountOpen] = useState(false);
-  const [mountPath, setMountPath] = useState<string | null>(null);
   const [uploadOpen, setUploadOpen] = useState(false);
   // Cancelling is not instant; hide the row until the refetch confirms it.
   const [removedIds, setRemovedIds] = useState<ReadonlySet<number>>(() => new Set());
@@ -140,7 +132,8 @@ export function TransfersPage() {
     return jobs.filter(
       (job) =>
         job.name.toLowerCase().includes(needle)
-        || job.displayTitle.toLowerCase().includes(needle),
+        || job.displayTitle.toLowerCase().includes(needle)
+        || formatJobReleaseName(job).toLowerCase().includes(needle),
     );
   }, [jobs, query]);
 
@@ -173,12 +166,12 @@ export function TransfersPage() {
   }, [category, searched]);
 
   const grouped = useMemo(() => {
-    const buckets = new Map<TransferGroup, JobData[]>();
-    for (const group of TRANSFER_GROUP_ORDER) {
+    const buckets = new Map<DownloadGroup, JobData[]>();
+    for (const group of DOWNLOAD_GROUP_ORDER) {
       buckets.set(group, []);
     }
     for (const job of inCategory) {
-      buckets.get(transferGroup(job.status))!.push(job);
+      buckets.get(downloadGroup(job.status))!.push(job);
     }
     return buckets;
   }, [inCategory]);
@@ -193,7 +186,7 @@ export function TransfersPage() {
     [grouped, inCategory.length],
   );
 
-  const visibleGroups = TRANSFER_GROUP_ORDER.filter((group) => {
+  const visibleGroups = DOWNLOAD_GROUP_ORDER.filter((group) => {
     const rows = grouped.get(group)!;
     if (rows.length === 0) {
       return false;
@@ -216,8 +209,6 @@ export function TransfersPage() {
   );
 
   const volumes = systemInfo?.systemInfo?.configuredStorage ?? [];
-  const mount = volumes.find((volume) => volume.path === mountPath) ?? volumes[0] ?? null;
-  const freeSpace = splitBytes(mount?.capacity?.freeBytes ?? 0);
 
   const handleRemoved = useCallback((id: number) => {
     setRemovedIds((current) => new Set(current).add(id));
@@ -241,12 +232,12 @@ export function TransfersPage() {
 
   return (
     <NextShell
-      title="Transfers"
+      title="Downloads"
       controls={
         <>
           <TextField
-            label="Search transfers"
-            placeholder="Search transfers"
+            label="Search downloads"
+            placeholder="Search downloads"
             mono={false}
             value={query}
             onChange={setQuery}
@@ -289,65 +280,10 @@ export function TransfersPage() {
                 remainingBytes > 0 ? `${formatSize(remainingBytes)} left to fetch` : "queue is clear"
               }
             />
-            <MetricCell
-              last
-              eyebrow={
-                <button
-                  type="button"
-                  data-wv-menu-trigger=""
-                  aria-haspopup="menu"
-                  aria-expanded={mountOpen}
-                  disabled={volumes.length === 0}
-                  onClick={() => {
-                    setMountOpen((previous) => !previous);
-                    setSortOpen(false);
-                  }}
-                  className="flex items-center gap-[7px] text-left"
-                >
-                  <span className="text-[10.5px] font-semibold tracking-[0.14em] text-wv-faint uppercase">
-                    Storage
-                  </span>
-                  <span className="truncate font-wv-mono text-[11px] text-wv-tertiary">
-                    {mount?.path ?? EM_DASH}
-                  </span>
-                  {volumes.length > 1 ? (
-                    <span aria-hidden="true" className="text-[8px] text-wv-muted">
-                      &#9660;
-                    </span>
-                  ) : null}
-                </button>
-              }
-              value={freeSpace.value}
-              unit={`${freeSpace.unit} free`}
-              note={
-                mount?.capacity
-                  ? `${formatSize(mount.capacity.usedBytes)} of ${formatSize(mount.capacity.totalBytes)} used`
-                  : (mount?.error ?? "no capacity reported")
-              }
-            >
-              <Menu
-                open={mountOpen}
-                onDismiss={() => setMountOpen(false)}
-                label="Storage volume"
-                className="top-[44px] left-4 min-w-[236px] sm:left-6"
-              >
-                {volumes.map((volume) => (
-                  <MenuItem
-                    key={volume.path}
-                    selected={volume.path === mount?.path}
-                    onSelect={() => {
-                      setMountPath(volume.path);
-                      setMountOpen(false);
-                    }}
-                  >
-                    <span className="truncate font-wv-mono">{volume.path}</span>
-                    <span className="ml-auto flex-none font-wv-mono text-wv-muted">
-                      {volume.capacity ? `${formatSize(volume.capacity.freeBytes)} free` : EM_DASH}
-                    </span>
-                  </MenuItem>
-                ))}
-              </Menu>
-            </MetricCell>
+            <StorageMounts
+              volumes={volumes}
+              className="flex-1 border-t border-wv-hairline px-4 py-4 sm:px-6 lg:border-t-0"
+            />
           </div>
 
           <Tabs
@@ -366,10 +302,7 @@ export function TransfersPage() {
                   data-wv-menu-trigger=""
                   aria-haspopup="menu"
                   aria-expanded={sortOpen}
-                  onClick={() => {
-                    setSortOpen((previous) => !previous);
-                    setMountOpen(false);
-                  }}
+                  onClick={() => setSortOpen((previous) => !previous)}
                   className="flex items-center gap-[6px] font-wv-mono text-[11.5px] text-wv-muted hover:text-wv-fg"
                 >
                   Sort by
@@ -383,7 +316,7 @@ export function TransfersPage() {
                 <Menu
                   open={sortOpen}
                   onDismiss={() => setSortOpen(false)}
-                  label="Sort transfers"
+                  label="Sort downloads"
                   className="top-[26px] right-0 w-[164px]"
                 >
                   {SORT_OPTIONS.map((option) => (
@@ -406,8 +339,8 @@ export function TransfersPage() {
       }
       statusRight={
         queue.totalCount > queue.jobs.length
-          ? `showing ${queue.jobs.length} of ${queue.totalCount} transfers`
-          : `${inCategory.length} of ${jobs.length} transfers shown`
+          ? `showing ${queue.jobs.length} of ${queue.totalCount} downloads`
+          : `${inCategory.length} of ${jobs.length} downloads shown`
       }
       // The list and the inspector are side by side only where both fit; below
       // that the inspector becomes a panel under the list rather than squeezing
@@ -426,9 +359,9 @@ export function TransfersPage() {
             return (
               <section key={group} className="flex flex-none flex-col">
                 <SectionHeader
-                  label={TRANSFER_GROUP_LABEL[group]}
+                  label={DOWNLOAD_GROUP_LABEL[group]}
                   count={rows.length}
-                  note={TRANSFER_GROUP_NOTE[group] || undefined}
+                  note={DOWNLOAD_GROUP_NOTE[group] || undefined}
                 />
                 {rows.map((job) => {
                   const color = statusColor(job.status);
@@ -439,11 +372,11 @@ export function TransfersPage() {
                       markSelection
                       selected={job.id === selectedId}
                       onClick={() => setSelectedId(job.id)}
-                      title={job.name}
+                      title={formatJobReleaseName(job)}
                       left={
                         <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px]">
                           <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
-                            {job.displayTitle || job.name}
+                            {formatJobReleaseName(job)}
                           </span>
                           <div className="flex items-center gap-3">
                             <Bar
@@ -480,7 +413,7 @@ export function TransfersPage() {
       </div>
 
       {selected === null ? null : (
-        <TransferInspector
+        <DownloadInspector
           job={selected}
           eta={trailingValue(selected)}
           rate={currentPhase(selected)?.rateBps ?? 0}

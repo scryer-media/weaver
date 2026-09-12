@@ -113,7 +113,7 @@ export function CategoriesPanel() {
       note: "a blank destination means the completed folder",
       columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr)",
       headers: ["Name", "Destination", "Also known as"],
-      empty: "No categories yet. Transfers without one land in the completed folder.",
+      empty: "No categories yet. Downloads without one land in the completed folder.",
       onRowClick: (id) => {
         const category = categories.find((entry) => String(entry.id) === id);
         if (category) {
@@ -206,7 +206,7 @@ export function CategoriesPanel() {
         note={confirmRemove?.name}
         busy={busy}
         confirmLabel="Remove category"
-        body={`Transfers already filed under ${confirmRemove?.name ?? "this category"} keep their folder; new ones land in the completed folder instead.`}
+        body={`Downloads already filed under ${confirmRemove?.name ?? "this category"} keep their folder; new ones land in the completed folder instead.`}
         onConfirm={() => void remove()}
         onDismiss={() => setConfirmRemove(null)}
       />

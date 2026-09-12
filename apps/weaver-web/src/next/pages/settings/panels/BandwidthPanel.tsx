@@ -328,7 +328,7 @@ export function BandwidthPanel() {
                 </div>
               </div>
               <KeyValueRow label="Remaining" value={formatSize(ispBlock.remainingBytes)} />
-              <KeyValueRow label="Reserved by running transfers" value={formatSize(ispBlock.reservedBytes)} />
+              <KeyValueRow label="Reserved by running downloads" value={formatSize(ispBlock.reservedBytes)} />
               <KeyValueRow label="Window resets" value={formatDate(ispBlock.windowEndsAtEpochMs)} />
               <KeyValueRow
                 label="Downloads held by the cap"

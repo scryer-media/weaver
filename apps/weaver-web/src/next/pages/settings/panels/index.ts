@@ -83,7 +83,7 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
   {
     slug: "post-processing",
     label: "Post-processing",
-    note: "scripts run when a transfer finishes",
+    note: "scripts run when a download finishes",
     tag: "beta",
     Component: PostProcessingPanel,
   },

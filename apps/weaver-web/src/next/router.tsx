@@ -30,7 +30,7 @@ export const nextRouter = createBrowserRouter(
     {
       errorElement: <NextRouteError />,
       children: [
-        { index: true, ...lazyRoute(() => import("./pages/TransfersPage"), "TransfersPage") },
+        { index: true, ...lazyRoute(() => import("./pages/DownloadsPage"), "DownloadsPage") },
         { path: "history", ...lazyRoute(() => import("./pages/CompletedPage"), "CompletedPage") },
         {
           path: "jobs/:id",
@@ -57,7 +57,7 @@ export const nextRouter = createBrowserRouter(
         },
         // The classic UI has screens this one folds into others (the upload
         // page, the standalone server and category editors). Anything
-        // unrecognised lands on Transfers rather than an error page.
+        // unrecognised lands on Downloads rather than an error page.
         { path: "*", element: <Navigate to="/" replace /> },
       ],
     },

@@ -274,7 +274,7 @@ export function Segmented<T extends string>({
 /* ------------------------------------------------------------------- select */
 
 /**
- * A real dropdown, styled like the Transfers menus — the prototype cycled
+ * A real dropdown, styled like the Downloads menus — the prototype cycled
  * options on click, which the handoff explicitly calls out as prototype-only.
  */
 export function Select<T extends string>({

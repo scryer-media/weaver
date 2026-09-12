@@ -46,7 +46,7 @@ function Field({ label, value, title }: { label: string; value: string; title?: 
  * It scrolls on its own and pins the action block below that scroller, so the
  * three buttons stay reachable however long the file list gets.
  */
-export function TransferInspector({
+export function DownloadInspector({
   job,
   eta,
   rate,
@@ -79,7 +79,7 @@ export function TransferInspector({
     <aside className="flex max-h-[46vh] min-h-0 w-full flex-none flex-col border-t border-wv-line-strong bg-wv-input xl:max-h-none xl:w-[344px] xl:border-t-0 xl:border-l">
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         <div className="flex flex-none flex-col gap-3 border-b border-wv-hairline px-5 py-[22px]">
-          <Eyebrow tone="rail">Selected transfer</Eyebrow>
+          <Eyebrow tone="rail">Selected download</Eyebrow>
           <div className="text-[15px] leading-[1.35] font-semibold tracking-[-0.01em] text-wv-strong">
             {job.displayTitle || job.name}
           </div>
@@ -117,7 +117,7 @@ export function TransferInspector({
           <Eyebrow tone="rail">Files</Eyebrow>
           {files.length === 0 ? (
             <div className="text-[12.5px] text-wv-muted">
-              Nothing written yet — files appear once the transfer reaches its destination.
+              Nothing written yet — files appear once the download reaches its destination.
             </div>
           ) : (
             files.map((file) => (
@@ -166,7 +166,7 @@ export function TransferInspector({
             void cancelJob({ id: job.id });
           }}
         >
-          Remove transfer
+          Remove download
         </DangerButton>
       </div>
     </aside>

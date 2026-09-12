@@ -13,7 +13,7 @@ import { formatClock, formatLatency, splitSpeed, splitUptime } from "../data/for
  * The rail's reusable bottom blocks.
  *
  * Screens pick the ones that belong to them rather than each building its own:
- * Transfers takes Throughput + Providers, Settings takes the config path, and
+ * Downloads takes Throughput + Providers, Settings takes the config path, and
  * the diagnostic screens take Attention + Uptime.
  */
 

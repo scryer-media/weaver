@@ -251,7 +251,7 @@ export function GeneralPanel() {
             {
               id: "intermediateDir",
               label: "Working directory",
-              help: "Where transfers are assembled before post-processing. Blank uses the data directory.",
+              help: "Where downloads are assembled before post-processing. Blank uses the data directory.",
               keywords: `${values.intermediateDir} incomplete temporary`,
               control: {
                 kind: "text",
@@ -263,7 +263,7 @@ export function GeneralPanel() {
             {
               id: "completeDir",
               label: "Completed directory",
-              help: "Where finished transfers land. Categories are relative to this folder.",
+              help: "Where finished downloads land. Categories are relative to this folder.",
               keywords: `${values.completeDir} destination`,
               control: {
                 kind: "text",

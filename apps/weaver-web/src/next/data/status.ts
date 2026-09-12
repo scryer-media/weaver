@@ -10,30 +10,30 @@ import type { JobData } from "@/lib/job-types";
  * new interface, not a new set of words for weaver's pipeline states.
  */
 
-export type TransferGroup = "active" | "paused" | "queued" | "attention";
+export type DownloadGroup = "active" | "paused" | "queued" | "attention";
 
-export const TRANSFER_GROUP_ORDER: readonly TransferGroup[] = [
+export const DOWNLOAD_GROUP_ORDER: readonly DownloadGroup[] = [
   "active",
   "paused",
   "queued",
   "attention",
 ];
 
-export const TRANSFER_GROUP_LABEL: Record<TransferGroup, string> = {
+export const DOWNLOAD_GROUP_LABEL: Record<DownloadGroup, string> = {
   active: "In progress",
   paused: "Paused",
   queued: "Queued",
   attention: "Needs attention",
 };
 
-export const TRANSFER_GROUP_NOTE: Record<TransferGroup, string> = {
+export const DOWNLOAD_GROUP_NOTE: Record<DownloadGroup, string> = {
   active: "",
   paused: "resume to continue",
   queued: "starts when a slot frees",
   attention: "cancelled or failed",
 };
 
-export function transferGroup(status: string): TransferGroup {
+export function downloadGroup(status: string): DownloadGroup {
   const token = statusToken(status);
   if (token === "paused") return "paused";
   if (token === "failed") return "attention";
@@ -48,7 +48,7 @@ export function useStatusLabel(): (status: string) => string {
 
 /**
  * The second line of the inspector's Status field: what the pipeline is doing
- * with this transfer right now, in weaver's own terms.
+ * with this download right now, in weaver's own terms.
  */
 export function statusDetail(job: JobData): string | null {
   if (job.error) {
