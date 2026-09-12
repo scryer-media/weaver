@@ -15,6 +15,7 @@ fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
     assert!(!works.is_empty(), "the fixture job has queued work");
     let compatibility = DownloadBatchCompatibility::from_work(&works[0]);
     DownloadBatchLease {
+        lane_id: 0,
         job_id,
         runtime_generation: 0,
         lane_mode: DownloadLaneMode::Sequential,

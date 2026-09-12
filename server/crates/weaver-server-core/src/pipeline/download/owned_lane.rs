@@ -834,6 +834,7 @@ fn discard_closed_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) -> bool
 /// "what is the current lease" when it lands. The context rides with the work
 /// instead.
 struct LaneLeaseContext {
+    lane_id: u64,
     job_id: JobId,
     runtime_generation: u64,
     spillover_loan_kind: Option<SpilloverLoanKind>,
@@ -852,6 +853,7 @@ impl LaneLeaseContext {
         supports_pipelining: bool,
     ) -> Self {
         Self {
+            lane_id: lease.lane_id,
             job_id: lease.job_id,
             runtime_generation: lease.runtime_generation,
             spillover_loan_kind: lease.spillover_loan_kind,
@@ -975,7 +977,14 @@ fn stream_owned_result(
     let now = lane.stats();
     let stats = stats_delta(now, *stats_mark);
     *stats_mark = now;
-    send_owned_batch(event_tx, vec![result], Vec::new(), stats, false)
+    send_owned_batch(
+        event_tx,
+        result.lane_id,
+        vec![result],
+        Vec::new(),
+        stats,
+        false,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1148,6 +1157,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             let result = result_from_trace(
                 work,
                 work_context.runtime_generation,
+                work_context.lane_id,
                 *trace,
                 DownloadLaneObservation {
                     server_idx: Some(server_idx),
@@ -1182,6 +1192,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             let (response_tx, response_rx) = oneshot::channel();
             if refill_tx
                 .blocking_send(DownloadLaneRefillRequest {
+                    lane_id: context.lane_id,
                     job_id: context.job_id,
                     runtime_generation: context.runtime_generation,
                     server_idx,
@@ -1225,6 +1236,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 let (retry_tx, retry_rx) = oneshot::channel();
                 if refill_tx
                     .blocking_send(DownloadLaneRefillRequest {
+                        lane_id: context.lane_id,
                         job_id: context.job_id,
                         runtime_generation: context.runtime_generation,
                         server_idx,
@@ -1293,6 +1305,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         let result = result_from_trace(
             work,
             work_context.runtime_generation,
+            work_context.lane_id,
             trace,
             DownloadLaneObservation {
                 server_idx: Some(server_idx),
@@ -1336,6 +1349,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 let result = unresolved_result(
                     work,
                     work_context.runtime_generation,
+                    work_context.lane_id,
                     server_idx,
                     work_context.mode,
                     supports_pipelining,
@@ -1383,12 +1397,20 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     // guarantees every streamed result reached the orchestrator before the
     // park message arrives on the other channel and releases the connection.
     let stats = stats_delta(lane.stats(), stats_mark);
-    let _ = send_owned_batch(&event_tx, Vec::new(), unrequested_works, stats, true);
+    let _ = send_owned_batch(
+        &event_tx,
+        park_context.lane_id,
+        Vec::new(),
+        unrequested_works,
+        stats,
+        true,
+    );
 
     if !keep_cached_lane {
         park_cached_lane(cached_lane);
     }
     let _ = parked_tx.blocking_send(DownloadLaneParked {
+        lane_id: park_context.lane_id,
         job_id: park_context.job_id,
         mode: booked_mode,
         spillover_loan_kind: park_context.spillover_loan_kind,
@@ -1418,6 +1440,7 @@ fn drain_pending_refill(
         let context = LaneLeaseContext::from_lease(&lease, server_idx, supports_pipelining);
         let _ = send_owned_batch(
             event_tx,
+            lease.lane_id,
             Vec::new(),
             lease.works,
             weaver_nntp::blocking::BlockingLaneStats::default(),
@@ -1476,6 +1499,7 @@ fn stats_delta(
 /// different channel.
 fn send_owned_batch(
     event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,
+    lane_id: u64,
     results: Vec<DownloadResult>,
     unrequested_works: Vec<DownloadWork>,
     stats: weaver_nntp::blocking::BlockingLaneStats,
@@ -1492,6 +1516,7 @@ fn send_owned_batch(
     };
     event_tx
         .blocking_send(OwnedDownloadLaneEvent::BatchComplete {
+            lane_id,
             results,
             unrequested_works,
             stats,
@@ -1507,6 +1532,7 @@ fn send_owned_batch(
 fn result_from_trace(
     work: DownloadWork,
     runtime_generation: u64,
+    lane_id: u64,
     trace: weaver_nntp::client::DecodedBodyTrace,
     mut observation: DownloadLaneObservation,
     exclude_servers: &[usize],
@@ -1528,6 +1554,7 @@ fn result_from_trace(
         observation.connection_discarded = true;
     }
     DownloadResult {
+        lane_id,
         segment_id,
         runtime_generation,
         data,
@@ -1545,6 +1572,7 @@ fn result_from_trace(
 fn unresolved_result(
     work: DownloadWork,
     runtime_generation: u64,
+    lane_id: u64,
     server_idx: usize,
     mode: DownloadLaneMode,
     supports_pipelining: bool,
@@ -1558,6 +1586,7 @@ fn unresolved_result(
     let is_recovery = work.is_recovery;
     let completion_critical = work.completion_critical;
     DownloadResult {
+        lane_id,
         segment_id: work.segment_id,
         runtime_generation,
         data: Err(DownloadError::Fetch(DownloadFailure::new(
@@ -1620,6 +1649,7 @@ fn test_lease(
     works: Vec<DownloadWork>,
 ) -> DownloadBatchLease {
     DownloadBatchLease {
+        lane_id: 0,
         job_id,
         runtime_generation,
         lane_mode: DownloadLaneMode::Pipelined { depth: 4 },
@@ -1770,6 +1800,7 @@ mod tests {
         let straggler = result_from_trace(
             tail_work(1, 0),
             old.runtime_generation,
+            0,
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: Vec::new(),
                 result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
@@ -1806,6 +1837,7 @@ mod tests {
                     tail_work(segment_number, 0),
                     9,
                     0,
+                    0,
                     DownloadLaneMode::Sequential,
                     false,
                     None,
@@ -1815,9 +1847,16 @@ mod tests {
                     &[],
                     "streamed",
                 );
-                send_owned_batch(&sender_tx, vec![result], Vec::new(), stats, false)?;
+                send_owned_batch(&sender_tx, 0, vec![result], Vec::new(), stats, false)?;
             }
-            send_owned_batch(&sender_tx, Vec::new(), vec![tail_work(9, 0)], stats, true)
+            send_owned_batch(
+                &sender_tx,
+                0,
+                Vec::new(),
+                vec![tail_work(9, 0)],
+                stats,
+                true,
+            )
         });
 
         for segment_number in 0..3u32 {
@@ -1959,6 +1998,7 @@ mod tests {
         let result = result_from_trace(
             tail_work(9, 0),
             0,
+            0,
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: vec![weaver_nntp::client::FetchAttemptTrace {
                     server_idx: 0,
@@ -2064,6 +2104,7 @@ mod tests {
         let rejection = control.try_reserve(1).err().unwrap();
         let result = result_from_trace(
             tail_work(6, 0),
+            0,
             0,
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: Vec::new(),

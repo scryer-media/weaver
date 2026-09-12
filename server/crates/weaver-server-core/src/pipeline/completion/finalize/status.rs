@@ -616,6 +616,8 @@ impl Pipeline {
         }
         self.remove_pending_completion_check(job_id);
         self.transition_postprocessing_status(job_id, JobStatus::Paused, Some("paused"));
+        self.download_restart_durable_lead_retry_after
+            .remove(&job_id);
         Ok(())
     }
 

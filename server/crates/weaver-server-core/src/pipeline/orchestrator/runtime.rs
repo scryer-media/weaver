@@ -381,6 +381,7 @@ impl Pipeline {
             snapshot_publish_pending: false,
             download_restart_durable_lead_retry_after: HashMap::new(),
             checkpoint_progress_articles: HashMap::new(),
+            download_lane_owners: HashMap::new(),
             propagation_ready_at: HashMap::new(),
             published_propagation_holds: HashMap::new(),
             propagation_delay,
@@ -725,6 +726,7 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
+        self.retire_stalled_download_lanes(job_id);
         self.pending_file_progress
             .retain(|file_id, _| file_id.job_id != job_id);
         self.persisted_file_progress
@@ -788,44 +790,7 @@ impl Pipeline {
     }
 
     fn release_stalled_download_runtime(&mut self, job_id: JobId) -> usize {
-        let in_flight = self.active_downloads_by_job.remove(&job_id).unwrap_or(0);
-        let in_flight_connections = self
-            .active_download_connections_by_job
-            .remove(&job_id)
-            .unwrap_or(0);
-        let completion_critical_connections = self
-            .active_completion_critical_connections_by_job
-            .remove(&job_id)
-            .unwrap_or(0);
-        self.active_downloads = self.active_downloads.saturating_sub(in_flight);
-        self.active_download_connections = self
-            .active_download_connections
-            .saturating_sub(in_flight_connections);
-        self.active_completion_critical_connections = self
-            .active_completion_critical_connections
-            .saturating_sub(completion_critical_connections);
-        self.active_downloads_by_file
-            .retain(|file_id, _| file_id.job_id != job_id);
-
-        let reserved_segments: Vec<_> = self
-            .bandwidth_reservations
-            .keys()
-            .copied()
-            .filter(|segment_id| segment_id.file_id.job_id == job_id)
-            .collect();
-        for segment_id in reserved_segments {
-            if let Err(error) = self.release_bandwidth_reservation(segment_id) {
-                error!(
-                    error = %error,
-                    segment = %segment_id,
-                    "failed to release stalled job bandwidth reservation"
-                );
-            }
-        }
-        self.rate_limit_reservations
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-
-        in_flight
+        self.retire_stalled_download_lanes(job_id)
     }
 
     pub(crate) fn auto_pause_stalled_downloads(&mut self) {
@@ -919,6 +884,7 @@ impl Pipeline {
                 self.pump_decode_queue();
             }
 
+            self.consume_due_checkpoint_rechecks();
             self.dispatch_downloads();
             // The byte and age triggers are polled on the loop's
             // existing periodic seam rather than on a timer of their own, so an
@@ -973,23 +939,12 @@ impl Pipeline {
                 self.dispatch_downloads();
             }
 
-            let mut processed_results = 0usize;
-            while processed_results < Self::DOWNLOAD_RESULTS_PER_TURN {
-                let Some(result) = pending_download_results.pop_front() else {
-                    break;
-                };
-                self.process_released_download_done(result).await;
-                processed_results += 1;
-                // Ingesting a turn's worth of results is the longest stretch of
-                // a loop turn, and it is exactly when lanes finish their leases
-                // and park. Draining the control channel here and dispatching
-                // on the park hands the freed connection straight back out
-                // instead of holding it until the turn ends.
-                self.drain_ready_lane_control_messages();
-                if self.take_download_dispatch_wake() {
-                    self.dispatch_downloads();
-                }
-            }
+            let processed_results = self
+                .process_download_result_turn(
+                    &mut pending_download_results,
+                    &mut metrics_snapshot_interval,
+                )
+                .await;
             if processed_results == 0 {
                 tokio::select! {
                     cmd = self.cmd_rx.recv() => {
@@ -1007,7 +962,7 @@ impl Pipeline {
                         }
                     }
                     Some(result) = self.download_done_rx.recv() => {
-                        self.release_download_result(&result);
+                        if !self.release_download_result(&result) { continue; }
                         self.note_released_download_result_pending(
                             result.segment_id.file_id.job_id,
                             Self::released_download_result_lead_bytes(&result),
@@ -1081,12 +1036,12 @@ impl Pipeline {
                         self.receive_retry_work(retry);
                     }
                     _ = metrics_snapshot_interval.tick() => {
-                        self.sample_phase_progress();
-                        self.shared_state.refresh_metrics_snapshot();
-                        self.flush_pending_snapshot();
+                        self.refresh_periodic_snapshot();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
-                    _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
+                    _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
+                        self.consume_due_checkpoint_rechecks();
+                    }
                     _ = propagation_sleep, if propagation_delay.is_some() => {}
                     _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
                         self.requeue_due_infrastructure_retries();
@@ -1172,6 +1127,48 @@ impl Pipeline {
         info!("pipeline stopped");
     }
 
+    pub(crate) async fn process_download_result_turn(
+        &mut self,
+        pending: &mut VecDeque<DownloadResult>,
+        metrics_interval: &mut tokio::time::Interval,
+    ) -> usize {
+        let mut processed = 0;
+        while processed < Self::DOWNLOAD_RESULTS_PER_TURN {
+            let Some(result) = pending.pop_front() else {
+                break;
+            };
+            self.process_released_download_done(result).await;
+            processed += 1;
+            // Return freed connections during ingestion rather than waiting
+            // until the entire result batch has been processed.
+            self.drain_ready_lane_control_messages();
+            if self.take_download_dispatch_wake() {
+                self.dispatch_downloads();
+            }
+        }
+        if processed != 0 {
+            // A backlog can keep every actor operation immediately ready.
+            // Let the timer driver and transport tasks run between batches.
+            tokio::task::yield_now().await;
+        }
+        // Busy turns skip the blocking select. Poll the same interval here
+        // without waiting so sustained results cannot starve UI refreshes.
+        let due = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(metrics_interval.poll_tick(cx).is_ready())
+        })
+        .await;
+        if due {
+            self.refresh_periodic_snapshot();
+        }
+        processed
+    }
+
+    fn refresh_periodic_snapshot(&mut self) {
+        self.sample_phase_progress();
+        self.shared_state.refresh_metrics_snapshot();
+        self.flush_pending_snapshot();
+    }
+
     /// The pause demand, at the command seam.
     ///
     /// A paused job stops feeding the byte trigger and its sets go quiet, so
@@ -1199,6 +1196,21 @@ impl Pipeline {
             Some(job_id) => self.demand_direct_store_barriers(job_id, demand).await,
             None => self.demand_direct_store_barriers_for_all_jobs(demand).await,
         }
+    }
+
+    pub(crate) fn consume_due_checkpoint_rechecks(&mut self) {
+        let now = Instant::now();
+        if self
+            .download_restart_durable_lead_retry_after
+            .values()
+            .any(|ready_at| *ready_at <= now)
+        {
+            self.flush_file_progress_batch(
+                "download.file_progress.flush.restart_durable_lead_retry_recheck",
+            );
+        }
+        self.download_restart_durable_lead_retry_after
+            .retain(|_, ready_at| *ready_at > now);
     }
 
     pub(crate) fn next_restart_durable_lead_retry_delay(&self) -> Option<std::time::Duration> {
@@ -1329,7 +1341,9 @@ impl Pipeline {
             let Ok(result) = self.download_done_rx.try_recv() else {
                 break;
             };
-            self.release_download_result(&result);
+            if !self.release_download_result(&result) {
+                continue;
+            }
             self.note_released_download_result_pending(
                 result.segment_id.file_id.job_id,
                 Self::released_download_result_lead_bytes(&result),

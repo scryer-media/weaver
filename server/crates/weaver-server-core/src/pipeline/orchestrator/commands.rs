@@ -392,6 +392,7 @@ impl Pipeline {
             SchedulerCommand::PauseAll { reply } => {
                 self.global_paused = true;
                 self.scheduled_pause = false;
+                self.download_restart_durable_lead_retry_after.clear();
                 self.shared_state.set_paused(true);
                 self.shared_state.set_download_block(
                     self.bandwidth_cap

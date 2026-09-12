@@ -3,19 +3,33 @@ use std::path::{Component, Path};
 
 use crate::runtime::fs::{paths_equivalent_for_placement, rename_no_overwrite};
 
-/// A verified placement is a permutation, not necessarily independent renames
-/// or pairs. Vacate every source before installing any destination so a cycle
-/// of any length can settle. Success means the *whole* mapping was installed;
-/// the caller may only then rebind file identities and archive topology.
+mod journal;
+pub(crate) use journal::{Binding, Transaction, begin, recover};
+
+#[cfg(test)]
 pub(super) fn apply_complete_plan(dir: &Path, plan: &par2_rs::PlacementPlan) -> io::Result<usize> {
     apply_complete_plan_with_move(dir, plan, rename_no_overwrite)
 }
 
+#[cfg(test)]
 fn apply_complete_plan_with_move(
     dir: &Path,
     plan: &par2_rs::PlacementPlan,
-    mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
+    move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<usize> {
+    let Some(mut transaction) = journal::prepare(dir, plan, Vec::new())? else {
+        return Ok(0);
+    };
+    transaction.run_with_move(move_file)?;
+    let count = transaction.len();
+    transaction.finish()?;
+    Ok(count)
+}
+
+fn validate_plan<'a>(
+    dir: &Path,
+    plan: &'a par2_rs::PlacementPlan,
+) -> io::Result<Vec<&'a par2_rs::PlacementEntry>> {
     let mut entries: Vec<&par2_rs::PlacementEntry> = Vec::new();
     for entry in plan
         .swaps
@@ -66,7 +80,7 @@ fn apply_complete_plan_with_move(
         entries.push(entry);
     }
     if entries.is_empty() {
-        return Ok(0);
+        return Ok(entries);
     }
 
     // Reject a collision or missing source before changing any file. Recheck
@@ -99,70 +113,7 @@ fn apply_complete_plan_with_move(
         }
     }
 
-    // Never let TempDir's destructor delete the only surviving copy if an I/O
-    // error prevents rollback. Original filenames identify retained bytes.
-    let staging = tempfile::Builder::new()
-        .prefix(".weaver-placement-")
-        .tempdir_in(dir)?
-        .keep();
-    let mut staged = 0;
-    let mut installed = 0;
-    let result = (|| {
-        for entry in &entries {
-            move_file(
-                &dir.join(&entry.current_name),
-                &staging.join(&entry.current_name),
-            )?;
-            staged += 1;
-        }
-        for entry in &entries {
-            move_file(
-                &staging.join(&entry.current_name),
-                &dir.join(&entry.correct_name),
-            )?;
-            installed += 1;
-        }
-        Ok::<_, io::Error>(())
-    })();
-
-    if let Err(error) = result {
-        // Move installed destinations out of the way before restoring sources;
-        // rolling each pair back directly would collide inside a cycle again.
-        let mut rollback_errors = Vec::new();
-        for entry in entries[..installed].iter().rev() {
-            if let Err(rollback) = move_file(
-                &dir.join(&entry.correct_name),
-                &staging.join(&entry.current_name),
-            ) {
-                rollback_errors.push(rollback.to_string());
-            }
-        }
-        for entry in entries[..staged].iter().rev() {
-            if let Err(rollback) = move_file(
-                &staging.join(&entry.current_name),
-                &dir.join(&entry.current_name),
-            ) {
-                rollback_errors.push(rollback.to_string());
-            }
-        }
-        if rollback_errors.is_empty() {
-            match std::fs::remove_dir(&staging) {
-                Ok(()) => return Err(error),
-                // A failed no-overwrite move can leave both copies if source
-                // removal fails. Never silently abandon retained staged bytes.
-                Err(cleanup) => rollback_errors.push(cleanup.to_string()),
-            }
-        }
-        return Err(io::Error::other(format!(
-            "{error}; placement rollback incomplete; retained files at {}: {}",
-            staging.display(),
-            rollback_errors.join("; ")
-        )));
-    }
-    // An empty staging directory failing to disappear does not invalidate the
-    // installed mapping. It must not prevent the caller from rebinding it.
-    let _ = std::fs::remove_dir(&staging);
-    Ok(entries.len())
+    Ok(entries)
 }
 
 #[cfg(test)]

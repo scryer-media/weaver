@@ -1494,6 +1494,40 @@ impl Pipeline {
         } else {
             file_identities
         };
+        // Placement replay precedes every existence/skip decision. Completed
+        // bytes can still be staged, or the filesystem mapping can be newer
+        // than a partially persisted set of file identities.
+        let recovery_dir = working_dir.clone();
+        let transactions =
+            tokio::task::spawn_blocking(move || crate::pipeline::placement::recover(&recovery_dir))
+                .await
+                .map_err(|e| crate::SchedulerError::Internal(e.to_string()))?
+                .map_err(crate::SchedulerError::Io)?;
+        for transaction in transactions {
+            for binding in transaction.bindings() {
+                let identity = file_identities
+                    .get(&binding.file_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        crate::SchedulerError::Internal(format!(
+                            "placement file index {} is missing; journal retained",
+                            binding.file_index
+                        ))
+                    })?;
+                file_identities.insert(
+                    binding.file_index,
+                    Self::apply_placement_identity(identity, binding),
+                );
+            }
+            let identities: Vec<_> = file_identities.values().cloned().collect();
+            self.db_blocking(move |db| db.save_file_identities(job_id, &identities))
+                .await
+                .map_err(crate::SchedulerError::State)?;
+            tokio::task::spawn_blocking(move || transaction.finish())
+                .await
+                .map_err(|e| crate::SchedulerError::Internal(e.to_string()))?
+                .map_err(crate::SchedulerError::Io)?;
+        }
         let (stale_rar_sets, refreshed_rar_files) =
             Self::scrub_restored_par2_file_identities(&mut file_identities);
         let mut restore_skip_plan = Self::build_restore_skip_plan(

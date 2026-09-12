@@ -9,6 +9,7 @@ mod ip_replacement;
 mod lanes;
 mod leases;
 mod metrics;
+mod ownership;
 mod pressure;
 mod refill;
 mod spawn;

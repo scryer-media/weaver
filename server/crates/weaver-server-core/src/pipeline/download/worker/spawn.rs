@@ -393,6 +393,7 @@ impl Pipeline {
 
         tokio::spawn(async move {
             let fetch_started = Instant::now();
+            let lane_id = initial_lease.lane_id;
             let mut lease = initial_lease;
             let mut recorded_mode = lease.lane_mode;
             let mut current_spillover_loan_kind: Option<SpilloverLoanKind>;
@@ -452,6 +453,7 @@ impl Pipeline {
                     );
                     let _ = tx
                         .send(DownloadResult {
+                            lane_id,
                             segment_id: work.segment_id,
                             runtime_generation,
                             data: Err(DownloadError::Fetch(work_failure)),
@@ -483,6 +485,7 @@ impl Pipeline {
                 }
                 let _ = parked_tx
                     .send(DownloadLaneParked {
+                        lane_id,
                         job_id,
                         mode,
                         spillover_loan_kind,
@@ -502,6 +505,7 @@ impl Pipeline {
 
             loop {
                 let DownloadBatchLease {
+                    lane_id: _,
                     job_id,
                     runtime_generation,
                     lane_mode,
@@ -610,6 +614,7 @@ impl Pipeline {
                                 };
                                 let _ = tx
                                     .send(DownloadResult {
+                                        lane_id,
                                         segment_id,
                                         runtime_generation,
                                         data,
@@ -691,6 +696,7 @@ impl Pipeline {
                                         async move {
                                             let _ = tx
                                                 .send(DownloadResult {
+                                                    lane_id,
                                                     segment_id,
                                                     runtime_generation,
                                                     data,
@@ -725,6 +731,7 @@ impl Pipeline {
                     for work in works_by_index.into_iter().flatten() {
                         let _ = tx
                             .send(DownloadResult {
+                                lane_id,
                                 segment_id: work.segment_id,
                                 runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(
@@ -769,6 +776,7 @@ impl Pipeline {
                     for work in pending_works {
                         let _ = tx
                             .send(DownloadResult {
+                                lane_id,
                                 segment_id: work.segment_id,
                                 runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(
@@ -812,6 +820,7 @@ impl Pipeline {
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
                 if refill_tx
                     .send(DownloadLaneRefillRequest {
+                        lane_id,
                         job_id,
                         runtime_generation,
                         server_idx,
@@ -856,6 +865,7 @@ impl Pipeline {
             lane.park();
             let _ = parked_tx
                 .send(DownloadLaneParked {
+                    lane_id,
                     job_id: current_job_id,
                     mode: recorded_mode,
                     spillover_loan_kind: current_spillover_loan_kind,

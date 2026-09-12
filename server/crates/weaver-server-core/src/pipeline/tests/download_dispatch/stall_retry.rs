@@ -43,6 +43,7 @@ async fn unavailable_provider_recovery_does_not_leave_602_retries_parked_forever
     for segment_number in 0..602 {
         pipeline
             .handle_download_done(DownloadResult {
+                lane_id: 0,
                 runtime_generation: 0,
                 segment_id: SegmentId {
                     file_id: NzbFileId {

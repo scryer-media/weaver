@@ -180,6 +180,84 @@ async fn spawn_capacity_limited_body_server(
 }
 
 #[tokio::test]
+async fn metrics_refresh_advances_during_continuous_download_result_turns() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    tokio::time::pause();
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    let mut pending = VecDeque::new();
+    // Results already accepted before cancellation still traverse this seam.
+    // Keep more than one bounded batch queued for every observed refresh.
+    for segment_number in 0..160 {
+        pending.push_back(DownloadResult {
+            lane_id: 0,
+            runtime_generation: 0,
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id: JobId(991),
+                    file_index: 0,
+                },
+                segment_number,
+            },
+            data: Ok(DownloadPayload::Raw(Bytes::new())),
+            attempts: vec![],
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: vec![],
+            release_connection_slot: false,
+        });
+    }
+    for downloaded in 1..=3 {
+        pipeline
+            .metrics
+            .bytes_downloaded
+            .store(downloaded, Ordering::Relaxed);
+        pipeline.snapshot_publish_pending = true;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(
+            pipeline
+                .process_download_result_turn(&mut pending, &mut interval)
+                .await,
+            16
+        );
+        assert!(!pending.is_empty());
+        assert_eq!(
+            pipeline.shared_state.metrics_snapshot().bytes_downloaded,
+            downloaded
+        );
+        assert!(!pipeline.snapshot_publish_pending);
+    }
+    // Busy turns before the deadline must not oversample or reset the cadence.
+    pipeline
+        .metrics
+        .bytes_downloaded
+        .store(99, Ordering::Relaxed);
+    assert_eq!(
+        pipeline
+            .process_download_result_turn(&mut pending, &mut interval)
+            .await,
+        16
+    );
+    assert_eq!(pipeline.shared_state.metrics_snapshot().bytes_downloaded, 3);
+    pending.clear();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        pipeline
+            .process_download_result_turn(&mut pending, &mut interval)
+            .await,
+        0
+    );
+    assert_eq!(
+        pipeline.shared_state.metrics_snapshot().bytes_downloaded,
+        99
+    );
+}
+
+#[tokio::test]
 async fn phase_end_removes_only_the_ended_phase_snapshot() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
@@ -778,6 +856,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
         tokio::time::timeout(
             Duration::from_secs(1),
             pipeline.handle_download_done(DownloadResult {
+                lane_id: 0,
                 runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
@@ -832,6 +911,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
     pipeline.active_downloads += 1;
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -931,6 +1011,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
         pipeline.active_downloads += 1;
         pipeline
             .handle_download_done(DownloadResult {
+                lane_id: 0,
                 runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
@@ -1020,6 +1101,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
         pipeline.active_downloads += 1;
         pipeline
             .handle_download_done(DownloadResult {
+                lane_id: 0,
                 runtime_generation: 0,
                 segment_id: SegmentId {
                     file_id: NzbFileId {

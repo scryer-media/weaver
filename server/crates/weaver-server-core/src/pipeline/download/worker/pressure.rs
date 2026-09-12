@@ -423,10 +423,11 @@ impl Pipeline {
 
     pub(in crate::pipeline) fn finish_checkpoint_progress_article(
         &mut self,
+        lane_id: u64,
         segment_id: SegmentId,
     ) {
         let job_id = segment_id.file_id.job_id;
-        if self.checkpoint_progress_articles.get(&job_id) == Some(&segment_id) {
+        if self.checkpoint_progress_articles.get(&job_id) == Some(&(lane_id, segment_id)) {
             self.checkpoint_progress_articles.remove(&job_id);
         }
     }

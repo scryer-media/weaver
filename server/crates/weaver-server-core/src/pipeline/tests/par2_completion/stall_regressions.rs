@@ -196,6 +196,47 @@ async fn placement_closed_cycles_install_bytes_before_rebinding_identity() {
 }
 
 #[tokio::test]
+async fn placement_journal_ignores_unchanged_identity_alongside_moves() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(30803);
+    let dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Mixed placement",
+            &[("a.bin".into(), 32), ("b.bin".into(), 32)],
+        ),
+    )
+    .await;
+    let mut plan = empty_placement_plan();
+    for (index, source, destination) in [(0, "a.bin", "new.bin"), (1, "b.bin", "b.bin")] {
+        write_and_complete_file(&mut pipeline, job_id, index, source, &[index as u8; 32]).await;
+        plan.renames.push(par2_rs::PlacementEntry {
+            file_id: par2_rs::FileId::from_bytes([index as u8; 16]),
+            current_name: source.into(),
+            correct_name: destination.into(),
+        });
+    }
+    pipeline
+        .apply_placement_plan_for_retry_or_repair(job_id, dir.clone(), &plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(dir.join("new.bin")).unwrap(), [0; 32]);
+    assert_eq!(std::fs::read(dir.join("b.bin")).unwrap(), [1; 32]);
+    for (file_index, filename) in [(0, "new.bin"), (1, "b.bin")] {
+        assert_eq!(
+            pipeline
+                .effective_file_identity(job_id, NzbFileId { job_id, file_index })
+                .unwrap()
+                .current_filename,
+            filename
+        );
+    }
+    assert!(placement::recover(&dir).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn placement_occupied_unrelated_destination_does_not_rebind_or_partially_move() {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;

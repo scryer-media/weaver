@@ -4,6 +4,7 @@ use std::collections::{BinaryHeap, HashMap};
 use crate::jobs::ids::{MessageId, NzbFileId, SegmentId};
 
 /// A work item representing a segment to download.
+#[derive(Clone)]
 pub struct DownloadWork {
     pub segment_id: SegmentId,
     pub message_id: MessageId,

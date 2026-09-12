@@ -1,7 +1,261 @@
 use super::*;
 
+#[tokio::test]
+async fn checkpoint_deadline_is_consumed_when_capacity_pressure_or_pause_bypasses_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = restored_with_parked_retries(&temp).await;
+    insert_active_job(
+        &mut pipeline,
+        PEER,
+        segmented_job_spec("Ready peer", "peer.bin", &[100; 640]),
+    )
+    .await;
+    pipeline.dispatch_downloads();
+    pipeline.hot_dispatch_underfill_since = Some(Instant::now() - Duration::from_secs(30));
+    for _ in 0..4 {
+        pipeline.dispatch_downloads();
+    }
+    assert_eq!(pipeline.active_download_connections, 4);
+    assert_eq!(pipeline.active_download_connections_by_job[&PEER], 3);
+    for mode in 0..3 {
+        pipeline.global_paused = mode == 1;
+        pipeline
+            .metrics
+            .write_buffered_bytes
+            .store(if mode == 2 { u64::MAX } else { 0 }, Ordering::Relaxed);
+        pipeline
+            .download_restart_durable_lead_retry_after
+            .insert(HOT, Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            pipeline.next_restart_durable_lead_retry_delay(),
+            Some(Duration::ZERO)
+        );
+        pipeline.consume_due_checkpoint_rechecks();
+        for _ in 0..10 {
+            pipeline.dispatch_downloads();
+            assert!(
+                pipeline
+                    .next_restart_durable_lead_retry_delay()
+                    .is_none_or(|delay| !delay.is_zero())
+            );
+        }
+    }
+    pipeline
+        .download_restart_durable_lead_retry_after
+        .insert(HOT, Instant::now() + Duration::from_millis(250));
+    let (reply, result) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::PauseAll { reply })
+        .await;
+    result.await.unwrap();
+    assert!(
+        pipeline
+            .download_restart_durable_lead_retry_after
+            .is_empty()
+    );
+    let (reply, result) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::ResumeAll { reply })
+        .await;
+    result.await.unwrap();
+    pipeline
+        .metrics
+        .write_buffered_bytes
+        .store(0, Ordering::Relaxed);
+    pipeline.pause_job_runtime(HOT).unwrap();
+    assert!(
+        !pipeline
+            .download_restart_durable_lead_retry_after
+            .contains_key(&HOT)
+    );
+    pipeline.resume_job_runtime(HOT).unwrap();
+    let (reply, result) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::CancelJob {
+            job_id: HOT,
+            origin: crate::jobs::handle::CancellationOrigin::User,
+            reply,
+        })
+        .await;
+    assert!(result.await.unwrap().is_ok());
+    assert!(
+        !pipeline
+            .download_restart_durable_lead_retry_after
+            .contains_key(&HOT)
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = restored_with_parked_retries(&temp).await;
+    let queued = pipeline.jobs[&HOT].download_queue.len();
+    pipeline.dispatch_downloads();
+    let (old_id, segment_id) = pipeline.checkpoint_progress_articles[&HOT];
+    let original = pipeline.download_lane_owners[&old_id].outstanding[&segment_id].clone();
+    pipeline.job_last_download_activity.insert(
+        HOT,
+        Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
+    );
+    pipeline.auto_pause_stalled_downloads();
+    assert_eq!(pipeline.jobs[&HOT].status, JobStatus::Paused);
+    assert_eq!(pipeline.jobs[&HOT].download_queue.len(), queued);
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.active_download_connections, 0);
+    assert!(pipeline.rate_limit_reservations.is_empty());
+    assert!(pipeline.bandwidth_reservations.is_empty());
+    assert!(!pipeline.checkpoint_progress_articles.contains_key(&HOT));
+    assert!(!pipeline.download_lane_owners.contains_key(&old_id));
+    // Force reuse of the same segment to exercise the hardest stale-event
+    // case; ordinary FIFO scheduling may select another queued article first.
+    let queue = &mut pipeline.jobs.get_mut(&HOT).unwrap().download_queue;
+    let returned = queue
+        .pop_first_matching(|work| work.segment_id == segment_id)
+        .unwrap();
+    let other_work = std::mem::take(queue);
+    queue.push(returned);
+    pipeline.resume_job_runtime(HOT).unwrap();
+    pipeline.dispatch_downloads();
+    pipeline.jobs.get_mut(&HOT).unwrap().download_queue = other_work;
+    let (replacement, replacement_segment) = pipeline.checkpoint_progress_articles[&HOT];
+    assert_ne!(replacement, old_id);
+    assert_eq!(replacement_segment, segment_id);
+    let reservations = pipeline.rate_limit_reservations.clone();
+    let bandwidth = pipeline.bandwidth_reservations.clone();
+    let late_result = |data| DownloadResult {
+        lane_id: old_id,
+        segment_id,
+        runtime_generation: pipeline.pool_generation,
+        data,
+        attempts: vec![],
+        lane_observation: None,
+        source_server_idx: None,
+        origin: DownloadResultOrigin::NormalPrimary,
+        retry_count: original.retry_count,
+        exclude_servers: original.exclude_servers.clone(),
+        release_connection_slot: false,
+    };
+    let late_success = late_result(Ok(DownloadPayload::Raw(Bytes::from_static(
+        b"late transport bytes",
+    ))));
+    let late_error = late_result(Err(DownloadError::fetch(
+        DownloadFailureKind::EstablishedTransport,
+        "old worker",
+    )));
+    pipeline.handle_download_done(late_success).await;
+    pipeline.handle_download_done(late_error).await;
+    let (response_tx, response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: old_id,
+        job_id: HOT,
+        runtime_generation: pipeline.pool_generation,
+        server_idx: 0,
+        remote_ip: "127.0.0.1".parse().unwrap(),
+        supports_pipelining: true,
+        current_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
+        compatibility: DownloadBatchCompatibility::from_work(&original),
+        response_tx,
+    });
+    assert!(response_rx.await.unwrap().lease.is_none());
+    pipeline.handle_owned_download_lane_event(
+        OwnedDownloadLaneEvent::BatchComplete {
+            lane_id: old_id,
+            results: vec![],
+            unrequested_works: vec![original],
+            stats: Default::default(),
+            ack: None,
+        },
+        &mut VecDeque::new(),
+    );
+    pipeline.handle_download_lane_parked(DownloadLaneParked {
+        lane_id: old_id,
+        job_id: HOT,
+        mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
+        completion_critical: false,
+        reason: LaneParkReason::Error,
+        release_connection_slot: true,
+        release_ip_replacement_burst: false,
+    });
+    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.active_download_connections, 1);
+    assert_eq!(pipeline.rate_limit_reservations, reservations);
+    assert_eq!(pipeline.bandwidth_reservations, bandwidth);
+    assert_eq!(
+        pipeline.checkpoint_progress_articles[&HOT],
+        (replacement, segment_id)
+    );
+    assert_eq!(pipeline.jobs[&HOT].download_queue.len(), queued - 1);
+    assert_eq!(pipeline.pending_retries_by_job[&HOT], 130);
+    assert_eq!(
+        pipeline.download_lane_owners[&replacement].outstanding[&segment_id].retry_count,
+        0
+    );
+}
+
 const HOT: JobId = JobId(49001);
 const PEER: JobId = JobId(49002);
+
+#[tokio::test]
+async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = restored_with_parked_retries(&temp).await;
+    let queued = pipeline.jobs[&HOT].download_queue.len();
+    pipeline.dispatch_downloads();
+    let (lane_id, segment_id) = pipeline.checkpoint_progress_articles[&HOT];
+    pipeline.pause_job_runtime(HOT).unwrap();
+    assert_eq!(
+        pipeline.active_downloads, 1,
+        "ordinary pause preserves in-flight ownership"
+    );
+    assert!(pipeline.download_lane_owners.contains_key(&lane_id));
+    let mut pending = VecDeque::new();
+    pipeline.handle_owned_download_lane_event(
+        OwnedDownloadLaneEvent::BatchComplete {
+            lane_id,
+            results: vec![DownloadResult {
+                lane_id,
+                segment_id,
+                runtime_generation: pipeline.pool_generation,
+                data: Err(DownloadError::fetch(
+                    DownloadFailureKind::LaneUnavailable,
+                    "accepted before retirement",
+                )),
+                attempts: vec![],
+                lane_observation: None,
+                source_server_idx: None,
+                origin: DownloadResultOrigin::NormalPrimary,
+                retry_count: 0,
+                exclude_servers: vec![],
+                release_connection_slot: false,
+            }],
+            unrequested_works: vec![],
+            stats: Default::default(),
+            ack: None,
+        },
+        &mut pending,
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pipeline.retire_stalled_download_lanes(HOT), 0);
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.active_download_connections, 0);
+    assert_eq!(pipeline.jobs[&HOT].download_queue.len(), queued - 1);
+    assert_eq!(
+        pipeline.checkpoint_progress_articles[&HOT],
+        (lane_id, segment_id)
+    );
+    pipeline
+        .process_released_download_done(pending.pop_front().unwrap())
+        .await;
+    assert!(!pipeline.checkpoint_progress_articles.contains_key(&HOT));
+    assert_eq!(pipeline.pending_retries_by_job[&HOT], 131);
+    assert!(
+        !pipeline
+            .pending_released_download_results_by_job
+            .contains_key(&HOT)
+    );
+}
 
 async fn restored_with_parked_retries(temp: &TempDir) -> Pipeline {
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -386,7 +640,7 @@ async fn checkpoint_progress_waits_for_result_even_when_durability_catches_up() 
     let temp = tempfile::tempdir().unwrap();
     let mut pipeline = restored_with_parked_retries(&temp).await;
     pipeline.dispatch_downloads();
-    let segment_id = pipeline.checkpoint_progress_articles[&HOT];
+    let (lane_id, segment_id) = pipeline.checkpoint_progress_articles[&HOT];
     pipeline
         .persisted_file_progress
         .insert(segment_id.file_id, pipeline.jobs[&HOT].downloaded_bytes);
@@ -397,6 +651,7 @@ async fn checkpoint_progress_waits_for_result_even_when_durability_catches_up() 
     // A transport failure is still a processed result: refund the allowance
     // and park the same work without spending its content-retry budget.
     let result = DownloadResult {
+        lane_id,
         runtime_generation: pipeline.pool_generation,
         segment_id,
         data: Err(DownloadError::fetch(

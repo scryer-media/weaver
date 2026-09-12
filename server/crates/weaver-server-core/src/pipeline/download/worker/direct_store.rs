@@ -108,7 +108,7 @@ impl Pipeline {
                             (!set.router.volume_needs_header(**volume), **volume)
                         })
                         .and_then(|(_, file)| {
-                            state.download_queue.peek_next_matching(|work| {
+                            state.download_queue.peek_first_matching(|work| {
                                 work.segment_id.file_id.file_index == *file
                             })
                         })

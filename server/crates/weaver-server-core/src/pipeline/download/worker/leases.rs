@@ -645,6 +645,7 @@ impl Pipeline {
             self.lease_effective_exclude_servers(job_id, &compatibility);
         if compatibility.is_recovery {
             let lease = DownloadBatchLease {
+                lane_id: Self::next_download_lane_id(),
                 job_id,
                 runtime_generation: self.pool_generation,
                 lane_mode: DownloadLaneMode::Sequential,
@@ -689,6 +690,7 @@ impl Pipeline {
         }
 
         let lease = DownloadBatchLease {
+            lane_id: Self::next_download_lane_id(),
             job_id,
             runtime_generation: self.pool_generation,
             lane_mode: DownloadLaneMode::Sequential,
@@ -799,6 +801,7 @@ impl Pipeline {
         let effective_exclude_servers =
             self.lease_effective_exclude_servers(job_id, &compatibility);
         DownloadBatchLease {
+            lane_id: Self::next_download_lane_id(),
             job_id,
             runtime_generation: self.pool_generation,
             lane_mode,
@@ -995,8 +998,9 @@ impl Pipeline {
     ) {
         if let Some(segment_id) = self.checkpoint_progress_article_for_lease(lease) {
             self.checkpoint_progress_articles
-                .insert(lease.job_id, segment_id);
+                .insert(lease.job_id, (lease.lane_id, segment_id));
         }
+        self.book_download_lane_owner(lease, starts_connection);
         self.activate_download_batch(
             lease.job_id,
             DownloadBatchClass::from(&lease.compatibility),

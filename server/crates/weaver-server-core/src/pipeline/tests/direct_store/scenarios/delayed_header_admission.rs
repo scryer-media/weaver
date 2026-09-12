@@ -3,6 +3,101 @@ use super::*;
 const JOB: JobId = JobId(48002);
 const MEMBER: &str = "Silver.Horizon.Diagnostic.mkv";
 
+#[tokio::test]
+async fn delayed_header_probe_must_scan_past_blocked_critical_head() {
+    check_blocked_header_probe(false).await;
+}
+
+#[tokio::test]
+async fn delayed_header_probe_preserves_priority_over_an_earlier_confirmed_volume_retry() {
+    check_blocked_header_probe(true).await;
+}
+
+async fn check_blocked_header_probe(earlier_confirmed_retry: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    let header = pipeline
+        .jobs
+        .get_mut(&JOB)
+        .unwrap()
+        .download_queue
+        .pop_first_matching(|work| work.segment_id == segment(65, 0))
+        .unwrap();
+    pipeline
+        .rate_limit_reservations
+        .insert(header.segment_id, header.byte_estimate as u64);
+    loop {
+        let pressure = pipeline.refresh_download_pressure();
+        let Some(lease) = pipeline.try_lease_initial_download_batch_for_test(JOB, pressure) else {
+            break;
+        };
+        for work in lease.works {
+            let id = work.segment_id;
+            submit_volume_article(
+                &mut pipeline,
+                JOB,
+                &volumes,
+                id.file_id.file_index,
+                id.segment_number,
+            )
+            .await;
+        }
+    }
+    pipeline.rate_limit_reservations.remove(&header.segment_id);
+    pipeline.note_retry_scheduled(header.segment_id);
+    loop {
+        let pressure = pipeline.refresh_download_pressure();
+        let Some(lease) = pipeline.try_lease_initial_download_batch_for_test(JOB, pressure) else {
+            break;
+        };
+        for work in lease.works {
+            let id = work.segment_id;
+            submit_volume_article(
+                &mut pipeline,
+                JOB,
+                &volumes,
+                id.file_id.file_index,
+                id.segment_number,
+            )
+            .await;
+        }
+    }
+    pipeline.note_retry_requeued(header.segment_id);
+    let queue = &mut pipeline.jobs.get_mut(&JOB).unwrap().download_queue;
+    let mut later = queue
+        .pop_first_matching(|work| work.segment_id.file_id.file_index > 65)
+        .unwrap();
+    // Later identity/header discovery is completion-critical and can lead
+    // a returned ordinary header retry, as in an obfuscated volume probe wave.
+    later.completion_critical = true;
+    queue.push(later);
+    queue.push(header);
+    assert!(
+        queue
+            .peek_next_matching(|work| work.segment_id.file_id.file_index > 65)
+            .is_some()
+    );
+    assert!(
+        queue
+            .peek_first_matching(|work| work.segment_id == segment(65, 0))
+            .is_some()
+    );
+    if earlier_confirmed_retry {
+        // Header discovery retains priority over a retry in a volume whose
+        // header is already known. An ordinal-only minimum would hide the
+        // missing header behind this parked retry instead.
+        pipeline.note_retry_scheduled(segment(64, 1));
+    }
+    let pressure = pipeline.refresh_download_pressure();
+    let probe = pipeline.try_lease_initial_download_batch_for_test(JOB, pressure);
+    assert!(
+        probe.is_some(),
+        "queued delayed header must remain admissible behind a blocked critical head"
+    );
+    assert_eq!(probe.unwrap().works[0].segment_id, segment(65, 0));
+}
+
 // Original valid RAR5 data; scale the production resident/scratch ratio down
 // so the regression exercises the real router without gigabytes of fixtures.
 fn fixture() -> (Vec<u8>, Vec<(String, Vec<u8>)>) {

@@ -1,6 +1,122 @@
 use super::*;
 
 #[tokio::test]
+async fn restore_job_replays_placement_before_building_download_queue() {
+    for boundary in 1..=7 {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+        let job_id = JobId(49801);
+        let files: Vec<_> = ["a.bin", "b.bin", "c.bin"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (name.to_string(), vec![index as u8; 32]))
+            .collect();
+        let spec = rar_job_spec("Placement restart", &files);
+        insert_active_job(&mut pipeline, job_id, spec.clone()).await;
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+            persist_completed_file_hash(&pipeline, job_id, index as u32, name, bytes).await;
+        }
+        let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+        let identities: Vec<_> = (0..3)
+            .map(|file_index| {
+                pipeline
+                    .effective_file_identity(job_id, NzbFileId { job_id, file_index })
+                    .unwrap()
+            })
+            .collect();
+        pipeline
+            .db
+            .save_file_identities(job_id, &identities)
+            .unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pipeline::completion::finalize::placement::journal::tests::placement_crash_child",
+                "--nocapture",
+            ])
+            .env("WEAVER_PLACEMENT_CRASH_ROOT", &working_dir)
+            .env("WEAVER_PLACEMENT_CRASH_BOUNDARY", boundary.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(77),
+            "child did not reach boundary {boundary}: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        if boundary == 7 {
+            // Filesystem placement finished and only the first identity was
+            // committed before the process stopped. Reapplying a name map
+            // would rotate this file a second time.
+            let mut identity = pipeline
+                .effective_file_identity(
+                    job_id,
+                    NzbFileId {
+                        job_id,
+                        file_index: 0,
+                    },
+                )
+                .unwrap();
+            identity.current_filename = "b.bin".into();
+            identity.canonical_filename = Some("b.bin".into());
+            pipeline.db.save_file_identity(job_id, &identity).unwrap();
+        }
+        let recovered = pipeline
+            .db
+            .load_active_jobs()
+            .unwrap()
+            .remove(&job_id)
+            .unwrap();
+        drop(pipeline);
+        let (mut restored, _, _) = new_direct_pipeline(&temp).await;
+        restored
+            .restore_job(RestoreJobRequest {
+                job_id,
+                job_hash: [0; 32],
+                spec,
+                file_progress: recovered.file_progress,
+                complete_files: recovered.complete_files,
+                detected_archives: recovered.detected_archives,
+                file_identities: recovered.file_identities,
+                extracted_members: HashSet::new(),
+                status: JobStatus::Downloading,
+                download_state: None,
+                post_state: None,
+                run_state: None,
+                queued_repair_at_epoch_ms: None,
+                queued_extract_at_epoch_ms: None,
+                paused_resume_status: None,
+                paused_resume_download_state: None,
+                paused_resume_post_state: None,
+                working_dir: working_dir.clone(),
+            })
+            .await
+            .unwrap();
+        let state = &restored.jobs[&job_id];
+        assert!(
+            state.download_queue.is_empty(),
+            "boundary {boundary} must not redownload staged bytes"
+        );
+        for (index, destination) in ["b.bin", "c.bin", "a.bin"].iter().enumerate() {
+            assert_eq!(
+                &state.file_identities[&(index as u32)].current_filename,
+                destination
+            );
+            assert_eq!(
+                std::fs::read(working_dir.join(destination)).unwrap(),
+                [index as u8; 32]
+            );
+        }
+        assert!(
+            crate::pipeline::placement::recover(&working_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 async fn restore_job_rehydrates_detected_obfuscated_split_7z_identity() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;

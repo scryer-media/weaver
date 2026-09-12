@@ -6,6 +6,7 @@ impl Pipeline {
         request: DownloadLaneRefillRequest,
     ) {
         let DownloadLaneRefillRequest {
+            lane_id,
             job_id,
             runtime_generation,
             server_idx,
@@ -17,7 +18,7 @@ impl Pipeline {
             response_tx,
         } = request;
         let batch_class = DownloadBatchClass::from(&compatibility);
-        if runtime_generation != self.pool_generation {
+        if runtime_generation != self.pool_generation || !self.download_lane_is_live(lane_id) {
             let _ = response_tx.send(DownloadLaneRefillResponse {
                 lease: None,
                 park_reason: LaneParkReason::Error,
@@ -215,6 +216,7 @@ impl Pipeline {
         }
         if let Some(lease) = lease.as_mut() {
             lease.spillover_loan_kind = spillover_loan_kind;
+            lease.lane_id = lane_id;
         }
 
         let Some(lease) = lease else {
@@ -267,13 +269,22 @@ impl Pipeline {
             supports_pipelining,
         );
         let work_count = lease.works.len();
+        let booked_works = lease.works.clone();
         match response_tx.send(DownloadLaneRefillResponse {
             lease: Some(lease),
             park_reason: LaneParkReason::NoWork,
         }) {
             Ok(()) => {
+                if let Some(owner) = self.download_lane_owners.get_mut(&lane_id) {
+                    owner.mode = next_mode;
+                    owner.completion_critical = granted_class.completion_critical;
+                    owner
+                        .outstanding
+                        .extend(booked_works.into_iter().map(|work| (work.segment_id, work)));
+                }
                 if let Some(segment_id) = progress_article {
-                    self.checkpoint_progress_articles.insert(job_id, segment_id);
+                    self.checkpoint_progress_articles
+                        .insert(job_id, (lane_id, segment_id));
                 }
                 self.metrics
                     .download_lane_refill_granted_total

@@ -3,6 +3,7 @@ pub mod archive;
 pub(crate) use archive::rar_state;
 mod capacity;
 mod completion;
+pub(crate) use completion::finalize::placement;
 mod decode;
 pub mod diagnostics;
 mod direct_store;
@@ -361,7 +362,18 @@ impl<'a> DownloadBatchSelector<'a> {
     }
 }
 
+pub(super) struct DownloadLaneOwner {
+    job_id: JobId,
+    mode: DownloadLaneMode,
+    spillover_loan_kind: Option<SpilloverLoanKind>,
+    completion_critical: bool,
+    connection: bool,
+    ip_replacement: bool,
+    outstanding: HashMap<SegmentId, DownloadWork>,
+}
+
 pub(super) struct DownloadBatchLease {
+    pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) lane_mode: DownloadLaneMode,
@@ -383,6 +395,7 @@ pub(super) struct DownloadBatchLease {
 }
 
 pub(super) struct DownloadLaneRefillRequest {
+    pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
@@ -895,12 +908,14 @@ pub(super) enum IpReplacementTrialEvent {
     SameIpRejected,
     CandidateRejected,
     CandidateAccepted {
+        lane_id: u64,
         old_key: ServerIpKey,
         samples: Vec<weaver_nntp::client::FetchAttemptTrace>,
     },
 }
 
 pub(super) struct DownloadLaneParked {
+    pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) mode: DownloadLaneMode,
     pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
@@ -916,6 +931,7 @@ pub(super) enum OwnedDownloadLaneEvent {
         error: weaver_nntp::client::BlockingBodyLaneAcquireError,
     },
     BatchComplete {
+        lane_id: u64,
         results: Vec<DownloadResult>,
         unrequested_works: Vec<DownloadWork>,
         stats: weaver_nntp::blocking::BlockingLaneStats,
@@ -964,6 +980,7 @@ impl DownloadResultOrigin {
 
 /// Result of a download task.
 pub(super) struct DownloadResult {
+    pub(super) lane_id: u64,
     pub(super) segment_id: SegmentId,
     pub(super) runtime_generation: u64,
     pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
@@ -3138,7 +3155,8 @@ pub struct Pipeline {
     /// Per-job delay after restart-durable-lead throttling parks primary work.
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
     /// The one over-limit article reserved until its result is processed or returned.
-    pub(super) checkpoint_progress_articles: HashMap<JobId, SegmentId>,
+    pub(super) checkpoint_progress_articles: HashMap<JobId, (u64, SegmentId)>,
+    pub(super) download_lane_owners: HashMap<u64, DownloadLaneOwner>,
     /// When each deferred job's articles become old enough to fetch.
     ///
     /// Absent means the question has not been asked yet or was answered
