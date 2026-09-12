@@ -7,6 +7,18 @@
     <script>
       (() => {
         const root = document.documentElement;
+        // The Next UI is a single dark palette on its own background, so it
+        // settles both questions at once and skips the theme class entirely.
+        try {
+          if (window.localStorage.getItem("weaver.ui-variant") === "next") {
+            root.dataset.ui = "next";
+            root.dataset.initialTheme = "dark";
+            root.style.colorScheme = "dark";
+            return;
+          }
+        } catch {
+          // Storage is unreadable; fall through to the classic interface.
+        }
         try {
           const storedTheme = window.localStorage.getItem("theme");
           const theme = storedTheme === "system"
@@ -27,6 +39,10 @@
       html[data-initial-theme="light"], html[data-initial-theme="light"] body {
         background-color: #f8f9fc;
         color-scheme: light;
+      }
+      html[data-ui="next"], html[data-ui="next"] body {
+        background-color: #1a1b1e;
+        color-scheme: dark;
       }
     </style>
     <meta name="theme-color" content="#d9d9d9" media="(prefers-color-scheme: light)" />

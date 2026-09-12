@@ -1,5 +1,8 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+/* Design tokens for the Next UI (src/next). Namespaced `wv-`; nothing here
+   touches the classic palette below. */
+@import "./next/theme.css";
 
 @custom-variant dark (&:is(.dark *));
 

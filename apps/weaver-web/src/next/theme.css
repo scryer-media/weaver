@@ -1,0 +1,221 @@
+/*
+ * Design tokens for the Next UI.
+ *
+ * The redesign is a self-contained palette: it shares no colour, radius or
+ * typeface with the classic interface, so every token here is namespaced `wv-`
+ * and every utility that uses one reads `bg-wv-chrome`, `text-wv-faint` and so
+ * on. Tailwind generates those utilities from the `@theme` block below; nothing
+ * in this file leaks into the classic tree, which never sets `data-ui`.
+ *
+ * Two rules the whole system depends on: the radius is 0 everywhere, and the
+ * only shadow in the system belongs to floating menus.
+ */
+
+@theme {
+  /* Surfaces. */
+  --color-wv-app: #1a1b1e;
+  --color-wv-rail: #151619;
+  --color-wv-chrome: #1f2024;
+  --color-wv-list: #1c1d21;
+  --color-wv-section: #232429;
+  --color-wv-selected: #26282e;
+  --color-wv-row-hover: #22242a;
+  --color-wv-cell-hover: #1e2025;
+  --color-wv-nav-active: #23252b;
+  /* Accent-tinted grounds: the selection bar, a checked row, a state chip,
+     the current page button. Every one of them reads as "this is the good
+     outcome, and it is what you picked". */
+  --color-wv-bulk: #22302d;
+  --color-wv-bulk-line: #2f4440;
+  --color-wv-ok-bg: #1f2b29;
+  --color-wv-ok-line: #3a4b47;
+  --color-wv-ok-hover: #263533;
+  --color-wv-row-picked: #232a29;
+  --color-wv-page-current: #23302d;
+  --color-wv-nav-hover: #2a2c33;
+  --color-wv-input: #191a1d;
+  --color-wv-button: #23242a;
+  --color-wv-button-hover: #2b2d33;
+  --color-wv-segment-active: #2e3038;
+  --color-wv-menu-hover: #2a2b30;
+
+  /* Lines. */
+  --color-wv-line-strong: #2a2b30;
+  --color-wv-hairline: #26272c;
+  --color-wv-log-line: #1f2126;
+  --color-wv-axis: #2f3035;
+  --color-wv-control: #3a3b41;
+  --color-wv-control-hover: #4c4e55;
+  --color-wv-control-hover-strong: #55575f;
+  --color-wv-control-focus: #6f6d66;
+  --color-wv-track: #33343a;
+  --color-wv-danger-border: #4a3530;
+  --color-wv-danger-border-hover: #6b4640;
+  --color-wv-danger-bg: #26201f;
+  --color-wv-danger-bg-hover: #2d2320;
+  /* A control that is present but cannot act — a pagination arrow at the end. */
+  --color-wv-control-off: #2c2d33;
+
+  /* Text. */
+  --color-wv-fg: #ecebe6;
+  --color-wv-strong: #ffffff;
+  --color-wv-secondary: #d6d3cc;
+  --color-wv-tertiary: #cdcac3;
+  --color-wv-muted: #a09d96;
+  --color-wv-faint: #84817a;
+  --color-wv-eyebrow: #c4c1ba;
+  --color-wv-note: #97948d;
+  --color-wv-disabled: #75726b;
+  --color-wv-dim: #5f6068;
+
+  /* Accent. Every accent use derives from the one variable below, so a build
+     that wants a different brand colour changes `--wv-accent` and nothing else. */
+  --color-wv-accent: var(--wv-accent);
+  --color-wv-accent-hover: var(--wv-accent-hover);
+  --color-wv-on-accent: #10201c;
+
+  /* Semantic state. */
+  --color-wv-info: #6aa9cf;
+  --color-wv-warn: #d3a43e;
+  --color-wv-error: #e0745a;
+  --color-wv-error-text: #e89b82;
+  --color-wv-violet: #a98ad6;
+  --color-wv-green: #5fbf94;
+  --color-wv-gold: #c2ad5e;
+  --color-wv-idle: #8d8a82;
+  --color-wv-slate: #7f8692;
+  --color-wv-inert: #4e4f56;
+  --color-wv-chip-off: #3a414f;
+
+  /* Type. */
+  --font-wv-ui: "Instrument Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-wv-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  /* The single shadow in the system. */
+  --shadow-wv-menu: 0 18px 40px -18px rgba(0, 0, 0, 0.9);
+}
+
+:root {
+  --wv-accent: #3fb39c;
+  --wv-accent-hover: #52c4ad;
+}
+
+/*
+ * Scoped reset. `globals.css` paints a gradient body, forces the classic sans
+ * on every element and hands headings a display face; none of that belongs to
+ * this UI, and the selectors below are specific enough to win without `!important`.
+ */
+html[data-ui="next"],
+html[data-ui="next"] body {
+  background: var(--color-wv-app);
+  background-image: none;
+  color: var(--color-wv-fg);
+  color-scheme: dark;
+  margin: 0;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+}
+
+html[data-ui="next"] *,
+html[data-ui="next"] h1,
+html[data-ui="next"] h2,
+html[data-ui="next"] h3,
+html[data-ui="next"] h4,
+html[data-ui="next"] h5,
+html[data-ui="next"] h6 {
+  font-family: var(--font-wv-ui);
+}
+
+html[data-ui="next"] .font-wv-mono,
+html[data-ui="next"] .font-wv-mono * {
+  font-family: var(--font-wv-mono);
+}
+
+html[data-ui="next"] input::placeholder {
+  color: var(--color-wv-disabled);
+}
+
+/* Range inputs are native: the accent drives the filled track and the thumb. */
+html[data-ui="next"] input[type="range"] {
+  accent-color: var(--wv-accent);
+}
+
+/* Square, unobtrusive scrollbars — the classic pill thumb reads as foreign here. */
+html[data-ui="next"] * {
+  scrollbar-color: #3a3b41 transparent;
+  scrollbar-width: thin;
+}
+
+html[data-ui="next"] ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+html[data-ui="next"] ::-webkit-scrollbar-thumb {
+  background: #3a3b41;
+  border: 3px solid var(--color-wv-app);
+  border-radius: 0;
+}
+
+html[data-ui="next"] ::-webkit-scrollbar-thumb:hover {
+  background: #55575f;
+}
+
+html[data-ui="next"] ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/*
+ * Responsive grid tracks.
+ *
+ * Every list on these screens is a CSS grid holding the handoff's exact
+ * tracks, and those tracks are too many to fit a phone. `wv-cols` reads them
+ * from custom properties instead of a literal, so one class carries a table
+ * through every width and no screen grows its own breakpoint code.
+ *
+ * Each step falls back through the smaller ones, so a table can define `base`
+ * and `lg` and skip the rest. A caller that passes a single template gets it
+ * at every width, which is what most grids still want.
+ */
+html[data-ui="next"] .wv-cols {
+  grid-template-columns: var(--wv-cols);
+}
+
+@media (min-width: 40rem) {
+  html[data-ui="next"] .wv-cols {
+    grid-template-columns: var(--wv-cols-sm, var(--wv-cols));
+  }
+}
+
+@media (min-width: 64rem) {
+  html[data-ui="next"] .wv-cols {
+    grid-template-columns: var(--wv-cols-lg, var(--wv-cols-sm, var(--wv-cols)));
+  }
+}
+
+@media (min-width: 80rem) {
+  html[data-ui="next"] .wv-cols {
+    grid-template-columns: var(
+      --wv-cols-xl,
+      var(--wv-cols-lg, var(--wv-cols-sm, var(--wv-cols)))
+    );
+  }
+}
+
+/*
+ * A strip that scrolls sideways rather than clipping: tab bars, segmented
+ * controls, anything whose items are a fixed set too wide for a phone. The
+ * scrollbar is hidden because these are 32-40px tall and a visible one eats
+ * the row; the selector is specific enough to beat the thin-scrollbar default
+ * set above.
+ */
+html[data-ui="next"] .wv-xscroll {
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+html[data-ui="next"] .wv-xscroll::-webkit-scrollbar {
+  display: none;
+}
