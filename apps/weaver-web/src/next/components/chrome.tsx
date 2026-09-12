@@ -1,4 +1,5 @@
 import type { CSSProperties, ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { WV } from "../data/palette";
 
@@ -325,17 +326,127 @@ export function Square({
   );
 }
 
+/** Quarter-cell levels a building cell climbs before it reads as filled. */
+const BAR_LEVELS = 4;
+
+/** How long a reported jump takes to walk up to its new value. */
+const BAR_STEP_MS = 900;
+
+/*
+ * One size observer for every meter on the page.
+ *
+ * Each bar needs its own width to know where its cell boundaries fall, and a
+ * queue view can hold dozens of them -- one observer apiece is a lot of
+ * machinery for one number each.
+ */
+let barSizes: ResizeObserver | null = null;
+const barSinks = new WeakMap<Element, (width: number) => void>();
+
+function barSizeObserver(): ResizeObserver {
+  barSizes ??= new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      barSinks.get(entry.target)?.(entry.contentRect.width);
+    }
+  });
+  return barSizes;
+}
+
+function useTrackWidth() {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const track = ref.current;
+    if (track === null) {
+      return;
+    }
+    // Measured before the first paint, so a meter never shows a frame drawn
+    // against a width of zero.
+    setWidth(track.getBoundingClientRect().width);
+    barSinks.set(track, setWidth);
+    const observer = barSizeObserver();
+    observer.observe(track);
+    return () => {
+      observer.unobserve(track);
+      barSinks.delete(track);
+    };
+  }, []);
+  return [ref, width] as const;
+}
+
+/**
+ * Walk a value up to its target one drawn level at a time.
+ *
+ * Progress lands every couple of seconds, often several cells at once, and
+ * painting it straight makes the meter lurch. Walking it means each cell climbs
+ * its levels the way a terminal meter redraws. `quantum` is the value change
+ * worth one level, so this re-renders only when the drawing would differ --
+ * four times per cell crossed rather than once per frame. Reduced motion skips
+ * the walk and takes the new value as it is.
+ */
+function useSteppedValue(target: number, quantum: number): number {
+  const [shown, setShown] = useState(target);
+  const shownRef = useRef(target);
+
+  useEffect(() => {
+    const settle = () => {
+      shownRef.current = target;
+      setShown(target);
+    };
+    const reduced =
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+    if (!(quantum > 0) || reduced || Math.abs(target - shownRef.current) < quantum) {
+      settle();
+      return;
+    }
+    const from = shownRef.current;
+    const start = performance.now();
+    let frame = 0;
+    const tick = (now: number) => {
+      const fraction = Math.min(1, (now - start) / BAR_STEP_MS);
+      if (fraction >= 1) {
+        settle();
+        return;
+      }
+      const next = from + (target - from) * fraction;
+      if (Math.abs(next - shownRef.current) >= quantum) {
+        shownRef.current = next;
+        setShown(next);
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    // A backgrounded tab is handed no animation frames, so the walk above would
+    // neither advance nor end there: the meter would sit on whatever value it
+    // held when the tab went away, even after the job behind it finished.
+    // Timers still fire, throttled, so this is what guarantees the value
+    // arrives. Where frames do flow the walk has already settled before it
+    // runs, and settling twice on the same number is a no-op.
+    const guard = window.setTimeout(settle, BAR_STEP_MS + 50);
+    return () => {
+      window.clearTimeout(guard);
+      cancelAnimationFrame(frame);
+    };
+  }, [target, quantum]);
+
+  return shown;
+}
+
 /**
  * A terminal-style block meter.
  *
- * Two layers: a track of 2px dashes and a fill of near-solid cells, clipped to
- * the value. Both share one cell period and one origin, so the cells line up
- * and a fill cut mid-cell reads as a partial block rather than a smooth edge.
+ * The track is 2px dashes on one cell period and the fill is the same period in
+ * near-solid cells, so the bar reads as a row of character cells rather than a
+ * continuous strip.
+ *
+ * It fills the way a TUI meter does. Whole cells behind the value are solid;
+ * the cell at the value is a stub that climbs in quarters, so it gains height
+ * first and only once it is full does the next one start. Nothing eases -- the
+ * value itself is walked up in those same quarter steps, so every level gets
+ * drawn instead of being skipped over by a smooth slide.
  *
  * Sizes in the system: 7-8px in rows and gauges, 10px for a pipeline span,
  * 12px for a job's hero bar. The two larger ones take the wider 7px period the
- * design gives them. The width never transitions — the bar steps, it does not
- * ease.
+ * design gives them.
  */
 export function Bar({
   percent,
@@ -355,15 +466,50 @@ export function Bar({
 }) {
   const clamped = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
   const cell = period ?? blockPeriod(height);
+  const [ref, width] = useTrackWidth();
+  const cells = Math.max(1, Math.floor(width / cell));
+  const shown = useSteppedValue(clamped, 100 / (cells * BAR_LEVELS));
+
+  // Whole cells first, then the level the next one has reached. The epsilon
+  // keeps a value sitting exactly on a boundary from also drawing an empty stub
+  // past it.
+  const exact = (shown / 100) * cells;
+  const filled = Math.min(cells, Math.floor(exact + 1e-6));
+  const level = filled >= cells ? 0 : Math.floor((exact - filled) * BAR_LEVELS);
+
   return (
     <div
+      ref={ref}
       className={cn("relative", className)}
-      style={{ height, backgroundImage: blockTrack(cell), ...style }}
+      style={{
+        height,
+        backgroundImage: blockTrack(cell),
+        // The cells tile from the left and a track is rarely an exact multiple
+        // of one, so the ground is cut to the last whole cell. Otherwise a
+        // finished meter ends in a few pixels of leftover dashes and reads as
+        // still having somewhere to go.
+        backgroundRepeat: "no-repeat",
+        backgroundSize: `${cells * cell}px 100%`,
+        ...style,
+      }}
     >
-      <div
-        className="absolute inset-y-0 left-0 overflow-hidden"
-        style={{ width: `${clamped}%`, backgroundImage: blockFill(color, cell) }}
-      />
+      {filled === 0 ? null : (
+        <div
+          className="absolute inset-y-0 left-0"
+          style={{ width: filled * cell, backgroundImage: blockFill(color, cell) }}
+        />
+      )}
+      {level === 0 ? null : (
+        <div
+          className="absolute bottom-0"
+          style={{
+            left: filled * cell,
+            width: cell - 1,
+            height: `${(level / BAR_LEVELS) * 100}%`,
+            background: color,
+          }}
+        />
+      )}
     </div>
   );
 }
