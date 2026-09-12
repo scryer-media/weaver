@@ -91,9 +91,13 @@
    * Type. Three roles, and the weight belongs to the role: titles are the
    * title face at 600, emphasis inside the interface is 500, and everything
    * a person reads straight through is 400. Values stay on the mono face.
+   *
+   * The body face is JetBrains Mono, so the interface reads as the machine's
+   * own surface rather than as a document about it. The title face stays
+   * proportional, which is what keeps a heading legible as a heading.
    */
   --font-wv-title: "Sora Variable", "Inter Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-wv-ui: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-wv-ui: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
   --font-wv-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
 
   /* The single shadow in the system. */
