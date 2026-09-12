@@ -3,6 +3,7 @@ use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 mod completion;
+mod direct_store;
 mod hot;
 mod ip_replacement;
 mod lanes;

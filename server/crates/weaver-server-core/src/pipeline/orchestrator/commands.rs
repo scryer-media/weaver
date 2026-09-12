@@ -186,6 +186,8 @@ impl Pipeline {
                         self.active_decodes_by_job.remove(&job_id);
                         self.active_decodes_by_file
                             .retain(|file_id, _| file_id.job_id != job_id);
+                        self.active_decode_bytes
+                            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
                         self.pending_retries_by_job.remove(&job_id);
                         self.pending_retries_by_segment
                             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);

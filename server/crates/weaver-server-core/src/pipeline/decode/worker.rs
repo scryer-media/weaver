@@ -821,7 +821,8 @@ impl Pipeline {
             .map_err(|error| format!("failed to checksum completed file: {error}"))
     }
 
-    pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId) {
+    pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId, raw_bytes: u64) {
+        self.active_decode_bytes.insert(segment_id, raw_bytes);
         let job_id = segment_id.file_id.job_id;
         *self.active_decodes_by_job.entry(job_id).or_default() += 1;
         *self
@@ -832,6 +833,7 @@ impl Pipeline {
     }
 
     fn note_decode_finished(&mut self, segment_id: SegmentId) {
+        self.active_decode_bytes.remove(&segment_id);
         let job_id = segment_id.file_id.job_id;
         if let Some(active) = self.active_decodes_by_job.get_mut(&job_id) {
             *active = active.saturating_sub(1);

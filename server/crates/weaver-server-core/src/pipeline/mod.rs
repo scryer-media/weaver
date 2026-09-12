@@ -2783,6 +2783,8 @@ pub struct Pipeline {
     pub(super) active_decodes_by_job: HashMap<JobId, usize>,
     /// In-flight decode task count per file.
     pub(super) active_decodes_by_file: HashMap<NzbFileId, usize>,
+    /// Raw article bytes reserved until the actor consumes each decode result.
+    pub(super) active_decode_bytes: HashMap<SegmentId, u64>,
     /// Last time a job made observable progress in the download stage.
     pub(super) job_last_download_activity: HashMap<JobId, Instant>,
     /// Delayed retry tasks that have been scheduled but not yet re-queued.

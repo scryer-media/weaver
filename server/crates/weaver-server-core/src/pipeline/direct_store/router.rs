@@ -1849,7 +1849,6 @@ impl VolumeStaging {
         }
     }
 
-    #[cfg(test)]
     fn staged_bytes(&self) -> u64 {
         self.chunks
             .values()
@@ -3095,6 +3094,21 @@ impl DirectSetRouter {
         self.holds_budget
     }
 
+    /// Stop ordinary lookahead before the hard paging ceiling. The remaining
+    /// quarter absorbs estimate error and permits serialized routing probes.
+    pub(crate) fn holds_admission_limit(&self) -> u64 {
+        let capacity = self.holds_budget.saturating_add(self.scratch.ceiling);
+        capacity.saturating_sub(capacity / 4)
+    }
+
+    /// An incomplete header walk can still release retained bytes, including
+    /// bytes from later volumes whose split-member offsets depend on this one.
+    pub(crate) fn volume_needs_header(&self, volume: u32) -> bool {
+        self.staging
+            .get(&volume)
+            .is_none_or(|staging| !staging.confirmed)
+    }
+
     /// Test hook: force-stage a range without draining it, so a test can build
     /// the one drain shape ordinary routing reaches only through history — bytes
     /// the router staged and could not place, sitting next to a repaired range.
@@ -3168,7 +3182,6 @@ impl DirectSetRouter {
     /// `-rr` volume's recovery record is envelope-classified and is a percentage
     /// of the volume, per volume — and the point of paging is to move that term
     /// from the one ceiling to the other rather than to demote the set.
-    #[cfg(test)]
     pub(crate) fn staged_bytes(&self) -> u64 {
         self.staging.values().fold(0u64, |total, staging| {
             total.saturating_add(staging.staged_bytes())

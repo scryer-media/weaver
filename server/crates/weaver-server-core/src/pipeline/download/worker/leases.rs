@@ -223,11 +223,13 @@ impl Pipeline {
         selector: Option<DownloadBatchSelector<'_>>,
         selection: DownloadWorkSelection,
         uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
+        leased: &[DownloadWork],
     ) -> Option<DownloadWork> {
         // Sweep-owned files take the scanning path below, which looks past
         // their work the way it looks past non-bootstrap work.
         let sweep_held = self.demotion_sweep_held_file_indices(job_id);
-        if bootstrap_files.is_none() && sweep_held.is_none() {
+        let direct_admission = self.direct_store_admission(job_id, leased);
+        if bootstrap_files.is_none() && sweep_held.is_none() && direct_admission.is_empty() {
             if let Some(uu_cursor_ordinals) = uu_cursor_ordinals {
                 return self.jobs.get_mut(&job_id).and_then(|state| {
                     let matches = |work: &DownloadWork| {
@@ -276,6 +278,7 @@ impl Pipeline {
                     && sweep_held
                         .as_deref()
                         .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
+                    && direct_admission.iter().all(|set| set.allows(work))
                     && selector.is_none_or(|selector| selector.matches(work))
                     && selection.matches(work)
                     && uu_cursor_ordinals
@@ -309,6 +312,7 @@ impl Pipeline {
             None,
             selection,
             uu_cursor_ordinals.as_ref(),
+            &[],
         ) else {
             return Ok(None);
         };
@@ -461,6 +465,7 @@ impl Pipeline {
             Some(DownloadBatchSelector::new(&compatibility, rule)),
             selection,
             uu_cursor_ordinals.as_ref(),
+            &[],
         ) {
             Some(first) => first,
             None => {
@@ -572,9 +577,15 @@ impl Pipeline {
         }
         let match_groups = matches!(rule, DownloadBatchRule::Refill { match_groups: true });
         let groups = compatibility.groups.clone();
+        let direct_admission = self.direct_store_admission(job_id, &[]);
+        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
         self.jobs.get_mut(&job_id).and_then(|state| {
             let matches = |work: &DownloadWork| {
                 require_recovery.is_none_or(|is_recovery| work.is_recovery == is_recovery)
+                    && direct_admission.iter().all(|set| set.allows(work))
+                    && sweep_held
+                        .as_deref()
+                        .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
                     && !work.exclude_servers.contains(&server_idx)
                     && work.avoid_server != Some(server_idx)
                     && (!match_groups
@@ -614,6 +625,7 @@ impl Pipeline {
             None,
             DownloadWorkSelection::NonCritical,
             uu_cursor_ordinals.as_ref(),
+            &[],
         ) else {
             return Ok(None);
         };
@@ -664,6 +676,7 @@ impl Pipeline {
                 Some(DownloadBatchSelector::initial(&compatibility)),
                 DownloadWorkSelection::NonCritical,
                 uu_cursor_ordinals.as_ref(),
+                &works,
             ) else {
                 break;
             };
@@ -771,6 +784,7 @@ impl Pipeline {
                 Some(selector),
                 selection,
                 uu_cursor_ordinals.as_ref(),
+                &works,
             ) else {
                 break;
             };

@@ -238,6 +238,7 @@ impl Pipeline {
             active_downloads_by_file: HashMap::new(),
             active_decodes_by_job: HashMap::new(),
             active_decodes_by_file: HashMap::new(),
+            active_decode_bytes: HashMap::new(),
             job_last_download_activity: HashMap::new(),
             pending_retries_by_job: HashMap::new(),
             pending_retries_by_segment: HashMap::new(),

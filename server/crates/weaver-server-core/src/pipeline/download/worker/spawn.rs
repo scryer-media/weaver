@@ -321,7 +321,7 @@ impl Pipeline {
             }
 
             if work.raw.len() > crate::runtime::buffers::BufferTier::Large.size_bytes() {
-                self.note_decode_started(work.segment_id);
+                self.note_decode_started(work.segment_id, work.raw.len() as u64);
                 self.spawn_decode_task(work, None);
                 available_decode_slots -= 1;
                 continue;
@@ -333,7 +333,7 @@ impl Pipeline {
                 continue;
             };
 
-            self.note_decode_started(work.segment_id);
+            self.note_decode_started(work.segment_id, work.raw.len() as u64);
             self.spawn_decode_task(work, Some(output));
             available_decode_slots -= 1;
         }

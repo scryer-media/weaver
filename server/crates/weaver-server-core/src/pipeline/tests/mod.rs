@@ -2280,7 +2280,7 @@ fn park_job_on_its_final_decode(pipeline: &mut Pipeline, segment_id: SegmentId, 
         state.recovery_queue = DownloadQueue::new();
     }
     pipeline.metrics.note_decode_task_started(raw_size);
-    pipeline.note_decode_started(segment_id);
+    pipeline.note_decode_started(segment_id, raw_size);
 }
 
 /// Drives every outstanding demotion reconstruction ticket to its handler, the
