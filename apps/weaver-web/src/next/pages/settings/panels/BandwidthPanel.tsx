@@ -244,7 +244,7 @@ export function BandwidthPanel() {
                         index > 0 ? "border-l border-wv-control " : ""
                       }${
                         values.limitUnit === unit.value
-                          ? "bg-wv-segment-active font-semibold text-wv-strong"
+                          ? "bg-wv-segment-active font-medium text-wv-strong"
                           : "text-wv-muted hover:text-wv-strong"
                       }`}
                     >

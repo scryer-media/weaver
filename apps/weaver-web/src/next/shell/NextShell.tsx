@@ -125,7 +125,7 @@ export function NextShell({
               className={({ isActive }) =>
                 cn(
                   "flex h-8 items-center gap-[10px] px-[10px] text-[13.5px] hover:bg-wv-nav-hover",
-                  isActive ? "bg-wv-nav-active font-semibold text-wv-strong" : "text-wv-fg",
+                  isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
                 )
               }
             >
@@ -194,7 +194,9 @@ export function NextShell({
            */
           <header className="flex min-h-14 flex-none flex-wrap items-center gap-x-4 gap-y-2 border-b border-wv-line-strong bg-wv-chrome py-2 pr-4 pl-12 sm:pr-6 lg:pl-6">
             <div className="flex min-w-0 items-baseline gap-[10px]">
-              <h1 className="flex-none text-[15px] font-semibold tracking-[-0.01em]">{title}</h1>
+              <h1 className="flex-none font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
+                {title}
+              </h1>
               {note === undefined ? null : (
                 <span className="hidden truncate font-wv-mono text-[11.5px] text-wv-muted sm:inline">
                   {note}

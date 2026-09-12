@@ -45,7 +45,7 @@ export function Tabs<T extends string>({
               className={cn(
                 "relative h-[39px] flex-none text-[13px] whitespace-nowrap",
                 isActive
-                  ? "font-semibold text-wv-strong"
+                  ? "font-medium text-wv-strong"
                   : "text-wv-muted hover:text-wv-secondary",
               )}
             >

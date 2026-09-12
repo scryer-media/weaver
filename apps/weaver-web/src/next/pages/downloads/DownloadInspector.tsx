@@ -80,7 +80,7 @@ export function DownloadInspector({
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         <div className="flex flex-none flex-col gap-3 border-b border-wv-hairline px-5 py-[22px]">
           <Eyebrow tone="rail">Selected download</Eyebrow>
-          <div className="text-[15px] leading-[1.35] font-semibold tracking-[-0.01em] text-wv-strong">
+          <div className="font-wv-title text-[15px] leading-[1.35] font-semibold tracking-[-0.01em] text-wv-strong">
             {job.displayTitle || job.name}
           </div>
           <div className="font-wv-mono text-[11px] leading-[1.5] break-all text-wv-faint">

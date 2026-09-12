@@ -16,7 +16,7 @@ export function Eyebrow({
   return (
     <div
       className={cn(
-        "text-[10.5px] font-semibold uppercase tracking-[0.14em]",
+        "font-wv-title text-[10.5px] font-semibold uppercase tracking-[0.14em]",
         tone === "header" ? "text-wv-eyebrow" : "text-wv-faint",
         className,
       )}
@@ -573,7 +573,7 @@ export function blockFill(color: string, cell = 6): string {
 export function EmptyState({ title, body }: { title: string; body: string }) {
   return (
     <div className="flex flex-col gap-1.5 px-4 sm:px-6 py-10">
-      <div className="text-[14px] font-semibold text-wv-fg">{title}</div>
+      <div className="font-wv-title text-[14px] font-semibold text-wv-fg">{title}</div>
       <div className="text-[13px] text-wv-muted">{body}</div>
     </div>
   );

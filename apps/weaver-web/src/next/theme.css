@@ -87,8 +87,13 @@
   --color-wv-inert: #4e4f56;
   --color-wv-chip-off: #3a414f;
 
-  /* Type. */
-  --font-wv-ui: "Instrument Sans Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  /*
+   * Type. Three roles, and the weight belongs to the role: titles are the
+   * title face at 600, emphasis inside the interface is 500, and everything
+   * a person reads straight through is 400. Values stay on the mono face.
+   */
+  --font-wv-title: "Sora Variable", "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-wv-ui: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-wv-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
 
   /* The single shadow in the system. */
@@ -131,6 +136,11 @@ html[data-ui="next"] h6 {
 html[data-ui="next"] .font-wv-mono,
 html[data-ui="next"] .font-wv-mono * {
   font-family: var(--font-wv-mono);
+}
+
+html[data-ui="next"] .font-wv-title,
+html[data-ui="next"] .font-wv-title * {
+  font-family: var(--font-wv-title);
 }
 
 html[data-ui="next"] input::placeholder {

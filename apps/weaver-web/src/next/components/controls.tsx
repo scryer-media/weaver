@@ -29,7 +29,7 @@ export function PrimaryButton({
       onClick={onClick}
       disabled={disabled}
       className={cn(
-        "flex h-[34px] cursor-pointer items-center whitespace-nowrap px-4 text-[13px] font-semibold",
+        "flex h-[34px] cursor-pointer items-center whitespace-nowrap px-4 text-[13px] font-medium",
         disabled
           ? "cursor-default bg-wv-button text-wv-disabled"
           : "bg-wv-accent text-wv-on-accent hover:bg-wv-accent-hover",
@@ -260,7 +260,7 @@ export function Segmented<T extends string>({
                 ? "h-[28px] px-[11px] font-wv-mono text-[11.5px]"
                 : "h-8 px-[13px] text-[12.5px]",
               index > 0 && "border-l border-wv-control",
-              active ? "bg-wv-segment-active font-semibold text-wv-strong" : "text-wv-muted",
+              active ? "bg-wv-segment-active font-medium text-wv-strong" : "text-wv-muted",
             )}
           >
             {option.label}

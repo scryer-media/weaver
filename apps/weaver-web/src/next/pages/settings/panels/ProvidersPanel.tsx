@@ -744,7 +744,7 @@ function quotaFields(values: ServerForm, patch: (next: Partial<ServerForm>) => v
                     index > 0 ? "border-l border-wv-control " : ""
                   }${
                     values.quotaUnit === unit
-                      ? "bg-wv-segment-active font-semibold text-wv-strong"
+                      ? "bg-wv-segment-active font-medium text-wv-strong"
                       : "text-wv-muted hover:text-wv-strong"
                   }`}
                 >
