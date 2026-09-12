@@ -1,12 +1,14 @@
 /*
- * Typefaces for the Next UI. Three families, three jobs: Sora names things —
- * screens, dialogs, sections — JetBrains Mono carries every other word a
- * person wrote, and IBM Plex Mono carries every value a machine produced.
+ * Typefaces for the Next UI. Two families, two jobs: Sora names things —
+ * screens, dialogs, sections — and JetBrains Mono carries everything else,
+ * the words a person wrote and the values a machine produced alike.
  *
- * Only Sora and the IBM Plex weights are declared here. JetBrains Mono is
- * already loaded by the top-level `fonts.css`, where it is classic's mono
- * face, and both stylesheets are imported unconditionally — so declaring it a
- * second time would fetch the same file under the same family name.
+ * Only Sora is declared here. JetBrains Mono is already loaded by the
+ * top-level `fonts.css`, where it is classic's mono face, and both stylesheets
+ * are imported unconditionally — so declaring it a second time would fetch the
+ * same file under the same family name. Both are the variable weight-axis
+ * build, latin subset only, so one file per family covers every weight the
+ * interface sets.
  */
 
 @font-face {
@@ -16,42 +18,6 @@
   font-weight: 100 800;
   src: url("@fontsource-variable/sora/files/sora-latin-wght-normal.woff2")
     format("woff2-variations");
-  unicode-range:
-    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
-    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
-    U+2212, U+2215, U+FEFF, U+FFFD;
-}
-
-@font-face {
-  font-family: "IBM Plex Mono";
-  font-style: normal;
-  font-display: swap;
-  font-weight: 400;
-  src: url("@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
-  unicode-range:
-    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
-    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
-    U+2212, U+2215, U+FEFF, U+FFFD;
-}
-
-@font-face {
-  font-family: "IBM Plex Mono";
-  font-style: normal;
-  font-display: swap;
-  font-weight: 500;
-  src: url("@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-500-normal.woff2") format("woff2");
-  unicode-range:
-    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
-    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
-    U+2212, U+2215, U+FEFF, U+FFFD;
-}
-
-@font-face {
-  font-family: "IBM Plex Mono";
-  font-style: normal;
-  font-display: swap;
-  font-weight: 600;
-  src: url("@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-600-normal.woff2") format("woff2");
   unicode-range:
     U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
     U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
