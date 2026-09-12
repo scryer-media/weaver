@@ -380,6 +380,7 @@ impl Pipeline {
             snapshot_published_at: None,
             snapshot_publish_pending: false,
             download_restart_durable_lead_retry_after: HashMap::new(),
+            checkpoint_progress_articles: HashMap::new(),
             propagation_ready_at: HashMap::new(),
             published_propagation_holds: HashMap::new(),
             propagation_delay,
@@ -740,6 +741,7 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
+        self.checkpoint_progress_articles.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
         // The direct-store runtime is per-job state like every map
         // above it. Left behind, its sets keep a removed job "active" and the

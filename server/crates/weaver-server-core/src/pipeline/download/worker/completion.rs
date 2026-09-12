@@ -463,6 +463,12 @@ impl Pipeline {
     }
 
     pub(crate) async fn process_download_done(&mut self, result: DownloadResult) {
+        let segment_id = result.segment_id;
+        self.process_download_done_inner(result).await;
+        self.finish_checkpoint_progress_article(segment_id);
+    }
+
+    async fn process_download_done_inner(&mut self, result: DownloadResult) {
         let job_id = result.segment_id.file_id.job_id;
         if self
             .jobs

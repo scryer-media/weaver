@@ -3137,6 +3137,8 @@ pub struct Pipeline {
     pub(super) snapshot_publish_pending: bool,
     /// Per-job delay after restart-durable-lead throttling parks primary work.
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
+    /// The one over-limit article reserved until its result is processed or returned.
+    pub(super) checkpoint_progress_articles: HashMap<JobId, SegmentId>,
     /// When each deferred job's articles become old enough to fetch.
     ///
     /// Absent means the question has not been asked yet or was answered

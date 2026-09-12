@@ -2,10 +2,80 @@ use super::*;
 
 impl DownloadPipelineBacklog {
     pub(in crate::pipeline::download::worker) fn has_durable_catch_up_work(self) -> bool {
-        self.active_decodes != 0
-            || self.delayed_retries != 0
+        self.active_downloads != 0
+            || self.active_decodes != 0
             || self.released_results != 0
             || self.pending_decodes != 0
+    }
+}
+
+/// A single actor-state view shared by work selection and queue availability.
+/// Parked retries and cached sockets cannot advance the durable byte floor.
+#[derive(Clone, Copy)]
+pub(in crate::pipeline) struct CheckpointAdmission {
+    pub(in crate::pipeline) enforced: bool,
+    pub(in crate::pipeline) undurable_bytes: u64,
+    limit: u64,
+    can_advance: bool,
+    progress_article_in_flight: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::pipeline) enum CheckpointDecision {
+    NotEnforced,
+    RecoveryExempt,
+    WithinLimit,
+    ProgressArticle,
+    WaitingForPipeline,
+}
+
+impl CheckpointDecision {
+    pub(in crate::pipeline) fn as_str(self) -> &'static str {
+        match self {
+            Self::NotEnforced => "not_enforced",
+            Self::RecoveryExempt => "recovery_exempt",
+            Self::WithinLimit => "within_limit",
+            Self::ProgressArticle => "progress_article",
+            Self::WaitingForPipeline => "waiting_for_pipeline",
+        }
+    }
+
+    pub(super) fn allows(self) -> bool {
+        self != Self::WaitingForPipeline
+    }
+}
+
+impl CheckpointAdmission {
+    pub(in crate::pipeline) fn decision(
+        self,
+        work: &DownloadWork,
+        leased: &[DownloadWork],
+    ) -> CheckpointDecision {
+        if !self.enforced || self.limit == 0 {
+            return CheckpointDecision::NotEnforced;
+        }
+        if work.is_recovery {
+            return CheckpointDecision::RecoveryExempt;
+        }
+        if self.progress_article_in_flight {
+            return CheckpointDecision::WaitingForPipeline;
+        }
+        let projected = leased
+            .iter()
+            .filter(|work| !work.is_recovery)
+            .map(|work| work.byte_estimate as u64)
+            .fold(self.undurable_bytes, u64::saturating_add)
+            .saturating_add(work.byte_estimate as u64);
+        if projected <= self.limit {
+            CheckpointDecision::WithinLimit
+        } else if !self.can_advance && leased.is_empty() {
+            // One article may close the gap that prevents checkpointing. Once
+            // leased, the batch itself reserves this allowance; activation and
+            // result/decode accounting carry it until the actor handles it.
+            CheckpointDecision::ProgressArticle
+        } else {
+            CheckpointDecision::WaitingForPipeline
+        }
     }
 }
 
@@ -197,10 +267,7 @@ impl Pipeline {
         self.active_download_connections < limit
     }
 
-    pub(in crate::pipeline::download::worker) fn durable_download_floor_bytes_for_job(
-        &self,
-        job_id: JobId,
-    ) -> u64 {
+    pub(in crate::pipeline) fn durable_download_floor_bytes_for_job(&self, job_id: JobId) -> u64 {
         let Some(state) = self.jobs.get(&job_id) else {
             return 0;
         };
@@ -228,7 +295,7 @@ impl Pipeline {
         floor.max(state.restored_download_floor_bytes)
     }
 
-    pub(in crate::pipeline::download::worker) fn estimated_undurable_download_bytes_for_job(
+    pub(in crate::pipeline) fn estimated_undurable_download_bytes_for_job(
         &self,
         job_id: JobId,
     ) -> u64 {
@@ -315,46 +382,72 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline::download::worker) fn next_queued_download_exceeds_restart_durable_lead(
+    pub(in crate::pipeline::download::worker) fn should_enforce_restart_durable_lead(
         &self,
         job_id: JobId,
     ) -> bool {
         self.jobs
             .get(&job_id)
-            .and_then(|state| state.download_queue.peek_next_matching(|_| true))
-            .is_some_and(|work| !self.primary_download_within_restart_durable_lead(job_id, work))
+            .is_some_and(|state| state.restored_download_floor_bytes != 0)
     }
 
-    pub(in crate::pipeline::download::worker) fn restart_durable_lead_block(
-        &self,
-        job_id: JobId,
-        work: &DownloadWork,
-    ) -> Option<(u64, u64)> {
-        self.restart_durable_lead_block_with_extra(job_id, work, 0)
-    }
-
-    pub(in crate::pipeline::download::worker) fn should_enforce_restart_durable_lead(
-        &self,
-        job_id: JobId,
-    ) -> bool {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return false;
-        };
-        if state.restored_download_floor_bytes == 0 {
-            return false;
+    pub(in crate::pipeline) fn checkpoint_admission(&self, job_id: JobId) -> CheckpointAdmission {
+        let enforced = self.should_enforce_restart_durable_lead(job_id);
+        CheckpointAdmission {
+            enforced,
+            // Ordinary jobs do not use this guard. Keep their per-article
+            // admission path free of file and downstream-backlog scans.
+            undurable_bytes: if enforced {
+                self.estimated_undurable_download_bytes_for_job(job_id)
+            } else {
+                0
+            },
+            limit: Self::restart_durable_lead_limit_bytes(),
+            can_advance: enforced
+                && self
+                    .download_pipeline_backlog_for_job(job_id)
+                    .has_durable_catch_up_work(),
+            progress_article_in_flight: self.checkpoint_progress_articles.contains_key(&job_id),
         }
-        self.download_restart_durable_lead_retry_after
-            .contains_key(&job_id)
-            || self
-                .download_pipeline_backlog_for_job(job_id)
-                .has_durable_catch_up_work()
     }
 
-    pub(in crate::pipeline::download::worker) fn should_cap_lease_for_restart_durable_lead(
+    pub(super) fn checkpoint_progress_article_for_lease(
         &self,
-        job_id: JobId,
-    ) -> bool {
-        self.should_enforce_restart_durable_lead(job_id)
+        lease: &DownloadBatchLease,
+    ) -> Option<SegmentId> {
+        let first = lease.works.first()?;
+        (self.checkpoint_admission(lease.job_id).decision(first, &[])
+            == CheckpointDecision::ProgressArticle)
+            .then_some(first.segment_id)
+    }
+
+    pub(in crate::pipeline) fn finish_checkpoint_progress_article(
+        &mut self,
+        segment_id: SegmentId,
+    ) {
+        let job_id = segment_id.file_id.job_id;
+        if self.checkpoint_progress_articles.get(&job_id) == Some(&segment_id) {
+            self.checkpoint_progress_articles.remove(&job_id);
+        }
+    }
+
+    pub(super) fn note_checkpoint_dispatch_block(&mut self, job_id: JobId) {
+        // Preserve the existing wake deadline across repeated availability
+        // checks; continually extending it can itself starve a retry wake.
+        if self
+            .download_restart_durable_lead_retry_after
+            .get(&job_id)
+            .is_some_and(|ready| *ready > Instant::now())
+        {
+            return;
+        }
+        self.metrics
+            .download_restart_durable_lead_blocked_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.download_restart_durable_lead_retry_after.insert(
+            job_id,
+            Instant::now() + DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY,
+        );
     }
 
     /// Every configured connection is available to downloads, always.
@@ -448,30 +541,9 @@ impl Pipeline {
         job_id: JobId,
         work: &DownloadWork,
     ) -> bool {
-        if !self.should_enforce_restart_durable_lead(job_id) {
-            return true;
-        }
-        self.restart_durable_lead_block(job_id, work).is_none()
-    }
-
-    pub(in crate::pipeline::download::worker) fn restart_durable_lead_block_with_extra(
-        &self,
-        job_id: JobId,
-        work: &DownloadWork,
-        extra_undurable_bytes: u64,
-    ) -> Option<(u64, u64)> {
-        if work.is_recovery {
-            return None;
-        }
-        let limit = Self::restart_durable_lead_limit_bytes();
-        if limit == 0 {
-            return None;
-        }
-        let projected = self
-            .estimated_undurable_download_bytes_for_job(job_id)
-            .saturating_add(extra_undurable_bytes)
-            .saturating_add(work.byte_estimate as u64);
-        (projected > limit).then_some((projected, limit))
+        self.checkpoint_admission(job_id)
+            .decision(work, &[])
+            .allows()
     }
 
     pub(crate) fn refresh_download_pressure(&mut self) -> DownloadPressure {

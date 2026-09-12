@@ -17,6 +17,7 @@ fn posted_job_spec(name: &str, posted_at: Option<u64>) -> JobSpec {
     spec
 }
 
+mod checkpoint_progress;
 mod emits_download_pipeline_drained;
 mod gapless_lanes;
 mod lane_depth_seeding;

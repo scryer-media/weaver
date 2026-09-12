@@ -27,52 +27,14 @@ impl Pipeline {
         stop_on_cap_block: bool,
     ) -> Result<Option<DownloadWork>, DispatchAttempt> {
         if !self.primary_download_within_restart_durable_lead(job_id, &work) {
-            let (projected_before_flush, limit) = self
-                .restart_durable_lead_block(job_id, &work)
-                .expect("blocked durable lead must include projected bytes");
             self.flush_file_progress_batch("download.file_progress.flush.restart_durable_lead");
-            if let Some((projected_after_flush, _)) = self.restart_durable_lead_block(job_id, &work)
-            {
-                let backlog = self.download_pipeline_backlog_for_job(job_id);
-                if !backlog.has_durable_catch_up_work() {
-                    debug!(
-                        job_id = job_id.0,
-                        segment = ?work.segment_id,
-                        projected_before_flush,
-                        projected_after_flush,
-                        limit,
-                        "dispatch continuing: restart durable lead exceeded but download pipeline is idle"
-                    );
-                } else {
-                    self.metrics
-                        .download_restart_durable_lead_blocked_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.download_restart_durable_lead_retry_after.insert(
-                        job_id,
-                        Instant::now() + DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY,
-                    );
-                    debug!(
-                        job_id = job_id.0,
-                        segment = ?work.segment_id,
-                        projected_before_flush,
-                        projected_after_flush,
-                        limit,
-                        active_downloads = backlog.active_downloads,
-                        active_connections = backlog.active_connections,
-                        active_decodes = backlog.active_decodes,
-                        delayed_retries = backlog.delayed_retries,
-                        released_results = backlog.released_results,
-                        pending_decodes = backlog.pending_decodes,
-                        buffered_write_segments = backlog.buffered_write_segments,
-                        buffered_write_bytes = backlog.buffered_write_bytes,
-                        "dispatch delayed: restart durable lead"
-                    );
-                    if let Some(state) = self.jobs.get_mut(&job_id) {
-                        state.download_queue.push(work);
-                    }
-                    self.update_queue_metrics();
-                    return Ok(None);
+            if !self.primary_download_within_restart_durable_lead(job_id, &work) {
+                self.note_checkpoint_dispatch_block(job_id);
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.download_queue.push(work);
                 }
+                self.update_queue_metrics();
+                return Ok(None);
             }
         }
         self.download_restart_durable_lead_retry_after
@@ -229,7 +191,12 @@ impl Pipeline {
         // their work the way it looks past non-bootstrap work.
         let sweep_held = self.demotion_sweep_held_file_indices(job_id);
         let direct_admission = self.direct_store_admission(job_id, leased);
-        if bootstrap_files.is_none() && sweep_held.is_none() && direct_admission.is_empty() {
+        let checkpoint = self.checkpoint_admission(job_id);
+        if bootstrap_files.is_none()
+            && sweep_held.is_none()
+            && direct_admission.is_empty()
+            && !checkpoint.enforced
+        {
             if let Some(uu_cursor_ordinals) = uu_cursor_ordinals {
                 return self.jobs.get_mut(&job_id).and_then(|state| {
                     let matches = |work: &DownloadWork| {
@@ -271,7 +238,8 @@ impl Pipeline {
                 }
             });
         }
-        self.jobs.get_mut(&job_id).and_then(|state| {
+        let checkpoint_blocked = std::cell::Cell::new(false);
+        let result = self.jobs.get_mut(&job_id).and_then(|state| {
             let matches = |work: &DownloadWork| {
                 bootstrap_files
                     .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
@@ -283,6 +251,13 @@ impl Pipeline {
                     && selection.matches(work)
                     && uu_cursor_ordinals
                         .is_none_or(|cursors| Self::uu_work_closes_cursor(cursors, work))
+                    && {
+                        let allowed = checkpoint.decision(work, leased).allows();
+                        if !allowed {
+                            checkpoint_blocked.set(true);
+                        }
+                        allowed
+                    }
             };
             match selection {
                 DownloadWorkSelection::Any => state.download_queue.pop_first_matching(matches),
@@ -293,7 +268,11 @@ impl Pipeline {
                     .download_queue
                     .pop_first_matching_in_class(false, matches),
             }
-        })
+        });
+        if result.is_none() && checkpoint_blocked.get() {
+            self.note_checkpoint_dispatch_block(job_id);
+        }
+        result
     }
 
     pub(in crate::pipeline::download::worker) fn try_lease_initial_download_batch(
@@ -579,7 +558,9 @@ impl Pipeline {
         let groups = compatibility.groups.clone();
         let direct_admission = self.direct_store_admission(job_id, &[]);
         let sweep_held = self.demotion_sweep_held_file_indices(job_id);
-        self.jobs.get_mut(&job_id).and_then(|state| {
+        let checkpoint = self.checkpoint_admission(job_id);
+        let checkpoint_blocked = std::cell::Cell::new(false);
+        let result = self.jobs.get_mut(&job_id).and_then(|state| {
             let matches = |work: &DownloadWork| {
                 require_recovery.is_none_or(|is_recovery| work.is_recovery == is_recovery)
                     && direct_admission.iter().all(|set| set.allows(work))
@@ -596,6 +577,13 @@ impl Pipeline {
                     && selection.matches(work)
                     && uu_cursor_ordinals
                         .is_none_or(|cursors| Self::uu_work_closes_cursor(cursors, work))
+                    && {
+                        let allowed = checkpoint.decision(work, &[]).allows();
+                        if !allowed {
+                            checkpoint_blocked.set(true);
+                        }
+                        allowed
+                    }
             };
             match selection {
                 DownloadWorkSelection::Any => state.download_queue.pop_first_matching(matches),
@@ -606,7 +594,11 @@ impl Pipeline {
                     .download_queue
                     .pop_first_matching_in_class(false, matches),
             }
-        })
+        });
+        if result.is_none() && checkpoint_blocked.get() {
+            self.note_checkpoint_dispatch_block(job_id);
+        }
+        result
     }
 
     pub(in crate::pipeline::download::worker) fn try_lease_ip_replacement_trial_batch(
@@ -755,12 +747,6 @@ impl Pipeline {
                     ))
                 }
             };
-        let cap_for_restart_durable_lead = self.should_cap_lease_for_restart_durable_lead(job_id);
-        let mut leased_undurable_bytes = if first.is_recovery {
-            0
-        } else {
-            first.byte_estimate as u64
-        };
         let mut works = vec![first];
         let selection = if compatibility.completion_critical {
             DownloadWorkSelection::CompletionCritical
@@ -791,22 +777,8 @@ impl Pipeline {
             if par2_metadata_bootstrap_files.is_some() {
                 self.par2_metadata_bootstrap_claims_work(job_id, &next);
             }
-            if cap_for_restart_durable_lead
-                && self
-                    .restart_durable_lead_block_with_extra(job_id, &next, leased_undurable_bytes)
-                    .is_some()
-            {
-                if let Some(state) = self.jobs.get_mut(&job_id) {
-                    state.download_queue.push(next);
-                }
-                break;
-            }
             match self.reserve_download_work_for_dispatch(job_id, next, false) {
                 Ok(Some(next)) => {
-                    if !next.is_recovery {
-                        leased_undurable_bytes =
-                            leased_undurable_bytes.saturating_add(next.byte_estimate as u64);
-                    }
                     works.push(next);
                 }
                 Ok(None) | Err(DispatchAttempt::StopAll) | Err(DispatchAttempt::NoWork) => break,
@@ -1021,6 +993,10 @@ impl Pipeline {
         activation_items: &[(SegmentId, NzbFileId, u64)],
         starts_connection: bool,
     ) {
+        if let Some(segment_id) = self.checkpoint_progress_article_for_lease(lease) {
+            self.checkpoint_progress_articles
+                .insert(lease.job_id, segment_id);
+        }
         self.activate_download_batch(
             lease.job_id,
             DownloadBatchClass::from(&lease.compatibility),

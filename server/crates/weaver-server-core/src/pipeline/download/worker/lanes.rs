@@ -981,6 +981,7 @@ impl Pipeline {
         &mut self,
         work: DownloadWork,
     ) {
+        self.finish_checkpoint_progress_article(work.segment_id);
         let job_id = work.segment_id.file_id.job_id;
         self.active_downloads = self.active_downloads.saturating_sub(1);
         if work.is_recovery {

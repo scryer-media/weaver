@@ -377,6 +377,30 @@ impl DownloadQueue {
             .and_then(|Reverse(pw)| matches(&pw.work).then_some(&pw.work))
     }
 
+    /// Read the same candidate as `pop_first_matching`, including work hidden
+    /// behind an ineligible head. Keep the ordinary eligible-head path O(1).
+    pub fn peek_first_matching(
+        &self,
+        mut matches: impl FnMut(&DownloadWork) -> bool,
+    ) -> Option<&DownloadWork> {
+        for heap in [&self.completion_critical_heap, &self.ordinary_heap] {
+            if let Some(Reverse(item)) = heap.peek()
+                && matches(&item.work)
+            {
+                return Some(&item.work);
+            }
+            if let Some(item) = heap
+                .iter()
+                .map(|Reverse(item)| item)
+                .filter(|item| matches(&item.work))
+                .min()
+            {
+                return Some(&item.work);
+            }
+        }
+        None
+    }
+
     /// The head of one dispatch class without removing it, in O(1).
     ///
     /// For decisions that are about the *shape* of the work rather than the

@@ -259,6 +259,7 @@ impl Pipeline {
         // and the difference between the two is a class change to settle.
         let granted_class = DownloadBatchClass::from(&lease.compatibility);
         let activation_items = Self::activation_items(&lease);
+        let progress_article = self.checkpoint_progress_article_for_lease(&lease);
         let next_mode = Self::actual_download_lane_mode(
             lease.lane_mode,
             &lease.server_modes,
@@ -271,6 +272,9 @@ impl Pipeline {
             park_reason: LaneParkReason::NoWork,
         }) {
             Ok(()) => {
+                if let Some(segment_id) = progress_article {
+                    self.checkpoint_progress_articles.insert(job_id, segment_id);
+                }
                 self.metrics
                     .download_lane_refill_granted_total
                     .fetch_add(1, Ordering::Relaxed);
