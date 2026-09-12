@@ -84,6 +84,13 @@ const EVENT_TONE_CLASS = {
   plain: "text-wv-muted",
 } as const;
 
+/**
+ * Provider bars by rank, not by identity: the same hues the category rotation
+ * uses, in contribution order. A provider keeps its colour for as long as it
+ * keeps its place, which is what the eye actually tracks down a short list.
+ */
+const PROVIDER_COLORS = [WV.accent, WV.info, WV.violet, WV.green, WV.gold] as const;
+
 interface JobEvent {
   kind: string;
   fileId: string | null;
@@ -91,11 +98,21 @@ interface JobEvent {
   timestamp: number;
 }
 
+/** One provider's share of a job, as the engine attributed it. */
+interface ServerContribution {
+  serverId: number;
+  /** Null once the server has been removed from the configuration. */
+  serverHost: string | null;
+  articles: number;
+  wireBytes: number;
+}
+
 interface JobSnapshot {
   queueItem?: GraphqlJobData | null;
   historyItem?: GraphqlJobData | null;
   jobTimeline?: JobTimelineData | null;
   jobEvents?: JobEvent[];
+  serverAttribution?: ServerContribution[];
 }
 
 interface OutputFile {
@@ -167,6 +184,22 @@ export function JobDetailPage() {
   const job = useMemo(() => (raw ? normalizeJobData(raw) : null), [raw]);
   // The engine appends; the log reads newest first, like every other log here.
   const events = useMemo(() => [...(snapshot?.jobEvents ?? [])].reverse(), [snapshot?.jobEvents]);
+  // Shares are of the payload that *was* attributed, not of the job's bytes:
+  // an article whose serving provider could not be named is left out of the
+  // ledger rather than charged to the wrong one, so these add to 100% of a
+  // total that can be smaller than the download. Ordered and measured by
+  // payload, which is the question the panel answers.
+  const providers = useMemo(() => {
+    const credited = (snapshot?.serverAttribution ?? []).filter((entry) => entry.articles > 0);
+    const attributed = credited.reduce((sum, entry) => sum + entry.wireBytes, 0);
+    return credited
+      .slice()
+      .sort((left, right) => right.wireBytes - left.wireBytes || left.serverId - right.serverId)
+      .map((entry) => ({
+        ...entry,
+        share: attributed > 0 ? (entry.wireBytes / attributed) * 100 : 0,
+      }));
+  }, [snapshot?.serverAttribution]);
   // A running job's window keeps growing, so the axis has to move with it; a
   // finished one is fixed and needs no clock at all.
   const now = useNow(1000, inQueue);
@@ -374,6 +407,7 @@ export function JobDetailPage() {
             { id: "log", label: "Event log", meta: events.length },
             { id: "release", label: "Release details" },
             { id: "metadata", label: "Metadata" },
+            { id: "providers", label: "Providers", meta: providers.length },
           ]}
         />
       }
@@ -684,11 +718,41 @@ export function JobDetailPage() {
           </DetailBlock>
 
           {/*
-            The prototype ends on "Providers used". weaver does not persist which
-            provider served which article — the attempt events are transient — so
-            this panel says what the job's bytes actually were instead of
-            inventing an attribution.
+            The prototype's last panel. It lists only the providers that served
+            something: the ledger omits a provider that contributed nothing
+            rather than carrying it at zero, so "this backup went untouched" is
+            read from its absence here, not from a row.
           */}
+          <DetailBlock
+            id="providers"
+            title="Providers used"
+            tone="panel"
+            note={
+              providers.length === 0
+                ? undefined
+                : "Shares are of the payload whose provider was recorded."
+            }
+            bodyClassName="gap-[11px]"
+          >
+            {providers.length === 0 ? (
+              <div className="text-[12.5px] leading-[1.5] text-wv-muted">
+                Not recorded for this job — either nothing has landed yet, or it
+                finished before weaver kept per-provider counts.
+              </div>
+            ) : (
+              providers.map((provider, index) => (
+                <ShareRow
+                  key={provider.serverId}
+                  label={provider.serverHost ?? `Server ${provider.serverId}`}
+                  title={`${provider.articles.toLocaleString()} articles`}
+                  note={`${formatSize(provider.wireBytes)} · ${Math.round(provider.share)}%`}
+                  percent={provider.share}
+                  color={PROVIDER_COLORS[index % PROVIDER_COLORS.length]}
+                />
+              ))
+            )}
+          </DetailBlock>
+
           <DetailBlock id="recovery" title="Bytes" tone="panel" bodyClassName="gap-[11px]">
             <ShareRow
               label="Payload"
@@ -783,16 +847,21 @@ function ShareRow({
   note,
   percent,
   color,
+  title,
 }: {
   label: string;
   note: string;
   percent: number;
   color: string;
+  /** Hover detail for a label that stands for more than it can show. */
+  title?: string;
 }) {
   return (
     <div className="flex min-w-0 flex-col gap-[5px]">
       <div className="flex items-baseline justify-between gap-[10px] text-[12.5px]">
-        <span className="truncate text-wv-tertiary">{label}</span>
+        <span className="truncate text-wv-tertiary" title={title ?? label}>
+          {label}
+        </span>
         <span className="flex-none font-wv-mono text-[11px] text-wv-muted">{note}</span>
       </div>
       <Bar percent={percent} color={color} />
