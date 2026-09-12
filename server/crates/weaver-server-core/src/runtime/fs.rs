@@ -47,9 +47,12 @@ pub(crate) fn rename_file_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
         };
         let src = path(src)?;
         let dst = path(dst)?;
+        // The raw syscall rather than the libc wrapper: musl's static libc has
+        // no renameat2 symbol, so the portable release binary cannot link it.
         #[cfg(target_os = "linux")]
         let result = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 src.as_ptr(),
                 libc::AT_FDCWD,
@@ -495,6 +498,24 @@ mod tests {
         rename_no_overwrite(&src, &dst).unwrap();
 
         assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    #[test]
+    fn rename_file_exclusive_moves_once_and_never_replaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src.bin");
+        let dst = temp.path().join("dst.bin");
+        std::fs::write(&src, b"source").unwrap();
+
+        rename_file_exclusive(&src, &dst).unwrap();
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+
+        std::fs::write(&src, b"second").unwrap();
+        let error = rename_file_exclusive(&src, &dst).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"second");
         assert_eq!(std::fs::read(&dst).unwrap(), b"source");
     }
 
