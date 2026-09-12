@@ -2520,4 +2520,5 @@ async fn next_par2_analysis_done(pipeline: &mut Pipeline) -> crate::pipeline::Pa
 mod decode_matrix_s_own;
 mod ignorable_furniture_inside_recovery;
 mod par2_session_io_errors;
+mod stall_regressions;
 mod unavailable_promoted_recovery_promotes;

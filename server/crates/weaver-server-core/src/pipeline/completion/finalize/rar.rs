@@ -813,7 +813,7 @@ impl Pipeline {
         );
     }
 
-    pub(super) async fn apply_placement_plan_for_retry_or_repair(
+    pub(in crate::pipeline) async fn apply_placement_plan_for_retry_or_repair(
         &mut self,
         job_id: JobId,
         working_dir: PathBuf,
@@ -833,7 +833,7 @@ impl Pipeline {
         }
         let plan_for_apply = plan.clone();
         let moved = tokio::task::spawn_blocking(move || {
-            par2_rs::apply_placement_plan(&working_dir, &plan_for_apply)
+            placement::apply_complete_plan(&working_dir, &plan_for_apply)
                 .map_err(|e| format!("placement normalization failed: {e}"))
         })
         .await

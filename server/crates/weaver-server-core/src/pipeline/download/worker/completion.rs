@@ -843,7 +843,13 @@ impl Pipeline {
                         weaver_nntp::pool::BodyServerAvailability::WaitingUntil(delay) => {
                             Some(delay)
                         }
-                        weaver_nntp::pool::BodyServerAvailability::Blocked => None,
+                        // Eligibility can change without rebuilding the
+                        // client (for example, a quota reservation refund).
+                        // Keep a bounded recheck so these articles cannot
+                        // become an indefinite wait with no wake source.
+                        weaver_nntp::pool::BodyServerAvailability::Blocked => {
+                            Some(BODY_SERVER_BLOCKED_RECHECK_DELAY)
+                        }
                     };
                     if self
                         .last_no_eligible_server_warn

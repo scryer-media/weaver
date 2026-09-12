@@ -1343,7 +1343,17 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         }
     };
 
-    drain_pending_refill(pending_refill.take(), &event_tx);
+    if let Some(granted_context) = drain_pending_refill(
+        pending_refill.take(),
+        &event_tx,
+        server_idx,
+        supports_pipelining,
+    ) {
+        // Granting a refill already rebooks the connection in the actor,
+        // even when a transport fault prevents the worker from adopting it.
+        booked_mode = granted_context.mode;
+        park_context = Arc::new(granted_context);
+    }
     let unrequested_works = pending
         .into_iter()
         .map(|(work, _)| work)
@@ -1376,14 +1386,15 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
 fn drain_pending_refill(
     pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>>,
     event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,
-) {
-    let Some(response_rx) = pending_refill else {
-        return;
-    };
+    server_idx: usize,
+    supports_pipelining: bool,
+) -> Option<LaneLeaseContext> {
+    let response_rx = pending_refill?;
     if let Ok(response) = response_rx.blocking_recv()
         && let Some(lease) = response.lease
         && !lease.works.is_empty()
     {
+        let context = LaneLeaseContext::from_lease(&lease, server_idx, supports_pipelining);
         let _ = send_owned_batch(
             event_tx,
             Vec::new(),
@@ -1391,7 +1402,9 @@ fn drain_pending_refill(
             weaver_nntp::blocking::BlockingLaneStats::default(),
             true,
         );
+        return Some(context);
     }
+    None
 }
 
 /// Whether a park keeps the socket for the worker's next lease.
@@ -2522,3 +2535,6 @@ mod probe_tests {
         assert!(handle.idle_workers().is_empty());
     }
 }
+
+#[cfg(test)]
+mod fault_tests;

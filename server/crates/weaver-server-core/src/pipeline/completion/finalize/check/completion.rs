@@ -843,10 +843,12 @@ impl Pipeline {
             // work is parked recovery is not "pending" here, analyses run, and
             // promotion drains the pool.
             let promoted_recovery_state = self.promoted_recovery_pipeline_state(job_id);
+            // A promoted file can remain incomplete after its last article
+            // proved unavailable. Only live pipeline work can change it now;
+            // otherwise the salvage and next-wave evaluation below must run.
             if rar_par2_repair_ready
                 && promoted_recovery_state.promoted_par2_files > 0
-                && (promoted_recovery_state.incomplete_promoted_par2_files > 0
-                    || self.job_has_pending_download_pipeline_work(job_id))
+                && self.job_has_pending_download_pipeline_work(job_id)
             {
                 debug!(
                     job_id = job_id.0,

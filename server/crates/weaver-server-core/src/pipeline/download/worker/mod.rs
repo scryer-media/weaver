@@ -125,6 +125,7 @@ const IP_REPLACEMENT_CANDIDATE_BETTER_RATIO: f64 = 0.85;
 const IP_REPLACEMENT_CANDIDATE_BETTER_MS: f64 = 40.0;
 const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]

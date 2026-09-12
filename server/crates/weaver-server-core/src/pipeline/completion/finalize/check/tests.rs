@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn verified_placement_preserves_portable_download_names() {
+    for (described, installed) in [
+        ("disc1/payload.bin", "disc1_payload.bin"),
+        ("disc1\\payload.bin", "disc1_payload.bin"),
+        ("release:payload.bin", "release_payload.bin"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("posted.bin");
+        std::fs::write(&source, b"verified payload").unwrap();
+        let verification = par2_rs::VerificationResult {
+            files: vec![file_verification(
+                1,
+                described,
+                par2_rs::verify::FileStatus::Renamed(source.clone()),
+                vec![true],
+            )],
+            recovery_blocks_available: 0,
+            total_missing_blocks: 0,
+            repairable: par2_rs::verify::Repairability::NotNeeded,
+        };
+        let plan = placement_plan_from_verification(&verification);
+        assert_eq!(plan.renames[0].correct_name, installed);
+        super::super::placement::apply_complete_plan(dir.path(), &plan).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(installed)).unwrap(),
+            b"verified payload"
+        );
+        assert!(!source.exists());
+    }
+}
+
+#[test]
 fn clean_par2_verification_mode_labels_are_stable() {
     assert_eq!(CleanPar2VerificationMode::Grid.as_str(), "grid");
     assert_eq!(CleanPar2VerificationMode::FileCrc.as_str(), "file_crc");

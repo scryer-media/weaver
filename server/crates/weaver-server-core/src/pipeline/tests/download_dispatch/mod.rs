@@ -23,3 +23,4 @@ mod lane_depth_seeding;
 mod lane_failure_visibility;
 mod owned_download_lane_pool;
 mod propagation_delay;
+mod stall_retry;
