@@ -92,14 +92,14 @@
    * title face at 600, emphasis inside the interface is 500, and everything
    * a person reads straight through is 400.
    *
-   * Everything but a title is JetBrains Mono, so the interface reads as the
+   * Everything but a title is Fira Code, so the interface reads as the
    * machine's own surface rather than as a document about it. The title face
    * stays proportional, which is what keeps a heading legible as a heading.
    * Values a machine produced keep their own token, so markup still says
    * which text is a value, but they are set in the same face as the body.
    */
   --font-wv-title: "Sora Variable", "Inter Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-wv-ui: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --font-wv-ui: "Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
   --font-wv-mono: var(--font-wv-ui);
 
   /* The single shadow in the system. */
