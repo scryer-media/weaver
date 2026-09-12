@@ -199,7 +199,14 @@ impl Pipeline {
 
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.jobs.remove(&job_id);
+        self.retire_stalled_download_lanes(job_id);
         self.job_order.retain(|id| *id != job_id);
+        self.remove_pending_completion_check(job_id);
+        self.pending_retries_by_job.remove(&job_id);
+        self.pending_retries_by_segment
+            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        self.cancel_infrastructure_retries_for_job(job_id);
+        self.download_wait_by_job.remove(&job_id);
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);
         self.clear_par2_runtime_state(job_id);

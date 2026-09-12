@@ -1527,7 +1527,9 @@ fn placement_plan_from_verification(
                 renames.push(par2_rs::PlacementEntry {
                     file_id: file.file_id,
                     current_name: current_name.into_owned(),
-                    correct_name: file.filename.clone(),
+                    // Match the quick verifier and download identity layer;
+                    // PAR2 descriptions can contain non-portable path names.
+                    correct_name: sanitize_download_filename(&file.filename),
                 });
             }
             par2_rs::verify::FileStatus::Damaged(_) | par2_rs::verify::FileStatus::Missing => {

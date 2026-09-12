@@ -891,6 +891,7 @@ async fn a_recovery_lease_takes_an_owned_lane_at_the_ordinary_depth() {
     };
     let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
+        lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
@@ -942,6 +943,7 @@ async fn recovery_async_handoff_keeps_owned_lane_caches() {
     };
     let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
+        lane_id: 0,
         job_id: work.segment_id.file_id.job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
@@ -1186,6 +1188,7 @@ async fn shutdown_drain_consumes_inflight_download_results() {
     pipeline
         .download_done_tx
         .send(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1240,6 +1243,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1295,6 +1299,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: retry.segment_id,
             data: Err(DownloadError::fetch(
@@ -1359,6 +1364,7 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1420,6 +1426,7 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1505,6 +1512,7 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1625,6 +1633,7 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1726,6 +1735,7 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1910,6 +1920,7 @@ async fn stale_generation_transport_failure_is_requeued_without_poisoning_health
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 1,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1958,6 +1969,7 @@ async fn stale_generation_success_does_not_update_new_lane_health() {
     pipeline.active_download_connections = 1;
 
     pipeline.release_download_result(&DownloadResult {
+        lane_id: 0,
         runtime_generation: 1,
         segment_id: SegmentId {
             file_id: NzbFileId {
@@ -2379,6 +2391,7 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -2517,6 +2530,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: large_segment,
             data: Err(DownloadError::Fetch(first_failure)),
@@ -2531,6 +2545,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
         .await;
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: tail_segment,
             data: Err(DownloadError::Fetch(tail_failure)),
@@ -2636,6 +2651,7 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -2735,6 +2751,7 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -2876,6 +2893,7 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -3022,6 +3040,7 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -3146,6 +3165,7 @@ async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
     // failed bytes instead of retrying forever.
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3213,6 +3233,7 @@ async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
     // missing article, not requeued without budget forever.
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3273,6 +3294,7 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3341,6 +3363,7 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3400,6 +3423,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3442,6 +3466,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {

@@ -276,7 +276,28 @@ impl Pipeline {
         true
     }
 
-    pub(crate) fn release_download_result(&mut self, result: &DownloadResult) {
+    pub(crate) fn release_download_result(&mut self, result: &DownloadResult) -> bool {
+        if !self.accept_lane_work(result.lane_id, result.segment_id) {
+            let bytes = match &result.data {
+                Ok(DownloadPayload::Raw(raw)) => raw.len() as u64,
+                Ok(DownloadPayload::Decoded(decoded)) => decoded.raw_size,
+                Err(DownloadError::Decode { raw_size, .. }) => *raw_size,
+                Err(_) => 0,
+            };
+            self.rate_limiter.consume(bytes);
+            if let Err(error) = self.record_download_bandwidth_usage(bytes) {
+                error!(%error, "failed to account for retired lane transport usage");
+            }
+            return false;
+        }
+        if result.release_connection_slot
+            && let Some(owner) = self.download_lane_owners.get_mut(&result.lane_id)
+        {
+            owner.connection = false;
+            if owner.outstanding.is_empty() && !owner.ip_replacement {
+                self.download_lane_owners.remove(&result.lane_id);
+            }
+        }
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.release_result");
         let stale_generation = result.runtime_generation != self.pool_generation;
         let policy_outcome = matches!(
@@ -379,11 +400,13 @@ impl Pipeline {
             );
         }
         self.publish_hot_dispatch_metrics(Instant::now());
+        true
     }
 
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
-        self.release_download_result(&result);
-        self.process_download_done(result).await;
+        if self.release_download_result(&result) {
+            self.process_download_done(result).await;
+        }
     }
 
     pub(crate) fn released_download_result_lead_bytes(result: &DownloadResult) -> u64 {
@@ -463,6 +486,13 @@ impl Pipeline {
     }
 
     pub(crate) async fn process_download_done(&mut self, result: DownloadResult) {
+        let segment_id = result.segment_id;
+        let lane_id = result.lane_id;
+        self.process_download_done_inner(result).await;
+        self.finish_checkpoint_progress_article(lane_id, segment_id);
+    }
+
+    async fn process_download_done_inner(&mut self, result: DownloadResult) {
         let job_id = result.segment_id.file_id.job_id;
         if self
             .jobs
@@ -843,7 +873,13 @@ impl Pipeline {
                         weaver_nntp::pool::BodyServerAvailability::WaitingUntil(delay) => {
                             Some(delay)
                         }
-                        weaver_nntp::pool::BodyServerAvailability::Blocked => None,
+                        // Eligibility can change without rebuilding the
+                        // client (for example, a quota reservation refund).
+                        // Keep a bounded recheck so these articles cannot
+                        // become an indefinite wait with no wake source.
+                        weaver_nntp::pool::BodyServerAvailability::Blocked => {
+                            Some(BODY_SERVER_BLOCKED_RECHECK_DELAY)
+                        }
                     };
                     if self
                         .last_no_eligible_server_warn

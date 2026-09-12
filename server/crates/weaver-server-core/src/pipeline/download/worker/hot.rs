@@ -29,9 +29,33 @@ impl Pipeline {
         job_id: JobId,
     ) -> bool {
         let uu_capped = !self.uu_files.is_empty() && self.uu_spool_dispatch_capped();
+        let direct_admission = self.direct_store_admission(job_id, &[]);
+        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
+        let checkpoint = self.checkpoint_admission(job_id);
         self.jobs.get(&job_id).is_some_and(|state| {
             if !Self::status_allows_download_dispatch(&state.status) {
                 return false;
+            }
+            // A retained-byte cap is local to its set. Reporting raw queue
+            // occupancy here would prevent spillover from using free lanes.
+            if !direct_admission.is_empty() || sweep_held.is_some() || checkpoint.enforced {
+                return state
+                    .download_queue
+                    .peek_first_matching(|work| {
+                        direct_admission.iter().all(|set| set.allows(work))
+                            && checkpoint.decision(work, &[]).allows()
+                            && sweep_held.as_deref().is_none_or(|held| {
+                                !held.contains(&work.segment_id.file_id.file_index)
+                            })
+                            && (!uu_capped
+                                || self
+                                    .uu_files
+                                    .get(&work.segment_id.file_id)
+                                    .is_none_or(|uu| {
+                                        uu.next_index == work.segment_id.segment_number
+                                    }))
+                    })
+                    .is_some();
             }
             if !uu_capped {
                 return !state.download_queue.is_empty();

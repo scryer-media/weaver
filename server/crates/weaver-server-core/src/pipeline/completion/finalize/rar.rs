@@ -813,14 +813,96 @@ impl Pipeline {
         );
     }
 
-    pub(super) async fn apply_placement_plan_for_retry_or_repair(
+    pub(crate) fn apply_placement_identity(
+        mut identity: crate::jobs::record::ActiveFileIdentity,
+        binding: &placement::Binding,
+    ) -> crate::jobs::record::ActiveFileIdentity {
+        identity.current_filename = binding.filename.clone();
+        identity.canonical_filename = Some(binding.filename.clone());
+        identity.classification = Self::canonical_archive_identity_from_filename(&binding.filename)
+            .or(identity.classification);
+        identity.classification_source = crate::jobs::record::FileIdentitySource::Par2;
+        identity
+    }
+
+    async fn bind_placement_transaction(
+        &mut self,
+        job_id: JobId,
+        transaction: placement::Transaction,
+    ) -> Result<(), String> {
+        for binding in transaction.bindings() {
+            let identity = self
+                .effective_file_identity(
+                    job_id,
+                    NzbFileId {
+                        job_id,
+                        file_index: binding.file_index,
+                    },
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "placement identity {} is missing; journal retained",
+                        binding.file_index
+                    )
+                })?;
+            self.set_file_identity(job_id, Self::apply_placement_identity(identity, binding))?;
+        }
+        tokio::task::spawn_blocking(move || transaction.finish())
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
+    }
+
+    fn invalidate_verification_after_placement_replay(&mut self, job_id: JobId) {
+        self.clear_pending_par2_repairs_for_job(job_id);
+        self.invalidate_par2_session_for_identity_rebind(job_id);
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.completed_checksums.clear();
+            for set in runtime.sets.values_mut() {
+                set.settled = false;
+                set.failure = None;
+                set.missing_blocks = 0;
+                set.post_verdict_reconcile_attempts = 0;
+                set.scan_carry = None;
+                set.scan_carry_exclusions.clear();
+            }
+        }
+        self.par2_verified.remove(&job_id);
+        self.schedule_job_completion_check(job_id);
+    }
+
+    pub(in crate::pipeline) async fn recover_placement_before_verification(
+        &mut self,
+        job_id: JobId,
+        working_dir: PathBuf,
+    ) -> Result<bool, String> {
+        let report = tokio::task::spawn_blocking(move || placement::recover(&working_dir))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        for transaction in report.transactions {
+            self.bind_placement_transaction(job_id, transaction).await?;
+        }
+        if report.replayed {
+            self.invalidate_verification_after_placement_replay(job_id);
+        }
+        Ok(report.replayed)
+    }
+
+    pub(in crate::pipeline) async fn apply_placement_plan_for_retry_or_repair(
         &mut self,
         job_id: JobId,
         working_dir: PathBuf,
         plan: &par2_rs::PlacementPlan,
-    ) -> Result<(), String> {
+    ) -> Result<placement::ApplyOutcome, String> {
+        if self
+            .recover_placement_before_verification(job_id, working_dir.clone())
+            .await?
+        {
+            return Ok(placement::ApplyOutcome::Reverify);
+        }
         if plan.swaps.is_empty() && plan.renames.is_empty() {
-            return Ok(());
+            return Ok(placement::ApplyOutcome::Applied);
         }
 
         let plan = plan.clone();
@@ -831,13 +913,43 @@ impl Pipeline {
         for name in &normalized_files {
             self.taint_direct_unpack_for_file(job_id, name);
         }
+        let bindings = self
+            .jobs
+            .get(&job_id)
+            .into_iter()
+            .flat_map(|state| state.assembly.files())
+            .filter_map(|file| self.effective_file_identity(job_id, file.file_id()))
+            .filter_map(|identity| {
+                normalization_map
+                    .get(&identity.current_filename)
+                    .filter(|filename| **filename != identity.current_filename)
+                    .map(|filename| placement::Binding {
+                        file_index: identity.file_index,
+                        filename: filename.clone(),
+                    })
+            })
+            .collect();
         let plan_for_apply = plan.clone();
-        let moved = tokio::task::spawn_blocking(move || {
-            par2_rs::apply_placement_plan(&working_dir, &plan_for_apply)
-                .map_err(|e| format!("placement normalization failed: {e}"))
+        let recovery_dir = working_dir.clone();
+        let transaction = tokio::task::spawn_blocking(move || {
+            placement::begin(&working_dir, &plan_for_apply, bindings)
         })
         .await
-        .map_err(|e| format!("placement normalization task panicked: {e}"))??;
+        .map_err(|e| format!("placement normalization task panicked: {e}"))?;
+        let transaction = match transaction {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                self.recover_placement_before_verification(job_id, recovery_dir)
+                    .await?;
+                // Preparation may already have cleaned up a completed rollback.
+                self.invalidate_verification_after_placement_replay(job_id);
+                return Ok(placement::ApplyOutcome::Reverify);
+            }
+            other => other.map_err(|e| format!("placement normalization failed: {e}"))?,
+        };
+        let Some(transaction) = transaction else {
+            return Ok(placement::ApplyOutcome::Applied);
+        };
+        let moved = transaction.len();
 
         // Placement changes paths, not the bytes still owned by each
         // NzbFileId. Binding and archive identity are refreshed below; raw
@@ -891,47 +1003,7 @@ impl Pipeline {
                     )
             })
             .unwrap_or_default();
-        let file_rows: Vec<(NzbFileId, crate::jobs::record::ActiveFileIdentity, bool)> = self
-            .jobs
-            .get(&job_id)
-            .map(|state| {
-                state
-                    .assembly
-                    .files()
-                    .filter_map(|file| {
-                        self.effective_file_identity(job_id, file.file_id())
-                            .map(|identity| (file.file_id(), identity, file.is_complete()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let by_current: HashMap<String, (NzbFileId, bool)> = file_rows
-            .iter()
-            .map(|(file_id, identity, is_complete)| {
-                (identity.current_filename.clone(), (*file_id, *is_complete))
-            })
-            .collect();
-
-        for (current_name, correct_name) in &normalization_map {
-            let Some((file_id, _)) = by_current.get(current_name).copied() else {
-                continue;
-            };
-            let Some((_, identity, _)) = file_rows
-                .iter()
-                .find(|(candidate_file_id, _, _)| *candidate_file_id == file_id)
-                .cloned()
-            else {
-                continue;
-            };
-            let classification = Self::canonical_archive_identity_from_filename(correct_name)
-                .or(identity.classification.clone());
-            let mut rebound_identity = identity;
-            rebound_identity.current_filename = correct_name.clone();
-            rebound_identity.canonical_filename = Some(correct_name.clone());
-            rebound_identity.classification = classification;
-            rebound_identity.classification_source = crate::jobs::record::FileIdentitySource::Par2;
-            self.set_file_identity(job_id, rebound_identity)?;
-        }
+        self.bind_placement_transaction(job_id, transaction).await?;
 
         let touched_complete_files: Vec<NzbFileId> = self
             .jobs
@@ -967,7 +1039,7 @@ impl Pipeline {
                 .await;
         }
 
-        Ok(())
+        Ok(placement::ApplyOutcome::Applied)
     }
 
     pub(super) async fn recompute_rar_retry_frontier(&mut self, job_id: JobId) {

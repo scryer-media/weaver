@@ -45,6 +45,14 @@ impl Pipeline {
         // per-stage stamps cannot: a repair that is rejected still spent the
         // time it spent.
         let _finish_scope = crate::runtime::perf_probe::scope("par2_repair.finish");
+        match self
+            .recover_placement_before_verification(job_id, working_dir.clone())
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => return self.fail_par2_repair(job_id, error),
+        }
         let mut stage_start = std::time::Instant::now();
         let slices_repaired = par2_repair_slices_repaired(pre_repair);
         info!(
@@ -92,7 +100,7 @@ impl Pipeline {
         let deobfuscation_moved_current_canonical = !deobfuscation_canonical_file_ids.is_empty();
         let placement_moves_paths = !post_repair_placement_plan.swaps.is_empty()
             || !post_repair_placement_plan.renames.is_empty();
-        if let Err(error) = self
+        match self
             .apply_placement_plan_for_retry_or_repair(
                 job_id,
                 working_dir.clone(),
@@ -100,7 +108,11 @@ impl Pipeline {
             )
             .await
         {
-            return self.fail_par2_repair(job_id, error);
+            Ok(placement::ApplyOutcome::Applied) => {}
+            Ok(placement::ApplyOutcome::Reverify) => return,
+            Err(error) => {
+                return self.fail_par2_repair(job_id, error);
+            }
         }
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.apply_placement", stage_start);

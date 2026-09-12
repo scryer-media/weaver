@@ -19,6 +19,12 @@ impl SystemQuery {
     async fn version(&self) -> &str {
         env!("CARGO_PKG_VERSION")
     }
+    /// Latest stable Weaver release information observed by the background checker.
+    #[graphql(guard = "ReadGuard")]
+    async fn update_status(&self, ctx: &Context<'_>) -> Result<UpdateStatus> {
+        let service = ctx.data::<weaver_server_core::update_check::UpdateCheckService>()?;
+        Ok(service.status().into())
+    }
     /// Safe runtime and storage facts for the built-in troubleshooting UI.
     #[graphql(guard = "ReadGuard")]
     async fn system_info(&self, ctx: &Context<'_>) -> Result<SystemInfo> {

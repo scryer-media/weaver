@@ -513,6 +513,7 @@ impl Default for DownloadBlockState {
 }
 
 /// Commands sent to the scheduler's main loop.
+#[derive(Clone)]
 pub struct RestoreJobRequest {
     pub job_id: JobId,
     pub job_hash: [u8; 32],

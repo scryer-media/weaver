@@ -36,7 +36,7 @@ impl Pipeline {
                 let _ = reply.send(result);
             }
             SchedulerCommand::ResumeJob { job_id, reply } => {
-                let result = self.resume_job_runtime(job_id);
+                let result = self.resume_restored_job(job_id).await;
                 if result.is_ok() {
                     self.publish_snapshot();
                     let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
@@ -169,6 +169,7 @@ impl Pipeline {
                             .jobs
                             .remove(&job_id)
                             .expect("job was retained until archive completed");
+                        self.retire_stalled_download_lanes(job_id);
                         self.job_order.retain(|id| *id != job_id);
                         self.remove_pending_completion_check(job_id);
                         self.update_queue_metrics();
@@ -186,6 +187,8 @@ impl Pipeline {
                         self.active_decodes_by_job.remove(&job_id);
                         self.active_decodes_by_file
                             .retain(|file_id, _| file_id.job_id != job_id);
+                        self.active_decode_bytes
+                            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
                         self.pending_retries_by_job.remove(&job_id);
                         self.pending_retries_by_segment
                             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
@@ -390,6 +393,7 @@ impl Pipeline {
             SchedulerCommand::PauseAll { reply } => {
                 self.global_paused = true;
                 self.scheduled_pause = false;
+                self.download_restart_durable_lead_retry_after.clear();
                 self.shared_state.set_paused(true);
                 self.shared_state.set_download_block(
                     self.bandwidth_cap

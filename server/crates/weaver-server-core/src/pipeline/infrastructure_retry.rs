@@ -44,6 +44,14 @@ impl<T> InfrastructureRetryQueue<T> {
         self.timed.first_key_value().map(|(deadline, _)| *deadline)
     }
 
+    /// Inspect deadlines without waking, rescheduling, or copying retry work.
+    pub(super) fn iter_with_deadlines(&self) -> impl Iterator<Item = (Option<Instant>, &T)> {
+        self.timed
+            .iter()
+            .flat_map(|(deadline, batch)| batch.iter().map(move |work| (Some(*deadline), work)))
+            .chain(self.indefinite.iter().map(|work| (None, work)))
+    }
+
     pub(super) fn take_due(&mut self, now: Instant) -> Vec<T> {
         let mut due = Vec::new();
         while self

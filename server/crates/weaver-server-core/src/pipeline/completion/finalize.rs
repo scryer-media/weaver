@@ -70,6 +70,7 @@ pub(crate) mod deobfuscate;
 pub(in crate::pipeline) mod extract;
 mod nested;
 mod output;
+pub(crate) mod placement;
 pub(crate) mod rar;
 mod sfv;
 mod status;

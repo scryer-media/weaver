@@ -3,11 +3,13 @@ use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 mod completion;
+mod direct_store;
 mod hot;
 mod ip_replacement;
 mod lanes;
 mod leases;
 mod metrics;
+mod ownership;
 mod pressure;
 mod refill;
 mod spawn;
@@ -125,6 +127,7 @@ const IP_REPLACEMENT_CANDIDATE_BETTER_RATIO: f64 = 0.85;
 const IP_REPLACEMENT_CANDIDATE_BETTER_MS: f64 = 40.0;
 const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
@@ -155,26 +158,13 @@ impl Pipeline {
         if self.propagation_hold_until(job_id).is_some() {
             return DispatchAttempt::NoWork;
         }
-        if let Some(ready_at) = self
+        if self
             .download_restart_durable_lead_retry_after
-            .get(&job_id)
-            .copied()
-            && ready_at > Instant::now()
+            .contains_key(&job_id)
         {
-            let backlog = self.download_pipeline_backlog_for_job(job_id);
-            if backlog.has_durable_catch_up_work() {
-                if self.next_queued_download_exceeds_restart_durable_lead(job_id) {
-                    self.flush_file_progress_batch(
-                        "download.file_progress.flush.restart_durable_lead_retry_recheck",
-                    );
-                }
-                if self.next_queued_download_exceeds_restart_durable_lead(job_id) {
-                    self.update_queue_metrics();
-                    return DispatchAttempt::NoWork;
-                }
-            }
-            self.download_restart_durable_lead_retry_after
-                .remove(&job_id);
+            self.flush_file_progress_batch(
+                "download.file_progress.flush.restart_durable_lead_retry_recheck",
+            );
         }
         self.apply_rar_unlock_priorities_if_dirty(job_id);
         let mut lease = match self.try_lease_initial_download_batch(job_id, pressure, selection) {

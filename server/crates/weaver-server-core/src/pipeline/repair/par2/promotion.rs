@@ -1193,6 +1193,8 @@ impl Pipeline {
                 name: state.spec.name.clone(),
                 error: if let JobStatus::Failed { error } = &state.status {
                     Some(error.clone())
+                } else if self.blocked_restores.contains_key(&state.job_id) {
+                    state.failure_error.clone()
                 } else {
                     None
                 },
@@ -1220,8 +1222,23 @@ impl Pipeline {
                 failed_bytes: state.failed_bytes,
                 health,
                 terminal_discards: Vec::new(),
-                total_files: state.assembly.total_file_count() as u32,
-                completed_files: state.assembly.complete_file_count() as u32,
+                total_files: self.blocked_restores.get(&state.job_id).map_or_else(
+                    || state.assembly.total_file_count() as u32,
+                    |request| request.spec.files.len() as u32,
+                ),
+                completed_files: self.blocked_restores.get(&state.job_id).map_or_else(
+                    || state.assembly.complete_file_count() as u32,
+                    |request| {
+                        request
+                            .complete_files
+                            .iter()
+                            .filter(|file| {
+                                file.job_id == state.job_id
+                                    && (file.file_index as usize) < request.spec.files.len()
+                            })
+                            .count() as u32
+                    },
+                ),
                 remaining_par_files,
                 password: state.spec.password.clone(),
                 category: state.spec.category.clone(),
