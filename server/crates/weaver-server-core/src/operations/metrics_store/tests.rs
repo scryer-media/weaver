@@ -326,6 +326,7 @@ fn job_info(job_id: u64, status: JobStatus) -> JobInfo {
         error: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        server_attribution: Vec::new(),
         created_at_epoch_ms: 0.0,
     }
 }

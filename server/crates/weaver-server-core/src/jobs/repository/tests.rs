@@ -404,6 +404,7 @@ fn archive_job_moves_to_history() {
             ])
             .unwrap(),
         ),
+        server_attribution: None,
     };
     db.archive_job(JobId(1), &history).unwrap();
 
@@ -459,6 +460,7 @@ fn archive_job_conflict_preserves_persisted_nzb_bytes_when_active_row_is_gone() 
         created_at: 1_700_000_001,
         completed_at: 1_700_000_010,
         metadata: None,
+        server_attribution: None,
     };
     db.archive_job(JobId(1), &history).unwrap();
     let (_, expected_nzb_zstd) = db.load_history_job_persisted_nzb(1).unwrap().unwrap();
@@ -532,6 +534,7 @@ fn max_job_id_all_spans_both_tables() {
         created_at: 0,
         completed_at: 0,
         metadata: None,
+        server_attribution: None,
     };
     db.insert_job_history(&history).unwrap();
 
@@ -985,6 +988,7 @@ fn archive_job_uses_requested_job_id_for_history_row() {
             created_at: 1_700_000_001,
             completed_at: 1_700_000_010,
             metadata: None,
+            server_attribution: None,
         },
     )
     .unwrap();
@@ -1020,6 +1024,7 @@ fn late_active_state_writes_noop_after_archive() {
             created_at: 1_700_000_001,
             completed_at: 1_700_000_010,
             metadata: None,
+            server_attribution: None,
         },
     )
     .unwrap();

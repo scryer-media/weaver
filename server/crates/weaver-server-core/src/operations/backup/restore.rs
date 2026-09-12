@@ -792,6 +792,9 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default(),
         output_dir: row.output_dir,
+        server_attribution: crate::jobs::server_attribution::contributions_from_storage(
+            row.server_attribution.as_deref(),
+        ),
         error: if let JobStatus::Failed { error } = &status {
             Some(error.clone())
         } else {
@@ -915,6 +918,7 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
+            server_attribution: None,
         });
         assert_eq!(repairing.status, crate::JobStatus::Repairing);
         assert_eq!(repairing.download_state, crate::DownloadState::Complete);
@@ -938,6 +942,7 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
+            server_attribution: None,
         });
         assert_eq!(moving.status, crate::JobStatus::Moving);
         assert_eq!(moving.download_state, crate::DownloadState::Complete);

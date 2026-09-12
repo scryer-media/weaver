@@ -568,6 +568,7 @@ mod tests {
             metadata: Vec::new(),
             output_dir: None,
             created_at_epoch_ms: 0.0,
+            server_attribution: Vec::new(),
         }
     }
 

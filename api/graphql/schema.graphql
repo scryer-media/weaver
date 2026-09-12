@@ -632,6 +632,15 @@ type JobDetailSnapshot {
 	historyItem: HistoryItem
 	jobTimeline: JobTimeline
 	jobEvents: [JobEvent!]!
+	"""
+	Which servers served this job's articles, highest count first.
+
+	Counted as articles land, so it covers only articles whose serving
+	server could be named: it understates rather than misattributes, and
+	the totals need not add up to the job's article count. Empty for jobs
+	that finished before the counters existed.
+	"""
+	serverAttribution: [JobServerContribution!]!
 }
 
 """
@@ -664,6 +673,21 @@ type JobOutputResult {
 	outputDir: String!
 	files: [JobOutputFile!]!
 	totalBytes: Int!
+}
+
+"""
+How many of a job's articles one server served.
+
+`serverId` is the configured server's own id. `serverHost` is resolved from
+the current configuration at read time rather than stored per job, so a
+server that has since been deleted keeps its counts and reports a null host;
+clients render those by id.
+"""
+type JobServerContribution {
+	serverId: Int!
+	serverHost: String
+	articles: Int!
+	wireBytes: Int!
 }
 
 """

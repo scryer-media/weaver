@@ -142,6 +142,7 @@ fn nzbget_history_row(
         created_at: 1_700_000_000,
         completed_at,
         metadata,
+        server_attribution: None,
     }
 }
 
@@ -439,6 +440,7 @@ fn scheduler_handle_with_mock_commands_with_db(
                                 } else {
                                     serde_json::to_string(&job.metadata).ok()
                                 },
+                                server_attribution: None,
                             });
                         }
                         state.publish_jobs(jobs);
@@ -510,6 +512,7 @@ fn job_info_from_spec(job_id: JobId, spec: JobSpec) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
+        server_attribution: Vec::new(),
     }
 }
 
@@ -587,6 +590,7 @@ fn nzbget_test_job(
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
+        server_attribution: Vec::new(),
     }
 }
 
@@ -1075,6 +1079,7 @@ fn sample_job(job_id: u64, name: &str, status: JobStatus) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
+        server_attribution: Vec::new(),
     }
 }
 

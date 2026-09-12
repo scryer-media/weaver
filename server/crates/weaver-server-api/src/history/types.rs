@@ -171,6 +171,14 @@ pub struct JobDetailSnapshot {
     pub history_item: Option<HistoryItem>,
     pub job_timeline: Option<JobTimeline>,
     pub job_events: Vec<JobEvent>,
+    /// Which servers served this job's articles, highest count first.
+    ///
+    /// Counted as articles land, so it covers only articles whose serving
+    /// server could be named: it understates rather than misattributes, and
+    /// the totals need not add up to the job's article count. Empty for jobs
+    /// that finished before the counters existed.
+    #[serde(default)]
+    pub server_attribution: Vec<crate::jobs::types::JobServerContribution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

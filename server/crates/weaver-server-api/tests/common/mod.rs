@@ -610,6 +610,7 @@ fn spawn_test_scheduler(
                         category_bytes: None,
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
+                        server_attribution: Default::default(),
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -762,6 +763,7 @@ fn spawn_test_scheduler(
                         category_bytes: None,
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
+                        server_attribution: Default::default(),
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));
@@ -946,6 +948,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             metadata: state.spec.metadata.clone(),
             output_dir: None,
             created_at_epoch_ms: state.created_at_epoch_ms,
+            server_attribution: Vec::new(),
         })
         .collect()
 }

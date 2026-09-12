@@ -574,6 +574,12 @@ export const JOB_QUERY = gql`
         message
         timestamp
       }
+      serverAttribution {
+        serverId
+        serverHost
+        articles
+        wireBytes
+      }
     }
   }
   ${JOB_TIMELINE_FIELDS}
@@ -654,6 +660,12 @@ export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
         fileId
         message
         timestamp
+      }
+      serverAttribution {
+        serverId
+        serverHost
+        articles
+        wireBytes
       }
     }
   }

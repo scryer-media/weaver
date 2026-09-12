@@ -22,6 +22,7 @@ fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
         created_at,
         completed_at,
         metadata: None,
+        server_attribution: None,
     }
 }
 
@@ -142,6 +143,7 @@ fn job(status: JobStatus) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_000.0,
+        server_attribution: Vec::new(),
     }
 }
 

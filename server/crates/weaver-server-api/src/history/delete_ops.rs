@@ -319,6 +319,7 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
+            server_attribution: None,
         }
     }
 

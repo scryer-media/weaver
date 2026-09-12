@@ -144,6 +144,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             category: state.spec.category.clone(),
             metadata: state.spec.metadata.clone(),
             output_dir: None,
+            server_attribution: Vec::new(),
             created_at_epoch_ms: state.created_at_epoch_ms,
         })
         .collect()
@@ -278,6 +279,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         downloaded_bytes: 0,
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
+                        server_attribution: Default::default(),
                         failed_bytes: 0,
                         probe_projected_failed_bytes: 0,
                         par2_bytes,
@@ -435,6 +437,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         downloaded_bytes: 0,
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
+                        server_attribution: Default::default(),
                         failed_bytes: 0,
                         probe_projected_failed_bytes: 0,
                         par2_bytes,
@@ -1028,6 +1031,7 @@ fn job_download_rates_report_only_transferring_download_phases() {
             error: None,
             download_wait_reason: None,
             download_retry_at_epoch_ms: None,
+            server_attribution: Vec::new(),
             created_at_epoch_ms: 0.0,
         }
     }

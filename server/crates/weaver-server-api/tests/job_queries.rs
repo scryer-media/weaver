@@ -30,6 +30,7 @@ fn sample_history_row(job_id: u64, name: &str, status: &str, completed_at: i64) 
         created_at: completed_at - 60,
         completed_at,
         metadata: None,
+        server_attribution: None,
     }
 }
 

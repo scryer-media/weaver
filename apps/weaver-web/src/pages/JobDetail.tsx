@@ -8,6 +8,10 @@ import {
   type DuplicateSnapshot,
 } from "@/features/duplicates/DuplicateSnapshotPanel";
 import { JobProgress } from "@/components/JobProgress";
+import {
+  JobProvidersCard,
+  type JobServerContributionData,
+} from "@/components/JobProvidersCard";
 import { JobStatusBadgeGroup } from "@/components/JobStatusBadge";
 import { getJobStages } from "@/lib/job-stages";
 import { PageHeader } from "@/components/PageHeader";
@@ -75,6 +79,7 @@ interface JobDetailSnapshotData {
     message: string;
     timestamp: number;
   }>;
+  serverAttribution?: JobServerContributionData[] | null;
 }
 
 interface JobDetailQueryData {
@@ -515,6 +520,9 @@ export function JobDetail() {
           onForget={() => setDuplicateAction("forget")}
         />
       ) : null}
+
+      {/* Providers that served the articles */}
+      <JobProvidersCard contributions={jobQueryData?.serverAttribution} />
 
       {/* Output files */}
       <JobOutputFilesCard jobId={job.id} status={job.status} />

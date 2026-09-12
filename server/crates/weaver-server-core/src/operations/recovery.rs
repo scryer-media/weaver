@@ -137,6 +137,10 @@ pub async fn recover_server_state(
                 category: recovered.category,
                 metadata: recovered.metadata,
                 output_dir: Some(recovered.output_dir.display().to_string()),
+                // Recovered from the active-job snapshot, which carries no
+                // attribution: the ledger lives with the finished job's
+                // history row.
+                server_attribution: Vec::new(),
                 created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
             });
         } else {
@@ -298,6 +302,9 @@ pub async fn recover_server_state(
                         .and_then(|metadata| serde_json::from_str(&metadata).ok())
                         .unwrap_or_default(),
                     output_dir: row.output_dir,
+                    server_attribution: crate::jobs::server_attribution::contributions_from_storage(
+                        row.server_attribution.as_deref(),
+                    ),
                     created_at_epoch_ms: row.created_at as f64 * 1000.0,
                 });
             }
@@ -520,6 +527,7 @@ mod tests {
             created_at: 1_700_000_000,
             completed_at: 1_700_000_100,
             metadata: None,
+            server_attribution: None,
         })
         .unwrap();
 

@@ -775,6 +775,13 @@ pub struct JobInfo {
     pub metadata: Vec<(String, String)>,
     /// Output directory where extracted files land.
     pub output_dir: Option<String>,
+    /// Which servers served this job's articles, and how much each carried.
+    ///
+    /// Reporting only, and only as far as attribution reached: articles
+    /// Weaver could not name a server for are absent, so these counts are a
+    /// floor. Empty for a job downloaded before this was recorded.
+    #[serde(default)]
+    pub server_attribution: Vec<crate::jobs::server_attribution::JobServerContribution>,
     /// Error message (only set when status is Failed).
     pub error: Option<String>,
     #[serde(default)]

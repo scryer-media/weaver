@@ -437,3 +437,20 @@ kind = "sql"
 file = "migrations/0047_repair_outputs/schema.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 48
+description = "per-job server attribution"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0048_job_server_attribution/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0048_job_server_attribution/schema.sql"
+engine = "postgres"
+scope = "all"

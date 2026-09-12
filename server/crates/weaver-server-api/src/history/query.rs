@@ -173,7 +173,8 @@ impl HistoryQuery {
     ) -> Result<JobDetailSnapshot> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
-        load_job_detail_snapshot(handle, db, job_id).await
+        let server_hosts = server_hosts_by_id(ctx.data::<SharedConfig>()?).await;
+        load_job_detail_snapshot(handle, db, job_id, server_hosts).await
     }
     /// Active or recent background history delete operations.
     #[graphql(guard = "ReadGuard")]
@@ -246,10 +247,27 @@ impl HistoryQuery {
     }
 }
 
+/// Host label per configured server id, for naming a job's contributing servers
+/// without denormalizing the host into every archived job.
+pub(crate) async fn server_hosts_by_id(config: &SharedConfig) -> HashMap<u32, String> {
+    crate::observability::with_timed_config_read(
+        config,
+        "history.query.job_detail_server_hosts",
+        |cfg| {
+            cfg.servers
+                .iter()
+                .map(|server| (server.id, server.host.clone()))
+                .collect()
+        },
+    )
+    .await
+}
+
 pub(crate) async fn load_job_detail_snapshot(
     handle: SchedulerHandle,
     db: weaver_server_core::Database,
     job_id: u64,
+    server_hosts: HashMap<u32, String>,
 ) -> Result<JobDetailSnapshot> {
     let snapshot_started = Instant::now();
     let live_job = match handle.get_job(JobId(job_id)) {
@@ -281,6 +299,31 @@ pub(crate) async fn load_job_detail_snapshot(
     .await
     .map_err(|error| async_graphql::Error::new(error.to_string()))?
     .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+
+    // Prefer the live counters while the job is still resident; once it has been
+    // archived they only exist in the history row. Both are already aggregated
+    // per server, so this is a sort over a handful of entries.
+    let mut server_attribution: Vec<crate::jobs::types::JobServerContribution> = live_job
+        .as_ref()
+        .map(|job| job.server_attribution.clone())
+        .or_else(|| {
+            history.as_ref().map(|row| {
+                weaver_server_core::jobs::server_attribution::contributions_from_storage(
+                    row.server_attribution.as_deref(),
+                )
+            })
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|contribution| {
+            crate::jobs::types::JobServerContribution::from_core(contribution, &server_hosts)
+        })
+        .collect();
+    server_attribution.sort_by(|a, b| {
+        b.articles
+            .cmp(&a.articles)
+            .then_with(|| a.server_id.cmp(&b.server_id))
+    });
 
     let queue_item = live_job.as_ref().map(queue_item_from_job);
     let history_item = history.as_ref().map(|row| {
@@ -332,6 +375,7 @@ pub(crate) async fn load_job_detail_snapshot(
         history_item,
         job_timeline,
         job_events,
+        server_attribution,
     })
 }
 
@@ -777,6 +821,9 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
+        server_attribution: weaver_server_core::jobs::server_attribution::contributions_from_storage(
+            row.server_attribution.as_deref(),
+        ),
     }
 }
 
@@ -804,6 +851,7 @@ mod tests {
             created_at: completed_at - 10,
             completed_at,
             metadata: None,
+            server_attribution: None,
         }
     }
 

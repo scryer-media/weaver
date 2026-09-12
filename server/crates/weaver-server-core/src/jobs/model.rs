@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::JobId;
 use crate::jobs::record::ActiveFileIdentity;
+use crate::jobs::server_attribution::JobServerAttribution;
 use crate::pipeline::download::queue::{DownloadQueue, DownloadWork};
 use weaver_model::files::FileRole;
 
@@ -584,6 +585,12 @@ pub struct JobState {
     /// the download-phase rate, which must integrate the same bytes as the
     /// global speed gauge so a queue row and the nav counter agree.
     pub downloaded_wire_bytes: u64,
+    /// Which servers served this job's articles, counted as they land.
+    ///
+    /// Reporting only: nothing in the scheduling or failover path reads it.
+    /// An article whose server cannot be named is left uncounted, so this
+    /// understates rather than misattributes.
+    pub server_attribution: JobServerAttribution,
     /// Conservative restored progress floor from persisted file-write checkpoints.
     /// This is only used for reporting after restart and must not affect scheduling.
     pub restored_download_floor_bytes: u64,
