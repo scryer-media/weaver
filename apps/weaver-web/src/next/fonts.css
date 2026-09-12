@@ -1,12 +1,12 @@
 /*
  * Typefaces for the Next UI. Three families, three jobs: Sora names things —
- * screens, dialogs, sections — Inter carries every other word a person wrote,
- * and IBM Plex Mono carries every value a machine produced.
+ * screens, dialogs, sections — JetBrains Mono carries every other word a
+ * person wrote, and IBM Plex Mono carries every value a machine produced.
  *
- * Only Sora and the mono weights are declared here. Inter is already loaded by
- * the top-level `fonts.css` for the classic UI, and both stylesheets are
- * imported unconditionally, so declaring it a second time would fetch the same
- * file under the same family name.
+ * Only Sora and the IBM Plex weights are declared here. JetBrains Mono is
+ * already loaded by the top-level `fonts.css`, where it is classic's mono
+ * face, and both stylesheets are imported unconditionally — so declaring it a
+ * second time would fetch the same file under the same family name.
  */
 
 @font-face {
