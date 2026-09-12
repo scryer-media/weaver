@@ -20,7 +20,14 @@ import { ListRow, ValueCell } from "../components/rows";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
 import { EM_DASH, formatSize } from "../data/format";
-import { categoryColor, statusColor, UNCATEGORISED_COLOR } from "../data/palette";
+import { statusColor } from "../data/palette";
+import {
+  categoryFacets,
+  facetKey,
+  NO_FACETS,
+  toggleFacet,
+  type CategoryEntry,
+} from "../data/categories";
 import {
   DOWNLOAD_GROUP_LABEL,
   DOWNLOAD_GROUP_NOTE,
@@ -31,12 +38,7 @@ import {
   type DownloadGroup,
 } from "../data/status";
 import { NextShell } from "../shell/NextShell";
-import {
-  CategoryListBlock,
-  ProvidersBlock,
-  ThroughputBlock,
-  type CategoryEntry,
-} from "../shell/rail-blocks";
+import { CategoryListBlock, ProvidersBlock, ThroughputBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 
@@ -50,8 +52,6 @@ const SORT_OPTIONS: { value: SortId; label: string }[] = [
   { value: "progress", label: "Progress" },
   { value: "eta", label: "Time left" },
 ];
-
-const UNCATEGORISED = "uncategorised";
 
 /** Group → the tab that shows it. "All" shows everything. */
 const TAB_FOR_GROUP: Record<DownloadGroup, TabId> = {
@@ -95,10 +95,10 @@ function sortJobs(jobs: JobData[], sort: SortId, etaById: Map<number, string>): 
 }
 
 export function DownloadsPage() {
-  const { queue, speed, isPaused } = useNextData();
+  const { queue, categories: configured, speed, isPaused } = useNextData();
   const statusLabel = useStatusLabel();
 
-  const [category, setCategory] = useState<string | null>(null);
+  const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
   const [tab, setTab] = useState<TabId>("all");
   const [sort, setSort] = useState<SortId>("priority");
   const [query, setQuery] = useState("");
@@ -137,33 +137,19 @@ export function DownloadsPage() {
     );
   }, [jobs, query]);
 
-  const categories = useMemo<CategoryEntry[]>(() => {
-    const counts = new Map<string, number>();
-    for (const job of searched) {
-      const key = job.category || UNCATEGORISED;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-    const names = new Set<string>([...queue.categories, ...counts.keys()]);
-    const entries: CategoryEntry[] = [
-      { key: null, label: "All categories", color: UNCATEGORISED_COLOR, count: searched.length },
-    ];
-    for (const name of [...names].sort((left, right) => left.localeCompare(right))) {
-      entries.push({
-        key: name,
-        label: name,
-        color: name === UNCATEGORISED ? UNCATEGORISED_COLOR : categoryColor(name),
-        count: counts.get(name) ?? 0,
-      });
-    }
-    return entries;
-  }, [queue.categories, searched]);
+  const categories = useMemo<CategoryEntry[]>(
+    () => categoryFacets({ configured, rows: searched, extras: queue.categories }),
+    [configured, queue.categories, searched],
+  );
 
+  // Facets union: two of them asks for both, which is the only reading that
+  // lets a second click widen the view rather than empty it.
   const inCategory = useMemo(() => {
-    if (category === null) {
+    if (facets.size === 0) {
       return searched;
     }
-    return searched.filter((job) => (job.category || UNCATEGORISED) === category);
-  }, [category, searched]);
+    return searched.filter((job) => facets.has(facetKey(job)));
+  }, [facets, searched]);
 
   const grouped = useMemo(() => {
     const buckets = new Map<DownloadGroup, JobData[]>();
@@ -256,8 +242,9 @@ export function DownloadsPage() {
       railMiddle={
         <CategoryListBlock
           items={categories}
-          active={category}
-          onSelect={(next) => setCategory(next)}
+          selected={facets}
+          onToggle={(key) => setFacets((current) => toggleFacet(current, key))}
+          onClear={() => setFacets(NO_FACETS)}
         />
       }
       railFooter={
@@ -382,7 +369,7 @@ export function DownloadsPage() {
                             <Bar
                               percent={percent}
                               color={color}
-                              height={7}
+                              height={10}
                               className="max-w-[196px] min-w-[56px] flex-1"
                             />
                             <span className="w-[34px] flex-none font-wv-mono text-[11.5px] text-wv-muted">

@@ -12,7 +12,7 @@ import { statusToken } from "@/lib/status-tokens";
 import { Bar, Eyebrow } from "@/next/components/chrome";
 import { DangerButton, SecondaryButton } from "@/next/components/controls";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
-import { fileColor, statusColor } from "@/next/data/palette";
+import { statusColor } from "@/next/data/palette";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 
 interface OutputFile {
@@ -71,7 +71,6 @@ export function DownloadInspector({
   const color = statusColor(job.status);
   const percent = Math.round(job.progress * 100);
   const files = data?.jobOutputFiles?.files ?? [];
-  const largest = files.reduce((max, file) => (file.sizeBytes > max ? file.sizeBytes : max), 0);
   const detail = statusDetail(job);
   const isPaused = token === "paused";
 
@@ -87,7 +86,7 @@ export function DownloadInspector({
             {job.name}
           </div>
           <div className="mt-1 flex items-center gap-3">
-            <Bar percent={percent} color={color} height={12} className="flex-1" />
+            <Bar percent={percent} color={color} height={16} className="flex-1" />
             <span className="w-[34px] flex-none text-right font-wv-mono text-[11.5px] text-wv-secondary">
               {percent}%
             </span>
@@ -121,19 +120,16 @@ export function DownloadInspector({
             </div>
           ) : (
             files.map((file) => (
-              <div key={file.path} className="flex flex-col gap-[6px]">
-                <div className="flex items-baseline gap-3">
-                  <span title={file.path} className="min-w-0 flex-1 truncate text-[12.5px] text-wv-secondary">
-                    {file.name}
-                  </span>
-                  <span className="flex-none font-wv-mono text-[11.5px] text-wv-muted">
-                    {formatSize(file.sizeBytes)}
-                  </span>
-                </div>
-                <Bar
-                  percent={largest > 0 ? (file.sizeBytes / largest) * 100 : 0}
-                  color={fileColor(file.name, color)}
-                />
+              <div key={file.path} className="flex items-baseline gap-3">
+                <span
+                  title={file.path}
+                  className="min-w-0 flex-1 truncate text-[12.5px] text-wv-secondary"
+                >
+                  {file.name}
+                </span>
+                <span className="flex-none font-wv-mono text-[11.5px] text-wv-muted">
+                  {formatSize(file.sizeBytes)}
+                </span>
               </div>
             ))
           )}

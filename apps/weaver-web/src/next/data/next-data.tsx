@@ -10,6 +10,7 @@ import {
 import { useQuery, useSubscription } from "urql";
 import { useGraphqlConnectionState, type GraphqlConnectionStatus } from "@/graphql/client";
 import {
+  CATEGORIES_QUERY,
   HISTORY_JOBS_COUNT_QUERY,
   LIVE_METRICS_QUERY,
   LIVE_METRICS_SUBSCRIPTION,
@@ -60,6 +61,13 @@ interface LiveMetricsSnapshot {
   providerHoldoffs?: ProviderHoldoff[];
 }
 
+/** A category as it is configured, not as the queue happens to use it. */
+export interface ConfiguredCategory {
+  id: number;
+  name: string;
+  destDir: string | null;
+}
+
 export interface NextData {
   version: string;
   speed: number;
@@ -68,6 +76,15 @@ export interface NextData {
   isPaused: boolean;
   downloadBlock: DownloadBlockState;
   queue: LiveQueue;
+  /**
+   * The categories a person configured, in the order the daemon returns them.
+   *
+   * Deliberately not `queue.categories`, which is the set of categories the
+   * jobs in the queue happen to carry: a configured category with nothing in
+   * it right now is still a category you can filter by, and an empty rail is
+   * not the same statement as "you have no categories".
+   */
+  categories: ConfiguredCategory[];
   historyCount: number;
   providers: ProviderHealth[];
   holdoffs: ProviderHoldoff[];
@@ -88,6 +105,7 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   scheduledSpeedLimit: 0,
 };
 
+const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
 const EMPTY_PROVIDERS: ProviderHealth[] = [];
 const EMPTY_HOLDOFFS: ProviderHoldoff[] = [];
 
@@ -108,6 +126,9 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const [{ data: versionData }] = useQuery<{ version: string }>({ query: VERSION_QUERY });
   const [{ data: historyCountData }, reexecuteHistoryCount] = useQuery<{ all: number }>({
     query: HISTORY_JOBS_COUNT_QUERY,
+  });
+  const [{ data: categoryData }] = useQuery<{ categories: ConfiguredCategory[] }>({
+    query: CATEGORIES_QUERY,
   });
   const [{ data: providerData }, reexecuteProviders] = useQuery<{
     serverHealth: ProviderHealth[];
@@ -171,6 +192,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const globalState = snapshot?.globalState;
   const downloadBlock = globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK;
   const isPaused = globalState?.isPaused ?? false;
+  const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
   const providers = providerData?.serverHealth ?? EMPTY_PROVIDERS;
   const holdoffs = snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS;
   const version = versionData?.version ?? "";
@@ -185,6 +207,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       isPaused,
       downloadBlock,
       queue,
+      categories,
       historyCount,
       providers,
       holdoffs,
@@ -195,6 +218,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       },
     }),
     [
+      categories,
       connectionState.status,
       downloadBlock,
       historyCount,

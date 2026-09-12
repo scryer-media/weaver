@@ -42,7 +42,7 @@ import {
   formatSpan,
 } from "../data/format";
 import { useNow } from "../data/clock";
-import { fileColor, statusColor, WV } from "../data/palette";
+import { statusColor, WV } from "../data/palette";
 import { releaseFields, releaseFlags } from "../data/release";
 import { currentPhase, eventTone, useStatusLabel } from "../data/status";
 import { buildTimelineView, type JobTimelineData } from "../data/timeline";
@@ -67,7 +67,7 @@ import { JumpListBlock } from "../shell/rail-blocks";
 // it is the one that goes when a phone cannot hold four tracks.
 const FILE_COLUMNS = {
   base: "minmax(0, 1fr) 62px 46px",
-  sm: "minmax(0, 2fr) minmax(56px, 1fr) 68px 54px",
+  sm: "minmax(0, 1fr) 68px 54px",
 };
 
 // A log needs its clock and its message; the machine-readable kind is what a
@@ -244,7 +244,6 @@ export function JobDetailPage() {
   const color = statusColor(job.status);
   const percent = job.progress * 100;
   const phase = currentPhase(job);
-  const largest = files.reduce((max, file) => Math.max(max, file.sizeBytes), 0);
   const stageIds = new Set(timeline?.stages.map((stage) => stage.id) ?? []);
   const verified = stageIds.has("VERIFYING");
   const repaired = stageIds.has("REPAIRING");
@@ -451,7 +450,7 @@ export function JobDetailPage() {
             {job.name}
           </div>
           <div className="flex items-center gap-[14px]">
-            <Bar percent={percent} color={color} height={12} className="min-w-0 flex-1" />
+            <Bar percent={percent} color={color} height={16} className="min-w-0 flex-1" />
             <span className="flex-none font-wv-mono text-[13px] font-medium text-wv-fg">
               {percent.toFixed(1)}%
             </span>
@@ -567,11 +566,6 @@ export function JobDetailPage() {
                 <div className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">
                   {file.name}
                 </div>
-                <Bar
-                  percent={largest > 0 ? (file.sizeBytes / largest) * 100 : 0}
-                  color={fileColor(file.name, color)}
-                  className="hidden min-w-0 sm:block"
-                />
                 <div className="text-right font-wv-mono text-[12px] text-wv-muted">
                   {formatSize(file.sizeBytes)}
                 </div>

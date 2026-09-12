@@ -490,6 +490,16 @@ input HistoryPageInput {
 	pageSize: Int!
 	search: String
 	status: HistoryStatusFilter
+	"""
+	Keep only rows whose category is one of these; absent or empty keeps
+	every row.
+
+	The list unions rather than intersects, so a caller offering categories
+	as facets widens the result with each one. The empty string selects rows
+	with no category at all, which is how "uncategorised" is asked for
+	without a second field.
+	"""
+	categories: [String!]
 	sortField: HistorySortField
 	sortDirection: HistorySortDirection
 }
