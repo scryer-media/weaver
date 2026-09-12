@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import {
   SecurityUpgradeWizard,
   SetupWizardPage,
@@ -14,6 +14,27 @@ import { useLanguage } from "@/lib/hooks/use-language";
 import { TranslateContext, type TranslateContextValue } from "@/lib/context/translate-context";
 import { PwaProvider } from "@/lib/context/pwa-context";
 import { Toaster } from "@/components/ui/sonner";
+import { applyUiVariant, readUiVariant } from "@/lib/ui-variant";
+
+/// The Next interface is a second, self-contained UI tree (`src/next`).
+/// Loading it lazily keeps its chunk out of a classic browser's bundle; the
+/// variant only changes on a full reload (see `setUiVariant`), so reading it
+/// once per mount is enough and no component below ever re-renders on a switch.
+const NextApp = lazy(() => import("./next/NextApp"));
+
+const uiVariant = readUiVariant();
+
+/// `index.html` already stamps `data-ui` before first paint, which is what
+/// stops the two backgrounds flashing over each other. Stamping it again here
+/// is what makes the two reads agree: a browser that exposes storage to the
+/// app but not to a document-start script would otherwise mount this tree
+/// with none of its scoped CSS applied.
+applyUiVariant(uiVariant);
+
+/// Gates render this while they decide. It has to match the interface that is
+/// about to paint, or the window flashes the other UI's background first.
+const GATE_PLACEHOLDER_CLASS =
+  uiVariant === "next" ? "h-dvh bg-wv-app" : "min-h-screen bg-background";
 
 function AppProviders() {
   const { isReady, t, uiLanguage, setLanguagePreference, selectedLanguage } = useLanguage();
@@ -62,14 +83,20 @@ function AppProviders() {
   );
 
   if (!isReady) {
-    return <div className="min-h-screen bg-background" aria-hidden="true" />;
+    return <div className={GATE_PLACEHOLDER_CLASS} aria-hidden="true" />;
   }
 
   return (
     <TranslateContext.Provider value={contextValue}>
       <Provider value={client}>
         <SecurityUpgradeGate>
-          <RouterProvider router={router} useTransitions={false} />
+          {uiVariant === "next" ? (
+            <Suspense fallback={<div className={GATE_PLACEHOLDER_CLASS} aria-hidden="true" />}>
+              <NextApp />
+            </Suspense>
+          ) : (
+            <RouterProvider router={router} useTransitions={false} />
+          )}
         </SecurityUpgradeGate>
         <Toaster />
       </Provider>
@@ -130,7 +157,7 @@ function SecurityUpgradeGate({ children }: { children: React.ReactNode }) {
   }, [data, error, fetching]);
 
   if (decision === "pending") {
-    return <div className="min-h-screen bg-background" aria-hidden="true" />;
+    return <div className={GATE_PLACEHOLDER_CLASS} aria-hidden="true" />;
   }
   if (decision === "wizard" && data) {
     return (
@@ -188,7 +215,7 @@ function SetupGate({ children }: { children: React.ReactNode }) {
   }, []);
 
   if (setupRequired === null) {
-    return <div className="min-h-screen bg-background" aria-hidden="true" />;
+    return <div className={GATE_PLACEHOLDER_CLASS} aria-hidden="true" />;
   }
   if (setupRequired) {
     return <SetupWizardPage environment={setupEnvironment} />;
@@ -198,7 +225,15 @@ function SetupGate({ children }: { children: React.ReactNode }) {
 
 export function App() {
   return (
-    <ThemeProvider attribute="class" defaultTheme="dark" enableSystem>
+    // The Next interface ships a single dark palette and paints its own
+    // background, so the theme is pinned there; the classic tree keeps the
+    // user's light/dark/system choice.
+    <ThemeProvider
+      attribute="class"
+      defaultTheme="dark"
+      enableSystem
+      forcedTheme={uiVariant === "next" ? "dark" : undefined}
+    >
       <PwaProvider>
         <SetupGate>
           <AppProviders />

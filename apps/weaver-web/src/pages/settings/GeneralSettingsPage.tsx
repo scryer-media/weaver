@@ -23,6 +23,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate, useLanguageSettings } from "@/lib/context/translate-context";
 import { AVAILABLE_LANGUAGES } from "@/lib/i18n";
+import { readUiVariant, setUiVariant } from "@/lib/ui-variant";
 import {
   DEFAULT_DUPLICATE_POLICY,
   DUPLICATE_ACTIONS,
@@ -89,6 +90,8 @@ function storageBehaviorDraftKey(draft: StorageBehaviorDraft | null): string {
 export function GeneralSettingsPage() {
   const t = useTranslate();
   const { uiLanguage, setLanguagePreference } = useLanguageSettings();
+  // Switching reloads the document, so this never goes stale under us.
+  const uiVariant = readUiVariant();
   const [{ data }, reexecuteQuery] = useQuery<{ settings: GeneralSettings }>({
     query: SETTINGS_QUERY,
   });
@@ -316,6 +319,22 @@ export function GeneralSettingsPage() {
             ))}
           </SelectContent>
         </Select>
+      </SectionCard>
+
+      <SectionCard title={t("settings.interface")} description={t("settings.interfaceDesc")}>
+        <div className="flex items-center justify-between gap-4 rounded-inner border border-border p-5">
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-foreground">{t("settings.nextUi")}</div>
+            <div className="mt-1 text-[12.5px] text-muted-foreground">
+              {t("settings.nextUiDesc")}
+            </div>
+          </div>
+          <Switch
+            checked={uiVariant === "next"}
+            onCheckedChange={(enabled) => setUiVariant(enabled ? "next" : "classic")}
+            aria-label={t("settings.nextUi")}
+          />
+        </div>
       </SectionCard>
 
       <SectionCard title={t("settings.speedLimit")} description={t("settings.speedLimitDesc")}>
