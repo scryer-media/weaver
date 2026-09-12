@@ -8,6 +8,9 @@ connections as in use while nothing downloaded. Lanes now keep their sockets
 across job boundaries, and a server that refuses a connection is asked again
 after half a minute instead of ten.
 
+It also corrects a server's download-quota reading, which could show room on a
+server that had none left.
+
 ## What changed
 
 ### Download reliability
@@ -32,6 +35,21 @@ after half a minute instead of ten.
   pause length and how many refusals the current episode has seen, and an
   info line marks the moment the server accepts again.
 
+### Server quotas
+
+- **A server at its download quota is reported as blocked again.** Weaver
+  checks, before each batch of work, whether any server could take a download
+  at all. That check asked for no particular article, which every server with
+  a byte of headroom can supply, and its answer was recorded as though the
+  server had just accepted real work — clearing the "at quota" mark the last
+  real request had set. A server whose quota was spent could therefore show as
+  having room, and the reason given for held-back downloads could read as
+  something other than the server quota. The quota itself was always enforced:
+  no download exceeded a configured cap, and work still moved to another
+  server, so this was what you were told rather than what Weaver did. The
+  check is now read-only, and only a request the server actually turns away
+  marks it as at quota.
+
 ## Upgrade notes
 
 - No database migration, GraphQL schema change or settings change is required.
@@ -39,3 +57,6 @@ after half a minute instead of ten.
   followed by minutes of idle lanes, this release addresses that. Configuring
   a few connections fewer than the provider's limit still avoids the refusal
   in the first place.
+- If a server's download quota looked unspent while its work was going
+  elsewhere, its quota reading will now be correct without any action. Recorded
+  usage was never wrong, so no quota needs resetting.
