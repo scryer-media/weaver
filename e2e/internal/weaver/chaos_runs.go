@@ -55,24 +55,46 @@ func cmdChaosTest() {
 		name             string
 		config           string
 		requireStatChaos bool
+		// providerCap is the primary server's connection cap for the round,
+		// set below the lanes weaver is configured to open. The round then
+		// asserts the provider refused connects and that the cap held.
+		//
+		// The provider counts every session, including this harness's own
+		// control connection, and weaver keeps its accepted lanes cached
+		// between jobs. Weaver is therefore stopped before the cap is lifted
+		// and started fresh before it is applied, so no round inherits the
+		// previous round's open sockets and the control commands always get a
+		// slot.
+		providerCap int
+		// newsgroupPerJob submits each job for its own newsgroup, so every job
+		// boundary hands a cached connection work for a different group. With
+		// providerCap this reproduces the stall where connections opened for
+		// one job were dropped at the next job and no replacement was admitted.
+		newsgroupPerJob bool
 	}
 
 	rounds := []chaosRound{
-		{"baseline (no chaos)", "", false},
-		{"201 greetings on all connects", "greet_201=100", false},
-		{"400 greetings on 30% of connects", "greet_400=30", false},
-		{"drop 30% connections", "drop_conn=30", false},
-		{"reject 50% auth", "reject_auth=50", false},
-		{"force BODY re-auth on 50% of requests", "reauth_body=50", false},
-		{"split BODY terminator on all requests", "split_term=100", false},
-		{"drop 10% of BODY responses mid-transfer", "drop_mid_body=10", false},
-		{"malformed terminator on 10% of BODY responses", "bad_term=10", false},
-		{"corrupt 5% bodies", "corrupt_body=5", false},
-		{"timeout 10% bodies", "timeout_body=10", false},
-		{"STAT bad code on all requests", "stat_bad_code=100", true},
-		{"STAT short response on all requests", "stat_short=100", true},
-		{"combined: STAT bad code 100% + drop mid-body 5%", "stat_bad_code=100,drop_mid_body=5", true},
-		{"combined: reauth 30% + drop mid-body 5% + slow 5ms", "reauth_body=30,drop_mid_body=5,slow_body=5", false},
+		{"baseline (no chaos)", "", false, 0, false},
+		{"201 greetings on all connects", "greet_201=100", false, 0, false},
+		{"400 greetings on 30% of connects", "greet_400=30", false, 0, false},
+		{"drop 30% connections", "drop_conn=30", false, 0, false},
+		{"reject 50% auth", "reject_auth=50", false, 0, false},
+		{"force BODY re-auth on 50% of requests", "reauth_body=50", false, 0, false},
+		{"split BODY terminator on all requests", "split_term=100", false, 0, false},
+		{"drop 10% of BODY responses mid-transfer", "drop_mid_body=10", false, 0, false},
+		{"malformed terminator on 10% of BODY responses", "bad_term=10", false, 0, false},
+		{"corrupt 5% bodies", "corrupt_body=5", false, 0, false},
+		{"timeout 10% bodies", "timeout_body=10", false, 0, false},
+		{"STAT bad code on all requests", "stat_bad_code=100", true, 0, false},
+		{"STAT short response on all requests", "stat_short=100", true, 0, false},
+		{"combined: STAT bad code 100% + drop mid-body 5%", "stat_bad_code=100,drop_mid_body=5", true, 0, false},
+		{"combined: reauth 30% + drop mid-body 5% + slow 5ms", "reauth_body=30,drop_mid_body=5,slow_body=5", false, 0, false},
+		{
+			name:            "provider cap below configured lanes, new newsgroup per job",
+			config:          "max_conns=4,slow_body=5",
+			providerCap:     4,
+			newsgroupPerJob: true,
+		},
 	}
 
 	onlyRound := 0
@@ -110,6 +132,9 @@ func cmdChaosTest() {
 
 		// Keep control-plane operations out of the chaos blast radius. The
 		// workload below still runs with the round's chaos enabled.
+		if round.providerCap > 0 {
+			killWeaver()
+		}
 		if err := ensureNntpChaosOff(); err != nil {
 			log.Fatalf("reset NNTP chaos before round %q: %v", round.name, err)
 		}
@@ -121,6 +146,11 @@ func cmdChaosTest() {
 				log.Fatalf("enable NNTP chaos for round %q: %v", round.name, err)
 			}
 			log.Printf("chaos enabled: %s", round.config)
+		}
+		if round.providerCap > 0 {
+			if err := restartStandardManagedWeaverPreservingState(); err != nil {
+				log.Fatalf("start managed weaver under provider cap for round %q: %v", round.name, err)
+			}
 		}
 
 		// Submit in small batches so NNTP chaos exercises recovery behavior
@@ -146,7 +176,11 @@ func cmdChaosTest() {
 			batchJobs := make([]job, 0, len(batch))
 
 			for _, s := range batch {
-				jobID, err := submitOneNZBWithOptions(weaverURL, s, submitNZBOptions{force: roundIdx > 0})
+				options := submitNZBOptions{force: roundIdx > 0}
+				if round.newsgroupPerJob {
+					options.newsgroup = "alt.binaries." + s.Slug
+				}
+				jobID, err := submitOneNZBWithOptions(weaverURL, s, options)
 				if err != nil {
 					log.Printf("  %s: submit error: %v", s.Slug, err)
 					batchJobs = append(batchJobs, job{slug: s.Slug, status: "ERROR"})
@@ -344,7 +378,50 @@ func cmdChaosTest() {
 			}
 		}
 
+		if round.providerCap > 0 {
+			// Weaver's cached lanes hold the capped slots; stop it so the
+			// provider answers the harness again, then read the round's
+			// connection counters before the cap is lifted.
+			killWeaver()
+			connections, err := fetchNntpConnectionMetricsFrom(nntpHost(), nntpPort())
+			if err != nil {
+				log.Printf("  FAIL: fetch connection metrics for round %q: %v", round.name, err)
+				roundFail++
+				totalFail++
+			} else {
+				log.Printf(
+					"  connection metrics: limit %d, attempted %d, accepted %d, rejected %d, peak active %d",
+					connections.ConfiguredLimit,
+					connections.Attempted,
+					connections.Accepted,
+					connections.Rejected,
+					connections.PeakActive,
+				)
+				if connections.ConfiguredLimit != round.providerCap {
+					log.Printf("  FAIL: round %q provider cap was %d, expected %d", round.name, connections.ConfiguredLimit, round.providerCap)
+					roundFail++
+					totalFail++
+				}
+				if connections.Rejected <= 0 {
+					log.Printf("  FAIL: round %q provider refused no connects, so the cap was never hit", round.name)
+					roundFail++
+					totalFail++
+				}
+				if connections.PeakActive > int64(round.providerCap) {
+					log.Printf("  FAIL: round %q provider held %d connections over its cap of %d", round.name, connections.PeakActive, round.providerCap)
+					roundFail++
+					totalFail++
+				}
+			}
+		}
+
 		sendNntpCommand("CHAOS off")
+
+		if round.providerCap > 0 {
+			if err := restartStandardManagedWeaverPreservingState(); err != nil {
+				log.Fatalf("restart managed weaver after provider cap round %q: %v", round.name, err)
+			}
+		}
 
 		// Post-round diagnostics
 		var diagIDs []int
