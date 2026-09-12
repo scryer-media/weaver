@@ -34,6 +34,14 @@ import {
 import { WV } from "../data/palette";
 import { useStatusLabel } from "../data/status";
 import { NextShell, RailBlock } from "../shell/NextShell";
+import { CategoryListBlock } from "../shell/rail-blocks";
+import {
+  categoryFacets,
+  facetsToCategories,
+  NO_FACETS,
+  toggleFacet,
+} from "../data/categories";
+import { useNextData } from "../data/next-data";
 
 /**
  * Completed — the archive of finished work.
@@ -156,6 +164,7 @@ function csvCell(value: string | number): string {
 export function CompletedPage() {
   const navigate = useNavigate();
   const statusLabel = useStatusLabel();
+  const { categories: configured } = useNextData();
 
   const [tab, setTab] = useState<TabId>("all");
   const [sort, setSort] = useState<SortId>("newest");
@@ -164,22 +173,25 @@ export function CompletedPage() {
   const [pageIndex, setPageIndex] = useState(0);
   const [pageSize, setPageSize] = useState<number>(50);
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
+  const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const midnight = useStartOfToday();
 
   const sortOption = SORT_OPTIONS.find((option) => option.value === sort)!;
+  const categories = useMemo(() => facetsToCategories(facets), [facets]);
   const input = useMemo(
     () => ({
       pageIndex,
       pageSize,
       search: query.trim() === "" ? undefined : query.trim(),
       status: TAB_STATUS[tab],
+      categories,
       sortField: sortOption.field,
       sortDirection: sortOption.direction,
     }),
-    [pageIndex, pageSize, query, sortOption.direction, sortOption.field, tab],
+    [categories, pageIndex, pageSize, query, sortOption.direction, sortOption.field, tab],
   );
 
   const [{ data, fetching }, reexecute] = useQuery<HistoryPageResponse>({
@@ -196,6 +208,7 @@ export function CompletedPage() {
         pageIndex: 0,
         pageSize: SAMPLE_SIZE,
         status: "ALL",
+        categories,
         sortField: "COMPLETED_AT",
         sortDirection: "DESC",
       },
@@ -249,6 +262,18 @@ export function CompletedPage() {
       capped: sample.length >= SAMPLE_SIZE,
     };
   }, [midnight, sample]);
+
+  // No counts here: history is paginated on the server, so the only number
+  // this page could put beside a facet is "how many on the page you are
+  // looking at", which is not what a number there would be read as.
+  const facetItems = useMemo(
+    () =>
+      categoryFacets({
+        configured,
+        extras: rows.map((row) => row.category).filter((name): name is string => !!name),
+      }),
+    [configured, rows],
+  );
 
   const volumes = systemInfo?.systemInfo?.configuredStorage ?? [];
   const mounts = storageMounts(volumes);
@@ -377,6 +402,14 @@ export function CompletedPage() {
             Export list
           </SecondaryButton>
         </>
+      }
+      railMiddle={
+        <CategoryListBlock
+          items={facetItems}
+          selected={facets}
+          onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
+          onClear={() => reset(() => setFacets(NO_FACETS))}
+        />
       }
       railFooter={
         <RailBlock eyebrow="Archive">

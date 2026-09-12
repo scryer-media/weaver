@@ -5,8 +5,9 @@ import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { cn } from "@/lib/utils";
 import { RailBlock, RailMetric } from "./NextShell";
 import { Bar, Square } from "../components/chrome";
+import { UNCATEGORISED, type CategoryEntry } from "../data/categories";
 import { useNextData, type ProviderHealth } from "../data/next-data";
-import { WV } from "../data/palette";
+import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
 import { formatClock, formatLatency, splitSpeed, splitUptime } from "../data/format";
 
 /**
@@ -194,50 +195,62 @@ export function PathBlock({
   );
 }
 
-export interface CategoryEntry {
-  /** `null` is the "all categories" row; anything else is a real category name. */
-  key: string | null;
-  label: string;
-  count: number;
-  color: string;
-}
-
 /**
- * The rail's contextual middle block on the list screens.
+ * The rail's contextual middle block on the list screens: the configured
+ * categories, as facets.
  *
- * Counts come from `queuePage.categories` plus the jobs themselves, which the
- * server computes before it applies any filter — so switching category never
- * changes the numbers next to the other categories.
+ * Facets are additive and they union — picking Movies and TV asks for both,
+ * not for the empty intersection. "All categories" is the cleared state rather
+ * than a facet of its own, so it reads as selected exactly when nothing else
+ * is, and clicking it clears the rest.
+ *
+ * A count is the size of that facet alone, computed before any facet is
+ * applied, so the numbers beside the other rows never move as you select.
  */
 export function CategoryListBlock({
   items,
-  active,
-  onSelect,
+  selected,
+  onToggle,
+  onClear,
 }: {
   items: readonly CategoryEntry[];
-  active: string | null;
-  onSelect: (key: string | null) => void;
+  selected: ReadonlySet<string>;
+  onToggle: (key: string) => void;
+  onClear: () => void;
 }) {
   return (
     <RailBlock eyebrow="Categories" position="middle" className="gap-[9px]">
       {items.map((item) => {
-        const isActive = item.key === active;
+        const isActive = item.key === null ? selected.size === 0 : selected.has(item.key);
+        // A facet's colour is the rail's business, not the list's: "all" and
+        // "uncategorised" are the absence of a category and share its grey.
+        const color =
+          item.key === null || item.key === UNCATEGORISED
+            ? UNCATEGORISED_COLOR
+            : categoryColor(item.key);
         return (
           <button
             key={item.key ?? "*"}
             type="button"
-            onClick={() => onSelect(item.key)}
+            onClick={() => (item.key === null ? onClear() : onToggle(item.key))}
             aria-pressed={isActive}
             className={cn(
               "flex items-center gap-[9px] text-left text-[12.5px]",
-              isActive ? "text-wv-strong" : "text-wv-fg hover:text-wv-secondary",
+              isActive ? "font-medium text-wv-strong" : "text-wv-fg hover:text-wv-secondary",
             )}
           >
-            <Square color={item.color} />
+            {/*
+              The swatch doubles as the checkbox: solid once the facet is on,
+              a ring of the same colour while it is off. One glyph, so a rail
+              of eight categories does not grow a column of empty boxes.
+            */}
+            <Square color={color} hollow={!isActive} />
             <span className="min-w-0 truncate">{item.label}</span>
-            <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">
-              {item.count}
-            </span>
+            {item.count === undefined ? null : (
+              <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">
+                {item.count}
+              </span>
+            )}
           </button>
         );
       })}

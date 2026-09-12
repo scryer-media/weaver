@@ -311,17 +311,30 @@ export function Tag({ children }: { children: ReactNode }) {
 export function Square({
   color,
   size = 7,
+  hollow = false,
   className,
 }: {
   color: string;
   size?: number;
+  /**
+   * Outline the square in `color` instead of filling it, at the same size.
+   *
+   * This is how the category rail says "off" without adding a second glyph:
+   * the swatch that names a facet is also the box that says whether it is on.
+   */
+  hollow?: boolean;
   className?: string;
 }) {
   return (
     <span
       aria-hidden="true"
       className={cn("flex-none", className)}
-      style={{ width: size, height: size, background: color }}
+      style={{
+        width: size,
+        height: size,
+        background: hollow ? "transparent" : color,
+        boxShadow: hollow ? `inset 0 0 0 1px ${color}` : undefined,
+      }}
     />
   );
 }

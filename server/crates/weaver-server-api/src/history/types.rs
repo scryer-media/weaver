@@ -132,6 +132,14 @@ pub struct HistoryPageInput {
     pub page_size: u32,
     pub search: Option<String>,
     pub status: Option<HistoryStatusFilter>,
+    /// Keep only rows whose category is one of these; absent or empty keeps
+    /// every row.
+    ///
+    /// The list unions rather than intersects, so a caller offering categories
+    /// as facets widens the result with each one. The empty string selects rows
+    /// with no category at all, which is how "uncategorised" is asked for
+    /// without a second field.
+    pub categories: Option<Vec<String>>,
     pub sort_field: Option<HistorySortField>,
     pub sort_direction: Option<HistorySortDirection>,
 }
