@@ -63,7 +63,9 @@ export function Dialog({
         )}
       >
         <header className="flex h-14 flex-none items-baseline gap-[10px] border-b border-wv-line-strong px-4 sm:px-6">
-          <h2 className="flex-none text-[15px] font-semibold tracking-[-0.01em]">{title}</h2>
+          <h2 className="flex-none font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
+            {title}
+          </h2>
           {note === undefined ? null : (
             <span className="truncate font-wv-mono text-[11.5px] text-wv-muted">{note}</span>
           )}

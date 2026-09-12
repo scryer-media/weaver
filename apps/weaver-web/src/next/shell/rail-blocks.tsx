@@ -265,7 +265,7 @@ export function PanelListBlock({
           className={({ isActive }) =>
             cn(
               "-mx-[10px] flex h-[30px] items-center gap-[10px] px-[10px] text-[12.5px] hover:bg-wv-nav-hover",
-              isActive ? "bg-wv-nav-active font-semibold text-wv-strong" : "text-wv-fg",
+              isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
             )
           }
         >

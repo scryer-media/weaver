@@ -264,7 +264,7 @@ export function SchedulesPanel() {
                             }
                             className={`flex h-8 w-[46px] cursor-pointer items-center justify-center border font-wv-mono text-[11.5px] ${
                               active
-                                ? "border-wv-accent bg-wv-segment-active font-semibold text-wv-strong"
+                                ? "border-wv-accent bg-wv-segment-active font-medium text-wv-strong"
                                 : "border-wv-control bg-wv-input text-wv-muted hover:border-wv-control-hover"
                             }`}
                           >

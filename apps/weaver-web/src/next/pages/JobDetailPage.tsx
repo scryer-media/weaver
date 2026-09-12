@@ -322,7 +322,7 @@ export function JobDetailPage() {
             <span aria-hidden="true" className="flex-none text-wv-dim">
               /
             </span>
-            <h1 className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em]">
+            <h1 className="min-w-0 truncate font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
               {job.displayTitle || job.name}
             </h1>
             <StateChip label={statusLabel(job.status)} tone={failed ? "bad" : "ok"} />

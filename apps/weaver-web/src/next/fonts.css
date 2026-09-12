@@ -1,16 +1,20 @@
 /*
- * Typefaces for the Next UI. The redesign names two families and uses them
- * for opposite jobs: Instrument Sans carries every word a person wrote, IBM
- * Plex Mono carries every value a machine produced. Nothing else is loaded, and
- * neither family is used by the classic UI.
+ * Typefaces for the Next UI. Three families, three jobs: Sora names things —
+ * screens, dialogs, sections — Inter carries every other word a person wrote,
+ * and IBM Plex Mono carries every value a machine produced.
+ *
+ * Only Sora and the mono weights are declared here. Inter is already loaded by
+ * the top-level `fonts.css` for the classic UI, and both stylesheets are
+ * imported unconditionally, so declaring it a second time would fetch the same
+ * file under the same family name.
  */
 
 @font-face {
-  font-family: "Instrument Sans Variable";
+  font-family: "Sora Variable";
   font-style: normal;
   font-display: swap;
-  font-weight: 400 700;
-  src: url("@fontsource-variable/instrument-sans/files/instrument-sans-latin-wght-normal.woff2")
+  font-weight: 100 800;
+  src: url("@fontsource-variable/sora/files/sora-latin-wght-normal.woff2")
     format("woff2-variations");
   unicode-range:
     U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
