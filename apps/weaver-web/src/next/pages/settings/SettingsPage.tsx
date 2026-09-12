@@ -6,7 +6,7 @@ import { NextShell } from "../../shell/NextShell";
 import { PanelListBlock, PathBlock } from "../../shell/rail-blocks";
 import { useNextData } from "../../data/next-data";
 import { EmptyState } from "../../components/chrome";
-import { PrimaryButton, SecondaryButton } from "../../components/controls";
+import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
 import { SettingsShellProvider, type PanelFlags } from "./framework";
 import { SETTINGS_PANELS, findPanel } from "./panels";
 
@@ -84,15 +84,27 @@ export function SettingsPage() {
       statusRight={<span className={statusTone}>{statusRight}</span>}
       controls={
         <>
-          <div ref={setControlsHost} className="flex items-center gap-[10px]" />
-          <input
-            type="text"
-            aria-label="Search settings"
+          {/*
+            A measured field, not a greedy one: `w-full` here asked for the
+            whole controls row, which pushed the panel's own button and the
+            Revert/Save pair onto lines of their own. Same widths the other
+            top bars use, and the same min-width, so the field yields before
+            the title does.
+          */}
+          <TextField
+            label="Search settings"
             placeholder="Search settings"
+            mono={false}
             value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            className="h-[34px] w-full border border-wv-control bg-wv-input px-3 text-[13px] text-wv-fg outline-none focus:border-wv-control-focus"
+            onChange={setSearch}
+            className="w-[132px] min-w-[88px] sm:w-[172px] sm:min-w-[96px]"
           />
+          {/*
+            The panel's own actions sit between the search and the commit
+            pair. `empty:hidden` keeps a panel that publishes none — most of
+            them — from spending a gap on an empty slot.
+          */}
+          <div ref={setControlsHost} className="flex items-center gap-[10px] empty:hidden" />
           <SecondaryButton
             disabled={!flags.dirty || flags.busy}
             onClick={() => actionsRef.current?.revert()}

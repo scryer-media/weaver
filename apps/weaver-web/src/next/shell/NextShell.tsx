@@ -186,7 +186,13 @@ export function NextShell({
         </button>
 
         {header ?? (
-          <header className="flex min-h-14 flex-none flex-wrap items-center gap-x-4 gap-y-2 border-b border-wv-line-strong bg-wv-chrome py-2 pr-4 pl-12 sm:py-0 sm:pr-6 lg:pl-6">
+          /*
+           * The vertical padding stays at every width. `min-h-14` already
+           * fixes the resting height, so on a single row the padding changes
+           * nothing — it only earns its keep once the controls wrap, where
+           * dropping it left the first row flush against the top edge.
+           */
+          <header className="flex min-h-14 flex-none flex-wrap items-center gap-x-4 gap-y-2 border-b border-wv-line-strong bg-wv-chrome py-2 pr-4 pl-12 sm:pr-6 lg:pl-6">
             <div className="flex min-w-0 items-baseline gap-[10px]">
               <h1 className="flex-none text-[15px] font-semibold tracking-[-0.01em]">{title}</h1>
               {note === undefined ? null : (
