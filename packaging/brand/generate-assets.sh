@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Regenerate every committed raster brand asset from the vector sources in this
-# directory.
+# Regenerate every committed brand asset derived from the vector sources in this
+# directory: the rasters, and the lockups the repository README draws.
 #
 # This is NOT run in CI. The rasters are committed because they are reviewed
 # artwork and because a release must not depend on a rasterizer version. The
@@ -55,6 +55,7 @@ fi
 MARK_COLOR="$script_dir/weaver-mark-color.svg"
 MARK_DARK="$script_dir/weaver-mark-dark.svg"
 MARK_WHITE="$script_dir/weaver-mark-white.svg"
+LOCKUP_COLOR="$script_dir/weaver-lockup-color.svg"
 
 # A copy of a source whose viewBox is its own ink box, cached per source.
 #
@@ -186,6 +187,23 @@ emit_to "$MARK_COLOR" 400 80 "#323232" "$work/hero.png"
 mkdir -p "$destination/docs/img"
 magick "$work/hero.png" -strip "$destination/docs/img/weaver-hero.webp"
 
+# The repository README's header: the colour lockup once per colour scheme, for
+# a <picture> to choose between. These stay vectors, because the page draws them
+# at whatever width it has. The viewBox is cut to the ink, so the header is as
+# tall as the artwork rather than the source's canvas, and the dark-scheme copy
+# draws WEAVER in white, as the white lockup does.
+lockup="$(tight_svg "$LOCKUP_COLOR")"
+cp "$lockup" "$destination/docs/img/weaver-lockup-on-light.svg"
+sed 's/fill: #262324;/fill: #fff;/' "$lockup" \
+  > "$destination/docs/img/weaver-lockup-on-dark.svg"
+# A source that stops drawing WEAVER through that one class declaration would
+# otherwise leave dark lettering on the dark page without a word said.
+if grep -q '#262324' "$destination/docs/img/weaver-lockup-on-dark.svg" \
+  || ! grep -q 'fill: #fff;' "$destination/docs/img/weaver-lockup-on-dark.svg"; then
+  echo "weaver-lockup-color.svg no longer draws WEAVER as one 'fill: #262324;'" >&2
+  exit 1
+fi
+
 if [ "$check_only" = true ]; then
   status=0
   while IFS= read -r -d '' generated; do
@@ -199,6 +217,6 @@ if [ "$check_only" = true ]; then
   exit "$status"
 fi
 
-echo "regenerated the brand rasters under $web, $macos, $windows and docs/img."
+echo "regenerated the brand assets under $web, $macos, $windows and docs/img."
 echo "weaver.icns is derived from $web/app-icon-dark-512.png:"
 echo "  packaging/macos/assets/generate-assets.sh"

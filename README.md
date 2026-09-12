@@ -1,4 +1,9 @@
-<h1 align="center">Weaver</h1>
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/weaver-lockup-on-dark.svg" />
+    <img src="docs/img/weaver-lockup-on-light.svg" alt="Weaver" width="440" />
+  </picture>
+</h1>
 
 <p align="center">
   A modern, all-in-one Usenet downloader built in Rust.<br/>
