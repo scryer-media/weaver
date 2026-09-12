@@ -514,6 +514,41 @@ export function Bar({
   );
 }
 
+/**
+ * A filled fraction, drawn round.
+ *
+ * The bars measure progress along a length; this measures how full something
+ * already is, which is a different question and reads better as a wedge than as
+ * one more horizontal strip. A pie also survives being small: at 30px the
+ * quarter marks are still legible, where a 30px bar is a smudge.
+ */
+export function Pie({
+  percent,
+  color,
+  size = 46,
+  className,
+}: {
+  percent: number;
+  color: string;
+  size?: number;
+  className?: string;
+}) {
+  const filled = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+  return (
+    <div
+      role="img"
+      aria-label={`${Math.round(filled)}% full`}
+      className={cn("flex-none rounded-full", className)}
+      style={{
+        width: size,
+        height: size,
+        background: `conic-gradient(${color} 0 ${filled}%, ${WV.pending} ${filled}% 100%)`,
+        boxShadow: `inset 0 0 0 1px ${WV.track}`,
+      }}
+    />
+  );
+}
+
 /** The cell period a bar of this height takes. */
 export function blockPeriod(height: number): number {
   return height >= 10 ? 7 : 6;

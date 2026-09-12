@@ -7,7 +7,7 @@ import { readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download
 import { Bar, EmptyState, KeyValueRow, SectionHeader } from "../components/chrome";
 import { PrimaryButton, SecondaryButton } from "../components/controls";
 import { EM_DASH, formatCount, formatDuration, formatSize } from "../data/format";
-import { WV } from "../data/palette";
+import { usageColor } from "../data/palette";
 import { useMetricsSnapshot } from "../data/use-metrics-series";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../shell/rail-blocks";
@@ -57,12 +57,6 @@ interface SystemInfo {
 function enumLabel(value: string): string {
   if (!value) return EM_DASH;
   return value.charAt(0) + value.slice(1).toLowerCase().replace(/_/g, " ");
-}
-
-function usageBarColor(percent: number): string {
-  if (percent >= 85) return WV.error;
-  if (percent >= 65) return WV.warn;
-  return WV.accent;
 }
 
 function reportText(info: SystemInfo, cacheInUse: string): string {
@@ -255,7 +249,7 @@ export function SystemInfoPage() {
                       </span>
                     </div>
                     <div className="ml-auto flex items-center gap-5">
-                      <Bar percent={percent} color={usageBarColor(percent)} className="w-full max-w-[220px]" />
+                      <Bar percent={percent} color={usageColor(percent)} className="w-full max-w-[220px]" />
                       <span className="w-[46px] text-right font-wv-mono text-[12.5px] text-wv-secondary">
                         {Math.round(percent)}%
                       </span>

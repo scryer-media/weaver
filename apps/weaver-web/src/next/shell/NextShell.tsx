@@ -86,9 +86,9 @@ export function NextShell({
 
   // The prototypes each wire up only their own screens, so their rails show
   // different subsets. In the product the list is always whole — otherwise
-  // Monitoring is unreachable from Transfers.
+  // Monitoring is unreachable from Downloads.
   const nav: NavEntry[] = [
-    { to: "/", label: "Transfers", count: queue.summary.totalItems, end: false },
+    { to: "/", label: "Downloads", count: queue.summary.totalItems, end: false },
     { to: "/history", label: "Completed", count: historyCount },
     { to: "/monitoring", label: "Monitoring" },
     { to: "/system-info", label: "System info" },

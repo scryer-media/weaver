@@ -61,7 +61,7 @@ export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => 
             disabled={upload.readyCount === 0 || upload.staging || upload.fetching}
             onClick={() => void upload.submit()}
           >
-            {upload.readyCount > 1 ? `Add ${upload.readyCount} transfers` : "Add transfer"}
+            {upload.readyCount > 1 ? `Add ${upload.readyCount} downloads` : "Add download"}
           </PrimaryButton>
         </>
       }
@@ -155,7 +155,7 @@ export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => 
               onChange={upload.setCategory}
             />
           </FormRow>
-          <FormRow label="Priority" help="Higher priority transfers start first.">
+          <FormRow label="Priority" help="Higher priority downloads start first.">
             <Select
               label="Priority"
               value={upload.priority}

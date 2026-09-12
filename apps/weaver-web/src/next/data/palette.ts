@@ -34,6 +34,18 @@ export const WV = {
   faint: "#84817a",
 } as const;
 
+/**
+ * How full is too full.
+ *
+ * Shared so a capacity bar and a capacity pie never disagree about when a
+ * volume has become a problem.
+ */
+export function usageColor(percent: number): string {
+  if (percent >= 85) return WV.error;
+  if (percent >= 65) return WV.warn;
+  return WV.accent;
+}
+
 /** Area fills under the lead series of a chart. */
 export const WV_FILL = {
   accent: "rgba(63, 179, 156, 0.13)",

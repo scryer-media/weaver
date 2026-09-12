@@ -879,7 +879,7 @@ export function RssPanel() {
         note={confirmFeed?.name}
         busy={busy}
         confirmLabel="Remove feed"
-        body="Its rules and everything it remembers seeing go with it. Transfers it already queued are untouched."
+        body="Its rules and everything it remembers seeing go with it. Downloads it already queued are untouched."
         onConfirm={() => {
           if (confirmFeed) {
             void deleteFeed({ id: confirmFeed.id }).then(() => {

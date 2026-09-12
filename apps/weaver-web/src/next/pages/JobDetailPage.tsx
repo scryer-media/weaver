@@ -59,7 +59,7 @@ import { JumpListBlock } from "../shell/rail-blocks";
  * let you miss the part that explains the part you are looking at.
  *
  * It reads `jobDetailSnapshot`, which answers for a queued job and a finished
- * one alike, so the same screen serves a transfer in flight and an entry in
+ * one alike, so the same screen serves a download in flight and an entry in
  * history without branching into two pages.
  */
 
@@ -284,7 +284,7 @@ export function JobDetailPage() {
               to={inQueue ? "/" : "/history"}
               className="flex-none font-wv-mono text-[11.5px] text-wv-muted hover:text-wv-fg"
             >
-              {inQueue ? "‹ Transfers" : "‹ Completed"}
+              {inQueue ? "‹ Downloads" : "‹ Completed"}
             </Link>
             <span aria-hidden="true" className="flex-none text-wv-dim">
               /
@@ -744,15 +744,15 @@ export function JobDetailPage() {
 
       <ConfirmDialog
         open={confirm === "cancel"}
-        title="Cancel transfer"
+        title="Cancel download"
         note={job.displayTitle || job.name}
         busy={busy}
-        confirmLabel="Cancel transfer"
-        body="The transfer stops and leaves the queue. Partial data is cleaned up as usual."
+        confirmLabel="Cancel download"
+        body="The download stops and leaves the queue. Partial data is cleaned up as usual."
         onDismiss={() => setConfirm(null)}
         onConfirm={() => {
           setConfirm(null);
-          void run("Transfer cancelled", () => cancelJob({ id: job.id }));
+          void run("Download cancelled", () => cancelJob({ id: job.id }));
         }}
       />
 

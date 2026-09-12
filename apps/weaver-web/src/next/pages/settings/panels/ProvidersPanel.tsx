@@ -696,7 +696,7 @@ export function ProvidersPanel() {
         note={confirmRemove?.host}
         busy={busy}
         confirmLabel="Remove provider"
-        body={`Weaver will stop using ${confirmRemove?.host ?? "this provider"}. Transfers in flight fall back to the remaining providers.`}
+        body={`Weaver will stop using ${confirmRemove?.host ?? "this provider"}. Downloads in flight fall back to the remaining providers.`}
         onConfirm={() => void remove()}
         onDismiss={() => setConfirmRemove(null)}
       />

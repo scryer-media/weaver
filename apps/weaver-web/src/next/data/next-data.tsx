@@ -23,7 +23,7 @@ import { useLiveQueue, type LiveQueue } from "./use-live-queue";
 /**
  * Everything the Next chrome needs, resolved once above the router.
  *
- * The rail carries live values on every screen — transfer and history counts,
+ * The rail carries live values on every screen — download and history counts,
  * throughput, provider load, attention items — so these queries belong to the
  * shell rather than to whichever page happens to be mounted. Pages read the
  * same context instead of opening a second subscription for the same data.

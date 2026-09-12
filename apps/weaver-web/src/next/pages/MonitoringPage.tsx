@@ -218,7 +218,7 @@ export function MonitoringPage() {
             eyebrow="Pipeline"
             value={pipelineBusy ? "Active" : "Idle"}
             valueClassName={pipelineBusy ? "text-wv-accent" : "text-wv-idle"}
-            note={`${queue.summary.activeItems} transfers, ${repairs} repairs`}
+            note={`${queue.summary.activeItems} downloads, ${repairs} repairs`}
           />
           <MetricCell
             eyebrow="Throughput"

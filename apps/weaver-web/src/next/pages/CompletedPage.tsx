@@ -7,7 +7,7 @@ import {
   RERUN_POST_PROCESSING_MUTATION,
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
-import { normalizeGraphqlTimestamp } from "@/lib/job-types";
+import { formatJobReleaseName, normalizeGraphqlTimestamp } from "@/lib/job-types";
 import { saveBlobAsDownload } from "@/lib/download";
 import { statusToken } from "@/lib/status-tokens";
 import { EmptyState, MetricCell, MetricStrip, SectionHeader, Square } from "../components/chrome";
@@ -17,6 +17,7 @@ import { Pagination } from "../components/Pagination";
 import { CheckBox, SecondaryButton, TextField } from "../components/controls";
 import { Menu, MenuItem } from "../components/Menu";
 import { GridHeader, GridRow } from "../components/rows";
+import { StorageMounts, storageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useStartOfToday } from "../data/clock";
 import { NEXT_HISTORY_PAGE_QUERY } from "../data/queries";
@@ -85,6 +86,7 @@ interface HistoryRow {
   id: number;
   name: string;
   displayTitle: string;
+  originalTitle: string;
   status: string;
   error: string | null;
   totalBytes: number;
@@ -102,12 +104,6 @@ interface HistoryPageResponse {
     totalCount: number;
     counts: { all: number; success: number; failure: number };
   };
-}
-
-interface StorageVolume {
-  labels: string[];
-  path: string;
-  capacity: { totalBytes: number; usedBytes: number; freeBytes: number } | null;
 }
 
 interface DayGroup {
@@ -255,10 +251,11 @@ export function CompletedPage() {
   }, [midnight, sample]);
 
   const volumes = systemInfo?.systemInfo?.configuredStorage ?? [];
-  const library =
-    volumes.find((volume) => volume.labels.some((label) => label.startsWith("Complete")))
-    ?? volumes[0]
-    ?? null;
+  const mounts = storageMounts(volumes);
+  const freeAcross = mounts.reduce(
+    (total, mount) => total + (mount.capacity?.freeBytes ?? 0),
+    0,
+  );
 
   const pickedOnPage = rows.filter((row) => picked.has(row.id));
   const allPicked = rows.length > 0 && pickedOnPage.length === rows.length;
@@ -383,21 +380,7 @@ export function CompletedPage() {
       }
       railFooter={
         <RailBlock eyebrow="Archive">
-          <div className="flex items-baseline justify-between gap-3 text-[12.5px] text-wv-tertiary">
-            <span>Used</span>
-            <span className="font-wv-mono text-[11px] text-wv-muted">
-              {library?.capacity ? formatSize(library.capacity.usedBytes) : EM_DASH}
-            </span>
-          </div>
-          <div className="flex items-baseline justify-between gap-3 text-[12.5px] text-wv-tertiary">
-            <span>Free</span>
-            <span className="font-wv-mono text-[11px] text-wv-muted">
-              {library?.capacity ? formatSize(library.capacity.freeBytes) : EM_DASH}
-            </span>
-          </div>
-          <div className="font-wv-mono text-[10.5px] break-all text-wv-faint">
-            {library?.path ?? "no library folder configured"}
-          </div>
+          <StorageMounts volumes={volumes} layout="stack" />
         </RailBlock>
       }
       beforeContent={
@@ -543,9 +526,11 @@ export function CompletedPage() {
           ?? `${formatCount(totalCount)} of ${formatCount(counts.all)} entries match · history is kept until an entry is deleted`
       }
       statusRight={
-        library?.capacity
-          ? `${formatSize(library.capacity.freeBytes)} free on ${library.path}`
-          : undefined
+        mounts.length === 0
+          ? undefined
+          : mounts.length === 1
+            ? `${formatSize(freeAcross)} free on ${mounts[0].label}`
+            : `${formatSize(freeAcross)} free across ${mounts.length} volumes`
       }
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
@@ -578,16 +563,20 @@ export function CompletedPage() {
                     columns={COLUMNS}
                     selected={picked.has(row.id)}
                     onClick={() => navigate(`/jobs/${row.id}`)}
-                    title={row.error ? `${row.name}\n${row.error}` : row.name}
+                    title={
+                      row.error
+                        ? `${formatJobReleaseName(row)}\n${row.error}`
+                        : formatJobReleaseName(row)
+                    }
                     className="border-b border-wv-hairline px-4 sm:px-[22px] py-[11px]"
                   >
                     <CheckBox
-                      label={`Select ${row.displayTitle || row.name}`}
+                      label={`Select ${formatJobReleaseName(row)}`}
                       checked={picked.has(row.id)}
                       onChange={() => togglePicked(row.id)}
                     />
                     <div className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">
-                      {row.name}
+                      {formatJobReleaseName(row)}
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square
