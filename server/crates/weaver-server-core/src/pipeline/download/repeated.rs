@@ -442,6 +442,7 @@ impl Pipeline {
                     .await;
                 let _ = tx
                     .send(DownloadResult {
+                        lane_id: lease.lane_id,
                         segment_id: work.segment_id,
                         runtime_generation: lease.runtime_generation,
                         data: reply.data,
@@ -460,6 +461,7 @@ impl Pipeline {
             }
             let _ = parked
                 .send(DownloadLaneParked {
+                    lane_id: lease.lane_id,
                     job_id: lease.job_id,
                     mode: lease.lane_mode,
                     spillover_loan_kind: lease.spillover_loan_kind,

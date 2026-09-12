@@ -9,6 +9,8 @@ const zh: LocaleDictionary = {
   "nav.upload": "上传",
   "nav.settings": "设置",
   "nav.sponsor": "赞助",
+  "update.newVersion": "新版本 v{{version}}",
+  "update.newVersionAria": "在新标签页中打开 GitHub 上的 Weaver v{{version}}",
 
   // Status labels
   "status.queued": "排队中",

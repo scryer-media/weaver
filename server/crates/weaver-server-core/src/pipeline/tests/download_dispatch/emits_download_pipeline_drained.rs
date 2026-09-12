@@ -1091,6 +1091,7 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
 
     pipeline
         .process_released_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(payload)),
@@ -1895,6 +1896,7 @@ async fn hot_share_yield_signal_clears_when_refill_gates_disable_bounded_share()
     pipeline.global_paused = true;
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id,
         server_idx: 0,
@@ -2621,6 +2623,7 @@ async fn lane_refill_reclaims_spillover_when_hot_regains_queued_work() {
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: spillover_job_id,
         server_idx: 0,
@@ -2780,6 +2783,7 @@ async fn hot_lane_refill_is_granted_when_hot_holds_all_capacity_and_peer_has_no_
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: hot_job_id,
         server_idx: 0,
@@ -2878,6 +2882,7 @@ async fn hot_lane_refill_yields_to_higher_priority_completion_critical_work_with
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: hot_job_id,
         server_idx: 0,
@@ -2973,6 +2978,7 @@ async fn lane_refill_preserves_same_band_spillover_after_underfill() {
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: spillover_job_id,
         server_idx: 0,
@@ -3083,6 +3089,7 @@ async fn lane_refill_reclaims_spillover_after_measured_speed_harm() {
 
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: spillover_job_id,
         server_idx: 0,
@@ -3117,6 +3124,7 @@ async fn lane_refill_reclaims_spillover_after_measured_speed_harm() {
     );
 
     pipeline.handle_download_lane_parked(DownloadLaneParked {
+        lane_id: 0,
         job_id: spillover_job_id,
         mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: Some(SpilloverLoanKind::MeasuredUnderfill),
@@ -3175,6 +3183,7 @@ async fn released_download_result_fences_completion_until_processed() {
 
     pipeline
         .process_released_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from_static(b"discarded"))),
@@ -3239,6 +3248,7 @@ async fn failed_job_retains_released_result_ledgers_until_terminal_processing() 
 
     pipeline
         .process_released_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(payload)),
@@ -3288,7 +3298,9 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
     let mut pending = VecDeque::new();
     pipeline.handle_owned_download_lane_event(
         OwnedDownloadLaneEvent::BatchComplete {
+            lane_id: 0,
             results: vec![DownloadResult {
+                lane_id: 0,
                 runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Decoded(DecodeResult {
@@ -3396,6 +3408,7 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
     let mut pending = VecDeque::new();
     pipeline.handle_owned_download_lane_event(
         OwnedDownloadLaneEvent::BatchComplete {
+            lane_id: 0,
             results: vec![],
             unrequested_works: vec![tail_work],
             stats: weaver_nntp::blocking::BlockingLaneStats::default(),

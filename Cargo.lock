@@ -4550,6 +4550,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"
@@ -6093,6 +6097,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http",
+ "httpdate",
  "ipnet",
  "keyring",
  "keyring-core",
@@ -6111,6 +6116,7 @@ dependencies = [
  "rmp-serde",
  "security-framework",
  "security-framework-sys",
+ "semver",
  "serde",
  "serde_json",
  "sevenz-rust2",

@@ -41,6 +41,7 @@ fn refill_request(
     response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
 ) -> DownloadLaneRefillRequest {
     DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id,
         server_idx: 0,
@@ -193,6 +194,7 @@ async fn a_parked_lane_wakes_dispatch_without_a_loop_turn() {
         .insert(job_id, 1);
 
     pipeline.handle_download_lane_parked(DownloadLaneParked {
+        lane_id: 0,
         job_id,
         mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,
@@ -213,6 +215,7 @@ async fn a_parked_lane_wakes_dispatch_without_a_loop_turn() {
 
     // A park that keeps the connection has nothing to redispatch onto.
     pipeline.handle_download_lane_parked(DownloadLaneParked {
+        lane_id: 0,
         job_id,
         mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,

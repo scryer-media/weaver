@@ -275,6 +275,7 @@ pub(crate) async fn run(
             .into());
         }
     };
+    let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())?;
 
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
     let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
@@ -288,6 +289,7 @@ pub(crate) async fn run(
         security: security.clone(),
         rss: rss.clone(),
         watch_folder: watch_folder.clone(),
+        update_check: update_check.clone(),
         schedules: shared_schedules,
         log_buffer: log_ring_buffer,
         system_runtime: weaver_server_api::SystemRuntimeContext {
@@ -313,6 +315,7 @@ pub(crate) async fn run(
     scheduled_resume.recover().await?;
 
     let rss_task = rss.start_background_loop();
+    let update_check_task = update_check.start_background_loop();
     watch_folder.reconcile_from_config().await?;
     let metrics_history_task = shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
     let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
@@ -438,6 +441,7 @@ pub(crate) async fn run(
             watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
+            update_check_task.abort();
             semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
             wiring::flush_server_transfer_usage(
@@ -458,6 +462,7 @@ pub(crate) async fn run(
             watch_folder.stop().await;
             metrics_history_task.abort();
             maintenance_task.abort();
+            update_check_task.abort();
             semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
             wiring::flush_server_transfer_usage(
@@ -477,6 +482,7 @@ pub(crate) async fn run(
         ServeStop::Signal => info!("received shutdown signal, shutting down"),
         ServeStop::Restart => info!("restart requested, shutting down before starting again"),
     }
+    update_check_task.abort();
     proxies.stop_all().await;
     handle.shutdown().await.ok();
     if let Err(join_error) = pipeline_task.await {

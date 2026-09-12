@@ -145,6 +145,7 @@ pub struct TestHarness {
     /// The same config the schema holds, so a policy mutation's live effect on
     /// the trusted-network list is observable from a test.
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
+    pub update_check: weaver_server_core::update_check::UpdateCheckService,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
@@ -241,6 +242,8 @@ impl TestHarness {
 
         let scheduled_resume =
             weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
+        let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())
+            .expect("failed to create update checker");
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
             scheduled_resume: scheduled_resume.clone(),
@@ -252,6 +255,7 @@ impl TestHarness {
             security: security.clone(),
             rss,
             watch_folder,
+            update_check: update_check.clone(),
             schedules: shared_schedules,
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
@@ -301,6 +305,7 @@ impl TestHarness {
             server_transfer_policy,
             auth_cache,
             security,
+            update_check,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }

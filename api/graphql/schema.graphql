@@ -1513,6 +1513,10 @@ type QueryRoot {
 	"""
 	version: String!
 	"""
+	Latest stable Weaver release information observed by the background checker.
+	"""
+	updateStatus: UpdateStatus!
+	"""
 	Safe runtime and storage facts for the built-in troubleshooting UI.
 	"""
 	systemInfo: SystemInfo!
@@ -2459,6 +2463,10 @@ type SubscriptionRoot {
 	"""
 	serviceLogLines: String!
 	"""
+	Subscribe to release-check state changes, including the initial snapshot.
+	"""
+	updateStatusUpdates: UpdateStatus!
+	"""
 	Subscribe to cadence-driven system metrics and global queue state.
 	"""
 	systemMetricsUpdates: SystemMetricsSnapshot!
@@ -2564,6 +2572,21 @@ enum TimelineStage {
 	EXTRACTING
 	INTERRUPTED
 	FINAL_MOVE
+}
+
+"""
+Latest stable release observed by the background release checker.
+"""
+type UpdateStatus {
+	currentVersion: String!
+	latestVersion: String
+	updateAvailable: Boolean!
+	releaseUrl: String
+	publishedAtEpochMs: Int
+	checking: Boolean!
+	lastCheckedAtEpochMs: Int
+	lastSuccessfulCheckAtEpochMs: Int
+	lastError: String
 }
 
 """

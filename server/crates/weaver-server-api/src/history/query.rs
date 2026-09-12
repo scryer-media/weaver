@@ -715,7 +715,11 @@ fn normalize_history_categories(categories: Option<Vec<String>>) -> Option<Vec<S
         .into_iter()
         .map(|category| category.trim().to_string())
         .collect();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn history_matches_categories(item: &HistoryItem, categories: Option<&[String]>) -> bool {
@@ -852,9 +856,10 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
-        server_attribution: weaver_server_core::jobs::server_attribution::contributions_from_storage(
-            row.server_attribution.as_deref(),
-        ),
+        server_attribution:
+            weaver_server_core::jobs::server_attribution::contributions_from_storage(
+                row.server_attribution.as_deref(),
+            ),
     }
 }
 

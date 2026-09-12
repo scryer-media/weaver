@@ -301,6 +301,19 @@ impl Pipeline {
             }
         }
 
+        let working_dir = self.jobs[&job_id].working_dir.clone();
+        match self
+            .recover_placement_before_verification(job_id, working_dir)
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                self.fail_job(job_id, error);
+                return;
+            }
+        }
+
         self.discover_embedded_par3_at_completion(job_id).await;
         if self
             .jobs
@@ -896,10 +909,12 @@ impl Pipeline {
             // work is parked recovery is not "pending" here, analyses run, and
             // promotion drains the pool.
             let promoted_recovery_state = self.promoted_recovery_pipeline_state(job_id);
+            // A promoted file can remain incomplete after its last article
+            // proved unavailable. Only live pipeline work can change it now;
+            // otherwise the salvage and next-wave evaluation below must run.
             if rar_par2_repair_ready
                 && promoted_recovery_state.promoted_par2_files > 0
-                && (promoted_recovery_state.incomplete_promoted_par2_files > 0
-                    || self.job_has_pending_download_pipeline_work(job_id))
+                && self.job_has_pending_download_pipeline_work(job_id)
             {
                 debug!(
                     job_id = job_id.0,
@@ -1475,7 +1490,7 @@ impl Pipeline {
                             return;
                         }
                         self.try_deobfuscate_files_with_par2(job_id).await;
-                        if let Err(error) = self
+                        match self
                             .apply_placement_plan_for_retry_or_repair(
                                 job_id,
                                 working_dir.clone(),
@@ -1483,8 +1498,12 @@ impl Pipeline {
                             )
                             .await
                         {
-                            self.finish_par2_set_failure(job_id, set_id, error).await;
-                            return;
+                            Ok(placement::ApplyOutcome::Applied) => {}
+                            Ok(placement::ApplyOutcome::Reverify) => return,
+                            Err(error) => {
+                                self.finish_par2_set_failure(job_id, set_id, error).await;
+                                return;
+                            }
                         }
                         placement_pass = Some(scanned);
                     }
@@ -2096,7 +2115,7 @@ impl Pipeline {
                     // Rename obfuscated files using PAR2 metadata even when
                     // verification is clean (files may be intact but obfuscated).
                     self.try_deobfuscate_files_with_par2(job_id).await;
-                    if let Err(error) = self
+                    match self
                         .apply_placement_plan_for_retry_or_repair(
                             job_id,
                             working_dir.clone(),
@@ -2104,8 +2123,12 @@ impl Pipeline {
                         )
                         .await
                     {
-                        self.finish_par2_set_failure(job_id, set_id, error).await;
-                        return;
+                        Ok(placement::ApplyOutcome::Applied) => {}
+                        Ok(placement::ApplyOutcome::Reverify) => return,
+                        Err(error) => {
+                            self.finish_par2_set_failure(job_id, set_id, error).await;
+                            return;
+                        }
                     }
                     self.retry_par2_authoritative_identity(job_id).await;
                     // A clean verdict repaired nothing.
@@ -2203,7 +2226,7 @@ impl Pipeline {
                         "PAR2 verification — damage detected"
                     );
 
-                    if let Err(error) = self
+                    match self
                         .apply_placement_plan_for_retry_or_repair(
                             job_id,
                             working_dir.clone(),
@@ -2211,8 +2234,12 @@ impl Pipeline {
                         )
                         .await
                     {
-                        self.finish_par2_set_failure(job_id, set_id, error).await;
-                        return;
+                        Ok(placement::ApplyOutcome::Applied) => {}
+                        Ok(placement::ApplyOutcome::Reverify) => return,
+                        Err(error) => {
+                            self.finish_par2_set_failure(job_id, set_id, error).await;
+                            return;
+                        }
                     }
 
                     let repair_preview = match self

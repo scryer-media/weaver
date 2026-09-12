@@ -23,6 +23,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_async_fallback() 
     let segment_id = work.segment_id;
     let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
+        lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
@@ -110,6 +111,7 @@ async fn owned_download_lane_selection_contention_requeues_without_async_fallbac
     let segment_id = work.segment_id;
     let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
+        lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
@@ -357,6 +359,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: first_segment,
             data: quota_data,
@@ -371,6 +374,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
         .await;
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: tail_segment,
             data: unrequested_data,
@@ -402,6 +406,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
     pipeline.ip_replacement_burst_active = true;
     pipeline.metrics.set_ip_replacement_burst_active(true);
     pipeline.handle_download_lane_parked(DownloadLaneParked {
+        lane_id: 0,
         job_id,
         mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,
@@ -456,6 +461,7 @@ async fn release_download_result_excludes_ip_replacement_trial_from_hot_success_
         .insert(segment_id.file_id, 1);
 
     pipeline.release_download_result(&DownloadResult {
+        lane_id: 0,
         runtime_generation: 0,
         segment_id,
         data: Ok(DownloadPayload::Raw(Bytes::from_static(b"trial-article"))),
@@ -490,6 +496,7 @@ async fn accepted_ip_replacement_trial_samples_update_per_ip_ewma() {
     pipeline.ip_replacement_trial_extra_connections = 1;
     pipeline.ip_replacement_burst_active = true;
     pipeline.handle_ip_replacement_trial_event(IpReplacementTrialEvent::CandidateAccepted {
+        lane_id: 0,
         old_key,
         samples: vec![weaver_nntp::client::FetchAttemptTrace {
             server_idx: 0,
@@ -536,6 +543,7 @@ async fn disabled_ip_replacement_ignores_late_candidate_acceptance() {
     pipeline.ip_replacement_trial_extra_connections = 0;
     pipeline.ip_replacement_burst_active = false;
     pipeline.handle_ip_replacement_trial_event(IpReplacementTrialEvent::CandidateAccepted {
+        lane_id: 0,
         old_key,
         samples: vec![weaver_nntp::client::FetchAttemptTrace {
             server_idx: 0,
@@ -573,6 +581,7 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
 
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: JobId(21004),
         server_idx: old_key.server_idx,
@@ -1495,6 +1504,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
     pipeline.active_downloads += 1;
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Decoded(DecodeResult {
@@ -2563,6 +2573,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 500]))),
@@ -2600,6 +2611,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 1_600]))),
@@ -2640,6 +2652,33 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     pipeline.bandwidth_cap.reserve(256);
     pipeline.bandwidth_reservations.insert(segment_id, 256);
     pipeline.rate_limit_reservations.insert(segment_id, 256);
+    let lane_id = Pipeline::next_download_lane_id();
+    pipeline.download_lane_owners.insert(
+        lane_id,
+        DownloadLaneOwner {
+            job_id,
+            mode: DownloadLaneMode::Sequential,
+            spillover_loan_kind: None,
+            completion_critical: false,
+            connection: false,
+            ip_replacement: false,
+            outstanding: HashMap::from([(
+                segment_id,
+                DownloadWork {
+                    segment_id,
+                    message_id: crate::jobs::ids::MessageId::new("stalled-article"),
+                    groups: Arc::from(vec![]),
+                    priority: 0,
+                    byte_estimate: 256,
+                    retry_count: 0,
+                    is_recovery: false,
+                    completion_critical: false,
+                    exclude_servers: vec![],
+                    avoid_server: None,
+                },
+            )]),
+        },
+    );
     pipeline.job_last_download_activity.insert(
         job_id,
         std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),

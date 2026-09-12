@@ -52,6 +52,7 @@ pub struct SchemaContext {
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
     pub rss: RssService,
     pub watch_folder: WatchFolderService,
+    pub update_check: weaver_server_core::update_check::UpdateCheckService,
     pub schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
     pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
     pub system_runtime: SystemRuntimeContext,
@@ -153,6 +154,7 @@ pub fn build_schema(context: SchemaContext) -> WeaverSchema {
     .data(context.security)
     .data(context.rss)
     .data(context.watch_folder)
+    .data(context.update_check)
     .data(context.schedules)
     .data(http_client)
     .data(context.log_buffer)

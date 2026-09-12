@@ -183,7 +183,10 @@ mod tests {
         attribution.note_article(4, 1_024);
 
         let stored = attribution.to_storage_json().expect("a non-empty ledger");
-        assert_eq!(JobServerAttribution::from_storage_json(&stored), attribution);
+        assert_eq!(
+            JobServerAttribution::from_storage_json(&stored),
+            attribution
+        );
     }
 
     /// The stored shape is a persisted format: rows written by an older build

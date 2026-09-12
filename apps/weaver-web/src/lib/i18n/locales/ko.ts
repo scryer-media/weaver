@@ -9,6 +9,8 @@ const ko: LocaleDictionary = {
   "nav.upload": "업로드",
   "nav.settings": "설정",
   "nav.sponsor": "후원하기",
+  "update.newVersion": "새 버전 v{{version}}",
+  "update.newVersionAria": "GitHub에서 Weaver v{{version}}을 새 탭으로 열기",
 
   // Status labels
   "status.queued": "대기 중",

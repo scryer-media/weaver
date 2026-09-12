@@ -797,9 +797,13 @@ impl Pipeline {
     pub(in crate::pipeline) fn reset_owned_download_lanes(&mut self) {
         for lease in self.owned_download_lane_pool.reset() {
             for work in lease.works {
-                self.restore_owned_lane_unrequested_work(work);
+                if !self.accept_lane_work(lease.lane_id, work.segment_id) {
+                    continue;
+                }
+                self.restore_owned_lane_unrequested_work(lease.lane_id, work);
             }
             self.handle_download_lane_parked(DownloadLaneParked {
+                lane_id: lease.lane_id,
                 job_id: lease.job_id,
                 mode: lease.lane_mode,
                 spillover_loan_kind: lease.spillover_loan_kind,
@@ -819,6 +823,9 @@ impl Pipeline {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.owned_lane.event");
         match event {
             OwnedDownloadLaneEvent::AcquireFailed { lease, error } => {
+                if !self.download_lane_is_live(lease.lane_id) {
+                    return;
+                }
                 // Capacity admission and health-mutex contention are both
                 // "ask again shortly": the work goes back to the scheduler on
                 // the owned fast path instead of being demoted to an async
@@ -826,6 +833,7 @@ impl Pipeline {
                 self.note_owned_lane_acquire_failure(&lease, &error);
                 if error.should_requeue_owned_work() {
                     let DownloadBatchLease {
+                        lane_id,
                         job_id,
                         lane_mode,
                         spillover_loan_kind,
@@ -844,9 +852,11 @@ impl Pipeline {
                         1,
                     );
                     for work in works {
-                        self.restore_owned_lane_unrequested_work(work);
+                        self.accept_lane_work(lane_id, work.segment_id);
+                        self.restore_owned_lane_unrequested_work(lane_id, work);
                     }
                     self.handle_download_lane_parked(DownloadLaneParked {
+                        lane_id,
                         job_id,
                         mode: lane_mode,
                         spillover_loan_kind,
@@ -870,6 +880,7 @@ impl Pipeline {
                 self.spawn_async_download_batch(lease);
             }
             OwnedDownloadLaneEvent::BatchComplete {
+                lane_id,
                 results,
                 unrequested_works,
                 stats,
@@ -915,7 +926,9 @@ impl Pipeline {
                     stats.decoded_articles,
                 );
                 for result in results {
-                    self.release_download_result(&result);
+                    if !self.release_download_result(&result) {
+                        continue;
+                    }
                     self.note_released_download_result_pending(
                         result.segment_id.file_id.job_id,
                         Self::released_download_result_lead_bytes(&result),
@@ -923,7 +936,10 @@ impl Pipeline {
                     pending.push_back(result);
                 }
                 for work in unrequested_works {
-                    self.restore_owned_lane_unrequested_work(work);
+                    if !self.accept_lane_work(lane_id, work.segment_id) {
+                        continue;
+                    }
+                    self.restore_owned_lane_unrequested_work(lane_id, work);
                 }
             }
         }
@@ -979,14 +995,23 @@ impl Pipeline {
 
     pub(in crate::pipeline::download::worker) fn restore_owned_lane_unrequested_work(
         &mut self,
+        lane_id: u64,
         work: DownloadWork,
     ) {
+        self.finish_checkpoint_progress_article(lane_id, work.segment_id);
+        self.reconcile_rate_limit_for_download(work.segment_id, None);
         let job_id = work.segment_id.file_id.job_id;
         self.active_downloads = self.active_downloads.saturating_sub(1);
         if work.is_recovery {
             self.active_recovery = self.active_recovery.saturating_sub(1);
         }
-        self.note_download_activity(job_id);
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| !is_terminal_status(&state.status))
+        {
+            self.note_download_activity(job_id);
+        }
         if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
             *in_flight = in_flight.saturating_sub(1);
             if *in_flight == 0 {
@@ -1070,7 +1095,20 @@ impl Pipeline {
         }
     }
 
-    pub(crate) fn handle_download_lane_parked(&mut self, parked: DownloadLaneParked) {
+    pub(crate) fn handle_download_lane_parked(&mut self, mut parked: DownloadLaneParked) {
+        if !self.download_lane_is_live(parked.lane_id) {
+            return;
+        }
+        if let Some(owner) = self.download_lane_owners.get_mut(&parked.lane_id) {
+            parked.mode = owner.mode;
+            parked.completion_critical = owner.completion_critical;
+            parked.spillover_loan_kind = owner.spillover_loan_kind;
+            parked.release_connection_slot = std::mem::take(&mut owner.connection);
+            parked.release_ip_replacement_burst = std::mem::take(&mut owner.ip_replacement);
+            if owner.outstanding.is_empty() {
+                self.download_lane_owners.remove(&parked.lane_id);
+            }
+        }
         debug!(
             job_id = parked.job_id.0,
             mode = ?parked.mode,

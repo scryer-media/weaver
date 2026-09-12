@@ -95,6 +95,26 @@ pub struct JobPipelineDiagnostics {
     pub finalizing_download: bool,
     pub download_wait_reason: Option<String>,
     pub download_wait_pending: Option<usize>,
+    /// Optional so older diagnostic packets deserialize as unknown, not zero.
+    #[serde(default)]
+    pub accepted_download_bytes: Option<u64>,
+    #[serde(default)]
+    pub durable_download_floor_bytes: Option<u64>,
+    /// Current undurable estimate plus the next queued primary article, if any.
+    #[serde(default)]
+    pub projected_undurable_download_bytes: Option<u64>,
+    #[serde(default)]
+    pub checkpoint_lead_limit_bytes: Option<u64>,
+    /// Admission for the next primary article; no queue or retry state is changed.
+    #[serde(default)]
+    pub checkpoint_admission: Option<String>,
+    /// Central infrastructure queue only; ordinary article retries are separate.
+    #[serde(default)]
+    pub infrastructure_retries_timed: Option<usize>,
+    #[serde(default)]
+    pub infrastructure_retries_indefinite: Option<usize>,
+    #[serde(default)]
+    pub infrastructure_retry_next_deadline_epoch_ms: Option<f64>,
 }
 
 /// Direct-store admission state for one job.
@@ -155,12 +175,34 @@ impl Pipeline {
     pub(crate) fn diagnostics_snapshot(&self) -> PipelineDiagnostics {
         let metrics = self.metrics.snapshot();
         let now = std::time::Instant::now();
+        let retry_now = tokio::time::Instant::now();
+        let captured_at_epoch_ms = crate::jobs::epoch_ms_now();
+        // One pass over retries, with allocation bounded by jobs rather than
+        // articles. The large queues in a stall must not expand the packet.
+        let mut retries = std::collections::HashMap::new();
+        for (deadline, retry) in self.infrastructure_retries.iter_with_deadlines() {
+            let summary = retries
+                .entry(retry.work.segment_id.file_id.job_id)
+                .or_insert((0usize, 0usize, None::<tokio::time::Instant>));
+            if let Some(deadline) = deadline {
+                summary.0 += 1;
+                summary.2 = Some(summary.2.map_or(deadline, |next| next.min(deadline)));
+            } else {
+                summary.1 += 1;
+            }
+        }
 
         let mut jobs: Vec<JobPipelineDiagnostics> = self
             .jobs
             .iter()
             .map(|(job_id, state)| {
                 let wait = self.download_wait_by_job.get(job_id);
+                let checkpoint = self.checkpoint_admission(*job_id);
+                let next = state
+                    .download_queue
+                    .peek_first_matching(|work| !work.is_recovery);
+                let (timed, indefinite, deadline) =
+                    retries.get(job_id).copied().unwrap_or_default();
                 JobPipelineDiagnostics {
                     job_id: job_id.0,
                     status: state.status.clone(),
@@ -197,6 +239,32 @@ impl Pipeline {
                     finalizing_download: self.jobs_finalizing_download.contains(job_id),
                     download_wait_reason: wait.map(|wait| wait.reason.to_string()),
                     download_wait_pending: wait.map(|wait| wait.pending_count),
+                    accepted_download_bytes: Some(state.downloaded_bytes),
+                    durable_download_floor_bytes: Some(
+                        self.durable_download_floor_bytes_for_job(*job_id),
+                    ),
+                    projected_undurable_download_bytes: Some(
+                        self.estimated_undurable_download_bytes_for_job(*job_id)
+                            .saturating_add(next.map_or(0, |work| work.byte_estimate as u64)),
+                    ),
+                    checkpoint_lead_limit_bytes: Some(Self::restart_durable_lead_limit_bytes()),
+                    checkpoint_admission: Some(
+                        next.map_or("no_queued_primary", |work| {
+                            checkpoint.decision(work, &[]).as_str()
+                        })
+                        .to_string(),
+                    ),
+                    infrastructure_retries_timed: Some(timed),
+                    infrastructure_retries_indefinite: Some(indefinite),
+                    infrastructure_retry_next_deadline_epoch_ms: deadline.map(|deadline| {
+                        if deadline >= retry_now {
+                            captured_at_epoch_ms
+                                + deadline.duration_since(retry_now).as_secs_f64() * 1000.0
+                        } else {
+                            captured_at_epoch_ms
+                                - retry_now.duration_since(deadline).as_secs_f64() * 1000.0
+                        }
+                    }),
                 }
             })
             .collect();
@@ -239,7 +307,7 @@ impl Pipeline {
             .unwrap_or_default();
 
         PipelineDiagnostics {
-            captured_at_epoch_ms: crate::jobs::epoch_ms_now(),
+            captured_at_epoch_ms,
             tuner: TunerDiagnostics {
                 params: self.tuner.params().clone(),
                 configured_connections: self

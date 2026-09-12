@@ -98,6 +98,7 @@ async fn admitted_job_reconstructs_an_entirely_missing_payload() {
     }
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
