@@ -83,18 +83,24 @@ iconutil --convert icns "$iconset" --output "$output_dir/weaver.icns"
 # these coordinates and that file move together. The art is light-themed
 # because Finder paints filename labels black over any custom background
 # picture — dark art makes the labels unreadable.
-# Named by path rather than family: ImageMagick on macOS has no font cache of
-# its own, so `-font Arial-Bold` resolves only on some installs.
-wordmark_font="/System/Library/Fonts/Supplemental/Arial Bold.ttf"
-if [ ! -f "$wordmark_font" ]; then
-  echo "missing wordmark font at $wordmark_font" >&2
+# The wordmark is the brand artwork rather than a system font, so the disk
+# window and the app icon sitting in it say the same thing in the same voice.
+# librsvg draws it for the reason packaging/brand/generate-assets.sh gives:
+# ImageMagick's own SVG renderer does not read these sources correctly.
+wordmark_source="$repo_root/packaging/brand/weaver-wordmark-dark.svg"
+if [ ! -f "$wordmark_source" ]; then
+  echo "missing wordmark source at $wordmark_source" >&2
+  exit 1
+fi
+if ! command -v rsvg-convert >/dev/null 2>&1; then
+  echo "rsvg-convert not found; brew install librsvg" >&2
   exit 1
 fi
 
 draw_background() {
   local scale="$1" out="$2"
   local width=$((600 * scale)) height=$((400 * scale))
-  local wordmark=$((27 * scale)) offset=$((40 * scale))
+  local wordmark=$((20 * scale)) offset=$((40 * scale))
   local ax=$((240 * scale)) ay=$((210 * scale))
   local bx=$((330 * scale)) tipx=$((362 * scale))
   local shaft=$((5 * scale)) head=$((16 * scale))
@@ -106,10 +112,17 @@ draw_background() {
     -draw "polygon $ax,$((ay - shaft)) $bx,$((ay - shaft)) $bx,$((ay - head)) $tipx,$ay $bx,$((ay + head)) $bx,$((ay + shaft)) $ax,$((ay + shaft))" \
     -channel A -evaluate multiply 0.30 +channel "$work/arrow${scale}x.png"
 
+  # The source centres its lettering in a canvas with slack around it, so it is
+  # trimmed to the ink before placement — otherwise the offset below would be
+  # measured from empty space. Its alpha is faded once, before compositing, for
+  # the same reason the arrow is.
+  rsvg-convert -h "$((wordmark * 8))" "$wordmark_source" -o "$work/wordmark${scale}x-raw.png"
+  magick "$work/wordmark${scale}x-raw.png" -trim +repage -resize "x${wordmark}" \
+    -channel A -evaluate multiply 0.45 +channel "$work/wordmark${scale}x.png"
+
   magick -size "${width}x${height}" gradient:'#fbfcfe-#eef1f6' \
     "$work/arrow${scale}x.png" -compose over -composite \
-    -font "$wordmark_font" -pointsize "$wordmark" -fill 'rgba(15,23,42,0.45)' \
-    -gravity north -annotate "+0+$offset" 'Weaver' \
+    "$work/wordmark${scale}x.png" -gravity north -geometry "+0+$offset" -composite \
     "$out"
 }
 

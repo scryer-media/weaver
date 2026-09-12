@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router";
+import { BrandLockup } from "@/lib/brand";
 import { cn } from "@/lib/utils";
 import { useNextData } from "../data/next-data";
 import { Eyebrow } from "../components/chrome";
@@ -101,8 +102,7 @@ export function NextShell({
   const renderRail = (onDismiss?: () => void) => (
     <>
       <div className="flex h-14 flex-none items-center gap-[9px] border-b border-wv-line-strong px-[18px]">
-        <span aria-hidden="true" className="size-[18px] flex-none bg-wv-accent" />
-        <span className="text-[14px] font-semibold tracking-[-0.01em]">Weaver</span>
+        <BrandLockup className="h-[16px] w-auto flex-none" />
         <span className="ml-auto font-wv-mono text-[10px] text-wv-faint">{version || "—"}</span>
         {onDismiss === undefined ? null : (
           <button

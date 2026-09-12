@@ -29,6 +29,7 @@ import { formatSpeed } from "@/components/SpeedDisplay";
 import { Badge } from "@/components/ui/badge";
 import { Sparkline } from "@/components/ui/sparkline";
 import { UploadModal } from "@/components/UploadModal";
+import { BrandLockup } from "@/lib/brand";
 import { useSpeedHistory } from "@/lib/hooks/use-speed-history";
 import { LiveDataProvider, type DownloadBlockState } from "@/lib/context/live-data-context";
 import type { JobDownloadRate } from "@/lib/live-job-download-rates";
@@ -414,10 +415,8 @@ export function Layout() {
         {/* Desktop sidebar */}
         <aside className="hidden w-52 shrink-0 flex-col border-r border-border bg-card/40 backdrop-blur-md min-[1600px]:flex min-[1600px]:w-[248px]">
           <div className="flex items-start justify-between border-b border-border px-5 py-5">
-            <Link to="/" className="min-w-0">
-              <div className="font-space-grotesk text-[22px] font-bold leading-none tracking-tight text-foreground">
-                Weaver
-              </div>
+            <Link to="/" className="min-w-0 text-foreground">
+              <BrandLockup className="h-[18px] w-auto min-[1600px]:h-[21px]" />
             </Link>
             <ThemeToggle />
           </div>
@@ -519,7 +518,7 @@ export function Layout() {
             >
               <Menu className="size-4" />
             </button>
-            <span className="font-space-grotesk text-lg font-bold tracking-tight">Weaver</span>
+            <BrandLockup className="h-[17px] w-auto flex-none text-foreground" />
             <span className="ml-auto font-space-grotesk text-[15px] font-bold text-foreground">
               {formatSpeed(liveData.speed)}
             </span>
@@ -536,8 +535,11 @@ export function Layout() {
       <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
         <SheetContent side="left" className="w-[280px] border-border bg-card sm:max-w-[280px]">
           <SheetHeader className="border-b border-border px-5 py-5 text-left">
-            <SheetTitle className="font-space-grotesk text-xl font-bold text-foreground">
-              Weaver
+            <SheetTitle className="text-foreground">
+              {/* The drawer takes its accessible name from this title, so the
+                  name stays in text and the artwork beside it is decorative. */}
+              <BrandLockup className="h-[19px] w-auto" decorative />
+              <span className="sr-only">Weaver</span>
             </SheetTitle>
           </SheetHeader>
           <div className="flex min-h-0 flex-1 flex-col">

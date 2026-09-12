@@ -1,4 +1,5 @@
 import { isRouteErrorResponse, useNavigate, useRouteError } from "react-router";
+import { BrandLockup } from "@/lib/brand";
 import { NextShell } from "./NextShell";
 import { EmptyState } from "../components/chrome";
 import { PrimaryButton, SecondaryButton } from "../components/controls";
@@ -51,8 +52,7 @@ export function NextRouteError() {
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-wv-app text-wv-fg">
       <header className="flex h-14 flex-none items-center gap-[9px] border-b border-wv-line-strong bg-wv-chrome px-4 sm:px-6">
-        <span aria-hidden="true" className="size-[18px] flex-none bg-wv-accent" />
-        <span className="text-[14px] font-semibold tracking-[-0.01em]">Weaver</span>
+        <BrandLockup className="h-[16px] w-auto flex-none" />
       </header>
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <EmptyState title={title} body={body} />
