@@ -1,6 +1,6 @@
 # Brand sources
 
-The vector originals every raster brand asset in the tree is generated from.
+The vector originals every brand asset in the tree is generated from.
 Eight files, three forms × the colourways each form ships in:
 
 | File | Form |
@@ -18,7 +18,7 @@ Eight files, three forms × the colourways each form ships in:
 
 ```sh
 brew install librsvg imagemagick
-packaging/brand/generate-assets.sh          # every raster below
+packaging/brand/generate-assets.sh          # every asset below
 packaging/macos/assets/generate-assets.sh   # then weaver.icns and the DMG art
 ```
 
@@ -40,6 +40,11 @@ What comes out, and from which source:
 - `server/app/weaver/resources/windows/weaver.ico` — the colour mark. One icon
   resource serves both the executable and the notification area.
 - `docs/img/weaver-hero.webp` — the colour mark, plated.
+- `docs/img/weaver-lockup-on-light.svg` and `weaver-lockup-on-dark.svg` — the
+  colour lockup for the repository README, with the viewBox cut to the ink. A
+  README cannot restyle an image the way the interfaces restyle their inline
+  lockup, so it picks one of the two by colour scheme; the dark one draws
+  WEAVER in white.
 - `packaging/macos/assets/` — `weaver.icns` and the DMG background's wordmark.
 
 ## Two traps
