@@ -198,6 +198,126 @@ const HOT: JobId = JobId(49001);
 const PEER: JobId = JobId(49002);
 
 #[tokio::test]
+async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
+    for cancel in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut pipeline = restored_with_parked_retries(&temp).await;
+        pipeline.dispatch_downloads();
+        let (lane_id, segment_id) = pipeline.checkpoint_progress_articles[&HOT];
+        let original = pipeline.download_lane_owners[&lane_id].outstanding[&segment_id].clone();
+        insert_active_job(
+            &mut pipeline,
+            PEER,
+            segmented_job_spec("Ready peer", "peer.bin", &[100; 64]),
+        )
+        .await;
+        let reserved = pipeline.rate_limit_reservations[&segment_id];
+        // Keep a small unrelated debt after the refund: both a missing refund
+        // and a duplicate refund produce a materially different balance.
+        pipeline.rate_limiter.set_rate(1);
+        pipeline.rate_limiter.consume(reserved + 100);
+        if cancel {
+            let (reply, done) = oneshot::channel();
+            pipeline
+                .handle_command(SchedulerCommand::CancelJob {
+                    job_id: HOT,
+                    origin: crate::jobs::handle::CancellationOrigin::User,
+                    reply,
+                })
+                .await;
+            done.await.unwrap().unwrap();
+        } else {
+            pipeline.jobs.get_mut(&HOT).unwrap().status = JobStatus::Failed {
+                error: "removed".into(),
+            };
+            pipeline.purge_terminal_job_runtime(HOT);
+        }
+        assert!(!pipeline.jobs.contains_key(&HOT));
+        assert!(!pipeline.job_last_download_activity.contains_key(&HOT));
+        assert!(!pipeline.download_lane_owners.contains_key(&lane_id));
+        assert!(pipeline.rate_limit_reservations.is_empty());
+        assert!(pipeline.bandwidth_reservations.is_empty());
+        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.active_download_connections, 0);
+        let remaining = pipeline.rate_limiter.time_until_ready().as_secs_f64();
+        assert!(
+            (95.0..=100.0).contains(&remaining),
+            "refund debt: {remaining}"
+        );
+        for data in [
+            Ok(DownloadPayload::Raw(Bytes::from_static(b"late bytes"))),
+            Err(DownloadError::fetch(
+                DownloadFailureKind::EstablishedTransport,
+                "late error",
+            )),
+        ] {
+            pipeline
+                .handle_download_done(DownloadResult {
+                    lane_id,
+                    segment_id,
+                    runtime_generation: pipeline.pool_generation,
+                    data,
+                    attempts: vec![],
+                    lane_observation: None,
+                    source_server_idx: None,
+                    origin: DownloadResultOrigin::NormalPrimary,
+                    retry_count: original.retry_count,
+                    exclude_servers: original.exclude_servers.clone(),
+                    release_connection_slot: true,
+                })
+                .await;
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+            lane_id,
+            job_id: HOT,
+            runtime_generation: pipeline.pool_generation,
+            server_idx: 0,
+            remote_ip: "127.0.0.1".parse().unwrap(),
+            supports_pipelining: true,
+            current_mode: DownloadLaneMode::Sequential,
+            spillover_loan_kind: None,
+            compatibility: DownloadBatchCompatibility::from_work(&original),
+            response_tx,
+        });
+        assert!(response_rx.await.unwrap().lease.is_none());
+        pipeline.handle_owned_download_lane_event(
+            OwnedDownloadLaneEvent::BatchComplete {
+                lane_id,
+                results: vec![],
+                unrequested_works: vec![original],
+                stats: Default::default(),
+                ack: None,
+            },
+            &mut VecDeque::new(),
+        );
+        pipeline.handle_download_lane_parked(DownloadLaneParked {
+            lane_id,
+            job_id: HOT,
+            mode: DownloadLaneMode::Sequential,
+            spillover_loan_kind: None,
+            completion_critical: false,
+            reason: LaneParkReason::Error,
+            release_connection_slot: true,
+            release_ip_replacement_burst: false,
+        });
+        let remaining = pipeline.rate_limiter.time_until_ready().as_secs_f64();
+        // Retired results still charge their ten actual transport bytes.
+        assert!(
+            (105.0..=110.0).contains(&remaining),
+            "late events must only charge actual transport: {remaining}"
+        );
+        assert!(!pipeline.job_last_download_activity.contains_key(&HOT));
+        assert!(!pipeline.pending_retries_by_job.contains_key(&HOT));
+        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.active_download_connections, 0);
+        pipeline.rate_limiter.set_rate(0);
+        pipeline.dispatch_downloads();
+        assert!(pipeline.active_download_connections_by_job[&PEER] > 0);
+    }
+}
+
+#[tokio::test]
 async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
     let temp = tempfile::tempdir().unwrap();
     let mut pipeline = restored_with_parked_retries(&temp).await;

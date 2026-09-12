@@ -2978,6 +2978,8 @@ pub struct Pipeline {
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     /// Jobs that should re-enter completion/post-processing on the next loop pass.
     pub(super) pending_completion_checks: VecDeque<JobId>,
+    /// Presence gates every attempt to resume a partially restored job.
+    pub(crate) blocked_restores: HashMap<JobId, crate::jobs::handle::RestoreJobRequest>,
     /// Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,

@@ -233,7 +233,7 @@ async fn placement_journal_ignores_unchanged_identity_alongside_moves() {
             filename
         );
     }
-    assert!(placement::recover(&dir).unwrap().is_empty());
+    assert!(placement::recover(&dir).unwrap().transactions.is_empty());
 }
 
 #[tokio::test]

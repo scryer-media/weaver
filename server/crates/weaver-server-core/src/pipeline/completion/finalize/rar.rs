@@ -853,28 +853,56 @@ impl Pipeline {
             .map_err(|e| e.to_string())
     }
 
+    fn invalidate_verification_after_placement_replay(&mut self, job_id: JobId) {
+        self.clear_pending_par2_repairs_for_job(job_id);
+        self.invalidate_par2_session_for_identity_rebind(job_id);
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.completed_checksums.clear();
+            for set in runtime.sets.values_mut() {
+                set.settled = false;
+                set.failure = None;
+                set.missing_blocks = 0;
+                set.post_verdict_reconcile_attempts = 0;
+                set.scan_carry = None;
+                set.scan_carry_exclusions.clear();
+            }
+        }
+        self.par2_verified.remove(&job_id);
+        self.schedule_job_completion_check(job_id);
+    }
+
+    pub(in crate::pipeline) async fn recover_placement_before_verification(
+        &mut self,
+        job_id: JobId,
+        working_dir: PathBuf,
+    ) -> Result<bool, String> {
+        let report = tokio::task::spawn_blocking(move || placement::recover(&working_dir))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        for transaction in report.transactions {
+            self.bind_placement_transaction(job_id, transaction).await?;
+        }
+        if report.replayed {
+            self.invalidate_verification_after_placement_replay(job_id);
+        }
+        Ok(report.replayed)
+    }
+
     pub(in crate::pipeline) async fn apply_placement_plan_for_retry_or_repair(
         &mut self,
         job_id: JobId,
         working_dir: PathBuf,
         plan: &par2_rs::PlacementPlan,
-    ) -> Result<(), String> {
-        let recovery_dir = working_dir.clone();
-        let recovered = tokio::task::spawn_blocking(move || placement::recover(&recovery_dir))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
-        if !recovered.is_empty() {
-            for transaction in recovered {
-                self.bind_placement_transaction(job_id, transaction).await?;
-            }
-            self.clear_pending_par2_repairs_for_job(job_id);
-            // This plan was computed against names from before replay. Verify
-            // the recovered mapping before proposing another permutation.
-            return Ok(());
+    ) -> Result<placement::ApplyOutcome, String> {
+        if self
+            .recover_placement_before_verification(job_id, working_dir.clone())
+            .await?
+        {
+            return Ok(placement::ApplyOutcome::Reverify);
         }
         if plan.swaps.is_empty() && plan.renames.is_empty() {
-            return Ok(());
+            return Ok(placement::ApplyOutcome::Applied);
         }
 
         let plan = plan.clone();
@@ -902,14 +930,24 @@ impl Pipeline {
             })
             .collect();
         let plan_for_apply = plan.clone();
+        let recovery_dir = working_dir.clone();
         let transaction = tokio::task::spawn_blocking(move || {
             placement::begin(&working_dir, &plan_for_apply, bindings)
-                .map_err(|e| format!("placement normalization failed: {e}"))
         })
         .await
-        .map_err(|e| format!("placement normalization task panicked: {e}"))??;
+        .map_err(|e| format!("placement normalization task panicked: {e}"))?;
+        let transaction = match transaction {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                self.recover_placement_before_verification(job_id, recovery_dir)
+                    .await?;
+                // Preparation may already have cleaned up a completed rollback.
+                self.invalidate_verification_after_placement_replay(job_id);
+                return Ok(placement::ApplyOutcome::Reverify);
+            }
+            other => other.map_err(|e| format!("placement normalization failed: {e}"))?,
+        };
         let Some(transaction) = transaction else {
-            return Ok(());
+            return Ok(placement::ApplyOutcome::Applied);
         };
         let moved = transaction.len();
 
@@ -1001,7 +1039,7 @@ impl Pipeline {
                 .await;
         }
 
-        Ok(())
+        Ok(placement::ApplyOutcome::Applied)
     }
 
     pub(super) async fn recompute_rar_retry_frontier(&mut self, job_id: JobId) {

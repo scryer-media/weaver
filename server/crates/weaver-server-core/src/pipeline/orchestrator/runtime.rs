@@ -326,6 +326,7 @@ impl Pipeline {
             last_direct_verdict: None,
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
+            blocked_restores: HashMap::new(),
             download_done_tx,
             download_done_rx,
             download_refill_tx,
@@ -726,7 +727,7 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
-        self.retire_stalled_download_lanes(job_id);
+        self.blocked_restores.remove(&job_id);
         self.pending_file_progress
             .retain(|file_id, _| file_id.job_id != job_id);
         self.persisted_file_progress

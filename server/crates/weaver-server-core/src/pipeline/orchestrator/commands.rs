@@ -36,7 +36,7 @@ impl Pipeline {
                 let _ = reply.send(result);
             }
             SchedulerCommand::ResumeJob { job_id, reply } => {
-                let result = self.resume_job_runtime(job_id);
+                let result = self.resume_restored_job(job_id).await;
                 if result.is_ok() {
                     self.publish_snapshot();
                     let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
@@ -169,6 +169,7 @@ impl Pipeline {
                             .jobs
                             .remove(&job_id)
                             .expect("job was retained until archive completed");
+                        self.retire_stalled_download_lanes(job_id);
                         self.job_order.retain(|id| *id != job_id);
                         self.remove_pending_completion_check(job_id);
                         self.update_queue_metrics();

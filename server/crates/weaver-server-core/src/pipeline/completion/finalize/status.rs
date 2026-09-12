@@ -625,6 +625,11 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Result<(), crate::SchedulerError> {
+        if self.blocked_restores.contains_key(&job_id) {
+            return Err(crate::SchedulerError::Conflict(
+                "placement recovery must succeed before resume".into(),
+            ));
+        }
         let (resume_status, resume_download_state, resume_post_state) =
             match self.jobs.get_mut(&job_id) {
                 Some(state) => {

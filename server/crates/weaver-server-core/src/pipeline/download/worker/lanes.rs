@@ -1005,7 +1005,13 @@ impl Pipeline {
         if work.is_recovery {
             self.active_recovery = self.active_recovery.saturating_sub(1);
         }
-        self.note_download_activity(job_id);
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| !is_terminal_status(&state.status))
+        {
+            self.note_download_activity(job_id);
+        }
         if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
             *in_flight = in_flight.saturating_sub(1);
             if *in_flight == 0 {

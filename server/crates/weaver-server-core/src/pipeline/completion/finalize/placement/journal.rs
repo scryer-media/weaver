@@ -70,6 +70,13 @@ pub(crate) struct Transaction {
     journal: Journal,
 }
 
+#[derive(Default)]
+pub(crate) struct RecoveryReport {
+    pub transactions: Vec<Transaction>,
+    /// Includes rollback and completion cleanup, even without pending bindings.
+    pub replayed: bool,
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -163,9 +170,10 @@ pub(super) fn prepare(
     plan: &par2_rs::PlacementPlan,
     bindings: Vec<Binding>,
 ) -> io::Result<Option<Transaction>> {
-    if !recover(dir)?.is_empty() {
-        return Err(invalid(
-            "finish recovered placement identities before starting another placement",
+    if recover(dir)?.replayed {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "placement recovery invalidated the proposed plan; verify again",
         ));
     }
     let entries = validate_plan(dir, plan)?;
@@ -289,13 +297,14 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn recover(dir: &Path) -> io::Result<Vec<Transaction>> {
+pub(crate) fn recover(dir: &Path) -> io::Result<RecoveryReport> {
     let listing = match fs::read_dir(dir) {
         Ok(listing) => listing,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RecoveryReport::default()),
         Err(e) => return Err(e),
     };
     let mut transactions = Vec::new();
+    let mut replayed = false;
     for item in listing {
         let item = item?;
         if !item.file_name().to_string_lossy().starts_with(PREFIX) {
@@ -331,6 +340,7 @@ pub(crate) fn recover(dir: &Path) -> io::Result<Vec<Transaction>> {
             ))
         })?;
         validate_journal(&journal)?;
+        replayed = true;
         let next = staging.join(NEXT_JOURNAL);
         if let Ok(metadata) = fs::symlink_metadata(&next) {
             if !metadata.is_file() {
@@ -366,7 +376,10 @@ pub(crate) fn recover(dir: &Path) -> io::Result<Vec<Transaction>> {
             "multiple unfinished placement identity transactions; retained files require inspection",
         ));
     }
-    Ok(transactions)
+    Ok(RecoveryReport {
+        transactions,
+        replayed,
+    })
 }
 
 impl Transaction {
@@ -648,6 +661,7 @@ mod tests {
         drop(transaction);
         recover(dir.path())
             .unwrap()
+            .transactions
             .pop()
             .unwrap()
             .finish()
@@ -715,6 +729,38 @@ mod tests {
     }
 
     #[test]
+    fn placement_preparation_rejects_plans_invalidated_by_inline_recovery() {
+        for rollback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            for (index, name) in ["a.bin", "b.bin", "c.bin"].iter().enumerate() {
+                fs::write(dir.path().join(name), [index as u8; 32]).unwrap();
+            }
+            let mut transaction = begin(dir.path(), &plan(), vec![]).unwrap().unwrap();
+            if rollback {
+                transaction.journal.phase = Phase::RollbackVacate;
+                transaction.save().unwrap();
+            }
+            drop(transaction);
+            let error = match prepare(dir.path(), &plan(), vec![]) {
+                Err(error) => error,
+                Ok(_) => panic!("a pre-replay plan must not start another transaction"),
+            };
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            let names = if rollback {
+                ["a.bin", "b.bin", "c.bin"]
+            } else {
+                ["b.bin", "c.bin", "a.bin"]
+            };
+            for (index, name) in names.iter().enumerate() {
+                assert_eq!(fs::read(dir.path().join(name)).unwrap(), [index as u8; 32]);
+            }
+            let report = recover(dir.path()).unwrap();
+            assert_eq!(report.replayed, !rollback);
+            assert_eq!(report.transactions.len(), usize::from(!rollback));
+        }
+    }
+
+    #[test]
     fn placement_replays_duplicate_links_and_interrupted_rollback() {
         for copied in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -736,7 +782,7 @@ mod tests {
                 fs::hard_link(&source, &destination).unwrap();
             }
             drop(transaction);
-            let mut recovered = recover(dir.path()).unwrap().pop().unwrap();
+            let mut recovered = recover(dir.path()).unwrap().transactions.pop().unwrap();
             // Interrupt rollback after vacating one installed destination.
             recovered.journal.phase = Phase::RollbackVacate;
             recovered.save().unwrap();
@@ -744,7 +790,13 @@ mod tests {
                 .move_entry(0, Location::Staged, &mut rename_no_overwrite)
                 .unwrap();
             drop(recovered);
-            assert!(recover(dir.path()).unwrap().is_empty());
+            let report = recover(dir.path()).unwrap();
+            assert!(
+                report.replayed,
+                "inline rollback must invalidate earlier verification"
+            );
+            assert!(report.transactions.is_empty());
+            assert!(!recover(dir.path()).unwrap().replayed);
             for (index, name) in ["a.bin", "b.bin", "c.bin"].iter().enumerate() {
                 assert_eq!(fs::read(dir.path().join(name)).unwrap(), [index as u8; 32]);
             }
@@ -792,6 +844,7 @@ mod tests {
         drop(transaction);
         recover(dir.path())
             .unwrap()
+            .transactions
             .pop()
             .unwrap()
             .finish()

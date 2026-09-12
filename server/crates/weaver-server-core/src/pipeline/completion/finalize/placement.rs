@@ -6,6 +6,12 @@ use crate::runtime::fs::{paths_equivalent_for_placement, rename_no_overwrite};
 mod journal;
 pub(crate) use journal::{Binding, Transaction, begin, recover};
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ApplyOutcome {
+    Applied,
+    Reverify,
+}
+
 #[cfg(test)]
 pub(super) fn apply_complete_plan(dir: &Path, plan: &par2_rs::PlacementPlan) -> io::Result<usize> {
     apply_complete_plan_with_move(dir, plan, rename_no_overwrite)

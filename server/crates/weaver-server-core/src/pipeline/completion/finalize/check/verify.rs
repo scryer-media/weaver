@@ -475,6 +475,17 @@ impl Pipeline {
         has_crc_failures: bool,
         archive_extraction_applicable: bool,
     ) {
+        match self
+            .recover_placement_before_verification(job_id, working_dir.clone())
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                self.finish_par2_set_failure(job_id, set_id, error).await;
+                return;
+            }
+        }
         let CleanPar2Verification {
             verification,
             placement_plan,
@@ -486,12 +497,16 @@ impl Pipeline {
         Self::log_placement_plan(job_id, &placement_plan);
 
         self.try_deobfuscate_files_with_par2(job_id).await;
-        if let Err(error) = self
+        match self
             .apply_placement_plan_for_retry_or_repair(job_id, working_dir, &placement_plan)
             .await
         {
-            self.finish_par2_set_failure(job_id, set_id, error).await;
-            return;
+            Ok(placement::ApplyOutcome::Applied) => {}
+            Ok(placement::ApplyOutcome::Reverify) => return,
+            Err(error) => {
+                self.finish_par2_set_failure(job_id, set_id, error).await;
+                return;
+            }
         }
         self.retry_par2_authoritative_identity(job_id).await;
         // Before refreshing topologies, adopt any RAR volume PAR2 rebuilt that

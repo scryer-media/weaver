@@ -1454,6 +1454,191 @@ impl Pipeline {
         &mut self,
         request: RestoreJobRequest,
     ) -> Result<(), crate::SchedulerError> {
+        if self.jobs.contains_key(&request.job_id) {
+            return Err(crate::SchedulerError::JobExists(request.job_id));
+        }
+        let original = request.clone();
+        match self.restore_job_inner(request).await {
+            Ok(()) => {
+                self.blocked_restores.remove(&original.job_id);
+                self.persist_active_runtime(original.job_id);
+            }
+            Err(error) => {
+                self.install_blocked_restore(original, error.to_string())
+                    .await;
+            }
+        }
+        // A blocked restore is a retained queue entry and must be published.
+        Ok(())
+    }
+
+    async fn install_blocked_restore(&mut self, request: RestoreJobRequest, error: String) {
+        let job_id = request.job_id;
+        let resume = request.paused_resume_status.clone().unwrap_or_else(|| {
+            if matches!(request.status, JobStatus::Paused) {
+                JobStatus::Downloading
+            } else {
+                request.status.clone()
+            }
+        });
+        let floor = request
+            .spec
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                let total: u64 = file
+                    .segments
+                    .iter()
+                    .map(|segment| u64::from(segment.bytes))
+                    .sum();
+                if request.complete_files.contains(&NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                }) {
+                    total
+                } else {
+                    request
+                        .file_progress
+                        .get(&(index as u32))
+                        .copied()
+                        .unwrap_or(0)
+                        .min(total)
+                }
+            })
+            .sum();
+        let identities = if request.file_identities.is_empty() {
+            Self::build_initial_file_identities(&request.spec, &request.detected_archives)
+        } else {
+            request.file_identities.clone()
+        };
+        let state = JobState {
+            job_id,
+            job_hash: request.job_hash,
+            spec: request.spec.clone(),
+            status: JobStatus::Paused,
+            download_state: crate::jobs::model::DownloadState::Queued,
+            post_state: crate::jobs::model::PostState::Idle,
+            run_state: crate::jobs::model::RunState::Paused,
+            assembly: JobAssembly::new(job_id),
+            extraction_depth: 0,
+            created_at: std::time::Instant::now(),
+            created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
+            queued_repair_at_epoch_ms: request.queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms: request.queued_extract_at_epoch_ms,
+            paused_resume_status: Some(resume),
+            paused_resume_download_state: request.paused_resume_download_state,
+            paused_resume_post_state: request.paused_resume_post_state,
+            failure_error: Some(format!("Placement recovery blocked: {error}")),
+            working_dir: request.working_dir.clone(),
+            downloaded_bytes: 0,
+            restored_download_floor_bytes: floor,
+            downloaded_wire_bytes: 0,
+            failed_bytes: 0,
+            probe_projected_failed_bytes: 0,
+            par2_bytes: request.spec.par2_bytes(),
+            health_probing: false,
+            health_probe_round: 0,
+            health_probe_failing_files: 0,
+            health_failing_files: HashSet::new(),
+            early_recovery_requested_blocks: 0,
+            last_health_probe_failed_bytes: 0,
+            next_health_probe_failed_bytes: 1,
+            detected_archives: request.detected_archives.clone(),
+            file_identities: identities,
+            held_segments: Vec::new(),
+            download_queue: DownloadQueue::new(),
+            recovery_queue: DownloadQueue::new(),
+            staging_dir: None,
+            category_bytes: None,
+        };
+        let message = state.failure_error.clone().unwrap();
+        let queued_repair = state.queued_repair_at_epoch_ms;
+        let queued_extract = state.queued_extract_at_epoch_ms;
+        let resume_status = state
+            .paused_resume_status
+            .as_ref()
+            .map(Self::persist_active_status_for);
+        let resume_download = state
+            .paused_resume_download_state
+            .map(|value| value.as_str());
+        let resume_post = state.paused_resume_post_state.map(|value| value.as_str());
+        self.jobs.insert(job_id, state);
+        if !self.job_order.contains(&job_id) {
+            self.job_order.push(job_id);
+        }
+        self.blocked_restores.insert(job_id, request);
+        self.remove_pending_completion_check(job_id);
+        self.update_queue_metrics();
+        // Await this write: the next startup must retain the pause even if
+        // filesystem recovery succeeds by then.
+        if let Err(persist_error) = self
+            .db_blocking(move |db| {
+                db.set_active_job_runtime(
+                    job_id,
+                    "paused",
+                    Some("queued"),
+                    Some("idle"),
+                    Some("paused"),
+                    Some(&message),
+                    queued_repair,
+                    queued_extract,
+                    resume_status,
+                    resume_download,
+                    resume_post,
+                )
+            })
+            .await
+        {
+            tracing::error!(job_id = job_id.0, %persist_error, "failed to persist blocked restore pause");
+        }
+        tracing::warn!(job_id = job_id.0, %error, "placement recovery blocked; job retained paused");
+    }
+
+    pub(crate) async fn resume_restored_job(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<(), crate::SchedulerError> {
+        if let Some(mut request) = self.blocked_restores.get(&job_id).cloned() {
+            let recovered = self
+                .db_blocking(move |db| db.load_active_jobs())
+                .await
+                .map_err(crate::SchedulerError::State)?
+                .remove(&job_id)
+                .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
+            request.file_identities = recovered.file_identities;
+            request.file_progress = recovered.file_progress;
+            request.complete_files = recovered.complete_files;
+            request.detected_archives = recovered.detected_archives;
+            request.extracted_members = recovered.extracted_members;
+            request.queued_repair_at_epoch_ms = recovered.queued_repair_at_epoch_ms;
+            request.queued_extract_at_epoch_ms = recovered.queued_extract_at_epoch_ms;
+            request.status = JobStatus::Paused;
+            let position = self
+                .job_order
+                .iter()
+                .position(|id| *id == job_id)
+                .unwrap_or(self.job_order.len());
+            self.jobs.remove(&job_id);
+            self.job_order.retain(|id| *id != job_id);
+            self.restore_job(request).await?;
+            self.job_order.retain(|id| *id != job_id);
+            self.job_order
+                .insert(position.min(self.job_order.len()), job_id);
+            if self.blocked_restores.contains_key(&job_id) {
+                self.publish_snapshot();
+                return Err(crate::SchedulerError::Conflict(
+                    self.jobs[&job_id].failure_error.clone().unwrap(),
+                ));
+            }
+        }
+        self.resume_job_runtime(job_id)
+    }
+
+    async fn restore_job_inner(
+        &mut self,
+        request: RestoreJobRequest,
+    ) -> Result<(), crate::SchedulerError> {
         let RestoreJobRequest {
             job_id,
             job_hash,
@@ -1503,7 +1688,7 @@ impl Pipeline {
                 .await
                 .map_err(|e| crate::SchedulerError::Internal(e.to_string()))?
                 .map_err(crate::SchedulerError::Io)?;
-        for transaction in transactions {
+        for transaction in transactions.transactions {
             for binding in transaction.bindings() {
                 let identity = file_identities
                     .get(&binding.file_index)
