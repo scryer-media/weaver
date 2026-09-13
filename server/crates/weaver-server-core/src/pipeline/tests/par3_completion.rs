@@ -825,6 +825,17 @@ async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
                     .unwrap();
             pipeline.handle_repair_work_done(done).await;
         }
+        // No recovery candidates remain in this fixture. The scheduler can now
+        // authorize sliding discovery, including after a later source change.
+        assert!(
+            pipeline
+                .par3_runtime
+                .as_mut()
+                .unwrap()
+                .request_donor_search(job_id)
+                .unwrap()
+        );
+        settle_par3(&mut pipeline, job_id).await;
         let views: Vec<_> = pipeline
             .par3_runtime
             .as_ref()
@@ -1090,6 +1101,22 @@ async fn restored_completed_images_are_reverified_without_article_placements() {
         settle_par3(&mut pipeline, job_id).await;
         let runtime = pipeline.par3_runtime.as_ref().unwrap();
         assert_eq!(runtime.verified(job_id), !changed);
+        if changed {
+            assert_eq!(
+                runtime.assessments(job_id).next().unwrap().1.status,
+                par3_rs::session::RepairStatus::NeedRecovery
+            );
+            assert!(
+                pipeline
+                    .par3_runtime
+                    .as_mut()
+                    .unwrap()
+                    .request_donor_search(job_id)
+                    .unwrap()
+            );
+            settle_par3(&mut pipeline, job_id).await;
+        }
+        let runtime = pipeline.par3_runtime.as_ref().unwrap();
         let (_, view) = runtime.assessments(job_id).next().unwrap();
         assert_eq!(
             view.files.iter().filter(|file| file.complete).count(),

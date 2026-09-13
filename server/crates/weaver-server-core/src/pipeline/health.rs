@@ -599,6 +599,7 @@ impl Pipeline {
 
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
+        tracing::error!(job_id = job_id.0, reason = %error, "job failed");
         // Terminal transition: a job dying without a recovery set never had a
         // PAR2 verdict available to it. No-op when a pass already ruled.
         self.note_job_unverifiable_if_no_par2_set(job_id);

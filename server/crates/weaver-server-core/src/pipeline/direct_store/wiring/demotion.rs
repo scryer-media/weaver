@@ -299,7 +299,8 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Err(ReconstructionFailure::NoLayout);
         };
-        if set.router.member_partials().is_empty() {
+        let preserve_holds = matches!(reason, DemotionReason::Par3MemoryPressure);
+        if !preserve_holds && set.router.member_partials().is_empty() {
             // Nothing was ever routed to a member, so there is nothing to
             // reconstruct *from* beyond headers. Refetching is both correct and
             // cheaper than materializing header-only volumes.
@@ -353,7 +354,13 @@ impl Pipeline {
             // struck and whose targeted requeue owns every segment the atoms do
             // not wholly back; a hold materialized here would be written twice
             // and counted against a completion gate nothing then clears.
-            let physical_coverage = set.volume_coverage(*volume_index);
+            // A PAR3 spill starts outside an article handoff. Its immutable
+            // holds can be reconstructed too, subject to the same CRC atoms.
+            let physical_coverage = if preserve_holds && handoffs.is_empty() {
+                set.volume_coverage_with_holds(*volume_index)
+            } else {
+                set.volume_coverage(*volume_index)
+            };
             let crcs = set.volume_crc_runs(*volume_index);
             // Routing can demote after durably placing only part of the current
             // article. Keep that range provisional: the decode handoff owns the
@@ -485,8 +492,13 @@ impl Pipeline {
             "submitting a direct demotion reconstruction ticket"
         );
         let done_tx = self.direct_demotion_done_tx.clone();
+        let disk_reservation = self
+            .par3_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.take_spill_disk(job_id));
         tokio::spawn(async move {
             let rebuilt = tokio::task::spawn_blocking(move || {
+                let _disk_reservation = disk_reservation;
                 crate::pipeline::direct_store::reconstruct::reconstruct_volumes(
                     &provider, &plans, sparse,
                 )

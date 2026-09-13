@@ -5,7 +5,7 @@ use super::sources::PublishedSources;
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::pipeline::Pipeline;
 use par3_rs::ingest::{PacketScanner, ScanEvent};
-use par3_rs::runtime::{EngineError, EngineResult, ExecutionOptions, HandleBudget, MemoryBudget};
+use par3_rs::runtime::{EngineError, EngineResult, ExecutionOptions, HandleBudget};
 use par3_rs::source::{DiskSourceAccess, SourceAccess, SourceId, SourceSnapshot};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,11 +16,10 @@ const MAX_CARRIERS: usize = 4096;
 const MAX_SETS: usize = 256;
 
 fn execution_options() -> ExecutionOptions {
-    static MEMORY: OnceLock<MemoryBudget> = OnceLock::new();
     static HANDLES: OnceLock<HandleBudget> = OnceLock::new();
     let mut options = ExecutionOptions::default();
-    options.memory = MEMORY.get_or_init(|| MemoryBudget::new(256 << 20)).clone();
-    options.retained_bytes = 128 << 20;
+    options.memory = budget::budgets().native.clone();
+    options.retained_bytes = options.memory.limit() / 2;
     options.handles = HANDLES.get_or_init(|| HandleBudget::new(128)).clone();
     options.open_handles = 128;
     options.workers = 1;
@@ -228,7 +227,7 @@ impl Par3Job {
             carrier.resume = Some(carrier.scan_start);
         }
         self.name_search = placement::NameSearch::default();
-        self.donor_search = donors::Cache::default();
+        self.donor_search.evict();
     }
 
     fn assess(&mut self) -> EngineResult<()> {
@@ -1071,6 +1070,7 @@ impl Pipeline {
 
 mod assessment;
 mod bindings;
+mod budget;
 mod completion;
 mod coordination;
 #[cfg(windows)]
