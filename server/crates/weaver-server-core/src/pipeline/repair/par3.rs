@@ -23,6 +23,7 @@ fn execution_options() -> ExecutionOptions {
     options.handles = HANDLES.get_or_init(|| HandleBudget::new(128)).clone();
     options.open_handles = 128;
     options.workers = 1;
+    options.stripe_bytes = 1 << 20;
     options
 }
 
@@ -979,15 +980,14 @@ impl Pipeline {
         };
         if !coordinator.contains_job(job_id)
             || coordinator.is_installing(job_id)
-            || self.job_has_pending_download_pipeline_work(job_id)
             || self.direct_demotion_in_flight.contains_key(&job_id)
         {
             return Ok(());
         }
         let mut dirty = coordinator.dirty_sources(job_id);
         // An incomplete source may never emit a file-complete event. Metadata
-        // can also precede its first byte. Publish its surviving placements once
-        // the download drains, without rereading already known clean sources.
+        // can also precede its first byte. Publish quiescent sources without
+        // waiting for unrelated files or parked retries to finish.
         if let Some(state) = self.jobs.get(&job_id) {
             for file in state.assembly.files() {
                 let source = SourceId(u64::from(file.file_id().file_index));
@@ -1005,7 +1005,31 @@ impl Pipeline {
         for source in dirty {
             let file_index = u32::try_from(source.0)
                 .map_err(|_| EngineError::InvalidState("unknown PAR3 source identity"))?;
-            self.enqueue_par3_file(job_id, NzbFileId { job_id, file_index })?;
+            let file_id = NzbFileId { job_id, file_index };
+            if self
+                .active_downloads_by_file
+                .get(&file_id)
+                .copied()
+                .unwrap_or(0)
+                != 0
+                || self
+                    .active_decodes_by_file
+                    .get(&file_id)
+                    .copied()
+                    .unwrap_or(0)
+                    != 0
+                || self
+                    .pending_decode
+                    .iter()
+                    .any(|work| work.segment_id.file_id == file_id)
+                || self
+                    .write_buffers
+                    .get(&file_id)
+                    .is_some_and(|buffer| buffer.buffered_len() != 0)
+            {
+                continue;
+            }
+            self.enqueue_par3_file(job_id, file_id)?;
         }
         Ok(())
     }
@@ -1068,6 +1092,7 @@ impl Pipeline {
     }
 }
 
+mod acquisition;
 mod assessment;
 mod bindings;
 mod budget;

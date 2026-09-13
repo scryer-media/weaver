@@ -6,21 +6,51 @@ use crate::pipeline::direct_store::provider::{
     CipherOverlayCounters, VirtualVolume, VirtualVolumeReader, is_hole,
 };
 use par3_rs::runtime::HandleLease;
+use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, Weak};
 
-/// One cached ranged reader across a job, independent of its source count.
+/// Idle readers retain each publication's cipher frontier under shared budgets.
 #[derive(Default)]
-pub(in crate::pipeline) struct ReaderCache(Mutex<Option<(Arc<()>, Reader)>>);
+pub(in crate::pipeline) struct ReaderCache {
+    inner: Mutex<IdleReaders>,
+    hits: AtomicU64,
+    evictions: AtomicU64,
+}
+
+#[derive(Default)]
+struct IdleReaders {
+    epoch: u64,
+    readers: VecDeque<(SourceId, Weak<()>, Reader)>,
+}
+
+const MAX_IDLE_READERS: usize = 16;
 
 impl ReaderCache {
     pub(super) fn clear(&self) -> EngineResult<()> {
-        self.0
+        let mut cache = self
+            .inner
             .lock()
-            .map_err(|_| EngineError::InvalidState("PAR3 reader cache poisoned"))?
-            .take();
+            .map_err(|_| EngineError::InvalidState("PAR3 reader cache poisoned"))?;
+        cache.epoch = cache.epoch.wrapping_add(1);
+        cache.readers.clear();
         Ok(())
+    }
+
+    fn evict(&self) -> io::Result<bool> {
+        let evicted = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("PAR3 reader cache poisoned"))?
+            .readers
+            .pop_front()
+            .is_some();
+        if evicted {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(evicted)
     }
 }
 
@@ -66,6 +96,8 @@ pub(in crate::pipeline) struct VirtualSource {
     identity: Arc<()>,
     cache: Arc<ReaderCache>,
     counters: Arc<CipherOverlayCounters>,
+    requested_bytes: Arc<AtomicU64>,
+    snapshot_checks: AtomicU64,
     _memory: assessment::ViewReservation,
     payloads: Arc<Vec<Arc<budget::PayloadLease>>>,
     _pins: Vec<HandleLease>,
@@ -126,6 +158,8 @@ impl VirtualSource {
             cache,
             identity: Arc::new(()),
             counters: Arc::new(CipherOverlayCounters::default()),
+            requested_bytes: Arc::new(AtomicU64::new(0)),
+            snapshot_checks: AtomicU64::new(0),
             _memory: memory,
             payloads,
             _pins: pins,
@@ -139,6 +173,7 @@ impl VirtualSource {
 
     fn check(&self) -> io::Result<()> {
         self.options.cancel.check().map_err(io::Error::other)?;
+        self.snapshot_checks.fetch_add(1, Ordering::Relaxed);
         for backing in &self.backing {
             if backing.access.snapshot(self.source)? != backing.snapshot {
                 return Err(io::Error::other(EngineError::SourceChanged(self.source)));
@@ -147,18 +182,47 @@ impl VirtualSource {
         Ok(())
     }
 
-    fn reader(&self) -> io::Result<Reader> {
-        let cached = self
-            .cache
-            .0
-            .lock()
-            .map_err(|_| io::Error::other("PAR3 reader cache poisoned"))?
-            .take();
-        if let Some((identity, reader)) = cached
-            && Arc::ptr_eq(&identity, &self.identity)
-        {
-            return Ok(reader);
+    fn reader(&self) -> io::Result<(Reader, u64)> {
+        let epoch = {
+            let mut cache = self
+                .cache
+                .inner
+                .lock()
+                .map_err(|_| io::Error::other("PAR3 reader cache poisoned"))?;
+            cache
+                .readers
+                .retain(|(_, identity, _)| identity.strong_count() != 0);
+            if let Some(index) = cache.readers.iter().position(|(source, identity, _)| {
+                *source == self.source && identity.ptr_eq(&Arc::downgrade(&self.identity))
+            }) {
+                let (_, _, reader) = cache.readers.remove(index).expect("cached reader");
+                self.cache.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok((reader, cache.epoch));
+            }
+            cache.epoch
+        };
+        loop {
+            match self.new_reader() {
+                Ok(reader) => return Ok((reader, epoch)),
+                Err(error)
+                    if budget::pressure_source(&error).is_some()
+                        || error.get_ref().is_some_and(|inner| {
+                            inner.downcast_ref::<EngineError>().is_some_and(|error| {
+                                matches!(error, EngineError::ResourceLimit(_))
+                                    || budget::error_pressure_source(error).is_some()
+                            })
+                        }) =>
+                {
+                    if !self.cache.evict()? {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
+    }
+
+    fn new_reader(&self) -> io::Result<Reader> {
         // Cover one bounded cipher temporary, the chain-to-seed buffer and the
         // owned metadata clone. Handles are leased before either can open.
         let memory = assessment::ViewReservation::acquire(
@@ -175,6 +239,7 @@ impl VirtualSource {
             .map_err(io::Error::other)?;
         Ok(Reader {
             cancel: self.options.cancel.clone(),
+            requested_bytes: Arc::clone(&self.requested_bytes),
             inner: VirtualVolumeReader::<true>::new(
                 self.volume.clone(),
                 Arc::clone(&self.counters),
@@ -184,6 +249,50 @@ impl VirtualSource {
             _handles: handles,
             _pins: pins,
         })
+    }
+
+    fn return_reader(&self, reader: Reader, epoch: u64) -> io::Result<()> {
+        let mut cache = self
+            .cache
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("PAR3 reader cache poisoned"))?;
+        if cache.epoch != epoch || self.options.cancel.check().is_err() {
+            return Ok(());
+        }
+        // Concurrent reads own distinct readers. Retain only the last returned
+        // frontier for a publication; no checked-out reader is evicted here.
+        cache
+            .readers
+            .retain(|(source, _, _)| *source != self.source);
+        if cache.readers.len() == MAX_IDLE_READERS {
+            cache.readers.pop_front();
+            self.cache.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        cache
+            .readers
+            .push_back((self.source, Arc::downgrade(&self.identity), reader));
+        Ok(())
+    }
+}
+
+impl Drop for VirtualSource {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = self.cache.inner.lock() {
+            cache
+                .readers
+                .retain(|(_, identity, _)| !identity.ptr_eq(&Arc::downgrade(&self.identity)));
+        }
+        tracing::info!(
+            source = self.source.0,
+            requested_bytes = self.requested_bytes.load(Ordering::Relaxed),
+            snapshot_checks = self.snapshot_checks.load(Ordering::Relaxed),
+            reencrypted_bytes = self.counters.reencrypted_bytes(),
+            chained_bytes = self.counters.chained_bytes(),
+            reader_reuses = self.cache.hits.load(Ordering::Relaxed),
+            reader_evictions = self.cache.evictions.load(Ordering::Relaxed),
+            "PAR3 virtual source retired"
+        );
     }
 }
 
@@ -217,16 +326,11 @@ impl SourceAccess for VirtualSource {
             return Ok(0);
         }
         self.check()?;
-        let mut reader = self.reader()?;
+        let (mut reader, epoch) = self.reader()?;
         reader.inner.seek(SeekFrom::Start(offset))?;
         let count = reader.read(out)?;
         self.check()?;
-        *self
-            .cache
-            .0
-            .lock()
-            .map_err(|_| io::Error::other("PAR3 reader cache poisoned"))? =
-            Some((Arc::clone(&self.identity), reader));
+        self.return_reader(reader, epoch)?;
         Ok(count)
     }
 
@@ -238,7 +342,7 @@ impl SourceAccess for VirtualSource {
         let Some(prefix) = self.ranges.first().filter(|range| range.start == 0) else {
             return Ok(None);
         };
-        let mut reader = self.reader()?;
+        let (mut reader, _) = self.reader()?;
         reader.inner.seek(SeekFrom::Start(0))?;
         // PAR3 can use an honest prefix even when later readable islands exist.
         // PublishedSources checks freshness around sequential reads as well.
@@ -248,6 +352,7 @@ impl SourceAccess for VirtualSource {
 
 struct Reader {
     cancel: par3_rs::runtime::CancellationToken,
+    requested_bytes: Arc<AtomicU64>,
     inner: VirtualVolumeReader<true>,
     _memory: assessment::ViewReservation,
     _payloads: Arc<Vec<Arc<budget::PayloadLease>>>,
@@ -258,6 +363,8 @@ struct Reader {
 impl Read for Reader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.cancel.check().map_err(io::Error::other)?;
+        self.requested_bytes
+            .fetch_add(out.len() as u64, Ordering::Relaxed);
         match self.inner.read(out) {
             Err(error) if is_hole(&error) => Ok(0),
             result => result,

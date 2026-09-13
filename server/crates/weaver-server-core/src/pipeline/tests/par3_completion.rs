@@ -2,6 +2,63 @@ use super::*;
 
 const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
 
+#[tokio::test]
+async fn par3_repair_phases_admit_two_and_preserve_par2_exclusion() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    for number in 1..=4 {
+        let id = JobId(number);
+        insert_active_job(
+            &mut pipeline,
+            id,
+            standalone_job_spec("repair phases", &[("payload.bin".into(), 1)]),
+        )
+        .await;
+        if number < 4 {
+            pipeline
+                .par3_runtime
+                .get_or_insert_with(Box::default)
+                .admit(id)
+                .unwrap();
+        }
+    }
+    assert!(pipeline.maybe_start_par3_repair(JobId(1)).await);
+    assert!(pipeline.maybe_start_par3_repair(JobId(2)).await);
+    assert!(!pipeline.maybe_start_par3_repair(JobId(3)).await);
+    assert!(!pipeline.maybe_start_repair(JobId(4)).await);
+    assert_eq!(pipeline.active_repair_jobs(), 2);
+    pipeline.transition_postprocessing_status(
+        JobId(1),
+        JobStatus::Downloading,
+        Some("downloading"),
+    );
+    pipeline.promote_queued_repairs();
+    assert!(matches!(
+        pipeline.jobs[&JobId(3)].status,
+        JobStatus::Repairing
+    ));
+    assert!(matches!(
+        pipeline.jobs[&JobId(4)].status,
+        JobStatus::QueuedRepair
+    ));
+    for number in [2, 3] {
+        pipeline.transition_postprocessing_status(
+            JobId(number),
+            JobStatus::Downloading,
+            Some("downloading"),
+        );
+    }
+    pipeline.promote_queued_repairs();
+    assert!(matches!(
+        pipeline.jobs[&JobId(4)].status,
+        JobStatus::Repairing
+    ));
+    assert!(
+        !pipeline.maybe_start_par3_repair(JobId(1)).await,
+        "an active PAR2 repair keeps its existing exclusive admission"
+    );
+}
+
 #[test]
 fn par3_indexes_and_smaller_volumes_do_not_change_par2_promotion() {
     for (names, promoted) in [
@@ -555,6 +612,122 @@ async fn par3_index_avoids_speculative_recovery_and_defers_early_health_abort() 
     assert!(pipeline.par3_runtime.is_none());
 }
 
+#[tokio::test]
+async fn par3_recovery_windows_bound_47_and_81_articles_without_duplicate_admission() {
+    for count in [47, 81] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3210);
+        let mut spec = standalone_job_spec("window", &[("set.vol0+1.par3".into(), 750_000)]);
+        spec.files[0].role = FileRole::from_filename("set.vol0+1.par3");
+        spec.files[0].segments = (0..count).map(|number| segment_spec! {
+            number: number, bytes: 750_000, message_id: format!("window-{number}@example.test"),
+        }).collect();
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        // No index has arrived: exercise bounded ordinal discovery, without
+        // inventing authenticated packet positions or recovery counts.
+        let runtime = pipeline.par3_runtime.get_or_insert_with(Box::default);
+        runtime.admit(job_id).unwrap();
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        for work in state.download_queue.drain_all() {
+            state.recovery_queue.push(work);
+        }
+        let mut received = HashSet::new();
+        let mut windows = 0;
+        while received.len() < count as usize {
+            assert!(pipeline.promote_par3_recovery_window(job_id, false));
+            let size = pipeline.jobs[&job_id].download_queue.len();
+            assert_eq!(size, (count as usize - received.len()).min(32));
+            assert!(pipeline.promote_par3_recovery_window(job_id, false));
+            assert_eq!(pipeline.jobs[&job_id].download_queue.len(), size);
+            let work = pipeline
+                .jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .download_queue
+                .drain_all();
+            for item in work {
+                assert!(item.completion_critical);
+                assert_eq!(item.retry_count, 0);
+                assert!(item.exclude_servers.is_empty());
+                assert!(received.insert(item.segment_id));
+                // A parked article must not block the next window or lose its
+                // retry ownership. It is not put back in the source queue.
+                pipeline
+                    .pending_retries_by_segment
+                    .insert(item.segment_id, 1);
+            }
+            windows += 1;
+        }
+        assert_eq!(windows, (count as usize).div_ceil(32));
+        assert_eq!(pipeline.pending_retries_by_segment.len(), count as usize);
+        assert!(!pipeline.promote_par3_recovery_window(job_id, false));
+    }
+}
+
+#[tokio::test]
+async fn par3_windows_preserve_byte_limits_pause_and_unassessed_arrivals() {
+    for (article_bytes, prefetch, expected) in [
+        (18 << 20, false, 1),
+        (40 << 20, false, 1),
+        (9 << 20, true, 0),
+    ] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3211);
+        let name = "set.vol0+1.par3";
+        let mut spec = standalone_job_spec("bounded", &[(name.into(), article_bytes)]);
+        spec.files[0].role = FileRole::from_filename(name);
+        spec.files[0].segments = (0..3)
+            .map(|number| {
+                segment_spec! {
+                    number: number, bytes: article_bytes,
+                    message_id: format!("bounded-{number}@example.test"),
+                }
+            })
+            .collect();
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        pipeline
+            .par3_runtime
+            .get_or_insert_with(Box::default)
+            .admit(job_id)
+            .unwrap();
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        for work in state.download_queue.drain_all() {
+            state.recovery_queue.push(work);
+        }
+        state.status = JobStatus::Paused;
+        assert!(!pipeline.promote_par3_recovery_window(job_id, prefetch));
+        assert!(pipeline.jobs[&job_id].download_queue.is_empty());
+        pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Downloading;
+        assert_eq!(
+            pipeline.promote_par3_recovery_window(job_id, prefetch),
+            expected != 0
+        );
+        assert_eq!(pipeline.jobs[&job_id].download_queue.len(), expected);
+        if expected == 0 {
+            assert_eq!(pipeline.jobs[&job_id].recovery_queue.len(), 3);
+            continue;
+        }
+        let work = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .download_queue
+            .drain_all();
+        let file = work[0].segment_id.file_id;
+        pipeline.active_decodes_by_file.insert(file, 1);
+        assert!(pipeline.promote_par3_recovery_window(job_id, false));
+        assert!(
+            pipeline.jobs[&job_id].download_queue.is_empty(),
+            "decode must publish before another batch"
+        );
+        pipeline.active_decodes_by_file.remove(&file);
+        assert!(pipeline.promote_par3_recovery_window(job_id, false));
+        assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 1);
+    }
+}
+
 async fn settle_par3(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline.par3_runtime.as_ref().unwrap().has_work(job_id) {
         let done =
@@ -563,6 +736,129 @@ async fn settle_par3(pipeline: &mut Pipeline, job_id: JobId) {
                 .unwrap()
                 .unwrap();
         pipeline.handle_repair_work_done(done).await;
+    }
+}
+
+#[tokio::test]
+async fn par3_prefetch_requires_confirmed_protected_damage_and_runs_only_once() {
+    for mode in ["unprotected", "withdrawn", "absent"] {
+        let confirmed = mode != "unprotected";
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3220);
+        let files = [
+            (
+                "a.bin",
+                (0..5000u32).map(|i| (i * 7 + 3) as u8).collect::<Vec<_>>(),
+            ),
+            ("b.txt", b"qrstuvwxyz".to_vec()),
+            (
+                "sub/c.bin",
+                (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+            ),
+            ("set.par3", INDEX.to_vec()),
+            ("still-downloading.bin", Vec::new()),
+            ("set.vol0+1.par3", Vec::new()),
+        ];
+        let mut spec = standalone_job_spec(
+            "prefetch",
+            &files
+                .iter()
+                .map(|(name, bytes)| ((*name).into(), (bytes.len() as u32).max(750_000)))
+                .collect::<Vec<_>>(),
+        );
+        spec.files[3].role = FileRole::from_filename("set.par3");
+        spec.files[5].role = FileRole::from_filename("set.vol0+1.par3");
+        spec.files[5].segments = (0..16).map(|number| segment_spec! {
+            number: number, bytes: 750_000, message_id: format!("prefetch-{number}@example.test"),
+        }).collect();
+        let working = insert_active_job(&mut pipeline, job_id, spec).await;
+        tokio::fs::create_dir(working.join("sub")).await.unwrap();
+        for (index, (name, bytes)) in files[..4].iter().enumerate() {
+            if mode == "absent" && index == 0 {
+                continue;
+            }
+            tokio::fs::write(working.join(name), bytes).await.unwrap();
+            pipeline
+                .jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .assembly
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                })
+                .unwrap()
+                .mark_complete();
+        }
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .download_queue
+            .extract_matching(|work| work.segment_id.file_id.file_index < 4);
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 3,
+                },
+            )
+            .await;
+        settle_par3(&mut pipeline, job_id).await;
+        let missing = SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: if confirmed { 0 } else { 4 },
+            },
+            segment_number: 0,
+        };
+        pipeline
+            .segment_terminal_states
+            .insert(missing, SegmentTerminalState::Missing);
+        if mode == "withdrawn" {
+            // Withdraw verification while retaining the authenticated binding.
+            pipeline.invalidate_par3_source_write(missing.file_id);
+        }
+        pipeline.maybe_prefetch_par3_recovery(job_id);
+        let promoted = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .download_queue
+            .extract_matching(|work| work.segment_id.file_id.file_index == 5);
+        if confirmed {
+            assert!(!promoted.is_empty());
+            assert!(promoted.len() <= 8);
+            assert!(
+                promoted
+                    .iter()
+                    .map(|work| u64::from(work.byte_estimate))
+                    .sum::<u64>()
+                    <= 8 << 20
+            );
+        } else {
+            assert!(
+                promoted.is_empty(),
+                "an unprotected missing article cannot justify prefetch"
+            );
+        }
+        assert_eq!(
+            pipeline.jobs[&job_id].download_queue.len(),
+            1,
+            "ordinary payload remains queued"
+        );
+        pipeline.maybe_prefetch_par3_recovery(job_id);
+        assert_eq!(
+            pipeline.jobs[&job_id].download_queue.len(),
+            1,
+            "a parked or transient window cannot repeat prefetch"
+        );
+        for work in promoted {
+            assert_eq!(work.retry_count, 0);
+            assert!(work.exclude_servers.is_empty());
+        }
     }
 }
 

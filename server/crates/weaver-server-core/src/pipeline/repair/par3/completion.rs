@@ -268,7 +268,7 @@ impl Pipeline {
                     self.fail_job(job_id, format!("PAR3 output planning failed: {error}"));
                     return true;
                 }
-                if !self.maybe_start_repair(job_id).await {
+                if !self.maybe_start_par3_repair(job_id).await {
                     return true;
                 }
                 let output = self.jobs[&job_id].working_dir.clone();
@@ -435,6 +435,36 @@ impl Pipeline {
                 };
                 let _ = self.event_tx.send(event);
                 self.release_direct_unpack_after_repair(job_id);
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::Downloading,
+                    Some("downloading"),
+                );
+                self.schedule_job_completion_check(job_id);
+            }
+            Err(error)
+                if budget::is_native_pressure(&error)
+                    && self
+                        .par3_runtime
+                        .as_mut()
+                        .is_some_and(|runtime| runtime.take_repair_retry(job_id)) =>
+            {
+                if let Err(error) = self.clear_par3_pressure_temporaries(job_id, &error).await {
+                    self.fail_job(job_id, error);
+                    return;
+                }
+                if let Err(error) = self
+                    .par3_runtime
+                    .as_mut()
+                    .expect("admitted job")
+                    .queue_reassessment(job_id)
+                {
+                    self.fail_job(
+                        job_id,
+                        format!("PAR3 reassessment admission failed: {error}"),
+                    );
+                    return;
+                }
                 self.transition_postprocessing_status(
                     job_id,
                     JobStatus::Downloading,
@@ -613,84 +643,6 @@ impl Pipeline {
     }
 
     fn promote_par3_recovery(&mut self, job_id: JobId) -> bool {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return false;
-        };
-        let candidates: std::collections::BTreeSet<_> = state
-            .spec
-            .files
-            .iter()
-            .enumerate()
-            .filter(|(_, file)| matches!(file.role, FileRole::Par3 { .. }))
-            .map(|(index, _)| index as u32)
-            .collect();
-        let state = self.jobs.get_mut(&job_id).expect("live job");
-        let mut pool = state.recovery_queue.drain_all();
-        pool.extend(
-            state
-                .download_queue
-                .extract_matching(|work| candidates.contains(&work.segment_id.file_id.file_index)),
-        );
-        let runtime = self.par3_runtime.as_ref().expect("admitted job");
-        let selected = pool
-            .iter()
-            .map(|work| work.segment_id)
-            .filter(|id| {
-                candidates.contains(&id.file_id.file_index)
-                    && !runtime.article_promoted(job_id, id.file_id.file_index, id.segment_number)
-            })
-            .min_by_key(|id| {
-                let needed = runtime.needed_offset(job_id, id.file_id.file_index);
-                let established = needed.is_some_and(|needed| {
-                    state
-                        .assembly
-                        .file(id.file_id)
-                        .and_then(|file| file.placement_of(id.segment_number))
-                        .is_some_and(|(offset, len)| {
-                            offset <= needed && needed < offset.saturating_add(u64::from(len))
-                        })
-                });
-                let rank = if established {
-                    0
-                } else if needed.is_some() {
-                    1
-                } else {
-                    2
-                };
-                (rank, id.file_id.file_index, id.segment_number)
-            });
-        let Some(selected) = selected else {
-            for work in pool {
-                state.recovery_queue.push(work);
-            }
-            return false;
-        };
-        if let Err(error) = self.par3_runtime.as_mut().expect("admitted job").promote(
-            job_id,
-            selected.file_id.file_index,
-            selected.segment_number,
-        ) {
-            for work in pool {
-                state.recovery_queue.push(work);
-            }
-            self.fail_job(job_id, format!("PAR3 acquisition failed: {error}"));
-            return true;
-        }
-        for mut work in pool {
-            if work.segment_id == selected {
-                work.priority = crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY;
-                work.completion_critical = true;
-                state.download_queue.push(work);
-            } else {
-                state.recovery_queue.push(work);
-            }
-        }
-        // The candidate's name is only a discovery hint. Reassess authenticated
-        // matrix/cohort requirements after each article. Unknown decoded
-        // offsets use finite ordinal probes; NZB encoded sizes never substitute
-        // for established decoded positions.
-        self.transition_postprocessing_status(job_id, JobStatus::Downloading, Some("downloading"));
-        self.update_queue_metrics();
-        true
+        self.promote_par3_recovery_window(job_id, false)
     }
 }

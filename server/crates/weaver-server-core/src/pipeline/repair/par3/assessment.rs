@@ -24,6 +24,7 @@ pub(in crate::pipeline) struct AssessmentView {
     pub files: Vec<AssessedFile>,
     pub(super) output_lengths: Vec<u64>,
     pub requirements: Vec<RecoveryRequirement>,
+    pub(super) block_size: u64,
     pub(super) embedded_source: Option<SourceId>,
     pub(super) verified_sources: std::collections::BTreeSet<SourceId>,
     _reservation: ViewReservation,
@@ -63,6 +64,7 @@ impl AssessmentView {
                 .map(|layout| layout.files().iter().map(|file| file.len).collect())
                 .unwrap_or_default(),
             requirements: assessment.requirements.clone(),
+            block_size: layout.map_or(0, |layout| layout.block_size()),
             embedded_source: layout
                 .filter(|layout| {
                     layout.files().len() == 1

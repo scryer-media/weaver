@@ -180,6 +180,14 @@ async fn persist_events(
 
         match recv {
             Ok(event) => {
+                let barrier = matches!(
+                    event,
+                    PipelineEvent::RepairComplete { .. }
+                        | PipelineEvent::EmbeddedProtectionReplaced { .. }
+                        | PipelineEvent::JobCompleted { .. }
+                        | PipelineEvent::JobFailed { .. }
+                        | PipelineEvent::JobCancelled { .. }
+                );
                 if should_record_job_event(&event) {
                     let gql = PipelineEventGql::from(&event);
                     if let Some(job_id) = gql.job_id {
@@ -197,8 +205,11 @@ async fn persist_events(
                     }
                 }
 
-                if batch.len() >= 50 {
+                if batch.len() >= 50 || barrier {
                     flush_job_event_batch(&db, &mut batch).await;
+                }
+                if barrier && let Err(error) = db.flush_write_queue().await {
+                    tracing::warn!(%error, "failed to flush lifecycle event boundary");
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -328,6 +339,45 @@ mod tests {
 
         sender.await.unwrap();
         drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repair_boundary_flushes_before_the_periodic_deadline_or_shutdown() {
+        let db = Database::open_in_memory().unwrap();
+        let (tx, rx) = broadcast::channel(64);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(persist_events(rx, db.clone(), shutdown.clone()));
+        // Let the interval's immediate first tick finish before sending a batch.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let started = tokio::time::Instant::now();
+        for id in [7, 8] {
+            tx.send(PipelineEvent::JobPaused { job_id: JobId(id) })
+                .unwrap();
+            tx.send(PipelineEvent::RepairComplete {
+                job_id: JobId(id),
+                slices_repaired: 3,
+            })
+            .unwrap();
+        }
+        // Yield to the subscriber and SQLite worker, without advancing time,
+        // closing the channel, reaching the batch size or notifying shutdown.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if db.get_job_events(8).unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(tokio::time::Instant::now(), started);
+        for id in [7, 8] {
+            let events = db.get_job_events(id).unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1].kind, "RepairComplete");
+        }
+        shutdown.notify_one();
         task.await.unwrap();
     }
 }

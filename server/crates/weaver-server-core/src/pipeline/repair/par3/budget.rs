@@ -149,6 +149,16 @@ pub(super) fn budgets() -> &'static Budgets {
     })
 }
 
+pub(super) fn is_native_pressure(error: &EngineError) -> bool {
+    match error {
+        EngineError::ResourceLimit("memory budget" | "minimum repair stripe" | "open handles") => {
+            true
+        }
+        EngineError::RepairInterrupted { cause, .. } => is_native_pressure(cause),
+        _ => false,
+    }
+}
+
 pub(super) fn is_host_pressure(error: &EngineError) -> bool {
     match error {
         EngineError::ResourceLimit("PAR3 host state" | "PAR3 retained payload") => true,

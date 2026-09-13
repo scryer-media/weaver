@@ -14,6 +14,47 @@ async fn next(coordinator: &mut Coordinator) -> WorkDone {
 }
 
 #[tokio::test]
+async fn peer_pressure_waits_for_retirement_then_retries_once_in_isolation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    let mut coordinator = Coordinator::default();
+    coordinator.cpu_limit = 4;
+    for id in [JobId(1), JobId(2)] {
+        coordinator.enqueue(id, SourceId(0), path.clone()).unwrap();
+    }
+    coordinator.dispatch().unwrap();
+    let mut failed = next(&mut coordinator).await;
+    let peer = next(&mut coordinator).await;
+    let id = failed.job_id;
+    failed.result = Err(EngineError::ResourceLimit("memory budget"));
+    assert_eq!(coordinator.settle(failed), Some(id));
+    assert!(coordinator.error(id).is_none());
+    assert!(coordinator.jobs[&id].retry_serial);
+    coordinator.enqueue(id, SourceId(0), path).unwrap();
+    coordinator.dispatch().unwrap();
+    assert!(
+        coordinator.jobs[&id].ticket.is_none(),
+        "handback, not cancellation, releases the peer's capacity"
+    );
+    coordinator.settle(peer);
+    coordinator.dispatch().unwrap();
+    assert_eq!(coordinator.in_flight.len(), 1);
+    let mut solo = next(&mut coordinator).await;
+    assert_eq!(solo.job_id, id);
+    solo.result = Err(EngineError::ResourceLimit("memory budget"));
+    coordinator.settle(solo);
+    assert!(matches!(
+        coordinator.error(id),
+        Some(EngineError::ResourceLimit("memory budget"))
+    ));
+    assert!(
+        !coordinator.has_work(id),
+        "a solo failure cannot become an unbounded retry loop"
+    );
+    assert!(coordinator.worker_allowances.is_empty());
+}
+
+#[tokio::test]
 async fn idle_session_eviction_preserves_requirements_and_reopens_after_arrivals() {
     let root = tempfile::tempdir().unwrap();
     let path = carrier(root.path());
@@ -350,6 +391,7 @@ async fn busy_job_yields_worker_capacity_to_other_jobs() {
     let root = tempfile::tempdir().unwrap();
     let path = carrier(root.path());
     let mut coordinator = Coordinator::default();
+    coordinator.cpu_limit = 1;
     coordinator
         .enqueue(JobId(1), SourceId(0), path.clone())
         .unwrap();
@@ -390,6 +432,7 @@ async fn workers_return_retained_state_and_serialize_carriers() {
     let root = tempfile::tempdir().unwrap();
     let path = carrier(root.path());
     let mut coordinator = Coordinator::default();
+    coordinator.cpu_limit = 1;
     coordinator
         .enqueue(JobId(1), SourceId(0), path.clone())
         .unwrap();
@@ -415,6 +458,40 @@ async fn workers_return_retained_state_and_serialize_carriers() {
     let done = next(&mut coordinator).await;
     assert_eq!(coordinator.settle(done), Some(JobId(2)));
     assert!(coordinator.in_flight.is_empty());
+}
+
+#[tokio::test]
+async fn two_jobs_share_cpu_and_cancelled_tickets_keep_their_allowance() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    let mut coordinator = Coordinator::default();
+    coordinator.cpu_limit = 4;
+    for id in [JobId(1), JobId(2), JobId(3)] {
+        coordinator.enqueue(id, SourceId(0), path.clone()).unwrap();
+    }
+    coordinator.dispatch().unwrap();
+    assert_eq!(coordinator.in_flight.len(), 2);
+    assert_eq!(
+        coordinator
+            .worker_allowances
+            .values()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![2, 2]
+    );
+    coordinator.forget(JobId(1));
+    coordinator.dispatch().unwrap();
+    assert_eq!(coordinator.in_flight.len(), 2);
+    assert!(coordinator.jobs[&JobId(3)].runtime.is_some());
+    for _ in 0..2 {
+        let done = next(&mut coordinator).await;
+        coordinator.settle(done);
+    }
+    assert!(coordinator.worker_allowances.is_empty());
+    coordinator.dispatch().unwrap();
+    assert_eq!(coordinator.worker_allowances.values().sum::<usize>(), 4);
+    let done = next(&mut coordinator).await;
+    assert_eq!(coordinator.settle(done), Some(JobId(3)));
 }
 
 #[tokio::test]
@@ -725,6 +802,7 @@ fn discovery_hint_cannot_authorize_rewriting_a_clean_standalone_set() {
         SourceId(1),
         KnownSource {
             carrier: true,
+            protected: false,
             embedded_start: Some(0),
             complete_disk_image: false,
             promoted: BTreeMap::new(),
