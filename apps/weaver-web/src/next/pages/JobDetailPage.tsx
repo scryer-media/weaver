@@ -15,7 +15,7 @@ import {
   RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
-import { normalizeJobData, type GraphqlJobData } from "@/lib/job-types";
+import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
 import {
   Bar,
@@ -31,6 +31,7 @@ import {
 } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { DangerButton, SecondaryButton } from "../components/controls";
+import { PhaseBars, useJobProgress } from "../components/PhaseBars";
 import { GridRow } from "../components/rows";
 import { Waterfall } from "../components/Waterfall";
 import {
@@ -134,6 +135,13 @@ interface DuplicateSnapshot {
   } | null;
 }
 
+/** What the progress clock holds before the snapshot arrives. */
+const NO_JOB: Pick<JobData, "id" | "status" | "phaseProgress"> = {
+  id: -1,
+  status: "",
+  phaseProgress: [],
+};
+
 /** `SOME_EVENT_KIND` is the engine's word; the log shows it as it is. */
 function sentenceCase(value: string): string {
   const text = value.replace(/_/g, " ").toLowerCase();
@@ -182,6 +190,7 @@ export function JobDetailPage() {
   const inQueue = Boolean(snapshot?.queueItem);
   const raw = snapshot?.queueItem ?? snapshot?.historyItem ?? null;
   const job = useMemo(() => (raw ? normalizeJobData(raw) : null), [raw]);
+  const progress = useJobProgress(job ?? NO_JOB);
   // The engine appends; the log reads newest first, like every other log here.
   const events = useMemo(() => [...(snapshot?.jobEvents ?? [])].reverse(), [snapshot?.jobEvents]);
   // Shares are of the payload that *was* attributed, not of the job's bytes:
@@ -204,8 +213,8 @@ export function JobDetailPage() {
   // finished one is fixed and needs no clock at all.
   const now = useNow(1000, inQueue);
   const timeline = useMemo(
-    () => buildTimelineView(snapshot?.jobTimeline, now),
-    [now, snapshot?.jobTimeline],
+    () => buildTimelineView(snapshot?.jobTimeline, now, job?.status === "PROPAGATING"),
+    [job?.status, now, snapshot?.jobTimeline],
   );
 
   const files = filesData?.jobOutputFiles?.files ?? [];
@@ -241,7 +250,7 @@ export function JobDetailPage() {
   const token = statusToken(job.status);
   const failed = token === "failed";
   const done = token === "completed";
-  const color = statusColor(job.status);
+  const color = statusColor(progress.status);
   const percent = job.progress * 100;
   const phase = currentPhase(job);
   const stageIds = new Set(timeline?.stages.map((stage) => stage.id) ?? []);
@@ -262,7 +271,7 @@ export function JobDetailPage() {
       ? repaired
         ? "Complete — repaired, moved, scripts run"
         : "Complete — verified, moved, scripts run"
-      : `${statusLabel(job.status)} — ${Math.round(percent)}% of this job`;
+      : `${statusLabel(progress.status)} — ${Math.round(percent)}% of this job`;
 
   const statusSentence = failed
     ? `Stopped ${formatClockSeconds(job.completedAt)} · ${job.error || "the pipeline could not finish this job"}`
@@ -324,7 +333,7 @@ export function JobDetailPage() {
             <h1 className="min-w-0 truncate font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
               {job.displayTitle || job.name}
             </h1>
-            <StateChip label={statusLabel(job.status)} tone={failed ? "bad" : "ok"} />
+            <StateChip label={statusLabel(progress.status)} tone={failed ? "bad" : "ok"} />
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             {inQueue ? (
@@ -449,12 +458,14 @@ export function JobDetailPage() {
           <div className="font-wv-mono text-[11.5px] leading-[1.5] break-all text-wv-muted">
             {job.name}
           </div>
-          <div className="flex items-center gap-[14px]">
-            <Bar percent={percent} color={color} height={16} className="min-w-0 flex-1" />
-            <span className="flex-none font-wv-mono text-[13px] font-medium text-wv-fg">
-              {percent.toFixed(1)}%
-            </span>
-          </div>
+          <PhaseBars
+            job={job}
+            view={progress}
+            height={16}
+            decimals={1}
+            barClassName="min-w-0 flex-1"
+            percentClassName="text-[13px] font-medium text-wv-fg"
+          />
           <div className="font-wv-mono text-[11.5px] text-wv-muted">{statusSentence}</div>
         </div>
 
@@ -529,6 +540,7 @@ export function JobDetailPage() {
           {timeline ? (
             <Waterfall
               stages={timeline.stages}
+              members={timeline.members}
               ticks={timeline.ticks}
               window={timeline.window}
               total={timeline.total}

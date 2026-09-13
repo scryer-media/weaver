@@ -9,10 +9,10 @@ import {
 } from "@/graphql/queries";
 import type { JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
-import { Bar, Eyebrow } from "@/next/components/chrome";
+import { Eyebrow } from "@/next/components/chrome";
 import { DangerButton, SecondaryButton } from "@/next/components/controls";
+import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
-import { statusColor } from "@/next/data/palette";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 
 interface OutputFile {
@@ -68,10 +68,13 @@ export function DownloadInspector({
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
 
   const token = statusToken(job.status);
-  const color = statusColor(job.status);
-  const percent = Math.round(job.progress * 100);
+  const progress = useJobProgress(job);
   const files = data?.jobOutputFiles?.files ?? [];
-  const detail = statusDetail(job);
+  // Only a phase with a bar is one the inspector says the job is in.
+  const detail = statusDetail(
+    job,
+    progress.bars.find((bar) => bar.phase === progress.status) ?? progress.bars.at(-1) ?? null,
+  );
   const isPaused = token === "paused";
 
   return (
@@ -85,12 +88,14 @@ export function DownloadInspector({
           <div className="font-wv-mono text-[11px] leading-[1.5] break-all text-wv-faint">
             {job.name}
           </div>
-          <div className="mt-1 flex items-center gap-3">
-            <Bar percent={percent} color={color} height={16} className="flex-1" />
-            <span className="w-[34px] flex-none text-right font-wv-mono text-[11.5px] text-wv-secondary">
-              {percent}%
-            </span>
-          </div>
+          <PhaseBars
+            job={job}
+            view={progress}
+            height={16}
+            className="mt-1"
+            barClassName="flex-1"
+            percentClassName="w-[34px] text-right text-[11.5px] text-wv-secondary"
+          />
           {/* The inspector is a summary; the whole story lives on the job's own screen. */}
           <Link
             to={`/jobs/${job.id}`}
@@ -103,7 +108,9 @@ export function DownloadInspector({
         <div className="flex flex-none flex-col gap-[9px] border-b border-wv-hairline px-5 py-[18px]">
           <Field
             label="Status"
-            value={detail ? `${statusLabel(job.status)} — ${detail}` : statusLabel(job.status)}
+            value={
+              detail ? `${statusLabel(progress.status)} — ${detail}` : statusLabel(progress.status)
+            }
           />
           <Field label="Category" value={job.category || "uncategorised"} />
           <Field label="Total size" value={formatSize(job.totalBytes)} />

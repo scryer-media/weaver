@@ -11,16 +11,15 @@ import {
   useStableEtaSpeed,
   useStableQueueEta,
 } from "@/lib/hooks/use-stable-queue-eta";
+import { useTranslate } from "@/lib/context/translate-context";
 import { statusToken } from "@/lib/status-tokens";
-import { Bar, EmptyState, MetricCell, SectionHeader, Square } from "../components/chrome";
+import { EmptyState, MetricCell, SectionHeader } from "../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
 import { Menu, MenuItem } from "../components/Menu";
 import { StorageMounts, type StorageVolume } from "../components/storage";
-import { ListRow, ValueCell } from "../components/rows";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
-import { EM_DASH, formatSize } from "../data/format";
-import { statusColor } from "../data/palette";
+import { EM_DASH, formatDayClock, formatSize } from "../data/format";
 import {
   categoryFacets,
   facetKey,
@@ -41,6 +40,7 @@ import { NextShell } from "../shell/NextShell";
 import { CategoryListBlock, ProvidersBlock, ThroughputBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
+import { DownloadRow } from "./downloads/DownloadRow";
 
 type TabId = "all" | "active" | "queued" | "paused";
 type SortId = "priority" | "name" | "size" | "progress" | "eta";
@@ -52,6 +52,9 @@ const SORT_OPTIONS: { value: SortId; label: string }[] = [
   { value: "progress", label: "Progress" },
   { value: "eta", label: "Time left" },
 ];
+
+/** The statuses a global pause or a download block holds back. */
+const HELD_BACK_STATUSES = new Set(["DOWNLOADING", "QUEUED", "PROPAGATING"]);
 
 /** Group → the tab that shows it. "All" shows everything. */
 const TAB_FOR_GROUP: Record<DownloadGroup, TabId> = {
@@ -95,8 +98,9 @@ function sortJobs(jobs: JobData[], sort: SortId, etaById: Map<number, string>): 
 }
 
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused } = useNextData();
+  const { queue, categories: configured, speed, isPaused, downloadBlock } = useNextData();
   const statusLabel = useStatusLabel();
+  const t = useTranslate();
 
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
   const [tab, setTab] = useState<TabId>("all");
@@ -201,19 +205,26 @@ export function DownloadsPage() {
     setSelectedId((current) => (current === id ? null : current));
   }, []);
 
-  const trailingValue = useCallback(
-    (job: JobData): string => {
-      const token = statusToken(job.status);
-      if (token === "paused") return "paused";
-      const eta = etaById.get(job.id);
-      if (eta) return eta;
-      const phase = currentPhase(job);
-      if (token !== "queued" && phase && phase.totalBytes > 0) {
-        return `${Math.round(phase.progressPercent)}%`;
+  // A cap or a provider quota stops every download that would otherwise be
+  // fetching, whatever its own status says; so does pausing everything.
+  const blocked = downloadBlock.kind === "ISP_CAP" || downloadBlock.kind === "SERVER_QUOTA";
+  const blockEta =
+    downloadBlock.kind === "SERVER_QUOTA"
+      ? t("jobs.serverQuotaEta")
+      : t("jobs.bandwidthCapEta", { resetAt: formatDayClock(downloadBlock.windowEndsAtEpochMs) });
+  const blockLabel = t("jobs.bandwidthCapShort");
+
+  /** What stands in for time left: a hold, or an estimate; null when there is neither. */
+  const waitValue = useCallback(
+    (job: JobData): string | null => {
+      if (statusToken(job.status) === "paused") return "paused";
+      if (HELD_BACK_STATUSES.has(job.status)) {
+        if (blocked) return blockEta;
+        if (isPaused) return "paused";
       }
-      return EM_DASH;
+      return etaById.get(job.id) ?? null;
     },
-    [etaById],
+    [blockEta, blocked, etaById, isPaused],
   );
 
   return (
@@ -350,51 +361,24 @@ export function DownloadsPage() {
                   count={rows.length}
                   note={DOWNLOAD_GROUP_NOTE[group] || undefined}
                 />
-                {rows.map((job) => {
-                  const color = statusColor(job.status);
-                  const percent = Math.round(job.progress * 100);
-                  return (
-                    <ListRow
-                      key={job.id}
-                      markSelection
-                      selected={job.id === selectedId}
-                      onClick={() => setSelectedId(job.id)}
-                      title={formatJobReleaseName(job)}
-                      left={
-                        <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px]">
-                          <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
-                            {formatJobReleaseName(job)}
-                          </span>
-                          <div className="flex items-center gap-3">
-                            <Bar
-                              percent={percent}
-                              color={color}
-                              height={10}
-                              // 49 whole cells of the 7px period a 10px bar takes; a cap
-                              // off that multiple leaves dead track before the percentage.
-                              className="max-w-[343px] min-w-[56px] flex-1"
-                            />
-                            <span className="w-[34px] flex-none font-wv-mono text-[11.5px] text-wv-muted">
-                              {percent}%
-                            </span>
-                          </div>
-                        </div>
-                      }
-                      right={
-                        <>
-                          <div className="flex min-w-[96px] items-center gap-[9px]">
-                            <Square color={color} />
-                            <span className="truncate text-[12.5px] text-wv-secondary">
-                              {statusLabel(job.status)}
-                            </span>
-                          </div>
-                          <ValueCell>{formatSize(job.totalBytes)}</ValueCell>
-                          <ValueCell>{trailingValue(job)}</ValueCell>
-                        </>
-                      }
-                    />
-                  );
-                })}
+                {rows.map((job) => (
+                  <DownloadRow
+                    key={job.id}
+                    job={job}
+                    selected={job.id === selectedId}
+                    onSelect={setSelectedId}
+                    statusLabel={statusLabel}
+                    wait={waitValue(job)}
+                    hold={blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null}
+                    statusTitle={
+                      job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
+                        ? t("status.propagationUntil", {
+                            time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
+                          })
+                        : undefined
+                    }
+                  />
+                ))}
               </section>
             );
           })
@@ -403,8 +387,9 @@ export function DownloadsPage() {
 
       {selected === null ? null : (
         <DownloadInspector
+          key={selected.id}
           job={selected}
-          eta={trailingValue(selected)}
+          eta={waitValue(selected) ?? EM_DASH}
           rate={currentPhase(selected)?.rateBps ?? 0}
           onRemoved={handleRemoved}
         />

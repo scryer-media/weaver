@@ -234,6 +234,20 @@ export function formatDate(epochMs: number | null | undefined): string {
   });
 }
 
+/** A moment within the next few days: `14 Sep, 00:00`. */
+export function formatDayClock(epochMs: number | null | undefined): string {
+  if (epochMs == null || !Number.isFinite(epochMs)) {
+    return EM_DASH;
+  }
+  return new Date(epochMs).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
 export function formatLatency(milliseconds: number | null | undefined): string {
   if (milliseconds == null || !Number.isFinite(milliseconds) || milliseconds <= 0) {
     return EM_DASH;
