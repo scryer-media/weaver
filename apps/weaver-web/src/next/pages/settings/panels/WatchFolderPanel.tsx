@@ -5,6 +5,7 @@ import {
   UPDATE_SETTINGS_MUTATION,
   WATCH_FOLDER_SETTINGS_QUERY,
 } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import { KeyValueRow } from "../../../components/chrome";
 import { SecondaryButton } from "../../../components/controls";
 import {
@@ -60,13 +61,15 @@ const DEFAULTS: WatchFolder = {
   scanningPaused: false,
 };
 
+/** Option labels are translation keys, resolved when the panel renders. */
 const MODES: { value: string; label: string }[] = [
-  { value: "off", label: "Off" },
-  { value: "polling", label: "Polling" },
-  { value: "realtime", label: "Live" },
+  { value: "off", label: "next.common.off" },
+  { value: "polling", label: "next.watchFolder.polling" },
+  { value: "realtime", label: "next.watchFolder.live" },
 ];
 
 export function WatchFolderPanel() {
+  const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{ settings: { watchFolder: WatchFolder } }>({
     query: WATCH_FOLDER_SETTINGS_QUERY,
   });
@@ -98,7 +101,7 @@ export function WatchFolderPanel() {
     },
     save: () => {
       if (values.mode !== "off" && !values.path.trim()) {
-        setError("Choose a folder before switching the watcher on.");
+        setError(t("next.watchFolder.folderRequired"));
         return;
       }
       setError(null);
@@ -115,11 +118,11 @@ export function WatchFolderPanel() {
         },
       }).then((result) => {
         if (result.error || !result.data?.updateSettings) {
-          setError(result.error?.message ?? "Could not save the watch folder.");
+          setError(result.error?.message ?? t("next.watchFolder.saveFailed"));
           return;
         }
         draft.markSaved();
-        setStatus("Saved");
+        setStatus(t("next.settings.saved"));
         void reexecute({ requestPolicy: "network-only" });
       });
     },
@@ -147,24 +150,24 @@ export function WatchFolderPanel() {
     {
       kind: "section",
       id: "folder",
-      title: "Watch folder",
+      title: t("next.settings.panel.watchFolder"),
       fields: [
         {
           id: "mode",
-          label: "Watching",
-          help: "Live uses filesystem events; polling re-reads the folder on a timer. Network shares usually need polling.",
+          label: t("next.watchFolder.watching"),
+          help: t("next.watchFolder.watchingHelp"),
           keywords: "off polling realtime inotify",
           control: {
             kind: "segmented",
             value: values.mode,
-            options: MODES,
+            options: MODES.map((option) => ({ ...option, label: t(option.label) })),
             onChange: (next) => draft.set({ mode: next as WatchFolderMode }),
           },
         },
         {
           id: "path",
-          label: "Folder",
-          help: "Every .nzb dropped here is queued and then moved aside.",
+          label: t("next.watchFolder.folder"),
+          help: t("next.watchFolder.folderHelp"),
           keywords: values.path,
           control: {
             kind: "path",
@@ -177,34 +180,34 @@ export function WatchFolderPanel() {
           ? [
               {
                 id: "pollIntervalSecs",
-                label: "Poll interval",
-                help: "How often the folder is re-read.",
+                label: t("next.watchFolder.pollInterval"),
+                help: t("next.watchFolder.pollIntervalHelp"),
                 control: {
                   kind: "number" as const,
                   value: values.pollIntervalSecs,
                   min: 1,
                   onChange: (next: number) => draft.set({ pollIntervalSecs: next }),
-                  suffix: "seconds",
+                  suffix: t("next.general.seconds"),
                 },
               },
             ]
           : []),
         {
           id: "stabilitySecs",
-          label: "Settle time",
-          help: "Wait this long after a file stops changing before reading it, so a half-written NZB is never queued.",
+          label: t("next.watchFolder.settleTime"),
+          help: t("next.watchFolder.settleTimeHelp"),
           control: {
             kind: "number",
             value: values.stabilitySecs,
             min: 0,
             onChange: (next) => draft.set({ stabilitySecs: next }),
-            suffix: "seconds",
+            suffix: t("next.general.seconds"),
           },
         },
         {
           id: "categoryFromSubfolders",
-          label: "Category from subfolder",
-          help: "A file in `watch/tv` is queued under the `tv` category.",
+          label: t("next.watchFolder.categoryFromSubfolder"),
+          help: t("next.watchFolder.categoryFromSubfolderHelp"),
           control: {
             kind: "toggle",
             value: values.categoryFromSubfolders,
@@ -213,8 +216,8 @@ export function WatchFolderPanel() {
         },
         {
           id: "scanningPaused",
-          label: "Pause scanning",
-          help: "Keep the configuration but stop picking anything up for now.",
+          label: t("next.watchFolder.pauseScanning"),
+          help: t("next.watchFolder.pauseScanningHelp"),
           control: {
             kind: "toggle",
             value: values.scanningPaused,
@@ -227,15 +230,18 @@ export function WatchFolderPanel() {
       ? {
           kind: "custom",
           id: "report",
-          title: "Last scan",
-          note: `${report.queuedNzbs} queued of ${report.discoveredFiles} found`,
+          title: t("next.watchFolder.lastScan"),
+          note: t("next.watchFolder.lastScanNote", {
+            queued: report.queuedNzbs,
+            found: report.discoveredFiles,
+          }),
           searchText: "scan report queued discovered errors skipped",
           body: (
             <>
-              <KeyValueRow label="Files found" value={report.discoveredFiles} />
-              <KeyValueRow label="Queued" value={report.queuedNzbs} />
+              <KeyValueRow label={t("next.watchFolder.filesFound")} value={report.discoveredFiles} />
+              <KeyValueRow label={t("next.watchFolder.queued")} value={report.queuedNzbs} />
               {problems.length === 0 ? (
-                <KeyValueRow label="Problems" value="none" />
+                <KeyValueRow label={t("next.watchFolder.problems")} value={t("next.job.none")} />
               ) : (
                 problems.map((problem) => (
                   <div
@@ -269,7 +275,7 @@ export function WatchFolderPanel() {
     <>
       <PanelControls>
         <SecondaryButton icon="refresh" onClick={() => void runScan()} disabled={scanState.fetching}>
-          {scanState.fetching ? "Scanning…" : "Scan now"}
+          {scanState.fetching ? t("next.watchFolder.scanning") : t("next.watchFolder.scanNow")}
         </SecondaryButton>
       </PanelControls>
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { SETTINGS_QUERY, UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
-import { useLanguageSettings } from "@/lib/context/translate-context";
+import { useLanguageSettings, useTranslate } from "@/lib/context/translate-context";
 import { AVAILABLE_LANGUAGES } from "@/lib/i18n";
 import { setUiVariant } from "@/lib/ui-variant";
 import {
@@ -39,51 +39,48 @@ interface GeneralSettings {
 }
 
 const DUPLICATE_ACTION_LABEL: Record<DuplicateAction, string> = {
-  ACCEPT: "Accept",
-  WARN: "Warn",
-  PAUSE: "Pause",
-  BLOCK: "Block",
+  ACCEPT: "next.general.duplicateAction.accept",
+  WARN: "next.general.duplicateAction.warn",
+  PAUSE: "next.general.duplicateAction.pause",
+  BLOCK: "next.general.duplicateAction.block",
 };
 
-const DUPLICATE_OPTIONS = DUPLICATE_ACTIONS.map((action) => ({
-  value: action,
-  label: DUPLICATE_ACTION_LABEL[action],
-}));
-
+/** Translation keys, resolved when the panel renders. */
 const DUPLICATE_FIELDS: { key: keyof DuplicatePolicy; label: string; help: string }[] = [
   {
     key: "strictActiveOrSuccess",
-    label: "Same release, already here",
-    help: "An identical NZB that is downloading now or finished successfully.",
+    label: "next.general.duplicate.strictActive",
+    help: "next.general.duplicate.strictActiveHelp",
   },
   {
     key: "strictFailedOrCancelled",
-    label: "Same release, previously failed",
-    help: "An identical NZB whose earlier attempt failed or was cancelled.",
+    label: "next.general.duplicate.strictFailed",
+    help: "next.general.duplicate.strictFailedHelp",
   },
   {
     key: "articleLayoutActiveOrSuccess",
-    label: "Same article layout, already here",
-    help: "A different NZB that posts the same articles as a live or finished job.",
+    label: "next.general.duplicate.layoutActive",
+    help: "next.general.duplicate.layoutActiveHelp",
   },
   {
     key: "articleLayoutFailedOrCancelled",
-    label: "Same article layout, previously failed",
-    help: "A different NZB that posts the same articles as a failed attempt.",
+    label: "next.general.duplicate.layoutFailed",
+    help: "next.general.duplicate.layoutFailedHelp",
   },
   {
     key: "articleSet",
-    label: "Overlapping article set",
-    help: "A partial overlap with something weaver has already seen.",
+    label: "next.general.duplicate.articleSet",
+    help: "next.general.duplicate.articleSetHelp",
   },
   {
     key: "normalizedName",
-    label: "Same normalised name",
-    help: "A release whose name matches once casing, spacing and tags are stripped.",
+    label: "next.general.duplicate.normalizedName",
+    help: "next.general.duplicate.normalizedNameHelp",
   },
 ];
 
 export function GeneralPanel() {
+  const t = useTranslate();
   const { uiLanguage, setLanguagePreference } = useLanguageSettings();
   const [{ data, fetching }, reexecute] = useQuery<{ settings: GeneralSettings }>({ query: SETTINGS_QUERY });
   const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
@@ -130,11 +127,11 @@ export function GeneralPanel() {
         },
       }).then((result) => {
         if (result.error || !result.data?.updateSettings) {
-          setError(result.error?.message ?? "Could not save these settings.");
+          setError(result.error?.message ?? t("next.settings.saveFailed"));
           return;
         }
         draft.markSaved();
-        setStatus("Saved");
+        setStatus(t("next.settings.saved"));
         void reexecute({ requestPolicy: "network-only" });
       });
     },
@@ -143,8 +140,8 @@ export function GeneralPanel() {
   const interfaceFields: FieldSpec[] = [
     {
       id: "language",
-      label: "Language",
-      help: "Display language for the Weaver interface. Applies to this browser only.",
+      label: t("next.general.language"),
+      help: t("next.general.languageHelp"),
       keywords: "locale translation",
       control: {
         kind: "select",
@@ -158,8 +155,8 @@ export function GeneralPanel() {
     },
     {
       id: "ui-variant",
-      label: "New interface",
-      help: "Turning this off returns this browser to the classic interface and reloads the page.",
+      label: t("next.general.newInterface"),
+      help: t("next.general.newInterfaceHelp"),
       keywords: "classic theme appearance layout",
       control: {
         kind: "toggle",
@@ -174,30 +171,30 @@ export function GeneralPanel() {
   ];
 
   const blocks: (SettingsBlock | null)[] = [
-    { kind: "section", id: "interface", title: "Interface", fields: interfaceFields },
+    { kind: "section", id: "interface", title: t("next.general.interface"), fields: interfaceFields },
     values
       ? {
           kind: "section",
           id: "downloads",
-          title: "Downloads",
+          title: t("next.general.downloads"),
           fields: [
             {
               id: "maxRetries",
-              label: "Article retries",
-              help: "How many times a failed article is tried again before weaver gives up on it.",
+              label: t("next.general.retries"),
+              help: t("next.general.retriesHelp"),
               control: {
                 kind: "number",
                 value: values.maxRetries,
                 min: 0,
                 max: 20,
                 onChange: (next) => draft.set({ maxRetries: next }),
-                suffix: "attempts",
+                suffix: t("next.general.attempts"),
               },
             },
             {
               id: "propagationDelaySecs",
-              label: "Propagation delay",
-              help: "Hold a new NZB this long before starting, so every article has reached the servers.",
+              label: t("next.general.propagationDelay"),
+              help: t("next.general.propagationDelayHelp"),
               keywords: "wait posting delay seconds",
               control: {
                 kind: "number",
@@ -205,13 +202,13 @@ export function GeneralPanel() {
                 min: 0,
                 step: 60,
                 onChange: (next) => draft.set({ propagationDelaySecs: next }),
-                suffix: "seconds",
+                suffix: t("next.general.seconds"),
               },
             },
             {
               id: "ipReplacement",
-              label: "Extra connection while an address is on trial",
-              help: "Open one additional connection to a provider address weaver is still assessing.",
+              label: t("next.general.trialConnection"),
+              help: t("next.general.trialConnectionHelp"),
               keywords: "ip replacement trial connections",
               control: {
                 kind: "toggle",
@@ -222,8 +219,8 @@ export function GeneralPanel() {
             },
             {
               id: "srrdb",
-              label: "SRRDB release lookup",
-              help: "For obfuscated archive members, send only their CRC32 checksum to the public SRRDB index to recover a release name.",
+              label: t("next.general.srrdb"),
+              help: t("next.general.srrdbHelp"),
               keywords: "obfuscated rename",
               control: {
                 kind: "toggle",
@@ -238,20 +235,20 @@ export function GeneralPanel() {
       ? {
           kind: "section",
           id: "storage",
-          title: "Storage",
-          note: "paths the daemon writes to",
+          title: t("next.general.storage"),
+          note: t("next.general.storageNote"),
           fields: [
             {
               id: "dataDir",
-              label: "Data directory",
-              help: "Set when the daemon starts; the database and the default folders live here.",
+              label: t("next.settings.dataDirectory"),
+              help: t("next.general.dataDirHelp"),
               keywords: values.dataDir,
               control: { kind: "static", value: values.dataDir },
             },
             {
               id: "intermediateDir",
-              label: "Working directory",
-              help: "Where downloads are assembled before post-processing. Blank uses the data directory.",
+              label: t("next.general.workingDir"),
+              help: t("next.general.workingDirHelp"),
               keywords: `${values.intermediateDir} incomplete temporary`,
               control: {
                 kind: "path",
@@ -262,8 +259,8 @@ export function GeneralPanel() {
             },
             {
               id: "completeDir",
-              label: "Completed directory",
-              help: "Where finished downloads land. Categories are relative to this folder.",
+              label: t("next.general.completeDir"),
+              help: t("next.general.completeDirHelp"),
               keywords: `${values.completeDir} destination`,
               control: {
                 kind: "path",
@@ -274,8 +271,8 @@ export function GeneralPanel() {
             },
             {
               id: "cleanupAfterExtract",
-              label: "Clean up after unpacking",
-              help: "Delete archives and repair files once a release has been unpacked successfully.",
+              label: t("next.general.cleanup"),
+              help: t("next.general.cleanupHelp"),
               keywords: "delete rar par2 housekeeping",
               control: {
                 kind: "toggle",
@@ -290,17 +287,20 @@ export function GeneralPanel() {
       ? {
           kind: "section",
           id: "duplicates",
-          title: "Duplicates",
-          note: "what happens when a new NZB matches something weaver has seen",
+          title: t("next.general.duplicates"),
+          note: t("next.general.duplicatesNote"),
           fields: DUPLICATE_FIELDS.map(({ key, label, help }) => ({
             id: key,
-            label,
-            help,
+            label: t(label),
+            help: t(help),
             keywords: "duplicate",
             control: {
               kind: "select" as const,
               value: values.duplicatePolicy[key],
-              options: DUPLICATE_OPTIONS,
+              options: DUPLICATE_ACTIONS.map((action) => ({
+                value: action,
+                label: t(DUPLICATE_ACTION_LABEL[action]),
+              })),
               onChange: (next: string) =>
                 draft.set({
                   duplicatePolicy: {

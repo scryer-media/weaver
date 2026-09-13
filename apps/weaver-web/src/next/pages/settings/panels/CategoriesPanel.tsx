@@ -7,6 +7,7 @@ import {
   SETTINGS_QUERY,
   UPDATE_CATEGORY_MUTATION,
 } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
@@ -39,6 +40,7 @@ interface CategoryForm {
 const NEW_CATEGORY: CategoryForm = { name: "", destDir: "", aliases: "" };
 
 export function CategoriesPanel() {
+  const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{ categories: Category[] }>({ query: CATEGORIES_QUERY });
   const [{ data: settingsData }] = useQuery<{ settings: { completeDir: string; dataDir: string } }>({
     query: SETTINGS_QUERY,
@@ -75,7 +77,7 @@ export function CategoriesPanel() {
   const save = async () => {
     const name = form.name.trim();
     if (!name) {
-      setError("A category needs a name.");
+      setError(t("next.categories.nameRequired"));
       return;
     }
     setBusy(true);
@@ -109,12 +111,12 @@ export function CategoriesPanel() {
     {
       kind: "table",
       id: "categories",
-      title: "Categories",
-      note: "a blank destination means the completed folder",
+      title: t("next.settings.panel.categories"),
+      note: t("next.categories.note"),
       columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr)",
-      headers: ["Name", "Destination", "Also known as"],
-      empty: "No categories yet. Downloads without one land in the completed folder.",
-      emptyAction: { label: "Add category", onClick: () => open(null) },
+      headers: [t("next.categories.name"), t("next.categories.destination"), t("next.categories.aliases")],
+      empty: t("next.categories.empty"),
+      emptyAction: { label: t("next.categories.add"), onClick: () => open(null) },
       onRowClick: (id) => {
         const category = categories.find((entry) => String(entry.id) === id);
         if (category) {
@@ -143,30 +145,30 @@ export function CategoriesPanel() {
   return (
     <>
       <PanelControls>
-        <PrimaryButton icon="add" onClick={() => open(null)}>Add category</PrimaryButton>
+        <PrimaryButton icon="add" onClick={() => open(null)}>{t("next.categories.add")}</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
         open={editingId !== null}
-        title={editingId === "new" ? "Add category" : (editing?.name ?? "Category")}
-        note={editingId === "new" ? "new category" : `#${editing?.id ?? ""}`}
+        title={editingId === "new" ? t("next.categories.add") : (editing?.name ?? t("next.categories.category"))}
+        note={editingId === "new" ? t("next.categories.newNote") : `#${editing?.id ?? ""}`}
         error={error}
         busy={busy}
         onSave={() => void save()}
         onDismiss={() => setEditingId(null)}
         onDelete={editing ? () => setConfirmRemove(editing) : undefined}
-        deleteLabel="Remove category"
+        deleteLabel={t("next.categories.remove")}
         sections={[
           {
             id: "category",
-            title: "Category",
+            title: t("next.categories.category"),
             fields: [
               {
                 id: "name",
-                label: "Name",
-                help: "What the queue, the rail and your indexer call this category.",
+                label: t("next.categories.name"),
+                help: t("next.categories.nameHelp"),
                 control: {
                   kind: "text",
                   mono: false,
@@ -176,8 +178,10 @@ export function CategoriesPanel() {
               },
               {
                 id: "destDir",
-                label: "Destination",
-                help: `Leave blank to use ${completeDir || "the completed folder"}/${form.name || "<name>"}.`,
+                label: t("next.categories.destination"),
+                help: t("next.categories.destinationHelp", {
+                  path: `${completeDir || t("next.categories.completedFolder")}/${form.name || t("next.categories.namePlaceholder")}`,
+                }),
                 control: {
                   kind: "path",
                   value: form.destDir,
@@ -187,8 +191,8 @@ export function CategoriesPanel() {
               },
               {
                 id: "aliases",
-                label: "Also known as",
-                help: "Comma-separated names an indexer may send instead of this one.",
+                label: t("next.categories.aliases"),
+                help: t("next.categories.aliasesHelp"),
                 control: {
                   kind: "text",
                   value: form.aliases,
@@ -203,11 +207,11 @@ export function CategoriesPanel() {
 
       <ConfirmDialog
         open={confirmRemove !== null}
-        title="Remove category"
+        title={t("next.categories.remove")}
         note={confirmRemove?.name}
         busy={busy}
-        confirmLabel="Remove category"
-        body={`Downloads already filed under ${confirmRemove?.name ?? "this category"} keep their folder; new ones land in the completed folder instead.`}
+        confirmLabel={t("next.categories.remove")}
+        body={t("next.categories.removeBody", { name: confirmRemove?.name ?? "" })}
         onConfirm={() => void remove()}
         onDismiss={() => setConfirmRemove(null)}
       />

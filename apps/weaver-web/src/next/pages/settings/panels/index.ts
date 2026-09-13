@@ -23,8 +23,9 @@ import { WatchFolderPanel } from "./WatchFolderPanel";
 
 export interface PanelDefinition {
   slug: string;
+  /** Translation key of the panel's name. */
   label: string;
-  /** The mono subtitle beside the panel's title in the top bar. */
+  /** Translation key of the mono subtitle beside the panel's title in the top bar. */
   note: string;
   /** Right-hand rail tag; `"count:providers"` resolves to the server count. */
   tag?: "beta" | "count:providers";
@@ -36,80 +37,80 @@ export interface PanelDefinition {
 export const SETTINGS_PANELS: readonly PanelDefinition[] = [
   {
     slug: "general",
-    label: "General",
-    note: "interface, language, downloads",
+    label: "next.settings.panel.general",
+    note: "next.settings.panel.generalNote",
     icon: "general",
     Component: GeneralPanel,
   },
   {
     slug: "servers",
-    label: "Providers",
-    note: "tried in priority order",
+    label: "next.settings.panel.servers",
+    note: "next.settings.panel.serversNote",
     tag: "count:providers",
     icon: "providers",
     Component: ProvidersPanel,
   },
   {
     slug: "security",
-    label: "Security",
-    note: "sign-in, access, API keys",
+    label: "next.settings.panel.security",
+    note: "next.settings.panel.securityNote",
     icon: "security",
     Component: SecurityPanel,
   },
   {
     slug: "rss",
-    label: "RSS",
-    note: "feeds, rules, seen items",
+    label: "next.settings.panel.rss",
+    note: "next.settings.panel.rssNote",
     icon: "rss",
     Component: RssPanel,
   },
   {
     slug: "categories",
-    label: "Categories",
-    note: "where a release lands",
+    label: "next.settings.panel.categories",
+    note: "next.settings.panel.categoriesNote",
     icon: "categories",
     Component: CategoriesPanel,
   },
   {
     slug: "proxies",
-    label: "Proxies",
-    note: "tunnels providers and feeds may use",
+    label: "next.settings.panel.proxies",
+    note: "next.settings.panel.proxiesNote",
     icon: "proxies",
     Component: ProxiesPanel,
   },
   {
     slug: "bandwidth",
-    label: "Bandwidth",
-    note: "ceilings and the ISP cap",
+    label: "next.settings.panel.bandwidth",
+    note: "next.settings.panel.bandwidthNote",
     icon: "bandwidth",
     Component: BandwidthPanel,
   },
   {
     slug: "schedules",
-    label: "Schedules",
-    note: "when weaver pauses and resumes",
+    label: "next.settings.panel.schedules",
+    note: "next.settings.panel.schedulesNote",
     icon: "schedules",
     Component: SchedulesPanel,
   },
   {
     slug: "post-processing",
-    label: "Post-processing",
-    note: "scripts run when a download finishes",
+    label: "next.settings.panel.postProcessing",
+    note: "next.settings.panel.postProcessingNote",
     tag: "beta",
     icon: "postProcessing",
     Component: PostProcessingPanel,
   },
   {
     slug: "watch-folder",
-    label: "Watch folder",
-    note: "NZB files picked up from disk",
+    label: "next.settings.panel.watchFolder",
+    note: "next.settings.panel.watchFolderNote",
     icon: "watchFolder",
     Component: WatchFolderPanel,
   },
   {
     slug: "backup",
-    label: "Backup",
-    note: "snapshot and restore",
+    label: "next.settings.panel.backup",
+    note: "next.settings.panel.backupNote",
     icon: "backup",
     Component: BackupPanel,
   },

@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router";
 import { useQuery } from "urql";
 import { SETTINGS_QUERY } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import { NextShell } from "../../shell/NextShell";
 import { PanelListBlock, PathBlock } from "../../shell/rail-blocks";
 import { useNextData } from "../../data/next-data";
@@ -23,6 +24,7 @@ import { SETTINGS_PANELS, findPanel } from "./panels";
 const CLEAN: PanelFlags = { dirty: false, busy: false, status: null, failed: false };
 
 export function SettingsPage() {
+  const t = useTranslate();
   const { panel: slug } = useParams();
   const panel = findPanel(slug);
   const { providers } = useNextData();
@@ -53,21 +55,22 @@ export function SettingsPage() {
     () =>
       SETTINGS_PANELS.map((entry) => ({
         to: `/settings/${entry.slug}`,
-        label: entry.label,
+        label: t(entry.label),
         icon: entry.icon,
         tag:
           entry.tag === "beta"
-            ? "Beta"
+            ? t("next.settings.beta")
             : entry.tag === "count:providers"
               ? providers.length > 0
                 ? String(providers.length)
                 : undefined
               : undefined,
       })),
-    [providers.length],
+    [providers.length, t],
   );
 
-  const statusRight = flags.status ?? (flags.dirty ? "Unsaved changes" : "All changes saved");
+  const statusRight =
+    flags.status ?? (flags.dirty ? t("next.settings.unsaved") : t("next.settings.allSaved"));
   const statusTone = flags.failed
     ? "text-wv-error-text"
     : flags.dirty
@@ -78,10 +81,12 @@ export function SettingsPage() {
 
   return (
     <NextShell
-      title={panel?.label ?? "Settings"}
-      note={panel?.note}
-      railMiddle={<PanelListBlock eyebrow="Settings" items={railItems} />}
-      railFooter={<PathBlock eyebrow="Data directory" path={settingsData?.settings?.dataDir} />}
+      title={panel ? t(panel.label) : t("nav.settings")}
+      note={panel ? t(panel.note) : undefined}
+      railMiddle={<PanelListBlock eyebrow={t("nav.settings")} items={railItems} />}
+      railFooter={
+        <PathBlock eyebrow={t("next.settings.dataDirectory")} path={settingsData?.settings?.dataDir} />
+      }
       statusRight={<span className={statusTone}>{statusRight}</span>}
       controls={
         <>
@@ -93,8 +98,8 @@ export function SettingsPage() {
             the title does.
           */}
           <TextField
-            label="Search settings"
-            placeholder="Search settings"
+            label={t("next.settings.search")}
+            placeholder={t("next.settings.search")}
             mono={false}
             value={search}
             onChange={setSearch}
@@ -111,14 +116,18 @@ export function SettingsPage() {
             disabled={!flags.dirty || flags.busy}
             onClick={() => actionsRef.current?.revert()}
           >
-            Revert
+            {t("next.settings.revert")}
           </SecondaryButton>
           <PrimaryButton
             icon="save"
             disabled={!flags.dirty || flags.busy}
             onClick={() => actionsRef.current?.save()}
           >
-            {flags.busy ? "Saving…" : flags.dirty ? "Save changes" : "Saved"}
+            {flags.busy
+              ? t("settings.saving")
+              : flags.dirty
+                ? t("next.settings.saveChanges")
+                : t("next.settings.saved")}
           </PrimaryButton>
         </>
       }
@@ -134,8 +143,8 @@ export function SettingsPage() {
             <Panel key={panel?.slug} />
           ) : (
             <EmptyState
-              title="No such settings panel"
-              body="Pick one from the settings list in the navigation."
+              title={t("next.settings.noPanel")}
+              body={t("next.settings.noPanelBody")}
             />
           )}
         </SettingsShellProvider>

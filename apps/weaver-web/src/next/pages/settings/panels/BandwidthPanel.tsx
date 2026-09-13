@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { SETTINGS_QUERY, UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
 import type { DownloadBlockState } from "@/lib/context/live-data-context";
+import { useTranslate } from "@/lib/context/translate-context";
 import { Bar, KeyValueRow } from "../../../components/chrome";
 import { WV } from "../../../data/palette";
 import { formatDate, formatRate, formatSize } from "../../../data/format";
@@ -56,20 +57,21 @@ const DEFAULT_CAP: IspBandwidthCap = {
   monthlyResetDay: 1,
 };
 
+/** Option labels are translation keys, resolved when the panel renders. */
 const PERIODS: { value: string; label: string }[] = [
-  { value: "DAILY", label: "Daily" },
-  { value: "WEEKLY", label: "Weekly" },
-  { value: "MONTHLY", label: "Monthly" },
+  { value: "DAILY", label: "next.bandwidth.daily" },
+  { value: "WEEKLY", label: "next.bandwidth.weekly" },
+  { value: "MONTHLY", label: "next.bandwidth.monthly" },
 ];
 
 const WEEKDAYS: { value: string; label: string }[] = [
-  { value: "MON", label: "Monday" },
-  { value: "TUE", label: "Tuesday" },
-  { value: "WED", label: "Wednesday" },
-  { value: "THU", label: "Thursday" },
-  { value: "FRI", label: "Friday" },
-  { value: "SAT", label: "Saturday" },
-  { value: "SUN", label: "Sunday" },
+  { value: "MON", label: "next.weekday.mon" },
+  { value: "TUE", label: "next.weekday.tue" },
+  { value: "WED", label: "next.weekday.wed" },
+  { value: "THU", label: "next.weekday.thu" },
+  { value: "FRI", label: "next.weekday.fri" },
+  { value: "SAT", label: "next.weekday.sat" },
+  { value: "SUN", label: "next.weekday.sun" },
 ];
 
 const UNITS: { value: string; label: string }[] = [
@@ -95,6 +97,7 @@ function trimNumber(value: number): string {
 }
 
 export function BandwidthPanel() {
+  const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{
     settings: { maxDownloadSpeed: number; ispBandwidthCap: IspBandwidthCap | null };
     globalState: { downloadBlock: DownloadBlockState } | null;
@@ -141,7 +144,7 @@ export function BandwidthPanel() {
       const unitBytes = values.limitUnit === "TB" ? TIB : GIB;
       const limitBytes = Math.max(0, Math.round(Number(values.limitValue || 0) * unitBytes));
       if (values.cap.enabled && limitBytes <= 0) {
-        setError("Set a cap size before switching the cap on.");
+        setError(t("next.bandwidth.capSizeRequired"));
         return;
       }
       setError(null);
@@ -159,11 +162,11 @@ export function BandwidthPanel() {
         },
       }).then((result) => {
         if (result.error || !result.data?.updateSettings) {
-          setError(result.error?.message ?? "Could not save the bandwidth settings.");
+          setError(result.error?.message ?? t("next.bandwidth.saveFailed"));
           return;
         }
         draft.markSaved();
-        setStatus("Saved");
+        setStatus(t("next.settings.saved"));
         void reexecute({ requestPolicy: "network-only" });
       });
     },
@@ -178,8 +181,8 @@ export function BandwidthPanel() {
     ? [
         {
           id: "maxDownloadSpeed",
-          label: "Download ceiling",
-          help: "Applies immediately and persists across restarts. Zero means unlimited.",
+          label: t("next.bandwidth.ceiling"),
+          help: t("next.bandwidth.ceilingHelp"),
           keywords: "speed limit throttle rate",
           control: {
             kind: "slider",
@@ -189,13 +192,13 @@ export function BandwidthPanel() {
             step: SPEED_STEP,
             onChange: (next) => draft.set({ maxDownloadSpeed: next }),
             display:
-              values.maxDownloadSpeed === 0 ? "Unlimited" : formatRate(values.maxDownloadSpeed),
+              values.maxDownloadSpeed === 0 ? t("settings.unlimited") : formatRate(values.maxDownloadSpeed),
           },
         },
         {
           id: "capEnabled",
-          label: "Enforce a data cap",
-          help: "Stop downloading once the window's allowance is spent, and resume when it resets.",
+          label: t("next.bandwidth.enforceCap"),
+          help: t("next.bandwidth.enforceCapHelp"),
           keywords: "isp quota allowance metered",
           control: {
             kind: "toggle",
@@ -205,20 +208,20 @@ export function BandwidthPanel() {
         },
         {
           id: "capPeriod",
-          label: "Cap window",
-          help: "How often the allowance resets.",
+          label: t("next.bandwidth.capWindow"),
+          help: t("next.bandwidth.capWindowHelp"),
           keywords: "daily weekly monthly period",
           control: {
             kind: "segmented",
             value: values.cap.period,
-            options: PERIODS,
+            options: PERIODS.map((option) => ({ ...option, label: t(option.label) })),
             onChange: (next) => draft.set({ cap: { ...values.cap, period: next as CapPeriod } }),
           },
         },
         {
           id: "capLimit",
-          label: "Allowance",
-          help: "How much may be downloaded inside one window.",
+          label: t("next.bandwidth.allowance"),
+          help: t("next.bandwidth.allowanceHelp"),
           keywords: "cap size gb tb limit",
           control: {
             kind: "custom",
@@ -227,7 +230,7 @@ export function BandwidthPanel() {
                 <input
                   type="text"
                   inputMode="decimal"
-                  aria-label="Allowance"
+                  aria-label={t("next.bandwidth.allowance")}
                   value={values.limitValue}
                   placeholder="0"
                   onChange={(event) => draft.set({ limitValue: event.target.value })}
@@ -258,8 +261,8 @@ export function BandwidthPanel() {
         },
         {
           id: "resetTime",
-          label: "Reset at",
-          help: "Local time the window rolls over.",
+          label: t("next.bandwidth.resetAt"),
+          help: t("next.bandwidth.resetAtHelp"),
           keywords: "clock hour",
           control: {
             kind: "time",
@@ -271,12 +274,12 @@ export function BandwidthPanel() {
           ? [
               {
                 id: "weeklyResetWeekday",
-                label: "Reset day",
-                help: "Which day of the week the allowance rolls over.",
+                label: t("next.bandwidth.resetDay"),
+                help: t("next.bandwidth.resetDayHelp"),
                 control: {
                   kind: "select" as const,
                   value: values.cap.weeklyResetWeekday,
-                  options: WEEKDAYS,
+                  options: WEEKDAYS.map((option) => ({ ...option, label: t(option.label) })),
                   onChange: (next: string) =>
                     draft.set({ cap: { ...values.cap, weeklyResetWeekday: next as Weekday } }),
                 },
@@ -287,8 +290,8 @@ export function BandwidthPanel() {
           ? [
               {
                 id: "monthlyResetDay",
-                label: "Reset day of month",
-                help: "Months shorter than this day roll over on their last day.",
+                label: t("next.bandwidth.resetDayOfMonth"),
+                help: t("next.bandwidth.resetDayOfMonthHelp"),
                 control: {
                   kind: "number" as const,
                   value: values.cap.monthlyResetDay,
@@ -307,12 +310,12 @@ export function BandwidthPanel() {
     ispBlock && ispBlock.limitBytes > 0 ? (ispBlock.usedBytes / ispBlock.limitBytes) * 100 : 0;
 
   const blocks: (SettingsBlock | null)[] = [
-    values ? { kind: "section", id: "limits", title: "Limits", fields: limitFields } : null,
+    values ? { kind: "section", id: "limits", title: t("next.bandwidth.limits"), fields: limitFields } : null,
     ispBlock?.capEnabled
       ? {
           kind: "custom",
           id: "window",
-          title: "Current window",
+          title: t("next.bandwidth.currentWindow"),
           note: ispBlock.timezoneName || undefined,
           searchText: "current window usage cap remaining resets",
           body: (
@@ -323,16 +326,22 @@ export function BandwidthPanel() {
                   color={usedPercent >= 90 ? WV.error : usedPercent >= 70 ? WV.warn : WV.accent}
                 />
                 <div className="flex items-baseline justify-between font-wv-mono text-[11.5px] text-wv-muted">
-                  <span>{formatSize(ispBlock.usedBytes)} used</span>
-                  <span>{formatSize(ispBlock.limitBytes)} allowance</span>
+                  <span>{t("next.bandwidth.used", { size: formatSize(ispBlock.usedBytes) })}</span>
+                  <span>{t("next.monitoring.allowance", { size: formatSize(ispBlock.limitBytes) })}</span>
                 </div>
               </div>
-              <KeyValueRow label="Remaining" value={formatSize(ispBlock.remainingBytes)} />
-              <KeyValueRow label="Reserved by running downloads" value={formatSize(ispBlock.reservedBytes)} />
-              <KeyValueRow label="Window resets" value={formatDate(ispBlock.windowEndsAtEpochMs)} />
+              <KeyValueRow label={t("next.monitoring.remaining")} value={formatSize(ispBlock.remainingBytes)} />
               <KeyValueRow
-                label="Downloads held by the cap"
-                value={ispBlock.kind === "ISP_CAP" ? "Yes" : "No"}
+                label={t("next.monitoring.reserved")}
+                value={formatSize(ispBlock.reservedBytes)}
+              />
+              <KeyValueRow
+                label={t("next.monitoring.windowResets")}
+                value={formatDate(ispBlock.windowEndsAtEpochMs)}
+              />
+              <KeyValueRow
+                label={t("next.monitoring.heldByCap")}
+                value={ispBlock.kind === "ISP_CAP" ? t("next.common.yes") : t("next.common.no")}
               />
             </>
           ),

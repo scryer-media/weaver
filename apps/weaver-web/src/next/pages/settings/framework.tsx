@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { useTranslate } from "@/lib/context/translate-context";
 import { Eyebrow, EmptyState, SectionHeader } from "@/next/components/chrome";
 import { PathField } from "@/next/features/DirectoryBrowserDialog";
 import {
@@ -305,6 +306,7 @@ export function SettingsBlocks({
   /** The panel's settings are still on its way; its fields would only show blanks. */
   loading?: boolean;
 }) {
+  const t = useTranslate();
   const search = useSettingsSearch().trim().toLowerCase();
 
   const present = blocks.filter(
@@ -335,7 +337,7 @@ export function SettingsBlocks({
     .filter((block): block is SettingsBlock => block !== null);
 
   if (loading) {
-    return <EmptyState loading title="Loading" body="Fetching these settings." />;
+    return <EmptyState loading title={t("next.common.loading")} body={t("next.settings.loadingBody")} />;
   }
 
   if (visible.length === 0) {
@@ -343,13 +345,13 @@ export function SettingsBlocks({
       <EmptyState
         title={
           search === ""
-            ? "Nothing to configure here"
-            : `No settings match "${search}"`
+            ? t("next.settings.nothingHere")
+            : t("next.settings.noMatch", { search })
         }
         body={
           search === ""
-            ? "This panel has no settings yet."
-            : "Try another term, or clear the search to see this page."
+            ? t("next.settings.nothingHereBody")
+            : t("next.settings.noMatchBody")
         }
       />
     );
@@ -382,6 +384,7 @@ export function SettingsBlocks({
  * here, unlike the tab strips: a table has no other cue that there is more.
  */
 function SettingsTable({ block }: { block: SettingsTableModel }) {
+  const t = useTranslate();
   return (
     <div className="min-w-0 overflow-x-auto">
       <div className="min-w-[640px]">
@@ -397,7 +400,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
         </div>
         {block.rows.length === 0 ? (
           <div className="flex flex-col items-start gap-3 px-4 sm:px-6 py-5">
-            <span className="text-[13px] text-wv-muted">{block.empty ?? "Nothing configured yet."}</span>
+            <span className="text-[13px] text-wv-muted">{block.empty ?? t("next.settings.nothingConfigured")}</span>
             {block.emptyAction === undefined ? null : (
               <PrimaryButton icon="add" onClick={block.emptyAction.onClick}>
                 {block.emptyAction.label}

@@ -7,6 +7,7 @@ import {
   TOGGLE_SCHEDULE_MUTATION,
   UPDATE_SCHEDULE_MUTATION,
 } from "@/graphql/queries";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { PrimaryButton, Toggle } from "../../../components/controls";
@@ -44,20 +45,21 @@ interface ScheduleForm {
 
 const MIB = 1024 * 1024;
 
+/** Labels are translation keys, resolved when the panel renders. */
 const DAYS = [
-  { key: "mon", label: "Mon" },
-  { key: "tue", label: "Tue" },
-  { key: "wed", label: "Wed" },
-  { key: "thu", label: "Thu" },
-  { key: "fri", label: "Fri" },
-  { key: "sat", label: "Sat" },
-  { key: "sun", label: "Sun" },
+  { key: "mon", label: "next.weekday.monShort" },
+  { key: "tue", label: "next.weekday.tueShort" },
+  { key: "wed", label: "next.weekday.wedShort" },
+  { key: "thu", label: "next.weekday.thuShort" },
+  { key: "fri", label: "next.weekday.friShort" },
+  { key: "sat", label: "next.weekday.satShort" },
+  { key: "sun", label: "next.weekday.sunShort" },
 ];
 
 const ACTIONS: { value: string; label: string }[] = [
-  { value: "pause", label: "Pause downloads" },
-  { value: "resume", label: "Resume downloads" },
-  { value: "speed_limit", label: "Set a speed limit" },
+  { value: "pause", label: "next.schedules.pause" },
+  { value: "resume", label: "next.schedules.resume" },
+  { value: "speed_limit", label: "next.schedules.setLimit" },
 ];
 
 const NEW_SCHEDULE: ScheduleForm = {
@@ -70,23 +72,26 @@ const NEW_SCHEDULE: ScheduleForm = {
   speedUnlimited: false,
 };
 
-function actionLabel(schedule: Schedule): string {
+function actionLabel(t: Translate, schedule: Schedule): string {
   if (schedule.actionType === "speed_limit") {
-    return schedule.speedLimitBytes ? `Limit to ${formatRate(schedule.speedLimitBytes)}` : "Remove the limit";
+    return schedule.speedLimitBytes
+      ? t("next.schedules.limitTo", { rate: formatRate(schedule.speedLimitBytes) })
+      : t("next.schedules.removeLimit");
   }
-  return schedule.actionType === "pause" ? "Pause downloads" : "Resume downloads";
+  return schedule.actionType === "pause" ? t("next.schedules.pause") : t("next.schedules.resume");
 }
 
-function daysLabel(days: string[]): string {
+function daysLabel(t: Translate, days: string[]): string {
   if (days.length === 0 || days.length === DAYS.length) {
-    return "Every day";
+    return t("next.schedules.everyDay");
   }
   return DAYS.filter((day) => days.includes(day.key))
-    .map((day) => day.label)
+    .map((day) => t(day.label))
     .join(" ");
 }
 
 export function SchedulesPanel() {
+  const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{ schedules: Schedule[] }>({ query: SCHEDULES_QUERY });
   const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
@@ -164,12 +169,18 @@ export function SchedulesPanel() {
     {
       kind: "table",
       id: "schedules",
-      title: "Schedules",
-      note: "local time, applied in order",
+      title: t("next.settings.panel.schedules"),
+      note: t("next.schedules.note"),
       columns: "84px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr) 44px",
-      headers: ["Time", "Days", "Action", "Label", ""],
-      empty: "No schedules yet. Weaver downloads whenever there is work.",
-      emptyAction: { label: "Add schedule", onClick: () => open(null) },
+      headers: [
+        t("next.schedules.time"),
+        t("next.schedules.days"),
+        t("next.schedules.action"),
+        t("next.schedules.label"),
+        "",
+      ],
+      empty: t("next.schedules.empty"),
+      emptyAction: { label: t("next.schedules.add"), onClick: () => open(null) },
       onRowClick: (id) => {
         const schedule = schedules.find((entry) => entry.id === id);
         if (schedule) {
@@ -178,15 +189,15 @@ export function SchedulesPanel() {
       },
       rows: schedules.map((schedule) => ({
         id: schedule.id,
-        searchText: `${schedule.time} ${daysLabel(schedule.days)} ${actionLabel(schedule)} ${schedule.label ?? ""}`,
+        searchText: `${schedule.time} ${daysLabel(t, schedule.days)} ${actionLabel(t, schedule)} ${schedule.label ?? ""}`,
         cells: [
           <Cell key="time" mono className="text-wv-fg">
             {schedule.time}
           </Cell>,
           <Cell key="days" mono className="text-wv-secondary">
-            {daysLabel(schedule.days)}
+            {daysLabel(t, schedule.days)}
           </Cell>,
-          <Cell key="action">{actionLabel(schedule)}</Cell>,
+          <Cell key="action">{actionLabel(t, schedule)}</Cell>,
           <Cell key="label" className="text-wv-muted">
             {schedule.label || "—"}
           </Cell>,
@@ -194,7 +205,7 @@ export function SchedulesPanel() {
             <Toggle
               size="table"
               checked={schedule.enabled}
-              label={`${schedule.time} schedule enabled`}
+              label={t("next.schedules.enabledAria", { time: schedule.time })}
               onChange={(next) => {
                 void toggleSchedule({ id: schedule.id, enabled: next }).then(() =>
                   reexecute({ requestPolicy: "network-only" }),
@@ -210,30 +221,34 @@ export function SchedulesPanel() {
   return (
     <>
       <PanelControls>
-        <PrimaryButton icon="add" onClick={() => open(null)}>Add schedule</PrimaryButton>
+        <PrimaryButton icon="add" onClick={() => open(null)}>{t("next.schedules.add")}</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
         open={editingId !== null}
-        title={editingId === "new" ? "Add schedule" : (editing?.label || editing?.time || "Schedule")}
-        note={editingId === "new" ? "new schedule" : daysLabel(editing?.days ?? [])}
+        title={
+          editingId === "new"
+            ? t("next.schedules.add")
+            : editing?.label || editing?.time || t("next.schedules.schedule")
+        }
+        note={editingId === "new" ? t("next.schedules.newNote") : daysLabel(t, editing?.days ?? [])}
         error={error}
         busy={busy}
         onSave={() => void save()}
         onDismiss={() => setEditingId(null)}
         onDelete={editing ? () => setConfirmRemove(editing) : undefined}
-        deleteLabel="Remove schedule"
+        deleteLabel={t("next.schedules.remove")}
         sections={[
           {
             id: "when",
-            title: "When",
+            title: t("next.schedules.when"),
             fields: [
               {
                 id: "time",
-                label: "Time",
-                help: "Local time, 24-hour.",
+                label: t("next.schedules.time"),
+                help: t("next.schedules.timeHelp"),
                 control: {
                   kind: "time",
                   value: form.time,
@@ -242,8 +257,8 @@ export function SchedulesPanel() {
               },
               {
                 id: "days",
-                label: "Days",
-                help: "Leave every day off to run this on all of them.",
+                label: t("next.schedules.days"),
+                help: t("next.schedules.daysHelp"),
                 control: {
                   kind: "custom",
                   control: (
@@ -269,7 +284,7 @@ export function SchedulesPanel() {
                                 : "border-wv-control bg-wv-input text-wv-muted hover:border-wv-control-hover"
                             }`}
                           >
-                            {day.label}
+                            {t(day.label)}
                           </button>
                         );
                       })}
@@ -281,15 +296,15 @@ export function SchedulesPanel() {
           },
           {
             id: "what",
-            title: "What happens",
+            title: t("next.schedules.whatHappens"),
             fields: [
               {
                 id: "actionType",
-                label: "Action",
+                label: t("next.schedules.action"),
                 control: {
                   kind: "select",
                   value: form.actionType,
-                  options: ACTIONS,
+                  options: ACTIONS.map((option) => ({ ...option, label: t(option.label) })),
                   onChange: (next) => setForm((current) => ({ ...current, actionType: next })),
                 },
               },
@@ -297,8 +312,8 @@ export function SchedulesPanel() {
                 ? [
                     {
                       id: "speedUnlimited",
-                      label: "Remove the limit instead",
-                      help: "Use this for the entry that ends an off-peak window.",
+                      label: t("next.schedules.removeLimitInstead"),
+                      help: t("next.schedules.removeLimitInsteadHelp"),
                       control: {
                         kind: "toggle" as const,
                         value: form.speedUnlimited,
@@ -311,8 +326,8 @@ export function SchedulesPanel() {
                       : [
                           {
                             id: "speedMib",
-                            label: "Speed limit",
-                            help: "Mebibytes per second.",
+                            label: t("next.schedules.speedLimit"),
+                            help: t("next.schedules.speedLimitHelp"),
                             control: {
                               kind: "text" as const,
                               value: form.speedMib,
@@ -326,19 +341,19 @@ export function SchedulesPanel() {
                 : []),
               {
                 id: "label",
-                label: "Label",
-                help: "Optional. Shown in the table so a pair of entries reads as one window.",
+                label: t("next.schedules.label"),
+                help: t("next.schedules.labelHelp"),
                 control: {
                   kind: "text",
                   mono: false,
                   value: form.label,
-                  placeholder: "Off-peak start",
+                  placeholder: t("next.schedules.labelPlaceholder"),
                   onChange: (next) => setForm((current) => ({ ...current, label: next })),
                 },
               },
               {
                 id: "enabled",
-                label: "Enabled",
+                label: t("next.schedules.enabled"),
                 control: {
                   kind: "toggle",
                   value: form.enabled,
@@ -352,11 +367,11 @@ export function SchedulesPanel() {
 
       <ConfirmDialog
         open={confirmRemove !== null}
-        title="Remove schedule"
+        title={t("next.schedules.remove")}
         note={confirmRemove?.time}
         busy={busy}
-        confirmLabel="Remove schedule"
-        body="The queue keeps whatever state it is in now; nothing else changes."
+        confirmLabel={t("next.schedules.remove")}
+        body={t("next.schedules.removeBody")}
         onConfirm={() => void remove()}
         onDismiss={() => setConfirmRemove(null)}
       />
