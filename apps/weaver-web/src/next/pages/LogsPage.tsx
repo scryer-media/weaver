@@ -105,7 +105,9 @@ export function LogsPage() {
       statusRight={`${formatCount(logs.matchedCount)} shown of ${formatCount(logs.bufferedCount)}`}
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-        {logs.lines.length === 0 ? (
+        {logs.lines.length === 0 && logs.loading ? (
+          <EmptyState loading title="Loading" body="Fetching recent log lines." />
+        ) : logs.lines.length === 0 ? (
           <EmptyState
             title="No lines match this filter"
             body="Clear the search or pick another level."

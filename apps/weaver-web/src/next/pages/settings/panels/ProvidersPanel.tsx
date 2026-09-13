@@ -263,7 +263,7 @@ function serverInput(form: ServerForm) {
 }
 
 export function ProvidersPanel() {
-  const [{ data }, reexecute] = useQuery<{ servers: Server[] }>({ query: SERVERS_QUERY });
+  const [{ data, fetching }, reexecute] = useQuery<{ servers: Server[] }>({ query: SERVERS_QUERY });
   const [, addServer] = useMutation(ADD_SERVER_MUTATION);
   const [, updateServer] = useMutation(UPDATE_SERVER_MUTATION);
   const [, removeServer] = useMutation(REMOVE_SERVER_MUTATION);
@@ -642,7 +642,7 @@ export function ProvidersPanel() {
         </SecondaryButton>
       </PanelControls>
 
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
         open={editingId !== null}

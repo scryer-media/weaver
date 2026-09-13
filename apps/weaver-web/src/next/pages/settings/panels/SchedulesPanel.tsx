@@ -87,7 +87,7 @@ function daysLabel(days: string[]): string {
 }
 
 export function SchedulesPanel() {
-  const [{ data }, reexecute] = useQuery<{ schedules: Schedule[] }>({ query: SCHEDULES_QUERY });
+  const [{ data, fetching }, reexecute] = useQuery<{ schedules: Schedule[] }>({ query: SCHEDULES_QUERY });
   const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
   const [, deleteSchedule] = useMutation(DELETE_SCHEDULE_MUTATION);
@@ -212,7 +212,7 @@ export function SchedulesPanel() {
         <SecondaryButton onClick={() => open(null)}>Add schedule</SecondaryButton>
       </PanelControls>
 
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
         open={editingId !== null}

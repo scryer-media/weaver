@@ -264,6 +264,7 @@ export function MonitoringPage() {
           note="bytes per second, downloaded vs committed"
           series={throughput}
           xLabels={labels}
+          loading={series.isLoading}
           formatValue={(value) => formatRate(value)}
         />
         <Chart
@@ -271,6 +272,7 @@ export function MonitoringPage() {
           note="downloaded, decoded and retried per second"
           series={segments}
           xLabels={labels}
+          loading={series.isLoading}
           formatValue={(value) => formatPerSecond(value)}
         />
         <Chart
@@ -278,6 +280,7 @@ export function MonitoringPage() {
           note="backlog across download, decode and commit"
           series={depths}
           xLabels={labels}
+          loading={series.isLoading}
           formatValue={(value) => formatCompactCount(value)}
         />
 

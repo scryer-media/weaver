@@ -3,6 +3,7 @@ import { NavLink, useLocation } from "react-router";
 import { BrandLockup } from "@/lib/brand";
 import { cn } from "@/lib/utils";
 import { useNextData } from "../data/next-data";
+import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
 
 /**
@@ -18,6 +19,10 @@ import { Eyebrow } from "../components/chrome";
  * the same blocks, and the top bar grows the button that opens it. The button
  * lives here rather than in the header markup so a screen that replaces the
  * whole title bar (job detail) keeps it without knowing the drawer exists.
+ *
+ * Throughput is the one rail block that is not the screen's to choose: it is
+ * pinned to the foot of the rail, outside the part that scrolls, so the download
+ * speed is in the same place on every screen however long the rail above it is.
  */
 
 interface NavEntry {
@@ -101,20 +106,21 @@ export function NextShell({
   // splitting it into one would put the rail's props back in a second signature.
   const renderRail = (onDismiss?: () => void) => (
     <>
-      <div className="flex h-14 flex-none items-center gap-[9px] border-b border-wv-line-strong px-[18px]">
-        <BrandLockup className="h-[16px] w-auto flex-none" />
-        <span className="ml-auto font-wv-mono text-[10px] text-wv-faint">{version || "—"}</span>
-        {onDismiss === undefined ? null : (
-          <button
-            type="button"
-            onClick={onDismiss}
-            aria-label="Close navigation"
-            className="-mr-[7px] flex size-7 flex-none cursor-pointer items-center justify-center text-[15px] text-wv-muted hover:text-wv-fg"
-          >
-            <span aria-hidden="true">×</span>
-          </button>
-        )}
-      </div>
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+        <div className="flex h-14 flex-none items-center gap-[9px] border-b border-wv-line-strong px-[18px]">
+          <BrandLockup className="h-[16px] w-auto flex-none" />
+          <span className="ml-auto font-wv-mono text-[10px] text-wv-faint">{version || "—"}</span>
+          {onDismiss === undefined ? null : (
+            <button
+              type="button"
+              onClick={onDismiss}
+              aria-label="Close navigation"
+              className="-mr-[7px] flex size-7 flex-none cursor-pointer items-center justify-center text-[15px] text-wv-muted hover:text-wv-fg"
+            >
+              <span aria-hidden="true">×</span>
+            </button>
+          )}
+        </div>
 
         <nav className="flex flex-col gap-0.5 px-[10px] py-[14px]">
           {nav.map((entry) => (
@@ -147,14 +153,16 @@ export function NextShell({
           ))}
         </nav>
 
-      {railMiddle}
-      <div className="mt-auto flex flex-none flex-col">{railFooter}</div>
+        {railMiddle}
+        <div className="mt-auto flex flex-none flex-col">{railFooter}</div>
+      </div>
+      <ThroughputBlock />
     </>
   );
 
   return (
     <div className="flex h-dvh overflow-hidden bg-wv-app text-wv-fg">
-      <aside className="hidden min-h-0 w-[236px] flex-none flex-col overflow-y-auto border-r border-wv-line-strong bg-wv-rail lg:flex">
+      <aside className="hidden min-h-0 w-[236px] flex-none flex-col border-r border-wv-line-strong bg-wv-rail lg:flex">
         {renderRail()}
       </aside>
 
@@ -164,7 +172,7 @@ export function NextShell({
             className="absolute inset-0 bg-[rgb(0_0_0_/_0.55)]"
             onPointerDown={() => setNavOpen(false)}
           />
-          <aside className="absolute inset-y-0 left-0 flex w-[264px] max-w-[86vw] flex-col overflow-y-auto border-r border-wv-line-strong bg-wv-rail">
+          <aside className="absolute inset-y-0 left-0 flex w-[264px] max-w-[86vw] flex-col border-r border-wv-line-strong bg-wv-rail">
             {renderRail(() => setNavOpen(false))}
           </aside>
         </div>
@@ -248,6 +256,21 @@ export function NextShell({
         </footer>
       </div>
     </div>
+  );
+}
+
+function ThroughputBlock() {
+  const { speed, peakSpeed } = useNextData();
+  const now = splitSpeed(speed);
+  const peak = splitSpeed(peakSpeed);
+  return (
+    <RailBlock eyebrow="Throughput">
+      <RailMetric
+        value={now.value}
+        unit={now.unit}
+        note={peakSpeed > 0 ? `peak ${peak.value} ${peak.unit}` : "no traffic yet"}
+      />
+    </RailBlock>
   );
 }
 

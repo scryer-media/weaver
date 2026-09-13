@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { LoadingMark } from "@/lib/loading-mark";
 import { SectionHeader, Square } from "./chrome";
 
 export interface ChartSeries {
@@ -60,6 +61,7 @@ export function Chart({
   series,
   xLabels,
   formatValue,
+  loading = false,
 }: {
   title: string;
   note?: ReactNode;
@@ -68,6 +70,8 @@ export function Chart({
   xLabels: readonly string[];
   /** Renders the four y-axis labels. */
   formatValue: (value: number) => string;
+  /** The history is still on its way: the plot holds the loading mark, not a flat line. */
+  loading?: boolean;
 }) {
   const max = series.reduce(
     (highest, entry) => entry.values.reduce((inner, value) => (value > inner ? value : inner), highest),
@@ -82,8 +86,9 @@ export function Chart({
       <div className="flex flex-wrap items-start gap-x-6 gap-y-5 px-4 sm:px-6 py-5">
         <div className="flex min-w-[280px] flex-[1_1_360px] gap-3">
           <div className="flex h-[148px] w-[62px] flex-none flex-col justify-between text-right font-wv-mono text-[10px] text-wv-faint">
+            {/* With no history yet the scale is a guess, so the axis stays blank rather than read 0. */}
             {yLabels.map((value, index) => (
-              <span key={index}>{formatValue(value)}</span>
+              <span key={index}>{loading ? " " : formatValue(value)}</span>
             ))}
           </div>
           <div className="flex min-w-0 flex-1 flex-col">
@@ -95,6 +100,12 @@ export function Chart({
                   style={{ top: `${offset}%` }}
                 />
               ))}
+              {loading ? (
+                <div role="status" className="absolute inset-0 flex items-center justify-center">
+                  <LoadingMark className="h-8" />
+                  <span className="sr-only">Loading {title.toLowerCase()}</span>
+                </div>
+              ) : null}
               {series.map((entry) => {
                 const points = pointsFor(entry.values, ceiling);
                 if (points === "") return null;
@@ -140,7 +151,7 @@ export function Chart({
                 {entry.label}
               </span>
               <span className="ml-auto font-wv-mono text-[13px] whitespace-nowrap text-wv-secondary">
-                {entry.value}
+                {loading ? "—" : entry.value}
               </span>
             </div>
           ))}

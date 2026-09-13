@@ -145,7 +145,7 @@ function splitExtensions(value: string): string[] {
 }
 
 export function PostProcessingPanel() {
-  const [{ data }, reexecute] = useQuery<PostProcessingData>({
+  const [{ data, fetching }, reexecute] = useQuery<PostProcessingData>({
     query: POST_PROCESSING_SETTINGS_QUERY,
     requestPolicy: "cache-and-network",
   });
@@ -696,7 +696,7 @@ export function PostProcessingPanel() {
         />
       </PanelControls>
 
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <ConfirmDialog
         open={confirmDirectory}

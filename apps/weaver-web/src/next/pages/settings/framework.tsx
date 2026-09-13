@@ -275,8 +275,11 @@ function matches(haystack: string, needle: string): boolean {
 /** Render a panel's blocks, filtered by the shell's search box. */
 export function SettingsBlocks({
   blocks,
+  loading = false,
 }: {
   blocks: readonly (SettingsBlock | null)[];
+  /** The panel's settings are still on its way; its fields would only show blanks. */
+  loading?: boolean;
 }) {
   const search = useSettingsSearch().trim().toLowerCase();
 
@@ -306,6 +309,10 @@ export function SettingsBlocks({
       return matches(block.searchText, search) ? block : null;
     })
     .filter((block): block is SettingsBlock => block !== null);
+
+  if (loading) {
+    return <EmptyState loading title="Loading" body="Fetching these settings." />;
+  }
 
   if (visible.length === 0) {
     return (

@@ -245,7 +245,7 @@ function reportLine(report: SyncReport): string {
 }
 
 export function RssPanel() {
-  const [{ data }, reexecute] = useQuery<RssData>({ query: RSS_SETTINGS_QUERY });
+  const [{ data, fetching }, reexecute] = useQuery<RssData>({ query: RSS_SETTINGS_QUERY });
   const [, addFeed] = useMutation(ADD_RSS_FEED_MUTATION);
   const [, updateFeed] = useMutation(UPDATE_RSS_FEED_MUTATION);
   const [, deleteFeed] = useMutation(DELETE_RSS_FEED_MUTATION);
@@ -831,7 +831,7 @@ export function RssPanel() {
         <SecondaryButton onClick={() => openFeed(null)}>Add feed</SecondaryButton>
       </PanelControls>
 
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
         open={feedId !== null}

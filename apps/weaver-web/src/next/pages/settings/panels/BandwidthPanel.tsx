@@ -95,7 +95,7 @@ function trimNumber(value: number): string {
 }
 
 export function BandwidthPanel() {
-  const [{ data }, reexecute] = useQuery<{
+  const [{ data, fetching }, reexecute] = useQuery<{
     settings: { maxDownloadSpeed: number; ispBandwidthCap: IspBandwidthCap | null };
     globalState: { downloadBlock: DownloadBlockState } | null;
   }>({ query: SETTINGS_QUERY });
@@ -340,5 +340,5 @@ export function BandwidthPanel() {
       : null,
   ];
 
-  return <SettingsBlocks blocks={blocks} />;
+  return <SettingsBlocks blocks={blocks} loading={fetching && !data} />;
 }

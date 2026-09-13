@@ -85,7 +85,7 @@ const DUPLICATE_FIELDS: { key: keyof DuplicatePolicy; label: string; help: strin
 
 export function GeneralPanel() {
   const { uiLanguage, setLanguagePreference } = useLanguageSettings();
-  const [{ data }, reexecute] = useQuery<{ settings: GeneralSettings }>({ query: SETTINGS_QUERY });
+  const [{ data, fetching }, reexecute] = useQuery<{ settings: GeneralSettings }>({ query: SETTINGS_QUERY });
   const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -314,5 +314,5 @@ export function GeneralPanel() {
       : null,
   ];
 
-  return <SettingsBlocks blocks={blocks} />;
+  return <SettingsBlocks blocks={blocks} loading={fetching && !data} />;
 }

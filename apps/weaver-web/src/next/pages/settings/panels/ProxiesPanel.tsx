@@ -190,7 +190,7 @@ function proxyInput(form: ProxyForm) {
 }
 
 export function ProxiesPanel() {
-  const [{ data }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
+  const [{ data, fetching }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
     query: PROXY_PROFILES_QUERY,
   });
   const [, saveProxy] = useMutation(SAVE_PROXY_MUTATION);
@@ -575,7 +575,7 @@ export function ProxiesPanel() {
         <SecondaryButton onClick={() => open(null)}>Add proxy</SecondaryButton>
       </PanelControls>
 
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
         open={editingId !== null}

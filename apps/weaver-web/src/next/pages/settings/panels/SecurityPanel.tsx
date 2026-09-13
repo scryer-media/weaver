@@ -86,19 +86,19 @@ function cleanMessage(message: string): string {
 }
 
 export function SecurityPanel() {
-  const [{ data: loginData }, refetchLogin] = useQuery<{ adminLoginStatus: LoginStatus }>({
+  const [{ data: loginData, fetching: loginFetching }, refetchLogin] = useQuery<{ adminLoginStatus: LoginStatus }>({
     query: LOGIN_STATUS_QUERY,
     requestPolicy: "network-only",
   });
-  const [{ data: bindData }, refetchBind] = useQuery<{ httpBindAddress: BindAddressStatus }>({
+  const [{ data: bindData, fetching: bindFetching }, refetchBind] = useQuery<{ httpBindAddress: BindAddressStatus }>({
     query: HTTP_BIND_ADDRESS_QUERY,
     requestPolicy: "network-only",
   });
-  const [{ data: policyData }, refetchPolicy] = useQuery<{ accessPolicy: AccessPolicyStatus }>({
+  const [{ data: policyData, fetching: policyFetching }, refetchPolicy] = useQuery<{ accessPolicy: AccessPolicyStatus }>({
     query: ACCESS_POLICY_QUERY,
     requestPolicy: "network-only",
   });
-  const [{ data: keysData }, refetchKeys] = useQuery<{ apiKeys: ApiKey[] }>({
+  const [{ data: keysData, fetching: keysFetching }, refetchKeys] = useQuery<{ apiKeys: ApiKey[] }>({
     query: API_KEYS_QUERY,
   });
 
@@ -425,7 +425,15 @@ export function SecurityPanel() {
         </div>
       ) : null}
 
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks
+        blocks={blocks}
+        loading={
+          (loginFetching && !loginData)
+          || (bindFetching && !bindData)
+          || (policyFetching && !policyData)
+          || (keysFetching && !keysData)
+        }
+      />
 
       <RecordEditor
         open={enableOpen}

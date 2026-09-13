@@ -8,30 +8,16 @@ import { Bar, Square } from "../components/chrome";
 import { UNCATEGORISED, type CategoryEntry } from "../data/categories";
 import { useNextData, type ProviderHealth } from "../data/next-data";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
-import { formatClock, formatLatency, splitSpeed, splitUptime } from "../data/format";
+import { formatClock, formatLatency, splitUptime } from "../data/format";
 
 /**
  * The rail's reusable bottom blocks.
  *
  * Screens pick the ones that belong to them rather than each building its own:
- * Downloads takes Throughput + Providers, Settings takes the config path, and
- * the diagnostic screens take Attention + Uptime.
+ * Downloads takes Providers, Settings takes the config path, and the diagnostic
+ * screens take Attention + Uptime. Throughput is not among them; the shell pins
+ * it under whatever a screen picks.
  */
-
-export function ThroughputBlock() {
-  const { speed, peakSpeed } = useNextData();
-  const now = splitSpeed(speed);
-  const peak = splitSpeed(peakSpeed);
-  return (
-    <RailBlock eyebrow="Throughput">
-      <RailMetric
-        value={now.value}
-        unit={now.unit}
-        note={peakSpeed > 0 ? `peak ${peak.value} ${peak.unit}` : "no traffic yet"}
-      />
-    </RailBlock>
-  );
-}
 
 export function providerLoadPercent(provider: ProviderHealth): number {
   const max = provider.connectionsMax || provider.connectionsConfigured;

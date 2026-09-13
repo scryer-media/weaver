@@ -91,7 +91,7 @@ function message(error: unknown): string {
 }
 
 export function BackupPanel() {
-  const [{ data }] = useQuery<{ settings: { dataDir: string } }>({ query: SETTINGS_QUERY });
+  const [{ data, fetching }] = useQuery<{ settings: { dataDir: string } }>({ query: SETTINGS_QUERY });
   const currentDataDir = data?.settings?.dataDir ?? "";
 
   const [status, setStatus] = useState<BackupStatus | null>(null);
@@ -553,7 +553,7 @@ export function BackupPanel() {
         </SecondaryButton>
       </PanelControls>
 
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <ConfirmDialog
         open={confirmRestore}

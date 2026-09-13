@@ -67,7 +67,7 @@ const MODES: { value: string; label: string }[] = [
 ];
 
 export function WatchFolderPanel() {
-  const [{ data }, reexecute] = useQuery<{ settings: { watchFolder: WatchFolder } }>({
+  const [{ data, fetching }, reexecute] = useQuery<{ settings: { watchFolder: WatchFolder } }>({
     query: WATCH_FOLDER_SETTINGS_QUERY,
   });
   const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
@@ -272,7 +272,7 @@ export function WatchFolderPanel() {
           {scanState.fetching ? "Scanning…" : "Scan now"}
         </SecondaryButton>
       </PanelControls>
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
     </>
   );
 }

@@ -37,7 +37,7 @@ import {
   type DownloadGroup,
 } from "../data/status";
 import { NextShell } from "../shell/NextShell";
-import { CategoryListBlock, ProvidersBlock, ThroughputBlock } from "../shell/rail-blocks";
+import { CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
@@ -259,12 +259,7 @@ export function DownloadsPage() {
           onClear={() => setFacets(NO_FACETS)}
         />
       }
-      railFooter={
-        <>
-          <ThroughputBlock />
-          <ProvidersBlock />
-        </>
-      }
+      railFooter={<ProvidersBlock />}
       beforeContent={
         <>
           <div className="flex flex-none border-b border-wv-hairline bg-wv-app">
@@ -276,7 +271,11 @@ export function DownloadsPage() {
                   : EM_DASH
               }
               note={
-                remainingBytes > 0 ? `${formatSize(remainingBytes)} left to fetch` : "queue is clear"
+                remainingBytes > 0
+                  ? `${formatSize(remainingBytes)} left to fetch`
+                  : queue.isLoading
+                    ? "fetching the queue"
+                    : "queue is clear"
               }
             />
             <StorageMounts
@@ -347,7 +346,9 @@ export function DownloadsPage() {
       contentClassName="flex-col xl:flex-row"
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-        {visibleGroups.length === 0 ? (
+        {queue.isLoading ? (
+          <EmptyState loading title="Loading" body="Fetching the queue." />
+        ) : visibleGroups.length === 0 ? (
           <EmptyState
             title="Nothing matches this view"
             body="Clear the search or pick another filter."

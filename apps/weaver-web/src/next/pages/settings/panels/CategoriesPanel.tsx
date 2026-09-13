@@ -39,7 +39,7 @@ interface CategoryForm {
 const NEW_CATEGORY: CategoryForm = { name: "", destDir: "", aliases: "" };
 
 export function CategoriesPanel() {
-  const [{ data }, reexecute] = useQuery<{ categories: Category[] }>({ query: CATEGORIES_QUERY });
+  const [{ data, fetching }, reexecute] = useQuery<{ categories: Category[] }>({ query: CATEGORIES_QUERY });
   const [{ data: settingsData }] = useQuery<{ settings: { completeDir: string; dataDir: string } }>({
     query: SETTINGS_QUERY,
   });
@@ -145,7 +145,7 @@ export function CategoriesPanel() {
         <SecondaryButton onClick={() => open(null)}>Add category</SecondaryButton>
       </PanelControls>
 
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
         open={editingId !== null}

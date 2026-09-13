@@ -89,6 +89,8 @@ export interface ServiceLogs {
   paused: boolean;
   setPaused: (paused: boolean) => void;
   connected: boolean;
+  /** The recent lines are still on their way; nothing is known to be missing yet. */
+  loading: boolean;
 }
 
 export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLogs {
@@ -132,7 +134,7 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
     scheduleRender();
   }, [scheduleRender]);
 
-  const [{ data }] = useQuery<{ serviceLogs: { lines: string[]; count: number } }>({
+  const [{ data, fetching }] = useQuery<{ serviceLogs: { lines: string[]; count: number } }>({
     query: SERVICE_LOGS_QUERY,
     variables: { limit: BUFFER_MAX },
   });
@@ -220,6 +222,7 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
       paused,
       setPaused,
       connected,
+      loading: fetching && !data,
     };
-  }, [buffer, connected, level, paused, query]);
+  }, [buffer, connected, data, fetching, level, paused, query]);
 }
