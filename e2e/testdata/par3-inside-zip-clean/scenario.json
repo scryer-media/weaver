@@ -1,0 +1,14 @@
+{
+  "slug": "par3-inside-zip-clean",
+  "title": "E2E.Test.PAR3.Inside.ZIP.Clean.Azure.Kiln.S01E01.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "An undamaged stored ZIP with PAR3 protection inserted by the reference. It must extract like any other ZIP, with the inserted protection causing no problems.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "azure.kiln.s01e01.mkv": "b1eb312d8468122246ae2ccdf4785e786357cb4deac086f265c1b63ff6ef50eb"
+  },
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

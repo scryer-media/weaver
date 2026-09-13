@@ -1,0 +1,16 @@
+{
+  "slug": "par3-direct-repair",
+  "title": "E2E.Test.PAR3.Direct.Repair.Cobalt.Drift.S02E05.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A loose payload with a Cauchy PAR3 set and two 100-byte overwrites made before posting. The yEnc checksums match the damaged bytes, so only PAR3's block hashes can find the damage and repair it.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "cobalt.drift.s02e05.mkv": "2f8b0563c3f9c75cf6a68af24949bdb5bf32304391c0d6d00cc59a5361e95fe8"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

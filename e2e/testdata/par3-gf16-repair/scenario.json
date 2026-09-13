@@ -1,0 +1,16 @@
+{
+  "slug": "par3-gf16-repair",
+  "title": "E2E.Test.PAR3.GF16.Repair.Ember.Vantage.S03E01.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "1 KiB blocks over a 3 MiB payload, enough input blocks that the set uses a 16-bit Galois field. Nine blocks are damaged against 64 recovery blocks.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "ember.vantage.s03e01.mkv": "61ed5c057edefef7a88e9a8f009aa40b0536eea8c49c3e8815275779c97b99a0"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

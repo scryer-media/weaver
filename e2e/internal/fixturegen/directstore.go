@@ -233,6 +233,48 @@ func DirectStoreRecipes() []Recipe {
 		})
 	}
 	recipes = append(recipes, withheldVolume.recipe(withheldVolumePar2))
+
+	// The PAR3 twins of the repair sets above. Same writer, same stored
+	// volumes, same article-deletion damage; the recovery set is the official
+	// PAR3 reference's instead of PAR2's, so direct routing has to carry a set
+	// through PAR3 verification and repair without demoting it.
+	directStorePar3 := func(redundancy int) func(context.Context, *Env) error {
+		return func(ctx context.Context, env *Env) error {
+			volumes, err := env.Outputs()
+			if err != nil {
+				return err
+			}
+			return env.PAR3(ctx, PAR3Spec{
+				Index: "archive.par3", ECC: 1, BlockSize: par3BlockSize, RedundancyPercent: redundancy, RecoveryFiles: 4, Sources: volumes,
+			})
+		}
+	}
+	recipes = append(recipes,
+		directStore{
+			slug:   "direct-store-par3-repair",
+			notes:  "Four stored RAR5 volumes with PAR3 recovery at 20% over four recovery files. The scenario deletes the tail articles of an interior volume; the holes are repaired while the set keeps routing direct.",
+			writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m",
+			members: []directStoreMember{{"auburn.relay.s02e01.mkv", 24 << 20, "auburn-relay"}},
+		}.recipe(directStorePar3(20)),
+		directStore{
+			slug:   "direct-store-encrypted-par3-repair",
+			notes:  "Four stored RAR5 volumes with `-p` data encryption and PAR3 recovery at 20%. The scenario deletes the tail articles of an interior volume; PAR3 repairs ciphertext in place while the clean volumes stay virtual.",
+			writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m", password: DirectStorePassword,
+			members: []directStoreMember{{"coral.meridian.s02e02.mkv", 24 << 20, "coral-meridian"}},
+		}.recipe(directStorePar3(20)),
+		directStore{
+			slug:   "direct-store-hp-par3-repair",
+			notes:  "Four stored RAR5 volumes with `-hp` header and data encryption and PAR3 recovery at 20%. The scenario deletes the tail articles of an interior volume; PAR3 repairs ciphertext under encrypted headers while the set stays direct.",
+			writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m", headerPassword: DirectStorePassword,
+			members: []directStoreMember{{"thistle.gate.s02e03.mkv", 24 << 20, "thistle-gate"}},
+		}.recipe(directStorePar3(20)),
+		directStore{
+			slug:   "direct-store-par3-withheld-volume",
+			notes:  "Four stored RAR5 volumes with `-hp` encryption and PAR3 recovery at 50%, enough to rebuild a whole volume. The scenario deletes every article of an interior volume after posting, so PAR3 has to create the volume from nothing while the set keeps routing direct.",
+			writer: DirectStoreRAR5Writer, format: RAR5, volumeSize: "8m", headerPassword: DirectStorePassword,
+			members: []directStoreMember{{"hazel.drift.s02e04.mkv", 24 << 20, "hazel-drift"}},
+		}.recipe(directStorePar3(50)),
+	)
 	return recipes
 }
 

@@ -1,0 +1,14 @@
+{
+  "slug": "par3-inside-zip-repair",
+  "title": "E2E.Test.PAR3.Inside.ZIP.Repair.Azure.Kiln.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A self-protected ZIP with 100 bytes of member data overwritten before posting. There are no sidecar files: the recovery data lives inside the container being repaired.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "azure.kiln.s01e02.mkv": "b9671695ec3abd6cce79d6910f61ce2f710581bc4bb77aa7b5b1ae2e4f852337"
+  },
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

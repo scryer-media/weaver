@@ -1,0 +1,13 @@
+{
+  "slug": "par3-par2-fallback",
+  "title": "E2E.Test.PAR3.PAR2.Fallback.Lichen.Harbor.S01E05.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A payload with a PAR2 set holding one recovery block, a PAR3 set holding eight, and four damaged blocks. PAR2 alone cannot repair it, so the job must fall back to PAR3 instead of failing.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "lichen.harbor.s01e05.mkv": "cbe3923b7e8dfcf564d197804b2229223517641ad3fee1146837c109d02d382a"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ]
+}

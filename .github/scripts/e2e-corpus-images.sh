@@ -24,7 +24,7 @@ fi
 lock=test-corpus/toolchains.json
 wanted=" $ONLY "
 
-jq -c '[.rar_writers[], .archivers[], .par2_generator] | .[] | select(.dockerfile != null)' "$lock" \
+jq -c '[.rar_writers[], .archivers[], .par2_generator, .par3_generator] | .[] | select(.dockerfile != null)' "$lock" \
 | while read -r pin; do
     id=$(echo "$pin" | jq -r .id)
     case "$wanted" in
@@ -40,6 +40,9 @@ jq -c '[.rar_writers[], .archivers[], .par2_generator] | .[] | select(.dockerfil
       */par2/*)
         args=(--build-arg "PAR2_URL=$(echo "$pin" | jq -r .url)"
               --build-arg "PAR2_SHA256=$(echo "$pin" | jq -r .sha256)") ;;
+      */par3/*)
+        args=(--build-arg "PAR3_URL=$(echo "$pin" | jq -r .url)"
+              --build-arg "PAR3_SHA256=$(echo "$pin" | jq -r .sha256)") ;;
       */sevenzip/*)
         args=(--build-arg "SEVENZIP_URL=$(echo "$pin" | jq -r .url)"
               --build-arg "SEVENZIP_SHA256=$(echo "$pin" | jq -r .sha256)") ;;

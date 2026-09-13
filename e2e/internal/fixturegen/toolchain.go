@@ -6,13 +6,15 @@
 // gzip, DEFLATE, zstd, bzip2 and brotli containers, and every format-agnostic
 // byte edit (split, concatenate, truncate, zero or overwrite a range, rename).
 // The only external processes are the pinned oracle containers, because RAR,
-// PAR2, 7z and video encoding exist only as binaries:
+// PAR2, PAR3, 7z and video encoding exist only as binaries:
 //
 //   - RAR archives are written exclusively by RARLAB's own `rar`. UnRAR's
 //     licence forbids using UnRAR code to create RAR archives, so no Go code,
 //     no third-party library and no hand-assembled header ever authors or
 //     edits a RAR structure here. Go may only move the resulting bytes around.
 //   - PAR2 recovery material comes from par2cmdline-turbo.
+//   - PAR3 recovery material, loose or inserted into a ZIP or 7z, comes from
+//     the official par3cmdline reference.
 //   - 7z containers come from the official 7-Zip console binary.
 //   - Video comes from the digest-pinned FFmpeg image.
 //   - uuencoding, and the split across multi-part postings, come from
@@ -78,6 +80,7 @@ type Lock struct {
 	RARWriters    []Toolchain `json:"rar_writers"`
 	VideoEncoder  Toolchain   `json:"video_encoder"`
 	PAR2Generator Toolchain   `json:"par2_generator"`
+	PAR3Generator Toolchain   `json:"par3_generator"`
 	UUCodec       Toolchain   `json:"uu_codec"`
 	Archivers     []Toolchain `json:"archivers"`
 	GoWriters     []GoWriter  `json:"go_writers"`
@@ -116,10 +119,10 @@ func LoadLock(root string) (Lock, error) {
 }
 
 func (lock Lock) all() []Toolchain {
-	toolchains := make([]Toolchain, 0, len(lock.RARWriters)+len(lock.Archivers)+3)
+	toolchains := make([]Toolchain, 0, len(lock.RARWriters)+len(lock.Archivers)+4)
 	toolchains = append(toolchains, lock.RARWriters...)
 	toolchains = append(toolchains, lock.Archivers...)
-	toolchains = append(toolchains, lock.VideoEncoder, lock.PAR2Generator, lock.UUCodec)
+	toolchains = append(toolchains, lock.VideoEncoder, lock.PAR2Generator, lock.PAR3Generator, lock.UUCodec)
 	return toolchains
 }
 
@@ -179,6 +182,8 @@ func (toolchain Toolchain) buildArgs() []string {
 		return []string{"RAR_URL=" + toolchain.URL, "RAR_SHA256=" + toolchain.SHA256, "RAR_BINARY=" + toolchain.Binary}
 	case strings.Contains(toolchain.Dockerfile, "/par2/"):
 		return []string{"PAR2_URL=" + toolchain.URL, "PAR2_SHA256=" + toolchain.SHA256}
+	case strings.Contains(toolchain.Dockerfile, "/par3/"):
+		return []string{"PAR3_URL=" + toolchain.URL, "PAR3_SHA256=" + toolchain.SHA256}
 	case strings.Contains(toolchain.Dockerfile, "/sevenzip/"):
 		return []string{"SEVENZIP_URL=" + toolchain.URL, "SEVENZIP_SHA256=" + toolchain.SHA256}
 	case strings.Contains(toolchain.Dockerfile, "/uudeview/"):

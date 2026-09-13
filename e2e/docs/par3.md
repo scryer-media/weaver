@@ -1,5 +1,12 @@
 # Native PAR3 pipeline scenarios
 
+The canonical corpus also carries PAR3 fixtures that run in the ordinary
+functional and release-gate profiles: the `par3-*` scenarios,
+`par2-par3-both-sufficient` and the four `direct-store-*par3*` sets, all written
+by the pinned par3cmdline reference through `cmd/fixturegen` (see
+[`generators.md`](generators.md)). The tests below are the separate, focused
+harnesses.
+
 `TestPar3E2E` owns a new Weaver process, loopback NNTP fixture and isolated database.
 SQLite is the default; the optional PostgreSQL fixture is described below.
 It submits NZBs through the authenticated GraphQL API and checks final output

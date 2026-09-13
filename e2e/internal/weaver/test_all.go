@@ -587,7 +587,7 @@ func cmdTest(targets []string) {
 }
 
 func cmdTestAll() {
-	slugs := append([]string(nil), canonicalFixtureSlugs...)
+	slugs := enabledCanonicalFixtureSlugs()
 
 	if len(slugs) == 0 {
 		log.Fatal("no canonical fixtures configured")
@@ -1090,8 +1090,10 @@ func assertDirectStoreEngagement(weaverURL string) error {
 // as a count rather than a list because the counters report finalized sets in
 // aggregate; par2-multi-set-archives contributes two independent sets.
 // direct-store-par2-withheld-volume counts: a volume nobody posted is created
-// by the repair and the set finalizes direct around it.
-const directStoreArchiveSetCount = 13
+// by the repair and the set finalizes direct around it. Three PAR3 twins of the
+// repair sets count the same way; direct-store-par3-withheld-volume is disabled
+// and does not run.
+const directStoreArchiveSetCount = 16
 
 // Demotion reasons that mean direct-store REFUSED an archive it is designed not
 // to carry. Refusal is the correct outcome and says nothing about health.
@@ -1139,7 +1141,7 @@ var byDesignDirectRefusals = map[string]bool{
 // correctly. Without this exemption the phase would fail on fixtures whose whole
 // point is being broken. Matched against the submitted job name.
 var jobsAllowedToDemoteOnDamage = []string{
-	"Corrupted", "PAR2", "MissingMiddle", "Damaged", "WrongPass",
+	"Corrupted", "PAR2", "PAR3", "MissingMiddle", "Damaged", "WrongPass",
 }
 
 // isDamageDemotion reports whether a reason means "the bytes were wrong", which

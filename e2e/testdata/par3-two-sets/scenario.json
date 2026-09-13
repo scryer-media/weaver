@@ -1,0 +1,17 @@
+{
+  "slug": "par3-two-sets",
+  "title": "E2E.Test.PAR3.Two.Sets.Onyx.Terrace.S01E01.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Two independent PAR3 sets in one posting, one Cauchy and one FFT at different block sizes, each over its own damaged payload. Both payloads must be repaired before the job completes.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "onyx.terrace.s01e01.featurette.mkv": "fb66e3755bd9229fa28f77c83344036e3983564c1413e6297b243e33016b552c",
+    "onyx.terrace.s01e01.mkv": "15d7a5cd8b5a3691644c3c9b42246dc3d08e87f34346c30ceaadd9d4efd7b850"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

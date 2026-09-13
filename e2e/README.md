@@ -130,7 +130,7 @@ not commit that ledger change unless you are publishing it.
 Every fixture is generated. `go run ./cmd/fixturegen` rebuilds any scenario
 from its recipe on the oracle images pinned in `test-corpus/toolchains.json` —
 official RARLAB releases, the official 7-Zip console binary, par2cmdline-turbo,
-a digest-pinned FFmpeg, and Go's own archive and codec writers. RAR bytes are
+the par3cmdline reference, a digest-pinned FFmpeg, and Go's own archive and codec writers. RAR bytes are
 only ever written by RARLAB's `rar`; every title in the corpus is invented.
 
 [`docs/test-corpus.md`](docs/test-corpus.md) covers the ledger, profiles,

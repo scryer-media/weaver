@@ -1,0 +1,17 @@
+{
+  "slug": "direct-store-par3-repair",
+  "title": "Auburn.Relay.S02E01.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR5 store-method set across four volumes with PAR3 recovery, damaged by deleting the last few articles of an interior volume. The holes are repaired while the set keeps routing direct.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "auburn.relay.s02e01.mkv": "0a6e832f8b02d14ee4953fea428d9a5d8ec15ce4489a7b08afd7385b45a59d85"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "deleteSubjectContains": [
+    "archive.part2.rar"
+  ],
+  "deleteSubjectTailArticles": 3
+}
