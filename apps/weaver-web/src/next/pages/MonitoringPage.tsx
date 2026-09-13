@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router";
 import { useQuery } from "urql";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import type { MetricsHistoryRange } from "@/lib/metrics";
 import { Bar, Eyebrow, KeyValueRow, MetricCell, SectionHeader, Square } from "../components/chrome";
 import { Segmented } from "../components/controls";
@@ -23,6 +24,7 @@ import {
 } from "../data/format";
 import { useMetricsSeries, useMetricsSnapshot } from "../data/use-metrics-series";
 import { WV, WV_FILL } from "../data/palette";
+import { aroundSlot, countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock, providerLoadPercent } from "../shell/rail-blocks";
 
@@ -60,6 +62,7 @@ function axisLabels(timestamps: readonly number[]): string[] {
 }
 
 export function MonitoringPage() {
+  const t = useTranslate();
   const { speed, peakSpeed, providers, queue, downloadBlock } = useNextData();
   const [rangeId, setRangeId] = useState<RangeId>("1h");
   const range = RANGES.find((entry) => entry.value === rangeId)!.range;
@@ -74,7 +77,7 @@ export function MonitoringPage() {
   const throughput: ChartSeries[] = [
     {
       key: "downloaded",
-      label: "Downloaded",
+      label: t("next.monitoring.series.downloaded"),
       color: WV.accent,
       fill: WV_FILL.accent,
       values: series.rate("weaver_pipeline_bytes_downloaded_total"),
@@ -82,14 +85,14 @@ export function MonitoringPage() {
     },
     {
       key: "committed",
-      label: "Committed",
+      label: t("next.monitoring.series.committed"),
       color: WV.info,
       values: series.rate("weaver_pipeline_bytes_committed_total"),
       value: formatRate(last(series.rate("weaver_pipeline_bytes_committed_total"))),
     },
     {
       key: "decoded",
-      label: "Decoded",
+      label: t("next.monitoring.series.decoded"),
       color: WV.slate,
       values: series.rate("weaver_pipeline_bytes_decoded_total"),
       value: formatRate(last(series.rate("weaver_pipeline_bytes_decoded_total"))),
@@ -99,7 +102,7 @@ export function MonitoringPage() {
   const segments: ChartSeries[] = [
     {
       key: "downloaded",
-      label: "Downloaded",
+      label: t("next.monitoring.series.downloaded"),
       color: WV.info,
       fill: WV_FILL.info,
       values: series.rate("weaver_pipeline_segments_downloaded_total"),
@@ -107,14 +110,14 @@ export function MonitoringPage() {
     },
     {
       key: "decoded",
-      label: "Decoded",
+      label: t("next.monitoring.series.decoded"),
       color: WV.accent,
       values: series.rate("weaver_pipeline_segments_decoded_total"),
       value: formatPerSecond(last(series.rate("weaver_pipeline_segments_decoded_total"))),
     },
     {
       key: "retried",
-      label: "Retried",
+      label: t("next.monitoring.series.retried"),
       color: WV.warn,
       values: series.rate("weaver_pipeline_segments_retried_total"),
       value: formatPerSecond(last(series.rate("weaver_pipeline_segments_retried_total"))),
@@ -124,7 +127,7 @@ export function MonitoringPage() {
   const depths: ChartSeries[] = [
     {
       key: "download",
-      label: "Download",
+      label: t("next.monitoring.series.download"),
       color: WV.violet,
       fill: WV_FILL.violet,
       values: series.gauge("weaver_pipeline_download_queue_depth"),
@@ -132,14 +135,14 @@ export function MonitoringPage() {
     },
     {
       key: "decode",
-      label: "Decode pending",
+      label: t("next.monitoring.series.decodePending"),
       color: WV.accent,
       values: series.gauge("weaver_pipeline_decode_pending"),
       value: formatCount(last(series.gauge("weaver_pipeline_decode_pending"))),
     },
     {
       key: "commit",
-      label: "Commit pending",
+      label: t("next.monitoring.series.commitPending"),
       color: WV.info,
       values: series.gauge("weaver_pipeline_commit_pending"),
       value: formatCount(last(series.gauge("weaver_pipeline_commit_pending"))),
@@ -149,28 +152,28 @@ export function MonitoringPage() {
   const failures = [
     {
       key: "articles-not-found",
-      label: "Articles not found",
+      label: t("next.monitoring.failure.notFound"),
       color: WV.warn,
       rate: last(series.rate("weaver_pipeline_articles_not_found_total")),
       total: metrics?.articlesNotFound ?? 0,
     },
     {
       key: "decode-errors",
-      label: "Decode errors",
+      label: t("next.monitoring.failure.decode"),
       color: WV.error,
       rate: last(series.rate("weaver_pipeline_decode_errors_total")),
       total: metrics?.decodeErrors ?? 0,
     },
     {
       key: "crc",
-      label: "CRC mismatches",
+      label: t("next.monitoring.failure.crc"),
       color: WV.violet,
       rate: last(series.rate("weaver_pipeline_crc_errors_total")),
       total: metrics?.crcErrors ?? 0,
     },
     {
       key: "permanent",
-      label: "Permanent failures",
+      label: t("next.monitoring.failure.permanent"),
       color: WV.error,
       rate: last(series.rate("weaver_pipeline_segments_failed_permanent_total")),
       total: metrics?.segmentsFailedPermanent ?? 0,
@@ -195,11 +198,11 @@ export function MonitoringPage() {
 
   return (
     <NextShell
-      title="Monitoring"
-      note="pipeline pressure, providers, failures"
+      title={t("next.nav.monitoring")}
+      note={t("next.monitoring.note")}
       controls={
         <Segmented
-          label="Time range"
+          label={t("next.monitoring.range")}
           value={rangeId}
           onChange={setRangeId}
           options={RANGES}
@@ -218,38 +221,44 @@ export function MonitoringPage() {
           })}
         >
           <MetricCell
-            eyebrow="Pipeline"
-            value={pipelineBusy ? "Active" : "Idle"}
+            eyebrow={t("next.monitoring.pipeline")}
+            value={pipelineBusy ? t("next.monitoring.active") : t("next.monitoring.idle")}
             valueClassName={pipelineBusy ? "text-wv-accent" : "text-wv-idle"}
-            note={`${queue.summary.activeItems} downloads, ${repairs} repairs`}
+            note={t("next.monitoring.pipelineNote", { downloads: queue.summary.activeItems, repairs })}
           />
           <MetricCell
-            eyebrow="Throughput"
+            eyebrow={t("next.shell.throughput")}
             value={throughputNow.value}
             unit={throughputNow.unit}
-            note={peakSpeed > 0 ? `peak ${peak.value} ${peak.unit} this session` : "no traffic yet"}
+            note={
+              peakSpeed > 0
+                ? t("next.monitoring.peak", { value: peak.value, unit: peak.unit })
+                : t("next.monitoring.noTraffic")
+            }
           />
           <MetricCell
-            eyebrow="Threads"
+            eyebrow={t("next.monitoring.threads")}
             value={formatCount(connectionsActive)}
             unit={`/ ${connectionsMax}`}
-            note={`${activeProviders} ${activeProviders === 1 ? "provider" : "providers"} active`}
+            note={countLabel(t, "next.monitoring.providersActive", activeProviders)}
           />
           <MetricCell
-            eyebrow="Decode"
+            eyebrow={t("next.monitoring.decode")}
             value={formatCount(metrics?.articlesPerSec ?? 0)}
             unit="seg/s"
             note={
               compute
-                ? `${compute.decoderTier} · ${compute.logicalCores} workers`
-                : "decoder tier unknown"
+                ? countLabel(t, "next.monitoring.workers", compute.logicalCores, {
+                    tier: compute.decoderTier,
+                  })
+                : t("next.monitoring.tierUnknown")
             }
           />
           <MetricCell
             last
-            eyebrow="Write queue"
+            eyebrow={t("next.monitoring.writeQueue")}
             value={buffered.value}
-            unit={`${buffered.unit} buffered`}
+            unit={t("next.monitoring.buffered", { unit: buffered.unit })}
             valueClassName={(metrics?.writeBufferedBytes ?? 0) > 0 ? "text-wv-warn" : undefined}
             note={`p99 ${formatLatency((metrics?.diskWriteLatencyUs ?? 0) / 1000)}`}
           />
@@ -258,29 +267,31 @@ export function MonitoringPage() {
       statusRight={
         series.error
           ? series.error
-          : `sampled every 5s · ${RANGES.find((entry) => entry.value === rangeId)!.label} window`
+          : t("next.monitoring.sampled", {
+              window: RANGES.find((entry) => entry.value === rangeId)!.label,
+            })
       }
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <Chart
-          title="Throughput"
-          note="bytes per second, downloaded vs committed"
+          title={t("next.shell.throughput")}
+          note={t("next.monitoring.throughputNote")}
           series={throughput}
           xLabels={labels}
           loading={series.isLoading}
           formatValue={(value) => formatRate(value)}
         />
         <Chart
-          title="Segments"
-          note="downloaded, decoded and retried per second"
+          title={t("next.monitoring.segments")}
+          note={t("next.monitoring.segmentsNote")}
           series={segments}
           xLabels={labels}
           loading={series.isLoading}
           formatValue={(value) => formatPerSecond(value)}
         />
         <Chart
-          title="Queue depths"
-          note="backlog across download, decode and commit"
+          title={t("next.monitoring.depths")}
+          note={t("next.monitoring.depthsNote")}
           series={depths}
           xLabels={labels}
           loading={series.isLoading}
@@ -291,13 +302,13 @@ export function MonitoringPage() {
 
         <section className="flex flex-none flex-col">
           <SectionHeader
-            label="Providers"
-            note="connection load, round-trip and failures"
+            label={t("next.rail.providers")}
+            note={t("next.monitoring.providersNote")}
             sticky={false}
           />
           {providers.length === 0 ? (
             <div className="px-4 sm:px-6 py-5 text-[13px] text-wv-muted">
-              No providers configured — add one in Settings → Providers.
+              {t("next.monitoring.noProviders")}
             </div>
           ) : (
             providers.map((provider) => {
@@ -331,19 +342,19 @@ export function MonitoringPage() {
                       {provider.connectionsActive} / {max}
                     </span>
                     <span
-                      title="round-trip"
+                      title={t("next.monitoring.roundTrip")}
                       className={`min-w-[68px] text-right font-wv-mono text-[12.5px] ${degraded ? "text-wv-warn" : "text-wv-secondary"}`}
                     >
                       {formatLatency(provider.latencyMs)}
                     </span>
                     <span
-                      title="failures since start"
+                      title={t("next.monitoring.failuresSinceStart")}
                       className="w-[74px] text-right font-wv-mono text-[12.5px] text-wv-secondary"
                     >
                       {formatCount(provider.failureCount)}
                     </span>
                     <span
-                      title="share of active connections"
+                      title={t("next.monitoring.connectionShare")}
                       className="w-[50px] text-right font-wv-mono text-[12.5px] text-wv-muted"
                     >
                       {share}%
@@ -356,7 +367,11 @@ export function MonitoringPage() {
         </section>
 
         <section className="flex flex-none flex-col">
-          <SectionHeader label="Failures" note="counter-derived, since startup" sticky={false} />
+          <SectionHeader
+            label={t("next.monitoring.failures")}
+            note={t("next.monitoring.failuresNote")}
+            sticky={false}
+          />
           {failures.map((failure) => (
             <div
               key={failure.key}
@@ -383,9 +398,9 @@ export function MonitoringPage() {
 }
 
 const PERIOD_NOTE: Record<"DAILY" | "WEEKLY" | "MONTHLY", string> = {
-  DAILY: "daily window",
-  WEEKLY: "weekly window",
-  MONTHLY: "monthly window",
+  DAILY: "next.monitoring.period.daily",
+  WEEKLY: "next.monitoring.period.weekly",
+  MONTHLY: "next.monitoring.period.monthly",
 };
 
 /**
@@ -395,18 +410,26 @@ const PERIOD_NOTE: Record<"DAILY" | "WEEKLY" | "MONTHLY", string> = {
  * because this is the screen someone watching a download's pace is already on.
  */
 function DataCapSection({ block }: { block: ReturnType<typeof useNextData>["downloadBlock"] }) {
+  const t = useTranslate();
   const settingsLink = (
     <Link to="/settings/bandwidth" className="text-wv-accent hover:text-wv-accent-hover">
-      Settings → Bandwidth
+      {t("next.monitoring.bandwidthLink")}
     </Link>
   );
 
   if (!block.capEnabled) {
+    const [noCapBefore, noCapAfter] = aroundSlot(t, "next.monitoring.noCap", "link");
     return (
       <section className="flex flex-none flex-col">
-        <SectionHeader label="Data cap" note="not enforced" sticky={false} />
+        <SectionHeader
+          label={t("next.monitoring.dataCap")}
+          note={t("next.monitoring.capNotEnforced")}
+          sticky={false}
+        />
         <div className="px-4 py-5 text-[13px] text-wv-muted sm:px-6">
-          No data cap is set. Downloads are never held for allowance — set one in {settingsLink}.
+          {noCapBefore}
+          {settingsLink}
+          {noCapAfter}
         </div>
       </section>
     );
@@ -416,9 +439,13 @@ function DataCapSection({ block }: { block: ReturnType<typeof useNextData>["down
   if (block.kind === "SERVER_QUOTA") {
     return (
       <section className="flex flex-none flex-col">
-        <SectionHeader label="Data cap" note="provider quota" sticky={false} />
+        <SectionHeader
+          label={t("next.monitoring.dataCap")}
+          note={t("next.monitoring.capProviderQuota")}
+          sticky={false}
+        />
         <div className="px-4 py-5 text-[13px] text-wv-muted sm:px-6">
-          Downloads are held by a provider quota; the cap's counters return once it lifts.
+          {t("next.monitoring.capQuotaHeld")}
         </div>
       </section>
     );
@@ -426,28 +453,40 @@ function DataCapSection({ block }: { block: ReturnType<typeof useNextData>["down
 
   const percent = block.limitBytes > 0 ? (block.usedBytes / block.limitBytes) * 100 : 0;
   const color = percent >= 90 ? WV.error : percent >= 70 ? WV.warn : WV.accent;
-  const note = [block.period ? PERIOD_NOTE[block.period] : null, block.timezoneName || null]
+  const note = [block.period ? t(PERIOD_NOTE[block.period]) : null, block.timezoneName || null]
     .filter(Boolean)
     .join(" · ");
 
   return (
     <section className="flex flex-none flex-col">
-      <SectionHeader label="Data cap" note={note || undefined} sticky={false} />
+      <SectionHeader label={t("next.monitoring.dataCap")} note={note || undefined} sticky={false} />
       <div className="flex flex-col gap-2 border-b border-wv-hairline px-4 py-[14px] sm:px-6">
-        <Bar percent={percent} color={color} label="Data cap used" />
+        <Bar percent={percent} color={color} label={t("next.monitoring.capUsed")} />
         <div className="flex items-baseline justify-between font-wv-mono text-[11.5px] text-wv-muted">
           <span>
-            {formatSize(block.usedBytes)} used · {Math.round(percent)}%
+            {t("next.monitoring.usedPercent", {
+              size: formatSize(block.usedBytes),
+              percent: Math.round(percent),
+            })}
           </span>
-          <span>{formatSize(block.limitBytes)} allowance</span>
+          <span>{t("next.monitoring.allowance", { size: formatSize(block.limitBytes) })}</span>
         </div>
       </div>
-      <KeyValueRow label="Remaining" value={formatSize(block.remainingBytes)} />
-      <KeyValueRow label="Reserved by running downloads" value={formatSize(block.reservedBytes)} />
-      <KeyValueRow label="Window resets" value={formatDayClock(block.windowEndsAtEpochMs)} />
+      <KeyValueRow label={t("next.monitoring.remaining")} value={formatSize(block.remainingBytes)} />
+      <KeyValueRow label={t("next.monitoring.reserved")} value={formatSize(block.reservedBytes)} />
       <KeyValueRow
-        label="Downloads held by the cap"
-        value={block.kind === "ISP_CAP" ? <span className="text-wv-warn">Yes</span> : "No"}
+        label={t("next.monitoring.windowResets")}
+        value={formatDayClock(block.windowEndsAtEpochMs)}
+      />
+      <KeyValueRow
+        label={t("next.monitoring.heldByCap")}
+        value={
+          block.kind === "ISP_CAP" ? (
+            <span className="text-wv-warn">{t("next.common.yes")}</span>
+          ) : (
+            t("next.common.no")
+          )
+        }
       />
     </section>
   );

@@ -1,9 +1,11 @@
 import { useState } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { EmptyState } from "../components/chrome";
 import { SecondaryButton, TextField } from "../components/controls";
 import { formatCount } from "../data/format";
 import { LOG_LEVEL_COLORS, WV } from "../data/palette";
+import { countLabel } from "../i18n/labels";
 import {
   LOG_LEVELS,
   useServiceLogs,
@@ -36,25 +38,28 @@ function messageFragments(line: LogLine) {
 }
 
 export function LogsPage() {
+  const t = useTranslate();
   const [level, setLevel] = useState<LogLevelFilter>("all");
   const [query, setQuery] = useState("");
   const logs = useServiceLogs(level, query);
 
   return (
     <NextShell
-      title="Logs"
-      note={`live tail · ${formatCount(logs.bufferedCount)} lines buffered`}
+      title={t("next.nav.logs")}
+      note={countLabel(t, "next.logs.buffered", logs.bufferedCount, {
+        count: formatCount(logs.bufferedCount),
+      })}
       controls={
         <>
           <TextField
-            label="Search logs"
-            placeholder="Search message, target, field"
+            label={t("next.logs.search")}
+            placeholder={t("next.logs.searchPlaceholder")}
             value={query}
             onChange={setQuery}
             className="w-[150px] sm:w-[260px]"
           />
           <SecondaryButton icon={logs.paused ? "resume" : "pause"} onClick={() => logs.setPaused(!logs.paused)}>
-            {logs.paused ? "Resume tail" : "Pause tail"}
+            {logs.paused ? t("next.logs.resumeTail") : t("next.logs.pauseTail")}
           </SecondaryButton>
         </>
       }
@@ -82,7 +87,7 @@ export function LogsPage() {
                   className="size-1.5 flex-none"
                   style={{ background: selected ? color : CHIP_OFF }}
                 />
-                {entry}
+                {entry === "all" ? t("next.logs.all") : entry}
                 <span className="text-wv-faint">{logs.counts[entry]}</span>
               </button>
             );
@@ -90,22 +95,25 @@ export function LogsPage() {
           </div>
           <span className="ml-auto hidden flex-none pl-3 font-wv-mono text-[11px] text-wv-faint sm:inline">
             {logs.paused
-              ? "paused — scroll freely"
+              ? t("next.logs.pausedNote")
               : logs.connected
-                ? "following new lines"
-                : "tail disconnected"}
+                ? t("next.logs.following")
+                : t("next.logs.disconnected")}
           </span>
         </div>
       }
-      statusRight={`${formatCount(logs.matchedCount)} shown of ${formatCount(logs.bufferedCount)}`}
+      statusRight={t("next.logs.shown", {
+        shown: formatCount(logs.matchedCount),
+        total: formatCount(logs.bufferedCount),
+      })}
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         {logs.lines.length === 0 && logs.loading ? (
-          <EmptyState loading title="Loading" body="Fetching recent log lines." />
+          <EmptyState loading title={t("next.common.loading")} body={t("next.logs.loadingBody")} />
         ) : logs.lines.length === 0 ? (
           <EmptyState
-            title="No lines match this filter"
-            body="Clear the search or pick another level."
+            title={t("next.logs.noMatch")}
+            body={t("next.logs.noMatchBody")}
           />
         ) : (
           logs.lines.map((line) => (

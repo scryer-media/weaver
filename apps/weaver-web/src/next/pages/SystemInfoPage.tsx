@@ -59,7 +59,13 @@ function enumLabel(value: string): string {
   return value.charAt(0) + value.slice(1).toLowerCase().replace(/_/g, " ");
 }
 
-function reportText(info: SystemInfo, cacheInUse: string): string {
+/**
+ * The bug-report text. It stays in English whatever the interface language: it
+ * is read by whoever triages the report, not by the person who copied it.
+ */
+function reportText(info: SystemInfo, cacheBytes: number, cacheLimit: number): string {
+  const cacheInUse =
+    cacheLimit > 0 ? `${formatSize(cacheBytes)} of ${formatSize(cacheLimit)}` : formatSize(cacheBytes);
   const lines = [
     `Weaver ${info.version}`,
     `Deployment: ${enumLabel(info.deployment)} · ${info.architecture}`,
@@ -111,7 +117,9 @@ export function SystemInfoPage() {
   const cacheBytes = metrics?.decodePendingBytes ?? 0;
   const cacheLimit = metrics?.decodePressureHardLimitBytes ?? 0;
   const cacheInUse =
-    cacheLimit > 0 ? `${formatSize(cacheBytes)} of ${formatSize(cacheLimit)}` : formatSize(cacheBytes);
+    cacheLimit > 0
+      ? t("next.system.usedOf", { used: formatSize(cacheBytes), total: formatSize(cacheLimit) })
+      : formatSize(cacheBytes);
 
   // Streamed straight off the endpoint: collection holds the request open for
   // the gap between two metrics samples, so the button stays busy throughout.
@@ -136,8 +144,8 @@ export function SystemInfoPage() {
 
   return (
     <NextShell
-      title="System info"
-      note="runtime, hardware and storage"
+      title={t("next.nav.systemInfo")}
+      note={t("next.system.note")}
       controls={
         <>
           <SecondaryButton
@@ -146,90 +154,112 @@ export function SystemInfoPage() {
             onClick={() => {
               if (!info) return;
               void navigator.clipboard
-                ?.writeText(reportText(info, cacheInUse))
+                ?.writeText(reportText(info, cacheBytes, cacheLimit))
                 .then(() => setCopied(true))
-                .catch(() => setFailure("Could not copy to the clipboard."));
+                .catch(() => setFailure(t("next.system.copyFailed")));
             }}
           >
-            {copied ? "Copied" : "Copy for a bug report"}
+            {copied ? t("next.system.copied") : t("next.system.copyReport")}
           </SecondaryButton>
           <PrimaryButton icon="downloadFile" disabled={busy} onClick={() => void downloadDiagnostics()}>
-            {busy ? "Collecting" : "Download diagnostics"}
+            {busy ? t("next.system.collecting") : t("next.system.downloadDiagnostics")}
           </PrimaryButton>
         </>
       }
       railMiddle={<AttentionBlock />}
       railFooter={<UptimeBlock />}
       statusRight={
-        failure ?? `collected at ${collectedAt.toLocaleTimeString([], { hour12: false })}`
+        failure ??
+        t("next.system.collectedAt", {
+          time: collectedAt.toLocaleTimeString([], { hour12: false }),
+        })
       }
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         {!info ? (
           <EmptyState
             loading={!error}
-            title={error ? "System info is unavailable" : "Loading"}
-            body={error ? error.message : "Reading the daemon's runtime facts."}
+            title={error ? t("next.system.unavailable") : t("next.common.loading")}
+            body={error ? error.message : t("next.system.loadingBody")}
           />
         ) : (
           <>
             <SectionHeader
-              label="Software"
-              note={`v${info.version} · up ${formatDuration(info.uptimeSeconds)}`}
+              label={t("next.system.software")}
+              note={t("next.system.softwareNote", {
+                version: info.version,
+                uptime: formatDuration(info.uptimeSeconds),
+              })}
             />
-            <KeyValueRow label="Version" value={info.version} />
+            <KeyValueRow label={t("next.system.version")} value={info.version} />
             <KeyValueRow
-              label="Deployment"
+              label={t("next.system.deployment")}
               value={`${enumLabel(info.deployment)} · ${info.architecture}`}
             />
-            <KeyValueRow label="Operating system" value={enumLabel(info.operatingSystem)} />
-            <KeyValueRow label="Database" value={enumLabel(info.databaseEngine)} />
-            <KeyValueRow label="Uptime" value={formatDuration(info.uptimeSeconds)} />
+            <KeyValueRow label={t("next.system.operatingSystem")} value={enumLabel(info.operatingSystem)} />
+            <KeyValueRow label={t("next.system.database")} value={enumLabel(info.databaseEngine)} />
+            <KeyValueRow label={t("next.rail.uptime")} value={formatDuration(info.uptimeSeconds)} />
 
-            <SectionHeader label="Compute" note="decoder and CPU" />
-            <KeyValueRow label="Decoder tier" value={info.compute.decoderTier} />
+            <SectionHeader label={t("next.system.compute")} note={t("next.system.computeNote")} />
+            <KeyValueRow label={t("next.system.decoderTier")} value={info.compute.decoderTier} />
             <KeyValueRow
-              label="Detected SIMD"
-              value={info.compute.simdFeatures.join(", ") || "none detected"}
+              label={t("next.system.simd")}
+              value={info.compute.simdFeatures.join(", ") || t("next.system.noneDetected")}
             />
             <KeyValueRow
-              label="Cores"
-              value={`${info.compute.physicalCores} physical · ${info.compute.logicalCores} logical`}
+              label={t("next.system.cores")}
+              value={t("next.system.coresValue", {
+                physical: info.compute.physicalCores,
+                logical: info.compute.logicalCores,
+              })}
             />
             <KeyValueRow
-              label="Container CPU quota"
-              value={info.compute.cgroupLimit == null ? "Not limited" : String(info.compute.cgroupLimit)}
+              label={t("next.system.cpuQuota")}
+              value={
+                info.compute.cgroupLimit == null
+                  ? t("next.system.notLimited")
+                  : String(info.compute.cgroupLimit)
+              }
             />
 
-            <SectionHeader label="Memory" note="host and container" />
-            <KeyValueRow label="Total memory" value={formatSize(info.memory.totalBytes)} />
+            <SectionHeader label={t("next.system.memory")} note={t("next.system.memoryNote")} />
+            <KeyValueRow label={t("next.system.totalMemory")} value={formatSize(info.memory.totalBytes)} />
             <KeyValueRow
-              label="Available at startup"
+              label={t("next.system.availableAtStartup")}
               value={formatSize(info.memory.availableAtStartupBytes)}
             />
             <KeyValueRow
-              label="Container limit"
+              label={t("next.system.containerLimit")}
               value={
                 info.memory.cgroupLimitBytes == null
-                  ? "Not limited"
+                  ? t("next.system.notLimited")
                   : formatSize(info.memory.cgroupLimitBytes)
               }
             />
-            <KeyValueRow label="Effective limit" value={formatSize(info.memory.effectiveLimitBytes)} />
-            <KeyValueRow label="Article cache in use" value={cacheInUse} />
-
-            <SectionHeader label="Primary storage" note="measured at startup" />
-            <KeyValueRow label="Filesystem" value={info.primaryStorage.filesystem} />
-            <KeyValueRow label="Storage class" value={info.primaryStorage.storageClass} />
             <KeyValueRow
-              label="Random-read benchmark"
+              label={t("next.system.effectiveLimit")}
+              value={formatSize(info.memory.effectiveLimitBytes)}
+            />
+            <KeyValueRow label={t("next.system.articleCache")} value={cacheInUse} />
+
+            <SectionHeader
+              label={t("next.system.primaryStorage")}
+              note={t("next.system.primaryStorageNote")}
+            />
+            <KeyValueRow label={t("next.system.filesystem")} value={info.primaryStorage.filesystem} />
+            <KeyValueRow label={t("next.system.storageClass")} value={info.primaryStorage.storageClass} />
+            <KeyValueRow
+              label={t("next.system.randomRead")}
               value={`${formatCount(info.primaryStorage.startupRandomReadIops)} IOPS`}
             />
 
-            <SectionHeader label="Configured storage" note="paths are hidden in exported reports" />
+            <SectionHeader
+              label={t("next.system.configuredStorage")}
+              note={t("next.system.configuredStorageNote")}
+            />
             {info.configuredStorage.length === 0 ? (
               <div className="px-4 sm:px-6 py-5 text-[13px] text-wv-muted">
-                No storage locations are configured yet.
+                {t("next.system.noStorage")}
               </div>
             ) : (
               info.configuredStorage.map((volume) => (
@@ -239,7 +269,7 @@ export function SystemInfoPage() {
                 >
                   <div className="flex min-w-0 flex-[1_1_260px] flex-col gap-1">
                     <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
-                      {volume.labels.join(" · ") || "storage"}
+                      {volume.labels.join(" · ") || t("next.system.storageFallback")}
                     </span>
                     <span title={volume.path} className="truncate font-wv-mono text-[11.5px] text-wv-faint">
                       {volume.path}
@@ -248,7 +278,10 @@ export function SystemInfoPage() {
                   <StorageUsage
                     label={
                       volume.capacity
-                        ? `${formatSize(volume.capacity.usedBytes)} of ${formatSize(volume.capacity.totalBytes)}`
+                        ? t("next.system.usedOf", {
+                            used: formatSize(volume.capacity.usedBytes),
+                            total: formatSize(volume.capacity.totalBytes),
+                          })
                         : EM_DASH
                     }
                     capacity={volume.capacity}
