@@ -12,6 +12,7 @@ import { Eyebrow, EmptyState, SectionHeader } from "@/next/components/chrome";
 import { PathField } from "@/next/features/DirectoryBrowserDialog";
 import {
   NumberField,
+  PrimaryButton,
   Segmented,
   Select,
   Slider,
@@ -265,6 +266,12 @@ export interface SettingsTableModel {
   onRowClick?: (id: string) => void;
   empty?: string;
   /**
+   * The panel's "Add" for this list, repeated under the empty message. An
+   * empty panel's next step belongs where the eye already is, not only in the
+   * top bar's corner.
+   */
+  emptyAction?: { label: string; onClick: () => void };
+  /**
    * A trailing row of the table's own actions — "Add rule", "Clear history".
    * The top bar carries a panel's actions; a table that owns more than one
    * list carries the ones that belong to that list.
@@ -389,8 +396,13 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
           ))}
         </div>
         {block.rows.length === 0 ? (
-          <div className="px-4 sm:px-6 py-5 text-[13px] text-wv-muted">
-            {block.empty ?? "Nothing configured yet."}
+          <div className="flex flex-col items-start gap-3 px-4 sm:px-6 py-5">
+            <span className="text-[13px] text-wv-muted">{block.empty ?? "Nothing configured yet."}</span>
+            {block.emptyAction === undefined ? null : (
+              <PrimaryButton icon="add" onClick={block.emptyAction.onClick}>
+                {block.emptyAction.label}
+              </PrimaryButton>
+            )}
           </div>
         ) : (
           block.rows.map((row) => {

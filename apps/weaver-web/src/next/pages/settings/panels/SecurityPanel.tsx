@@ -383,6 +383,7 @@ export function SecurityPanel() {
       columns: "minmax(0, 1fr) 160px 150px 150px 92px",
       headers: ["Name", "Scope", "Created", "Last used", ""],
       empty: "No API keys. Sonarr, Radarr and the NZBGet facade each need one.",
+      emptyAction: { label: "Add API key", onClick: () => setKeyOpen(true) },
       rows: keys.map((key) => ({
         id: String(key.id),
         searchText: `${key.name} ${key.scope}`,
@@ -408,7 +409,7 @@ export function SecurityPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton icon="add" onClick={() => setKeyOpen(true)}>New API key</SecondaryButton>
+        <PrimaryButton icon="add" onClick={() => setKeyOpen(true)}>Add API key</PrimaryButton>
       </PanelControls>
 
       {bind?.bindFallback ? (

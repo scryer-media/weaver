@@ -10,7 +10,7 @@ import {
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
-import { SecondaryButton } from "../../../components/controls";
+import { PrimaryButton } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { categoryColor } from "../../../data/palette";
 import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
@@ -114,6 +114,7 @@ export function CategoriesPanel() {
       columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr)",
       headers: ["Name", "Destination", "Also known as"],
       empty: "No categories yet. Downloads without one land in the completed folder.",
+      emptyAction: { label: "Add category", onClick: () => open(null) },
       onRowClick: (id) => {
         const category = categories.find((entry) => String(entry.id) === id);
         if (category) {
@@ -142,7 +143,7 @@ export function CategoriesPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton icon="add" onClick={() => open(null)}>Add category</SecondaryButton>
+        <PrimaryButton icon="add" onClick={() => open(null)}>Add category</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

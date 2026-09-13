@@ -12,7 +12,7 @@ import { parseWireguardConfig, stripConfigAssignment } from "@/lib/wireguard-con
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { SecondaryButton, TextArea } from "../../../components/controls";
+import { PrimaryButton, SecondaryButton, TextArea } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import { PanelControls, SettingsBlocks, type FieldSpec, type SettingsBlock } from "../framework";
@@ -536,6 +536,7 @@ export function ProxiesPanel() {
       columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 82px",
       headers: ["Name", "Type", "Endpoint", "Last test", ""],
       empty: "No proxies. Providers connect directly.",
+      emptyAction: { label: "Add proxy", onClick: () => open(null) },
       onRowClick: (id) => {
         const profile = profiles.find((entry) => String(entry.id) === id);
         if (profile) {
@@ -572,7 +573,7 @@ export function ProxiesPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton icon="add" onClick={() => open(null)}>Add proxy</SecondaryButton>
+        <PrimaryButton icon="add" onClick={() => open(null)}>Add proxy</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

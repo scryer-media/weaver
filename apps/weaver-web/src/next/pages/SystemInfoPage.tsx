@@ -4,10 +4,10 @@ import { authHeaders } from "@/graphql/client";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
-import { Bar, EmptyState, KeyValueRow, SectionHeader } from "../components/chrome";
+import { EmptyState, KeyValueRow, SectionHeader } from "../components/chrome";
 import { PrimaryButton, SecondaryButton } from "../components/controls";
+import { StorageUsage } from "../components/storage";
 import { EM_DASH, formatCount, formatDuration, formatSize } from "../data/format";
-import { usageColor } from "../data/palette";
 import { useMetricsSnapshot } from "../data/use-metrics-series";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../shell/rail-blocks";
@@ -232,38 +232,31 @@ export function SystemInfoPage() {
                 No storage locations are configured yet.
               </div>
             ) : (
-              info.configuredStorage.map((volume) => {
-                const percent =
-                  volume.capacity && volume.capacity.totalBytes > 0
-                    ? (volume.capacity.usedBytes / volume.capacity.totalBytes) * 100
-                    : 0;
-                return (
-                  <div
-                    key={volume.path}
-                    className="flex flex-wrap items-center gap-x-5 gap-y-3 border-b border-wv-hairline px-4 sm:px-6 py-[13px] hover:bg-wv-cell-hover"
-                  >
-                    <div className="flex min-w-0 flex-[1_1_260px] flex-col gap-1">
-                      <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
-                        {volume.labels.join(" · ") || "storage"}
-                      </span>
-                      <span title={volume.path} className="truncate font-wv-mono text-[11.5px] text-wv-faint">
-                        {volume.path}
-                      </span>
-                    </div>
-                    <div className="ml-auto flex items-center gap-5">
-                      <Bar percent={percent} color={usageColor(percent)} className="w-full max-w-[220px]" />
-                      <span className="w-[46px] text-right font-wv-mono text-[12.5px] text-wv-secondary">
-                        {Math.round(percent)}%
-                      </span>
-                      <span className="w-[168px] text-right font-wv-mono text-[12.5px] text-wv-muted">
-                        {volume.capacity
-                          ? `${formatSize(volume.capacity.usedBytes)} of ${formatSize(volume.capacity.totalBytes)}`
-                          : (volume.error ?? EM_DASH)}
-                      </span>
-                    </div>
+              info.configuredStorage.map((volume) => (
+                <div
+                  key={volume.path}
+                  className="flex flex-wrap items-center gap-x-5 gap-y-3 border-b border-wv-hairline px-4 sm:px-6 py-[13px] hover:bg-wv-cell-hover"
+                >
+                  <div className="flex min-w-0 flex-[1_1_260px] flex-col gap-1">
+                    <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
+                      {volume.labels.join(" · ") || "storage"}
+                    </span>
+                    <span title={volume.path} className="truncate font-wv-mono text-[11.5px] text-wv-faint">
+                      {volume.path}
+                    </span>
                   </div>
-                );
-              })
+                  <StorageUsage
+                    label={
+                      volume.capacity
+                        ? `${formatSize(volume.capacity.usedBytes)} of ${formatSize(volume.capacity.totalBytes)}`
+                        : EM_DASH
+                    }
+                    capacity={volume.capacity}
+                    error={volume.error}
+                    className="ml-auto w-[260px] max-w-full"
+                  />
+                </div>
+              ))
             )}
           </>
         )}

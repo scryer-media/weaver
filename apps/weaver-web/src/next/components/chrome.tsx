@@ -604,6 +604,32 @@ export function blockFill(color: string, cell = 6): string {
 }
 
 /** A content region with nothing to list yet; `loading` marks it as still on its way. */
+/**
+ * How long a loader holds back before it shows.
+ *
+ * Moving between screens starts a fetch on nearly every one, and most of them
+ * land well inside this. A loader that flashes up and straight away again reads
+ * as a flicker, not as progress, so it only appears for a load that is
+ * actually taking a moment.
+ */
+export const LOADER_DELAY_MS = 200;
+
+/** `active`, once it has stayed true for `delayMs`; false again the moment it drops. */
+export function useSettledFlag(active: boolean, delayMs = LOADER_DELAY_MS): boolean {
+  const [settled, setSettled] = useState(false);
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+    const timer = window.setTimeout(() => setSettled(true), delayMs);
+    return () => {
+      window.clearTimeout(timer);
+      setSettled(false);
+    };
+  }, [active, delayMs]);
+  return active && settled;
+}
+
 export function EmptyState({
   title,
   body,
@@ -619,12 +645,16 @@ export function EmptyState({
   /** What to do about it, under the words. */
   action?: ReactNode;
 }) {
+  // Held invisible rather than unrendered, so the pane keeps its geometry and
+  // the loader does not shift anything when it does appear.
+  const revealed = useSettledFlag(loading);
   return (
     <div
       role={loading ? "status" : undefined}
       className={cn(
         "flex gap-4 px-4 sm:px-6 py-10",
         centered ? "flex-1 flex-col items-center justify-center text-center" : "items-center",
+        loading && !revealed && "invisible",
       )}
     >
       {loading ? <LoadingMark className="h-8" /> : null}

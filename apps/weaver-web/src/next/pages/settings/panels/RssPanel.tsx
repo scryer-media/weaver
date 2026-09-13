@@ -16,7 +16,7 @@ import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/pro
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { SecondaryButton } from "../../../components/controls";
+import { PrimaryButton, SecondaryButton } from "../../../components/controls";
 import { RoutingEditor, RoutingState } from "../../../components/RoutingEditor";
 import { Cell } from "../../../components/rows";
 import { formatDate, formatSize } from "../../../data/format";
@@ -445,6 +445,7 @@ export function RssPanel() {
       columns: "minmax(0, 1fr) minmax(0, 1.3fr) 110px minmax(0, 1fr) 64px",
       headers: ["Name", "URL", "Interval", "Last poll", ""],
       empty: "No feeds. Add one to have weaver watch an indexer's search.",
+      emptyAction: { label: "Add feed", onClick: () => openFeed(null) },
       onRowClick: (id) => {
         const feed = feeds.find((entry) => String(entry.id) === id);
         if (feed) {
@@ -828,7 +829,7 @@ export function RssPanel() {
         <SecondaryButton icon="refresh" onClick={() => void sync()} disabled={feeds.length === 0}>
           Poll all
         </SecondaryButton>
-        <SecondaryButton icon="add" onClick={() => openFeed(null)}>Add feed</SecondaryButton>
+        <PrimaryButton icon="add" onClick={() => openFeed(null)}>Add feed</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

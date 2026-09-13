@@ -16,7 +16,7 @@ import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { RoutingEditor } from "../../../components/RoutingEditor";
-import { SecondaryButton, Toggle } from "../../../components/controls";
+import { PrimaryButton, SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import { formatLatency, formatSize } from "../../../data/format";
@@ -401,6 +401,12 @@ export function ProvidersPanel() {
     void reexecute({ requestPolicy: "network-only" });
   };
 
+  const addProvider = () => {
+    setForm(NEW_SERVER);
+    setTestResult(null);
+    setEditingId("new");
+  };
+
   const blocks: SettingsBlock[] = [
     {
       kind: "table",
@@ -410,6 +416,7 @@ export function ProvidersPanel() {
       columns: "minmax(0, 1fr) 92px 190px 150px 44px",
       headers: ["Host", "Threads", "Transport", "Role", ""],
       empty: "No providers yet. Add one to start downloading.",
+      emptyAction: { label: "Add provider", onClick: addProvider },
       onRowClick: (id) => {
         setForm(null);
         setTestResult(null);
@@ -631,16 +638,9 @@ export function ProvidersPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton
-          icon="add"
-          onClick={() => {
-            setForm(NEW_SERVER);
-            setTestResult(null);
-            setEditingId("new");
-          }}
-        >
+        <PrimaryButton icon="add" onClick={addProvider}>
           Add provider
-        </SecondaryButton>
+        </PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

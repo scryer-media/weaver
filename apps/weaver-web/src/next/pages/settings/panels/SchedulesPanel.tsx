@@ -9,7 +9,7 @@ import {
 } from "@/graphql/queries";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
-import { SecondaryButton, Toggle } from "../../../components/controls";
+import { PrimaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatRate } from "../../../data/format";
 import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
@@ -169,6 +169,7 @@ export function SchedulesPanel() {
       columns: "84px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr) 44px",
       headers: ["Time", "Days", "Action", "Label", ""],
       empty: "No schedules yet. Weaver downloads whenever there is work.",
+      emptyAction: { label: "Add schedule", onClick: () => open(null) },
       onRowClick: (id) => {
         const schedule = schedules.find((entry) => entry.id === id);
         if (schedule) {
@@ -209,7 +210,7 @@ export function SchedulesPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton icon="add" onClick={() => open(null)}>Add schedule</SecondaryButton>
+        <PrimaryButton icon="add" onClick={() => open(null)}>Add schedule</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { LoadingMark } from "@/lib/loading-mark";
-import { SectionHeader, Square } from "./chrome";
+import { SectionHeader, Square, useSettledFlag } from "./chrome";
 
 export interface ChartSeries {
   key: string;
@@ -78,6 +78,7 @@ export function Chart({
     0,
   );
   const ceiling = niceCeiling(max);
+  const showLoader = useSettledFlag(loading);
   const yLabels = [ceiling, (ceiling * 2) / 3, ceiling / 3, 0];
 
   return (
@@ -102,7 +103,7 @@ export function Chart({
               ))}
               {loading ? (
                 <div role="status" className="absolute inset-0 flex items-center justify-center">
-                  <LoadingMark className="h-8" />
+                  {showLoader ? <LoadingMark className="h-8" /> : null}
                   <span className="sr-only">Loading {title.toLowerCase()}</span>
                 </div>
               ) : null}
