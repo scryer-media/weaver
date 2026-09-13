@@ -271,6 +271,20 @@ h6 {
   animation: wv-pulse 1.5s ease-in-out infinite;
 }
 
+/* The loading mark's delayed entrance: a load that finishes first never shows it. */
+@keyframes weaver-loading-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@utility animate-loading-reveal {
+  animation: weaver-loading-reveal 200ms ease-out 400ms both;
+}
+
 @utility progress-indeterminate {
   background-image: linear-gradient(
     45deg,

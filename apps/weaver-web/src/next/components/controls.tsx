@@ -426,6 +426,10 @@ export function Slider({
  *
  * Kept as text while focused so a field can be cleared and retyped — a number
  * input that snaps an empty string back to 0 is unusable — and clamped on blur.
+ *
+ * A unit ("days", "seconds") is set inside the box at its right edge. The
+ * border belongs to the label wrapping both, so a click on the unit still
+ * lands in the field, and `className` sizes that box rather than the bare input.
  */
 export function NumberField({
   value,
@@ -464,7 +468,14 @@ export function NumberField({
   };
 
   return (
-    <div className="flex items-center gap-[10px]">
+    <label
+      className={cn(
+        "flex h-[34px] cursor-text items-center border border-wv-control bg-wv-input focus-within:border-wv-control-focus",
+        suffix === undefined ? "w-[110px]" : "w-fit",
+        disabled && "cursor-default",
+        className,
+      )}
+    >
       <input
         type="number"
         aria-label={label}
@@ -476,15 +487,17 @@ export function NumberField({
         onChange={(event) => setDraft(event.target.value)}
         onBlur={(event) => commit(event.target.value)}
         className={cn(
-          "h-[34px] w-[110px] border border-wv-control bg-wv-input px-3 font-wv-mono text-[12px] text-wv-fg outline-none focus:border-wv-control-focus",
+          "h-full min-w-0 bg-transparent pl-3 font-wv-mono text-[12px] text-wv-fg outline-none",
+          suffix === undefined ? "flex-1 pr-3" : "w-[86px] flex-none",
           disabled && "text-wv-disabled",
-          className,
         )}
       />
       {suffix === undefined ? null : (
-        <span className="flex-none font-wv-mono text-[11.5px] text-wv-muted">{suffix}</span>
+        <span className="flex-none pr-3 pl-2 font-wv-mono text-[11.5px] text-wv-muted">
+          {suffix}
+        </span>
       )}
-    </div>
+    </label>
   );
 }
 

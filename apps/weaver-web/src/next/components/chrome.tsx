@@ -1,5 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { LoadingMark } from "@/lib/loading-mark";
 import { cn } from "@/lib/utils";
 import { WV } from "../data/palette";
 
@@ -590,11 +591,18 @@ export function blockFill(color: string, cell = 6): string {
   return `repeating-linear-gradient(90deg, ${color} 0 ${cell - 1}px, transparent ${cell - 1}px ${cell}px)`;
 }
 
-export function EmptyState({ title, body }: { title: string; body: string }) {
+/** A content region with nothing to list yet; `loading` marks it as still on its way. */
+export function EmptyState({ title, body, loading = false }: { title: string; body: string; loading?: boolean }) {
   return (
-    <div className="flex flex-col gap-1.5 px-4 sm:px-6 py-10">
-      <div className="font-wv-title text-[14px] font-semibold text-wv-fg">{title}</div>
-      <div className="text-[13px] text-wv-muted">{body}</div>
+    <div
+      role={loading ? "status" : undefined}
+      className="flex items-center gap-4 px-4 sm:px-6 py-10"
+    >
+      {loading ? <LoadingMark className="h-8" /> : null}
+      <div className="flex min-w-0 flex-col gap-1.5">
+        <div className="font-wv-title text-[14px] font-semibold text-wv-fg">{title}</div>
+        <div className="text-[13px] text-wv-muted">{body}</div>
+      </div>
     </div>
   );
 }

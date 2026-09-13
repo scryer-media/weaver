@@ -50,14 +50,17 @@ export function useStatusLabel(): (status: string) => string {
  * The second line of the inspector's Status field: what the pipeline is doing
  * with this download right now, in weaver's own terms.
  */
-export function statusDetail(job: JobData): string | null {
+export function statusDetail(
+  job: JobData,
+  /** The phase the screen is showing; by default, the one that last reported. */
+  phase = currentPhase(job),
+): string | null {
   if (job.error) {
     return job.error;
   }
   if (job.downloadWaitReason) {
     return job.downloadWaitReason.toLowerCase().replace(/_/g, " ");
   }
-  const phase = currentPhase(job);
   if (phase && phase.totalBytes > 0) {
     return `${Math.round(phase.progressPercent)}% of ${phase.phase.toLowerCase()}`;
   }

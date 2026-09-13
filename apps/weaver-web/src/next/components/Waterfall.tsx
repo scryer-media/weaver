@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { blockFill, blockPeriod } from "./chrome";
 import { COLS_CLASS, columnStyle } from "./columns";
@@ -12,7 +13,21 @@ import { WV } from "../data/palette";
  * place: after a span that ends early, before one that starts late, and inside
  * anything that spans the middle — where it takes a solid chip of the span's
  * own colour so it stays readable against the cells.
+ *
+ * Under the stages, on the same axis, sit the files extracted from the job's
+ * archives. There can be hundreds of them, so they stay folded until asked for.
  */
+
+/** One run inside a stage's span. */
+export interface WaterfallSegment {
+  start: number;
+  end: number;
+  color: string;
+  /** Time the job sat through rather than spent working: drawn as an outline. */
+  dashed?: boolean;
+  /** What the run was and when, shown on hover. */
+  title?: string;
+}
 
 export interface WaterfallStage {
   id: string;
@@ -24,6 +39,10 @@ export interface WaterfallStage {
   duration: string;
   /** A stage that has not run: hollow square, dimmed label, no span. */
   pending?: boolean;
+  /** The runs the span is made of; without them it is drawn as one run. */
+  segments?: WaterfallSegment[];
+  /** The row's full story on hover, where the label has to be cut short. */
+  title?: string;
 }
 
 const TICK_POSITIONS = [0, 25, 50, 75, 100] as const;
@@ -45,17 +64,22 @@ const SPAN_HEIGHT = 13;
 
 export function Waterfall({
   stages,
+  members = [],
   ticks,
   window,
   total,
 }: {
   stages: readonly WaterfallStage[];
+  /** Files extracted from the job's archives, drawn as quieter rows under the stages. */
+  members?: readonly WaterfallStage[];
   /** Five labels, one per quarter of the axis. */
   ticks: readonly string[];
   /** The job's start and end, in words: `18:40:57 → 18:41:33`. */
   window: string;
   total: string;
 }) {
+  const [membersOpen, setMembersOpen] = useState(false);
+
   return (
     <div className="flex min-w-0 flex-col">
       <div
@@ -83,6 +107,28 @@ export function Waterfall({
         <StageRow key={stage.id} stage={stage} />
       ))}
 
+      {members.length === 0 ? null : (
+        <>
+          <button
+            type="button"
+            aria-expanded={membersOpen}
+            onClick={() => setMembersOpen((open) => !open)}
+            className="flex h-8 items-center gap-2 border-t border-wv-hairline text-left font-wv-mono text-[11px] text-wv-muted hover:text-wv-fg"
+          >
+            <span
+              aria-hidden="true"
+              className={cn("inline-block text-[8px] transition-transform", membersOpen && "rotate-90")}
+            >
+              &#9654;
+            </span>
+            Extracted files ({members.length})
+          </button>
+          {membersOpen
+            ? members.map((member) => <StageRow key={member.id} stage={member} tone="member" />)
+            : null}
+        </>
+      )}
+
       <div
         className={cn(COLS_CLASS, "grid h-[30px] items-center gap-[14px] border-t border-wv-axis")}
         style={columnStyle(COLUMNS)}
@@ -99,7 +145,7 @@ export function Waterfall({
   );
 }
 
-function StageRow({ stage }: { stage: WaterfallStage }) {
+function StageRow({ stage, tone = "stage" }: { stage: WaterfallStage; tone?: "stage" | "member" }) {
   const start = Math.max(0, Math.min(100, stage.start));
   const end = Math.max(start, Math.min(100, stage.end));
   // Where the label goes: after a span that finishes in the first two thirds,
@@ -107,37 +153,75 @@ function StageRow({ stage }: { stage: WaterfallStage }) {
   const after = end <= 62;
   const before = !after && start >= 38;
   const inside = !after && !before && !stage.pending;
+  const member = tone === "member";
+  const segments = stage.segments ?? [
+    { start: stage.start, end: stage.end, color: stage.color },
+  ];
 
   return (
     <div
-      className={cn(COLS_CLASS, "grid h-8 items-stretch gap-[14px] border-t border-wv-hairline")}
+      className={cn(
+        COLS_CLASS,
+        "grid items-stretch gap-[14px] border-t border-wv-hairline",
+        member ? "h-7" : "h-8",
+      )}
       style={columnStyle(COLUMNS)}
+      title={stage.title}
     >
-      <div className="flex min-w-0 items-center gap-2">
+      <div className={cn("flex min-w-0 items-center gap-2", member && "pl-[14px]")}>
         <span
           aria-hidden="true"
           className="size-1.5 flex-none"
           style={{ background: stage.pending ? WV.trackDash : stage.color }}
         />
         <span
-          className={`truncate text-[12.5px] ${stage.pending ? "text-wv-disabled" : "text-wv-fg"}`}
+          className={cn(
+            "truncate",
+            member ? "font-wv-mono text-[11px]" : "text-[12.5px]",
+            stage.pending ? "text-wv-disabled" : member ? "text-wv-secondary" : "text-wv-fg",
+          )}
         >
-          {stage.label}
+          {member ? (
+            // Files from one release share their leading name; the end of the
+            // path is what tells them apart, so a long one is cut at the front.
+            <span dir="rtl" className="block truncate text-left">
+              <bdi>{stage.label}</bdi>
+            </span>
+          ) : (
+            stage.label
+          )}
         </span>
       </div>
       <div className="relative min-w-0" style={{ backgroundImage: GRIDLINES }}>
-        {stage.pending ? null : (
-          <div
-            className="absolute top-[10px] h-[13px] min-w-[3px] overflow-hidden"
-            style={{
-              left: `${start}%`,
-              width: `${end - start}%`,
-              backgroundImage: blockFill(stage.color, blockPeriod(SPAN_HEIGHT)),
-            }}
-          />
-        )}
+        {stage.pending
+          ? null
+          : segments.map((segment, index) => {
+              const left = Math.max(0, Math.min(100, segment.start));
+              const right = Math.max(left, Math.min(100, segment.end));
+              return (
+                <div
+                  // Runs never reorder within a row, so their position is their identity.
+                  key={index}
+                  title={segment.title}
+                  className={cn(
+                    "absolute h-[13px] min-w-[3px] overflow-hidden",
+                    member ? "top-[7px]" : "top-[10px]",
+                  )}
+                  style={{
+                    left: `${left}%`,
+                    width: `${right - left}%`,
+                    ...(segment.dashed
+                      ? { border: `1px dashed ${segment.color}` }
+                      : { backgroundImage: blockFill(segment.color, blockPeriod(SPAN_HEIGHT)) }),
+                  }}
+                />
+              );
+            })}
         <span
-          className="absolute top-[10px] h-[13px] px-1.5 font-wv-mono text-[10px] leading-[13px] whitespace-nowrap"
+          className={cn(
+            "pointer-events-none absolute h-[13px] px-1.5 font-wv-mono text-[10px] leading-[13px] whitespace-nowrap",
+            member ? "top-[7px]" : "top-[10px]",
+          )}
           style={{
             left: after ? `${end}%` : before ? "auto" : `${start}%`,
             right: after || !before ? "auto" : `${100 - start}%`,

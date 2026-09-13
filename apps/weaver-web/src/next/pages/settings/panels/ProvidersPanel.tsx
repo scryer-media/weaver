@@ -10,6 +10,7 @@ import {
   TEST_CONNECTION_MUTATION,
   UPDATE_SERVER_MUTATION,
 } from "@/graphql/queries";
+import { LoadingMark } from "@/lib/loading-mark";
 import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
@@ -676,7 +677,10 @@ export function ProvidersPanel() {
         }
       >
         {values === null ? (
-          <div className="px-4 sm:px-6 py-5 font-wv-mono text-[12px] text-wv-muted">Loading provider…</div>
+          <div role="status" className="flex items-center gap-3 px-4 sm:px-6 py-5 font-wv-mono text-[12px] text-wv-muted">
+            <LoadingMark className="h-5" />
+            Loading provider…
+          </div>
         ) : null}
         {testResult ? (
           <div className="flex flex-none flex-col gap-1.5 border-t border-wv-hairline px-4 sm:px-6 py-4">

@@ -166,6 +166,7 @@ export function SystemInfoPage() {
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         {!info ? (
           <EmptyState
+            loading={!error}
             title={error ? "System info is unavailable" : "Loading"}
             body={error ? error.message : "Reading the daemon's runtime facts."}
           />
