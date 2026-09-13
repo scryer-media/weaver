@@ -746,7 +746,9 @@ fn discovery_hint_cannot_authorize_rewriting_a_clean_standalone_set() {
 fn excessive_repair_result_paths_are_rejected_before_dispatch_or_installation() {
     let root = tempfile::tempdir().unwrap();
     let (mut coordinator, set) = ready_inline_repair(root.path());
-    let output = PathBuf::from("x".repeat(1 << 20));
+    // One output carries a 16x accounting multiplier; exceed even the largest
+    // memory-scaled metadata allowance, without relying on machine RAM size.
+    let output = PathBuf::from("x".repeat(4 << 20));
     assert!(matches!(
         coordinator.request_repair(JobId(1), set, output),
         Err(EngineError::ResourceLimit(_))

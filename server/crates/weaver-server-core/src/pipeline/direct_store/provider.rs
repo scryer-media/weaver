@@ -313,10 +313,17 @@ impl CipherOverlayCounters {
 }
 
 impl VirtualVolume {
-    /// Conservative retention ceiling for a consumer that keeps this image
-    /// after the router advances. Shared buffers are counted by full allocation
-    /// size because even a short held run can keep their whole allocation alive.
+    /// Conservative image charge for consumers without shared payload leases.
     pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_payloads()
+            .fold(self.retained_metadata_bytes(), |total, bytes| {
+                total.saturating_add(bytes.len())
+            })
+    }
+
+    /// Metadata retained by an image. Payload allocations are separately leased
+    /// by consumers so readers of the same buffer do not multiply its charge.
+    pub(crate) fn retained_metadata_bytes(&self) -> usize {
         let mut bytes = 4096usize
             .saturating_add(self.envelope.capacity().saturating_mul(4))
             .saturating_add(self.extents.capacity().saturating_mul(128))
@@ -330,13 +337,16 @@ impl VirtualVolume {
         for cipher in self.ciphers.values() {
             bytes = bytes.saturating_add(cipher.retained_bytes());
         }
-        for run in self.held.iter() {
-            bytes = bytes.saturating_add(256);
-            if let HeldSource::Memory { bytes: held, .. } = &run.source {
-                bytes = bytes.saturating_add(held.len());
-            }
-        }
-        bytes
+        bytes.saturating_add(self.held.len().saturating_mul(256))
+    }
+
+    /// Even a short range can pin a whole allocation. Callers must lease the
+    /// allocation, not just the readable length, while any image retains it.
+    pub(crate) fn retained_payloads(&self) -> impl Iterator<Item = &Arc<[u8]>> {
+        self.held.iter().filter_map(|run| match &run.source {
+            HeldSource::Memory { bytes, .. } => Some(bytes),
+            HeldSource::Scratch { .. } => None,
+        })
     }
 
     /// Distinct pinned scratch handles retained by this image. The pins read

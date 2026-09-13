@@ -239,6 +239,52 @@ impl PublishedSources {
             .get(&source)
             .cloned())
     }
+
+    /// Release a fenced image during disk spill without losing its generation.
+    /// The tombstone has no readable ranges and can supply no evidence.
+    pub(in crate::pipeline) fn release_withdrawn_image(
+        &self,
+        source: SourceId,
+    ) -> EngineResult<()> {
+        let mut registry = self
+            .0
+            .write()
+            .map_err(|_| io::Error::other("source registry poisoned"))?;
+        let Some(old) = registry.sources.get(&source) else {
+            return Ok(());
+        };
+        if !old.ranges.is_empty() {
+            return Err(EngineError::InvalidState(
+                "cannot release an unfenced source image",
+            ));
+        }
+        let replacement = Arc::new(Publication {
+            access: Arc::new(WithdrawnImage(source, old.backing)),
+            backing: old.backing,
+            snapshot: old.snapshot,
+            ranges: Vec::new(),
+            revision: old.revision,
+        });
+        registry.sources.insert(source, replacement);
+        Ok(())
+    }
+}
+
+struct WithdrawnImage(SourceId, SourceSnapshot);
+
+impl SourceAccess for WithdrawnImage {
+    fn next_available(&self, _: SourceId, _: u64) -> io::Result<Option<Range<u64>>> {
+        Ok(None)
+    }
+    fn snapshot(&self, source: SourceId) -> io::Result<Option<SourceSnapshot>> {
+        Ok((source == self.0).then_some(self.1))
+    }
+    fn read_at(&self, _: SourceId, _: u64, _: &mut [u8]) -> io::Result<usize> {
+        Ok(0)
+    }
+    fn open_sequential(&self, _: SourceId) -> io::Result<Option<Box<dyn Read + Send>>> {
+        Ok(None)
+    }
 }
 
 fn covers(new: &[Range<u64>], old: &[Range<u64>]) -> bool {

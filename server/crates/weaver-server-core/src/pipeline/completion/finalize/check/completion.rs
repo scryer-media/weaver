@@ -332,6 +332,9 @@ impl Pipeline {
             self.fail_job(job_id, format!("PAR3 source refresh failed: {error}"));
             return;
         }
+        if self.spill_par3_source(job_id).await {
+            return;
+        }
         if self
             .par3_runtime
             .as_ref()

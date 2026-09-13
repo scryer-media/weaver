@@ -11,6 +11,7 @@ const MAX_PENDING: usize = 4096;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WorkKey {
     Source(SourceId),
+    Donors,
     Repair(par3_rs::InputSetId),
     Readback,
 }
@@ -32,6 +33,7 @@ pub(super) struct RepairCompletion {
 }
 
 enum PendingInput {
+    Donors,
     Readback(Box<readback::Installation>),
     Virtual {
         image: virtual_source::VirtualInput,
@@ -65,6 +67,7 @@ enum PendingInput {
 impl PendingInput {
     fn retained_cost(&self) -> EngineResult<usize> {
         let (path, extra) = match self {
+            Self::Donors => return Ok(1024),
             Self::Readback(_) => return Ok(readback::STRIPE_RESERVATION),
             Self::Virtual { name, .. } => {
                 return name
@@ -146,6 +149,9 @@ struct JobSlot {
     pending: BTreeMap<WorkKey, QueuedInput>,
     ticket: Option<u64>,
     errors: BTreeMap<SourceId, EngineError>,
+    donor_error: Option<EngineError>,
+    spill: Option<SourceId>,
+    spill_disk: Option<budget::DiskReservation>,
     completed_repair: Option<RepairCompletion>,
     completed_readback: Option<EngineResult<readback::ReadbackDone>>,
     installing: bool,
@@ -166,6 +172,9 @@ impl Default for JobSlot {
             pending: BTreeMap::new(),
             ticket: None,
             errors: BTreeMap::new(),
+            donor_error: None,
+            spill: None,
+            spill_disk: None,
             completed_repair: None,
             completed_readback: None,
             installing: false,
@@ -207,7 +216,7 @@ impl Default for Coordinator {
 }
 
 impl Coordinator {
-    pub(super) fn new(tx: mpsc::Sender<RepairWorkDone>) -> Self {
+    pub(in crate::pipeline) fn new(tx: mpsc::Sender<RepairWorkDone>) -> Self {
         Self {
             jobs: BTreeMap::new(),
             in_flight: BTreeMap::new(),
@@ -235,6 +244,7 @@ impl Coordinator {
     pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|job| {
             job.installing
+                || job.spill.is_some()
                 || job.ticket.is_some()
                 || !job.pending.is_empty()
                 || !job.dirty.is_empty()
@@ -331,8 +341,27 @@ impl Coordinator {
         volume: crate::pipeline::direct_store::provider::VirtualVolume,
         name: String,
     ) -> EngineResult<()> {
-        let image = virtual_source::VirtualInput::new(volume, &execution_options())?;
-        self.enqueue_input(job_id, source, PendingInput::Virtual { image, name })
+        self.admit(job_id)?;
+        if self.jobs[&job_id].spill.is_some() {
+            return Ok(());
+        }
+        let result =
+            virtual_source::VirtualInput::new(volume, &execution_options()).and_then(|image| {
+                self.enqueue_input(job_id, source, PendingInput::Virtual { image, name })
+            });
+        match result {
+            Err(error) if budget::is_host_pressure(&error) => {
+                tracing::debug!(job_id = job_id.0, source = source.0, %error,
+                    stage = "virtual_publication", "PAR3 source requires disk fallback");
+                self.jobs
+                    .get_mut(&job_id)
+                    .expect("admitted job")
+                    .spill
+                    .get_or_insert(source);
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     pub(super) fn admit(&mut self, job_id: JobId) -> EngineResult<()> {
@@ -447,7 +476,106 @@ impl Coordinator {
     }
 
     pub(super) fn error(&self, job_id: JobId) -> Option<&EngineError> {
-        self.jobs.get(&job_id)?.errors.values().next()
+        let job = self.jobs.get(&job_id)?;
+        job.errors.values().next().or(job.donor_error.as_ref())
+    }
+
+    pub(super) fn take_spill(&mut self, job_id: JobId) -> Option<SourceId> {
+        let job = self.jobs.get_mut(&job_id)?;
+        if job.ticket.is_some() || job.installing {
+            return None;
+        }
+        job.spill.take()
+    }
+
+    pub(super) fn reserve_spill_disk(
+        &mut self,
+        job_id: JobId,
+        bytes: u64,
+        available: u64,
+        reserve: u64,
+    ) -> EngineResult<()> {
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(EngineError::InvalidState("PAR3 spill job disappeared"))?;
+        job.spill_disk = Some(budget::DiskReservation::acquire(bytes, available, reserve)?);
+        Ok(())
+    }
+
+    pub(in crate::pipeline) fn take_spill_disk(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<budget::DiskReservation> {
+        self.jobs.get_mut(&job_id)?.spill_disk.take()
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn force_spill(&mut self, job_id: JobId, source: SourceId) {
+        self.admit(job_id).unwrap();
+        self.jobs.get_mut(&job_id).unwrap().spill = Some(source);
+    }
+
+    pub(super) fn release_spilled_images(
+        &mut self,
+        job_id: JobId,
+        sources: &[SourceId],
+    ) -> EngineResult<()> {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return Ok(());
+        };
+        if job.ticket.is_some() {
+            return Err(EngineError::InvalidState("PAR3 spill still has a reader"));
+        }
+        for &source in sources {
+            job.sources.release_withdrawn_image(source)?;
+            job.errors.remove(&source);
+        }
+        if let Some(runtime) = job.runtime.as_ref() {
+            runtime.virtual_readers.clear()?;
+        }
+        Ok(())
+    }
+
+    /// Called only after the scheduler has exhausted available parity.
+    pub(in crate::pipeline) fn request_donor_search(
+        &mut self,
+        job_id: JobId,
+    ) -> EngineResult<bool> {
+        let Some(job) = self.jobs.get(&job_id) else {
+            return Ok(false);
+        };
+        let Some(runtime) = job.runtime.as_ref() else {
+            return Ok(false);
+        };
+        if runtime.donor_search.exhaustive
+            || runtime.donor_search.exhausted
+            || job.pending.contains_key(&WorkKey::Donors)
+        {
+            return Ok(false);
+        }
+        self.check_pending_capacity(job_id, WorkKey::Donors)?;
+        let reservation = assessment::ViewReservation::acquire(1024)?;
+        self.jobs
+            .get_mut(&job_id)
+            .expect("known job")
+            .pending
+            .insert(
+                WorkKey::Donors,
+                QueuedInput {
+                    input: PendingInput::Donors,
+                    reservation,
+                },
+            );
+        self.dispatch()?;
+        Ok(true)
+    }
+
+    pub(super) fn donor_search_exhausted(&self, job_id: JobId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())
+            .is_some_and(|runtime| runtime.donor_search.exhausted)
     }
 
     pub(in crate::pipeline) fn is_promoted(&self, job_id: JobId, file_index: u32) -> bool {
@@ -881,6 +1009,7 @@ impl Coordinator {
         }
         let ready = |job: &&JobSlot| {
             job.ticket.is_none()
+                && job.spill.is_none()
                 && if job.installing {
                     job.pending.contains_key(&WorkKey::Readback)
                 } else {
@@ -897,7 +1026,7 @@ impl Coordinator {
         let Some(job_id) = next else {
             return Ok(());
         };
-        self.evict_idle_sessions(job_id, 128 << 20);
+        self.evict_idle_sessions(job_id, budget::budgets().native.limit() / 2);
         let job = self.jobs.get_mut(&job_id).expect("selected ready job");
         let ticket = self
             .next_ticket
@@ -934,6 +1063,11 @@ impl Coordinator {
             let result = tokio::task::spawn_blocking(move || {
                 // Keep the queue lease live while the worker owns its input;
                 // successful publication transfers it into retained state.
+                if matches!(input.input, PendingInput::Donors) {
+                    runtime.donor_search.exhaustive = true;
+                    let result = runtime.assess().map(|()| WorkOutput::Published);
+                    return (runtime, result);
+                }
                 if let PendingInput::Readback(mut installation) = input.input {
                     let result = installation.read_unit(&runtime.sources, &runtime.options);
                     return (
@@ -1020,7 +1154,9 @@ impl Coordinator {
                     PendingInput::Virtual { image, name } => {
                         runtime.publish_virtual(source, image, name)
                     }
-                    PendingInput::Repair { .. } | PendingInput::Readback(_) => {
+                    PendingInput::Repair { .. }
+                    | PendingInput::Readback(_)
+                    | PendingInput::Donors => {
                         unreachable!("repair dispatched above")
                     }
                     PendingInput::CompleteFile { path, name } => std::fs::metadata(&path)
@@ -1141,6 +1277,9 @@ impl Coordinator {
             return Some(done.job_id);
         }
         match (done.key, done.result) {
+            (WorkKey::Donors, result) => {
+                job.donor_error = result.err();
+            }
             (WorkKey::Readback, result) => {
                 job.completed_readback = Some(result.and_then(|output| match output {
                     WorkOutput::Readback(done) => Ok(done),
@@ -1164,8 +1303,19 @@ impl Coordinator {
                 job.errors.remove(&source);
             }
             (WorkKey::Source(source), Err(error)) => {
-                tracing::warn!(job_id = done.job_id.0, source = source.0, error = %error, "PAR3 carrier discovery incomplete");
-                job.errors.insert(source, error);
+                if budget::is_host_pressure(&error) {
+                    let refused = match &error {
+                        EngineError::Io(error) => budget::pressure_source(error).unwrap_or(source),
+                        _ => source,
+                    };
+                    job.spill.get_or_insert(refused);
+                    tracing::debug!(job_id = done.job_id.0, source = refused.0, %error,
+                        stage = "assessment", "PAR3 virtual reader requires disk fallback");
+                    job.errors.remove(&source);
+                } else {
+                    tracing::warn!(job_id = done.job_id.0, source = source.0, %error, "PAR3 carrier discovery incomplete");
+                    job.errors.insert(source, error);
+                }
             }
         }
         Some(done.job_id)

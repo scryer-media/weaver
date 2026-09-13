@@ -21,18 +21,31 @@ struct Attempt {
 pub(super) struct Cache {
     attempts: BTreeMap<Key, Attempt>,
     read_bytes: u64,
+    pub exhaustive: bool,
+    pub exhausted: bool,
+}
+
+impl Cache {
+    pub fn evict(&mut self) {
+        self.attempts.clear();
+        // Reopening a native session must not replenish cumulative search work.
+    }
 }
 
 impl Par3Job {
     pub(super) fn discover_donors(&mut self) -> EngineResult<()> {
-        if !self.sets.values().any(|set| {
-            set.view.as_ref().is_some_and(|view| {
-                matches!(
-                    view.status,
-                    RepairStatus::Ready | RepairStatus::NeedRecovery
-                )
+        if self.donor_search.exhausted
+            || self.sets.values().any(|set| {
+                set.view
+                    .as_ref()
+                    .is_some_and(|view| view.status == RepairStatus::Ready)
             })
-        }) {
+            || !self.sets.values().any(|set| {
+                set.view
+                    .as_ref()
+                    .is_some_and(|view| view.status == RepairStatus::NeedRecovery)
+            })
+        {
             return Ok(());
         }
         let _candidates = assessment::ViewReservation::acquire(self.bindings.len() * 64)?;
@@ -70,14 +83,12 @@ impl Par3Job {
                 let Some(view) = set.view.as_ref() else {
                     continue;
                 };
-                if !matches!(
-                    view.status,
-                    RepairStatus::Ready | RepairStatus::NeedRecovery
-                ) || (sliding && view.status != RepairStatus::NeedRecovery)
+                if view.status != RepairStatus::NeedRecovery
+                    || (sliding && !self.donor_search.exhaustive)
                 {
                     continue;
                 }
-                if search_pass(
+                let result = search_pass(
                     set,
                     &layout,
                     &candidates,
@@ -85,8 +96,24 @@ impl Par3Job {
                     &self.options,
                     &mut self.donor_search,
                     sliding,
-                )? {
-                    set.assess()?;
+                );
+                match result {
+                    Ok(true) => set.assess()?,
+                    Ok(false) => {}
+                    Err(EngineError::ResourceLimit("placement read work")) => {
+                        self.donor_search.exhausted = true;
+                        tracing::debug!(
+                            stage = "donor_search",
+                            sliding,
+                            read_bytes = self.donor_search.read_bytes,
+                            limit_bytes = READ_LIMIT,
+                            "PAR3 optional donor search exhausted; retaining native recovery assessment"
+                        );
+                        // Earlier candidates may already have supplied strong placements.
+                        set.assess()?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -176,16 +203,16 @@ fn search_pass(
                     continue;
                 }
                 let length = extent.range.end - extent.range.start;
-                let preferred = if sliding {
-                    attempt.shift.filter(|shift| *shift != 0).and_then(|shift| {
-                        let start = u64::try_from(i128::from(extent.range.start) + shift).ok()?;
-                        Some(start..start.checked_add(length)?)
-                    })
-                } else {
-                    Some(extent.range.clone())
-                };
+                let shifted = attempt.shift.filter(|shift| *shift != 0).and_then(|shift| {
+                    let start = u64::try_from(i128::from(extent.range.start) + shift).ok()?;
+                    Some(start..start.checked_add(length)?)
+                });
                 let mut found = None;
-                if let Some(range) = preferred {
+                for range in (!sliding)
+                    .then(|| extent.range.clone())
+                    .into_iter()
+                    .chain(shifted)
+                {
                     found = locate(
                         layout,
                         file_index,
@@ -198,6 +225,9 @@ fn search_pass(
                         options,
                         &mut cache.read_bytes,
                     )?;
+                    if found.is_some() {
+                        break;
+                    }
                 }
                 if sliding && found.is_none() {
                     found = locate(
@@ -259,6 +289,22 @@ fn locate(
             .read_bytes
             .saturating_sub(before),
     );
+    if matches!(
+        result,
+        Err(EngineError::ResourceLimit("placement read work"))
+    ) {
+        tracing::debug!(
+            stage = "donor_search",
+            source = access.source.0,
+            file,
+            extent,
+            range_start = access.range.start,
+            range_end = access.range.end,
+            read_bytes = *read_bytes,
+            limit_bytes = READ_LIMIT,
+            "PAR3 donor candidate reached the cumulative search limit"
+        );
+    }
     Ok(result?.matches.into_iter().next())
 }
 
@@ -337,6 +383,21 @@ mod tests {
         std::fs::write(&index, INDEX).unwrap();
         job.scan_file(SourceId(99), index, None).unwrap();
         job.assess().unwrap();
+        assert_eq!(
+            job.sets
+                .values()
+                .next()
+                .unwrap()
+                .view
+                .as_ref()
+                .unwrap()
+                .status,
+            RepairStatus::NeedRecovery,
+            "cheap checks must not start sliding discovery"
+        );
+        // The scheduler grants sliding discovery only after parity is exhausted.
+        job.donor_search.exhaustive = true;
+        job.assess().unwrap();
         assert!(job.name_search.source().is_none());
         assert_eq!(
             job.sets
@@ -381,6 +442,94 @@ mod tests {
             read,
             "negative donor searches are cached too"
         );
+    }
+
+    #[test]
+    fn cauchy_and_fft_defer_exhaustive_search_and_keep_exhaustion_nonfatal() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../e2e/internal/weaver/testdata/par3-shared");
+        for name in ["cauchy.par3", "fft.par3"] {
+            let mut job = Par3Job::default();
+            publish(
+                &mut job,
+                SourceId(1),
+                1,
+                "payload.bin",
+                vec![0; 262144 + 123],
+            );
+            job.scan_file(SourceId(99), root.join(name), None).unwrap();
+            job.assess().unwrap();
+            assert_eq!(
+                job.sets
+                    .values()
+                    .next()
+                    .unwrap()
+                    .view
+                    .as_ref()
+                    .unwrap()
+                    .status,
+                RepairStatus::NeedRecovery
+            );
+            assert_eq!(
+                job.donor_search.read_bytes, 0,
+                "native verification precedes donor searches"
+            );
+            job.donor_search.exhaustive = true;
+            job.donor_search.read_bytes = READ_LIMIT;
+            job.assess().unwrap();
+            assert!(job.donor_search.exhausted, "{name}");
+            job.options.cancel.cancel();
+            assert!(matches!(job.assess(), Err(EngineError::Cancelled)));
+        }
+    }
+
+    #[test]
+    fn exhausted_donor_work_preserves_late_recovery_and_survives_eviction() {
+        let root = tempfile::tempdir().unwrap();
+        let mut job = Par3Job::default();
+        for (index, (name, mut bytes)) in inputs().into_iter().enumerate() {
+            if index == 0 {
+                bytes[100] ^= 1;
+            }
+            publish(&mut job, SourceId(index as u64 + 1), 1, &name, bytes);
+        }
+        let index = root.path().join("set.par3");
+        std::fs::write(&index, INDEX).unwrap();
+        job.scan_file(SourceId(99), index, None).unwrap();
+        job.donor_search.read_bytes = READ_LIMIT;
+        job.donor_search.exhaustive = true;
+        job.assess().unwrap();
+        assert!(job.donor_search.exhausted);
+        assert_eq!(
+            job.sets
+                .values()
+                .next()
+                .unwrap()
+                .view
+                .as_ref()
+                .unwrap()
+                .status,
+            RepairStatus::NeedRecovery
+        );
+        job.evict_native_sessions();
+        assert_eq!(job.donor_search.read_bytes, READ_LIMIT);
+        assert!(job.donor_search.exhausted);
+        let recovery = root.path().join("set.vol0+1.par3");
+        std::fs::write(&recovery, RECOVERY).unwrap();
+        job.scan_file(SourceId(98), recovery, None).unwrap();
+        job.assess().unwrap();
+        assert_eq!(
+            job.sets
+                .values()
+                .next()
+                .unwrap()
+                .view
+                .as_ref()
+                .unwrap()
+                .status,
+            RepairStatus::Ready
+        );
+        assert_eq!(job.donor_search.read_bytes, READ_LIMIT);
     }
 
     #[test]

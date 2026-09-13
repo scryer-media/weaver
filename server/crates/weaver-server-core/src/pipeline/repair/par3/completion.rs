@@ -6,6 +6,88 @@ use par3_rs::session::RepairStatus;
 use par3_rs::session_repair::InstalledFile;
 
 impl Pipeline {
+    /// A refused virtual image becomes ordinary disk-backed source work. The
+    /// existing demotion ticket fences verification and owns reconstruction.
+    pub(in crate::pipeline) async fn spill_par3_source(&mut self, job_id: JobId) -> bool {
+        if self.direct_demotion_in_flight.contains_key(&job_id) {
+            return true;
+        }
+        let Some(source) = self
+            .par3_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.take_spill(job_id))
+        else {
+            return false;
+        };
+        let index = u32::try_from(source.0).ok().and_then(|file| {
+            self.direct_store.sets_for(job_id).iter().position(|set| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && set.plan().volume_for_file(file).is_some()
+            })
+        });
+        let Some(index) = index else {
+            self.fail_job(
+                job_id,
+                "PAR3 memory admission failed: source has no disk fallback".into(),
+            );
+            return true;
+        };
+        let set = self.direct_store.set(job_id, index).expect("selected set");
+        let sources: Vec<_> = set
+            .plan()
+            .volumes
+            .values()
+            .map(|file| SourceId(u64::from(*file)))
+            .collect();
+        let required = set.plan().volumes.keys().try_fold(0u64, |bytes, volume| {
+            bytes.checked_add(set.virtual_volume_len(*volume, 0))
+        });
+        let path = self.jobs[&job_id].working_dir.clone();
+        let reserve = self.direct_store.settings().holds_disk_reserve_bytes;
+        let space =
+            tokio::task::spawn_blocking(move || crate::operations::disk::probe_disk_space(&path))
+                .await;
+        let admitted = match (space, required) {
+            (Ok(Ok(space)), Some(bytes)) => self
+                .par3_runtime
+                .as_mut()
+                .expect("spill coordinator")
+                .reserve_spill_disk(job_id, bytes, space.available_bytes, reserve)
+                .is_ok(),
+            _ => false,
+        };
+        if !admitted {
+            self.fail_job(job_id, "PAR3 memory admission failed and disk fallback has insufficient or unavailable free space".into());
+            return true;
+        }
+        tracing::info!(
+            job_id = job_id.0,
+            source = source.0,
+            required_bytes = required,
+            stage = "disk_fallback",
+            "PAR3 memory pressure: reconstructing direct set on disk"
+        );
+        self.demote_direct_set(
+            job_id,
+            index,
+            crate::pipeline::direct_store::router::DemotionReason::Par3MemoryPressure,
+        )
+        .await;
+        // A sweep takes the lease through its blocking worker. A synchronous
+        // demotion refusal must not leave an unused reservation behind.
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            drop(runtime.take_spill_disk(job_id));
+            if let Err(error) = runtime.release_spilled_images(job_id, &sources) {
+                self.fail_job(
+                    job_id,
+                    format!("PAR3 disk fallback invalidation failed: {error}"),
+                );
+            }
+        }
+        true
+    }
+
     /// Read-only presentation of a drained download awaiting native work.
     /// Scheduler phases retain their own transition and completion contracts.
     pub(in crate::pipeline) fn show_par3_verification_wait(&self, job_id: JobId) -> bool {
@@ -46,6 +128,9 @@ impl Pipeline {
                 self.fail_job(job_id, format!("PAR3 discovery admission failed: {error}"));
                 return true;
             }
+        }
+        if self.spill_par3_source(job_id).await {
+            return true;
         }
         if self.reopen_par2_strong_decode_claims_on_par3_damage(job_id) {
             self.schedule_job_completion_check(job_id);
@@ -198,8 +283,33 @@ impl Pipeline {
             }
             RepairStatus::IncompleteMetadata | RepairStatus::NeedRecovery => {
                 if !self.promote_par3_recovery(job_id) {
+                    if status == RepairStatus::NeedRecovery {
+                        match self
+                            .par3_runtime
+                            .as_mut()
+                            .expect("admitted job")
+                            .request_donor_search(job_id)
+                        {
+                            Ok(true) => return true,
+                            Ok(false) => {}
+                            Err(error) => {
+                                self.fail_job(
+                                    job_id,
+                                    format!("PAR3 donor discovery failed: {error}"),
+                                );
+                                return true;
+                            }
+                        }
+                    }
                     let reason = if status == RepairStatus::IncompleteMetadata {
                         "authenticated metadata remains incomplete"
+                    } else if self
+                        .par3_runtime
+                        .as_ref()
+                        .expect("admitted job")
+                        .donor_search_exhausted(job_id)
+                    {
+                        "compatible recovery remains insufficient; bounded donor search exhausted"
                     } else {
                         "compatible recovery remains insufficient for one or more cohorts"
                     };

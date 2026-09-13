@@ -234,6 +234,8 @@ pub(crate) enum DemotionReason {
     /// pageable run is already in scratch and RAM is still over, which means one
     /// staged run is larger than the whole budget.
     HoldsBudgetExceeded,
+    /// PAR3 cannot retain the virtual image; preserve its posted bytes on disk.
+    Par3MemoryPressure,
     /// The holds scratch file could not be created, written or read.
     HoldsScratchFailed,
     /// Paging would push the holds scratch past its configured ceiling. Counted
@@ -515,6 +517,7 @@ impl DemotionReason {
             // Handing the conventional extractor the same image to fail against
             // is not a fallback; real files are.
             Self::ToleratedExtractionFailed => VolumeDemand::Real,
+            Self::Par3MemoryPressure => VolumeDemand::Real,
             // Holds are staged, unrouted bytes: a budget or scratch failure
             // ends *routing* and says nothing about the layout or about the
             // bytes already placed.
@@ -621,6 +624,7 @@ impl DemotionReason {
             Self::Par2Unbindable => "par2_unbindable",
             Self::ToleratedExtractionFailed => "tolerated_extraction_failed",
             Self::HoldsBudgetExceeded => "holds_budget",
+            Self::Par3MemoryPressure => "par3_memory_pressure",
             Self::HoldsScratchFailed => "holds_scratch_io",
             Self::HoldsScratchCeiling => "holds_scratch_ceiling",
             Self::HoldsScratchDiskReserve => "holds_scratch_disk_reserve",

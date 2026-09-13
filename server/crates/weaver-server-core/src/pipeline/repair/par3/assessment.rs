@@ -4,30 +4,18 @@ use super::*;
 use crate::pipeline::repair::backend::RepairBackend;
 use par3_rs::ingest::{IngestedPacket, MergeEffect};
 use par3_rs::session::{AssessedFile, RecoveryRequirement, RepairAssessment, RepairStatus};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-// Scheduling views and queued publications share a process-wide host budget,
-// separate from the native engine budget. Publication leases follow their
-// ranges into retained source state instead of expiring at worker dispatch.
-const VIEW_LIMIT: usize = 16 << 20;
-static VIEW_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-pub(super) struct ViewReservation(usize);
+pub(super) struct ViewReservation {
+    _reservation: super::budget::Reservation,
+}
 
 impl ViewReservation {
     pub fn acquire(bytes: usize) -> EngineResult<Self> {
-        VIEW_BYTES
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|total| *total <= VIEW_LIMIT)
+        super::budget::budgets()
+            .metadata
+            .acquire(bytes)
+            .map(|reservation| Self {
+                _reservation: reservation,
             })
-            .map_err(|_| EngineError::ResourceLimit("PAR3 host state"))?;
-        Ok(Self(bytes))
-    }
-}
-
-impl Drop for ViewReservation {
-    fn drop(&mut self) {
-        VIEW_BYTES.fetch_sub(self.0, Ordering::AcqRel);
     }
 }
 
@@ -181,7 +169,7 @@ mod tests {
     #[test]
     fn oversized_view_reservation_fails_without_changing_accounting() {
         assert!(matches!(
-            ViewReservation::acquire(VIEW_LIMIT + 1),
+            ViewReservation::acquire(usize::MAX),
             Err(EngineError::ResourceLimit(_))
         ));
         // An independent small reservation still succeeds and releases on drop.

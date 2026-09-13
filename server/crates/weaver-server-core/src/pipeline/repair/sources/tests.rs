@@ -8,6 +8,31 @@ fn backing(bytes: &[u8]) -> Arc<dyn SourceAccess> {
 }
 
 #[test]
+fn par3_spill_releases_fenced_images_without_reusing_their_evidence() {
+    let sources = PublishedSources::default();
+    let access = backing(b"abcdefgh");
+    let weak = Arc::downgrade(&access);
+    let before = sources
+        .replace(SourceId(0), access, 8, vec![0..2, 6..8])
+        .unwrap();
+    assert!(sources.release_withdrawn_image(SourceId(0)).is_err());
+    sources.withdraw(SourceId(0)).unwrap();
+    sources.release_withdrawn_image(SourceId(0)).unwrap();
+    assert!(weak.upgrade().is_none());
+    assert!(sources.snapshot(SourceId(0)).unwrap().unwrap().generation > before.generation);
+    assert_eq!(sources.next_available(SourceId(0), 0).unwrap(), None);
+    let mut bytes = [123; 8];
+    assert_eq!(sources.read_at(SourceId(0), 0, &mut bytes).unwrap(), 0);
+    assert_eq!(bytes, [123; 8]);
+    let after = sources
+        .replace(SourceId(0), backing(b"ABCDEFGH"), 8, vec![0..2, 6..8])
+        .unwrap();
+    assert!(after.generation > before.generation);
+    assert_eq!(sources.read_at(SourceId(0), 0, &mut bytes).unwrap(), 2);
+    assert_eq!(&bytes[..2], b"AB");
+}
+
+#[test]
 fn unchanged_backing_arrival_rechecks_both_generations_before_publication() {
     let sources = PublishedSources::default();
     let access = backing(b"abcdefgh");

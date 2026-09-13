@@ -14,6 +14,16 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub(in crate::pipeline) struct ReaderCache(Mutex<Option<(Arc<()>, Reader)>>);
 
+impl ReaderCache {
+    pub(super) fn clear(&self) -> EngineResult<()> {
+        self.0
+            .lock()
+            .map_err(|_| EngineError::InvalidState("PAR3 reader cache poisoned"))?
+            .take();
+        Ok(())
+    }
+}
+
 struct Backing {
     access: Arc<dyn SourceAccess>,
     snapshot: Option<SourceSnapshot>,
@@ -22,18 +32,26 @@ struct Backing {
 pub(in crate::pipeline) struct VirtualInput {
     pub volume: VirtualVolume,
     memory: assessment::ViewReservation,
+    payloads: Arc<Vec<Arc<budget::PayloadLease>>>,
     pins: Vec<HandleLease>,
 }
 
 impl VirtualInput {
     pub fn new(volume: VirtualVolume, options: &ExecutionOptions) -> EngineResult<Self> {
-        let memory = assessment::ViewReservation::acquire(volume.retained_bytes())?;
+        let memory = assessment::ViewReservation::acquire(volume.retained_metadata_bytes())?;
+        let payloads = Arc::new(
+            volume
+                .retained_payloads()
+                .map(|bytes| budget::budgets().retain(bytes))
+                .collect::<EngineResult<Vec<_>>>()?,
+        );
         let pins = (0..volume.retained_handles())
             .map(|_| options.handles.acquire())
             .collect::<EngineResult<Vec<_>>>()?;
         Ok(Self {
             volume,
             memory,
+            payloads,
             pins,
         })
     }
@@ -49,6 +67,7 @@ pub(in crate::pipeline) struct VirtualSource {
     cache: Arc<ReaderCache>,
     counters: Arc<CipherOverlayCounters>,
     _memory: assessment::ViewReservation,
+    payloads: Arc<Vec<Arc<budget::PayloadLease>>>,
     _pins: Vec<HandleLease>,
 }
 
@@ -63,6 +82,7 @@ impl VirtualSource {
         let VirtualInput {
             volume,
             memory,
+            payloads,
             pins,
         } = image;
         let mut paths = std::collections::BTreeSet::new();
@@ -107,6 +127,7 @@ impl VirtualSource {
             identity: Arc::new(()),
             counters: Arc::new(CipherOverlayCounters::default()),
             _memory: memory,
+            payloads,
             _pins: pins,
         })
     }
@@ -141,9 +162,9 @@ impl VirtualSource {
         // Cover one bounded cipher temporary, the chain-to-seed buffer and the
         // owned metadata clone. Handles are leased before either can open.
         let memory = assessment::ViewReservation::acquire(
-            (512usize << 10).saturating_add(self.volume.retained_bytes()),
+            (512usize << 10).saturating_add(self.volume.retained_metadata_bytes()),
         )
-        .map_err(io::Error::other)?;
+        .map_err(|error| budget::source_pressure(self.source, error))?;
         let handles = [
             self.options.handles.acquire().map_err(io::Error::other)?,
             self.options.handles.acquire().map_err(io::Error::other)?,
@@ -153,11 +174,13 @@ impl VirtualSource {
             .collect::<EngineResult<Vec<_>>>()
             .map_err(io::Error::other)?;
         Ok(Reader {
+            cancel: self.options.cancel.clone(),
             inner: VirtualVolumeReader::<true>::new(
                 self.volume.clone(),
                 Arc::clone(&self.counters),
             ),
             _memory: memory,
+            _payloads: Arc::clone(&self.payloads),
             _handles: handles,
             _pins: pins,
         })
@@ -224,14 +247,17 @@ impl SourceAccess for VirtualSource {
 }
 
 struct Reader {
+    cancel: par3_rs::runtime::CancellationToken,
     inner: VirtualVolumeReader<true>,
     _memory: assessment::ViewReservation,
+    _payloads: Arc<Vec<Arc<budget::PayloadLease>>>,
     _handles: [HandleLease; 2],
     _pins: Vec<HandleLease>,
 }
 
 impl Read for Reader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.cancel.check().map_err(io::Error::other)?;
         match self.inner.read(out) {
             Err(error) if is_hole(&error) => Ok(0),
             result => result,

@@ -21,6 +21,44 @@ fn access(
 }
 
 #[test]
+fn par3_large_shared_held_images_and_readers_release_every_payload_owner() {
+    use super::super::provider::HeldRun;
+    let bytes: Arc<[u8]> = vec![0x5a; 24 << 20].into();
+    let weak = Arc::downgrade(&bytes);
+    let mut volume = provider_fixture(ByteRanges::new()).volume;
+    volume.len = bytes.len() as u64;
+    volume.extents.clear();
+    volume.partials = Arc::default();
+    volume.held = Arc::new(vec![
+        HeldRun::memory(0, Arc::clone(&bytes), 0, 12 << 20),
+        HeldRun::memory(12 << 20, Arc::clone(&bytes), 12 << 20, 12 << 20),
+    ]);
+    let options = ExecutionOptions::default();
+    let cache = Arc::new(ReaderCache::default());
+    let first = access(volume.clone(), &options, &cache);
+    let mut reader = first.open_sequential(SOURCE).unwrap().unwrap();
+    let second = access(volume, &options, &cache);
+    let mut buffer = [0; 64];
+    assert_eq!(second.read_at(SOURCE, 20 << 20, &mut buffer).unwrap(), 64);
+    assert_eq!(buffer, [0x5a; 64]);
+    drop(first);
+    drop(second);
+    drop(cache);
+    drop(bytes);
+    assert!(
+        weak.upgrade().is_some(),
+        "the sequential reader still owns the allocation"
+    );
+    reader.read_exact(&mut buffer).unwrap();
+    assert_eq!(buffer, [0x5a; 64]);
+    options.cancel.cancel();
+    assert!(reader.read(&mut buffer).is_err());
+    drop(reader);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(options.handles.used(), 0);
+}
+
+#[test]
 fn par3_virtual_source_exposes_an_honest_prefix_and_reads_beyond_interior_holes() {
     let mut coverage = ByteRanges::new();
     coverage.insert(0, 300);
