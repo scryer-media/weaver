@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
+import { submissionStatusCanForceRetry } from "@/features/duplicates/duplicate-presentation";
 import { useUploadNzb, type UploadNzbEntry } from "@/features/upload/hooks/use-upload-nzb";
 import { NZB_UPLOAD_ACCEPT } from "@/features/upload/upload-file-types";
 import { cn } from "@/lib/utils";
@@ -18,8 +19,14 @@ const PRIORITIES: { value: string; label: string }[] = [
   { value: "LOW", label: "Low" },
 ];
 
+/** Staged, but the duplicate policy turned its submission away; only a forced submit takes it. */
+function isBlocked(entry: UploadNzbEntry): boolean {
+  return entry.status === "staged" && submissionStatusCanForceRetry(entry.submissionStatus);
+}
+
 function entryTone(entry: UploadNzbEntry): string {
   if (entry.status === "failed") return WV.error;
+  if (isBlocked(entry)) return WV.warn;
   if (entry.status === "staged" || entry.status === "submitted") return WV.accent;
   return WV.idle;
 }
@@ -156,11 +163,22 @@ export function AddNzbDialog({
                   style={{ color: entryTone(entry) }}
                   className="flex-none font-wv-mono text-[10.5px] tracking-[0.1em] uppercase"
                 >
-                  {entry.status}
+                  {isBlocked(entry) ? "blocked" : entry.status}
                 </span>
                 <span className="w-[72px] flex-none text-right font-wv-mono text-[11.5px] text-wv-muted">
                   {formatSize(entry.file.size)}
                 </span>
+                {isBlocked(entry) ? (
+                  <button
+                    type="button"
+                    disabled={upload.staging || upload.fetching}
+                    onClick={() => void upload.forceSubmitFile(entry.localId)}
+                    title={t("upload.forceDesc")}
+                    className="flex-none text-[12px] font-medium text-wv-accent hover:text-wv-accent-hover disabled:cursor-default disabled:opacity-50"
+                  >
+                    Force add
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => upload.removeFile(entry.localId)}
