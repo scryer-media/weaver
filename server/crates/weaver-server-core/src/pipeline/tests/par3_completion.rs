@@ -863,6 +863,93 @@ async fn par3_prefetch_requires_confirmed_protected_damage_and_runs_only_once() 
 }
 
 #[tokio::test]
+async fn damaged_obfuscated_par3_payload_retires_inferred_split_topology() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job = JobId(3199);
+    let name = "51273aad56a8b904e96928935278a627.201";
+    let expected: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
+    let mut damaged = expected.clone();
+    damaged[2200..2232].fill(0);
+    let files = [
+        (name, damaged),
+        ("b.txt", b"qrstuvwxyz".to_vec()),
+        (
+            "sub/c.bin",
+            (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+        ),
+        ("set.par3", INDEX.to_vec()),
+        (
+            "set.vol0+1.par3",
+            include_bytes!("../repair/backend/fixtures/set.vol0+1.par3").to_vec(),
+        ),
+    ];
+    let mut spec = standalone_job_spec(
+        "damaged obfuscated payload",
+        &files
+            .iter()
+            .map(|(name, bytes)| ((*name).into(), bytes.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    let working = insert_active_job(&mut pipeline, job, spec).await;
+    tokio::fs::create_dir(working.join("sub")).await.unwrap();
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job, index as u32, name, bytes).await;
+        pipeline
+            .try_load_par3_metadata(
+                job,
+                NzbFileId {
+                    job_id: job,
+                    file_index: index as u32,
+                },
+            )
+            .await;
+    }
+    pipeline.jobs.get_mut(&job).unwrap().download_queue = DownloadQueue::new();
+    for _ in 0..20 {
+        settle_par3(&mut pipeline, job).await;
+        if pipeline.par3_runtime.as_ref().unwrap().verified(job) {
+            break;
+        }
+        pipeline.check_par3_completion(job).await;
+    }
+    assert!(pipeline.par3_runtime.as_ref().unwrap().verified(job));
+    assert_eq!(
+        tokio::fs::read(working.join("a.bin")).await.unwrap(),
+        expected
+    );
+    assert!(pipeline.jobs[&job].assembly.archive_topologies().is_empty());
+    assert!(!pipeline.check_par3_completion(job).await);
+    for _ in 0..12 {
+        pipeline.check_job_completion(job).await;
+        while pipeline
+            .inflight_extractions
+            .get(&job)
+            .is_some_and(|sets| !sets.is_empty())
+        {
+            let done = next_extraction_done(&mut pipeline).await;
+            pipeline.handle_extraction_done(done).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if !pipeline.jobs.contains_key(&job) {
+            break;
+        }
+    }
+    let delivered = pipeline.complete_dir.join("damaged obfuscated payload");
+    assert_eq!(
+        tokio::fs::read(delivered.join("a.bin")).await.unwrap(),
+        expected
+    );
+    assert!(
+        !delivered.join(name).exists(),
+        "do not deliver the damaged donor"
+    );
+}
+
+#[tokio::test]
 async fn par3_repairs_an_interior_article_hole_and_reconciles_completion() {
     assert_par3_repairs_from_status(JobStatus::Downloading, false).await;
 }
