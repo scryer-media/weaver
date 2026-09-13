@@ -24,8 +24,8 @@ export function LoadingMark({ className, reveal = false }: { className?: string;
       <source media="(prefers-reduced-motion: reduce)" srcSet={loadingMarkStill} />
       <img
         src={loadingMark}
-        width={120}
-        height={82}
+        width={304}
+        height={209}
         alt=""
         aria-hidden="true"
         draggable={false}
