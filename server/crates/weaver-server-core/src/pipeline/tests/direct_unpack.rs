@@ -1488,6 +1488,57 @@ async fn a_set_armed_after_its_download_ended_is_not_killed_by_the_settle() {
     );
 }
 
+/// A set that learned another part after it armed.
+///
+/// The coverage is sized at arming. When the set's parts later resolve to a
+/// different count — an obfuscated volume bound to the set after the chase
+/// started — the settle used to walk the new part list against the old
+/// coverage and address a part it never had. The chase has to stop instead,
+/// retryably, and leave the set to extraction.
+#[tokio::test]
+async fn a_set_whose_parts_changed_after_arming_is_aborted_by_the_settle() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41615);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    assert!(files.len() > 1, "the fixture is a split set");
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    // Stand in for the arming that happened while the set knew one part fewer.
+    let stale = std::sync::Arc::new(crate::pipeline::direct_unpack::SetCoverage::new(
+        files.len() - 1,
+    ));
+    let running = pipeline
+        .direct_unpack
+        .replace_armed_coverage(job_id, set_name, std::sync::Arc::clone(&stale))
+        .expect("armed");
+
+    pipeline.settle_direct_unpack_after_download(job_id);
+
+    let armed = pipeline.direct_unpack.is_armed(job_id, set_name);
+    let latched = pipeline.direct_unpack.latched_reason(job_id, set_name);
+    let demoted = pipeline.direct_unpack.counters().demoted_part_unreadable;
+    running.abort("test teardown".to_string());
+    pipeline.direct_unpack_shutdown("test teardown").await;
+
+    assert!(!armed, "a chase over a set that changed shape must end");
+    assert!(
+        stale.abort_reason().is_some(),
+        "and its coverage must say why"
+    );
+    assert_eq!(latched, None, "the set may arm again with its real parts");
+    assert_eq!(demoted, 1);
+}
+
 /// The panic, at the seam that caused it.
 ///
 /// The download drains while a part's writes are still flushing, so the file on

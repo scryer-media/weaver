@@ -507,6 +507,19 @@ impl DirectUnpackRuntime {
             .get(&(job_id, set_name.to_string()))
             .map(|set| Arc::clone(&set.coverage))
     }
+
+    /// Swap an armed set's coverage, returning the one the worker still holds.
+    #[cfg(test)]
+    pub(crate) fn replace_armed_coverage(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        coverage: Arc<SetCoverage>,
+    ) -> Option<Arc<SetCoverage>> {
+        self.armed
+            .get_mut(&(job_id, set_name.to_string()))
+            .map(|set| std::mem::replace(&mut set.coverage, coverage))
+    }
 }
 
 impl Pipeline {
@@ -2142,6 +2155,36 @@ impl Pipeline {
                     continue;
                 }
             };
+            // The coverage was sized from the parts the set had when it armed.
+            // A set that has since learned another volume — an obfuscated part
+            // bound to it by its recovery set after arming — no longer lines up
+            // with it, and every index past the old count would address a part
+            // the chase never mapped. The chase describes a different set now,
+            // so it stops and extraction reads the set as it actually is.
+            let armed_parts = self
+                .direct_unpack
+                .armed
+                .get(&(job_id, set_name.clone()))
+                .map(|armed| armed.coverage.part_count());
+            if let Some(armed_parts) = armed_parts
+                && armed_parts != paths.len()
+            {
+                warn!(
+                    job_id = job_id.0,
+                    set_name,
+                    armed_parts,
+                    current_parts = paths.len(),
+                    "direct unpack set changed shape after it armed"
+                );
+                self.direct_unpack_abort_set(
+                    job_id,
+                    &set_name,
+                    "the set's parts changed after the chase armed",
+                    AbortLatch::Retryable,
+                    DemotionReason::PartUnreadable,
+                );
+                continue;
+            }
             let mut unsettled: Vec<String> = Vec::new();
             for (index, path) in paths.iter().enumerate() {
                 // Already settled by its own completion commit: nothing to add,
