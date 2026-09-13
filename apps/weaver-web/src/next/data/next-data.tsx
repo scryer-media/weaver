@@ -87,6 +87,12 @@ export interface NextData {
   categories: ConfiguredCategory[];
   historyCount: number;
   providers: ProviderHealth[];
+  /**
+   * Whether `providers` is an answer. It is also empty before server health
+   * first returns and while a read is failing, and neither of those says
+   * that nothing is configured.
+   */
+  providersLoaded: boolean;
   holdoffs: ProviderHoldoff[];
   connection: { status: GraphqlConnectionStatus; isDisconnected: boolean; isPolling: boolean };
 }
@@ -194,6 +200,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const isPaused = globalState?.isPaused ?? false;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
   const providers = providerData?.serverHealth ?? EMPTY_PROVIDERS;
+  const providersLoaded = providerData !== undefined;
   const holdoffs = snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS;
   const version = versionData?.version ?? "";
   const historyCount = historyCountData?.all ?? 0;
@@ -210,6 +217,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       categories,
       historyCount,
       providers,
+      providersLoaded,
       holdoffs,
       connection: {
         status: connectionState.status,
@@ -226,6 +234,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       isPaused,
       isPolling,
       providers,
+      providersLoaded,
       queue,
       speed,
       version,

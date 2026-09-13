@@ -235,3 +235,39 @@ html[data-ui="next"] .wv-xscroll {
 html[data-ui="next"] .wv-xscroll::-webkit-scrollbar {
   display: none;
 }
+
+/*
+ * A ping for the one control on a screen that has to be seen: a square ring
+ * leaves the control's edge and fades as it travels. It is an outline, so the
+ * menus keep the system's only shadow. With reduced motion the ring holds
+ * still a few pixels out, and keyboard focus swaps it for the focus ring.
+ */
+html[data-ui="next"] .wv-ping {
+  outline: 2px solid transparent;
+  animation: wv-ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+html[data-ui="next"] .wv-ping:focus-visible {
+  animation: none;
+  outline-color: var(--color-wv-strong);
+  outline-offset: 3px;
+}
+
+@keyframes wv-ping {
+  from {
+    outline-color: var(--wv-accent);
+    outline-offset: 0;
+  }
+  to {
+    outline-color: transparent;
+    outline-offset: 9px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html[data-ui="next"] .wv-ping {
+    animation: none;
+    outline-color: var(--wv-accent);
+    outline-offset: 3px;
+  }
+}

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router";
 import { useClient, useMutation, useQuery } from "urql";
 import {
   ADD_SERVER_MUTATION,
@@ -303,6 +304,27 @@ export function ProvidersPanel() {
       setForm(formToState(details, details.username ?? ""));
     }
   }, [details, form]);
+
+  // A link can ask for the add form outright, as the rail's call to action does
+  // when nothing is configured. Open it once, then take the ask out of the URL
+  // so neither a reload nor Back opens it again.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const askedToAdd = searchParams.has("add");
+  useEffect(() => {
+    if (!askedToAdd) {
+      return;
+    }
+    setForm(NEW_SERVER);
+    setTestResult(null);
+    setEditingId("new");
+    setSearchParams(
+      (params) => {
+        params.delete("add");
+        return params;
+      },
+      { replace: true },
+    );
+  }, [askedToAdd, setSearchParams]);
 
   const values = form;
 
