@@ -1,0 +1,17 @@
+{
+  "slug": "par3-rar5-withheld-volume",
+  "title": "E2E.Test.PAR3.RAR5.Withheld.Volume.Sienna.Gantry.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A compressed three-volume RAR5 set posted without its interior volume. The PAR3 set has enough recovery blocks to create the whole volume.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "sienna.gantry.s01e02.mkv": "47fa005baaad6a386679a52c55a2a00e0e65c71d0444cbd76eeeb6af7ec3a96b"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

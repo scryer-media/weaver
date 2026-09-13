@@ -1,0 +1,18 @@
+{
+  "slug": "direct-store-hp-par3-repair",
+  "title": "Thistle.Gate.S02E03.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR5 store-method set with `-hp` header and data encryption and PAR3 recovery, damaged by deleting the tail articles of an interior volume. PAR3 repairs ciphertext under encrypted headers while the set keeps routing direct.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "thistle.gate.s02e03.mkv": "4e287b51905452e98a618f68508d57c284ed55af7082dff87af192b7ab955c1a"
+  },
+  "password": "weaver-e2e-direct-password",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "deleteSubjectContains": [
+    "archive.part2.rar"
+  ],
+  "deleteSubjectTailArticles": 3
+}

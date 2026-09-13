@@ -1,0 +1,20 @@
+{
+  "slug": "par3-missing-articles",
+  "title": "E2E.Test.PAR3.Missing.Articles.Hollow.Beacon.S01E07.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "An 8 MiB payload whose last two articles are deleted after posting, so the file arrives short. The PAR3 set is named without the payload's extension, so the deletion cannot match it.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "hollow.beacon.s01e07.mkv": "7e5a405ef647a21bd1b3252d42913ff8c6d3424fb7a055911c7d649d8ddc6402"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ],
+  "deleteSubjectContains": [
+    "hollow.beacon.s01e07.mkv"
+  ],
+  "deleteSubjectTailArticles": 2
+}

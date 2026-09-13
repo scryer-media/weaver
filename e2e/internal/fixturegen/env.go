@@ -18,10 +18,11 @@ const (
 	// outputDir holds what the recipe will publish into testdata/<slug>/.
 	outputDir = "out"
 
-	// SevenZipToolchain, PAR2Toolchain and VideoToolchain are the ids the
-	// non-RAR oracles are pinned under.
+	// SevenZipToolchain, PAR2Toolchain, PAR3Toolchain and VideoToolchain are
+	// the ids the non-RAR oracles are pinned under.
 	SevenZipToolchain = "sevenzip-26.02"
 	PAR2Toolchain     = "par2cmdline-turbo-1.4.0"
+	PAR3Toolchain     = "par3cmdline-2971702e"
 	VideoToolchain    = "ffmpeg-7.1-ubuntu2404"
 
 	// RAR5Writer and RAR4Writer are the RARLAB releases the general corpus is

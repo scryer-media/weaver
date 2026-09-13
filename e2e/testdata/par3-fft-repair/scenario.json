@@ -1,0 +1,16 @@
+{
+  "slug": "par3-fft-repair",
+  "title": "E2E.Test.PAR3.FFT.Repair.Quartz.Fathom.S01E09.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "The same loose repair under FFT-based Reed-Solomon (`-e8`), with two adjacent blocks zeroed.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "quartz.fathom.s01e09.mkv": "30207d5b0581ddcb436ac303559662d582adb25091427d9fc7412ff840cee8f4"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

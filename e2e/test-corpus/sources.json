@@ -15,6 +15,7 @@
         "go-fixture-bytes",
         "go-klauspost-zstd@v1.19.2",
         "par2cmdline-turbo-1.4.0",
+        "par3cmdline-2971702e",
         "rarlab-4.20",
         "rarlab-5.00",
         "rarlab-6.24",
@@ -23,7 +24,7 @@
         "uudeview-0.5.20"
       ],
       "byte_reproducible": false,
-      "notes": "The Go fixture generator. Payload synthesis, every byte edit, and the zip, tar, gzip, DEFLATE, zstd, bzip2 and brotli containers are Go; RAR comes only from RARLAB's own writer, PAR2 from par2cmdline-turbo, 7z from the official 7-Zip console binary and video from the pinned FFmpeg image. Not byte-reproducible as a whole: RAR and 7z stamp creation times and draw encryption salts, and the video encoders are not bit-exact across builds. The zip, tar and stream-codec families are byte-reproducible from their recipe alone."
+      "notes": "The Go fixture generator. Payload synthesis, every byte edit, and the zip, tar, gzip, DEFLATE, zstd, bzip2 and brotli containers are Go; RAR comes only from RARLAB's own writer, PAR2 from par2cmdline-turbo, PAR3 from the par3cmdline reference, 7z from the official 7-Zip console binary and video from the pinned FFmpeg image. Not byte-reproducible as a whole: RAR and 7z stamp creation times and draw encryption salts, and the video encoders are not bit-exact across builds. The zip, tar and stream-codec families are byte-reproducible from their recipe alone."
     }
   },
   "files": [
@@ -244,6 +245,150 @@
       }
     },
     {
+      "path": "testdata/direct-store-encrypted-par3-repair/archive.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par3-repair/archive.part1.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par3-repair/archive.part2.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par3-repair/archive.part3.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par3-repair/archive.part4.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par3-repair/archive.vol00+06.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par3-repair/archive.vol06+12.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par3-repair/archive.vol18+24.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-encrypted-par3-repair/archive.vol42+35.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
       "path": "testdata/direct-store-encrypted/archive.part1.rar",
       "size": 8388608,
       "blake3": "9c9b9c1e5aaa0c81a762e244b54d6685667dfb2ca9ff57450e1d09b72ec9e461",
@@ -411,6 +556,150 @@
         "toolchains": [
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par3-repair/archive.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par3-repair/archive.part1.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par3-repair/archive.part2.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par3-repair/archive.part3.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par3-repair/archive.part4.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par3-repair/archive.vol00+06.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par3-repair/archive.vol06+12.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par3-repair/archive.vol18+24.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-hp-par3-repair/archive.vol42+35.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
           "rarlab-5.00"
         ]
       }
@@ -801,6 +1090,285 @@
         "toolchains": [
           "go-fixture-bytes",
           "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-repair/archive.par3",
+      "size": 10131,
+      "blake3": "228f647c431584383b81f4c024b807d0ffaeeff94b65579ae6e9569058ea7574",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-repair/archive.part1.rar",
+      "size": 8388608,
+      "blake3": "aefd7c8936c8e46c106ff6973442823b9f1626012645e7eb22bb3c3cf1571878",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-repair/archive.part2.rar",
+      "size": 8388608,
+      "blake3": "83b22f93ebb672efe6342cf99df10331d3c4eca511100ba93f553388888468a6",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-repair/archive.part3.rar",
+      "size": 8388608,
+      "blake3": "100705ab93c5f475da3f1bc2fb4a1a3e7d084175a61701ffc44882afaef4546f",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-repair/archive.part4.rar",
+      "size": 331,
+      "blake3": "23afd77de01df26068e312c9fc261568e40b8432a1d0df7bba45909b33838f2d",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-repair/archive.vol00+06.par3",
+      "size": 423907,
+      "blake3": "5c97a9be67b9da591c4452677399161dc44ee68dc52dc088cae65a183ac20734",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-repair/archive.vol06+12.par3",
+      "size": 827667,
+      "blake3": "c8d68ab7e12442be08fa82ccb61f69bd17936fdff4b8fd9600b26cbeff050ffc",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-repair/archive.vol18+24.par3",
+      "size": 1625171,
+      "blake3": "33702bbe0ddb3146a783410142613f8f803cece2b324665dac98eff1294fa2dc",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-repair/archive.vol42+35.par3",
+      "size": 2357051,
+      "blake3": "6ca715f3f8743f77ac53ee5b8c3ccf4a03bf166426bf16abb367382fd7fa94b4",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-withheld-volume/archive.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-withheld-volume/archive.part1.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-withheld-volume/archive.part2.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-withheld-volume/archive.part3.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-withheld-volume/archive.part4.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-withheld-volume/archive.vol00+013.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-withheld-volume/archive.vol13+026.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-withheld-volume/archive.vol39+052.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/direct-store-par3-withheld-volume/archive.vol91+102.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
           "rarlab-5.00"
         ]
       }
@@ -4459,6 +5027,126 @@
       }
     },
     {
+      "path": "testdata/par2-par3-both-sufficient/jasper.ferry.s01e02.mkv",
+      "size": 6291456,
+      "blake3": "edda93654950283db36cee70df5c2bedf425279fa33bd4cd92e8f269410c0efa",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-par3-both-sufficient/jasper.ferry.s01e02.par2",
+      "size": 2344,
+      "blake3": "4126cd73547666391d131f0d04d264b61576f657b708872a09f95465ad70f66f",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-par3-both-sufficient/jasper.ferry.s01e02.par3",
+      "size": 2820,
+      "blake3": "741d200ce9124be6c4f817297120ea356419cd6f2e8143c9a43c98706339c343",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-par3-both-sufficient/jasper.ferry.s01e02.vol0+1.par3",
+      "size": 68444,
+      "blake3": "53c119e3d117c267a613af0778c3592d35c8d73a62cfad5cc0b663f062ed592e",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-par3-both-sufficient/jasper.ferry.s01e02.vol0+8.par2",
+      "size": 533884,
+      "blake3": "b4f6f921d6b74e072d827238a38439339078b2690dc9a61a466f444f0e0642f5",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-par3-both-sufficient/jasper.ferry.s01e02.vol1+2.par3",
+      "size": 136773,
+      "blake3": "5b701ee6d0f22016f43993c8c86c0ac44cbb3f3aaf695a0638e9425ffe84ef03",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-par3-both-sufficient/jasper.ferry.s01e02.vol3+4.par3",
+      "size": 270726,
+      "blake3": "a6d2aaa8a8acd5c04035a5d057181d1b1b7b70964b919852ce17136905de1f31",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-par3-both-sufficient/jasper.ferry.s01e02.vol7+1.par3",
+      "size": 68444,
+      "blake3": "298aa772890da4c164eb7d2d9277afa7b9090395a713642ac41bda98910d60ec",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
       "path": "testdata/par2-partial-volume/test-media.mkv",
       "size": 5242880,
       "blake3": "44461a509759283580d445820f6d7681e6fd34c9ba46b53e8ea2036ac89f5de5",
@@ -5388,6 +6076,2851 @@
         "inputs": [
           "testdata/single-mkv/test-media.mkv",
           "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-7z-repair/archive.7z",
+      "size": 6291991,
+      "blake3": "58cf1ed724dc874df0a9397161d0a64bf87ff42538aed6cfea5301ec813d7a3e",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-7z-repair/archive.par3",
+      "size": 2847,
+      "blake3": "84b53253561b5a467e2a3d1750b8573aa260dc399716a57e746faf73c640c823",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-7z-repair/archive.vol0+1.par3",
+      "size": 68471,
+      "blake3": "d9d1d350b8f59be6dbcd266877ba6607cc687cf7b9ae8156937b7ec337ae560a",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-7z-repair/archive.vol1+2.par3",
+      "size": 136827,
+      "blake3": "a804ee5cfdc85b9a140995e7e69aba68897bfef6e675d755991cdec4c0d3181c",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-7z-repair/archive.vol3+4.par3",
+      "size": 270807,
+      "blake3": "6d3d1f4ab92cbe5e2cd966979e16cfc5f58c6a554beac727a834984785b5e3a6",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-7z-repair/archive.vol7+1.par3",
+      "size": 68471,
+      "blake3": "3138741c60580c20ffffe7b4849dcd0c7e23621fce43fca94166f44ace62c3c6",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-aligned-dedup/harbor.glyph.s01e02.mkv",
+      "size": 4194304,
+      "blake3": "1eecc01eb2a38bfb7b862722630e74b489f6466cbe7b07a0476ad166806a3130",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-aligned-dedup/harbor.glyph.s01e02.par3",
+      "size": 1016,
+      "blake3": "1f63c6506631178ed929217b49ca161a8b669032062be88e2b8e7b1a5c651310",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-aligned-dedup/harbor.glyph.s01e02.vol0+1.par3",
+      "size": 33872,
+      "blake3": "10143f9aa8448388e286b1ffc531990572b348868026cf727c77f895eb4414b5",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-aligned-dedup/harbor.glyph.s01e02.vol1+2.par3",
+      "size": 67625,
+      "blake3": "fb57b2f7167ab029afcbe8ffee598d71170d36cd51ddf1ddf1dacf70e06bd685",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-aligned-dedup/harbor.glyph.s01e02.vol3+4.par3",
+      "size": 134234,
+      "blake3": "8f41adf1e57c2c08e862c27e1a30b8107cc0514067218e1f3c41f6d758a7ba37",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-aligned-dedup/harbor.glyph.s01e02.vol7+1.par3",
+      "size": 33872,
+      "blake3": "613290dd00c6564210c1ca64fbff7926f146a4fc9360dd2e634898318f722a59",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-clean/amber.lattice.s01e03.mkv",
+      "size": 6291456,
+      "blake3": "8342d490184b545b062b867889967559b2119afa633509838d7e8f6d5308ec04",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-clean/amber.lattice.s01e03.par3",
+      "size": 2821,
+      "blake3": "756125446c9da50c736e461ba12ec0e632b22ab799a536e233fb60c6f3196f79",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-clean/amber.lattice.s01e03.vol0+1.par3",
+      "size": 68445,
+      "blake3": "5aade2b0a991748a057ecd4b9429193b566cc9fc2c54e7e18757742e98b39fcd",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-clean/amber.lattice.s01e03.vol1+2.par3",
+      "size": 136775,
+      "blake3": "f70bfe36bc197409e445a4c20287b8e3eb795c71741ebd0f106951f256f539b5",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-clean/amber.lattice.s01e03.vol3+4.par3",
+      "size": 270729,
+      "blake3": "b0af681094df374d7916375e9213db6c74585a0881c962c7e2474b68edf12d56",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-clean/amber.lattice.s01e03.vol7+1.par3",
+      "size": 68445,
+      "blake3": "87edb18992b1c70e08d4482795bf8c1a90c0bdaae4c35ebe5a7fcf7777f7cedf",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-data-packets/tidal.vesper.s01e06.par3",
+      "size": 2052,
+      "blake3": "24ae8d1e74c2cfafb8c58681212e5f2952e550a35b17fc6c0400fc86aaa9cd8b",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-data-packets/tidal.vesper.s01e06.part00+01.par3",
+      "size": 67644,
+      "blake3": "745d08d5dc5c0931ab3db5505b5318694aaebbd1ce2d9c8ee8bedb56ec55fedb",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-data-packets/tidal.vesper.s01e06.part01+02.par3",
+      "size": 135173,
+      "blake3": "bdb7f7dae809b0514b240f78f0743e687459064f2043d52878f9f4483d1bbc25",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-data-packets/tidal.vesper.s01e06.part03+04.par3",
+      "size": 268294,
+      "blake3": "cda1c71c297761d8a563a4e7f0ae9d73d50dce9a173d7ae4fe0b7a9b3c6118df",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-data-packets/tidal.vesper.s01e06.part07+08.par3",
+      "size": 532599,
+      "blake3": "3af18514c41e2d38e784cc55d42135e4eb3664ff18faace6242d8e53dc7e9e3f",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-data-packets/tidal.vesper.s01e06.part15+16.par3",
+      "size": 1059272,
+      "blake3": "b9a0b2473e2bb71131d514bf8c4c6a79f9790f34375f697d698cd0b21ca573cb",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-data-packets/tidal.vesper.s01e06.part31+32.par3",
+      "size": 2110681,
+      "blake3": "d8f0ff094331f5732f0550485a0f6f18618a783b43bf3c0872977857835eec5e",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-data-packets/tidal.vesper.s01e06.part63+01.par3",
+      "size": 67644,
+      "blake3": "d41092b11cde2e28b9e9971d6188989aa017dca9482b01f9dd0a00b6fde68589",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-direct-repair/cobalt.drift.s02e05.mkv",
+      "size": 6291456,
+      "blake3": "9b1ed920d61ebcc8c62d281ca472e6e5f6dc50d8d6344be47c5cf36a3f487712",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-direct-repair/cobalt.drift.s02e05.par3",
+      "size": 2820,
+      "blake3": "4fba7ceb46cc1109ed574bf35a5d35c347e383e597606bf76602d6dc8612e74e",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-direct-repair/cobalt.drift.s02e05.vol0+1.par3",
+      "size": 68444,
+      "blake3": "ab51321e830ef4e273d5e9b5a58e4c5dc2f167c7324ae6fe3dd2d0a7ef5baf74",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-direct-repair/cobalt.drift.s02e05.vol1+2.par3",
+      "size": 136773,
+      "blake3": "1f3eb12affe808e5762dab4d527d49fbdaf3eee17fcd8e39677cc374768c16ef",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-direct-repair/cobalt.drift.s02e05.vol3+4.par3",
+      "size": 270726,
+      "blake3": "54232ba64c3667a2da92741512d606e0f2a8fbb6c9d87aa69f2302c5fc496132",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-direct-repair/cobalt.drift.s02e05.vol7+1.par3",
+      "size": 68444,
+      "blake3": "ba4c421bce43c29b352dfc2a24707682af4c67905299e72687bc2fd132fee6df",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-disguised-carrier/000.metadata.bin",
+      "size": 68444,
+      "blake3": "57ea6bfa83404c60306897b6d37eefb5c176d51506430407f92b3304ee79ff68",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-disguised-carrier/russet.pylon.s01e03.mkv",
+      "size": 6291456,
+      "blake3": "914d6192bce49a7ffd10910a9dffdf47ced4598a837195b0c46ad106eddaba94",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-fft-repair/quartz.fathom.s01e09.mkv",
+      "size": 6291456,
+      "blake3": "b0d11d325ba4a788a4a9d8013aa15a1a0cd3b6319b37b63a736eed996904b70d",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-fft-repair/quartz.fathom.s01e09.par3",
+      "size": 2814,
+      "blake3": "fdce3dc2bdd486dd958e42f25b5be48e263e7b0f688dd3e82693c2a2da15d27c",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-fft-repair/quartz.fathom.s01e09.vol0+1.par3",
+      "size": 68438,
+      "blake3": "b3d04160e9f8748dbdebb88a7b9a5207369495d0bbc5f8c118611fb2c481ab10",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-fft-repair/quartz.fathom.s01e09.vol1+2.par3",
+      "size": 136761,
+      "blake3": "c87d29d885e038f36e04c012b918a87f44eb65fdb80e9bb9b63cc359eb146fe5",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-fft-repair/quartz.fathom.s01e09.vol3+4.par3",
+      "size": 270708,
+      "blake3": "ed6a56c0568307a01b19329e5fd552f822b4cc2183cdc8a062aff2b6c7ac77a2",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-fft-repair/quartz.fathom.s01e09.vol7+1.par3",
+      "size": 68438,
+      "blake3": "e5d00642d47ce55d6504104a470ae84cb5d7d317bf1e1ae129c0a3e638fd3a7d",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-gf16-repair/ember.vantage.s03e01.mkv",
+      "size": 3145851,
+      "blake3": "5840801ac001f02c6a44d711bdf2287aa3cd2f878c96bff2eafa4f77277cbe0e",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-gf16-repair/ember.vantage.s03e01.par3",
+      "size": 74286,
+      "blake3": "057fa03caf843ed22f4b36ce3b152de1f9685fe5ae62f9bb0b8ea8808bb1215e",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-gf16-repair/ember.vantage.s03e01.vol00+01.par3",
+      "size": 75398,
+      "blake3": "b35c585af69eba30f1fadb23e4bf7c2429ff58264f7631100774886e63b3df61",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-gf16-repair/ember.vantage.s03e01.vol01+02.par3",
+      "size": 150681,
+      "blake3": "72f6dbeff8c5ba391cca41caa7b562e8818f9278e607558906ccd42e054691b0",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-gf16-repair/ember.vantage.s03e01.vol03+04.par3",
+      "size": 227076,
+      "blake3": "d1d6bba8412fb4f31ca639e532b8ed185c379ef23d1688808c522ba7ce2ffc7d",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-gf16-repair/ember.vantage.s03e01.vol07+08.par3",
+      "size": 305695,
+      "blake3": "7a125508947d2e7b0de8fc76eb06bf12c57ab05525e0870d3ac292eda8a42ec8",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-gf16-repair/ember.vantage.s03e01.vol15+16.par3",
+      "size": 388762,
+      "blake3": "ec7e46b56bed13f7e26a792176cab383c1eab4bab673d4fa4652964754817d10",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-gf16-repair/ember.vantage.s03e01.vol31+32.par3",
+      "size": 480725,
+      "blake3": "31148073cb6b27357532cacd0846e41df9dd4a7597bdc66112c899802394fefa",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-gf16-repair/ember.vantage.s03e01.vol63+01.par3",
+      "size": 75398,
+      "blake3": "9e7b2547064acdc53c6d167769ffc6e3d8c40bbef5a08f6a44d794b8b185cad8",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-heavy-damage/velvet.basin.s02e02.mkv",
+      "size": 6291456,
+      "blake3": "1091f7e50c243e21379b5e1f606f48b4b527dffa2c1adfe43dd626ac05cb1609",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-heavy-damage/velvet.basin.s02e02.par3",
+      "size": 2820,
+      "blake3": "a89ea6c0c75d5290ffe4a70f8b428dcfd28db6d1c837bfcd17531a89ffa46b49",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-heavy-damage/velvet.basin.s02e02.vol00+01.par3",
+      "size": 68444,
+      "blake3": "d44cb3be9004f31569b26f75b91f6903c5cef63e2eac2b17a740720151b3609c",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-heavy-damage/velvet.basin.s02e02.vol01+02.par3",
+      "size": 136773,
+      "blake3": "43d8efb398c6b8ce9c3e26608c74b1f5f8c5fde7f3841dfb7daf2649568991ab",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-heavy-damage/velvet.basin.s02e02.vol03+04.par3",
+      "size": 270726,
+      "blake3": "888ef2aa8bc02895345d9a61444b5b5ff09a183eedae40cbd75a66c63f309484",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-heavy-damage/velvet.basin.s02e02.vol07+08.par3",
+      "size": 535927,
+      "blake3": "f23146bbb276e809f593a11b22998728573b4ec2930318fae6d64cbe6bbe99ce",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-heavy-damage/velvet.basin.s02e02.vol15+16.par3",
+      "size": 1063624,
+      "blake3": "a8cb32241abae939bbb9b666283422ffcb13d21aba1e3ddac022422c852c00cb",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-heavy-damage/velvet.basin.s02e02.vol31+17.par3",
+      "size": 1129248,
+      "blake3": "39fcf25316e5c29ff839e713c02fb4b84d59de7108bb682a483aa32ad6f8ec9b",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-inside-7z-repair/archive.7z",
+      "size": 4635749,
+      "blake3": "2f438e70ade692d387f457025896bd69d8464d13c9acc036126883375e8603b2",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-inside-zip-clean/archive.zip",
+      "size": 4636017,
+      "blake3": "c6f6f9184efe43559d80651d647f160dac416c805d433121a026eeacf06b6a16",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-inside-zip-header-repair/archive.zip",
+      "size": 4636017,
+      "blake3": "782fda4cdf12960bbe790b9cf602dc3a13f6cee3bdc754486719dbbb05a9e72c",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-inside-zip-insufficient/archive.zip",
+      "size": 4636017,
+      "blake3": "fae61a27ce9c16b4b01d9d0849ab69ed1c6381836cbf74bb755410f726c4cf36",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-inside-zip-missing-article/archive.zip",
+      "size": 4636017,
+      "blake3": "1a43f71b590a927316a89087ac4a966acfc2cafdfff512cd0b502fc5b6aadbba",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-inside-zip-repair/archive.zip",
+      "size": 4636017,
+      "blake3": "4147315336f9920f11cf72421025b9f74d9f03f82664b85ea8a7c9f3f296c01e",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-insufficient/slate.corridor.s01e10.mkv",
+      "size": 6291456,
+      "blake3": "3398c77b45cf8ae7137df0b65f7d8bdb161e6c09b3a7b3b1458897f65f252f55",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-insufficient/slate.corridor.s01e10.par3",
+      "size": 2822,
+      "blake3": "4a098cf8e696d4ed51be7bdb295a5b49bde53fd47ba4285d53bdcc82aed26127",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-insufficient/slate.corridor.s01e10.vol0+1.par3",
+      "size": 68446,
+      "blake3": "698eda8b9d8964163b894f727d542a13788d8a50d1fe551c3e7305111948ffd3",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-insufficient/slate.corridor.s01e10.vol1+2.par3",
+      "size": 136777,
+      "blake3": "60ba2d1157f30e7ade704176eb2a5fe67fd35038c2c8d1b02968b508989faa34",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-insufficient/slate.corridor.s01e10.vol3+1.par3",
+      "size": 68446,
+      "blake3": "226f08c4519015aa6e7a7c97ef4a4e28653a2d3c9241e7745db58b316e54d26c",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-articles/hollow.beacon.s01e07.mkv",
+      "size": 8388608,
+      "blake3": "7e5a405ef647a21bd1b3252d42913ff8c6d3424fb7a055911c7d649d8ddc6402",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-articles/hollow.beacon.s01e07.par3",
+      "size": 3589,
+      "blake3": "28ee6489cc534e8f178e23438f7bbefa3ab22c40b8cbd44cd24ce1c8ab931a0f",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-articles/hollow.beacon.s01e07.vol00+01.par3",
+      "size": 69213,
+      "blake3": "23ece141b82f315541064b3ab69ef173b50932f292863d73bfcc268281a0aeb8",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-articles/hollow.beacon.s01e07.vol01+02.par3",
+      "size": 138311,
+      "blake3": "d3aca6f26773b731cd8dfa95565bba964ac3aae62b477cd9787a777a23dc33c1",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-articles/hollow.beacon.s01e07.vol03+04.par3",
+      "size": 273033,
+      "blake3": "b73960a68bc315f8206fa3d7dd51586c3504ffafdc0f325918932341697f9f6a",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-articles/hollow.beacon.s01e07.vol07+08.par3",
+      "size": 539003,
+      "blake3": "d581e6985406132d9b5688dda22ee0297b65690d62715dd530b63f09cc207101",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-articles/hollow.beacon.s01e07.vol15+16.par3",
+      "size": 1067469,
+      "blake3": "1cf2cb43c843792b1ef0c3e54237ebad05c060de8f89234d92ae8a037f3509b9",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-articles/hollow.beacon.s01e07.vol31+17.par3",
+      "size": 1133093,
+      "blake3": "ee19a69ca0d4c2939907b9da5607e9ef4586357150aa5c41e2c50bb616a6a6cf",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-index/marble.causeway.s01e05.mkv",
+      "size": 6291456,
+      "blake3": "1384d09ea1bb3711b4c0c0ff25fcdc133bf7e1dac7b6d535e04860a6c156e49c",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-index/marble.causeway.s01e05.vol0+1.par3",
+      "size": 68447,
+      "blake3": "44ee493e68729d9d622aff829c7b86ea760f64f9242ec8a05e58e1d251b6e679",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-index/marble.causeway.s01e05.vol1+2.par3",
+      "size": 136779,
+      "blake3": "c5e1a562981756d0627422388eb86698e2aa9b1509b9ff00cb968fc0e0870adc",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-index/marble.causeway.s01e05.vol3+4.par3",
+      "size": 270735,
+      "blake3": "c89a6fc69e1790f032a62705aec2482db64c53a95b827e090bd53296d8de468b",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-missing-index/marble.causeway.s01e05.vol7+1.par3",
+      "size": 68447,
+      "blake3": "0babbc73bf49ba907a53a968d6c1d94cf67b4e9515c7d82726830dd8cfb28e1a",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-multi-file-repair/garnet.isle.s01.par3",
+      "size": 4230,
+      "blake3": "3879930217493a1ddecf23b3d7115560395a67707ea5dfadd71712e93136daea",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-multi-file-repair/garnet.isle.s01.vol00+1.par3",
+      "size": 69854,
+      "blake3": "6d2808e06fa2431d2b8aff315cdb8a3bda67a98c35772365388d282f58893653",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-multi-file-repair/garnet.isle.s01.vol01+2.par3",
+      "size": 139593,
+      "blake3": "1cf6d990da92dd8784fc97687dcb6067a45aa54a7af937a9391a0332fda300b9",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-multi-file-repair/garnet.isle.s01.vol03+4.par3",
+      "size": 274956,
+      "blake3": "71b524fb1878886eb71713346a13401d94b1687101dd820b4ccc21e0ca0e73b6",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-multi-file-repair/garnet.isle.s01.vol07+8.par3",
+      "size": 541567,
+      "blake3": "9a881e0343aea91fde8771e0765a4233459ba41ee49ee86569d4b17fb8ad748f",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-multi-file-repair/garnet.isle.s01.vol15+1.par3",
+      "size": 69854,
+      "blake3": "1e4ad816ccdd3fdf45f4ebf6d2bc3778e1ae476b6769ee59fb3cfd27e5d77543",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-multi-file-repair/garnet.isle.s01e01.mkv",
+      "size": 3145728,
+      "blake3": "5e17832e6ba4f85cf83cd930a7800cd2c588fe0aab69cc053872275abe414eda",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-multi-file-repair/garnet.isle.s01e02.mkv",
+      "size": 3145728,
+      "blake3": "fb2c720c70e0fcce15e45b5cd66c3f5b56a2da285ae008eb52ca083acc612259",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-multi-file-repair/garnet.isle.s01e03.mkv",
+      "size": 3145728,
+      "blake3": "79ce169e9cb01611f0630dcd1c2be0c8dec1047f6a933c958b043eaac1532ed0",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-obfuscated-names/51273aad56a8b904e96928935278a627.201",
+      "size": 6291456,
+      "blake3": "c08fdd1c48a7ad3700f90bd51eb98b69fb6bbcd090b2599982ba89e8197d6b96",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-obfuscated-names/indigo.vale.s01e08.par3",
+      "size": 2819,
+      "blake3": "a00991a022a2777cb4c561af81fc7cb080a1c6ef3023a959ddc716db072fa64b",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-obfuscated-names/indigo.vale.s01e08.vol0+1.par3",
+      "size": 68443,
+      "blake3": "7e17c770bdba96d81f7d2a5e8031bb382fb1bf7389c41a3b8f2ab163abbd3852",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-obfuscated-names/indigo.vale.s01e08.vol1+2.par3",
+      "size": 136771,
+      "blake3": "6182a47fe7bed5993c51c0addb2743b79581ae959be574f3b6992bd6ceb663bd",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-obfuscated-names/indigo.vale.s01e08.vol3+4.par3",
+      "size": 270723,
+      "blake3": "c38e4cc2b12e9ce54887752e2ce4b6878c97a97cc827ec0dd773029a519971b3",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-obfuscated-names/indigo.vale.s01e08.vol7+1.par3",
+      "size": 68443,
+      "blake3": "1374662133a6b8a088b411ce25de683023982472c7c82ac8a5cd792c22346fe6",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.en.srt",
+      "size": 8288,
+      "blake3": "d30fe11da906c7adec25bc93f5b0765cea39162e4fc08657b52b5deb7c850403",
+      "format": "srt",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.forced.srt",
+      "size": 8320,
+      "blake3": "de5bdfc876d153d8593db0f96c06e9067cbc50f9c8cab10bcb8a501b8bffa686",
+      "format": "srt",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.mkv",
+      "size": 2097232,
+      "blake3": "654021c60047eb52a3e329ec7868fd685c42f808be12fd157bc2147b59d4ec43",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.par3",
+      "size": 7158,
+      "blake3": "d841c295ee6055dc369c64af1cf4d3585cb9370656e54044f9cc0eb9747bfea0",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.vol00+01.par3",
+      "size": 15438,
+      "blake3": "1b55162e166f2d0f5510d1cc3be3cc8f822f3bdbb0a3ec094cd6d65b2bdfd182",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.vol01+02.par3",
+      "size": 30761,
+      "blake3": "89876e7f1b8500e85ba8d09fd0a0701a58e1d780b4822e096be753508a5ed900",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.vol03+04.par3",
+      "size": 54364,
+      "blake3": "d35a423566102927bf9fcb03b2a0049d8cfe1e22279830357639b77cccaa67c1",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.vol07+08.par3",
+      "size": 94527,
+      "blake3": "cc4681c10d09fab9b1e724c7da4af161655c78c46969ba443cf13236d4f06da6",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.vol15+16.par3",
+      "size": 167810,
+      "blake3": "00a2f93bf369b373077d851f935f40e9143784d06bc2ef2f0c4c776f36a0268c",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-packed-tails/copper.meadow.s01e01.vol31+01.par3",
+      "size": 15438,
+      "blake3": "928495836817bf38353d827b54590cf8b87c6612d4f6586c1396ebb28c47abae",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-par2-fallback/lichen.harbor.s01e05.mkv",
+      "size": 6291456,
+      "blake3": "7763fd9f5193b6a1b18729836fb2a4670dd715f59bfc5ac193f48abd7ba470d3",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-par2-fallback/lichen.harbor.s01e05.par2",
+      "size": 2344,
+      "blake3": "e98cde8c1471166f9a8332a68b432604cb615ec6684a932325f4b4d7ac546ac9",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-par2-fallback/lichen.harbor.s01e05.par3",
+      "size": 2821,
+      "blake3": "a88fd0330dd336afd859b628eae33da0b200332e31cb4297a46262ab61cf2a69",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-par2-fallback/lichen.harbor.s01e05.vol0+1.par2",
+      "size": 67948,
+      "blake3": "881b308469b44fa23f07f73973f4c70e3f5963a8b8f6417e5f20217f4577397c",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-par2-fallback/lichen.harbor.s01e05.vol0+1.par3",
+      "size": 68445,
+      "blake3": "cc4840a4a8d2db211f7d30b73bbdc848ec1031aaf2f271a8ef5befec86043dca",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-par2-fallback/lichen.harbor.s01e05.vol1+2.par3",
+      "size": 136775,
+      "blake3": "39d51948e687f9e3e8273b38d1b3896a97f81f7a8d16b5aa44f2ee75a1c1f0eb",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-par2-fallback/lichen.harbor.s01e05.vol3+4.par3",
+      "size": 270729,
+      "blake3": "787fca739636e53a077679fff5d74cdcf060d547f17885e7a92749a767507673",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-par2-fallback/lichen.harbor.s01e05.vol7+1.par3",
+      "size": 68445,
+      "blake3": "e7f33702367685afa6b4f132414b7bb2ff1af32e42f22493be21014d0253659b",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar4-repair/archive.par3",
+      "size": 2848,
+      "blake3": "032e71db27cd988dd166b3d84c7dc918fd2077e83186e48c7557474e5a09eb60",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar4-repair/archive.rar",
+      "size": 6291538,
+      "blake3": "b20b70ccf7c58b0d34bdb237508766aac40a0915bc0c381968dc9ee44024ad2b",
+      "format": "rar4",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar4-repair/archive.vol0+1.par3",
+      "size": 68472,
+      "blake3": "d30076969a7823b8865826815587ca96ccfbc7ff739053237888748790f4cd83",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar4-repair/archive.vol1+2.par3",
+      "size": 136829,
+      "blake3": "a2b0da8c345751922021f3a75735583bc7fe587b503b24cf622abe04b96f1ba6",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar4-repair/archive.vol3+4.par3",
+      "size": 270810,
+      "blake3": "47c55c2d3712d905ba9cf524ed595471009f2828d78335f3b6144d9756f08991",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar4-repair/archive.vol7+1.par3",
+      "size": 68472,
+      "blake3": "5b411a219fd62ebcc7a105c9aa1d367cf0e920156130b95de63be5a1734631e5",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-encrypted-repair/archive.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-encrypted-repair/archive.part1.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-encrypted-repair/archive.part2.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-encrypted-repair/archive.part3.rar",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-encrypted-repair/archive.vol00+1.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-encrypted-repair/archive.vol01+2.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-encrypted-repair/archive.vol03+4.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-encrypted-repair/archive.vol07+8.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-encrypted-repair/archive.vol15+9.par3",
+      "salted": true,
+      "size": 0,
+      "blake3": "",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-repair/archive.par3",
+      "size": 4695,
+      "blake3": "6f0300829870a95388a7b7931360d2b71d5c02c4dd0c3e7b5ac2ab6408c999a0",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-repair/archive.part1.rar",
+      "size": 4194304,
+      "blake3": "2462245ee5e92cd5f7ad65b6df8285a9abcbd6317e0cc75b33db77e487675e8b",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-repair/archive.part2.rar",
+      "size": 4194304,
+      "blake3": "54a455631dae095415b32334cac51b67ed99a60537b6087ac3091cc96140f035",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-repair/archive.part3.rar",
+      "size": 2107553,
+      "blake3": "d9f5a49e9e3af08950228b00754a70289ddb05051dbe55ac2715f967285b385b",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-repair/archive.vol00+1.par3",
+      "size": 70319,
+      "blake3": "1991b6882152a78e4a16d92cafee090956cd420d19c926854304a2a8885b84c3",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-repair/archive.vol01+2.par3",
+      "size": 140523,
+      "blake3": "0d36688e59e8123308fff778021aded840eadaa17d3822f85228f675f37a82b2",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-repair/archive.vol03+4.par3",
+      "size": 276351,
+      "blake3": "5e99f0b5b23df7feb6daf3103dafffbff5c37f6872883ae8f52b114cc165cb37",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-repair/archive.vol07+8.par3",
+      "size": 543427,
+      "blake3": "7b29ca945b9f7f133b526505b2b615ffd4e1ec78ea4be56116f274b48f335de5",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-repair/archive.vol15+9.par3",
+      "size": 609051,
+      "blake3": "1712730a4f0c88b035af0337a31ed037cb8de16eb1bdfe1a9f70e5263500a0cc",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.par3",
+      "size": 4695,
+      "blake3": "c40c70d8ce9f015440fe2476a84812ca5d439c8e35d63259ed69871de7c680dc",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.part1.rar",
+      "size": 4194304,
+      "blake3": "7a80c58d3bcfd68162f9cf67b2fca96cce5e64473ebfa06d31b87175ebb72ea1",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.part3.rar",
+      "size": 2107531,
+      "blake3": "097998761ee3ce6a058c254f699ba4be1650a81403ade07af952e6c7c5b9a272",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.vol00+01.par3",
+      "size": 70319,
+      "blake3": "bc1b041aa72e07a2e1902ef6befc2b677229a8c09c079d1d3a82cdb3a4861087",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.vol01+02.par3",
+      "size": 140523,
+      "blake3": "65b8bdfdfcb8fa58d89269bb5e7a85e7bfdd5cf9270dd2e28dfd14b2a9c03adb",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.vol03+04.par3",
+      "size": 276351,
+      "blake3": "803af696fe76fc1b5d0c05e92f04329f7140d142b6c09135161bc714080624f4",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.vol07+08.par3",
+      "size": 543427,
+      "blake3": "2d4274bf4523cb531d78bd8e78d95c022e577fda2896c707607613c39f1fc9bc",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.vol15+16.par3",
+      "size": 1072999,
+      "blake3": "a7ca6db07edaa42f263cf1ff00d2cd9425f5e79eb8799a00fccdfc970bf28991",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.vol31+32.par3",
+      "size": 2127563,
+      "blake3": "df3d0f8be0db63b64a172d0f829197187ff69e7650253a1dfa8135d7ebe9345a",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rar5-withheld-volume/archive.vol63+17.par3",
+      "size": 1138623,
+      "blake3": "d90c3164eafc9e89491eeead227afd6fe4bd39cc3b1c92aeaec14a1e42a0ab63",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-sliding-dedup/lumen.tract.s02e08.mkv",
+      "size": 4194427,
+      "blake3": "a5f6b3bfecd213c4a47e6e7ea67ba25f15b298f63c31318d93b6535a5a2934d0",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-sliding-dedup/lumen.tract.s02e08.par3",
+      "size": 1079,
+      "blake3": "73cc258c321bbcd88687f6338f97e5db4f12f6a5b0a676344d8907f3bc8ccdfd",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-sliding-dedup/lumen.tract.s02e08.vol0+1.par3",
+      "size": 33935,
+      "blake3": "d54dc7b6c615f8358f349c81632dd2f83274adcffc43ba88ced6ab1ab8787e3f",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-sliding-dedup/lumen.tract.s02e08.vol1+2.par3",
+      "size": 67751,
+      "blake3": "c4d6806259b533bd4e670eea2aa4121a1f38fb511a7aeccdf65e756befee9557",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-sliding-dedup/lumen.tract.s02e08.vol3+4.par3",
+      "size": 134423,
+      "blake3": "04e7f71a67b226d4f263fb3d484a7e6eeef436ee21a8d3fe612ce865b0707bfb",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-sliding-dedup/lumen.tract.s02e08.vol7+1.par3",
+      "size": 33935,
+      "blake3": "47cc143b4db865e973ef3de4995523c12db5397a219ec9e0de73153abe46fbad",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-split-7z-withheld-part/archive.7z.001",
+      "size": 78675,
+      "blake3": "0ffaf91d07a233259ed6960a39ee6d284c8127eba28d5fa374a5c527c9967196",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-split-7z-withheld-part/archive.7z.002",
+      "size": 78675,
+      "blake3": "56ec594cfbc5e586fb60a99e49ce43d0f0ff2c8956758d56edd0f079c38e0d42",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-split-7z-withheld-part/archive.7z.004",
+      "size": 78675,
+      "blake3": "e912a28cf61622a9d51e14053a8000fec80a0248ba27459f4dc5412de5896d6b",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-split-7z-withheld-part/archive.7z.005",
+      "size": 78674,
+      "blake3": "15faa41fa342777d57059ba5021529de709422f4d68d2b6d85468ec9fd50b219",
+      "format": "7z-part",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-split-7z-withheld-part/archive.7z.par3",
+      "size": 1895,
+      "blake3": "f1275bb6493f370f756e563d554310760fcd5432fe9bbe6cede1d63fdd63f628",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-split-7z-withheld-part/archive.7z.vol0+1.par3",
+      "size": 18367,
+      "blake3": "24f38b03747a5c279d3585c9da1fa08a3f7dc18f1aa36ddf26ca5110a5099406",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-split-7z-withheld-part/archive.7z.vol1+2.par3",
+      "size": 36619,
+      "blake3": "15ae20e84e6e82cbb759fbad658926068fdcbdc85915bdeb4d650e8f576bcc43",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-split-7z-withheld-part/archive.7z.vol3+4.par3",
+      "size": 71343,
+      "blake3": "28b7fd3edc12844a5c1dbe3640fcc28c7aee9a6660a856ed19a21aea2ef7e8af",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-split-7z-withheld-part/archive.7z.vol7+1.par3",
+      "size": 18367,
+      "blake3": "a2559fea6d52cb2db018c8d07f785984065b0d11e1696219622b8b27ba0e8f2d",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "ffmpeg-7.1-ubuntu2404",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.featurette.par3",
+      "size": 2824,
+      "blake3": "1f06326e21b54d37cf04e5bdd2e5536b2a18d9f1d27803720a50579c202fb9f8",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.featurette.vol0+1.par3",
+      "size": 35680,
+      "blake3": "85261297393db205e1055168e668ede4e784835c5cbace6a4480645dc10986f5",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.featurette.vol1+2.par3",
+      "size": 71245,
+      "blake3": "e8575e17169c1bc9525d2829339521a5293c81074e1b38d786af21240b25c60a",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.featurette.vol3+4.par3",
+      "size": 139666,
+      "blake3": "f1999a773c907beee612ca2c85d26c7f06fb381f5cf56cf500b3c3db1b5d6ac9",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.featurette.vol7+1.par3",
+      "size": 35680,
+      "blake3": "e06209b2b146fd17a23319ad63fe3a8561d5895f08a3d61a8ace161aaeb34c08",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.s01e01.featurette.mkv",
+      "size": 3145728,
+      "blake3": "de24b7d79ae4f89209c0237984172549f1726b41482b7f9e0d1d0113ca80eab9",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.s01e01.mkv",
+      "size": 6291456,
+      "blake3": "2b2e0d89d5f00f687e546530814cb43f0d704edc89b08a401fc3671742be6fa2",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.s01e01.par3",
+      "size": 2820,
+      "blake3": "5f157a38a82bb7b787be14157d42f066e5ff8cbcdfe09dc9a15c3b57f6e8e299",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.s01e01.vol0+1.par3",
+      "size": 68444,
+      "blake3": "9de69874a1d4680773547d480dd2daaa6024f2b31cfff95c11baabcaba79294a",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.s01e01.vol1+2.par3",
+      "size": 136773,
+      "blake3": "c5ffdd9b6a9dc78d21a8062243af06a107f699cec85ee16eb21b8b54e1b115d5",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.s01e01.vol3+4.par3",
+      "size": 270726,
+      "blake3": "f9188107ed54b57e0b96761e3d2f8e41d3155d2f1a1176c148a084751bdc6212",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-two-sets/onyx.terrace.s01e01.vol7+1.par3",
+      "size": 68444,
+      "blake3": "13a1ed7d2442fabc5295436e7ed1ee9b54e1bf0653426b66eeacc8269814730d",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-uneven-cohorts/saffron.relay.s01e04.mkv",
+      "size": 4227195,
+      "blake3": "83a6ca1aab142f25b286bdb5e146c8bb8d32c354c682b30cce3540d382641a5b",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-uneven-cohorts/saffron.relay.s01e04.par3",
+      "size": 3647,
+      "blake3": "d2f27a397e30fddd7608da5146ab4a2b762199f3695cc964643a49a15efcddae",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-uneven-cohorts/saffron.relay.s01e04.vol0+1.par3",
+      "size": 102215,
+      "blake3": "cd698144243037ab9ec91d1e53a3ee9cd2af078752a2eb29ddebb945bc9e774a",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-uneven-cohorts/saffron.relay.s01e04.vol1+2.par3",
+      "size": 204315,
+      "blake3": "0c37773e89387eb851fdb119986b40fb5dc4ea5d261a7c47e964019e94e6f8a9",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-uneven-cohorts/saffron.relay.s01e04.vol3+4.par3",
+      "size": 404983,
+      "blake3": "561eb2adc7a287904a119a2168533586de9f58e63d0b205516a0f15800a32027",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-uneven-cohorts/saffron.relay.s01e04.vol7+1.par3",
+      "size": 102215,
+      "blake3": "64230870b30ec09ce2a73b4e662c35333beb8d039d905267324f9583f5e42dba",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01.par3",
+      "size": 4233,
+      "blake3": "ee9ccf2a82a1889ce9d198e1efc26760c1bf8e134abc21b438e62b75bab684cb",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01.vol00+01.par3",
+      "size": 69857,
+      "blake3": "47358f1292042e759276aaeb1593a65435a01372ba0b3e3e8e7390fe2cb78f83",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01.vol01+02.par3",
+      "size": 139599,
+      "blake3": "38295d92e56e6173b3c1fcdb454ebd6a6f340ef5a62fc5bf78d63330a7e8df64",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01.vol03+04.par3",
+      "size": 274965,
+      "blake3": "762dc20f282b495a3d8063096625149796f4a2030596e24909057077c0eb5b7e",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01.vol07+08.par3",
+      "size": 541579,
+      "blake3": "a44c0c8d99efbc8da31b77838aa1289110ff4fabd1c12bebc048c0d38b8bf4ae",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01.vol15+16.par3",
+      "size": 1070689,
+      "blake3": "642c1a442a9fb835503ed7a8503ac542749bf05c6f80b1dda571827228115602",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01.vol31+32.par3",
+      "size": 2124791,
+      "blake3": "fd92a73eae6baffd1fbb07ae6fe6ffe48448fc6d54765270d7caaf01d1c24424",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01.vol63+01.par3",
+      "size": 69857,
+      "blake3": "1818ff322c328169f5f69c9f039625694d2531979635f48cca514c4bffcd9671",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01e01.mkv",
+      "size": 3145728,
+      "blake3": "e3355ae5a84a08b4cfbc40d86f16764b3a30e6519ea8bec21f6d38cb82fac559",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-withheld-file/birch.quarry.s01e03.mkv",
+      "size": 3145728,
+      "blake3": "8f619f407acf203a13a671c960f6d4d96af96dfd640100b49b8aa0f0771a0b7e",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-zip-repair/archive.par3",
+      "size": 2848,
+      "blake3": "bb2f5ab0b5e4296e031310ee3249eee0ececa8bdc7f2d35cca6e86ad532511e2",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-zip-repair/archive.vol0+1.par3",
+      "size": 68472,
+      "blake3": "ef539466ff1878b3afc932e6a4b93a7b34a791ae5f3dfc7c90f2508b5f1b3975",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-zip-repair/archive.vol1+2.par3",
+      "size": 136829,
+      "blake3": "fdb95d6db707dbc58e5d08e85c0f0c32df6f0114772e2df3a1fe0cfcf0d1325b",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-zip-repair/archive.vol3+4.par3",
+      "size": 270810,
+      "blake3": "efd65b31b9f961d79c8427146ed522d49c31d773ecbfe4a39a9eb2f06c83b80d",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-zip-repair/archive.vol7+1.par3",
+      "size": 68472,
+      "blake3": "fd23067faedd748367d9b5c09be74f7c04ada4214aa2f1ade52962f726ffe4d6",
+      "format": "par3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-zip-repair/archive.zip",
+      "size": 6291600,
+      "blake3": "73755d5c99fdc32e837d1a6a0e83017199410d58cc21ce0746fa5a8255a49326",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes",
+          "par3cmdline-2971702e"
         ]
       }
     },

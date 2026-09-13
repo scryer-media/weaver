@@ -1,0 +1,7 @@
+{
+  "slug": "par3-inside-zip-insufficient",
+  "title": "E2E.Test.PAR3.Inside.ZIP.Insufficient.Azure.Kiln.S01E04.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A self-protected ZIP at 10% redundancy with a mebibyte of member data zeroed, beyond what the inserted protection can restore. The job must fail instead of delivering damaged bytes.",
+  "category": "2000",
+  "expected_outcome": "repair_failure"
+}

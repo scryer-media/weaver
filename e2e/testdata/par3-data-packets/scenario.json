@@ -1,0 +1,13 @@
+{
+  "slug": "par3-data-packets",
+  "title": "E2E.Test.PAR3.Data.Packets.Tidal.Vesper.S01E06.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A set written with Data packets (`-D`), posted as its index and `.part` files only. Neither the payload nor any recovery volume is posted, so the payload must be rebuilt from the input the set carries.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "tidal.vesper.s01e06.mkv": "8f7e459af5bf18b6d0f23ec20692a532c60f3637c775ac4d7dbee0f5ad25b73d"
+  },
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

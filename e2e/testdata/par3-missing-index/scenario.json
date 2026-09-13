@@ -1,0 +1,16 @@
+{
+  "slug": "par3-missing-index",
+  "title": "E2E.Test.PAR3.Missing.Index.Marble.Causeway.S01E05.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A damaged payload posted with its PAR3 recovery volumes but no index file. The set must be read from the metadata each recovery volume repeats.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "marble.causeway.s01e05.mkv": "3bbad03f3fc27ce7351f07823b8cb501a675e778c66d352cd501277f71bcc97a"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}
