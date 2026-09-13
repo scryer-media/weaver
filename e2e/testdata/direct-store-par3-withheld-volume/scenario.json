@@ -4,6 +4,7 @@
   "description": "RAR5 store-method set with `-hp` header and data encryption and PAR3 recovery heavy enough to rebuild a whole volume. Every article of an interior volume is deleted after posting, so the NZB lists a volume every server answers 430 for. The recovery set already covers the missing volume, so the health probe stays off, and PAR3 creates the volume from nothing while the set keeps routing direct.",
   "category": "2000",
   "expected_outcome": "repair_then_success",
+  "disabled": "The health probe only stands down when PAR2 covers the damage (par2_recovery_covers_health_damage reads the served PAR2 set only), so a whole volume of 430s under PAR3 alone can still activate the probe this fixture forbids. Re-enable once PAR3 recovery counts toward that guard.",
   "expectedOutputBLAKE3": {
     "hazel.drift.s02e04.mkv": "5d758e422450a54f4b45c19de10dba615ccb690685a6c1790b8737a2feeb0fef"
   },

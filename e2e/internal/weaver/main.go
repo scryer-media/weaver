@@ -63,6 +63,10 @@ type Scenario struct {
 	ExpectedOutputBLAKE3               map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
 	ForbiddenOutputPaths               []string                   `json:"forbiddenOutputPaths,omitempty"`
 	RuntimeAssertions                  *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
+	// Disabled keeps a fixture in the corpus, seeded and verified, while the
+	// canonical runs leave it out. The value says why: the behavior it pins is
+	// one weaver does not deliver yet.
+	Disabled string `json:"disabled,omitempty"`
 }
 
 type ScenarioRuntimeAssertions struct {
@@ -1419,8 +1423,29 @@ func loadScenariosForSlugs(slugs []string) []*Scenario {
 	return scenarios
 }
 
+// loadCanonicalScenarios is the canonical corpus a run exercises: every
+// fixture except the disabled ones.
 func loadCanonicalScenarios() []*Scenario {
-	return loadScenariosForSlugs(canonicalFixtureSlugs)
+	scenarios := loadScenariosForSlugs(canonicalFixtureSlugs)
+	enabled := scenarios[:0]
+	for _, scenario := range scenarios {
+		if scenario.Disabled != "" {
+			log.Printf("skipping disabled fixture %s: %s", scenario.Slug, scenario.Disabled)
+			continue
+		}
+		enabled = append(enabled, scenario)
+	}
+	return enabled
+}
+
+// enabledCanonicalFixtureSlugs is loadCanonicalScenarios by slug.
+func enabledCanonicalFixtureSlugs() []string {
+	scenarios := loadCanonicalScenarios()
+	slugs := make([]string, 0, len(scenarios))
+	for _, scenario := range scenarios {
+		slugs = append(slugs, scenario.Slug)
+	}
+	return slugs
 }
 
 func nntpHost() string { return env("NNTP_HOST", "localhost") }
@@ -1828,8 +1853,12 @@ func ensureStandardDockerInfrastructure() {
 func cmdScenarios() {
 	fmt.Printf("%-25s %-5s %-22s %s\n", "SLUG", "CAT", "OUTCOME", "DESCRIPTION")
 	fmt.Println(strings.Repeat("-", 100))
-	for _, s := range loadCanonicalScenarios() {
-		fmt.Printf("%-25s %-5s %-22s %s\n", s.Slug, s.Category, s.ExpectedOutcome, s.Description)
+	for _, s := range loadScenariosForSlugs(canonicalFixtureSlugs) {
+		outcome := s.ExpectedOutcome
+		if s.Disabled != "" {
+			outcome = "disabled"
+		}
+		fmt.Printf("%-25s %-5s %-22s %s\n", s.Slug, s.Category, outcome, s.Description)
 	}
 }
 

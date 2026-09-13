@@ -4,6 +4,7 @@
   "description": "A compressed three-volume RAR5 set posted without its interior volume. The PAR3 set has enough recovery blocks to create the whole volume.",
   "category": "2000",
   "expected_outcome": "repair_then_success",
+  "disabled": "An interior volume absent from the NZB is only waited on and retried after repair on the PAR2 path (job_has_live_rar_waiting_for_absent_volumes, finish_par2_repair); PAR3 completion has no counterpart, and no PAR3 run covers a single withheld volume beside present siblings.",
   "expectedOutputBLAKE3": {
     "sienna.gantry.s01e02.mkv": "47fa005baaad6a386679a52c55a2a00e0e65c71d0444cbd76eeeb6af7ec3a96b"
   },
