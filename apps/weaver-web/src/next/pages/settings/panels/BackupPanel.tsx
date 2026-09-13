@@ -2,12 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery } from "urql";
 import { authHeaders } from "@/graphql/client";
 import { SETTINGS_QUERY } from "@/graphql/queries";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { saveResponseAsDownload } from "@/lib/download";
 import { KeyValueRow } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { DangerButton, SecondaryButton } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatDate } from "../../../data/format";
+import { countLabel } from "../../../i18n/labels";
 import { PathField } from "../../../features/DirectoryBrowserDialog";
 import {
   PanelControls,
@@ -68,22 +70,23 @@ function endpoint(path: string): string {
   return new URL(path, document.baseURI).href;
 }
 
-async function readJsonOrThrow(response: Response): Promise<unknown> {
+async function readJsonOrThrow(t: Translate, response: Response): Promise<unknown> {
   if (!response.ok) {
-    await throwJsonError(response);
+    await throwJsonError(t, response);
   }
   return response.json();
 }
 
-async function throwJsonError(response: Response): Promise<never> {
+async function throwJsonError(t: Translate, response: Response): Promise<never> {
+  const fallback = t("next.backup.requestFailed", { status: response.status });
   try {
     const payload = (await response.json()) as { error?: string };
-    throw new Error(payload.error || `Request failed with status ${response.status}`);
+    throw new Error(payload.error || fallback);
   } catch (error) {
     if (error instanceof Error) {
       throw error;
     }
-    throw new Error(`Request failed with status ${response.status}`, { cause: error });
+    throw new Error(fallback, { cause: error });
   }
 }
 
@@ -92,6 +95,7 @@ function message(error: unknown): string {
 }
 
 export function BackupPanel() {
+  const t = useTranslate();
   const [{ data, fetching }] = useQuery<{ settings: { dataDir: string } }>({ query: SETTINGS_QUERY });
   const currentDataDir = data?.settings?.dataDir ?? "";
 
@@ -121,7 +125,7 @@ export function BackupPanel() {
 
   const loadStatus = async () => {
     try {
-      setStatus((await readJsonOrThrow(await fetch(endpoint("api/backup/status"), {
+      setStatus((await readJsonOrThrow(t, await fetch(endpoint("api/backup/status"), {
         headers: authHeaders(),
       }))) as BackupStatus);
     } catch (failure) {
@@ -134,7 +138,7 @@ export function BackupPanel() {
     void loadStatus();
     // The status is read once when the panel opens; every action that can
     // change it reads it again itself.
-     
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- a language change must not re-read the status
   }, []);
 
   const mismatch = passwordConfirm !== "" && passwordConfirm !== password;
@@ -142,7 +146,7 @@ export function BackupPanel() {
   const download = async () => {
     setBusy(true);
     setError(null);
-    setNote("Building the archive…");
+    setNote(t("next.backup.building"));
     try {
       const response = await fetch(endpoint("api/backup/export"), {
         method: "POST",
@@ -150,10 +154,10 @@ export function BackupPanel() {
         body: JSON.stringify({ password: password.trim() ? password : null }),
       });
       if (!response.ok) {
-        await throwJsonError(response);
+        await throwJsonError(t, response);
       }
       const filename = await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
-      setNote(`Saved ${filename}`);
+      setNote(t("next.backup.savedFile", { name: filename }));
     } catch (failure) {
       setNote(null);
       setError(message(failure));
@@ -168,7 +172,7 @@ export function BackupPanel() {
     }
     setBusy(true);
     setError(null);
-    setNote("Reading the archive…");
+    setNote(t("next.backup.reading"));
     try {
       const form = new FormData();
       form.append("file", file);
@@ -179,6 +183,7 @@ export function BackupPanel() {
         form.append("data_dir", dataDir.trim());
       }
       const result = (await readJsonOrThrow(
+        t,
         await fetch(endpoint("api/backup/inspect"), {
           method: "POST",
           headers: authHeaders(),
@@ -191,8 +196,8 @@ export function BackupPanel() {
       );
       setNote(
         result.required_category_remaps.length > 0
-          ? "Archive read. Give the categories below a destination on this machine."
-          : "Archive read.",
+          ? t("next.backup.readNeedsRemaps")
+          : t("next.backup.readDone"),
       );
     } catch (failure) {
       setInspected(null);
@@ -210,7 +215,7 @@ export function BackupPanel() {
     setConfirmRestore(false);
     setBusy(true);
     setError(null);
-    setNote("Staging the restore…");
+    setNote(t("next.backup.staging"));
     try {
       const form = new FormData();
       form.append("file", file);
@@ -239,6 +244,7 @@ export function BackupPanel() {
         );
       }
       const report = (await readJsonOrThrow(
+        t,
         await fetch(endpoint("api/backup/restore"), {
           method: "POST",
           headers: authHeaders(),
@@ -247,8 +253,8 @@ export function BackupPanel() {
       )) as RestoreReport;
       setNote(
         report.restart_required
-          ? `Restore staged · ${report.history_jobs} downloads in history · restart weaver to apply it`
-          : `Restored ${report.history_jobs} downloads from history`,
+          ? countLabel(t, "next.backup.staged", report.history_jobs)
+          : countLabel(t, "next.backup.restored", report.history_jobs),
       );
       await loadStatus();
     } catch (failure) {
@@ -277,17 +283,19 @@ export function BackupPanel() {
     0,
   );
 
+  const baseDir = dataDir || currentDataDir || t("next.backup.theDataDirectory");
+
   const restoreFields: FieldSpec[] = [
     {
       id: "file",
-      label: "Archive",
-      help: "The .enc file a backup produced, from this machine or another one.",
+      label: t("next.backup.archive"),
+      help: t("next.backup.archiveHelp"),
       control: {
         kind: "custom",
         control: (
           <div className="flex min-w-0 flex-wrap items-center gap-3">
             <span className="max-w-[220px] truncate font-wv-mono text-[11.5px] text-wv-muted">
-              {file ? file.name : "no file chosen"}
+              {file ? file.name : t("next.backup.noFile")}
             </span>
             <input
               ref={fileRef}
@@ -301,15 +309,17 @@ export function BackupPanel() {
                 setNote(null);
               }}
             />
-            <SecondaryButton icon="chooseFile" onClick={() => fileRef.current?.click()}>Choose file</SecondaryButton>
+            <SecondaryButton icon="chooseFile" onClick={() => fileRef.current?.click()}>
+              {t("next.backup.chooseFile")}
+            </SecondaryButton>
           </div>
         ),
       },
     },
     {
       id: "restorePassword",
-      label: "Password",
-      help: "Whatever the archive was encrypted with.",
+      label: t("next.backup.password"),
+      help: t("next.backup.restorePasswordHelp"),
       control: {
         kind: "text",
         type: "password",
@@ -319,15 +329,15 @@ export function BackupPanel() {
     },
     {
       id: "dataDir",
-      label: "Data directory",
-      help: "Where the restored database and state are written on this machine.",
+      label: t("next.settings.dataDirectory"),
+      help: t("next.backup.dataDirHelp"),
       keywords: dataDir,
       control: { kind: "path", value: dataDir, onChange: setDataDir },
     },
     {
       id: "intermediateDir",
-      label: "Intermediate directory",
-      help: `Blank uses ${dataDir || currentDataDir || "the data directory"}/intermediate.`,
+      label: t("next.backup.intermediateDir"),
+      help: t("next.backup.blankUses", { path: `${baseDir}/intermediate` }),
       control: {
         kind: "path",
         value: intermediateDir,
@@ -337,8 +347,8 @@ export function BackupPanel() {
     },
     {
       id: "completeDir",
-      label: "Completed directory",
-      help: `Blank uses ${dataDir || currentDataDir || "the data directory"}/complete.`,
+      label: t("next.general.completeDir"),
+      help: t("next.backup.blankUses", { path: `${baseDir}/complete` }),
       control: {
         kind: "path",
         value: completeDir,
@@ -348,21 +358,21 @@ export function BackupPanel() {
     },
     {
       id: "inspect",
-      label: "Read the archive",
-      help: "Weaver checks the archive and reports what restoring it would do, before it does it.",
+      label: t("next.backup.readTheArchive"),
+      help: t("next.backup.readTheArchiveHelp"),
       control: {
         kind: "custom",
         control: (
           <div className="flex min-w-0 flex-wrap items-center gap-3">
             <span className="min-w-0 font-wv-mono text-[11.5px] text-wv-muted">
               {status === null
-                ? "checking…"
+                ? t("next.backup.checking")
                 : status.can_restore
-                  ? "restore available"
-                  : (status.reason ?? "restore unavailable")}
+                  ? t("next.backup.restoreAvailable")
+                  : (status.reason ?? t("next.backup.restoreUnavailable"))}
             </span>
             <SecondaryButton icon="inspectFile" disabled={!file || busy} onClick={() => void inspect()}>
-              Read archive
+              {t("next.backup.readArchive")}
             </SecondaryButton>
           </div>
         ),
@@ -370,8 +380,8 @@ export function BackupPanel() {
     },
     {
       id: "restore",
-      label: "Restore",
-      help: "Replaces this machine's settings, providers, categories and history with the archive's.",
+      label: t("next.backup.restore"),
+      help: t("next.backup.restoreHelp"),
       control: {
         kind: "custom",
         control: (
@@ -381,7 +391,7 @@ export function BackupPanel() {
             disabled={restoreBlocked}
             onClick={() => setConfirmRestore(true)}
           >
-            Restore from archive
+            {t("next.backup.restoreFromArchive")}
           </DangerButton>
         ),
       },
@@ -392,19 +402,19 @@ export function BackupPanel() {
     {
       kind: "section",
       id: "export",
-      title: "Backup",
-      note: "settings, providers, categories, schedules and history",
+      title: t("next.settings.panel.backup"),
+      note: t("next.backup.exportNote"),
       fields: [
         {
           id: "password",
-          label: "Password",
-          help: "The archive is encrypted with it. Weaver cannot recover it for you.",
+          label: t("next.backup.password"),
+          help: t("next.backup.passwordHelp"),
           control: { kind: "text", type: "password", value: password, onChange: setPassword },
         },
         {
           id: "passwordConfirm",
-          label: "Confirm password",
-          help: mismatch ? "The two passwords do not match." : undefined,
+          label: t("next.backup.confirmPassword"),
+          help: mismatch ? t("next.security.passwordsMismatch") : undefined,
           control: {
             kind: "text",
             type: "password",
@@ -418,18 +428,18 @@ export function BackupPanel() {
       ? {
           kind: "custom",
           id: "pending",
-          title: "Staged restore",
+          title: t("next.backup.stagedRestore"),
           note: status.pending_restore,
           searchText: "pending staged restore restart",
           body: (
             <div className="flex flex-col">
               <KeyValueRow
-                label="Waiting for a restart"
+                label={t("next.backup.waitingRestart")}
                 value={<span className="text-wv-warn">{status.pending_restore}</span>}
               />
               {status.pending_restore_error ? (
                 <KeyValueRow
-                  label="The last attempt failed"
+                  label={t("next.backup.lastAttemptFailed")}
                   value={
                     <span className="text-wv-error-text">{status.pending_restore_error}</span>
                   }
@@ -442,44 +452,47 @@ export function BackupPanel() {
     {
       kind: "section",
       id: "restore",
-      title: "Restore",
-      note: "applied on the daemon's next start",
+      title: t("next.backup.restore"),
+      note: t("next.backup.restoreNote"),
       fields: restoreFields,
     },
     manifest
       ? {
           kind: "custom",
           id: "manifest",
-          title: "What this archive holds",
-          note: inspected?.key_compatible ? undefined : "key not compatible",
+          title: t("next.backup.holds"),
+          note: inspected?.key_compatible ? undefined : t("next.backup.keyIncompatibleNote"),
           searchText: "manifest archive contents preview",
           body: (
             <div className="flex flex-col">
-              <KeyValueRow label="Taken" value={formatDate(manifest.created_at_epoch_ms)} />
-              <KeyValueRow label="Rows" value={exportedRows.toLocaleString()} />
-              <KeyValueRow label="Tables" value={manifest.included_tables.length} />
-              <KeyValueRow label="Schema" value={manifest.weaver_schema_version} />
-              <KeyValueRow label="Encrypted" value={manifest.encrypted ? "yes" : "no"} />
+              <KeyValueRow label={t("next.backup.taken")} value={formatDate(manifest.created_at_epoch_ms)} />
+              <KeyValueRow label={t("next.backup.rows")} value={exportedRows.toLocaleString()} />
+              <KeyValueRow label={t("next.backup.tables")} value={manifest.included_tables.length} />
+              <KeyValueRow label={t("next.backup.schema")} value={manifest.weaver_schema_version} />
+              <KeyValueRow
+                label={t("next.backup.encrypted")}
+                value={manifest.encrypted ? t("next.common.yes") : t("next.common.no")}
+              />
               {manifest.source_weaver_version ? (
-                <KeyValueRow label="Taken by" value={manifest.source_weaver_version} />
+                <KeyValueRow label={t("next.backup.takenBy")} value={manifest.source_weaver_version} />
               ) : null}
               {manifest.source_engine ? (
-                <KeyValueRow label="Source database" value={manifest.source_engine} />
+                <KeyValueRow label={t("next.backup.sourceDatabase")} value={manifest.source_engine} />
               ) : null}
               <KeyValueRow
-                label="Source data directory"
+                label={t("next.backup.sourceDataDir")}
                 value={
                   <span className="break-all">{manifest.source_paths.data_dir}</span>
                 }
               />
               <KeyValueRow
-                label="Source completed directory"
+                label={t("next.backup.sourceCompleteDir")}
                 value={
                   <span className="break-all">{manifest.source_paths.complete_dir}</span>
                 }
               />
               <KeyValueRow
-                label="Source intermediate directory"
+                label={t("next.backup.sourceIntermediateDir")}
                 value={
                   <span className="break-all">{manifest.source_paths.intermediate_dir}</span>
                 }
@@ -502,8 +515,7 @@ export function BackupPanel() {
               ))}
               {inspected && !inspected.key_compatible ? (
                 <div className="border-b border-wv-hairline px-4 sm:px-6 py-[11px] text-[12.5px] text-wv-error-text">
-                  This archive&apos;s encryption key cannot be promoted into the configured key
-                  store, so it cannot be restored here.
+                  {t("next.backup.keyIncompatible")}
                 </div>
               ) : null}
             </div>
@@ -514,10 +526,10 @@ export function BackupPanel() {
       ? {
           kind: "table",
           id: "remaps",
-          title: "Category destinations",
-          note: "these folders do not exist on this machine",
+          title: t("next.backup.categoryDestinations"),
+          note: t("next.backup.categoryDestinationsNote"),
           columns: "minmax(0, 1fr) minmax(0, 1.2fr) 280px",
-          headers: ["Category", "Was", "Now"],
+          headers: [t("next.categories.category"), t("next.backup.was"), t("next.backup.now")],
           rows: (inspected?.required_category_remaps ?? []).map((entry) => ({
             id: entry.category_name,
             searchText: `${entry.category_name} ${entry.current_dest_dir}`,
@@ -531,7 +543,7 @@ export function BackupPanel() {
               <PathField
                 key="now"
                 compact
-                label={`Destination for ${entry.category_name}`}
+                label={t("next.backup.destinationFor", { name: entry.category_name })}
                 value={remaps[entry.category_name] ?? ""}
                 className="w-full"
                 placeholder="/media/library"
@@ -553,7 +565,7 @@ export function BackupPanel() {
           disabled={busy || status?.busy || !password.trim() || mismatch}
           onClick={() => void download()}
         >
-          Download backup
+          {t("next.backup.download")}
         </SecondaryButton>
       </PanelControls>
 
@@ -561,11 +573,11 @@ export function BackupPanel() {
 
       <ConfirmDialog
         open={confirmRestore}
-        title="Restore from archive"
+        title={t("next.backup.restoreFromArchive")}
         note={file?.name}
         busy={busy}
-        confirmLabel="Stage restore"
-        body="Everything weaver knows — providers, categories, schedules, history — is replaced by the archive's. The restore is written aside and applied the next time the daemon starts."
+        confirmLabel={t("next.backup.stageRestore")}
+        body={t("next.backup.restoreBody")}
         onConfirm={() => void restore()}
         onDismiss={() => setConfirmRestore(false)}
       />

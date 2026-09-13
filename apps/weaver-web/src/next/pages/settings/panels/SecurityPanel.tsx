@@ -13,6 +13,7 @@ import {
   SET_ACCESS_POLICY_MUTATION,
   SET_HTTP_BIND_ADDRESS_MUTATION,
 } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Dialog } from "../../../components/Dialog";
@@ -69,16 +70,17 @@ interface ApiKey {
   lastUsedAt: number | null;
 }
 
+/** Labels are translation keys, resolved when the panel renders. */
 const ACCESS_MODES: { value: string; label: string }[] = [
-  { value: "login_required", label: "Login required for every browser" },
-  { value: "login_except_local", label: "Login required, except trusted networks" },
-  { value: "no_login", label: "No login (this machine only)" },
+  { value: "login_required", label: "next.security.mode.required" },
+  { value: "login_except_local", label: "next.security.mode.exceptTrusted" },
+  { value: "no_login", label: "next.security.mode.noLogin" },
 ];
 
 const KEY_SCOPES: { value: string; label: string }[] = [
-  { value: "READ", label: "Read only" },
-  { value: "CONTROL", label: "Control the queue" },
-  { value: "ADMIN", label: "Full administration" },
+  { value: "READ", label: "next.security.scope.read" },
+  { value: "CONTROL", label: "next.security.scope.control" },
+  { value: "ADMIN", label: "next.security.scope.admin" },
 ];
 
 function cleanMessage(message: string): string {
@@ -86,6 +88,7 @@ function cleanMessage(message: string): string {
 }
 
 export function SecurityPanel() {
+  const t = useTranslate();
   const [{ data: loginData, fetching: loginFetching }, refetchLogin] = useQuery<{ adminLoginStatus: LoginStatus }>({
     query: LOGIN_STATUS_QUERY,
     requestPolicy: "network-only",
@@ -176,8 +179,8 @@ export function SecurityPanel() {
           }
           messages.push(
             address.trim()
-              ? "Listen address saved — restart weaver to apply it"
-              : "Listen address cleared — weaver returns to this machine at its next restart",
+              ? t("next.security.listenSaved")
+              : t("next.security.listenCleared"),
           );
           void refetchBind({ requestPolicy: "network-only" });
         }
@@ -198,12 +201,12 @@ export function SecurityPanel() {
             setBusy(false);
             return;
           }
-          messages.push("Access policy applied");
+          messages.push(t("next.security.policyApplied"));
           void refetchPolicy({ requestPolicy: "network-only" });
         }
         setBusy(false);
         setDirty(false);
-        setStatus(messages.join(" · ") || "Saved");
+        setStatus(messages.join(" · ") || t("next.settings.saved"));
       })();
     },
   });
@@ -229,11 +232,11 @@ export function SecurityPanel() {
 
   const submitEnable = async () => {
     if (enableForm.password !== enableForm.confirm) {
-      setEnableError("The two passwords do not match.");
+      setEnableError(t("next.security.passwordsMismatch"));
       return;
     }
     if (!enableForm.username.trim() || !enableForm.password) {
-      setEnableError("A username and a password are both required.");
+      setEnableError(t("next.security.credentialsRequired"));
       return;
     }
     setBusy(true);
@@ -253,7 +256,7 @@ export function SecurityPanel() {
 
   const submitPassword = async () => {
     if (passwordForm.next !== passwordForm.confirm) {
-      setPasswordError("The two passwords do not match.");
+      setPasswordError(t("next.security.passwordsMismatch"));
       return;
     }
     setBusy(true);
@@ -272,14 +275,14 @@ export function SecurityPanel() {
 
   const submitKey = async () => {
     if (!keyForm.name.trim()) {
-      setKeyError("Name the key after whatever will use it.");
+      setKeyError(t("next.security.keyNameRequired"));
       return;
     }
     setBusy(true);
     const result = await createApiKey({ name: keyForm.name.trim(), scope: keyForm.scope });
     setBusy(false);
     if (result.error || !result.data?.createApiKey?.rawKey) {
-      setKeyError(result.error ? cleanMessage(result.error.message) : "The key could not be created.");
+      setKeyError(result.error ? cleanMessage(result.error.message) : t("next.security.keyCreateFailed"));
       return;
     }
     setKeyOpen(false);
@@ -294,33 +297,33 @@ export function SecurityPanel() {
   const accessFields: FieldSpec[] = [
     {
       id: "bindAddress",
-      label: "Listen address",
+      label: t("next.security.listenAddress"),
       help: bind?.editable
-        ? "Weaver answers on 127.0.0.1 by default, which only this machine can reach. Use 0.0.0.0 for every interface. Takes effect at the next restart."
-        : "Pinned by WEAVER_HTTP_BIND_ADDRESS in weaver's environment; change it in your deployment instead.",
+        ? t("next.security.listenHelp")
+        : t("next.security.listenPinnedHelp", { variable: "WEAVER_HTTP_BIND_ADDRESS" }),
       keywords: `${bind?.address ?? ""} bind interface host port`,
       control: bind?.editable
         ? {
             kind: "text",
             value: address,
-            placeholder: "127.0.0.1 (default)",
+            placeholder: t("next.security.listenPlaceholder", { address: "127.0.0.1" }),
             onChange: (next) => edit(() => setAddress(next)),
           }
         : { kind: "static", value: bind?.address ?? "—" },
     },
     {
       id: "accessMode",
-      label: "Browser access",
+      label: t("next.security.browserAccess"),
       help: policy?.envPinned
-        ? "Managed by WEAVER_TRUSTED_CIDRS in weaver's environment."
-        : "Who may use the web interface without signing in.",
+        ? t("next.security.accessPinnedHelp", { variable: "WEAVER_TRUSTED_CIDRS" })
+        : t("next.security.accessHelp"),
       keywords: "login policy trusted network cidr",
       control: policy?.envPinned
-        ? { kind: "static", value: policy.trustedNetworks.join(", ") || "none" }
+        ? { kind: "static", value: policy.trustedNetworks.join(", ") || t("next.job.none") }
         : {
             kind: "select",
             value: mode,
-            options: ACCESS_MODES,
+            options: ACCESS_MODES.map((option) => ({ ...option, label: t(option.label) })),
             className: "min-w-0 sm:min-w-[320px]",
             onChange: (next) => edit(() => setMode(next)),
           },
@@ -329,8 +332,8 @@ export function SecurityPanel() {
       ? [
           {
             id: "trustedNetworks",
-            label: "Trusted networks",
-            help: "One CIDR per line. Browsers inside these ranges skip the sign-in.",
+            label: t("next.security.trustedNetworks"),
+            help: t("next.security.trustedNetworksHelp"),
             keywords: "cidr subnet lan",
             control: {
               kind: "textarea" as const,
@@ -344,62 +347,79 @@ export function SecurityPanel() {
       : []),
   ];
 
+  const scopeLabel = (scope: string) => {
+    const entry = KEY_SCOPES.find((option) => option.value === scope);
+    return entry ? t(entry.label) : scope;
+  };
+
   const blocks: SettingsBlock[] = [
     {
       kind: "section",
       id: "sign-in",
-      title: "Sign-in",
-      note: login?.enabled ? `signed in as ${login.username ?? "admin"}` : "not configured",
+      title: t("next.security.signIn"),
+      note: login?.enabled
+        ? t("next.security.signedInAs", { name: login.username ?? "admin" })
+        : t("next.security.notConfigured"),
       fields: [
         {
           id: "loginEnabled",
-          label: "Require a login",
+          label: t("next.security.requireLogin"),
           help: login?.enabled
-            ? "Every browser must sign in before it can see anything."
-            : "Anyone who can reach weaver has full administrative access.",
+            ? t("next.security.requireLoginOnHelp")
+            : t("next.security.requireLoginOffHelp"),
           keywords: "password admin authentication",
           control: {
             kind: "custom",
             control: login?.enabled ? (
               <>
                 <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)}>
-                  Change password
+                  {t("next.security.changePassword")}
                 </SecondaryButton>
-                <SecondaryButton icon="unlock" onClick={() => setDisableOpen(true)}>Turn off</SecondaryButton>
+                <SecondaryButton icon="unlock" onClick={() => setDisableOpen(true)}>
+                  {t("next.security.turnOff")}
+                </SecondaryButton>
               </>
             ) : (
-              <PrimaryButton icon="lock" onClick={() => setEnableOpen(true)}>Set up a login</PrimaryButton>
+              <PrimaryButton icon="lock" onClick={() => setEnableOpen(true)}>
+                {t("next.security.setUpLogin")}
+              </PrimaryButton>
             ),
           },
         },
       ],
     },
-    { kind: "section", id: "access", title: "Network access", fields: accessFields },
+    { kind: "section", id: "access", title: t("next.security.networkAccess"), fields: accessFields },
     {
       kind: "table",
       id: "keys",
-      title: "API keys",
-      note: "shown once, at the moment they are created",
+      title: t("next.security.apiKeys"),
+      note: t("next.security.keysNote"),
       columns: "minmax(0, 1fr) 160px 150px 150px 92px",
-      headers: ["Name", "Scope", "Created", "Last used", ""],
-      empty: "No API keys. Sonarr, Radarr and the NZBGet facade each need one.",
-      emptyAction: { label: "Add API key", onClick: () => setKeyOpen(true) },
+      headers: [
+        t("next.security.name"),
+        t("next.security.scope"),
+        t("next.security.created"),
+        t("next.security.lastUsed"),
+        "",
+      ],
+      empty: t("next.security.keysEmpty"),
+      emptyAction: { label: t("next.security.addKey"), onClick: () => setKeyOpen(true) },
       rows: keys.map((key) => ({
         id: String(key.id),
-        searchText: `${key.name} ${key.scope}`,
+        searchText: `${key.name} ${key.scope} ${scopeLabel(key.scope)}`,
         cells: [
           <Cell key="name">{key.name}</Cell>,
           <Cell key="scope" mono className="text-wv-secondary">
-            {KEY_SCOPES.find((scope) => scope.value === key.scope)?.label ?? key.scope}
+            {scopeLabel(key.scope)}
           </Cell>,
           <Cell key="created" mono className="text-wv-muted">
             {formatDate(key.createdAt)}
           </Cell>,
           <Cell key="used" mono className="text-wv-muted">
-            {key.lastUsedAt ? formatDate(key.lastUsedAt) : "never"}
+            {key.lastUsedAt ? formatDate(key.lastUsedAt) : t("next.security.never")}
           </Cell>,
           <SecondaryButton icon="remove" key="revoke" className="h-7 px-2" onClick={() => setRemoveKey(key)}>
-            Revoke
+            {t("next.security.revoke")}
           </SecondaryButton>,
         ],
       })),
@@ -409,7 +429,7 @@ export function SecurityPanel() {
   return (
     <>
       <PanelControls>
-        <PrimaryButton icon="add" onClick={() => setKeyOpen(true)}>Add API key</PrimaryButton>
+        <PrimaryButton icon="add" onClick={() => setKeyOpen(true)}>{t("next.security.addKey")}</PrimaryButton>
       </PanelControls>
 
       {bind?.bindFallback ? (
@@ -421,8 +441,7 @@ export function SecurityPanel() {
       {bind?.exposedWithoutLogin && !login?.enabled ? (
         <div className="flex flex-none items-center gap-[9px] border-b border-wv-hairline bg-wv-cell-hover px-4 sm:px-6 py-3 text-[12.5px] text-wv-warn">
           <Square color={WV.warn} />
-          Weaver will be reachable beyond this machine after the next restart while no login is
-          configured.
+          {t("next.security.exposedWarning")}
         </div>
       ) : null}
 
@@ -438,21 +457,21 @@ export function SecurityPanel() {
 
       <RecordEditor
         open={enableOpen}
-        title="Set up a login"
-        note="applies immediately"
+        title={t("next.security.setUpLogin")}
+        note={t("next.security.appliesImmediately")}
         error={enableError}
         busy={busy}
-        saveLabel="Turn on login"
+        saveLabel={t("next.security.turnOnLogin")}
         onSave={() => void submitEnable()}
         onDismiss={() => setEnableOpen(false)}
         sections={[
           {
             id: "credentials",
-            title: "Administrator",
+            title: t("next.security.administrator"),
             fields: [
               {
                 id: "username",
-                label: "Username",
+                label: t("next.security.username"),
                 control: {
                   kind: "text",
                   mono: false,
@@ -463,7 +482,7 @@ export function SecurityPanel() {
               },
               {
                 id: "password",
-                label: "Password",
+                label: t("next.security.password"),
                 control: {
                   kind: "text",
                   type: "password",
@@ -474,7 +493,7 @@ export function SecurityPanel() {
               },
               {
                 id: "confirm",
-                label: "Repeat the password",
+                label: t("next.security.repeatPassword"),
                 control: {
                   kind: "text",
                   type: "password",
@@ -489,20 +508,20 @@ export function SecurityPanel() {
 
       <RecordEditor
         open={passwordOpen}
-        title="Change password"
+        title={t("next.security.changePassword")}
         error={passwordError}
         busy={busy}
-        saveLabel="Change password"
+        saveLabel={t("next.security.changePassword")}
         onSave={() => void submitPassword()}
         onDismiss={() => setPasswordOpen(false)}
         sections={[
           {
             id: "password",
-            title: "Password",
+            title: t("next.security.password"),
             fields: [
               {
                 id: "current",
-                label: "Current password",
+                label: t("next.security.currentPassword"),
                 control: {
                   kind: "text",
                   type: "password",
@@ -513,7 +532,7 @@ export function SecurityPanel() {
               },
               {
                 id: "next",
-                label: "New password",
+                label: t("next.security.newPassword"),
                 control: {
                   kind: "text",
                   type: "password",
@@ -523,7 +542,7 @@ export function SecurityPanel() {
               },
               {
                 id: "confirm",
-                label: "Repeat the new password",
+                label: t("next.security.repeatNewPassword"),
                 control: {
                   kind: "text",
                   type: "password",
@@ -539,22 +558,22 @@ export function SecurityPanel() {
 
       <RecordEditor
         open={keyOpen}
-        title="New API key"
-        note="you will only see it once"
+        title={t("next.security.newKey")}
+        note={t("next.security.newKeyNote")}
         error={keyError}
         busy={busy}
-        saveLabel="Create key"
+        saveLabel={t("next.security.createKey")}
         onSave={() => void submitKey()}
         onDismiss={() => setKeyOpen(false)}
         sections={[
           {
             id: "key",
-            title: "Key",
+            title: t("next.security.key"),
             fields: [
               {
                 id: "name",
-                label: "Name",
-                help: "Name it after whatever will use it — Sonarr, a script, a phone.",
+                label: t("next.security.name"),
+                help: t("next.security.keyNameHelp"),
                 control: {
                   kind: "text",
                   mono: false,
@@ -564,12 +583,12 @@ export function SecurityPanel() {
               },
               {
                 id: "scope",
-                label: "Scope",
-                help: "Read sees the queue; Control may add and remove work; Admin may change settings.",
+                label: t("next.security.scope"),
+                help: t("next.security.scopeHelp"),
                 control: {
                   kind: "select",
                   value: keyForm.scope,
-                  options: KEY_SCOPES,
+                  options: KEY_SCOPES.map((option) => ({ ...option, label: t(option.label) })),
                   onChange: (next) => setKeyForm((current) => ({ ...current, scope: next })),
                 },
               },
@@ -580,7 +599,7 @@ export function SecurityPanel() {
 
       <Dialog
         open={createdKey !== null}
-        title="API key created"
+        title={t("next.security.keyCreated")}
         note={createdKey?.name}
         width={560}
         onDismiss={() => setCreatedKey(null)}
@@ -593,18 +612,18 @@ export function SecurityPanel() {
                 }
               }}
             >
-              {copied ? "Copied" : "Copy key"}
+              {copied ? t("next.security.copied") : t("next.security.copyKey")}
             </SecondaryButton>
-            <PrimaryButton onClick={() => setCreatedKey(null)}>Done</PrimaryButton>
+            <PrimaryButton onClick={() => setCreatedKey(null)}>{t("next.security.done")}</PrimaryButton>
           </>
         }
       >
         <div className="flex flex-col gap-3 px-4 sm:px-6 py-5">
           <div className="text-[13px] leading-[1.55] text-wv-secondary">
-            Copy this now. Weaver stores only a hash of it, so it cannot be shown again.
+            {t("next.security.copyNow")}
           </div>
           <TextField
-            label="API key"
+            label={t("next.security.apiKey")}
             value={createdKey?.rawKey ?? ""}
             onChange={() => undefined}
             className="w-full"
@@ -614,10 +633,10 @@ export function SecurityPanel() {
 
       <ConfirmDialog
         open={disableOpen}
-        title="Turn off the login"
+        title={t("next.security.turnOffTitle")}
         busy={busy}
-        confirmLabel="Turn off login"
-        body="Anyone who can reach weaver will have full administrative access without signing in."
+        confirmLabel={t("next.security.turnOffLogin")}
+        body={t("next.security.turnOffBody")}
         onConfirm={() => {
           void disableLogin({}).then(() => {
             setDisableOpen(false);
@@ -629,11 +648,11 @@ export function SecurityPanel() {
 
       <ConfirmDialog
         open={removeKey !== null}
-        title="Revoke API key"
+        title={t("next.security.revokeTitle")}
         note={removeKey?.name}
         busy={busy}
-        confirmLabel="Revoke key"
-        body={`Anything still using ${removeKey?.name ?? "this key"} will stop working immediately.`}
+        confirmLabel={t("next.security.revokeKey")}
+        body={t("next.security.revokeBody", { name: removeKey?.name ?? t("next.security.thisKey") })}
         onConfirm={() => {
           if (removeKey) {
             void deleteApiKey({ id: removeKey.id }).then(() => {

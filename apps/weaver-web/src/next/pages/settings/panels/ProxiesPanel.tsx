@@ -7,6 +7,7 @@ import {
   SAVE_PROXY_MUTATION,
   TEST_PROXY_MUTATION,
 } from "@/graphql/proxies";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { proxyLabels, type ProxyKind, type ProxyProfile } from "@/lib/proxies";
 import { parseWireguardConfig, stripConfigAssignment } from "@/lib/wireguard-config";
 import { Square } from "../../../components/chrome";
@@ -149,25 +150,25 @@ function normalized(form: ProxyForm): ProxyForm {
   };
 }
 
-function wireguardProblem(form: ProxyForm, profile: ProxyProfile | null): string | null {
+function wireguardProblem(t: Translate, form: ProxyForm, profile: ProxyProfile | null): string | null {
   const privateKey = form.secrets.privateKey ?? "";
   if (!privateKey && !profile?.hasPrivateKey) {
-    return "WireGuard needs a private key.";
+    return t("next.proxies.needsPrivateKey");
   }
   const keys: [string, string][] = [
-    ["The private key", privateKey],
-    ["The peer public key", form.peerPublicKey],
-    ["The preshared key", form.secrets.presharedKey ?? ""],
+    ["next.proxies.malformedPrivateKey", privateKey],
+    ["next.proxies.malformedPeerKey", form.peerPublicKey],
+    ["next.proxies.malformedPresharedKey", form.secrets.presharedKey ?? ""],
   ];
   const malformed = keys.find(([, key]) => key && !WIREGUARD_KEY.test(key));
   if (malformed) {
-    return `${malformed[0]} does not look like a WireGuard key: 32 bytes of base64, exactly as wg genkey prints them.`;
+    return t(malformed[0]);
   }
   if (!form.peerPublicKey) {
-    return "WireGuard needs the peer's public key.";
+    return t("next.proxies.needsPeerKey");
   }
   if (splitList(form.addresses).length === 0) {
-    return "WireGuard needs at least one interface address, for example 10.6.0.2/32.";
+    return t("next.proxies.needsAddress");
   }
   return null;
 }
@@ -190,6 +191,7 @@ function proxyInput(form: ProxyForm) {
 }
 
 export function ProxiesPanel() {
+  const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
     query: PROXY_PROFILES_QUERY,
   });
@@ -242,12 +244,12 @@ export function ProxiesPanel() {
    */
   const applyConfig = () => {
     if (configText.length > 65536) {
-      setError("That configuration is larger than 64 KiB.");
+      setError(t("next.proxies.configTooLarge"));
       return;
     }
     const parsed = parseWireguardConfig(configText);
     if (!parsed) {
-      setError("That does not look like a WireGuard configuration.");
+      setError(t("next.proxies.configNotWireguard"));
       return;
     }
     const endpoint = parsed.endpoint ? splitEndpoint(parsed.endpoint) : null;
@@ -271,10 +273,10 @@ export function ProxiesPanel() {
     }));
     setNote(
       [
-        "Filled the form from the configuration.",
-        ...(parsed.peerCount > 1 ? [`It names ${parsed.peerCount} peers; only the first was read.`] : []),
+        t("next.proxies.configFilled"),
+        ...(parsed.peerCount > 1 ? [t("next.proxies.configPeers", { count: parsed.peerCount })] : []),
         ...(parsed.ignored.length
-          ? [`Ignored ${parsed.ignored.join(", ")}, which a tunnel proxy does not use.`]
+          ? [t("next.proxies.configIgnored", { fields: parsed.ignored.join(", ") })]
           : []),
       ].join(" "),
     );
@@ -284,15 +286,15 @@ export function ProxiesPanel() {
   const save = async () => {
     const clean = normalized(form);
     if (!clean.name.trim()) {
-      setError("A proxy needs a name.");
+      setError(t("next.proxies.nameRequired"));
       return;
     }
     if (!clean.host.trim()) {
-      setError("A proxy needs a host.");
+      setError(t("next.proxies.hostRequired"));
       return;
     }
     if (clean.kind === "WIRE_GUARD") {
-      const problem = wireguardProblem(clean, editing);
+      const problem = wireguardProblem(t, clean, editing);
       if (problem) {
         setError(problem);
         return;
@@ -313,13 +315,13 @@ export function ProxiesPanel() {
   };
 
   const runTest = async (profile: ProxyProfile) => {
-    setHealth((current) => ({ ...current, [profile.id]: "testing…" }));
+    setHealth((current) => ({ ...current, [profile.id]: t("next.proxies.testing") }));
     const result = await testProxy({ id: profile.id });
     const outcome = result.data?.testProxyProfile;
     setHealth((current) => ({
       ...current,
-      [profile.id]: outcome ? (outcome.message || (outcome.success ? "reachable" : "failed"))
-        : (result.error?.message ?? "failed"),
+      [profile.id]: outcome ? (outcome.message || (outcome.success ? t("next.proxies.reachable") : t("next.proxies.failed")))
+        : (result.error?.message ?? t("next.proxies.failed")),
     }));
   };
 
@@ -328,7 +330,7 @@ export function ProxiesPanel() {
   const connectionFields: FieldSpec[] = [
     {
       id: "name",
-      label: "Name",
+      label: t("next.proxies.name"),
       control: {
         kind: "text",
         mono: false,
@@ -338,7 +340,7 @@ export function ProxiesPanel() {
     },
     {
       id: "kind",
-      label: "Type",
+      label: t("next.proxies.type"),
       control: {
         kind: "select",
         value: form.kind,
@@ -349,13 +351,13 @@ export function ProxiesPanel() {
     },
     {
       id: "host",
-      label: isWireguard ? "Endpoint" : "Host",
-      help: isWireguard ? "A pasted `Endpoint = host:port` line works here too." : undefined,
+      label: isWireguard ? t("next.proxies.endpoint") : t("next.proxies.host"),
+      help: isWireguard ? t("next.proxies.endpointHelp") : undefined,
       control: { kind: "text", value: form.host, onChange: (next) => patch({ host: next }) },
     },
     {
       id: "port",
-      label: "Port",
+      label: t("next.proxies.port"),
       control: {
         kind: "number",
         value: form.port,
@@ -366,20 +368,20 @@ export function ProxiesPanel() {
     },
     {
       id: "timeoutSeconds",
-      label: "Timeout",
+      label: t("next.proxies.timeout"),
       control: {
         kind: "number",
         value: form.timeoutSeconds,
         min: 1,
         max: 600,
         onChange: (next) => patch({ timeoutSeconds: next }),
-        suffix: "seconds",
+        suffix: t("next.general.seconds"),
       },
     },
     {
       id: "enabled",
-      label: "Enabled",
-      help: "A disabled proxy keeps its configuration but is skipped when routing.",
+      label: t("next.proxies.enabled"),
+      help: t("next.proxies.enabledHelp"),
       control: { kind: "toggle", value: form.enabled, onChange: (next) => patch({ enabled: next }) },
     },
   ];
@@ -388,8 +390,8 @@ export function ProxiesPanel() {
     ? [
         {
           id: "privateKey",
-          label: "Private key",
-          help: editing?.hasPrivateKey ? "Stored. Leave blank to keep it." : undefined,
+          label: t("next.proxies.privateKey"),
+          help: editing?.hasPrivateKey ? t("next.proxies.storedKeep") : undefined,
           control: {
             kind: "text",
             type: "password",
@@ -400,7 +402,7 @@ export function ProxiesPanel() {
         },
         {
           id: "peerPublicKey",
-          label: "Peer public key",
+          label: t("next.proxies.peerPublicKey"),
           control: {
             kind: "text",
             value: form.peerPublicKey,
@@ -409,8 +411,8 @@ export function ProxiesPanel() {
         },
         {
           id: "presharedKey",
-          label: "Preshared key",
-          help: editing?.hasPresharedKey ? "Stored. Leave blank to keep it." : "Optional.",
+          label: t("next.proxies.presharedKey"),
+          help: editing?.hasPresharedKey ? t("next.proxies.storedKeep") : t("next.proxies.optional"),
           control: {
             kind: "text",
             type: "password",
@@ -421,8 +423,8 @@ export function ProxiesPanel() {
         },
         {
           id: "addresses",
-          label: "Interface addresses",
-          help: "One per line, for example 10.6.0.2/32.",
+          label: t("next.proxies.addresses"),
+          help: t("next.proxies.addressesHelp"),
           control: {
             kind: "textarea",
             value: form.addresses,
@@ -432,8 +434,8 @@ export function ProxiesPanel() {
         },
         {
           id: "dns",
-          label: "DNS servers",
-          help: "One per line. Optional.",
+          label: t("next.proxies.dns"),
+          help: t("next.proxies.dnsHelp"),
           control: {
             kind: "textarea",
             value: form.dns,
@@ -444,7 +446,7 @@ export function ProxiesPanel() {
         {
           id: "mtu",
           label: "MTU",
-          help: `Blank uses ${MTU_DEFAULT}.`,
+          help: t("next.proxies.mtuHelp", { value: MTU_DEFAULT }),
           control: {
             kind: "text",
             value: form.mtu,
@@ -454,8 +456,8 @@ export function ProxiesPanel() {
         },
         {
           id: "keepaliveSeconds",
-          label: "Keepalive",
-          help: `Blank uses ${KEEPALIVE_DEFAULT} seconds; 0 switches it off.`,
+          label: t("next.proxies.keepalive"),
+          help: t("next.proxies.keepaliveHelp", { seconds: KEEPALIVE_DEFAULT }),
           control: {
             kind: "text",
             value: form.keepaliveSeconds,
@@ -467,8 +469,8 @@ export function ProxiesPanel() {
     : [
         {
           id: "username",
-          label: "Username",
-          help: editing?.hasUsername ? "Stored. Leave blank to keep it." : "Optional.",
+          label: t("next.proxies.username"),
+          help: editing?.hasUsername ? t("next.proxies.storedKeep") : t("next.proxies.optional"),
           control: {
             kind: "text",
             value: form.secrets.username ?? "",
@@ -478,8 +480,8 @@ export function ProxiesPanel() {
         },
         {
           id: "password",
-          label: "Password",
-          help: editing?.hasPassword ? "Stored. Leave blank to keep it." : "Optional.",
+          label: t("next.proxies.password"),
+          help: editing?.hasPassword ? t("next.proxies.storedKeep") : t("next.proxies.optional"),
           control: {
             kind: "text",
             type: "password",
@@ -492,8 +494,8 @@ export function ProxiesPanel() {
           ? [
               {
                 id: "privateKey",
-                label: "Private key",
-                help: editing?.hasPrivateKey ? "Stored. Leave blank to keep it." : "OpenSSH format.",
+                label: t("next.proxies.privateKey"),
+                help: editing?.hasPrivateKey ? t("next.proxies.storedKeep") : t("next.proxies.sshKeyHelp"),
                 control: {
                   kind: "textarea" as const,
                   value: form.secrets.privateKey ?? "",
@@ -503,8 +505,8 @@ export function ProxiesPanel() {
               },
               {
                 id: "passphrase",
-                label: "Key passphrase",
-                help: editing?.hasPassphrase ? "Stored. Leave blank to keep it." : "Optional.",
+                label: t("next.proxies.passphrase"),
+                help: editing?.hasPassphrase ? t("next.proxies.storedKeep") : t("next.proxies.optional"),
                 control: {
                   kind: "text" as const,
                   type: "password" as const,
@@ -518,11 +520,11 @@ export function ProxiesPanel() {
       ];
 
   const sections: EditorSection[] = [
-    { id: "connection", title: "Connection", fields: connectionFields },
+    { id: "connection", title: t("next.proxies.connection"), fields: connectionFields },
     {
       id: "credentials",
-      title: isWireguard ? "Tunnel" : "Credentials",
-      note: "secrets are stored write-only",
+      title: isWireguard ? t("next.proxies.tunnel") : t("next.proxies.credentials"),
+      note: t("next.proxies.secretsNote"),
       fields: credentialFields,
     },
   ];
@@ -531,12 +533,18 @@ export function ProxiesPanel() {
     {
       kind: "table",
       id: "proxies",
-      title: "Proxies",
-      note: "assigned to providers and feeds on their own panels",
+      title: t("next.settings.panel.proxies"),
+      note: t("next.proxies.tableNote"),
       columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 82px",
-      headers: ["Name", "Type", "Endpoint", "Last test", ""],
-      empty: "No proxies. Providers connect directly.",
-      emptyAction: { label: "Add proxy", onClick: () => open(null) },
+      headers: [
+        t("next.proxies.name"),
+        t("next.proxies.type"),
+        t("next.proxies.endpoint"),
+        t("next.proxies.lastTest"),
+        "",
+      ],
+      empty: t("next.proxies.empty"),
+      emptyAction: { label: t("next.proxies.add"), onClick: () => open(null) },
       onRowClick: (id) => {
         const profile = profiles.find((entry) => String(entry.id) === id);
         if (profile) {
@@ -562,7 +570,7 @@ export function ProxiesPanel() {
           </Cell>,
           <span key="test" onClick={(event) => event.stopPropagation()}>
             <SecondaryButton icon="test" className="h-7 px-2" onClick={() => void runTest(profile)}>
-              Test
+              {t("next.proxies.test")}
             </SecondaryButton>
           </span>,
         ],
@@ -573,15 +581,15 @@ export function ProxiesPanel() {
   return (
     <>
       <PanelControls>
-        <PrimaryButton icon="add" onClick={() => open(null)}>Add proxy</PrimaryButton>
+        <PrimaryButton icon="add" onClick={() => open(null)}>{t("next.proxies.add")}</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
         open={editingId !== null}
-        title={editingId === "new" ? "Add proxy" : (editing?.name ?? "Proxy")}
-        note={editingId === "new" ? "new profile" : proxyLabels[form.kind]}
+        title={editingId === "new" ? t("next.proxies.add") : (editing?.name ?? t("next.proxies.proxy"))}
+        note={editingId === "new" ? t("next.proxies.newNote") : proxyLabels[form.kind]}
         width={620}
         sections={sections}
         error={error}
@@ -589,20 +597,22 @@ export function ProxiesPanel() {
         onSave={() => void save()}
         onDismiss={() => setEditingId(null)}
         onDelete={editing ? () => setConfirmRemove(editing) : undefined}
-        deleteLabel="Remove proxy"
+        deleteLabel={t("next.proxies.remove")}
         extraActions={
           editing?.hostKeyFingerprint ? (
-            <SecondaryButton icon="forget" onClick={() => setConfirmTrust(editing)}>Forget host key</SecondaryButton>
+            <SecondaryButton icon="forget" onClick={() => setConfirmTrust(editing)}>
+              {t("next.proxies.forgetHostKey")}
+            </SecondaryButton>
           ) : null
         }
       >
         {isWireguard ? (
           <div className="flex flex-none flex-col gap-2 border-t border-wv-hairline px-4 sm:px-6 py-4">
             <div className="text-[12.5px] text-wv-muted">
-              Paste a WireGuard configuration to fill this in.
+              {t("next.proxies.pasteNote")}
             </div>
             <TextArea
-              label="WireGuard configuration"
+              label={t("next.proxies.configLabel")}
               value={configText}
               rows={4}
               className="w-full"
@@ -614,7 +624,7 @@ export function ProxiesPanel() {
                 <div className="min-w-0 flex-1 text-[12px] leading-[1.45] text-wv-muted">{note}</div>
               )}
               <SecondaryButton icon="inspectFile" onClick={applyConfig} disabled={!configText.trim()}>
-                Read configuration
+                {t("next.proxies.readConfig")}
               </SecondaryButton>
             </div>
           </div>
@@ -623,11 +633,11 @@ export function ProxiesPanel() {
 
       <ConfirmDialog
         open={confirmRemove !== null}
-        title="Remove proxy"
+        title={t("next.proxies.remove")}
         note={confirmRemove?.name}
         busy={busy}
-        confirmLabel="Remove proxy"
-        body="Anything routed through this proxy falls back to its next route, or to a direct connection when one is allowed."
+        confirmLabel={t("next.proxies.remove")}
+        body={t("next.proxies.removeBody")}
         onConfirm={() => {
           if (confirmRemove) {
             void deleteProxy({ id: confirmRemove.id }).then(() => {
@@ -642,11 +652,11 @@ export function ProxiesPanel() {
 
       <ConfirmDialog
         open={confirmTrust !== null}
-        title="Forget host key"
+        title={t("next.proxies.forgetHostKey")}
         note={confirmTrust?.name}
         busy={busy}
-        confirmLabel="Forget key"
-        body="The next connection will trust whatever key the host presents. Only do this when you know the host was rebuilt."
+        confirmLabel={t("next.proxies.forgetKey")}
+        body={t("next.proxies.forgetBody")}
         onConfirm={() => {
           if (confirmTrust) {
             void resetTrust({ id: confirmTrust.id }).then(() => {
