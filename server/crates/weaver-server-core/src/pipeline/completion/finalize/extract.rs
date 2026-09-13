@@ -586,6 +586,77 @@ fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -
     }
 }
 
+/// How often a chase that is still finishing after the download is mirrored
+/// into the job's Extracting phase.
+const CHASE_MIRROR_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The chase's bytes as the job's Extracting phase currently shows them.
+///
+/// A chase decodes against counters of its own so the download never shows an
+/// extraction running underneath it. Once every part is in, though, a chase
+/// that is still finishing is the extraction — so its progress is mirrored into
+/// the phase while it is awaited, and withdrawn again unless its members are
+/// installed, leaving a conventional fallback to count from where it would
+/// have started.
+struct ChaseMirror {
+    phase: Arc<PhaseCounters>,
+    total_bytes: u64,
+    completed_bytes: u64,
+    settled: bool,
+}
+
+impl ChaseMirror {
+    fn new(phase: Arc<PhaseCounters>) -> Self {
+        Self {
+            phase,
+            total_bytes: 0,
+            completed_bytes: 0,
+            settled: false,
+        }
+    }
+
+    /// Bring the phase to the chase's current bytes. Completed is read before
+    /// total: the chase reserves a member's total before decoding into it, so
+    /// the mirror never shows more done than there is to do.
+    fn sync(&mut self, chase: &PhaseCounters) {
+        let completed_bytes = chase.completed_bytes.load(Ordering::Relaxed);
+        let total_bytes = chase.total_bytes.load(Ordering::Relaxed);
+        self.show(total_bytes, completed_bytes);
+    }
+
+    fn show(&mut self, total_bytes: u64, completed_bytes: u64) {
+        shift_mirrored(&self.phase.total_bytes, &mut self.total_bytes, total_bytes);
+        shift_mirrored(
+            &self.phase.completed_bytes,
+            &mut self.completed_bytes,
+            completed_bytes,
+        );
+    }
+
+    /// The members were installed: keep their bytes in the phase for good.
+    fn settle(mut self, total_bytes: u64, completed_bytes: u64) {
+        self.show(total_bytes, completed_bytes);
+        self.settled = true;
+    }
+}
+
+impl Drop for ChaseMirror {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.show(0, 0);
+        }
+    }
+}
+
+fn shift_mirrored(phase: &std::sync::atomic::AtomicU64, mirrored: &mut u64, current: u64) {
+    if current > *mirrored {
+        phase.fetch_add(current - *mirrored, Ordering::Relaxed);
+    } else if current < *mirrored {
+        phase.fetch_sub(*mirrored - current, Ordering::Relaxed);
+    }
+    *mirrored = current;
+}
+
 pub(in crate::pipeline) async fn install_direct_unpack(
     disposition: crate::pipeline::direct_unpack::wiring::ChaseDisposition,
     staging_for_install: PathBuf,
@@ -595,6 +666,7 @@ pub(in crate::pipeline) async fn install_direct_unpack(
     policy: Option<&crate::post_processing::model::PostProcessingSettings>,
     expected_names: Option<&HashSet<String>>,
 ) -> Option<FullSetExtractionOutcome> {
+    let mut mirror = ChaseMirror::new(phase_counters_for_install);
     // Resolve the chase first: if it produced usable members there is
     // no reason to decode the archive a second time.
     let chase = match disposition {
@@ -621,9 +693,14 @@ pub(in crate::pipeline) async fn install_direct_unpack(
             );
             tokio::pin!(deadline);
             let mut handle = pending.handle;
-            let joined = tokio::select! {
-                joined = &mut handle => Some(joined),
-                _ = &mut deadline => None,
+            let mut mirror_tick = tokio::time::interval(CHASE_MIRROR_INTERVAL);
+            mirror_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let joined = loop {
+                tokio::select! {
+                    joined = &mut handle => break Some(joined),
+                    _ = &mut deadline => break None,
+                    _ = mirror_tick.tick() => mirror.sync(&pending.counters),
+                }
             };
             match joined {
                 // The deadline won. End the chase's coverage so a worker
@@ -723,15 +800,10 @@ pub(in crate::pipeline) async fn install_direct_unpack(
 
         match install {
             Ok(Ok(())) => {
-                // The decode already happened; the phase never saw it.
-                // Attribute it once, here, so the Extracting bar
+                // The decode already happened, most or all of it before the
+                // phase could see it. Settle it here, so the Extracting bar
                 // reports real bytes instead of a zero-byte lie.
-                phase_counters_for_install
-                    .total_bytes
-                    .fetch_add(total_bytes, Ordering::Relaxed);
-                phase_counters_for_install
-                    .completed_bytes
-                    .fetch_add(completed_bytes, Ordering::Relaxed);
+                mirror.settle(total_bytes, completed_bytes);
                 tracing::info!(
                     job_id = job_id.0,
                     set_name = %set_name_for_channel,

@@ -102,8 +102,23 @@ pub(crate) fn build_job_timeline(
         _ => Vec::new(),
     };
 
-    let (extraction_groups, extracting_spans) =
+    let (extraction_groups, member_extracting_spans) =
         build_extraction_groups(events, outcome, ended_at, now);
+    let extracting_spans = merge_extracting_spans(
+        member_extracting_spans,
+        close_open_job_spans(
+            collect_job_spans(
+                events,
+                EventKind::ExtractionReady,
+                EventKind::ExtractionComplete,
+                extraction_stage_boundary_state,
+            ),
+            ended_at,
+            outcome,
+            now,
+        ),
+        now,
+    );
 
     let mut lanes = Vec::new();
     push_lane(&mut lanes, TimelineStage::PendingDownload, pending_spans);
@@ -755,6 +770,38 @@ fn build_extraction_groups(
 
     let extracting_spans = merge_ranges(aggregate_ranges);
     (extraction_groups, extracting_spans)
+}
+
+/// The job's own Extracting status is extraction even when no member reports
+/// it — an unpack that ran alongside the download and is only finishing now
+/// has nothing to announce per member — so the lane is the union of member
+/// activity and the time the job spent in that status.
+fn merge_extracting_spans(
+    member_spans: Vec<JobTimelineSpan>,
+    stage_spans: Vec<JobTimelineSpan>,
+    now: f64,
+) -> Vec<JobTimelineSpan> {
+    merge_ranges(
+        member_spans
+            .into_iter()
+            .chain(stage_spans)
+            .map(|span| (span.started_at, span.ended_at.unwrap_or(now), span.state))
+            .collect(),
+    )
+}
+
+fn extraction_stage_boundary_state(kind: EventKind) -> Option<TimelineSpanState> {
+    match kind {
+        EventKind::ExtractionFailed | EventKind::JobFailed | EventKind::JobCancelled => {
+            Some(TimelineSpanState::Failed)
+        }
+        EventKind::DownloadStarted
+        | EventKind::RepairStarted
+        | EventKind::MoveToCompleteStarted
+        | EventKind::JobCreated
+        | EventKind::JobCompleted => Some(TimelineSpanState::Complete),
+        _ => None,
+    }
 }
 
 fn extraction_boundary_state(kind: EventKind) -> Option<TimelineSpanState> {

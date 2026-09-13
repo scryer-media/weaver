@@ -26,6 +26,25 @@ pub(crate) struct RarChaseContext<'a> {
     pub policy: &'a crate::post_processing::model::PostProcessingSettings,
 }
 
+struct ChaseProgressWriter<'a, W> {
+    inner: W,
+    counters: &'a PhaseCounters,
+}
+
+impl<W: Write> Write for ChaseProgressWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.counters
+            .completed_bytes
+            .fetch_add(written as u64, Ordering::Relaxed);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub(crate) fn extract(
     context: RarChaseContext<'_>,
     should_extract: impl Fn(&str) -> Result<bool, String>,
@@ -120,15 +139,30 @@ pub(crate) fn extract(
                     root.create_dir(&relative, budget)?;
                     directories.push((info, output_dir.join(&relative)));
                 } else {
-                    let mut file = root.create_file(&relative, budget)?;
+                    // Count as the member decodes, against a total reserved from
+                    // its header, so a chase still finishing after the download
+                    // reports movement inside a single large member.
+                    let reserved_total = info.unpacked_size.unwrap_or(0);
+                    counters
+                        .total_bytes
+                        .fetch_add(reserved_total, Ordering::Relaxed);
+                    let mut file = ChaseProgressWriter {
+                        inner: root.create_file(&relative, budget)?,
+                        counters,
+                    };
                     let written = rar_entry_via(&mut archive, index, provider, &options)
                         .and_then(|entry| entry.copy_to(&mut file))
                         .map_err(|error| error.to_string())?;
                     file.flush().map_err(|error| error.to_string())?;
-                    counters.total_bytes.fetch_add(written, Ordering::Relaxed);
-                    counters
-                        .completed_bytes
-                        .fetch_add(written, Ordering::Relaxed);
+                    if written > reserved_total {
+                        counters
+                            .total_bytes
+                            .fetch_add(written - reserved_total, Ordering::Relaxed);
+                    } else {
+                        counters
+                            .total_bytes
+                            .fetch_sub(reserved_total - written, Ordering::Relaxed);
+                    }
                     apply_rar_member_filesystem_metadata(&info, &output_dir.join(&relative))?;
                 }
                 extracted.push(name);

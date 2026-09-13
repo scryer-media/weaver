@@ -229,6 +229,9 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
     } else {
         assert_eq!(chased, expected.keys().cloned().collect());
     }
+    let chased_bytes: u64 = chased.iter().map(|name| expected[name].len() as u64).sum();
+    assert_eq!(outcome.total_bytes, chased_bytes);
+    assert_eq!(outcome.completed_bytes, chased_bytes);
     assert_eq!(
         std::fs::read(outcome.staging_dir.join("zeros_64k.bin")).unwrap(),
         expected["zeros_64k.bin"]

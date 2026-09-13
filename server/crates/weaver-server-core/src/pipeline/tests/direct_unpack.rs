@@ -2738,6 +2738,27 @@ async fn consumption_gives_up_on_a_chase_that_never_finishes() {
     let outcome = result.expect("conventional extraction must finish after the deadline");
     assert_eq!(outcome.extracted.len(), 1);
 
+    // Whatever the parked chase showed in the Extracting phase while it was
+    // awaited is taken back out when it is given up on, so the phase holds the
+    // fallback's bytes and nothing twice.
+    let installed_len = std::fs::metadata(
+        pipeline
+            .extraction_staging_dir(job_id)
+            .join(&outcome.extracted[0]),
+    )
+    .unwrap()
+    .len();
+    let counters = pipeline
+        .phase_progress
+        .get(&(job_id, JobPhase::Extracting))
+        .map(|runtime| Arc::clone(&runtime.counters))
+        .expect("the Extracting phase exists");
+    assert_eq!(counters.total_bytes.load(Ordering::Relaxed), installed_len);
+    assert_eq!(
+        counters.completed_bytes.load(Ordering::Relaxed),
+        installed_len
+    );
+
     let reason = coverage
         .abort_reason()
         .expect("the deadline must end the chase's coverage");

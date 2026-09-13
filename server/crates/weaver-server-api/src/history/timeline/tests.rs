@@ -885,3 +885,103 @@ fn verifying_lane_splits_when_targeted_recovery_download_restarts() {
     assert_eq!(download_lane.spans[0].started_at, 4_000.0);
     assert_eq!(download_lane.spans[0].ended_at, Some(5_000.0));
 }
+
+fn extracting_lane(timeline: &JobTimeline) -> &JobTimelineLane {
+    timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Extracting)
+        .expect("extracting lane")
+}
+
+#[test]
+fn extracting_lane_covers_extraction_that_reports_no_members() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Complete),
+        Some(&history(1, 10)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event("DownloadFinished", 5_000, None, ""),
+            event("DownloadPipelineDrained", 5_000, None, ""),
+            event("ExtractionReady", 5_010, None, ""),
+            event("ExtractionComplete", 9_000, None, ""),
+            event("MoveToCompleteStarted", 9_005, None, ""),
+            event("MoveToCompleteFinished", 9_008, None, ""),
+            event("JobCompleted", 9_010, None, ""),
+        ],
+    );
+
+    assert!(timeline.extraction_groups.is_empty());
+    let lane = extracting_lane(&timeline);
+    assert_eq!(lane.spans.len(), 1);
+    assert_eq!(lane.spans[0].started_at, 5_010.0);
+    assert_eq!(lane.spans[0].ended_at, Some(9_000.0));
+    assert_eq!(lane.spans[0].state, TimelineSpanState::Complete);
+}
+
+#[test]
+fn extracting_lane_runs_while_the_job_is_extracting_without_members() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Extracting),
+        None,
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event("DownloadFinished", 5_000, None, ""),
+            event("ExtractionReady", 5_010, None, ""),
+        ],
+    );
+
+    let lane = extracting_lane(&timeline);
+    assert_eq!(lane.spans.len(), 1);
+    assert_eq!(lane.spans[0].started_at, 5_010.0);
+    assert_eq!(lane.spans[0].state, TimelineSpanState::Running);
+}
+
+#[test]
+fn extracting_lane_ends_at_the_final_move_without_a_completion_event() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Complete),
+        Some(&history(1, 10)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("ExtractionReady", 5_000, None, ""),
+            event("MoveToCompleteStarted", 7_000, None, ""),
+            event("MoveToCompleteFinished", 7_500, None, ""),
+            event("JobCompleted", 8_000, None, ""),
+        ],
+    );
+
+    let lane = extracting_lane(&timeline);
+    assert_eq!(lane.spans.len(), 1);
+    assert_eq!(lane.spans[0].ended_at, Some(7_000.0));
+}
+
+#[test]
+fn extracting_lane_joins_member_activity_and_the_extracting_status() {
+    let member =
+        crate::history::types::encode_timeline_member_subject("set", "episode05.mkv", None);
+    let timeline = build_job_timeline(
+        &job(JobStatus::Complete),
+        Some(&history(1, 10)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event("ExtractionMemberStarted", 3_000, member.clone(), ""),
+            event("ExtractionMemberFinished", 4_000, member, ""),
+            event("DownloadFinished", 5_000, None, ""),
+            event("ExtractionReady", 6_000, None, ""),
+            event("ExtractionFailed", 8_000, None, "crc failed"),
+            event("JobCompleted", 9_000, None, ""),
+        ],
+    );
+
+    let lane = extracting_lane(&timeline);
+    assert_eq!(lane.spans.len(), 2);
+    assert_eq!(lane.spans[0].started_at, 3_000.0);
+    assert_eq!(lane.spans[0].ended_at, Some(4_000.0));
+    assert_eq!(lane.spans[1].started_at, 6_000.0);
+    assert_eq!(lane.spans[1].ended_at, Some(8_000.0));
+    assert_eq!(lane.spans[1].state, TimelineSpanState::Failed);
+}
