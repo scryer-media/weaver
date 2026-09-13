@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import type { LucideIcon } from "lucide-react";
 import { Link, NavLink } from "react-router";
 import { useQuery } from "urql";
 import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
@@ -287,7 +288,7 @@ export function PanelListBlock({
   items,
 }: {
   eyebrow: string;
-  items: readonly { to: string; label: string; tag?: ReactNode }[];
+  items: readonly { to: string; label: string; icon?: LucideIcon; tag?: ReactNode }[];
 }) {
   return (
     <RailBlock eyebrow={eyebrow} position="middle" className="gap-0">
@@ -308,6 +309,14 @@ export function PanelListBlock({
                 aria-hidden="true"
                 className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
               />
+              {item.icon === undefined ? null : (
+                <item.icon
+                  aria-hidden="true"
+                  size={15}
+                  strokeWidth={1.75}
+                  className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
+                />
+              )}
               <span className="min-w-0 truncate">{item.label}</span>
               {item.tag === undefined ? null : (
                 <span className="ml-auto flex-none font-wv-mono text-[10.5px] tracking-[0.1em] text-wv-faint uppercase">

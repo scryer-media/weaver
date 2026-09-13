@@ -54,6 +54,7 @@ export function SettingsPage() {
       SETTINGS_PANELS.map((entry) => ({
         to: `/settings/${entry.slug}`,
         label: entry.label,
+        icon: entry.icon,
         tag:
           entry.tag === "beta"
             ? "Beta"
