@@ -12,6 +12,7 @@ import {
   UPDATE_RSS_FEED_MUTATION,
   UPDATE_RSS_RULE_MUTATION,
 } from "@/graphql/queries";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
@@ -21,6 +22,7 @@ import { RoutingEditor, RoutingState } from "../../../components/RoutingEditor";
 import { Cell } from "../../../components/rows";
 import { formatDate, formatSize } from "../../../data/format";
 import { WV } from "../../../data/palette";
+import { countLabel } from "../../../i18n/labels";
 import {
   PanelControls,
   SettingsBlocks,
@@ -160,10 +162,13 @@ const NEW_RULE: Omit<RuleForm, "feedId"> = {
   metadata: "",
 };
 
+/** Labels are translation keys, resolved when the panel renders. */
 const ACTIONS = [
-  { value: "ACCEPT", label: "Accept" },
-  { value: "REJECT", label: "Reject" },
+  { value: "ACCEPT", label: "next.rss.accept" },
+  { value: "REJECT", label: "next.rss.reject" },
 ];
+
+const DECISIONS = new Set(["submitted", "accepted", "rejected", "ignored", "error"]);
 
 /** `key = value` per line — the same shape a feed's own metadata is written in. */
 function metadataText(entries: readonly MetadataEntry[]): string {
@@ -199,26 +204,32 @@ function parseBytes(value: string): number | null {
 }
 
 /** "In bytes", and what those bytes come to once something is typed. */
-function sizeHelp(value: string): string {
+function sizeHelp(t: Translate, value: string): string {
   const bytes = parseBytes(value);
   return bytes === null || bytes <= 0
-    ? "In bytes. Blank means no limit."
-    : `In bytes — ${formatSize(bytes)}.`;
+    ? t("next.rss.sizeHelp")
+    : t("next.rss.sizeHelpValue", { size: formatSize(bytes) });
 }
 
-function pollHelp(seconds: number): string {
+function pollHelp(t: Translate, seconds: number): string {
   if (seconds % 3600 === 0) {
-    return `Every ${seconds / 3600} ${seconds === 3600 ? "hour" : "hours"}.`;
+    return countLabel(t, "next.rss.everyHours", seconds / 3600);
   }
   if (seconds % 60 === 0) {
-    return `Every ${seconds / 60} ${seconds === 60 ? "minute" : "minutes"}.`;
+    return countLabel(t, "next.rss.everyMinutes", seconds / 60);
   }
-  return `Every ${seconds} seconds.`;
+  return countLabel(t, "next.rss.everySeconds", seconds);
 }
 
-function feedState(feed: RssFeed): { color: string; text: string } {
+/** The daemon reports a decision as a lowercase word; unknown ones pass through. */
+function decisionLabel(t: Translate, decision: string): string {
+  const value = decision.toLowerCase();
+  return DECISIONS.has(value) ? t(`next.rss.decision.${value}`) : value;
+}
+
+function feedState(t: Translate, feed: RssFeed): { color: string; text: string } {
   if (!feed.enabled) {
-    return { color: WV.inert, text: "paused" };
+    return { color: WV.inert, text: t("next.rss.paused") };
   }
   if (feed.lastError) {
     return {
@@ -226,17 +237,17 @@ function feedState(feed: RssFeed): { color: string; text: string } {
       text: feed.lastError,
     };
   }
-  return { color: WV.accent, text: feed.lastSuccessAt ? formatDate(feed.lastSuccessAt) : "not polled yet" };
+  return { color: WV.accent, text: feed.lastSuccessAt ? formatDate(feed.lastSuccessAt) : t("next.rss.notPolled") };
 }
 
-function reportLine(report: SyncReport): string {
+function reportLine(t: Translate, report: SyncReport): string {
   const parts = [
-    `${report.feedsPolled} ${report.feedsPolled === 1 ? "feed" : "feeds"} polled`,
-    `${report.itemsNew} new`,
-    `${report.itemsSubmitted} queued`,
+    countLabel(t, "next.rss.feedsPolled", report.feedsPolled),
+    countLabel(t, "next.rss.itemsNew", report.itemsNew),
+    countLabel(t, "next.rss.itemsQueued", report.itemsSubmitted),
   ];
   if (report.itemsIgnored > 0) {
-    parts.push(`${report.itemsIgnored} ignored`);
+    parts.push(countLabel(t, "next.rss.itemsIgnored", report.itemsIgnored));
   }
   if (report.errors.length > 0) {
     parts.push(report.errors[0] ?? "");
@@ -245,6 +256,7 @@ function reportLine(report: SyncReport): string {
 }
 
 export function RssPanel() {
+  const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<RssData>({ query: RSS_SETTINGS_QUERY });
   const [, addFeed] = useMutation(ADD_RSS_FEED_MUTATION);
   const [, updateFeed] = useMutation(UPDATE_RSS_FEED_MUTATION);
@@ -295,7 +307,7 @@ export function RssPanel() {
   usePanelStatus(error ?? status, error !== null);
 
   const categoryOptions = [
-    { value: NO_CATEGORY, label: "None" },
+    { value: NO_CATEGORY, label: t("next.rss.noCategory") },
     ...categories.map((category) => ({ value: category.name, label: category.name })),
   ];
   const feedOptions = feeds.map((feed) => ({ value: String(feed.id), label: feed.name }));
@@ -359,11 +371,11 @@ export function RssPanel() {
 
   const saveFeed = async () => {
     if (!feedForm.name.trim()) {
-      setError("A feed needs a name.");
+      setError(t("next.rss.nameRequired"));
       return;
     }
     if (!feedForm.url.trim()) {
-      setError("A feed needs a URL.");
+      setError(t("next.rss.urlRequired"));
       return;
     }
     const input = {
@@ -393,7 +405,7 @@ export function RssPanel() {
 
   const saveRule = async () => {
     if (!ruleForm.feedId) {
-      setError("Pick the feed this rule belongs to.");
+      setError(t("next.rss.feedRequired"));
       return;
     }
     const input = {
@@ -424,7 +436,7 @@ export function RssPanel() {
 
   const sync = async (feed?: RssFeed) => {
     setError(null);
-    setStatus(feed ? `Polling ${feed.name}…` : "Polling every feed…");
+    setStatus(feed ? t("next.rss.polling", { name: feed.name }) : t("next.rss.pollingAll"));
     const result = await runSync({ feedId: feed ? feed.id : null });
     if (result.error) {
       setStatus(null);
@@ -432,7 +444,7 @@ export function RssPanel() {
       return;
     }
     const report = result.data?.runRssSync as SyncReport | undefined;
-    setStatus(report ? reportLine(report) : "Sync finished.");
+    setStatus(report ? reportLine(t, report) : t("next.rss.syncFinished"));
     refresh();
   };
 
@@ -440,12 +452,18 @@ export function RssPanel() {
     {
       kind: "table",
       id: "feeds",
-      title: "Feeds",
-      note: "polled in the background",
+      title: t("next.rss.feeds"),
+      note: t("next.rss.feedsNote"),
       columns: "minmax(0, 1fr) minmax(0, 1.3fr) 110px minmax(0, 1fr) 64px",
-      headers: ["Name", "URL", "Interval", "Last poll", ""],
-      empty: "No feeds. Add one to have weaver watch an indexer's search.",
-      emptyAction: { label: "Add feed", onClick: () => openFeed(null) },
+      headers: [
+        t("next.rss.name"),
+        t("next.rss.url"),
+        t("next.rss.interval"),
+        t("next.rss.lastPoll"),
+        "",
+      ],
+      empty: t("next.rss.feedsEmpty"),
+      emptyAction: { label: t("next.rss.addFeed"), onClick: () => openFeed(null) },
       onRowClick: (id) => {
         const feed = feeds.find((entry) => String(entry.id) === id);
         if (feed) {
@@ -453,7 +471,7 @@ export function RssPanel() {
         }
       },
       rows: feeds.map((feed) => {
-        const state = feedState(feed);
+        const state = feedState(t, feed);
         return {
           id: String(feed.id),
           searchText: `${feed.name} ${feed.url} ${feed.defaultCategory ?? ""}`,
@@ -473,7 +491,7 @@ export function RssPanel() {
             </Cell>,
             <span key="sync" onClick={(event) => event.stopPropagation()}>
               <SecondaryButton icon="refresh" className="h-7 px-2" onClick={() => void sync(feed)}>
-                Poll
+                {t("next.rss.poll")}
               </SecondaryButton>
             </span>,
           ],
@@ -483,11 +501,17 @@ export function RssPanel() {
     {
       kind: "table",
       id: "rules",
-      title: "Rules",
-      note: "applied in order, first match wins",
+      title: t("next.rss.rules"),
+      note: t("next.rss.rulesNote"),
       columns: "minmax(0, 1fr) 74px 64px minmax(0, 1.4fr) minmax(0, 1fr)",
-      headers: ["Feed", "Action", "Order", "Title matches", "Files into"],
-      empty: "No rules. Every item a feed reports is accepted.",
+      headers: [
+        t("next.rss.feed"),
+        t("next.rss.action"),
+        t("next.rss.order"),
+        t("next.rss.titleMatches"),
+        t("next.rss.filesInto"),
+      ],
+      empty: t("next.rss.rulesEmpty"),
       onRowClick: (id) => {
         const entry = rules.find((candidate) => String(candidate.rule.id) === id);
         if (entry) {
@@ -496,7 +520,7 @@ export function RssPanel() {
       },
       footer:
         feeds.length > 0 ? (
-          <SecondaryButton icon="add" onClick={() => openRule(null)}>Add rule</SecondaryButton>
+          <SecondaryButton icon="add" onClick={() => openRule(null)}>{t("next.rss.addRule")}</SecondaryButton>
         ) : undefined,
       rows: rules.map(({ rule, feed }) => ({
         id: String(rule.id),
@@ -510,13 +534,13 @@ export function RssPanel() {
             key="action"
             className={rule.action === "REJECT" ? "text-wv-error-text" : "text-wv-secondary"}
           >
-            {rule.action === "REJECT" ? "Reject" : "Accept"}
+            {rule.action === "REJECT" ? t("next.rss.reject") : t("next.rss.accept")}
           </Cell>,
           <Cell key="order" mono className="text-wv-muted">
             {rule.sortOrder}
           </Cell>,
           <Cell key="regex" mono className="text-wv-secondary" title={rule.titleRegex ?? ""}>
-            {rule.titleRegex || "anything"}
+            {rule.titleRegex || t("next.rss.anything")}
           </Cell>,
           <Cell key="category" className="text-wv-muted">
             {rule.categoryOverride || feed.defaultCategory || "—"}
@@ -527,11 +551,17 @@ export function RssPanel() {
     {
       kind: "table",
       id: "seen",
-      title: "Recently seen",
-      note: `${seenItems.length} remembered`,
+      title: t("next.rss.recentlySeen"),
+      note: countLabel(t, "next.rss.remembered", seenItems.length),
       columns: "minmax(0, 1.6fr) minmax(0, 1fr) 96px 92px minmax(0, 140px)",
-      headers: ["Item", "Feed", "Decision", "Size", "Seen"],
-      empty: "Nothing seen yet. Items appear here once a feed has been polled.",
+      headers: [
+        t("next.rss.item"),
+        t("next.rss.feed"),
+        t("next.rss.decisionColumn"),
+        t("next.rss.size"),
+        t("next.rss.seen"),
+      ],
+      empty: t("next.rss.seenEmpty"),
       onRowClick: (id) => {
         const item = seenItems.find((entry) => `${entry.feedId}:${entry.itemId}` === id);
         if (item) {
@@ -540,11 +570,13 @@ export function RssPanel() {
       },
       footer:
         seenItems.length > 0 ? (
-          <SecondaryButton icon="remove" onClick={() => setConfirmSeen("all")}>Clear history</SecondaryButton>
+          <SecondaryButton icon="remove" onClick={() => setConfirmSeen("all")}>
+            {t("next.rss.clearHistory")}
+          </SecondaryButton>
         ) : undefined,
       rows: seenItems.map((item) => ({
         id: `${item.feedId}:${item.itemId}`,
-        searchText: `${item.itemTitle} ${feedNames.get(item.feedId) ?? ""} ${item.decision}`,
+        searchText: `${item.itemTitle} ${feedNames.get(item.feedId) ?? ""} ${decisionLabel(t, item.decision)}`,
         cells: [
           <Cell key="title" className="text-wv-fg" title={item.error ?? item.itemTitle}>
             {item.itemTitle}
@@ -557,7 +589,7 @@ export function RssPanel() {
             mono
             className={item.error ? "text-wv-error-text" : "text-wv-secondary"}
           >
-            {item.decision.toLowerCase()}
+            {decisionLabel(t, item.decision)}
           </Cell>,
           <Cell key="size" mono className="text-wv-muted">
             {item.sizeBytes ? formatSize(item.sizeBytes) : "—"}
@@ -573,11 +605,11 @@ export function RssPanel() {
   const feedSections: EditorSection[] = [
     {
       id: "feed",
-      title: "Feed",
+      title: t("next.rss.feed"),
       fields: [
         {
           id: "name",
-          label: "Name",
+          label: t("next.rss.name"),
           control: {
             kind: "text",
             mono: false,
@@ -587,8 +619,8 @@ export function RssPanel() {
         },
         {
           id: "url",
-          label: "URL",
-          help: "The indexer's RSS or Newznab search, with its API key.",
+          label: t("next.rss.url"),
+          help: t("next.rss.urlHelp"),
           control: {
             kind: "text",
             type: "url",
@@ -598,8 +630,8 @@ export function RssPanel() {
         },
         {
           id: "enabled",
-          label: "Enabled",
-          help: "A disabled feed keeps its rules but is never polled.",
+          label: t("next.rss.enabled"),
+          help: t("next.rss.enabledHelp"),
           control: {
             kind: "toggle",
             value: feedForm.enabled,
@@ -608,22 +640,22 @@ export function RssPanel() {
         },
         {
           id: "pollIntervalSecs",
-          label: "Poll interval",
-          help: pollHelp(feedForm.pollIntervalSecs),
+          label: t("next.rss.pollInterval"),
+          help: pollHelp(t, feedForm.pollIntervalSecs),
           control: {
             kind: "number",
             value: feedForm.pollIntervalSecs,
             min: 30,
             max: 86400,
             step: 30,
-            suffix: "seconds",
+            suffix: t("next.general.seconds"),
             onChange: (next) => patchFeed({ pollIntervalSecs: next }),
           },
         },
         {
           id: "defaultCategory",
-          label: "Default category",
-          help: "What an accepted item is filed under when no rule overrides it.",
+          label: t("next.rss.defaultCategory"),
+          help: t("next.rss.defaultCategoryHelp"),
           control: {
             kind: "select",
             value: feedForm.defaultCategory,
@@ -633,8 +665,8 @@ export function RssPanel() {
         },
         {
           id: "metadata",
-          label: "Default metadata",
-          help: "One key = value per line, attached to every item this feed queues.",
+          label: t("next.rss.defaultMetadata"),
+          help: t("next.rss.defaultMetadataHelp"),
           control: {
             kind: "textarea",
             value: feedForm.metadata,
@@ -647,12 +679,12 @@ export function RssPanel() {
     },
     {
       id: "credentials",
-      title: "Credentials",
-      note: "optional · stored write-only",
+      title: t("next.rss.credentials"),
+      note: t("next.rss.credentialsNote"),
       fields: [
         {
           id: "username",
-          label: "Username",
+          label: t("next.rss.username"),
           control: {
             kind: "text",
             value: feedForm.username,
@@ -661,8 +693,8 @@ export function RssPanel() {
         },
         {
           id: "password",
-          label: "Password",
-          help: editingFeed?.hasPassword ? "Stored. Leave blank to keep it." : undefined,
+          label: t("next.rss.password"),
+          help: editingFeed?.hasPassword ? t("next.rss.passwordStored") : undefined,
           control: {
             kind: "text",
             type: "password",
@@ -675,7 +707,7 @@ export function RssPanel() {
           ? [
               {
                 id: "clearPassword",
-                label: "Forget the stored password",
+                label: t("next.rss.forgetPassword"),
                 control: {
                   kind: "toggle" as const,
                   value: feedForm.clearPassword,
@@ -688,12 +720,12 @@ export function RssPanel() {
     },
     {
       id: "routing",
-      title: "Network route",
+      title: t("next.providers.networkRoute"),
       fields: [
         {
           id: "routing",
-          label: "Proxy route",
-          help: "Each route is tried in order; new polls return to the first when it recovers.",
+          label: t("next.providers.proxyRoute"),
+          help: t("next.rss.proxyRouteHelp"),
           control: {
             kind: "custom",
             control: (
@@ -713,7 +745,7 @@ export function RssPanel() {
       ? [
           {
             id: "feedId",
-            label: "Feed",
+            label: t("next.rss.feed"),
             control: {
               kind: "select" as const,
               value: String(ruleForm.feedId),
@@ -725,18 +757,18 @@ export function RssPanel() {
       : []),
     {
       id: "action",
-      label: "Action",
-      help: "The first rule that matches an item decides it.",
+      label: t("next.rss.action"),
+      help: t("next.rss.actionHelp"),
       control: {
         kind: "segmented",
         value: ruleForm.action,
-        options: ACTIONS,
+        options: ACTIONS.map((option) => ({ ...option, label: t(option.label) })),
         onChange: (next) => patchRule({ action: next as RuleAction }),
       },
     },
     {
       id: "enabled",
-      label: "Enabled",
+      label: t("next.rss.enabled"),
       control: {
         kind: "toggle",
         value: ruleForm.enabled,
@@ -745,8 +777,8 @@ export function RssPanel() {
     },
     {
       id: "sortOrder",
-      label: "Order",
-      help: "Lower numbers are tried first.",
+      label: t("next.rss.order"),
+      help: t("next.rss.orderHelp"),
       control: {
         kind: "number",
         value: ruleForm.sortOrder,
@@ -757,8 +789,8 @@ export function RssPanel() {
     },
     {
       id: "titleRegex",
-      label: "Title matches",
-      help: "A regular expression. Blank matches every title.",
+      label: t("next.rss.titleMatches"),
+      help: t("next.rss.titleMatchesHelp"),
       control: {
         kind: "text",
         value: ruleForm.titleRegex,
@@ -768,8 +800,8 @@ export function RssPanel() {
     },
     {
       id: "itemCategories",
-      label: "Feed categories",
-      help: "Comma-separated categories as the indexer labels them. Blank matches any.",
+      label: t("next.rss.feedCategories"),
+      help: t("next.rss.feedCategoriesHelp"),
       control: {
         kind: "text",
         value: ruleForm.itemCategories,
@@ -779,8 +811,8 @@ export function RssPanel() {
     },
     {
       id: "minSizeBytes",
-      label: "Minimum size",
-      help: sizeHelp(ruleForm.minSizeBytes),
+      label: t("next.rss.minSize"),
+      help: sizeHelp(t, ruleForm.minSizeBytes),
       control: {
         kind: "text",
         value: ruleForm.minSizeBytes,
@@ -790,8 +822,8 @@ export function RssPanel() {
     },
     {
       id: "maxSizeBytes",
-      label: "Maximum size",
-      help: sizeHelp(ruleForm.maxSizeBytes),
+      label: t("next.rss.maxSize"),
+      help: sizeHelp(t, ruleForm.maxSizeBytes),
       control: {
         kind: "text",
         value: ruleForm.maxSizeBytes,
@@ -801,8 +833,8 @@ export function RssPanel() {
     },
     {
       id: "categoryOverride",
-      label: "File into",
-      help: "Overrides the feed's default category for items this rule accepts.",
+      label: t("next.rss.fileInto"),
+      help: t("next.rss.fileIntoHelp"),
       control: {
         kind: "select",
         value: ruleForm.categoryOverride,
@@ -812,8 +844,8 @@ export function RssPanel() {
     },
     {
       id: "metadata",
-      label: "Metadata",
-      help: "One key = value per line, attached to items this rule accepts.",
+      label: t("next.rss.metadata"),
+      help: t("next.rss.metadataHelp"),
       control: {
         kind: "textarea",
         value: ruleForm.metadata,
@@ -827,19 +859,19 @@ export function RssPanel() {
     <>
       <PanelControls>
         <SecondaryButton icon="refresh" onClick={() => void sync()} disabled={feeds.length === 0}>
-          Poll all
+          {t("next.rss.pollAll")}
         </SecondaryButton>
-        <PrimaryButton icon="add" onClick={() => openFeed(null)}>Add feed</PrimaryButton>
+        <PrimaryButton icon="add" onClick={() => openFeed(null)}>{t("next.rss.addFeed")}</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
         open={feedId !== null}
-        title={feedId === "new" ? "Add feed" : (editingFeed?.name ?? "Feed")}
+        title={feedId === "new" ? t("next.rss.addFeed") : (editingFeed?.name ?? t("next.rss.feed"))}
         note={
           feedId === "new" ? (
-            "new feed"
+            t("next.rss.newFeed")
           ) : editingFeed?.routingStatus ? (
             <RoutingState status={editingFeed.routingStatus} />
           ) : undefined
@@ -854,15 +886,15 @@ export function RssPanel() {
           setFeedId(null);
         }}
         onDelete={editingFeed ? () => setConfirmFeed(editingFeed) : undefined}
-        deleteLabel="Remove feed"
+        deleteLabel={t("next.rss.removeFeed")}
       />
 
       <RecordEditor
         open={ruleId !== null}
-        title={ruleId === "new" ? "Add rule" : "Edit rule"}
+        title={ruleId === "new" ? t("next.rss.addRule") : t("next.rss.editRule")}
         note={feedNames.get(ruleForm.feedId) ?? undefined}
         width={620}
-        sections={[{ id: "rule", title: "Rule", fields: ruleFields }]}
+        sections={[{ id: "rule", title: t("next.rss.rule"), fields: ruleFields }]}
         error={error}
         busy={busy}
         onSave={() => void saveRule()}
@@ -871,16 +903,16 @@ export function RssPanel() {
           setRuleId(null);
         }}
         onDelete={editingRule ? () => setConfirmRule(editingRule) : undefined}
-        deleteLabel="Remove rule"
+        deleteLabel={t("next.rss.removeRule")}
       />
 
       <ConfirmDialog
         open={confirmFeed !== null}
-        title="Remove feed"
+        title={t("next.rss.removeFeed")}
         note={confirmFeed?.name}
         busy={busy}
-        confirmLabel="Remove feed"
-        body="Its rules and everything it remembers seeing go with it. Downloads it already queued are untouched."
+        confirmLabel={t("next.rss.removeFeed")}
+        body={t("next.rss.removeFeedBody")}
         onConfirm={() => {
           if (confirmFeed) {
             void deleteFeed({ id: confirmFeed.id }).then(() => {
@@ -895,11 +927,11 @@ export function RssPanel() {
 
       <ConfirmDialog
         open={confirmRule !== null}
-        title="Remove rule"
+        title={t("next.rss.removeRule")}
         note={confirmRule ? (feedNames.get(confirmRule.feedId) ?? undefined) : undefined}
         busy={busy}
-        confirmLabel="Remove rule"
-        body="Items this rule used to decide fall through to the rules after it."
+        confirmLabel={t("next.rss.removeRule")}
+        body={t("next.rss.removeRuleBody")}
         onConfirm={() => {
           if (confirmRule) {
             void deleteRule({ id: confirmRule.id }).then(() => {
@@ -914,14 +946,16 @@ export function RssPanel() {
 
       <ConfirmDialog
         open={confirmSeen !== null}
-        title={confirmSeen === "all" ? "Clear seen history" : "Forget this item"}
-        note={confirmSeen === "all" ? `${seenItems.length} items` : confirmSeen?.itemTitle}
-        busy={busy}
-        confirmLabel={confirmSeen === "all" ? "Clear history" : "Forget item"}
-        body={
+        title={confirmSeen === "all" ? t("next.rss.clearSeenTitle") : t("next.rss.forgetItemTitle")}
+        note={
           confirmSeen === "all"
-            ? "Every feed may queue anything it reports again on its next poll."
-            : "The next poll that reports this item will treat it as new and may queue it again."
+            ? countLabel(t, "next.rss.items", seenItems.length)
+            : confirmSeen?.itemTitle
+        }
+        busy={busy}
+        confirmLabel={confirmSeen === "all" ? t("next.rss.clearHistory") : t("next.rss.forgetItem")}
+        body={
+          confirmSeen === "all" ? t("next.rss.clearSeenBody") : t("next.rss.forgetItemBody")
         }
         onConfirm={() => {
           if (confirmSeen === "all") {

@@ -10,6 +10,7 @@ import {
   TEST_CONNECTION_MUTATION,
   UPDATE_SERVER_MUTATION,
 } from "@/graphql/queries";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { Square } from "../../../components/chrome";
@@ -140,21 +141,22 @@ const NEW_SERVER: ServerForm = {
   certificateDerBase64: null,
 };
 
+/** Labels are translation keys, resolved when the panel renders. */
 const QUOTA_PERIODS: { value: string; label: string }[] = [
-  { value: "ONE_TIME", label: "One block" },
-  { value: "DAILY", label: "Daily" },
-  { value: "WEEKLY", label: "Weekly" },
-  { value: "MONTHLY", label: "Monthly" },
+  { value: "ONE_TIME", label: "next.providers.oneBlock" },
+  { value: "DAILY", label: "next.bandwidth.daily" },
+  { value: "WEEKLY", label: "next.bandwidth.weekly" },
+  { value: "MONTHLY", label: "next.bandwidth.monthly" },
 ];
 
 const WEEKDAYS: { value: string; label: string }[] = [
-  { value: "MON", label: "Monday" },
-  { value: "TUE", label: "Tuesday" },
-  { value: "WED", label: "Wednesday" },
-  { value: "THU", label: "Thursday" },
-  { value: "FRI", label: "Friday" },
-  { value: "SAT", label: "Saturday" },
-  { value: "SUN", label: "Sunday" },
+  { value: "MON", label: "next.weekday.mon" },
+  { value: "TUE", label: "next.weekday.tue" },
+  { value: "WED", label: "next.weekday.wed" },
+  { value: "THU", label: "next.weekday.thu" },
+  { value: "FRI", label: "next.weekday.fri" },
+  { value: "SAT", label: "next.weekday.sat" },
+  { value: "SUN", label: "next.weekday.sun" },
 ];
 
 function minutesToTime(minutes: number): string {
@@ -189,22 +191,22 @@ function shortCipher(suite: string): string {
     .replace(/_/g, "-");
 }
 
-function transportLabel(server: Server): string {
+function transportLabel(t: Translate, server: Server): string {
   if (!server.tls) {
-    return "Plain";
+    return t("next.providers.plain");
   }
   return server.tlsCipherSuite ? `TLS · ${shortCipher(server.tlsCipherSuite)}` : "TLS";
 }
 
-function roleLabel(server: Server): string {
+function roleLabel(t: Translate, server: Server): string {
   if (server.backfill) {
-    return "Block account";
+    return t("next.providers.blockAccount");
   }
   return server.priority === 0
-    ? "Primary"
+    ? t("next.providers.primary")
     : server.priority === 1
-      ? "Secondary"
-      : `Priority ${server.priority}`;
+      ? t("next.providers.secondary")
+      : t("next.providers.priorityN", { priority: server.priority });
 }
 
 function formToState(server: ServerDetails | Server, username: string): ServerForm {
@@ -263,6 +265,7 @@ function serverInput(form: ServerForm) {
 }
 
 export function ProvidersPanel() {
+  const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{ servers: Server[] }>({ query: SERVERS_QUERY });
   const [, addServer] = useMutation(ADD_SERVER_MUTATION);
   const [, updateServer] = useMutation(UPDATE_SERVER_MUTATION);
@@ -359,7 +362,7 @@ export function ProvidersPanel() {
       return;
     }
     if (!normalizeHost(values.host)) {
-      setError("A provider needs a hostname.");
+      setError(t("next.providers.hostRequired"));
       return;
     }
     setBusy(true);
@@ -411,12 +414,18 @@ export function ProvidersPanel() {
     {
       kind: "table",
       id: "servers",
-      title: "Servers",
-      note: "tried in priority order",
+      title: t("next.providers.servers"),
+      note: t("next.settings.panel.serversNote"),
       columns: "minmax(0, 1fr) 92px 190px 150px 44px",
-      headers: ["Host", "Threads", "Transport", "Role", ""],
-      empty: "No providers yet. Add one to start downloading.",
-      emptyAction: { label: "Add provider", onClick: addProvider },
+      headers: [
+        t("next.providers.host"),
+        t("next.providers.threads"),
+        t("next.providers.transport"),
+        t("next.providers.role"),
+        "",
+      ],
+      empty: t("next.providers.empty"),
+      emptyAction: { label: t("next.providers.add"), onClick: addProvider },
       onRowClick: (id) => {
         setForm(null);
         setTestResult(null);
@@ -424,7 +433,7 @@ export function ProvidersPanel() {
       },
       rows: servers.map((server) => ({
         id: String(server.id),
-        searchText: `${server.host} ${server.port} ${roleLabel(server)} ${transportLabel(server)}`,
+        searchText: `${server.host} ${server.port} ${roleLabel(t, server)} ${transportLabel(t, server)}`,
         cells: [
           <span key="host" className="flex min-w-0 items-center gap-[10px]">
             <Square color={server.active ? WV.accent : WV.inert} />
@@ -435,15 +444,15 @@ export function ProvidersPanel() {
             {server.connections}
           </Cell>,
           <Cell key="transport" mono className="text-wv-secondary">
-            {transportLabel(server)}
+            {transportLabel(t, server)}
           </Cell>,
-          <Cell key="role">{roleLabel(server)}</Cell>,
+          <Cell key="role">{roleLabel(t, server)}</Cell>,
           <span key="active" onClick={(event) => event.stopPropagation()}>
             <Toggle
               size="table"
               checked={server.active}
               onChange={(next) => void setActive(server, next)}
-              label={`${server.host} enabled`}
+              label={t("next.providers.enabledAria", { host: server.host })}
             />
           </span>,
         ],
@@ -455,12 +464,12 @@ export function ProvidersPanel() {
     ? [
         {
           id: "connection",
-          title: "Connection",
+          title: t("next.providers.connection"),
           fields: [
             {
               id: "host",
-              label: "Host",
-              help: "The provider's news server address.",
+              label: t("next.providers.host"),
+              help: t("next.providers.hostHelp"),
               control: {
                 kind: "text",
                 value: values.host,
@@ -470,7 +479,7 @@ export function ProvidersPanel() {
             },
             {
               id: "port",
-              label: "Port",
+              label: t("next.providers.port"),
               control: {
                 kind: "number",
                 value: values.port,
@@ -482,7 +491,7 @@ export function ProvidersPanel() {
             {
               id: "tls",
               label: "TLS",
-              help: "Encrypt the connection. Plain text is only sensible on a local relay.",
+              help: t("next.providers.tlsHelp"),
               control: {
                 kind: "toggle",
                 value: values.tls,
@@ -491,7 +500,7 @@ export function ProvidersPanel() {
             },
             {
               id: "username",
-              label: "Username",
+              label: t("next.providers.username"),
               control: {
                 kind: "text",
                 value: values.username,
@@ -500,8 +509,8 @@ export function ProvidersPanel() {
             },
             {
               id: "password",
-              label: "Password",
-              help: editingId === "new" ? undefined : "Leave blank to keep the stored password.",
+              label: t("next.providers.password"),
+              help: editingId === "new" ? undefined : t("next.providers.passwordKeep"),
               control: {
                 kind: "text",
                 type: "password",
@@ -512,8 +521,8 @@ export function ProvidersPanel() {
             },
             {
               id: "connections",
-              label: "Threads",
-              help: "Connections weaver may open at once. Never exceed what the plan allows.",
+              label: t("next.providers.threads"),
+              help: t("next.providers.threadsHelp"),
               control: {
                 kind: "number",
                 value: values.connections,
@@ -526,18 +535,18 @@ export function ProvidersPanel() {
         },
         {
           id: "role",
-          title: "Role",
+          title: t("next.providers.role"),
           fields: [
             {
               id: "active",
-              label: "Enabled",
-              help: "A disabled provider is kept but never dialled.",
+              label: t("next.providers.enabled"),
+              help: t("next.providers.enabledHelp"),
               control: { kind: "toggle", value: values.active, onChange: (next) => patch({ active: next }) },
             },
             {
               id: "priority",
-              label: "Priority",
-              help: "Lower is tried first. Providers sharing a number are used together.",
+              label: t("next.providers.priority"),
+              help: t("next.providers.priorityHelp"),
               control: {
                 kind: "number",
                 value: values.priority,
@@ -548,8 +557,8 @@ export function ProvidersPanel() {
             },
             {
               id: "backfill",
-              label: "Block account",
-              help: "Only used to fill articles the other providers could not supply.",
+              label: t("next.providers.blockAccount"),
+              help: t("next.providers.blockAccountHelp"),
               control: {
                 kind: "toggle",
                 value: values.backfill,
@@ -558,26 +567,26 @@ export function ProvidersPanel() {
             },
             {
               id: "retentionDays",
-              label: "Retention",
-              help: "Skip this provider for articles older than this. Zero means no limit.",
+              label: t("next.providers.retention"),
+              help: t("next.providers.retentionHelp"),
               control: {
                 kind: "number",
                 value: values.retentionDays,
                 min: 0,
                 onChange: (next) => patch({ retentionDays: next }),
-                suffix: "days",
+                suffix: t("next.providers.days"),
               },
             },
           ],
         },
         {
           id: "limits",
-          title: "Limits",
+          title: t("next.bandwidth.limits"),
           fields: [
             {
               id: "speedUnlimited",
-              label: "Unlimited speed",
-              help: "Turn off to hold this provider to a fixed rate.",
+              label: t("next.providers.unlimitedSpeed"),
+              help: t("next.providers.unlimitedSpeedHelp"),
               control: {
                 kind: "toggle",
                 value: values.speedUnlimited,
@@ -589,37 +598,37 @@ export function ProvidersPanel() {
               : [
                   {
                     id: "speedMib",
-                    label: "Speed ceiling",
+                    label: t("next.providers.speedCeiling"),
                     control: {
                       kind: "text" as const,
                       value: values.speedMib,
                       onChange: (next: string) => patch({ speedMib: next }),
                       className: "w-[110px]",
                     },
-                    help: "Mebibytes per second.",
+                    help: t("next.schedules.speedLimitHelp"),
                   },
                 ]),
             {
               id: "quotaEnabled",
-              label: "Data quota",
-              help: "Stop using this provider once its allowance is spent.",
+              label: t("next.providers.quota"),
+              help: t("next.providers.quotaHelp"),
               control: {
                 kind: "toggle",
                 value: values.quota.enabled,
                 onChange: (next) => patch({ quota: { ...values.quota, enabled: next } }),
               },
             },
-            ...(values.quota.enabled ? quotaFields(values, patch) : []),
+            ...(values.quota.enabled ? quotaFields(t, values, patch) : []),
           ],
         },
         {
           id: "routing",
-          title: "Network route",
+          title: t("next.providers.networkRoute"),
           fields: [
             {
               id: "routing",
-              label: "Proxy route",
-              help: "Each route is tried in order; new connections return to the first when it recovers.",
+              label: t("next.providers.proxyRoute"),
+              help: t("next.providers.proxyRouteHelp"),
               control: {
                 kind: "custom",
                 control: (
@@ -639,7 +648,7 @@ export function ProvidersPanel() {
     <>
       <PanelControls>
         <PrimaryButton icon="add" onClick={addProvider}>
-          Add provider
+          {t("next.providers.add")}
         </PrimaryButton>
       </PanelControls>
 
@@ -647,8 +656,12 @@ export function ProvidersPanel() {
 
       <RecordEditor
         open={editingId !== null}
-        title={editingId === "new" ? "Add provider" : (editing?.host ?? "Provider")}
-        note={editingId === "new" ? "new server" : `priority ${values?.priority ?? 0}`}
+        title={editingId === "new" ? t("next.providers.add") : (editing?.host ?? t("next.providers.provider"))}
+        note={
+          editingId === "new"
+            ? t("next.providers.newNote")
+            : t("next.providers.priorityNote", { priority: values?.priority ?? 0 })
+        }
         width={620}
         sections={sections}
         error={error}
@@ -657,7 +670,7 @@ export function ProvidersPanel() {
         onSave={() => void save()}
         onDismiss={closeEditor}
         onDelete={editing ? () => setConfirmRemove(editing) : undefined}
-        deleteLabel="Remove provider"
+        deleteLabel={t("next.providers.remove")}
         extraActions={
           <>
             {editing && values?.quota.enabled ? (
@@ -669,11 +682,11 @@ export function ProvidersPanel() {
                   );
                 }}
               >
-                Reset usage
+                {t("next.providers.resetUsage")}
               </SecondaryButton>
             ) : null}
             <SecondaryButton icon="test" onClick={() => void runTest()} disabled={testing}>
-              {testing ? "Testing…" : "Test connection"}
+              {testing ? t("next.providers.testing") : t("next.providers.test")}
             </SecondaryButton>
           </>
         }
@@ -681,7 +694,7 @@ export function ProvidersPanel() {
         {values === null ? (
           <div role="status" className="flex items-center gap-3 px-4 sm:px-6 py-5 font-wv-mono text-[12px] text-wv-muted">
             <LoadingMark className="h-5" />
-            Loading provider…
+            {t("next.providers.loading")}
           </div>
         ) : null}
         {testResult ? (
@@ -694,13 +707,13 @@ export function ProvidersPanel() {
             </div>
             <div className="font-wv-mono text-[11.5px] text-wv-muted">
               {formatLatency(testResult.latencyMs)}
-              {testResult.supportsPipelining ? " · pipelining" : ""}
+              {testResult.supportsPipelining ? ` · ${t("next.providers.pipelining")}` : ""}
               {testResult.tlsCipherSuite ? ` · ${shortCipher(testResult.tlsCipherSuite)}` : ""}
             </div>
             {testResult.adoptableTlsNameMismatchCertificate ? (
               <div className="flex flex-wrap items-center gap-3 pt-1">
                 <span className="text-[12px] text-wv-warn">
-                  The certificate belongs to a different hostname.
+                  {t("next.providers.certMismatch")}
                 </span>
                 <SecondaryButton
                   icon="trust"
@@ -711,7 +724,7 @@ export function ProvidersPanel() {
                     })
                   }
                 >
-                  Trust this certificate
+                  {t("next.providers.trustCert")}
                 </SecondaryButton>
               </div>
             ) : null}
@@ -721,11 +734,13 @@ export function ProvidersPanel() {
 
       <ConfirmDialog
         open={confirmRemove !== null}
-        title="Remove provider"
+        title={t("next.providers.remove")}
         note={confirmRemove?.host}
         busy={busy}
-        confirmLabel="Remove provider"
-        body={`Weaver will stop using ${confirmRemove?.host ?? "this provider"}. Downloads in flight fall back to the remaining providers.`}
+        confirmLabel={t("next.providers.remove")}
+        body={t("next.providers.removeBody", {
+          host: confirmRemove?.host ?? t("next.providers.thisProvider"),
+        })}
         onConfirm={() => void remove()}
         onDismiss={() => setConfirmRemove(null)}
       />
@@ -733,22 +748,26 @@ export function ProvidersPanel() {
   );
 }
 
-function quotaFields(values: ServerForm, patch: (next: Partial<ServerForm>) => void): FieldSpec[] {
+function quotaFields(
+  t: Translate,
+  values: ServerForm,
+  patch: (next: Partial<ServerForm>) => void,
+): FieldSpec[] {
   return [
     {
       id: "quotaPeriod",
-      label: "Quota window",
+      label: t("next.providers.quotaWindow"),
       control: {
         kind: "select",
         value: values.quota.period,
-        options: QUOTA_PERIODS,
+        options: QUOTA_PERIODS.map((option) => ({ ...option, label: t(option.label) })),
         onChange: (next) => patch({ quota: { ...values.quota, period: next as QuotaPeriod } }),
       },
     },
     {
       id: "quotaLimit",
-      label: "Allowance",
-      help: `Used so far: ${formatSize(values.quota.usedBytes)}.`,
+      label: t("next.bandwidth.allowance"),
+      help: t("next.providers.usedSoFar", { size: formatSize(values.quota.usedBytes) }),
       control: {
         kind: "custom",
         control: (
@@ -756,7 +775,7 @@ function quotaFields(values: ServerForm, patch: (next: Partial<ServerForm>) => v
             <input
               type="text"
               inputMode="decimal"
-              aria-label="Allowance"
+              aria-label={t("next.bandwidth.allowance")}
               value={values.quotaLimit}
               placeholder="0"
               onChange={(event) => patch({ quotaLimit: event.target.value })}
@@ -790,7 +809,7 @@ function quotaFields(values: ServerForm, patch: (next: Partial<ServerForm>) => v
       : [
           {
             id: "quotaResetTime",
-            label: "Reset at",
+            label: t("next.bandwidth.resetAt"),
             control: {
               kind: "time" as const,
               value: values.quotaResetTime,
@@ -802,11 +821,11 @@ function quotaFields(values: ServerForm, patch: (next: Partial<ServerForm>) => v
       ? [
           {
             id: "quotaWeekday",
-            label: "Reset day",
+            label: t("next.bandwidth.resetDay"),
             control: {
               kind: "select" as const,
               value: values.quota.weeklyResetWeekday,
-              options: WEEKDAYS,
+              options: WEEKDAYS.map((option) => ({ ...option, label: t(option.label) })),
               onChange: (next: string) =>
                 patch({ quota: { ...values.quota, weeklyResetWeekday: next as Weekday } }),
             },
@@ -817,7 +836,7 @@ function quotaFields(values: ServerForm, patch: (next: Partial<ServerForm>) => v
       ? [
           {
             id: "quotaMonthDay",
-            label: "Reset day of month",
+            label: t("next.bandwidth.resetDayOfMonth"),
             control: {
               kind: "number" as const,
               value: values.quota.monthlyResetDay,

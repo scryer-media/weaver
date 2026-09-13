@@ -7,6 +7,7 @@ import {
   SET_SCRIPT_LISTS_MUTATION,
   SET_SCRIPT_OPTIONS_MUTATION,
 } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
@@ -147,6 +148,7 @@ function splitExtensions(value: string): string[] {
 }
 
 export function PostProcessingPanel() {
+  const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<PostProcessingData>({
     query: POST_PROCESSING_SETTINGS_QUERY,
     requestPolicy: "cache-and-network",
@@ -226,7 +228,7 @@ export function PostProcessingPanel() {
           return;
         }
         draft.markSaved();
-        setStatus("Saved");
+        setStatus(t("next.settings.saved"));
         void reexecute({ requestPolicy: "network-only" });
       });
     },
@@ -266,7 +268,7 @@ export function PostProcessingPanel() {
         setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
         return;
       }
-      setStatus("Run list saved");
+      setStatus(t("next.postProcessing.runListSaved"));
       void reexecute({ requestPolicy: "network-only" });
     });
   };
@@ -283,7 +285,7 @@ export function PostProcessingPanel() {
       }
       setDirectory(null);
       setScope(GLOBAL);
-      setStatus("Scripts directory saved · assignments and saved options were cleared");
+      setStatus(t("next.postProcessing.directorySaved"));
       void reexecute({ requestPolicy: "network-only" });
     });
   };
@@ -323,7 +325,7 @@ export function PostProcessingPanel() {
       return;
     }
     setOptionsScript(null);
-    setStatus(`Options for ${selected.displayName} saved`);
+    setStatus(t("next.postProcessing.optionsSaved", { name: selected.displayName }));
     void reexecute({ requestPolicy: "network-only" });
   };
 
@@ -334,8 +336,8 @@ export function PostProcessingPanel() {
       setOptionValues((current) => ({ ...current, [option.name]: next }));
     const help = [
       ...option.description,
-      option.required ? "Required." : "",
-      option.defaultValue ? `Default ${option.defaultValue}.` : "",
+      option.required ? t("next.postProcessing.required") : "",
+      option.defaultValue ? t("next.postProcessing.defaultValue", { value: option.defaultValue }) : "",
     ]
       .filter(Boolean)
       .join(" ");
@@ -378,19 +380,22 @@ export function PostProcessingPanel() {
     };
   };
 
-  const scopeLabel = scope === GLOBAL ? "every download" : `the ${scope} category`;
+  const scopeNote =
+    scope === GLOBAL
+      ? t("next.postProcessing.runsForEvery")
+      : t("next.postProcessing.runsForCategory", { name: scope });
 
   const blocks: (SettingsBlock | null)[] = [
     {
       kind: "section",
       id: "execution",
-      title: "Execution",
-      note: settings?.strictSecurityRefusesExecution ? "strict security is on" : undefined,
+      title: t("next.postProcessing.execution"),
+      note: settings?.strictSecurityRefusesExecution ? t("next.postProcessing.strictOn") : undefined,
       fields: [
         {
           id: "executionEnabled",
-          label: "Run scripts",
-          help: "With this off, weaver discovers scripts but never executes one.",
+          label: t("next.postProcessing.runScripts"),
+          help: t("next.postProcessing.runScriptsHelp"),
           control: {
             kind: "toggle",
             value: values.executionEnabled,
@@ -399,8 +404,8 @@ export function PostProcessingPanel() {
         },
         {
           id: "concurrency",
-          label: "Concurrent scripts",
-          help: "How many downloads may be in post-processing at once.",
+          label: t("next.postProcessing.concurrency"),
+          help: t("next.postProcessing.concurrencyHelp"),
           control: {
             kind: "number",
             value: values.concurrency,
@@ -411,21 +416,21 @@ export function PostProcessingPanel() {
         },
         {
           id: "terminationGraceSeconds",
-          label: "Termination grace",
-          help: "How long a script has to exit after it is asked to stop.",
+          label: t("next.postProcessing.grace"),
+          help: t("next.postProcessing.graceHelp"),
           control: {
             kind: "number",
             value: values.terminationGraceSeconds,
             min: 0,
             max: 600,
-            suffix: "seconds",
+            suffix: t("next.general.seconds"),
             onChange: (next) => patch({ terminationGraceSeconds: next }),
           },
         },
         {
           id: "unacceptableExtensions",
-          label: "Unacceptable extensions",
-          help: "Comma-separated. A finished download holding one of these is refused.",
+          label: t("next.postProcessing.extensions"),
+          help: t("next.postProcessing.extensionsHelp"),
           keywords: values.unacceptableExtensions,
           control: {
             kind: "text",
@@ -436,11 +441,13 @@ export function PostProcessingPanel() {
         },
         {
           id: "strictSecurity",
-          label: "Strict security",
-          help: "Set by the daemon's own configuration; when on, anything unsigned is refused.",
+          label: t("next.postProcessing.strictSecurity"),
+          help: t("next.postProcessing.strictSecurityHelp"),
           control: {
             kind: "static",
-            value: settings?.strictSecurityRefusesExecution ? "refuses execution" : "permissive",
+            value: settings?.strictSecurityRefusesExecution
+              ? t("next.postProcessing.refuses")
+              : t("next.postProcessing.permissive"),
           },
         },
       ],
@@ -448,8 +455,8 @@ export function PostProcessingPanel() {
     {
       kind: "section",
       id: "interpreters",
-      title: "Interpreters",
-      note: "blank uses whatever is on the daemon's PATH",
+      title: t("next.postProcessing.interpreters"),
+      note: t("next.postProcessing.interpretersNote"),
       fields: [
         {
           id: "pythonInterpreter",
@@ -489,20 +496,20 @@ export function PostProcessingPanel() {
     {
       kind: "section",
       id: "directory",
-      title: "Scripts directory",
-      note: "read from the daemon's own filesystem",
+      title: t("next.postProcessing.directory"),
+      note: t("next.postProcessing.directoryNote"),
       fields: [
         {
           id: "scriptDirectory",
-          label: "Directory",
-          help: "Scripts are discovered here. Weaver never uploads, edits or deletes them.",
+          label: t("next.postProcessing.directoryLabel"),
+          help: t("next.postProcessing.directoryHelp"),
           keywords: scriptDirectory,
           control: {
             kind: "custom",
             control: (
               <div className="flex min-w-0 flex-wrap items-center gap-3">
                 <PathField
-                  label="Scripts directory"
+                  label={t("next.postProcessing.directory")}
                   value={scriptDirectory}
                   className="w-[360px] max-w-full"
                   onChange={setDirectory}
@@ -515,7 +522,7 @@ export function PostProcessingPanel() {
                   }
                   onClick={() => setConfirmDirectory(true)}
                 >
-                  Change
+                  {t("next.postProcessing.change")}
                 </SecondaryButton>
               </div>
             ),
@@ -526,22 +533,28 @@ export function PostProcessingPanel() {
     {
       kind: "table",
       id: "run-list",
-      title: "Run list",
-      note: `runs for ${scopeLabel}`,
+      title: t("next.postProcessing.runList"),
+      note: scopeNote,
       columns: "44px minmax(0, 1fr) 120px 92px 150px",
-      headers: ["Order", "Script", "Timeout", "Enabled", ""],
+      headers: [
+        t("next.postProcessing.order"),
+        t("next.postProcessing.script"),
+        t("next.postProcessing.timeout"),
+        t("next.postProcessing.enabled"),
+        "",
+      ],
       empty:
         scripts.length === 0
-          ? "No scripts were found in the scripts directory."
-          : "Nothing runs for this scope yet.",
+          ? t("next.postProcessing.noScripts")
+          : t("next.postProcessing.nothingRuns"),
       footer:
         available.length > 0 ? (
           <Select
-            label="Add a script to the run list"
+            label={t("next.postProcessing.addScriptLabel")}
             value=""
             className="min-w-0 sm:min-w-[240px]"
             options={[
-              { value: "", label: "Add a script…" },
+              { value: "", label: t("next.postProcessing.addScript") },
               ...available.map((script) => ({ value: script.name, label: script.displayName })),
             ]}
             onChange={(next) => {
@@ -567,13 +580,13 @@ export function PostProcessingPanel() {
               </span>
               {script ? null : (
                 <span className="flex-none font-wv-mono text-[11px] text-wv-error-text">
-                  missing
+                  {t("next.postProcessing.missing")}
                 </span>
               )}
             </span>,
             <NumberField
               key="timeout"
-              label={`Timeout for ${entry.script}`}
+              label={t("next.postProcessing.timeoutFor", { name: entry.script })}
               value={entry.timeoutSeconds ?? 0}
               min={0}
               max={86400}
@@ -587,7 +600,7 @@ export function PostProcessingPanel() {
             <Toggle
               key="enabled"
               size="table"
-              label={`Run ${entry.script}`}
+              label={t("next.postProcessing.runScript", { name: entry.script })}
               checked={entry.enabled}
               onChange={(next) => {
                 const updated = [...entries];
@@ -598,7 +611,7 @@ export function PostProcessingPanel() {
             <span key="order-controls" className="flex items-center gap-[6px]">
               <SecondaryButton
                 className="h-7 px-2"
-                title="Move up"
+                title={t("next.postProcessing.moveUp")}
                 disabled={index === 0}
                 onClick={() => patchEntries(moved(entries, index, index - 1))}
               >
@@ -606,7 +619,7 @@ export function PostProcessingPanel() {
               </SecondaryButton>
               <SecondaryButton
                 className="h-7 px-2"
-                title="Move down"
+                title={t("next.postProcessing.moveDown")}
                 disabled={index === entries.length - 1}
                 onClick={() => patchEntries(moved(entries, index, index + 1))}
               >
@@ -619,7 +632,7 @@ export function PostProcessingPanel() {
                   patchEntries(entries.filter((candidate) => candidate.script !== entry.script))
                 }
               >
-                Remove
+                {t("next.common.remove")}
               </SecondaryButton>
             </span>,
           ],
@@ -629,11 +642,16 @@ export function PostProcessingPanel() {
     {
       kind: "table",
       id: "scripts",
-      title: "Discovered scripts",
+      title: t("next.postProcessing.discovered"),
       note: scriptDirectory || undefined,
       columns: "minmax(0, 1fr) 110px 110px 110px",
-      headers: ["Script", "Adapter", "Version", "Options"],
-      empty: "Nothing here. Put a script in the scripts directory, then reload.",
+      headers: [
+        t("next.postProcessing.script"),
+        t("next.postProcessing.adapter"),
+        t("next.postProcessing.version"),
+        t("next.postProcessing.options"),
+      ],
+      empty: t("next.postProcessing.discoveredEmpty"),
       onRowClick: (id) => {
         const script = byName.get(id);
         if (script) {
@@ -654,7 +672,7 @@ export function PostProcessingPanel() {
             {script.version || "—"}
           </Cell>,
           <Cell key="options" mono className="text-wv-muted">
-            {script.options.length === 0 ? "none" : script.options.length}
+            {script.options.length === 0 ? t("next.job.none") : script.options.length}
           </Cell>,
         ],
       })),
@@ -663,7 +681,7 @@ export function PostProcessingPanel() {
       ? {
           kind: "custom",
           id: "problems",
-          title: "Scripts that could not be read",
+          title: t("next.postProcessing.problems"),
           note: `${problems.length}`,
           searchText: problems.map((problem) => `${problem.name} ${problem.message}`).join(" "),
           body: (
@@ -689,11 +707,11 @@ export function PostProcessingPanel() {
     <>
       <PanelControls>
         <Select
-          label="Which downloads this run list applies to"
+          label={t("next.postProcessing.scopeSelect")}
           value={scope}
           className="min-w-0 sm:min-w-[180px]"
           options={[
-            { value: GLOBAL, label: "Every download" },
+            { value: GLOBAL, label: t("next.postProcessing.everyDownload") },
             ...categories.map((category) => ({ value: category.name, label: category.name })),
           ]}
           onChange={setScope}
@@ -704,27 +722,27 @@ export function PostProcessingPanel() {
 
       <ConfirmDialog
         open={confirmDirectory}
-        title="Change scripts directory"
+        title={t("next.postProcessing.changeDirTitle")}
         note={scriptDirectory}
         busy={directoryState.fetching}
-        confirmLabel="Change directory"
-        body="Every script assignment and every saved script option is cleared. No file on disk is touched."
+        confirmLabel={t("next.postProcessing.changeDirConfirm")}
+        body={t("next.postProcessing.changeDirBody")}
         onConfirm={applyDirectory}
         onDismiss={() => setConfirmDirectory(false)}
       />
 
       <RecordEditor
         open={selected !== null}
-        title={selected?.displayName ?? "Script"}
+        title={selected?.displayName ?? t("next.postProcessing.script")}
         note={selected?.name}
         width={620}
         error={optionsError}
         busy={optionsBusy}
-        saveLabel="Save options"
+        saveLabel={t("next.postProcessing.saveOptions")}
         saveDisabled={(selected?.options.length ?? 0) === 0}
         sections={
           selected
-            ? [{ id: "options", title: "Options", fields: selected.options.map(optionField) }]
+            ? [{ id: "options", title: t("next.postProcessing.options"), fields: selected.options.map(optionField) }]
             : []
         }
         onSave={() => void persistOptions()}
@@ -735,7 +753,7 @@ export function PostProcessingPanel() {
       >
         {selected && selected.options.length === 0 ? (
           <div className="flex-none px-4 sm:px-6 py-5 text-[13px] text-wv-muted">
-            {selected.displayName} declares no options.
+            {t("next.postProcessing.noOptions", { name: selected.displayName })}
           </div>
         ) : null}
       </RecordEditor>
