@@ -499,6 +499,7 @@ async fn accepted_ip_replacement_trial_samples_update_per_ip_ewma() {
         lane_id: 0,
         old_key,
         samples: vec![weaver_nntp::client::FetchAttemptTrace {
+            connection_health: None,
             server_idx: 0,
             remote_ip: Some(candidate_ip),
             elapsed: Duration::from_millis(25),
@@ -546,6 +547,7 @@ async fn disabled_ip_replacement_ignores_late_candidate_acceptance() {
         lane_id: 0,
         old_key,
         samples: vec![weaver_nntp::client::FetchAttemptTrace {
+            connection_health: None,
             server_idx: 0,
             remote_ip: Some(candidate_ip),
             elapsed: Duration::from_millis(25),

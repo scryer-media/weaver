@@ -893,6 +893,45 @@ fn render_servers(out: &mut Encoder, server_health: &[ServerHealthInfo], runtime
             srv.connections_available,
         );
         out.sample(&f::SERVER_CONNECTIONS_ACTIVE, id, srv.connections_active);
+        for (phase, count) in [
+            ("physical", srv.sockets.physical),
+            ("dialing", srv.sockets.dialing),
+            ("async_idle", srv.sockets.async_idle),
+            ("owned_idle", srv.sockets.owned_idle),
+            ("closing", srv.sockets.closing),
+            ("replacement", srv.sockets.replacement),
+        ] {
+            out.sample(
+                &f::SERVER_SOCKETS,
+                &[
+                    ("server_id", srv.server_id.as_str()),
+                    ("server", srv.label.as_str()),
+                    ("phase", phase),
+                ],
+                count,
+            );
+        }
+        out.sample(
+            &f::SERVER_LOCAL_ADMISSION_DENIALS,
+            id,
+            srv.sockets.local_denials,
+        );
+        out.sample(
+            &f::SERVER_PROVIDER_REFUSALS,
+            id,
+            srv.sockets.provider_refusals,
+        );
+        out.sample(&f::SERVER_RECOVERY_EPOCH, id, srv.recovery.epoch);
+        out.sample(
+            &f::SERVER_RECOVERY_PROBE,
+            id,
+            u8::from(srv.recovery.probe_id.is_some()),
+        );
+        out.sample_f64(
+            &f::SERVER_RECOVERY_WAIT_SECONDS,
+            id,
+            srv.recovery.remaining.unwrap_or_default().as_secs_f64(),
+        );
         out.sample(&f::SERVER_CONNECTIONS_MAX, id, srv.connections_max);
         out.sample(
             &f::SERVER_CONNECTIONS_CONFIGURED,

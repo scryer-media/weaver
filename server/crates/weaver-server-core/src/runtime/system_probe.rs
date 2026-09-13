@@ -775,16 +775,17 @@ fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
         return (StorageClass::Network, filesystem);
     }
 
-    let storage_class = windows_seek_penalty(root_wide)
-        .map(|incurs_seek_penalty| {
-            if incurs_seek_penalty {
-                StorageClass::Hdd
-            } else {
-                StorageClass::Ssd
-            }
-        })
-        .unwrap_or(StorageClass::Unknown);
+    let storage_class = storage_class_from_seek_penalty(windows_seek_penalty(root_wide));
     (storage_class, filesystem)
+}
+
+#[cfg(any(windows, test))]
+fn storage_class_from_seek_penalty(penalty: Option<bool>) -> StorageClass {
+    match penalty {
+        Some(true) => StorageClass::Hdd,
+        Some(false) => StorageClass::Ssd,
+        None => StorageClass::Unknown,
+    }
 }
 
 /// Ask the storage device behind a volume root like `C:\` whether it incurs a

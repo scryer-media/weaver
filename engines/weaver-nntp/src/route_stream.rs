@@ -14,6 +14,12 @@ pub enum RouteStream {
         stream: DirectStream,
         peeked: Option<Option<u8>>,
     },
+    /// Installed only during a synchronous idle TLS inspection. Limits the
+    /// ciphertext consumed by backends that drive several reads per poll.
+    Inspecting {
+        inner: Option<Box<RouteStream>>,
+        remaining: usize,
+    },
 }
 impl From<tokio::net::TcpStream> for RouteStream {
     fn from(stream: tokio::net::TcpStream) -> Self {
@@ -29,6 +35,26 @@ impl From<DirectStream> for RouteStream {
     }
 }
 impl RouteStream {
+    pub(crate) fn begin_inspection(&mut self) {
+        let inner = std::mem::replace(
+            self,
+            Self::Inspecting {
+                inner: None,
+                remaining: 64 * 1024,
+            },
+        );
+        if let Self::Inspecting { inner: slot, .. } = self {
+            *slot = Some(Box::new(inner));
+        }
+    }
+
+    pub(crate) fn end_inspection(&mut self) {
+        let Self::Inspecting { inner, .. } = self else {
+            return;
+        };
+        *self = *inner.take().expect("inspection owns its transport");
+    }
+
     pub(crate) async fn readable(&mut self) -> io::Result<()> {
         match self {
             Self::Tcp(stream) => stream.readable().await,
@@ -43,6 +69,7 @@ impl RouteStream {
                 }
                 Ok(())
             }
+            Self::Inspecting { .. } => Err(io::ErrorKind::WouldBlock.into()),
         }
     }
     pub(crate) fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -77,6 +104,22 @@ impl AsyncRead for RouteStream {
                 }
                 Pin::new(stream).poll_read(cx, buf)
             }
+            Self::Inspecting { inner, remaining } => {
+                if *remaining == 0 {
+                    return Poll::Pending;
+                }
+                let mut limited = buf.take(*remaining);
+                let result = Pin::new(inner.as_deref_mut().expect("inspection transport"))
+                    .poll_read(cx, &mut limited);
+                let read = limited.filled().len();
+                // `ReadBuf::take` initialized these bytes through the child.
+                unsafe {
+                    buf.assume_init(read);
+                }
+                buf.advance(read);
+                *remaining -= read;
+                result
+            }
         }
     }
 }
@@ -89,18 +132,27 @@ impl AsyncWrite for RouteStream {
         match self.get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
             Self::Tunnel { stream, .. } => Pin::new(stream).poll_write(cx, buf),
+            Self::Inspecting { inner, .. } => {
+                Pin::new(inner.as_deref_mut().expect("inspection transport")).poll_write(cx, buf)
+            }
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
             Self::Tunnel { stream, .. } => Pin::new(stream).poll_flush(cx),
+            Self::Inspecting { inner, .. } => {
+                Pin::new(inner.as_deref_mut().expect("inspection transport")).poll_flush(cx)
+            }
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
             Self::Tunnel { stream, .. } => Pin::new(stream).poll_shutdown(cx),
+            Self::Inspecting { inner, .. } => {
+                Pin::new(inner.as_deref_mut().expect("inspection transport")).poll_shutdown(cx)
+            }
         }
     }
 }
@@ -212,3 +264,7 @@ impl Write for BlockingSocket {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "route_stream/tests.rs"]
+mod tests;

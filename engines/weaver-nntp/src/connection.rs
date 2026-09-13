@@ -348,6 +348,9 @@ pub struct NntpConnection {
     tls_cipher_preference: crate::tls::TlsCipherPreference,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
+    // Declared after the transport: a physical slot is refunded only after close.
+    pub(crate) socket_slot: Option<crate::socket_budget::SocketSlot>,
+    pub(crate) health_lease: Option<Arc<crate::recovery::ConnectionHealthLease>>,
     /// Immutable geometry the next decoded article's CRC pass checkpoints at.
     ///
     /// Set per fetch by the lane rather than at connect time: connections are
@@ -503,6 +506,8 @@ impl NntpConnection {
             tls_cipher_preference: config.tls_cipher_preference,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            socket_slot: None,
+            health_lease: None,
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
             group_probe_armed: false,
@@ -2022,6 +2027,24 @@ impl NntpConnection {
     /// When this connection was last used for a command.
     pub fn last_used(&self) -> Instant {
         self.last_used
+    }
+
+    pub(crate) fn idle_terminal(&mut self) -> bool {
+        !self.read_buf.is_empty()
+            || self
+                .transport
+                .as_mut()
+                .is_none_or(NntpTransport::idle_terminal)
+    }
+
+    pub(crate) fn accepts_new_work(&self) -> bool {
+        self.health_lease
+            .as_ref()
+            .is_none_or(|lease| lease.0.current())
+            && self
+                .socket_slot
+                .as_ref()
+                .is_none_or(|slot| !slot.retiring())
     }
 
     /// The server's advertised capabilities.

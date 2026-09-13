@@ -280,6 +280,22 @@ Weaver-web should feel rich, but it should still be a projection client over bac
 
 NNTP, NZB, yEnc, PAR2, and RAR are real engine boundaries.
 
+The NNTP engine owns physical socket admission per durable server. A socket
+retains its slot through dialing, handshake, active use, idle caching and local
+closure, across client generations and transport backends. Dispatch bookings
+are separate from that budget. Reclaiming an idle transport targets its owner
+and socket identity; only closure refunds its slot. Explicit IP-replacement
+trials have a separate, bounded allowance.
+
+Transport quarantine has connection-scoped outcomes and recovery epochs. Old
+socket outcomes cannot settle a new episode. Recovery admits one fresh,
+demanded article; a completed BODY response or valid not-found response proves
+recovery, while handshake alone does not. The server actor returns surplus
+article reservations before issuing that probe. Transport retries start at
+30 seconds and cap at 60 seconds; authentication and provider capacity refusals
+retain their separate policies. Idle inspection processes transport state
+without article work, with bounded input and no blocking waits.
+
 Those crates should own protocol and algorithm concerns. They should not own product semantics such as:
 
 - queue policy

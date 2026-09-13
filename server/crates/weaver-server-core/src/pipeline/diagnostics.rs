@@ -146,6 +146,19 @@ pub struct PoolServerDiagnostics {
     pub available_permits: usize,
     pub leased_connections: usize,
     pub over_limit: bool,
+    pub physical_slots: usize,
+    pub physical_limit: usize,
+    pub dialing_sockets: usize,
+    pub async_idle_sockets: usize,
+    pub owned_idle_sockets: usize,
+    pub closing_sockets: usize,
+    pub replacement_sockets: usize,
+    pub provider_refusals: u64,
+    pub local_admission_denials: u64,
+    pub recovery_epoch: u64,
+    pub recovery_probe_id: Option<u64>,
+    pub recovery_next_attempt_ms: Option<u64>,
+    pub recovery_quarantined: bool,
 }
 
 /// Download lane occupancy, taken from the published lane counters.
@@ -292,6 +305,8 @@ impl Pipeline {
                 (0..pool.server_count())
                     .map(|index| {
                         let (available_permits, configured_connections) = pool.server_load(index);
+                        let sockets = pool.socket_budget_snapshot(index);
+                        let recovery = pool.recovery_snapshot(index);
                         PoolServerDiagnostics {
                             server_index: index,
                             address: pool.server_address(weaver_nntp::ServerId(index)),
@@ -300,6 +315,21 @@ impl Pipeline {
                             leased_connections: configured_connections
                                 .saturating_sub(available_permits),
                             over_limit: pool.is_over_limit(weaver_nntp::ServerId(index)),
+                            physical_slots: sockets.physical,
+                            physical_limit: sockets.limit,
+                            dialing_sockets: sockets.dialing,
+                            async_idle_sockets: sockets.async_idle,
+                            owned_idle_sockets: sockets.owned_idle,
+                            closing_sockets: sockets.closing,
+                            replacement_sockets: sockets.replacement,
+                            provider_refusals: sockets.provider_refusals,
+                            local_admission_denials: sockets.local_denials,
+                            recovery_epoch: recovery.epoch,
+                            recovery_probe_id: recovery.probe_id,
+                            recovery_next_attempt_ms: recovery.remaining.map(|remaining| {
+                                remaining.as_millis().try_into().unwrap_or(u64::MAX)
+                            }),
+                            recovery_quarantined: recovery.quarantined,
                         }
                     })
                     .collect()

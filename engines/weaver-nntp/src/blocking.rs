@@ -182,6 +182,7 @@ pub struct BlockingBodyLane {
     /// Outstanding pipelined BODY commands, when the caller drives the lane
     /// request-by-request instead of batch-by-batch.
     ring: BodyRing,
+    idle_since: std::sync::Mutex<Option<Instant>>,
     _permit: BlockingConnectionPermit,
 }
 
@@ -261,6 +262,7 @@ impl BlockingBodyLane {
         // for a server that has proven it refuses message-id fetches with 412.
         if !conn.needs_group_prologue() {
             let remote_ip = conn.remote_ip();
+            permit.socket_slot.active();
             return Ok(Self {
                 conn,
                 checkpoint_plan: CheckpointPlan::None,
@@ -273,12 +275,14 @@ impl BlockingBodyLane {
                 soft_timeout,
                 ring: BodyRing::default(),
                 _permit: permit,
+                idle_since: std::sync::Mutex::new(None),
             });
         }
         for group in groups {
             match conn.select_group(group) {
                 Ok(()) => {
                     let remote_ip = conn.remote_ip();
+                    permit.socket_slot.active();
                     return Ok(Self {
                         conn,
                         checkpoint_plan: CheckpointPlan::None,
@@ -290,6 +294,7 @@ impl BlockingBodyLane {
                         transfer_ewma: None,
                         soft_timeout,
                         ring: BodyRing::default(),
+                        idle_since: std::sync::Mutex::new(None),
                         _permit: permit,
                     });
                 }
@@ -300,6 +305,7 @@ impl BlockingBodyLane {
 
         if groups.is_empty() {
             let remote_ip = conn.remote_ip();
+            permit.socket_slot.active();
             Ok(Self {
                 conn,
                 checkpoint_plan: CheckpointPlan::None,
@@ -311,6 +317,7 @@ impl BlockingBodyLane {
                 transfer_ewma: None,
                 soft_timeout,
                 ring: BodyRing::default(),
+                idle_since: std::sync::Mutex::new(None),
                 _permit: permit,
             })
         } else {
@@ -395,15 +402,54 @@ impl BlockingBodyLane {
 
     /// Whether the server has closed its side of the connection.
     ///
-    /// A non-blocking peek at the socket: a closed peer answers end-of-file
-    /// or an error, a live one has nothing to read yet. Meant for a cached
-    /// lane between leases, where the socket is otherwise silent; an idle
-    /// connection the server timed out would otherwise fail its first BODY
-    /// only after a full read timeout, holding its permit the whole while.
-    pub fn peer_closed(&self) -> bool {
-        // A tunnelled lane has no socket to peek at; it stays cached and a
-        // dead tunnel surfaces on its next read like any other transport error.
-        self.conn.transport.tcp().is_some_and(tcp_peer_closed)
+    /// Inspect only between leases, through TLS where applicable. Partial
+    /// records remain in the transport and inspection never waits for input.
+    pub fn peer_closed(&mut self) -> bool {
+        if !self.ring.outstanding.is_empty() || !self.conn.body_accounting.is_empty() {
+            return false;
+        }
+        if !self.accepts_new_work() {
+            return true;
+        }
+        let idle = self
+            .idle_since
+            .lock()
+            .expect("lane idle clock poisoned")
+            .map_or(Duration::ZERO, |since| since.elapsed());
+        if idle >= Duration::from_mins(5) {
+            return true;
+        }
+        if self.conn.transport.tcp().is_none() {
+            return idle >= Duration::from_secs(30);
+        }
+        !self.conn.read_buf.is_empty() || self.conn.transport.idle_terminal()
+    }
+
+    pub fn socket_id(&self) -> u64 {
+        self._permit.socket_slot.id()
+    }
+
+    pub fn mark_idle(&self, recall: Arc<dyn Fn(u64) + Send + Sync>) {
+        self.idle_since
+            .lock()
+            .expect("lane idle clock poisoned")
+            .get_or_insert_with(Instant::now);
+        self._permit
+            .socket_slot
+            .idle(crate::socket_budget::SocketPhase::OwnedIdle, recall);
+    }
+
+    pub fn mark_active(&self) {
+        *self.idle_since.lock().expect("lane idle clock poisoned") = None;
+        self._permit.socket_slot.active();
+    }
+
+    pub fn is_recovery_probe(&self) -> bool {
+        self._permit.health_lease.0.probing()
+    }
+
+    pub fn accepts_new_work(&self) -> bool {
+        self._permit.health_lease.0.current() && !self._permit.socket_slot.retiring()
     }
 
     /// Answer an existence probe on this lane's connection.
@@ -835,6 +881,7 @@ impl BlockingBodyLane {
             && self.ring.outstanding.is_empty()
             && !self.conn.poisoned
         {
+            self.conn.command_timeout = self.conn.command_timeout.min(Duration::from_millis(250));
             let _ = self.conn.quit();
         } else {
             self.conn.fail_body_pipeline();
@@ -931,6 +978,7 @@ impl BlockingBodyLane {
 
         DecodedBodyTrace {
             attempts: vec![FetchAttemptTrace {
+                connection_health: Some(Arc::clone(&self._permit.health_lease.0)),
                 server_idx: self.server_id.0,
                 remote_ip: self.remote_ip,
                 elapsed,
@@ -2119,8 +2167,8 @@ pub(crate) fn tcp_peer_closed(tcp: &TcpStream) -> bool {
     }
     let mut probe = [0u8; 1];
     let closed = match tcp.peek(&mut probe) {
-        Ok(0) => true,
-        Ok(_) => false,
+        // Any unsolicited plaintext is terminal for an idle NNTP session.
+        Ok(_) => true,
         Err(err) => !matches!(
             err.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
@@ -2131,6 +2179,58 @@ pub(crate) fn tcp_peer_closed(tcp: &TcpStream) -> bool {
 }
 
 impl BlockingTransport {
+    fn idle_terminal(&mut self) -> bool {
+        match self {
+            Self::Plain(tcp) => tcp.tcp().is_some_and(tcp_peer_closed),
+            Self::Rustls(inner) => {
+                if inner.tcp.set_nonblocking(true).is_err() {
+                    return true;
+                }
+                let mut plaintext = BytesMut::new();
+                let mut remaining = 64 * 1024;
+                let closed = loop {
+                    if inner.session.idle_terminal() {
+                        break true;
+                    }
+                    if remaining == 0 {
+                        break false;
+                    }
+                    let limit = inner.read_buffer.len().min(remaining);
+                    match inner.tcp.read(&mut inner.read_buffer[..limit]) {
+                        Ok(0) => break true,
+                        Ok(n) => {
+                            remaining -= n;
+                            if inner
+                                .session
+                                .feed_ciphertext_slice(
+                                    &inner.read_buffer[..n],
+                                    &mut plaintext,
+                                    None,
+                                )
+                                .is_err()
+                                || !plaintext.is_empty()
+                            {
+                                break true;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            break false;
+                        }
+                        Err(_) => break true,
+                    }
+                };
+                inner.tcp.set_nonblocking(false).is_err() || closed
+            }
+            #[cfg(not(windows))]
+            Self::S2n(inner) => inner.idle_terminal(),
+        }
+    }
+
     /// The direct TCP socket under this transport, if it is not tunnelled.
     fn tcp(&self) -> Option<&TcpStream> {
         match self {
@@ -2341,6 +2441,43 @@ impl BlockingManualTlsStream {
 
 #[cfg(not(windows))]
 impl BlockingS2nStream {
+    fn idle_terminal(&mut self) -> bool {
+        let Some(tcp) = self.tcp.tcp() else {
+            return false;
+        };
+        if tcp.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let mut input = s2n_io::IdleInput {
+            tcp,
+            remaining: 64 * 1024,
+        };
+        let context = (&mut input as *mut s2n_io::IdleInput<'_>).cast();
+        // s2n invokes this bounded callback synchronously; restore the direct
+        // fd before the stack context or its socket reference leaves scope.
+        let configured = unsafe {
+            s2n::s2n_connection_set_recv_ctx(self.conn.as_ptr(), context) == 0
+                && s2n::s2n_connection_set_recv_cb(self.conn.as_ptr(), Some(s2n_io::idle_recv)) == 0
+        };
+        let mut blocked = s2n::s2n_blocked_status::NOT_BLOCKED;
+        let mut byte = [0u8; 1];
+        let result = if configured {
+            unsafe {
+                s2n::s2n_recv(
+                    self.conn.as_ptr(),
+                    byte.as_mut_ptr().cast(),
+                    1,
+                    &mut blocked,
+                )
+            }
+        } else {
+            0
+        };
+        let terminal = result >= 0 || !s2n_retryable_blocked();
+        let restored = unsafe { s2n::s2n_connection_set_fd(self.conn.as_ptr(), tcp.as_raw_fd()) };
+        tcp.set_nonblocking(false).is_err() || restored != 0 || terminal
+    }
+
     fn connect(
         tcp: impl Into<BlockingSocket>,
         host: &str,

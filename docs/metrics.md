@@ -481,6 +481,12 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_server_latency_seconds` | gauge | `server_id`, `server` | EWMA request latency per server. |
 | `weaver_server_connections_available` | gauge | `server_id`, `server` | Available connection permits per server. |
 | `weaver_server_connections_active` | gauge | `server_id`, `server` | Connections currently checked out per server. |
+| `weaver_server_sockets` | gauge | `server_id`, `server`, `phase` | Physical socket occupancy, including dialing, idle, closing and replacement sockets. |
+| `weaver_server_local_admission_denials_total` | counter | `server_id`, `server` | Physical socket acquisitions denied locally. |
+| `weaver_server_provider_refusals_total` | counter | `server_id`, `server` | Actual connection-capacity refusals received from the provider. |
+| `weaver_server_recovery_epoch` | gauge | `server_id`, `server` | Current transport recovery epoch. |
+| `weaver_server_recovery_probe` | gauge | `server_id`, `server` | Whether a demanded recovery probe is owned. |
+| `weaver_server_recovery_wait_seconds` | gauge | `server_id`, `server` | Remaining delay before a fresh demanded recovery attempt. |
 | `weaver_server_connections_max` | gauge | `server_id`, `server` | Maximum connections per server. |
 | `weaver_server_connections_configured` | gauge | `server_id`, `server` | Operator-configured maximum connections per server. |
 | `weaver_server_capacity_penalty_until_epoch_ms` | gauge | `server_id`, `server` | Provider over-limit holdoff deadline in unix epoch milliseconds. **Deprecated — use `weaver_server_capacity_penalty_until_seconds`.** |
