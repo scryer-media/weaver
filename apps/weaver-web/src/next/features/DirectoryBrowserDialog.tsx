@@ -64,6 +64,7 @@ export function DirectoryBrowserDialog({
   const requestRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const crumbsRef = useRef<HTMLDivElement | null>(null);
+  const pathInputRef = useRef<HTMLInputElement | null>(null);
 
   const show = useCallback((next: DirectoryListing) => {
     setListing(next);
@@ -117,6 +118,13 @@ export function DirectoryBrowserDialog({
     // A saved path that no longer exists still opens somewhere useful.
     void browse(start, start === null ? "/" : null);
   }, [browse, initialPath, open]);
+
+  // Keys go to the picker once it is up, not to the field under the overlay.
+  useEffect(() => {
+    if (open) {
+      pathInputRef.current?.focus();
+    }
+  }, [open]);
 
   const createFolder = async () => {
     const name = newFolder.trim();
@@ -176,11 +184,17 @@ export function DirectoryBrowserDialog({
       width={720}
       footer={
         <>
+          {/* A failed create reports here, on the path's one line, rather than
+              adding a line of its own that would grow the dialog. */}
           <span
-            title={currentPath}
-            className="mr-auto min-w-0 flex-[1_1_200px] truncate font-wv-mono text-[11.5px] text-wv-muted"
+            aria-live="polite"
+            title={createError ?? currentPath}
+            className={cn(
+              "mr-auto min-w-0 flex-[1_1_200px] truncate text-[11.5px]",
+              createError === null ? "font-wv-mono text-wv-muted" : "text-wv-error-text",
+            )}
           >
-            {currentPath}
+            {createError ?? currentPath}
           </span>
           <SecondaryButton onClick={onClose}>Cancel</SecondaryButton>
           <PrimaryButton disabled={busy || !listing} onClick={() => listing && onChoose(listing.currentPath)}>
@@ -219,6 +233,7 @@ export function DirectoryBrowserDialog({
         <div className="flex flex-none flex-wrap items-center gap-2 border-b border-wv-hairline px-4 py-3 sm:px-6">
           <div className="flex min-w-0 flex-[1_1_320px] gap-2">
             <TextField
+              ref={pathInputRef}
               label="Folder path"
               value={typedPath}
               onChange={setTypedPath}
@@ -255,21 +270,20 @@ export function DirectoryBrowserDialog({
           cells={["Folder", listing && !loading && error === null ? describeEntryCount(shown.length, entries.length) : ""]}
           cellClassNames={[undefined, "text-right"]}
         />
-        {parent === null || loading ? null : (
-          <GridRow
-            columns={COLUMNS}
-            title={parent}
-            onClick={busy ? undefined : () => void browse(parent)}
-            className="h-[34px] flex-none border-b border-wv-hairline px-4 sm:px-[22px]"
-          >
-            <Cell mono className="text-wv-muted">
-              ..
-            </Cell>
-            <Cell mono className="text-right text-[11px] text-wv-faint">
-              up one level
-            </Cell>
-          </GridRow>
-        )}
+        {/* Always drawn, so the dialog keeps its height at a root or mid-load. */}
+        <GridRow
+          columns={COLUMNS}
+          title={parent ?? undefined}
+          onClick={parent === null || busy ? undefined : () => void browse(parent)}
+          className="h-[34px] flex-none border-b border-wv-hairline px-4 sm:px-[22px]"
+        >
+          <Cell mono className={parent === null ? "text-wv-faint" : "text-wv-muted"}>
+            ..
+          </Cell>
+          <Cell mono className="text-right text-[11px] text-wv-faint">
+            {listing !== null && parent === null ? "top level" : "up one level"}
+          </Cell>
+        </GridRow>
 
         <div
           ref={scrollRef}
@@ -331,13 +345,8 @@ export function DirectoryBrowserDialog({
             className="min-w-0 flex-[1_1_240px]"
           />
           <SecondaryButton disabled={busy || !listing || newFolder.trim() === ""} onClick={() => void createFolder()}>
-            {creating ? "Creating…" : "Create folder"}
+            Create folder
           </SecondaryButton>
-          {createError === null ? null : (
-            <div aria-live="polite" className="w-full text-[12px] text-wv-error-text">
-              {createError}
-            </div>
-          )}
         </div>
       </div>
     </Dialog>
@@ -345,8 +354,9 @@ export function DirectoryBrowserDialog({
 }
 
 /**
- * A path text field with a Browse button beside it: typing still works, and
- * the picker fills the field for anyone who would rather look.
+ * A path text field with a Browse button beside it. Focusing the field opens
+ * the picker too; closing it hands focus back to the field without reopening,
+ * so a path can still be typed, pasted or cleared there.
  */
 export function PathField({
   value,
@@ -366,22 +376,55 @@ export function PathField({
 }) {
   const [browsing, setBrowsing] = useState(false);
   const [startPath, setStartPath] = useState<string | null>(null);
+  const fieldRef = useRef<HTMLInputElement | null>(null);
+  // Set when focus is about to come back to the field on its own — the picker
+  // closing, or the window regaining focus — so that focus doesn't reopen it.
+  const quietFocus = useRef(false);
+
+  useEffect(() => {
+    const onWindowBlur = () => {
+      if (document.activeElement === fieldRef.current) {
+        quietFocus.current = true;
+      }
+    };
+    window.addEventListener("blur", onWindowBlur);
+    return () => window.removeEventListener("blur", onWindowBlur);
+  }, []);
+
+  const openPicker = () => {
+    setStartPath(value.trim() || null);
+    setBrowsing(true);
+  };
+  const closePicker = () => {
+    setBrowsing(false);
+    const field = fieldRef.current;
+    if (field && document.activeElement !== field) {
+      quietFocus.current = true;
+      field.focus();
+    }
+  };
+
   return (
     <div className={cn("flex min-w-0 items-center gap-2", className ?? "w-[340px] max-w-full")}>
       <TextField
+        ref={fieldRef}
         label={label}
         value={value}
         placeholder={placeholder}
         onChange={onChange}
+        onFocus={() => {
+          if (quietFocus.current) {
+            quietFocus.current = false;
+            return;
+          }
+          openPicker();
+        }}
         className={cn("min-w-0 flex-1", compact && "h-7")}
       />
       <SecondaryButton
         size={compact ? "compact" : "default"}
         className={compact ? "h-7" : undefined}
-        onClick={() => {
-          setStartPath(value.trim() || null);
-          setBrowsing(true);
-        }}
+        onClick={openPicker}
       >
         Browse
       </SecondaryButton>
@@ -389,10 +432,10 @@ export function PathField({
         open={browsing}
         initialPath={startPath}
         title={label}
-        onClose={() => setBrowsing(false)}
+        onClose={closePicker}
         onChoose={(path) => {
           onChange(path);
-          setBrowsing(false);
+          closePicker();
         }}
       />
     </div>

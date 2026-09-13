@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode, type Ref } from "react";
 import { cn } from "@/lib/utils";
 import { Menu, MenuItem } from "./Menu";
 
@@ -431,7 +431,9 @@ export function TextField({
   mono = true,
   type = "text",
   onBlur,
+  onFocus,
   onKeyDown,
+  ref,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -441,16 +443,20 @@ export function TextField({
   mono?: boolean;
   type?: "text" | "password" | "url";
   onBlur?: () => void;
+  onFocus?: () => void;
   onKeyDown?: (event: React.KeyboardEvent<HTMLInputElement>) => void;
+  ref?: Ref<HTMLInputElement>;
 }) {
   return (
     <input
+      ref={ref}
       type={type}
       aria-label={label}
       placeholder={placeholder}
       value={value}
       onChange={(event) => onChange(event.target.value)}
       onBlur={onBlur}
+      onFocus={onFocus}
       onKeyDown={onKeyDown}
       className={cn(
         "h-[34px] border border-wv-control bg-wv-input px-3 text-wv-fg outline-none focus:border-wv-control-focus",
