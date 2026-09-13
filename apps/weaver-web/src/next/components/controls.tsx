@@ -183,7 +183,9 @@ export function Toggle({
 /* ----------------------------------------------------------------- checkbox */
 
 /**
- * The 12px selection square.
+ * The 14px selection square. Its empty border is the faint text colour, about
+ * 4:1 against the list ground, and important: the global unlayered
+ * `* { border-color }` rule otherwise wins and the box fades into the rows.
  *
  * Rows own the click that opens them, so the box stops propagation itself —
  * every caller would otherwise have to remember to, and one that forgot would
@@ -216,13 +218,15 @@ export function CheckBox({
           onChange(!checked);
         }
       }}
-      className={cn("flex items-center", disabled ? "cursor-default opacity-40" : "cursor-pointer", className)}
+      className={cn("group flex items-center", disabled ? "cursor-default opacity-40" : "cursor-pointer", className)}
     >
       <span
         aria-hidden="true"
         className={cn(
-          "size-3 flex-none border",
-          checked ? "border-wv-accent bg-wv-accent" : "border-wv-inert",
+          "size-3.5 flex-none border",
+          checked
+            ? "!border-wv-accent bg-wv-accent"
+            : cn("!border-wv-faint", !disabled && "group-hover:!border-wv-muted"),
         )}
       />
     </button>
