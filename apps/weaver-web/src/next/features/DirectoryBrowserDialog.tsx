@@ -245,7 +245,11 @@ export function DirectoryBrowserDialog({
               }}
               className="min-w-0 flex-1"
             />
-            <SecondaryButton disabled={busy || typedPath.trim() === ""} onClick={() => void browse(typedPath.trim())}>
+            <SecondaryButton
+              icon="go"
+              disabled={busy || typedPath.trim() === ""}
+              onClick={() => void browse(typedPath.trim())}
+            >
               Go
             </SecondaryButton>
           </div>
@@ -344,7 +348,11 @@ export function DirectoryBrowserDialog({
             }}
             className="min-w-0 flex-[1_1_240px]"
           />
-          <SecondaryButton disabled={busy || !listing || newFolder.trim() === ""} onClick={() => void createFolder()}>
+          <SecondaryButton
+            icon="createFolder"
+            disabled={busy || !listing || newFolder.trim() === ""}
+            onClick={() => void createFolder()}
+          >
             Create folder
           </SecondaryButton>
         </div>
@@ -422,6 +430,7 @@ export function PathField({
         className={cn("min-w-0 flex-1", compact && "h-7")}
       />
       <SecondaryButton
+        icon="browse"
         size={compact ? "compact" : "default"}
         className={compact ? "h-7" : undefined}
         onClick={openPicker}

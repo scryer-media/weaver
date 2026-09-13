@@ -31,6 +31,7 @@ import {
 } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { DangerButton, SecondaryButton } from "../components/controls";
+import { Icon } from "../components/icons";
 import { PhaseBars, useJobProgress } from "../components/PhaseBars";
 import { GridRow } from "../components/rows";
 import { Waterfall } from "../components/Waterfall";
@@ -231,7 +232,7 @@ export function JobDetailPage() {
             body="It was deleted from history, or the link points at an id weaver does not hold."
           />
           <div className="px-4 sm:px-6">
-            <SecondaryButton onClick={() => navigate("/history")}>Back to Completed</SecondaryButton>
+            <SecondaryButton icon="back" onClick={() => navigate("/history")}>Back to Completed</SecondaryButton>
           </div>
         </div>
       </NextShell>
@@ -324,9 +325,10 @@ export function JobDetailPage() {
           <div className="flex min-w-0 flex-[1_1_260px] items-center gap-[11px]">
             <Link
               to={inQueue ? "/" : "/history"}
-              className="flex-none font-wv-mono text-[11.5px] text-wv-muted hover:text-wv-fg"
+              className="flex flex-none items-center gap-[5px] font-wv-mono text-[11.5px] text-wv-muted hover:text-wv-fg"
             >
-              {inQueue ? "‹ Downloads" : "‹ Completed"}
+              <Icon name="back" size={13} />
+              {inQueue ? "Downloads" : "Completed"}
             </Link>
             <span aria-hidden="true" className="flex-none text-wv-dim">
               /
@@ -340,6 +342,7 @@ export function JobDetailPage() {
             {inQueue ? (
               <>
                 <SecondaryButton
+                  icon={token === "paused" ? "resume" : "pause"}
                   size="compact"
                   disabled={busy}
                   onClick={() => {
@@ -352,6 +355,7 @@ export function JobDetailPage() {
                   {token === "paused" ? "Resume" : "Pause"}
                 </SecondaryButton>
                 <SecondaryButton
+                  icon="postProcessing"
                   size="compact"
                   disabled={busy}
                   onClick={() => {
@@ -362,13 +366,14 @@ export function JobDetailPage() {
                 >
                   Re-run scripts
                 </SecondaryButton>
-                <DangerButton size="compact" disabled={busy} onClick={() => setConfirm("cancel")}>
+                <DangerButton icon="cancelDownload" size="compact" disabled={busy} onClick={() => setConfirm("cancel")}>
                   Cancel
                 </DangerButton>
               </>
             ) : (
               <>
                 <SecondaryButton
+                  icon="redownload"
                   size="compact"
                   disabled={busy}
                   onClick={() => {
@@ -378,6 +383,7 @@ export function JobDetailPage() {
                   Re-download
                 </SecondaryButton>
                 <SecondaryButton
+                  icon="postProcessing"
                   size="compact"
                   disabled={busy}
                   onClick={() => {
@@ -389,6 +395,7 @@ export function JobDetailPage() {
                   Re-run scripts
                 </SecondaryButton>
                 <SecondaryButton
+                  icon="reprocess"
                   size="compact"
                   disabled={busy}
                   onClick={() => {
@@ -399,7 +406,7 @@ export function JobDetailPage() {
                 >
                   Reprocess
                 </SecondaryButton>
-                <DangerButton size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
+                <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
                   Delete
                 </DangerButton>
               </>
@@ -704,6 +711,7 @@ export function JobDetailPage() {
               }
             />
             <DangerButton
+              icon="forget"
               className="mt-1 h-[30px] w-full"
               disabled={busy || !duplicate}
               onClick={() => setConfirm("forget")}

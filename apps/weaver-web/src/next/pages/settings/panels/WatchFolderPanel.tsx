@@ -268,7 +268,7 @@ export function WatchFolderPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton onClick={() => void runScan()} disabled={scanState.fetching}>
+        <SecondaryButton icon="refresh" onClick={() => void runScan()} disabled={scanState.fetching}>
           {scanState.fetching ? "Scanning…" : "Scan now"}
         </SecondaryButton>
       </PanelControls>

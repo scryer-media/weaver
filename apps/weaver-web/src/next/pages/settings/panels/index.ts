@@ -1,18 +1,5 @@
 import type { ComponentType } from "react";
-import {
-  CalendarClock,
-  DatabaseBackup,
-  FolderInput,
-  FolderTree,
-  Gauge,
-  Rss,
-  Server,
-  Shield,
-  SlidersHorizontal,
-  SquareTerminal,
-  Waypoints,
-  type LucideIcon,
-} from "lucide-react";
+import type { IconName } from "../../../components/icons";
 import { BackupPanel } from "./BackupPanel";
 import { BandwidthPanel } from "./BandwidthPanel";
 import { CategoriesPanel } from "./CategoriesPanel";
@@ -41,8 +28,8 @@ export interface PanelDefinition {
   note: string;
   /** Right-hand rail tag; `"count:providers"` resolves to the server count. */
   tag?: "beta" | "count:providers";
-  /** The rail icon. A trial: the rail is the one place the redesign draws them. */
-  icon: LucideIcon;
+  /** The rail icon, from `ICONS`. */
+  icon: IconName;
   Component: ComponentType;
 }
 
@@ -51,7 +38,7 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "general",
     label: "General",
     note: "interface, language, downloads",
-    icon: SlidersHorizontal,
+    icon: "general",
     Component: GeneralPanel,
   },
   {
@@ -59,49 +46,49 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     label: "Providers",
     note: "tried in priority order",
     tag: "count:providers",
-    icon: Server,
+    icon: "providers",
     Component: ProvidersPanel,
   },
   {
     slug: "security",
     label: "Security",
     note: "sign-in, access, API keys",
-    icon: Shield,
+    icon: "security",
     Component: SecurityPanel,
   },
   {
     slug: "rss",
     label: "RSS",
     note: "feeds, rules, seen items",
-    icon: Rss,
+    icon: "rss",
     Component: RssPanel,
   },
   {
     slug: "categories",
     label: "Categories",
     note: "where a release lands",
-    icon: FolderTree,
+    icon: "categories",
     Component: CategoriesPanel,
   },
   {
     slug: "proxies",
     label: "Proxies",
     note: "tunnels providers and feeds may use",
-    icon: Waypoints,
+    icon: "proxies",
     Component: ProxiesPanel,
   },
   {
     slug: "bandwidth",
     label: "Bandwidth",
     note: "ceilings and the ISP cap",
-    icon: Gauge,
+    icon: "bandwidth",
     Component: BandwidthPanel,
   },
   {
     slug: "schedules",
     label: "Schedules",
     note: "when weaver pauses and resumes",
-    icon: CalendarClock,
+    icon: "schedules",
     Component: SchedulesPanel,
   },
   {
@@ -109,21 +96,21 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     label: "Post-processing",
     note: "scripts run when a download finishes",
     tag: "beta",
-    icon: SquareTerminal,
+    icon: "postProcessing",
     Component: PostProcessingPanel,
   },
   {
     slug: "watch-folder",
     label: "Watch folder",
     note: "NZB files picked up from disk",
-    icon: FolderInput,
+    icon: "watchFolder",
     Component: WatchFolderPanel,
   },
   {
     slug: "backup",
     label: "Backup",
     note: "snapshot and restore",
-    icon: DatabaseBackup,
+    icon: "backup",
     Component: BackupPanel,
   },
 ];

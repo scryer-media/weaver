@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { blockFill, blockPeriod } from "./chrome";
+import { Icon } from "./icons";
 import { COLS_CLASS, columnStyle } from "./columns";
 import { WV } from "../data/palette";
 
@@ -115,12 +116,11 @@ export function Waterfall({
             onClick={() => setMembersOpen((open) => !open)}
             className="flex h-8 items-center gap-2 border-t border-wv-hairline text-left font-wv-mono text-[11px] text-wv-muted hover:text-wv-fg"
           >
-            <span
-              aria-hidden="true"
-              className={cn("inline-block text-[8px] transition-transform", membersOpen && "rotate-90")}
-            >
-              &#9654;
-            </span>
+            <Icon
+              name="expand"
+              size={12}
+              className={cn("flex-none transition-transform", membersOpen && "rotate-90")}
+            />
             Extracted files ({members.length})
           </button>
           {membersOpen

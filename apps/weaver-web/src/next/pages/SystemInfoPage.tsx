@@ -141,6 +141,7 @@ export function SystemInfoPage() {
       controls={
         <>
           <SecondaryButton
+            icon="copy"
             disabled={!info}
             onClick={() => {
               if (!info) return;
@@ -152,7 +153,7 @@ export function SystemInfoPage() {
           >
             {copied ? "Copied" : "Copy for a bug report"}
           </SecondaryButton>
-          <PrimaryButton disabled={busy} onClick={() => void downloadDiagnostics()}>
+          <PrimaryButton icon="downloadFile" disabled={busy} onClick={() => void downloadDiagnostics()}>
             {busy ? "Collecting" : "Download diagnostics"}
           </PrimaryButton>
         </>

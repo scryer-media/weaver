@@ -107,12 +107,14 @@ export function SettingsPage() {
           */}
           <div ref={setControlsHost} className="flex items-center gap-[10px] empty:hidden" />
           <SecondaryButton
+            icon="revert"
             disabled={!flags.dirty || flags.busy}
             onClick={() => actionsRef.current?.revert()}
           >
             Revert
           </SecondaryButton>
           <PrimaryButton
+            icon="save"
             disabled={!flags.dirty || flags.busy}
             onClick={() => actionsRef.current?.save()}
           >

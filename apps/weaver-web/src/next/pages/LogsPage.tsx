@@ -53,12 +53,7 @@ export function LogsPage() {
             onChange={setQuery}
             className="w-[150px] sm:w-[260px]"
           />
-          <SecondaryButton onClick={() => logs.setPaused(!logs.paused)}>
-            <span
-              aria-hidden="true"
-              className="mr-[9px] size-1.5"
-              style={{ background: logs.paused ? "#75726b" : WV.accent }}
-            />
+          <SecondaryButton icon={logs.paused ? "resume" : "pause"} onClick={() => logs.setPaused(!logs.paused)}>
             {logs.paused ? "Resume tail" : "Pause tail"}
           </SecondaryButton>
         </>

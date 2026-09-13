@@ -15,6 +15,7 @@ import { BulkBar, BulkButton, BulkCluster } from "../components/BulkBar";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { Pagination } from "../components/Pagination";
 import { CheckBox, SecondaryButton, TextField } from "../components/controls";
+import { Icon } from "../components/icons";
 import { Menu, MenuItem } from "../components/Menu";
 import { GridHeader, GridRow } from "../components/rows";
 import { StorageMounts, storageMounts, type StorageVolume } from "../components/storage";
@@ -366,6 +367,7 @@ export function CompletedPage() {
   const bulkActions = (
     <>
       <BulkButton
+        icon="redownload"
         disabled={actionsBusy}
         onClick={() => {
           void runOnPicked("Re-queued", (id) => redownloadJob({ id }));
@@ -374,6 +376,7 @@ export function CompletedPage() {
         Re-download
       </BulkButton>
       <BulkButton
+        icon="postProcessing"
         disabled={actionsBusy}
         onClick={() => {
           void runOnPicked("Re-ran scripts for", (id) => rerunPostProcessing({ jobId: id }));
@@ -382,6 +385,7 @@ export function CompletedPage() {
         Re-run scripts
       </BulkButton>
       <BulkButton
+        icon="remove"
         tone="danger"
         disabled={actionsBusy}
         onClick={() => {
@@ -445,7 +449,7 @@ export function CompletedPage() {
             onChange={(next) => reset(() => setQuery(next))}
             className="w-[118px] min-w-[80px] sm:w-[172px] sm:min-w-[96px]"
           />
-          <SecondaryButton onClick={exportList} disabled={rows.length === 0}>
+          <SecondaryButton icon="downloadFile" onClick={exportList} disabled={rows.length === 0}>
             Export list
           </SecondaryButton>
         </>
@@ -523,9 +527,7 @@ export function CompletedPage() {
                   className="flex cursor-pointer items-center gap-[7px] font-wv-mono text-[11px] text-wv-muted hover:text-wv-fg"
                 >
                   {sortOption.label}
-                  <span aria-hidden="true" className="text-[8px] text-wv-disabled">
-                    &#9660;
-                  </span>
+                  <Icon name="dropdown" size={12} className="text-wv-disabled" />
                 </button>
                 <Menu
                   open={sortOpen}
@@ -685,8 +687,8 @@ export function CompletedPage() {
                         {elapsed === null ? EM_DASH : `took ${formatElapsed(elapsed)}`}
                       </span>
                     </div>
-                    <div aria-hidden="true" className="text-right text-[13px] text-wv-dim">
-                      &rsaquo;
+                    <div className="flex justify-end text-wv-dim">
+                      <Icon name="open" size={14} />
                     </div>
                   </GridRow>
                 );

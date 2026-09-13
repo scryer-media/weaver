@@ -60,8 +60,8 @@ export function NextRouteError() {
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <EmptyState title={title} body={body} />
         <div className="flex gap-[10px] px-4 sm:px-6">
-          <SecondaryButton onClick={() => void navigate(-1)}>Go back</SecondaryButton>
-          <PrimaryButton onClick={() => window.location.reload()}>Reload</PrimaryButton>
+          <SecondaryButton icon="back" onClick={() => void navigate(-1)}>Go back</SecondaryButton>
+          <PrimaryButton icon="refresh" onClick={() => window.location.reload()}>Reload</PrimaryButton>
         </div>
         {detail === null ? null : (
           <pre className="mt-6 overflow-x-auto border-t border-wv-hairline px-4 sm:px-6 py-5 font-wv-mono text-[11.5px] leading-[1.55] whitespace-pre-wrap text-wv-faint">

@@ -209,7 +209,7 @@ export function SchedulesPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton onClick={() => open(null)}>Add schedule</SecondaryButton>
+        <SecondaryButton icon="add" onClick={() => open(null)}>Add schedule</SecondaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

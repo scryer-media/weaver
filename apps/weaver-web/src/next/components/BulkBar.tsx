@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
+import { Icon, type IconName } from "./icons";
 
 /**
  * The 42px bar that appears once rows are ticked.
@@ -83,11 +84,14 @@ function ClearButton({ onClear }: { onClear: () => void }) {
 /** One 26px action inside a `BulkBar`. `tone="danger"` for anything that removes. */
 export function BulkButton({
   children,
+  icon,
   onClick,
   disabled,
   tone = "default",
 }: {
   children: ReactNode;
+  /** A leading icon, named by the action. */
+  icon?: IconName;
   onClick: () => void;
   disabled?: boolean;
   tone?: "default" | "danger";
@@ -105,6 +109,7 @@ export function BulkButton({
         disabled && "cursor-default opacity-50 hover:bg-transparent",
       )}
     >
+      {icon === undefined ? null : <Icon name={icon} size={13} className="-ml-[1px] mr-[6px] flex-none" />}
       {children}
     </button>
   );

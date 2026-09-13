@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { useNextData } from "../data/next-data";
 import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
+import { Icon, type IconName } from "../components/icons";
 
 /**
  * The chrome every Next screen shares: a 236px rail, a 56px top bar, the
@@ -28,6 +29,7 @@ import { Eyebrow } from "../components/chrome";
 interface NavEntry {
   to: string;
   label: string;
+  icon: IconName;
   /** Right-aligned mono count; omitted entries render nothing. */
   count?: number;
   end?: boolean;
@@ -94,12 +96,12 @@ export function NextShell({
   // different subsets. In the product the list is always whole — otherwise
   // Monitoring is unreachable from Downloads.
   const nav: NavEntry[] = [
-    { to: "/", label: "Downloads", count: queue.summary.totalItems, end: false },
-    { to: "/history", label: "Completed", count: historyCount },
-    { to: "/monitoring", label: "Monitoring" },
-    { to: "/system-info", label: "System info" },
-    { to: "/logs", label: "Logs" },
-    { to: "/settings", label: "Settings" },
+    { to: "/", label: "Downloads", icon: "downloads", count: queue.summary.totalItems, end: false },
+    { to: "/history", label: "Completed", icon: "completed", count: historyCount },
+    { to: "/monitoring", label: "Monitoring", icon: "monitoring" },
+    { to: "/system-info", label: "System info", icon: "systemInfo" },
+    { to: "/logs", label: "Logs", icon: "logs" },
+    { to: "/settings", label: "Settings", icon: "settings" },
   ];
 
   // Not a component: the aside and the drawer must render the same blocks, and
@@ -117,7 +119,7 @@ export function NextShell({
               aria-label="Close navigation"
               className="-mr-[7px] flex size-7 flex-none cursor-pointer items-center justify-center text-[15px] text-wv-muted hover:text-wv-fg"
             >
-              <span aria-hidden="true">×</span>
+              <Icon name="close" size={16} />
             </button>
           )}
         </div>
@@ -140,6 +142,11 @@ export function NextShell({
                   <span
                     aria-hidden="true"
                     className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
+                  />
+                  <Icon
+                    name={entry.icon}
+                    size={16}
+                    className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
                   />
                   <span className="truncate">{entry.label}</span>
                   {entry.count === undefined ? null : (
@@ -186,11 +193,7 @@ export function NextShell({
           aria-expanded={navOpen}
           className="absolute top-0 left-0 z-20 flex h-14 w-12 cursor-pointer items-center justify-center text-wv-muted hover:text-wv-fg lg:hidden"
         >
-          <span aria-hidden="true" className="flex w-[15px] flex-col gap-[3.5px]">
-            <span className="h-px bg-current" />
-            <span className="h-px bg-current" />
-            <span className="h-px bg-current" />
-          </span>
+          <Icon name="menu" size={17} />
         </button>
 
         {header ?? (

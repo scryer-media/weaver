@@ -1,6 +1,7 @@
 import { cn } from "@/lib/utils";
 import { Eyebrow } from "./chrome";
 import { Segmented } from "./controls";
+import { Icon, type IconName } from "./icons";
 import { formatCount } from "../data/format";
 
 /**
@@ -58,7 +59,7 @@ export function Pagination({
       </span>
 
       <div className="ml-auto flex items-center gap-2">
-        <Step label="‹ Previous" disabled={pageIndex === 0} onClick={() => onPage(pageIndex - 1)} />
+        <Step label="Previous" before="previous" disabled={pageIndex === 0} onClick={() => onPage(pageIndex - 1)} />
         <div className="flex items-center gap-1">
           {pages.map((page) => (
             <button
@@ -78,7 +79,8 @@ export function Pagination({
           ))}
         </div>
         <Step
-          label="Next ›"
+          label="Next"
+          after="next"
           disabled={pageIndex + 1 >= pageCount}
           onClick={() => onPage(pageIndex + 1)}
         />
@@ -89,10 +91,14 @@ export function Pagination({
 
 function Step({
   label,
+  before,
+  after,
   disabled,
   onClick,
 }: {
   label: string;
+  before?: IconName;
+  after?: IconName;
   disabled: boolean;
   onClick: () => void;
 }) {
@@ -108,7 +114,9 @@ function Step({
           : "cursor-pointer border-wv-control text-wv-fg hover:border-wv-control-hover",
       )}
     >
+      {before === undefined ? null : <Icon name={before} size={13} className="-ml-[3px] mr-[4px] flex-none" />}
       {label}
+      {after === undefined ? null : <Icon name={after} size={13} className="-mr-[3px] ml-[4px] flex-none" />}
     </button>
   );
 }

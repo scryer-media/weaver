@@ -11,6 +11,7 @@ import type { JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
 import { Eyebrow } from "@/next/components/chrome";
 import { DangerButton, SecondaryButton } from "@/next/components/controls";
+import { Icon } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
@@ -100,9 +101,10 @@ export function DownloadInspector({
           {/* The inspector is a summary; the whole story lives on the job's own screen. */}
           <Link
             to={`/jobs/${job.id}`}
-            className="font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
+            className="flex items-center gap-[3px] font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
           >
-            Open job detail &rsaquo;
+            Open job detail
+            <Icon name="open" size={13} />
           </Link>
         </div>
 
@@ -147,6 +149,7 @@ export function DownloadInspector({
       <div className="flex flex-none flex-col gap-[10px] border-t border-wv-hairline px-5 py-[18px]">
         <div className="flex gap-[10px]">
           <SecondaryButton
+            icon={isPaused ? "resume" : "pause"}
             className="flex-1 justify-center"
             onClick={() => {
               void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id }));
@@ -155,6 +158,7 @@ export function DownloadInspector({
             {isPaused ? "Resume" : "Pause"}
           </SecondaryButton>
           <SecondaryButton
+            icon="topOfQueue"
             className="flex-1 justify-center"
             onClick={() => {
               void updateJobs({ ids: [job.id], priority: "HIGH" });
@@ -164,6 +168,7 @@ export function DownloadInspector({
           </SecondaryButton>
         </div>
         <DangerButton
+          icon="cancelDownload"
           className="w-full justify-center"
           onClick={() => {
             onRemoved(job.id);

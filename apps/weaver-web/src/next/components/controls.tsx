@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type Ref } from "react";
 import { cn } from "@/lib/utils";
+import { Icon, type IconName } from "./icons";
 import { Menu, MenuItem } from "./Menu";
 
 /* ------------------------------------------------------------------ buttons */
@@ -7,16 +8,20 @@ import { Menu, MenuItem } from "./Menu";
 /**
  * The top bar's right-hand cluster is always
  * `[contextual control] [secondary] [primary]`, and these three are the whole
- * button vocabulary — there is no icon button anywhere in the redesign.
+ * button vocabulary. A button may lead with an icon from `ICONS`, named by the
+ * action it performs; the label always stays.
  */
 export function PrimaryButton({
   children,
+  icon,
   onClick,
   disabled,
   className,
   title,
 }: {
   children: ReactNode;
+  /** A leading icon, named by the action. */
+  icon?: IconName;
   onClick?: () => void;
   disabled?: boolean;
   className?: string;
@@ -36,6 +41,9 @@ export function PrimaryButton({
         className,
       )}
     >
+      {icon === undefined ? null : (
+        <Icon name={icon} size={14} className="-ml-[2px] mr-[7px] flex-none" />
+      )}
       {children}
     </button>
   );
@@ -43,6 +51,7 @@ export function PrimaryButton({
 
 export function SecondaryButton({
   children,
+  icon,
   onClick,
   disabled,
   className,
@@ -50,6 +59,8 @@ export function SecondaryButton({
   size = "default",
 }: {
   children: ReactNode;
+  /** A leading icon, named by the action. */
+  icon?: IconName;
   onClick?: () => void;
   disabled?: boolean;
   className?: string;
@@ -72,6 +83,9 @@ export function SecondaryButton({
         className,
       )}
     >
+      {icon === undefined ? null : (
+        <Icon name={icon} size={size === "compact" ? 13 : 14} className="-ml-[2px] mr-[7px] flex-none" />
+      )}
       {children}
     </button>
   );
@@ -79,6 +93,7 @@ export function SecondaryButton({
 
 export function DangerButton({
   children,
+  icon,
   onClick,
   disabled,
   className,
@@ -86,6 +101,8 @@ export function DangerButton({
   solid = false,
 }: {
   children: ReactNode;
+  /** A leading icon, named by the action. */
+  icon?: IconName;
   onClick?: () => void;
   disabled?: boolean;
   className?: string;
@@ -112,6 +129,9 @@ export function DangerButton({
         className,
       )}
     >
+      {icon === undefined ? null : (
+        <Icon name={icon} size={size === "compact" ? 13 : 14} className="-ml-[2px] mr-[7px] flex-none" />
+      )}
       {children}
     </button>
   );
@@ -357,9 +377,7 @@ export function Select<T extends string>({
         )}
       >
         <span className="truncate">{current?.label ?? value}</span>
-        <span aria-hidden="true" className="flex-none text-[8px] text-wv-muted">
-          &#9660;
-        </span>
+        <Icon name="dropdown" size={13} className="flex-none text-wv-muted" />
       </button>
       <Menu
         open={open}

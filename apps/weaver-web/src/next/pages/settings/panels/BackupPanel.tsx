@@ -301,7 +301,7 @@ export function BackupPanel() {
                 setNote(null);
               }}
             />
-            <SecondaryButton onClick={() => fileRef.current?.click()}>Choose file</SecondaryButton>
+            <SecondaryButton icon="chooseFile" onClick={() => fileRef.current?.click()}>Choose file</SecondaryButton>
           </div>
         ),
       },
@@ -361,7 +361,7 @@ export function BackupPanel() {
                   ? "restore available"
                   : (status.reason ?? "restore unavailable")}
             </span>
-            <SecondaryButton disabled={!file || busy} onClick={() => void inspect()}>
+            <SecondaryButton icon="inspectFile" disabled={!file || busy} onClick={() => void inspect()}>
               Read archive
             </SecondaryButton>
           </div>
@@ -376,6 +376,7 @@ export function BackupPanel() {
         kind: "custom",
         control: (
           <DangerButton
+            icon="restore"
             className="px-[14px]"
             disabled={restoreBlocked}
             onClick={() => setConfirmRestore(true)}
@@ -548,6 +549,7 @@ export function BackupPanel() {
     <>
       <PanelControls>
         <SecondaryButton
+          icon="downloadFile"
           disabled={busy || status?.busy || !password.trim() || mismatch}
           onClick={() => void download()}
         >

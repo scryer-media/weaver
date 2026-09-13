@@ -11,6 +11,7 @@ import {
 } from "@/lib/proxies";
 import { Square } from "./chrome";
 import { SecondaryButton, Select, Toggle } from "./controls";
+import { Icon } from "./icons";
 import { WV } from "../data/palette";
 
 /**
@@ -69,7 +70,7 @@ export function RoutingEditor({
                   disabled={index === 0}
                   onClick={() => onChange(moveProxy(value, index, -1))}
                 >
-                  &#8593;
+                  <Icon name="moveUp" size={13} />
                 </SecondaryButton>
                 <SecondaryButton
                   className="h-7 px-2"
@@ -77,9 +78,10 @@ export function RoutingEditor({
                   disabled={index === value.proxyIds.length - 1}
                   onClick={() => onChange(moveProxy(value, index, 1))}
                 >
-                  &#8595;
+                  <Icon name="moveDown" size={13} />
                 </SecondaryButton>
                 <SecondaryButton
+                  icon="remove"
                   className="h-7 px-2"
                   onClick={() =>
                     onChange({ ...value, proxyIds: value.proxyIds.filter((entry) => entry !== id) })

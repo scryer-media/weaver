@@ -471,7 +471,7 @@ export function RssPanel() {
               {state.text}
             </Cell>,
             <span key="sync" onClick={(event) => event.stopPropagation()}>
-              <SecondaryButton className="h-7 px-2" onClick={() => void sync(feed)}>
+              <SecondaryButton icon="refresh" className="h-7 px-2" onClick={() => void sync(feed)}>
                 Poll
               </SecondaryButton>
             </span>,
@@ -495,7 +495,7 @@ export function RssPanel() {
       },
       footer:
         feeds.length > 0 ? (
-          <SecondaryButton onClick={() => openRule(null)}>Add rule</SecondaryButton>
+          <SecondaryButton icon="add" onClick={() => openRule(null)}>Add rule</SecondaryButton>
         ) : undefined,
       rows: rules.map(({ rule, feed }) => ({
         id: String(rule.id),
@@ -539,7 +539,7 @@ export function RssPanel() {
       },
       footer:
         seenItems.length > 0 ? (
-          <SecondaryButton onClick={() => setConfirmSeen("all")}>Clear history</SecondaryButton>
+          <SecondaryButton icon="remove" onClick={() => setConfirmSeen("all")}>Clear history</SecondaryButton>
         ) : undefined,
       rows: seenItems.map((item) => ({
         id: `${item.feedId}:${item.itemId}`,
@@ -825,10 +825,10 @@ export function RssPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton onClick={() => void sync()} disabled={feeds.length === 0}>
+        <SecondaryButton icon="refresh" onClick={() => void sync()} disabled={feeds.length === 0}>
           Poll all
         </SecondaryButton>
-        <SecondaryButton onClick={() => openFeed(null)}>Add feed</SecondaryButton>
+        <SecondaryButton icon="add" onClick={() => openFeed(null)}>Add feed</SecondaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

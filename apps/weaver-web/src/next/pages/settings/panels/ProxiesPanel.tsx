@@ -560,7 +560,7 @@ export function ProxiesPanel() {
             {health[profile.id] ?? "—"}
           </Cell>,
           <span key="test" onClick={(event) => event.stopPropagation()}>
-            <SecondaryButton className="h-7 px-2" onClick={() => void runTest(profile)}>
+            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => void runTest(profile)}>
               Test
             </SecondaryButton>
           </span>,
@@ -572,7 +572,7 @@ export function ProxiesPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton onClick={() => open(null)}>Add proxy</SecondaryButton>
+        <SecondaryButton icon="add" onClick={() => open(null)}>Add proxy</SecondaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
@@ -591,7 +591,7 @@ export function ProxiesPanel() {
         deleteLabel="Remove proxy"
         extraActions={
           editing?.hostKeyFingerprint ? (
-            <SecondaryButton onClick={() => setConfirmTrust(editing)}>Forget host key</SecondaryButton>
+            <SecondaryButton icon="forget" onClick={() => setConfirmTrust(editing)}>Forget host key</SecondaryButton>
           ) : null
         }
       >
@@ -612,7 +612,7 @@ export function ProxiesPanel() {
               {note === null ? null : (
                 <div className="min-w-0 flex-1 text-[12px] leading-[1.45] text-wv-muted">{note}</div>
               )}
-              <SecondaryButton onClick={applyConfig} disabled={!configText.trim()}>
+              <SecondaryButton icon="inspectFile" onClick={applyConfig} disabled={!configText.trim()}>
                 Read configuration
               </SecondaryButton>
             </div>

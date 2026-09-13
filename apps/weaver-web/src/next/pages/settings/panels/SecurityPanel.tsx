@@ -362,13 +362,13 @@ export function SecurityPanel() {
             kind: "custom",
             control: login?.enabled ? (
               <>
-                <SecondaryButton onClick={() => setPasswordOpen(true)}>
+                <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)}>
                   Change password
                 </SecondaryButton>
-                <SecondaryButton onClick={() => setDisableOpen(true)}>Turn off</SecondaryButton>
+                <SecondaryButton icon="unlock" onClick={() => setDisableOpen(true)}>Turn off</SecondaryButton>
               </>
             ) : (
-              <PrimaryButton onClick={() => setEnableOpen(true)}>Set up a login</PrimaryButton>
+              <PrimaryButton icon="lock" onClick={() => setEnableOpen(true)}>Set up a login</PrimaryButton>
             ),
           },
         },
@@ -397,7 +397,7 @@ export function SecurityPanel() {
           <Cell key="used" mono className="text-wv-muted">
             {key.lastUsedAt ? formatDate(key.lastUsedAt) : "never"}
           </Cell>,
-          <SecondaryButton key="revoke" className="h-7 px-2" onClick={() => setRemoveKey(key)}>
+          <SecondaryButton icon="remove" key="revoke" className="h-7 px-2" onClick={() => setRemoveKey(key)}>
             Revoke
           </SecondaryButton>,
         ],
@@ -408,7 +408,7 @@ export function SecurityPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton onClick={() => setKeyOpen(true)}>New API key</SecondaryButton>
+        <SecondaryButton icon="add" onClick={() => setKeyOpen(true)}>New API key</SecondaryButton>
       </PanelControls>
 
       {bind?.bindFallback ? (

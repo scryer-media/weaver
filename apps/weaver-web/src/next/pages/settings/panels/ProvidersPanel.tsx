@@ -632,6 +632,7 @@ export function ProvidersPanel() {
     <>
       <PanelControls>
         <SecondaryButton
+          icon="add"
           onClick={() => {
             setForm(NEW_SERVER);
             setTestResult(null);
@@ -661,6 +662,7 @@ export function ProvidersPanel() {
           <>
             {editing && values?.quota.enabled ? (
               <SecondaryButton
+                icon="reset"
                 onClick={() => {
                   void resetQuota({ id: editing.id }).then(() =>
                     reexecute({ requestPolicy: "network-only" }),
@@ -670,7 +672,7 @@ export function ProvidersPanel() {
                 Reset usage
               </SecondaryButton>
             ) : null}
-            <SecondaryButton onClick={() => void runTest()} disabled={testing}>
+            <SecondaryButton icon="test" onClick={() => void runTest()} disabled={testing}>
               {testing ? "Testing…" : "Test connection"}
             </SecondaryButton>
           </>
@@ -701,6 +703,7 @@ export function ProvidersPanel() {
                   The certificate belongs to a different hostname.
                 </span>
                 <SecondaryButton
+                  icon="trust"
                   onClick={() =>
                     patch({
                       certificateDerBase64:

@@ -11,6 +11,7 @@ import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { NumberField, SecondaryButton, Select, Toggle } from "../../../components/controls";
+import { Icon } from "../../../components/icons";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import { PathField } from "../../../features/DirectoryBrowserDialog";
@@ -507,6 +508,7 @@ export function PostProcessingPanel() {
                   onChange={setDirectory}
                 />
                 <SecondaryButton
+                  icon="changeFolder"
                   disabled={
                     directoryState.fetching
                     || scriptDirectory.trim() === (settings?.scriptDirectory ?? "")
@@ -600,7 +602,7 @@ export function PostProcessingPanel() {
                 disabled={index === 0}
                 onClick={() => patchEntries(moved(entries, index, index - 1))}
               >
-                &#8593;
+                <Icon name="moveUp" size={13} />
               </SecondaryButton>
               <SecondaryButton
                 className="h-7 px-2"
@@ -608,9 +610,10 @@ export function PostProcessingPanel() {
                 disabled={index === entries.length - 1}
                 onClick={() => patchEntries(moved(entries, index, index + 1))}
               >
-                &#8595;
+                <Icon name="moveDown" size={13} />
               </SecondaryButton>
               <SecondaryButton
+                icon="remove"
                 className="h-7 px-2"
                 onClick={() =>
                   patchEntries(entries.filter((candidate) => candidate.script !== entry.script))

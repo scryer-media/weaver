@@ -142,7 +142,7 @@ export function CategoriesPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton onClick={() => open(null)}>Add category</SecondaryButton>
+        <SecondaryButton icon="add" onClick={() => open(null)}>Add category</SecondaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

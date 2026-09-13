@@ -1,11 +1,11 @@
 import type { ReactNode } from "react";
-import type { LucideIcon } from "lucide-react";
 import { Link, NavLink } from "react-router";
 import { useQuery } from "urql";
 import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { cn } from "@/lib/utils";
 import { RailBlock, RailMetric } from "./NextShell";
 import { Bar, Square } from "../components/chrome";
+import { Icon, type IconName } from "../components/icons";
 import { UNCATEGORISED, type CategoryEntry } from "../data/categories";
 import { useNextData, type ProviderHealth } from "../data/next-data";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
@@ -86,8 +86,11 @@ function AddProviderButton() {
       to="/settings/servers?add"
       className="wv-ping flex h-[40px] items-center justify-between gap-2 bg-wv-accent px-3 text-[13px] font-medium tracking-[0.08em] text-wv-on-accent uppercase hover:bg-wv-accent-hover"
     >
-      <span>Add provider</span>
-      <span aria-hidden="true">→</span>
+      <span className="flex items-center gap-2">
+        <Icon name="add" size={15} className="-ml-[1px] flex-none" />
+        Add provider
+      </span>
+      <Icon name="go" size={16} className="flex-none" />
     </Link>
   );
 }
@@ -288,7 +291,7 @@ export function PanelListBlock({
   items,
 }: {
   eyebrow: string;
-  items: readonly { to: string; label: string; icon?: LucideIcon; tag?: ReactNode }[];
+  items: readonly { to: string; label: string; icon?: IconName; tag?: ReactNode }[];
 }) {
   return (
     <RailBlock eyebrow={eyebrow} position="middle" className="gap-0">
@@ -310,10 +313,9 @@ export function PanelListBlock({
                 className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
               />
               {item.icon === undefined ? null : (
-                <item.icon
-                  aria-hidden="true"
+                <Icon
+                  name={item.icon}
                   size={15}
-                  strokeWidth={1.75}
                   className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
                 />
               )}

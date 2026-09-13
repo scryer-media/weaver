@@ -15,6 +15,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { statusToken } from "@/lib/status-tokens";
 import { EmptyState, MetricCell, SectionHeader } from "../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
+import { Icon } from "../components/icons";
 import { Menu, MenuItem } from "../components/Menu";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
@@ -248,13 +249,14 @@ export function DownloadsPage() {
             className="w-[132px] sm:w-[224px]"
           />
           <SecondaryButton
+            icon={isPaused ? "resume" : "pause"}
             onClick={() => {
               void (isPaused ? resumeAll({}) : pauseAll({}));
             }}
           >
             {isPaused ? "Resume all" : "Pause all"}
           </SecondaryButton>
-          <PrimaryButton onClick={() => setUploadOpen(true)}>Add NZB</PrimaryButton>
+          <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>Add NZB</PrimaryButton>
         </>
       }
       railMiddle={
@@ -313,9 +315,7 @@ export function DownloadsPage() {
                   <span className="font-semibold text-wv-fg">
                     {SORT_OPTIONS.find((option) => option.value === sort)!.label}
                   </span>
-                  <span aria-hidden="true" className="text-[8px]">
-                    &#9660;
-                  </span>
+                  <Icon name="dropdown" size={12} />
                 </button>
                 <Menu
                   open={sortOpen}
@@ -388,7 +388,7 @@ export function DownloadsPage() {
               centered
               title="No active downloads"
               body="Add an NZB, or drop one anywhere on this list."
-              action={<PrimaryButton onClick={() => setUploadOpen(true)}>Add NZB</PrimaryButton>}
+              action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>Add NZB</PrimaryButton>}
             />
           ) : visibleGroups.length === 0 ? (
             <EmptyState
