@@ -1,6 +1,7 @@
 //! Physical socket ownership, independent of checked-out work and client generations.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
@@ -32,7 +33,7 @@ pub struct SocketBudgetSnapshot {
 struct Entry {
     phase: SocketPhase,
     recall: Option<Recall>,
-    retiring: bool,
+    retiring: Arc<AtomicBool>,
     replacement: bool,
 }
 
@@ -80,7 +81,7 @@ impl SocketBudget {
                 .filter(|(_, entry)| !entry.replacement)
                 .skip(limit)
                 .filter_map(|(&id, entry)| {
-                    entry.retiring = true;
+                    entry.retiring.store(true, Ordering::Release);
                     entry.recall.take().map(|recall| {
                         entry.phase = SocketPhase::Closing;
                         (id, recall)
@@ -127,18 +128,20 @@ impl SocketBudget {
             .checked_add(1)
             .expect("socket identity exhausted");
         let id = state.next_id;
+        let retiring = Arc::new(AtomicBool::new(false));
         state.entries.insert(
             id,
             Entry {
                 phase: SocketPhase::Dialing,
                 recall: None,
-                retiring: false,
+                retiring: Arc::clone(&retiring),
                 replacement,
             },
         );
         Some(SocketSlot {
             budget: Arc::clone(self),
             id,
+            retiring,
         })
     }
 
@@ -188,6 +191,7 @@ impl SocketBudget {
 pub(crate) struct SocketSlot {
     budget: Arc<SocketBudget>,
     id: u64,
+    retiring: Arc<AtomicBool>,
 }
 
 impl SocketSlot {
@@ -196,12 +200,7 @@ impl SocketSlot {
     }
 
     pub(crate) fn retiring(&self) -> bool {
-        self.budget
-            .state
-            .lock()
-            .expect("socket budget poisoned")
-            .entries[&self.id]
-            .retiring
+        self.retiring.load(Ordering::Acquire)
     }
 
     pub(crate) fn active(&self) {

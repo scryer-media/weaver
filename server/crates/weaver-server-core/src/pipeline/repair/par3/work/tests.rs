@@ -866,6 +866,39 @@ async fn readback_rejects_stale_handback_without_releasing_worker_early() {
 }
 
 #[tokio::test]
+async fn pending_spill_allows_verified_installation_readback_to_finish() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("repaired.rar");
+    std::fs::write(&path, vec![7; readback::STRIPE_BYTES as usize + 1]).unwrap();
+    let mut coordinator = Coordinator::default();
+    coordinator.force_spill(JobId(1), SourceId(7));
+    coordinator
+        .queue_readback(JobId(1), readback_installation(path, &execution_options()))
+        .unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    assert_eq!(coordinator.take_spill(JobId(1)), None);
+    let mut readback = coordinator.take_readback(JobId(1)).unwrap().unwrap();
+    assert!(readback.result.is_ok());
+    readback.installation.offset = readback::STRIPE_BYTES;
+    coordinator
+        .queue_readback(JobId(1), readback.installation)
+        .unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    assert!(
+        coordinator
+            .take_readback(JobId(1))
+            .unwrap()
+            .unwrap()
+            .result
+            .is_ok()
+    );
+    coordinator.finish_installation(JobId(1));
+    assert_eq!(coordinator.take_spill(JobId(1)), Some(SourceId(7)));
+}
+
+#[tokio::test]
 async fn terminal_claims_require_current_bound_source_evidence() {
     let root = tempfile::tempdir().unwrap();
     let (mut coordinator, _) = ready_inline_repair(root.path());

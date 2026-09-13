@@ -5,6 +5,8 @@ use crate::pipeline::JobStatus;
 use par3_rs::session::RepairStatus;
 use par3_rs::session_repair::InstalledFile;
 
+mod pressure;
+
 impl Pipeline {
     /// A refused virtual image becomes ordinary disk-backed source work. The
     /// existing demotion ticket fences verification and owns reconstruction.
@@ -440,12 +442,47 @@ impl Pipeline {
                 );
                 self.schedule_job_completion_check(job_id);
             }
+            Err(error) if budget::error_pressure_source(&error).is_some() => {
+                if let Err(cleanup) = self.clear_par3_pressure_temporaries(job_id, &error).await {
+                    self.fail_direct_unpack_after_repair(job_id, &cleanup);
+                    self.fail_job(job_id, cleanup);
+                    return;
+                }
+                // The coordinator fenced further work when it received this
+                // error. Keep chases parked until the affected set is demoted;
+                // a partial repair has not vouched for their remaining bytes.
+                self.transition_postprocessing_status(
+                    job_id,
+                    JobStatus::Downloading,
+                    Some("downloading"),
+                );
+                self.schedule_job_completion_check(job_id);
+            }
             Err(error) => {
                 self.fail_direct_unpack_after_repair(job_id, &error.to_string());
                 self.fail_job(job_id, format!("PAR3 repair failed: {error}"));
             }
         }
         self.promote_queued_repairs();
+    }
+
+    async fn clear_par3_pressure_temporaries(
+        &self,
+        job_id: JobId,
+        error: &EngineError,
+    ) -> Result<(), String> {
+        let EngineError::RepairInterrupted { temporary, .. } = error else {
+            return Ok(());
+        };
+        if temporary.is_empty() {
+            return Ok(());
+        }
+        let paths = temporary.clone();
+        let root = self.jobs[&job_id].working_dir.clone();
+        tokio::task::spawn_blocking(move || pressure::clear_temporaries(&root, &paths))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("PAR3 pressure staging cleanup failed: {error}"))
     }
 
     async fn reconcile_par3_installations(

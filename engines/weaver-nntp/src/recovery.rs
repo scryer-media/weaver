@@ -1,6 +1,6 @@
 //! Connection-scoped recovery admission and stale-outcome fencing.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,13 @@ struct State {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct RecoveryGate(Mutex<State>);
+pub(crate) struct RecoveryGate {
+    state: Mutex<State>,
+    // Only admission/retirement changes this frontier. Live connections at or
+    // above it may issue work without locking the recovery policy.
+    first_current_id: AtomicU64,
+    quarantined: AtomicBool,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RecoverySnapshot {
@@ -26,7 +32,7 @@ pub struct RecoverySnapshot {
 
 impl RecoveryGate {
     pub(crate) fn snapshot(&self) -> RecoverySnapshot {
-        let state = self.0.lock().expect("recovery gate poisoned");
+        let state = self.state.lock().expect("recovery gate poisoned");
         RecoverySnapshot {
             epoch: state.epoch,
             probe_id: state.probe,
@@ -38,11 +44,11 @@ impl RecoveryGate {
     }
     #[cfg(test)]
     pub(crate) fn expire_now(&self) {
-        self.0.lock().expect("recovery gate poisoned").deadline = Some(Instant::now());
+        self.state.lock().expect("recovery gate poisoned").deadline = Some(Instant::now());
     }
 
     pub(crate) fn quarantined(&self) -> bool {
-        self.0.lock().expect("recovery gate poisoned").quarantine
+        self.quarantined.load(Ordering::Acquire)
     }
 
     pub(crate) fn quarantine(
@@ -50,9 +56,11 @@ impl RecoveryGate {
         duration: Duration,
         event: Option<(u64, u64)>,
     ) -> Option<Instant> {
-        let mut state = self.0.lock().expect("recovery gate poisoned");
+        let mut state = self.state.lock().expect("recovery gate poisoned");
         if event.is_some_and(|(epoch, id)| {
-            epoch != state.epoch || (state.quarantine && state.probe != Some(id))
+            epoch != state.epoch
+                || id < self.first_current_id.load(Ordering::Relaxed)
+                || (state.quarantine && state.probe != Some(id))
         }) {
             return None;
         }
@@ -64,11 +72,19 @@ impl RecoveryGate {
         let until = Instant::now() + duration;
         state.deadline = Some(until);
         state.probe = None;
+        self.first_current_id.store(
+            state
+                .next_id
+                .checked_add(1)
+                .expect("recovery identity exhausted"),
+            Ordering::Release,
+        );
+        self.quarantined.store(true, Ordering::Release);
         Some(until)
     }
 
     pub(crate) fn admit(self: &Arc<Self>, demanded: bool) -> Option<ConnectionHealthLease> {
-        let mut state = self.0.lock().expect("recovery gate poisoned");
+        let mut state = self.state.lock().expect("recovery gate poisoned");
         if state.quarantine
             && (!demanded
                 || state.probe.is_some()
@@ -89,7 +105,7 @@ impl RecoveryGate {
             gate: Arc::clone(self),
             epoch: state.epoch,
             id,
-            probe,
+            probe: AtomicBool::new(probe),
             failed: AtomicBool::new(false),
         })))
     }
@@ -100,7 +116,7 @@ pub struct ConnectionHealth {
     gate: Arc<RecoveryGate>,
     epoch: u64,
     id: u64,
-    probe: bool,
+    probe: AtomicBool,
     failed: AtomicBool,
 }
 
@@ -110,19 +126,23 @@ impl ConnectionHealth {
     }
 
     pub(crate) fn complete_recovery(&self) -> bool {
-        let mut state = self.gate.0.lock().expect("recovery gate poisoned");
+        if !self.probe.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut state = self.gate.state.lock().expect("recovery gate poisoned");
         if self.epoch != state.epoch || state.probe != Some(self.id) {
             return false;
         }
         state.quarantine = false;
         state.deadline = None;
         state.probe = None;
+        self.probe.store(false, Ordering::Release);
+        self.gate.quarantined.store(false, Ordering::Release);
         true
     }
 
     pub(crate) fn current(&self) -> bool {
-        let state = self.gate.0.lock().expect("recovery gate poisoned");
-        self.epoch == state.epoch && (!state.quarantine || state.probe == Some(self.id))
+        self.id >= self.gate.first_current_id.load(Ordering::Acquire)
     }
 
     pub(crate) fn first_failure(&self) -> bool {
@@ -130,8 +150,7 @@ impl ConnectionHealth {
     }
 
     pub(crate) fn probing(&self) -> bool {
-        let state = self.gate.0.lock().expect("recovery gate poisoned");
-        self.probe && state.quarantine && self.epoch == state.epoch && state.probe == Some(self.id)
+        self.probe.load(Ordering::Acquire) && self.current()
     }
 }
 
@@ -139,9 +158,19 @@ pub(crate) struct ConnectionHealthLease(pub(crate) Arc<ConnectionHealth>);
 
 impl Drop for ConnectionHealthLease {
     fn drop(&mut self) {
-        let mut state = self.0.gate.0.lock().expect("recovery gate poisoned");
+        let mut state = self.0.gate.state.lock().expect("recovery gate poisoned");
         if self.0.epoch == state.epoch && state.probe == Some(self.0.id) {
             state.probe = None;
+            self.0.gate.first_current_id.store(
+                state
+                    .next_id
+                    .checked_add(1)
+                    .expect("recovery identity exhausted"),
+                Ordering::Release,
+            );
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

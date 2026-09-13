@@ -1669,13 +1669,18 @@ impl NntpClient {
         let mut last_errors: Vec<Option<DecodedBodyError>> =
             (0..message_ids.len()).map(|_| None).collect();
         let mut pending: Vec<usize> = (0..message_ids.len()).collect();
-
-        for idx in order {
-            if pending.is_empty() {
-                break;
-            }
-
-            let pending_now = std::mem::take(&mut pending);
+        let mut providers = order.into_iter();
+        let mut continuation = None;
+        loop {
+            let (idx, pending_now) = if let Some(next) = continuation.take() {
+                next
+            } else {
+                let Some(idx) = providers.next() else { break };
+                if pending.is_empty() {
+                    break;
+                }
+                (idx, std::mem::take(&mut pending))
+            };
             let pending_ids: Vec<String> = pending_now
                 .iter()
                 .map(|message_idx| message_ids[*message_idx].to_string())
@@ -1839,9 +1844,11 @@ impl NntpClient {
                 request_write_error = Some(error);
             }
 
-            if recovery_probe && admitted == 1 && request_write_error.is_none() {
-                pending.extend(pending_now.iter().copied().skip(1));
-            }
+            let deferred = if recovery_probe && admitted == 1 && request_write_error.is_none() {
+                pending_now.iter().copied().skip(1).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
 
             if let Some(error) = request_write_error {
                 if is_connection_error(&error) {
@@ -2012,6 +2019,15 @@ impl NntpClient {
                         }
                     }
                     break;
+                }
+            }
+            if !deferred.is_empty() {
+                if self.pool.requires_recovery(idx) {
+                    pending.extend(deferred);
+                } else {
+                    // The probe settled transport recovery. Its unsent tail
+                    // still deserves this provider before normal failover.
+                    continuation = Some((idx, deferred));
                 }
             }
         }

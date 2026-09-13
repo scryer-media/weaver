@@ -95,3 +95,22 @@ fn explicit_replacement_is_separate_and_bounded() {
     drop(replacement);
     assert!(budget.try_acquire().is_some());
 }
+
+#[test]
+fn retirement_is_visible_without_waiting_for_the_registry() {
+    let budget = SocketBudget::new(2);
+    let first = budget.try_acquire().unwrap();
+    let second = budget.try_acquire().unwrap();
+    budget.configure(1);
+    let guard = budget.state.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send((first.retiring(), second.retiring())).unwrap();
+        (first, second)
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+    drop(guard);
+    drop(worker.join().unwrap());
+    assert_eq!(result.unwrap(), (false, true));
+    assert_eq!(budget.snapshot().physical, 0);
+}
