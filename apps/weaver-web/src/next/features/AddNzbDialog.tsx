@@ -1,9 +1,10 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { submissionStatusCanForceRetry } from "@/features/duplicates/duplicate-presentation";
 import { useUploadNzb, type UploadNzbEntry } from "@/features/upload/hooks/use-upload-nzb";
 import { NZB_UPLOAD_ACCEPT } from "@/features/upload/upload-file-types";
 import { cn } from "@/lib/utils";
+import { ConfirmDialog } from "@/next/components/ConfirmDialog";
 import { Dialog } from "@/next/components/Dialog";
 import { Eyebrow } from "@/next/components/chrome";
 import { FormRow } from "@/next/components/rows";
@@ -53,6 +54,27 @@ export function AddNzbDialog({
   const t = useTranslate();
   const upload = useUploadNzb({ open, resetOnOpen: true, onSubmitted: onClose });
   const { addFiles } = upload;
+  const blocked = upload.entries.filter(isBlocked);
+  // Set once a submit has answered, so its verdict is read from the entries it updated.
+  const [awaitingVerdict, setAwaitingVerdict] = useState(false);
+  const [confirmForce, setConfirmForce] = useState(false);
+  if (awaitingVerdict && !upload.fetching) {
+    setAwaitingVerdict(false);
+    if (blocked.length > 0) {
+      setConfirmForce(true);
+    }
+  }
+  if (!open && confirmForce) {
+    setConfirmForce(false);
+  }
+
+  // Duplicates are not a per-file decision made before submitting: everything
+  // goes in, and only what the duplicate policy turned away comes back as one
+  // question about adding those anyway.
+  const submit = async () => {
+    await upload.submit();
+    setAwaitingVerdict(true);
+  };
 
   // The hook clears the list as the dialog opens; this runs after that, and
   // only once for a given drop.
@@ -87,7 +109,7 @@ export function AddNzbDialog({
           <SecondaryButton onClick={onClose}>Cancel</SecondaryButton>
           <PrimaryButton
             disabled={upload.readyCount === 0 || upload.staging || upload.fetching}
-            onClick={() => void upload.submit()}
+            onClick={() => void submit()}
           >
             {upload.readyCount > 1 ? `Add ${upload.readyCount} downloads` : "Add download"}
           </PrimaryButton>
@@ -168,17 +190,6 @@ export function AddNzbDialog({
                 <span className="w-[72px] flex-none text-right font-wv-mono text-[11.5px] text-wv-muted">
                   {formatSize(entry.file.size)}
                 </span>
-                {isBlocked(entry) ? (
-                  <button
-                    type="button"
-                    disabled={upload.staging || upload.fetching}
-                    onClick={() => void upload.forceSubmitFile(entry.localId)}
-                    title={t("upload.forceDesc")}
-                    className="flex-none text-[12px] font-medium text-wv-accent hover:text-wv-accent-hover disabled:cursor-default disabled:opacity-50"
-                  >
-                    Force add
-                  </button>
-                ) : null}
                 <button
                   type="button"
                   onClick={() => upload.removeFile(entry.localId)}
@@ -221,6 +232,41 @@ export function AddNzbDialog({
           </FormRow>
         </div>
       </div>
+      <ConfirmDialog
+        open={confirmForce}
+        title="Add duplicates anyway?"
+        note={`${blocked.length} blocked`}
+        destructive={false}
+        busy={upload.fetching}
+        body={
+          <>
+            <span className="block">
+              {blocked.length === 1
+                ? "This NZB was turned away by the duplicate policy:"
+                : `These ${blocked.length} NZBs were turned away by the duplicate policy:`}
+            </span>
+            <span className="mt-3 flex flex-col gap-1 font-wv-mono text-[11.5px] text-wv-fg">
+              {blocked.slice(0, 6).map((entry) => (
+                <span key={entry.localId} className="truncate" title={entry.file.name}>
+                  {entry.displayName ?? entry.file.name}
+                </span>
+              ))}
+              {blocked.length > 6 ? (
+                <span className="text-wv-muted">{`and ${blocked.length - 6} more`}</span>
+              ) : null}
+            </span>
+            <span className="mt-3 block">{t("upload.forceDesc")}</span>
+          </>
+        }
+        confirmLabel={blocked.length === 1 ? "Add anyway" : `Add ${blocked.length} anyway`}
+        dismissLabel={blocked.length === 1 ? "Leave it out" : "Leave them out"}
+        onConfirm={() => {
+          const ids = blocked.map((entry) => entry.localId);
+          setConfirmForce(false);
+          void upload.submit({ force: true, localIds: ids });
+        }}
+        onDismiss={() => setConfirmForce(false)}
+      />
     </Dialog>
   );
 }

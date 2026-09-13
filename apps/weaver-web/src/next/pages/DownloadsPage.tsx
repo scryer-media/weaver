@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useRef, useState, type DragEvent } from "react";
-import { useMutation, useQuery } from "urql";
+import { useClient, useMutation, useQuery } from "urql";
+import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
 import {
   PAUSE_ALL_MUTATION,
   RESUME_ALL_MUTATION,
@@ -13,8 +14,10 @@ import {
 } from "@/lib/hooks/use-stable-queue-eta";
 import { useTranslate } from "@/lib/context/translate-context";
 import { statusToken } from "@/lib/status-tokens";
+import { BulkBar, BulkButton, BulkCluster, BulkMenu } from "../components/BulkBar";
 import { EmptyState, MetricCell, SectionHeader } from "../components/chrome";
-import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import { CheckBox, PrimaryButton, SecondaryButton, TextField } from "../components/controls";
 import { Icon } from "../components/icons";
 import { Menu, MenuItem } from "../components/Menu";
 import { StorageMounts, type StorageVolume } from "../components/storage";
@@ -42,6 +45,7 @@ import { CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
+import { SpeedLimitControl } from "./downloads/SpeedLimitControl";
 
 type TabId = "all" | "active" | "queued" | "paused";
 type SortId = "priority" | "name" | "size" | "progress" | "eta";
@@ -53,6 +57,12 @@ const SORT_OPTIONS: { value: SortId; label: string }[] = [
   { value: "progress", label: "Progress" },
   { value: "eta", label: "Time left" },
 ];
+
+const PRIORITY_OPTIONS = [
+  { value: "HIGH", label: "High" },
+  { value: "NORMAL", label: "Normal" },
+  { value: "LOW", label: "Low" },
+] as const;
 
 /** The statuses a global pause or a download block holds back. */
 const HELD_BACK_STATUSES = new Set(["DOWNLOADING", "QUEUED", "PROPAGATING"]);
@@ -118,6 +128,13 @@ export function DownloadsPage() {
   const dragDepth = useRef(0);
   // Cancelling is not instant; hide the row until the refetch confirms it.
   const [removedIds, setRemovedIds] = useState<ReadonlySet<number>>(() => new Set());
+  // Ticked for a bulk action; separate from the one row the inspector shows.
+  const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  const [report, setReport] = useState<string | null>(null);
+
+  const client = useClient();
 
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
@@ -193,6 +210,153 @@ export function DownloadsPage() {
 
   const selected = jobs.find((job) => job.id === selectedId) ?? null;
 
+  // A ticked download that finishes or is removed leaves the queue, and with
+  // it the selection.
+  if ([...picked].some((id) => !jobs.some((job) => job.id === id))) {
+    setPicked(new Set([...picked].filter((id) => jobs.some((job) => job.id === id))));
+  }
+
+  const togglePicked = useCallback((id: number) => {
+    setPicked((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  /** Tick or untick a whole section, both ways, like select-all on a page. */
+  const toggleGroup = (rows: readonly JobData[]) => {
+    const allPicked = rows.every((job) => picked.has(job.id));
+    setPicked((current) => {
+      const next = new Set(current);
+      for (const job of rows) {
+        if (allPicked) {
+          next.delete(job.id);
+        } else {
+          next.add(job.id);
+        }
+      }
+      return next;
+    });
+  };
+
+  /**
+   * One aliased mutation for the whole selection, so a hundred ticked rows are
+   * one request; each alias answers for its own id.
+   */
+  const runOnPicked = async (
+    label: string,
+    definition: Omit<Parameters<typeof executeAliasedIdMutation>[0], "client" | "ids">,
+  ) => {
+    const ids = [...picked];
+    setBulkBusy(true);
+    const result = await executeAliasedIdMutation<boolean>({ client, ids, ...definition });
+    setBulkBusy(false);
+    if (result.error) {
+      setReport(`${label} failed — ${result.error.message}`);
+      return;
+    }
+    const refused = ids.filter((_id, index) => result.data?.[`${definition.aliasPrefix}${index}`] !== true);
+    setPicked(new Set());
+    setReport(
+      refused.length === 0
+        ? `${label} ${ids.length} ${ids.length === 1 ? "download" : "downloads"}`
+        : `${label} ${ids.length - refused.length} of ${ids.length} — ${refused.length} refused`,
+    );
+    queue.refresh();
+  };
+
+  const pausePicked = () =>
+    runOnPicked("Paused", { operationName: "PauseSelectedJobs", aliasPrefix: "pauseJob", fieldName: "pauseJob" });
+
+  const resumePicked = () =>
+    runOnPicked("Resumed", { operationName: "ResumeSelectedJobs", aliasPrefix: "resumeJob", fieldName: "resumeJob" });
+
+  const editPicked = (label: string, category: string | null, priority: string | null) =>
+    runOnPicked(label, {
+      operationName: "UpdateSelectedJobs",
+      aliasPrefix: "updateJob",
+      fieldName: "updateJobs",
+      sharedVariables: {
+        category: { type: "String", value: category },
+        priority: { type: "String", value: priority },
+      },
+      buildFieldArguments: (idVariable) =>
+        `ids: [${idVariable}], category: $category, priority: $priority`,
+    });
+
+  // Rows leave the list the moment the cancel is sent, and any the daemon
+  // refuses come back once it answers.
+  const cancelPicked = async () => {
+    const ids = [...picked];
+    setBulkBusy(true);
+    setRemovedIds((current) => new Set([...current, ...ids]));
+    setSelectedId((current) => (current !== null && ids.includes(current) ? null : current));
+    const result = await executeAliasedIdMutation<boolean>({
+      client,
+      ids,
+      operationName: "CancelSelectedJobs",
+      aliasPrefix: "cancelJob",
+      fieldName: "cancelJob",
+    });
+    const cancelled = ids.filter((_id, index) => result.data?.[`cancelJob${index}`] === true);
+    const failed = ids.filter((id) => !cancelled.includes(id));
+    if (failed.length > 0) {
+      setRemovedIds((current) => new Set([...current].filter((id) => !failed.includes(id))));
+    }
+    setBulkBusy(false);
+    setConfirmCancel(false);
+    setPicked(new Set());
+    setReport(
+      failed.length === 0
+        ? `Cancelled ${ids.length} ${ids.length === 1 ? "download" : "downloads"}`
+        : `Cancelled ${cancelled.length} of ${ids.length} — ${failed.length} refused`,
+    );
+    queue.refresh();
+  };
+
+  const categoryOptions = [
+    { value: "", label: "Uncategorised" },
+    ...configured.map((category) => ({ value: category.name, label: category.name })),
+  ];
+
+  // One set of actions, shown in the tab row where it fits and in its own bar where it does not.
+  const bulkActions = (
+    <>
+      <BulkButton icon="pause" disabled={bulkBusy} onClick={() => void pausePicked()}>
+        Pause
+      </BulkButton>
+      <BulkButton icon="resume" disabled={bulkBusy} onClick={() => void resumePicked()}>
+        Resume
+      </BulkButton>
+      <BulkMenu
+        icon="priority"
+        label="Set priority"
+        disabled={bulkBusy}
+        options={PRIORITY_OPTIONS}
+        onSelect={(value) => void editPicked("Set priority on", null, value)}
+      >
+        Priority
+      </BulkMenu>
+      <BulkMenu
+        icon="categories"
+        label="Set category"
+        disabled={bulkBusy}
+        options={categoryOptions}
+        onSelect={(value) => void editPicked("Set category on", value, null)}
+      >
+        Category
+      </BulkMenu>
+      <BulkButton icon="cancelDownload" tone="danger" disabled={bulkBusy} onClick={() => setConfirmCancel(true)}>
+        Cancel
+      </BulkButton>
+    </>
+  );
+
   const remainingBytes = useMemo(
     () =>
       jobs.reduce((total, job) => {
@@ -256,6 +420,7 @@ export function DownloadsPage() {
           >
             {isPaused ? "Resume all" : "Pause all"}
           </SecondaryButton>
+          <SpeedLimitControl />
           <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>Add NZB</PrimaryButton>
         </>
       }
@@ -301,6 +466,13 @@ export function DownloadsPage() {
             ]}
             active={tab}
             onSelect={setTab}
+            center={
+              picked.size === 0 ? undefined : (
+                <BulkCluster count={picked.size} onClear={() => setPicked(new Set())}>
+                  {bulkActions}
+                </BulkCluster>
+              )
+            }
             right={
               <div className="relative">
                 <button
@@ -339,8 +511,16 @@ export function DownloadsPage() {
               </div>
             }
           />
+
+          {/* From xl the actions sit in the tab row instead; below it there is no room. */}
+          {picked.size === 0 ? null : (
+            <BulkBar count={picked.size} onClear={() => setPicked(new Set())} className="xl:hidden">
+              {bulkActions}
+            </BulkBar>
+          )}
         </>
       }
+      statusNote={report ?? undefined}
       statusRight={
         queue.totalCount > queue.jobs.length
           ? `showing ${queue.jobs.length} of ${queue.totalCount} downloads`
@@ -401,6 +581,13 @@ export function DownloadsPage() {
               return (
                 <section key={group} className="flex flex-none flex-col">
                   <SectionHeader
+                    lead={
+                      <CheckBox
+                        label={`Select every ${DOWNLOAD_GROUP_LABEL[group].toLowerCase()} download`}
+                        checked={rows.every((job) => picked.has(job.id))}
+                        onChange={() => toggleGroup(rows)}
+                      />
+                    }
                     label={DOWNLOAD_GROUP_LABEL[group]}
                     count={rows.length}
                     note={DOWNLOAD_GROUP_NOTE[group] || undefined}
@@ -411,6 +598,8 @@ export function DownloadsPage() {
                       job={job}
                       selected={job.id === selectedId}
                       onSelect={setSelectedId}
+                      picked={picked.has(job.id)}
+                      onPick={togglePicked}
                       statusLabel={statusLabel}
                       wait={waitValue(job)}
                       hold={blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null}
@@ -444,6 +633,19 @@ export function DownloadsPage() {
           onRemoved={handleRemoved}
         />
       )}
+
+      <ConfirmDialog
+        open={confirmCancel}
+        title="Cancel downloads"
+        note={`${picked.size} selected`}
+        busy={bulkBusy}
+        destructive
+        body="These downloads will be stopped and cannot be resumed."
+        confirmLabel="Cancel downloads"
+        dismissLabel="Keep downloading"
+        onConfirm={() => void cancelPicked()}
+        onDismiss={() => setConfirmCancel(false)}
+      />
 
       <AddNzbDialog
         open={uploadOpen}

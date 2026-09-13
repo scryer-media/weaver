@@ -15,6 +15,7 @@ export function ConfirmDialog({
   note,
   body,
   confirmLabel = "Remove",
+  dismissLabel = "Cancel",
   destructive = true,
   busy = false,
   onConfirm,
@@ -26,6 +27,8 @@ export function ConfirmDialog({
   note?: ReactNode;
   body: ReactNode;
   confirmLabel?: string;
+  /** For an action that is itself a cancel, where a plain "Cancel" beside it would read as the action. */
+  dismissLabel?: string;
   destructive?: boolean;
   busy?: boolean;
   onConfirm: () => void;
@@ -41,7 +44,7 @@ export function ConfirmDialog({
       onDismiss={onDismiss}
       footer={
         <>
-          <SecondaryButton onClick={onDismiss}>Cancel</SecondaryButton>
+          <SecondaryButton onClick={onDismiss}>{dismissLabel}</SecondaryButton>
           {alternative === undefined ? null : (
             <DangerButton onClick={alternative.onConfirm} disabled={busy} className="px-[14px]">
               {alternative.label}

@@ -1,6 +1,7 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { Icon, type IconName } from "./icons";
+import { Menu, MenuItem } from "./Menu";
 
 /**
  * The 42px bar that appears once rows are ticked.
@@ -101,16 +102,79 @@ export function BulkButton({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className={cn(
-        "flex h-[26px] cursor-pointer items-center border px-[11px] text-[12.5px] whitespace-nowrap",
-        tone === "danger"
-          ? "border-wv-danger-border bg-wv-danger-bg text-wv-error-text hover:bg-wv-danger-bg-hover"
-          : "border-wv-ok-line bg-wv-ok-bg text-wv-secondary hover:bg-wv-ok-hover",
-        disabled && "cursor-default opacity-50 hover:bg-transparent",
-      )}
+      className={bulkButtonClass(tone, disabled)}
     >
       {icon === undefined ? null : <Icon name={icon} size={13} className="-ml-[1px] mr-[6px] flex-none" />}
       {children}
     </button>
+  );
+}
+
+/**
+ * A `BulkButton` that opens a short list and applies the pick to every
+ * selected row — a priority, a category. There is no current value to mark:
+ * the rows it acts on can each hold a different one.
+ */
+export function BulkMenu({
+  children,
+  icon,
+  label,
+  options,
+  onSelect,
+  disabled,
+}: {
+  children: ReactNode;
+  icon?: IconName;
+  /** Accessible name for the list. */
+  label: string;
+  options: readonly { value: string; label: string }[];
+  onSelect: (value: string) => void;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        data-wv-menu-trigger=""
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={disabled}
+        onClick={() => setOpen((previous) => !previous)}
+        className={bulkButtonClass("default", disabled)}
+      >
+        {icon === undefined ? null : <Icon name={icon} size={13} className="-ml-[1px] mr-[6px] flex-none" />}
+        {children}
+        <Icon name="dropdown" size={12} className="-mr-[2px] ml-[6px] flex-none text-wv-muted" />
+      </button>
+      <Menu
+        open={open}
+        onDismiss={() => setOpen(false)}
+        label={label}
+        className="top-[30px] right-0 max-h-[280px] w-[184px] overflow-y-auto"
+      >
+        {options.map((option) => (
+          <MenuItem
+            key={option.value}
+            onSelect={() => {
+              setOpen(false);
+              onSelect(option.value);
+            }}
+          >
+            {option.label}
+          </MenuItem>
+        ))}
+      </Menu>
+    </div>
+  );
+}
+
+function bulkButtonClass(tone: "default" | "danger", disabled: boolean | undefined): string {
+  return cn(
+    "flex h-[26px] cursor-pointer items-center border px-[11px] text-[12.5px] whitespace-nowrap",
+    tone === "danger"
+      ? "border-wv-danger-border bg-wv-danger-bg text-wv-error-text hover:bg-wv-danger-bg-hover"
+      : "border-wv-ok-line bg-wv-ok-bg text-wv-secondary hover:bg-wv-ok-hover",
+    disabled && "cursor-default opacity-50 hover:bg-transparent",
   );
 }

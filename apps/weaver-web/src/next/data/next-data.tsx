@@ -15,10 +15,14 @@ import {
   LIVE_METRICS_QUERY,
   LIVE_METRICS_SUBSCRIPTION,
   SERVER_HEALTH_QUERY,
+  UPDATE_STATUS_QUERY,
+  UPDATE_STATUS_SUBSCRIPTION,
   VERSION_QUERY,
 } from "@/graphql/queries";
+import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import type { DownloadBlockState } from "@/lib/context/live-data-context";
+import { formatRate } from "./format";
 import { useLiveQueue, type LiveQueue } from "./use-live-queue";
 
 /**
@@ -70,6 +74,8 @@ export interface ConfiguredCategory {
 
 export interface NextData {
   version: string;
+  /** A newer release to advertise, once one has both a version and a page to open. */
+  update: { version: string; url: string } | undefined;
   speed: number;
   /** Highest speed seen since the tab opened; the rail and stat strip both note it. */
   peakSpeed: number;
@@ -130,6 +136,13 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const queue = useLiveQueue();
 
   const [{ data: versionData }] = useQuery<{ version: string }>({ query: VERSION_QUERY });
+  const [{ data: updateStatusData }] = useQuery<{ updateStatus: UpdateStatus }>({
+    query: UPDATE_STATUS_QUERY,
+  });
+  const [{ data: updateStatusLive }] = useSubscription<{ updateStatusUpdates: UpdateStatus }>({
+    query: UPDATE_STATUS_SUBSCRIPTION,
+    pause: connectionState.status === "disconnected",
+  });
   const [{ data: historyCountData }, reexecuteHistoryCount] = useQuery<{ all: number }>({
     query: HISTORY_JOBS_COUNT_QUERY,
   });
@@ -203,12 +216,22 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const providersLoaded = providerData !== undefined;
   const holdoffs = snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS;
   const version = versionData?.version ?? "";
+  const update = useMemo(
+    () =>
+      releaseNotification(
+        updateStatusLive?.updateStatusUpdates ?? updateStatusData?.updateStatus,
+      ),
+    [updateStatusData?.updateStatus, updateStatusLive?.updateStatusUpdates],
+  );
+
+  useDocumentTitle(speed, isPaused);
   const historyCount = historyCountData?.all ?? 0;
   const isPolling = reconnectPolling.isPolling;
 
   const value = useMemo<NextData>(
     () => ({
       version,
+      update,
       speed,
       peakSpeed: peakSpeedRef.current,
       isPaused,
@@ -237,9 +260,46 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       providersLoaded,
       queue,
       speed,
+      update,
       version,
     ],
   );
 
   return <NextDataContext.Provider value={value}>{children}</NextDataContext.Provider>;
+}
+
+/** How long the tab title holds one speed before it takes the next. */
+const TITLE_HOLD_MS = 2500;
+
+/**
+ * The browser tab says what weaver is doing: the download speed while it
+ * fetches, "Paused" while everything is held. A speed that moves every second
+ * would make the tab flicker, so a new figure waits out the last one; a change
+ * of state — pausing, going idle — shows at once.
+ */
+function useDocumentTitle(speed: number, isPaused: boolean) {
+  const lastUpdate = useRef(0);
+  useEffect(() => {
+    const title = isPaused ? "Paused - Weaver" : speed > 0 ? `${formatRate(speed)} - Weaver` : "Weaver";
+    const apply = () => {
+      lastUpdate.current = Date.now();
+      document.title = title;
+    };
+    // A held figure is applied once the hold runs out rather than dropped, or a
+    // speed that then stays put would never reach the tab.
+    const wait = speed > 0 && !isPaused ? lastUpdate.current + TITLE_HOLD_MS - Date.now() : 0;
+    if (wait <= 0) {
+      apply();
+      return;
+    }
+    const timer = window.setTimeout(apply, wait);
+    return () => window.clearTimeout(timer);
+  }, [isPaused, speed]);
+
+  useEffect(
+    () => () => {
+      document.title = "Weaver";
+    },
+    [],
+  );
 }

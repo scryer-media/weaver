@@ -37,11 +37,14 @@ export function SectionHeader({
   label,
   count,
   note,
+  lead,
   sticky = true,
 }: {
   label: ReactNode;
   count?: ReactNode;
   note?: ReactNode;
+  /** A control ahead of the label — the checkbox that ticks every row in the section. */
+  lead?: ReactNode;
   sticky?: boolean;
 }) {
   return (
@@ -51,6 +54,7 @@ export function SectionHeader({
         sticky && "sticky top-0 z-[5]",
       )}
     >
+      {lead}
       <Eyebrow>{label}</Eyebrow>
       {count === undefined ? null : (
         <span className="font-wv-mono text-[11px] text-wv-note">{count}</span>

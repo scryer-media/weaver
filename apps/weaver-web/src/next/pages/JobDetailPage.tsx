@@ -4,6 +4,7 @@ import { useMutation, useQuery, useSubscription } from "urql";
 import {
   ACCEPT_HISTORY_DELETE_MUTATION,
   CANCEL_JOB_MUTATION,
+  CANCEL_JOB_POST_PROCESSING_MUTATION,
   DUPLICATE_SNAPSHOT_QUERY,
   FORGET_DUPLICATE_IDENTITY_MUTATION,
   JOB_DETAIL_UPDATES_SUBSCRIPTION,
@@ -183,6 +184,7 @@ export function JobDetailPage() {
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
+  const [, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
 
   const [confirm, setConfirm] = useState<"delete" | "cancel" | "forget" | null>(null);
   const [report, setReport] = useState<string | null>(null);
@@ -339,6 +341,19 @@ export function JobDetailPage() {
             <StateChip label={statusLabel(progress.status)} tone={failed ? "bad" : "ok"} />
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
+            {/* Only while scripts run: a job waiting for a script slot reports itself as queued. */}
+            {job.status === "POST_PROCESSING" ? (
+              <SecondaryButton
+                icon="stopScripts"
+                size="compact"
+                disabled={busy}
+                onClick={() => {
+                  void run("Stopped post-processing", () => cancelPostProcessing({ jobId: job.id }));
+                }}
+              >
+                Stop scripts
+              </SecondaryButton>
+            ) : null}
             {inQueue ? (
               <>
                 <SecondaryButton

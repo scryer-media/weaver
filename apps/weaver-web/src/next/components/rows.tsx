@@ -19,7 +19,9 @@ import { Eyebrow } from "./chrome";
 export function ListRow({
   left,
   right,
+  lead,
   selected = false,
+  picked = false,
   onClick,
   density = "comfortable",
   /** Draw the 3px leading rail that marks selection. Queue rows use it. */
@@ -29,7 +31,11 @@ export function ListRow({
 }: {
   left: ReactNode;
   right?: ReactNode;
+  /** A control ahead of the text block — a row's checkbox. */
+  lead?: ReactNode;
   selected?: boolean;
+  /** Ticked for a bulk action, which is a different thing from being the row the inspector shows. */
+  picked?: boolean;
   onClick?: () => void;
   density?: "comfortable" | "compact";
   markSelection?: boolean;
@@ -37,12 +43,28 @@ export function ListRow({
   title?: string;
 }) {
   const interactive = typeof onClick === "function";
-  const Element = interactive ? "button" : "div";
+  // A button cannot hold another control, so a row with a lead is a div that
+  // behaves as one.
+  const Element = interactive && lead === undefined ? "button" : "div";
 
   return (
     <Element
       {...(interactive
-        ? { type: "button" as const, onClick, "aria-pressed": selected }
+        ? lead === undefined
+          ? { type: "button" as const, onClick, "aria-pressed": selected }
+          : {
+              role: "button",
+              tabIndex: 0,
+              onClick,
+              "aria-pressed": selected,
+              onKeyDown: (event: React.KeyboardEvent) => {
+                if (event.target !== event.currentTarget) return;
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onClick();
+                }
+              },
+            }
         : {})}
       title={title}
       className={cn(
@@ -54,11 +76,18 @@ export function ListRow({
             )
           : "px-4 sm:px-6",
         density === "compact" ? "py-2" : "py-[13px]",
-        selected ? "bg-wv-selected" : interactive ? "hover:bg-wv-row-hover" : "hover:bg-wv-cell-hover",
+        selected
+          ? "bg-wv-selected"
+          : picked
+            ? "bg-wv-row-picked"
+            : interactive
+              ? "hover:bg-wv-row-hover"
+              : "hover:bg-wv-cell-hover",
         interactive && "cursor-pointer",
         className,
       )}
     >
+      {lead}
       {left}
       {right === undefined ? null : (
         <div className="ml-auto flex flex-none items-center gap-5">{right}</div>

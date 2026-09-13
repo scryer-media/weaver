@@ -1,8 +1,9 @@
 import { useState } from "react";
+import { Link } from "react-router";
 import { useQuery } from "urql";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import type { MetricsHistoryRange } from "@/lib/metrics";
-import { Bar, Eyebrow, MetricCell, SectionHeader, Square } from "../components/chrome";
+import { Bar, Eyebrow, KeyValueRow, MetricCell, SectionHeader, Square } from "../components/chrome";
 import { Segmented } from "../components/controls";
 import { Chart, type ChartSeries } from "../components/Chart";
 import { columnStyle } from "../components/columns";
@@ -12,9 +13,11 @@ import {
   formatClock,
   formatCompactCount,
   formatCount,
+  formatDayClock,
   formatLatency,
   formatPerSecond,
   formatRate,
+  formatSize,
   splitBytes,
   splitSpeed,
 } from "../data/format";
@@ -57,7 +60,7 @@ function axisLabels(timestamps: readonly number[]): string[] {
 }
 
 export function MonitoringPage() {
-  const { speed, peakSpeed, providers, queue } = useNextData();
+  const { speed, peakSpeed, providers, queue, downloadBlock } = useNextData();
   const [rangeId, setRangeId] = useState<RangeId>("1h");
   const range = RANGES.find((entry) => entry.value === rangeId)!.range;
 
@@ -284,6 +287,8 @@ export function MonitoringPage() {
           formatValue={(value) => formatCompactCount(value)}
         />
 
+        <DataCapSection block={downloadBlock} />
+
         <section className="flex flex-none flex-col">
           <SectionHeader
             label="Providers"
@@ -374,5 +379,76 @@ export function MonitoringPage() {
         </section>
       </div>
     </NextShell>
+  );
+}
+
+const PERIOD_NOTE: Record<"DAILY" | "WEEKLY" | "MONTHLY", string> = {
+  DAILY: "daily window",
+  WEEKLY: "weekly window",
+  MONTHLY: "monthly window",
+};
+
+/**
+ * How much of the data cap's current window is spent.
+ *
+ * The same counters Settings → Bandwidth shows under Current window, here
+ * because this is the screen someone watching a download's pace is already on.
+ */
+function DataCapSection({ block }: { block: ReturnType<typeof useNextData>["downloadBlock"] }) {
+  const settingsLink = (
+    <Link to="/settings/bandwidth" className="text-wv-accent hover:text-wv-accent-hover">
+      Settings → Bandwidth
+    </Link>
+  );
+
+  if (!block.capEnabled) {
+    return (
+      <section className="flex flex-none flex-col">
+        <SectionHeader label="Data cap" note="not enforced" sticky={false} />
+        <div className="px-4 py-5 text-[13px] text-wv-muted sm:px-6">
+          No data cap is set. Downloads are never held for allowance — set one in {settingsLink}.
+        </div>
+      </section>
+    );
+  }
+
+  // A provider quota block carries placeholder cap counters, so none are shown for it.
+  if (block.kind === "SERVER_QUOTA") {
+    return (
+      <section className="flex flex-none flex-col">
+        <SectionHeader label="Data cap" note="provider quota" sticky={false} />
+        <div className="px-4 py-5 text-[13px] text-wv-muted sm:px-6">
+          Downloads are held by a provider quota; the cap's counters return once it lifts.
+        </div>
+      </section>
+    );
+  }
+
+  const percent = block.limitBytes > 0 ? (block.usedBytes / block.limitBytes) * 100 : 0;
+  const color = percent >= 90 ? WV.error : percent >= 70 ? WV.warn : WV.accent;
+  const note = [block.period ? PERIOD_NOTE[block.period] : null, block.timezoneName || null]
+    .filter(Boolean)
+    .join(" · ");
+
+  return (
+    <section className="flex flex-none flex-col">
+      <SectionHeader label="Data cap" note={note || undefined} sticky={false} />
+      <div className="flex flex-col gap-2 border-b border-wv-hairline px-4 py-[14px] sm:px-6">
+        <Bar percent={percent} color={color} label="Data cap used" />
+        <div className="flex items-baseline justify-between font-wv-mono text-[11.5px] text-wv-muted">
+          <span>
+            {formatSize(block.usedBytes)} used · {Math.round(percent)}%
+          </span>
+          <span>{formatSize(block.limitBytes)} allowance</span>
+        </div>
+      </div>
+      <KeyValueRow label="Remaining" value={formatSize(block.remainingBytes)} />
+      <KeyValueRow label="Reserved by running downloads" value={formatSize(block.reservedBytes)} />
+      <KeyValueRow label="Window resets" value={formatDayClock(block.windowEndsAtEpochMs)} />
+      <KeyValueRow
+        label="Downloads held by the cap"
+        value={block.kind === "ISP_CAP" ? <span className="text-wv-warn">Yes</span> : "No"}
+      />
+    </section>
   );
 }

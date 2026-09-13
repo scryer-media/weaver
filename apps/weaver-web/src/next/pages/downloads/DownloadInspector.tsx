@@ -1,7 +1,9 @@
+import { useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
   CANCEL_JOB_MUTATION,
+  CANCEL_JOB_POST_PROCESSING_MUTATION,
   JOB_OUTPUT_FILES_QUERY,
   PAUSE_JOB_MUTATION,
   RESUME_JOB_MUTATION,
@@ -10,10 +12,11 @@ import {
 import type { JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
 import { Eyebrow } from "@/next/components/chrome";
-import { DangerButton, SecondaryButton } from "@/next/components/controls";
+import { DangerButton, SecondaryButton, Select } from "@/next/components/controls";
 import { Icon } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
+import { useNextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 
 interface OutputFile {
@@ -28,6 +31,29 @@ interface OutputFilesResponse {
     files: OutputFile[];
     totalBytes: number;
   } | null;
+}
+
+type Priority = "HIGH" | "NORMAL" | "LOW";
+
+const PRIORITY_OPTIONS: { value: Priority; label: string }[] = [
+  { value: "HIGH", label: "High" },
+  { value: "NORMAL", label: "Normal" },
+  { value: "LOW", label: "Low" },
+];
+
+/** Priority rides in the job's metadata; anything unset or unknown is Normal. */
+function jobPriority(job: JobData): Priority {
+  const raw = job.metadata.find((entry) => entry.key === "priority")?.value?.toUpperCase();
+  return raw === "HIGH" || raw === "LOW" ? raw : "NORMAL";
+}
+
+function EditField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-3">
+      <span className="w-[104px] flex-none text-[12.5px] text-wv-muted">{label}</span>
+      <div className="min-w-0 flex-1">{children}</div>
+    </div>
+  );
 }
 
 function Field({ label, value, title }: { label: string; value: string; title?: string }) {
@@ -67,6 +93,50 @@ export function DownloadInspector({
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
+  const [stopState, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
+  const { categories, queue } = useNextData();
+  // What was just picked, shown until the queue carries it back; the daemon's
+  // answer can take a refresh to arrive, and a select that snaps back to the
+  // old value in the meantime reads as a refusal.
+  const [pending, setPending] = useState<{ priority?: Priority; category?: string }>({});
+  const [failure, setFailure] = useState<string | null>(null);
+
+  const priority = pending.priority ?? jobPriority(job);
+  const category = pending.category ?? (job.category || "");
+  if (pending.priority !== undefined && pending.priority === jobPriority(job)) {
+    setPending(({ priority: _settled, ...rest }) => rest);
+  }
+  if (pending.category !== undefined && pending.category === (job.category || "")) {
+    setPending(({ category: _settled, ...rest }) => rest);
+  }
+
+  const edit = (change: { priority?: Priority; category?: string }) => {
+    setPending((current) => ({ ...current, ...change }));
+    setFailure(null);
+    void updateJobs({ ids: [job.id], ...change }).then((result) => {
+      if (result.error) {
+        setPending((current) => {
+          const next = { ...current };
+          for (const key of Object.keys(change) as (keyof typeof change)[]) {
+            delete next[key];
+          }
+          return next;
+        });
+        setFailure(result.error.message);
+        return;
+      }
+      queue.refresh();
+    });
+  };
+
+  const categoryOptions = [
+    { value: "", label: "Uncategorised" },
+    ...categories.map((entry) => ({ value: entry.name, label: entry.name })),
+    // A category that has since been removed from settings is still the job's.
+    ...(category !== "" && !categories.some((entry) => entry.name === category)
+      ? [{ value: category, label: category }]
+      : []),
+  ];
 
   const token = statusToken(job.status);
   const progress = useJobProgress(job);
@@ -115,7 +185,27 @@ export function DownloadInspector({
               detail ? `${statusLabel(progress.status)} — ${detail}` : statusLabel(progress.status)
             }
           />
-          <Field label="Category" value={job.category || "uncategorised"} />
+          <EditField label="Category">
+            <Select
+              label="Category"
+              value={category}
+              options={categoryOptions}
+              onChange={(next) => edit({ category: next })}
+              className="h-[30px] w-full min-w-0 text-[12.5px]"
+            />
+          </EditField>
+          <EditField label="Priority">
+            <Select
+              label="Priority"
+              value={priority}
+              options={PRIORITY_OPTIONS}
+              onChange={(next) => edit({ priority: next })}
+              className="h-[30px] w-full min-w-0 text-[12.5px]"
+            />
+          </EditField>
+          {failure === null ? null : (
+            <div className="text-[12px] text-wv-error-text">{failure}</div>
+          )}
           <Field label="Total size" value={formatSize(job.totalBytes)} />
           <Field label="Rate" value={rate > 0 ? formatRate(rate) : EM_DASH} />
           <Field label="Time left" value={eta} />
@@ -167,6 +257,24 @@ export function DownloadInspector({
             Top of queue
           </SecondaryButton>
         </div>
+        {/* Only while scripts run: a job waiting for a script slot reports itself as queued. */}
+        {job.status === "POST_PROCESSING" ? (
+          <SecondaryButton
+            icon="stopScripts"
+            className="w-full justify-center"
+            disabled={stopState.fetching}
+            onClick={() => {
+              setFailure(null);
+              void cancelPostProcessing({ jobId: job.id }).then((result) => {
+                if (result.error) {
+                  setFailure(result.error.message);
+                }
+              });
+            }}
+          >
+            Stop scripts
+          </SecondaryButton>
+        ) : null}
         <DangerButton
           icon="cancelDownload"
           className="w-full justify-center"

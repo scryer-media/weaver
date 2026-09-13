@@ -45,6 +45,7 @@ import {
 import { useNextData } from "../data/next-data";
 import { describeDeleteProgress } from "../data/history-deletes";
 import { useHistoryDeletes } from "../data/use-history-deletes";
+import { useHistoryLiveRefresh } from "../data/use-history-live-refresh";
 
 /**
  * Completed — the archive of finished work.
@@ -245,6 +246,12 @@ export function CompletedPage() {
   // Deletes run as background operations: rows handed to one stay on the page,
   // locked, until the last operation drains and the page is fetched again.
   const deletes = useHistoryDeletes({ rows: pageRows, onDrained: refresh });
+  const refreshDeletes = deletes.refresh;
+  const refreshLive = useCallback(() => {
+    refresh();
+    refreshDeletes();
+  }, [refresh, refreshDeletes]);
+  useHistoryLiveRefresh({ refresh: refreshLive, deletesActive: deletes.active });
   const rows = deletes.rows;
   const lockedIds = useMemo(
     () => new Set(rows.filter((row) => row.deleteOperation?.locked).map((row) => row.id)),

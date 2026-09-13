@@ -128,5 +128,7 @@ export function useHistoryDeletes<T extends { id: number; deleteOperation: RowDe
     progress,
     accepting,
     accept,
+    /** Ask the operation list again, for a screen that learned something changed. */
+    refresh: pollOperations,
   };
 }

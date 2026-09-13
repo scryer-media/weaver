@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
 import { Square } from "@/next/components/chrome";
+import { CheckBox } from "@/next/components/controls";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { ListRow, ValueCell } from "@/next/components/rows";
 import { EM_DASH, formatSize } from "@/next/data/format";
@@ -17,6 +18,8 @@ export const DownloadRow = memo(function DownloadRow({
   job,
   selected,
   onSelect,
+  picked,
+  onPick,
   statusLabel,
   wait,
   hold,
@@ -25,6 +28,9 @@ export const DownloadRow = memo(function DownloadRow({
   job: JobData;
   selected: boolean;
   onSelect: (id: number) => void;
+  /** Ticked for a bulk action. */
+  picked: boolean;
+  onPick: (id: number) => void;
   statusLabel: (status: string) => string;
   /** A hold or an estimate for the last column; without one it shows the phase's progress. */
   wait: string | null;
@@ -46,8 +52,12 @@ export const DownloadRow = memo(function DownloadRow({
     <ListRow
       markSelection
       selected={selected}
+      picked={picked}
       onClick={() => onSelect(job.id)}
       title={name}
+      lead={
+        <CheckBox label={`Select ${name}`} checked={picked} onChange={() => onPick(job.id)} />
+      }
       left={
         <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px]">
           <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">

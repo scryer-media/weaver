@@ -70,7 +70,7 @@ export function NextShell({
   contentClassName?: string;
   children: ReactNode;
 }) {
-  const { version, queue, historyCount, connection } = useNextData();
+  const { version, update, queue, historyCount, connection } = useNextData();
   const [navOpen, setNavOpen] = useState(false);
   const { pathname } = useLocation();
 
@@ -163,6 +163,7 @@ export function NextShell({
         {railMiddle}
         <div className="mt-auto flex flex-none flex-col">{railFooter}</div>
       </div>
+      {update === undefined ? null : <UpdateBlock version={update.version} url={update.url} />}
       <ThroughputBlock />
     </>
   );
@@ -194,6 +195,10 @@ export function NextShell({
           className="absolute top-0 left-0 z-20 flex h-14 w-12 cursor-pointer items-center justify-center text-wv-muted hover:text-wv-fg lg:hidden"
         >
           <Icon name="menu" size={17} />
+          {update === undefined ? null : (
+            // The drawer is where the release notice lives; the dot says there is one to open it for.
+            <span aria-hidden="true" className="absolute top-[17px] right-[11px] size-[7px] bg-wv-accent" />
+          )}
         </button>
 
         {header ?? (
@@ -258,6 +263,38 @@ export function NextShell({
           )}
         </footer>
       </div>
+    </div>
+  );
+}
+
+/**
+ * A newer weaver release, as the rail's loudest block.
+ *
+ * It sits pinned beside Throughput rather than inside the part that scrolls,
+ * so it is on screen on every page for as long as the release is newer, and it
+ * takes the accent ground and the ping — the same treatment as the one other
+ * control the rail insists on — because an update is easy to miss and cheap to
+ * act on.
+ */
+function UpdateBlock({ version, url }: { version: string; url: string }) {
+  return (
+    <div className="flex-none border-t border-wv-line-strong px-[10px] py-[10px]">
+      <a
+        href={url}
+        target="_blank"
+        rel="noreferrer noopener"
+        aria-label={`Open Weaver v${version} on GitHub in a new tab`}
+        className="wv-ping flex items-center gap-3 bg-wv-accent px-[12px] py-[11px] text-wv-on-accent hover:bg-wv-accent-hover"
+      >
+        <Icon name="update" size={22} className="flex-none" />
+        <span className="flex min-w-0 flex-col gap-[3px]">
+          <span className="text-[13.5px] leading-none font-semibold tracking-[-0.005em]">
+            Update available
+          </span>
+          <span className="truncate font-wv-mono text-[11px] leading-none">v{version} is out</span>
+        </span>
+        <Icon name="external" size={15} className="ml-auto flex-none" />
+      </a>
     </div>
   );
 }
