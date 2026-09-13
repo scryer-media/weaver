@@ -15,6 +15,7 @@ import { TranslateContext, type TranslateContextValue } from "@/lib/context/tran
 import { PwaProvider } from "@/lib/context/pwa-context";
 import { Toaster } from "@/components/ui/sonner";
 import { applyUiVariant, readUiVariant } from "@/lib/ui-variant";
+import { LoadingMark } from "@/lib/loading-mark";
 
 /// The Next interface is a second, self-contained UI tree (`src/next`).
 /// Loading it lazily keeps its chunk out of a classic browser's bundle; the
@@ -32,9 +33,19 @@ const uiVariant = readUiVariant();
 applyUiVariant(uiVariant);
 
 /// Gates render this while they decide. It has to match the interface that is
-/// about to paint, or the window flashes the other UI's background first.
+/// about to paint, or the window flashes the other UI's background first. The
+/// loading mark waits before it appears, so a gate that decides at once shows a
+/// plain background rather than a flicker.
 const GATE_PLACEHOLDER_CLASS =
   uiVariant === "next" ? "h-dvh bg-wv-app" : "min-h-screen bg-background";
+
+function GatePlaceholder() {
+  return (
+    <div className={`${GATE_PLACEHOLDER_CLASS} flex items-center justify-center`} aria-hidden="true">
+      <LoadingMark className="h-10" reveal />
+    </div>
+  );
+}
 
 function AppProviders() {
   const { isReady, t, uiLanguage, setLanguagePreference, selectedLanguage } = useLanguage();
@@ -83,7 +94,7 @@ function AppProviders() {
   );
 
   if (!isReady) {
-    return <div className={GATE_PLACEHOLDER_CLASS} aria-hidden="true" />;
+    return <GatePlaceholder />;
   }
 
   return (
@@ -91,7 +102,7 @@ function AppProviders() {
       <Provider value={client}>
         <SecurityUpgradeGate>
           {uiVariant === "next" ? (
-            <Suspense fallback={<div className={GATE_PLACEHOLDER_CLASS} aria-hidden="true" />}>
+            <Suspense fallback={<GatePlaceholder />}>
               <NextApp />
             </Suspense>
           ) : (
@@ -157,7 +168,7 @@ function SecurityUpgradeGate({ children }: { children: React.ReactNode }) {
   }, [data, error, fetching]);
 
   if (decision === "pending") {
-    return <div className={GATE_PLACEHOLDER_CLASS} aria-hidden="true" />;
+    return <GatePlaceholder />;
   }
   if (decision === "wizard" && data) {
     return (
@@ -215,7 +226,7 @@ function SetupGate({ children }: { children: React.ReactNode }) {
   }, []);
 
   if (setupRequired === null) {
-    return <div className={GATE_PLACEHOLDER_CLASS} aria-hidden="true" />;
+    return <GatePlaceholder />;
   }
   if (setupRequired) {
     return <SetupWizardPage environment={setupEnvironment} />;

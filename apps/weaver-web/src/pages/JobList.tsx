@@ -107,6 +107,7 @@ import {
 } from "@/lib/job-types";
 import { orderQueueByLiveActivity, prioritizeDownloadingJobs } from "@/lib/queue-live-order";
 import { cn } from "@/lib/utils";
+import { LoadingMark } from "@/lib/loading-mark";
 
 type QueueStatusFilter =
   | "QUEUED"
@@ -1688,7 +1689,8 @@ export function JobList() {
   }
 
   const queueEmptyState: ReactNode = isQueueBootstrapPending ? (
-    <div role="status" className="py-8 text-center text-sm text-muted-foreground">
+    <div role="status" className="flex flex-col items-center gap-3 py-8 text-sm text-muted-foreground">
+      <LoadingMark className="h-8" />
       {t("label.loading")}
     </div>
   ) : totalCount === 0 && !hasUnfilteredQueueItems ? (

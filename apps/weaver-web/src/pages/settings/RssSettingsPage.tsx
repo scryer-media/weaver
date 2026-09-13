@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
+import { LoadingMark } from "@/lib/loading-mark";
 import {
   ADD_RSS_FEED_MUTATION,
   ADD_RSS_RULE_MUTATION,
@@ -470,7 +471,8 @@ export function RssSettingsPage() {
       ) : null}
 
       {fetching && !data ? (
-        <div className="rounded-card border border-border bg-card p-6 text-sm text-muted-foreground">
+        <div className="flex items-center gap-3 rounded-card border border-border bg-card p-6 text-sm text-muted-foreground">
+          <LoadingMark className="h-5" />
           {t("label.loading")}
         </div>
       ) : null}

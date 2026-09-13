@@ -569,6 +569,7 @@ export function CompletedPage() {
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         {rows.length === 0 ? (
           <EmptyState
+            loading={fetching}
             title={fetching ? "Loading" : "Nothing matches this view"}
             body={
               fetching

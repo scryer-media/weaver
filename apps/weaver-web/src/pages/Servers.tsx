@@ -1,7 +1,7 @@
 import { ProxyRoutingEditor, ProxyRoutingStatus } from "@/components/ProxyRoutingEditor";
 import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { FilePenLine, Loader2, Trash2 } from "lucide-react";
+import { FilePenLine, Trash2 } from "lucide-react";
 import { useMutation, useQuery } from "urql";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { EmptyState } from "@/components/EmptyState";
@@ -39,6 +39,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
+import { LoadingMark } from "@/lib/loading-mark";
 
 type ServerDownloadQuotaPeriod = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
 type ServerDownloadQuotaWeekday = "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN";
@@ -480,7 +481,7 @@ export function Servers({ embedded = false }: { embedded?: boolean }) {
           <SectionCard title={t("servers.editServer")} description={t("settings.serversDesc")}>
             <div className="flex items-center justify-between gap-4">
               <div className="flex items-center gap-3 text-sm text-muted-foreground">
-                {editingServerFetching ? <Loader2 className="size-4 animate-spin" /> : null}
+                {editingServerFetching ? <LoadingMark className="h-5" /> : null}
                 <span>
                   {editingServerFetching
                     ? t("label.loading")

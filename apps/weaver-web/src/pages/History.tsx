@@ -29,6 +29,7 @@ import { FilterChip } from "@/components/FilterChip";
 import { JobStatusBadge } from "@/components/JobStatusBadge";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { cn } from "@/lib/utils";
+import { LoadingMark } from "@/lib/loading-mark";
 import { STATUS_BG_CLASS, STATUS_TEXT_CLASS } from "@/lib/status-tokens";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useGraphqlConnectionState } from "@/graphql/client";
@@ -1117,7 +1118,10 @@ export function History() {
 
   const hasNoHistory = counts.all === 0 && totalCount === 0 && historyPreferences.search.length === 0 && historyPreferences.status === "all";
   const historyEmptyState = fetching && !data ? (
-    <div className="py-12 text-center text-muted-foreground">{t("label.loading")}</div>
+    <div role="status" className="flex flex-col items-center gap-3 py-12 text-muted-foreground">
+      <LoadingMark className="h-8" />
+      {t("label.loading")}
+    </div>
   ) : hasNoHistory ? (
     <div className="py-4">
       <EmptyState title={t("history.title")} description={t("history.empty")} />

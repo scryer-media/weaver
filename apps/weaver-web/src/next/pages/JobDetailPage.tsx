@@ -232,7 +232,7 @@ export function JobDetailPage() {
     return (
       <NextShell title="Job" note={`#${id}`}>
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-          <EmptyState title="Loading" body="Fetching this job's snapshot." />
+          <EmptyState loading title="Loading" body="Fetching this job's snapshot." />
         </div>
       </NextShell>
     );
