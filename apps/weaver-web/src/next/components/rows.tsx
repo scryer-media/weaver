@@ -11,9 +11,9 @@ import { Eyebrow } from "./chrome";
  * storage volumes, history entries. `FormRow` is the settings equivalent: a
  * label and help text on the left, exactly one control on the right.
  *
- * Both wrap rather than truncate their clusters: the text block carries a
+ * A `ListRow` wraps rather than truncates its cluster: the text block carries a
  * `flex-basis`, so the values drop to a second line before a host or a path is
- * cut short.
+ * cut short. A `FormRow` does not wrap; it is two real columns.
  */
 
 export function ListRow({
@@ -90,6 +90,18 @@ export function ValueCell({
   );
 }
 
+/**
+ * A settings row: a label column and a control column.
+ *
+ * The label sits directly beside its control, and help text wraps inside the
+ * label column, so a long sentence makes the row taller instead of pushing the
+ * control onto a line of its own. Both columns are centred on the row.
+ *
+ * The control column is never narrower than a text field and grows for a wider
+ * control, so the text wraps at the same edge from one row to the next. Only a
+ * phone-width screen, where a 268px field leaves no room for the label, stacks
+ * the control under the text.
+ */
 export function FormRow({
   label,
   help,
@@ -102,8 +114,8 @@ export function FormRow({
   htmlFor?: string;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-x-6 gap-y-3 border-b border-wv-hairline px-4 sm:px-6 py-[14px] hover:bg-wv-cell-hover">
-      <div className="flex min-w-0 flex-[1_1_300px] flex-col gap-1">
+    <div className="grid grid-cols-1 items-center gap-x-6 gap-y-3 border-b border-wv-hairline px-4 py-[14px] hover:bg-wv-cell-hover sm:grid-cols-[minmax(0,1fr)_minmax(268px,max-content)] sm:px-6">
+      <div className="flex min-w-0 flex-col gap-1">
         <label
           htmlFor={htmlFor}
           className="text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg"
@@ -114,7 +126,7 @@ export function FormRow({
           <div className="text-[12px] leading-[1.45] text-pretty text-wv-muted">{help}</div>
         )}
       </div>
-      <div className="ml-auto flex w-full min-w-0 flex-none items-center gap-3 sm:w-auto sm:min-w-[260px] sm:justify-end">
+      <div className="flex min-w-0 items-center gap-3 sm:justify-end">
         {children}
       </div>
     </div>
