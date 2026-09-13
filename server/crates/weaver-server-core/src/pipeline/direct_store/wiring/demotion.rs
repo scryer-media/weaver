@@ -154,6 +154,14 @@ impl Pipeline {
         // above, and for the same reason: it describes volumes that were
         // virtual when it was reached and are about to become files the
         // conventional path writes. The next pass reads the set as it now is.
+        self.direct_unpack_abort_set(
+            job_id,
+            &set_name,
+            "direct RAR source demoted",
+            crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+            crate::pipeline::direct_unpack::wiring::DemotionReason::PartUnreadable,
+        );
+        self.taint_direct_unpack_set(job_id, &set_name);
         self.clear_pending_par2_repairs_for_job(job_id);
         self.invalidate_par3_direct_set(job_id, set_index);
         self.direct_store.begin_materialization(

@@ -68,6 +68,12 @@ impl Pipeline {
                 }
 
                 has_incomplete_sets = true;
+                if self.rar_chase_owns_set(job_id, set_name) {
+                    // Full-set consumption joins the chase and installs only its
+                    // verified output, or falls back after a failed chase.
+                    fallback_sets.push(set_name.clone());
+                    continue;
+                }
                 if let Some(state) = set_state
                     && let Some(plan) = state.plan.as_ref()
                 {

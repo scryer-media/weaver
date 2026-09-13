@@ -119,7 +119,6 @@ pub struct NntpPool {
 struct AuthAdmission {
     // 0 = unverified, 1 = verified, >=2 = monotonic retry deadline plus 2.
     state: AtomicU64,
-    first_connection: Mutex<()>,
     cooldown: Duration,
     epoch: Instant,
 }
@@ -414,7 +413,6 @@ impl NntpPool {
             auth_admission: (0..server_count)
                 .map(|_| AuthAdmission {
                     state: AtomicU64::new(0),
-                    first_connection: Mutex::new(()),
                     cooldown: auth_cooldown,
                     epoch: Instant::now(),
                 })
@@ -440,13 +438,8 @@ impl NntpPool {
         initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
         let auth = &self.auth_admission[idx];
-        auth.check()?;
-        let _first = if auth.state.load(Ordering::Acquire) == 0 {
-            let guard = auth.first_connection.lock().await;
-            (auth.state.load(Ordering::Acquire) == 0).then_some(guard)
-        } else {
-            None
-        };
+        // Cold handshakes fan out. A rejection latches subsequent admission;
+        // connection-limit recovery has its own single-probe gate below.
         auth.check()?;
         // Asked only once this connect will actually dial, so a probe slot is
         // never taken by a caller the auth gate turns away.
@@ -1309,13 +1302,6 @@ impl NntpPool {
             .get(server.0)
             .ok_or(NntpError::PoolExhausted)?;
         admission.check()?;
-        let _first = if admission.state.load(Ordering::Acquire) == 0 {
-            let guard = admission.first_connection.blocking_lock();
-            (admission.state.load(Ordering::Acquire) == 0).then_some(guard)
-        } else {
-            None
-        };
-        admission.check()?;
         let result = connect();
         admission.finish(&result);
         if result.is_ok() {
@@ -1491,22 +1477,47 @@ mod tests {
     use crate::health::{HealthConfig, ServerState};
 
     #[test]
-    fn rejected_auth_admission_bounds_connects_and_allows_recovery() {
+    fn cold_auth_admission_fans_out_then_latches_rejection() {
         let pool = NntpPool::new(test_pool_config(4));
         let attempts = AtomicUsize::new(0);
+        let (started, starts) = std::sync::mpsc::channel();
+        let release = (SyncMutex::new(false), std::sync::Condvar::new());
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
                     let result: Result<()> =
                         pool.with_blocking_connect_admission(ServerId(0), || {
                             attempts.fetch_add(1, Ordering::Relaxed);
+                            started.send(()).unwrap();
+                            let (lock, ready) = &release;
+                            let _guard = ready
+                                .wait_while(lock.lock().unwrap(), |open| !*open)
+                                .unwrap();
                             Err(NntpError::AuthenticationRejected)
                         });
                     assert!(matches!(result, Err(NntpError::AuthenticationRejected)));
                 });
             }
+            let concurrent = (0..4)
+                .take_while(|_| starts.recv_timeout(Duration::from_secs(5)).is_ok())
+                .count();
+            *release.0.lock().unwrap() = true;
+            release.1.notify_all();
+            assert_eq!(
+                concurrent, 4,
+                "all cold dials must start before any finishes"
+            );
         });
-        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(attempts.load(Ordering::Relaxed), 4);
+        assert!(matches!(
+            pool.with_blocking_connect_admission(ServerId(0), || {
+                panic!("latched authentication failure must prevent another dial")
+            }),
+            Err::<(), _>(NntpError::AuthenticationRejected)
+        ));
+        // A late successful sibling must not erase the rejection.
+        pool.auth_admission[0].finish(&Ok(()));
+        assert!(pool.auth_admission[0].check().is_err());
         pool.auth_admission[0].state.store(2, Ordering::Release);
         assert!(
             pool.with_blocking_connect_admission(ServerId(0), || Ok(()))
@@ -1518,6 +1529,65 @@ mod tests {
                 .with_blocking_connect_admission(ServerId(0), || Ok(()))
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn cold_async_dials_start_before_the_first_greeting() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_pool_config(4);
+        config.servers[0].server.host = "127.0.0.1".into();
+        config.servers[0].server.port = listener.local_addr().unwrap().port();
+        config.servers[0].server.tls = false;
+        let pool = Arc::new(NntpPool::new(config));
+        let server = tokio::spawn(async move {
+            // A serialized first handshake cannot pass: the server deliberately
+            // withholds every greeting until all four sockets arrive.
+            let mut sockets = Vec::new();
+            for _ in 0..4 {
+                sockets.push(
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                );
+            }
+            let mut sessions = tokio::task::JoinSet::new();
+            for socket in sockets {
+                sessions.spawn(async move {
+                    let (reader, mut writer) = socket.into_split();
+                    writer.write_all(b"200 ready\r\n").await.unwrap();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Some(line) = lines.next_line().await.unwrap() {
+                        if line == "CAPABILITIES" {
+                            writer
+                                .write_all(b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                                .await
+                                .unwrap();
+                        } else {
+                            writer.write_all(b"500 unsupported\r\n").await.unwrap();
+                        }
+                    }
+                });
+            }
+            while let Some(result) = sessions.join_next().await {
+                result.unwrap();
+            }
+        });
+        let mut dials = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let pool = Arc::clone(&pool);
+            dials.spawn(async move { pool.connect_server_excluding(0, &[], None).await });
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(result) = dials.join_next().await {
+                drop(result.unwrap().unwrap());
+            }
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     fn test_pool_config(max_per_server: usize) -> PoolConfig {

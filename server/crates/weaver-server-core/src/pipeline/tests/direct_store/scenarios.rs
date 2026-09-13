@@ -4,6 +4,7 @@
 
 use super::*;
 
+mod chasing;
 mod classification_frontier;
 #[cfg(unix)]
 mod cross_device;

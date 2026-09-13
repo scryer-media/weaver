@@ -357,6 +357,21 @@ impl SetCoverage {
         self.advanced.notify_all();
     }
 
+    /// Finish a source whose readable bytes are described by explicit ranges.
+    /// Unlike a verified contiguous file, a finished sparse source may retain
+    /// holes. Settling its length must never promote those holes to coverage.
+    pub fn finish_ranged_part(&self, index: usize, len: u64) {
+        self.note_part_len(index, len);
+        let mut state = self.lock();
+        let Some(part) = state.parts.get_mut(index) else {
+            return;
+        };
+        part.complete = true;
+        Self::reconcile_total_when_settled(&mut state);
+        drop(state);
+        self.advanced.notify_all();
+    }
+
     /// Freeze both new reads and publication of reads already in flight.
     pub fn pause_for_repair(&self) {
         self.lock().repair_paused = true;

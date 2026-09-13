@@ -749,7 +749,32 @@ pub(crate) struct ToleratedExtraction {
     /// commit loop: every file renamed into a directory bumps that directory's
     /// mtime, so restoring it before the members land would restore a value the
     /// next rename overwrites.
-    directories: Vec<(unrar_rs::MemberInfo, PathBuf)>,
+    directories: Vec<(ToleratedDirectoryMetadata, PathBuf)>,
+}
+
+#[derive(Debug)]
+enum ToleratedDirectoryMetadata {
+    Parsed(Box<unrar_rs::MemberInfo>),
+    // Installation already applied permissions and archive metadata. Only
+    // directory times can be changed by the stored-member renames that follow.
+    Installed {
+        accessed: filetime::FileTime,
+        modified: filetime::FileTime,
+    },
+}
+
+impl ToleratedDirectoryMetadata {
+    fn apply(&self, path: &std::path::Path) -> Result<(), String> {
+        match self {
+            Self::Parsed(info) => {
+                crate::pipeline::extraction::apply_rar_member_filesystem_metadata(info, path)
+            }
+            Self::Installed { accessed, modified } => {
+                filetime::set_file_times(path, *accessed, *modified)
+                    .map_err(|error| error.to_string())
+            }
+        }
+    }
 }
 
 /// Everything the authoritative PAR2 pass needs to read a job's direct sets
