@@ -469,6 +469,7 @@ export function Bar({
   period,
   className,
   style,
+  label,
 }: {
   percent: number;
   color: string;
@@ -477,6 +478,8 @@ export function Bar({
   period?: number;
   className?: string;
   style?: CSSProperties;
+  /** What the meter measures. With one, it is announced as a progress bar. */
+  label?: string;
 }) {
   const clamped = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
   const cell = period ?? blockPeriod(height);
@@ -495,6 +498,15 @@ export function Bar({
     <div
       ref={ref}
       className={cn("relative", className)}
+      {...(label === undefined
+        ? {}
+        : {
+            role: "progressbar",
+            "aria-label": label,
+            "aria-valuemin": 0,
+            "aria-valuemax": 100,
+            "aria-valuenow": Math.round(clamped),
+          })}
       style={{
         height,
         backgroundImage: blockTrack(cell),

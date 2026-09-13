@@ -157,6 +157,14 @@ function StageRow({ stage, tone = "stage" }: { stage: WaterfallStage; tone?: "st
   const segments = stage.segments ?? [
     { start: stage.start, end: stage.end, color: stage.color },
   ];
+  // A label inside the span sits on its longest run: anchored to the first one,
+  // a download paused after a moment would paint its chip across the gap.
+  const anchor = inside && segments.length > 0
+    ? segments.reduce((widest, segment) =>
+        segment.end - segment.start > widest.end - widest.start ? segment : widest,
+      )
+    : null;
+  const anchorStart = anchor ? Math.max(0, Math.min(100, anchor.start)) : start;
 
   return (
     <div
@@ -223,7 +231,7 @@ function StageRow({ stage, tone = "stage" }: { stage: WaterfallStage; tone?: "st
             member ? "top-[7px]" : "top-[10px]",
           )}
           style={{
-            left: after ? `${end}%` : before ? "auto" : `${start}%`,
+            left: after ? `${end}%` : before ? "auto" : `${anchorStart}%`,
             right: after || !before ? "auto" : `${100 - start}%`,
             background: inside ? stage.color : "transparent",
             color: inside ? WV.onSpan : stage.pending ? WV.disabled : WV.muted,

@@ -44,8 +44,9 @@ import {
 } from "../data/format";
 import { useNow } from "../data/clock";
 import { statusColor, WV } from "../data/palette";
+import { ratePhase } from "../data/phase-bars";
 import { releaseFields, releaseFlags } from "../data/release";
-import { currentPhase, eventTone, useStatusLabel } from "../data/status";
+import { eventTone, useStatusLabel } from "../data/status";
 import { buildTimelineView, type JobTimelineData } from "../data/timeline";
 import { useNextData } from "../data/next-data";
 import { NextShell, RailBlock } from "../shell/NextShell";
@@ -252,7 +253,7 @@ export function JobDetailPage() {
   const done = token === "completed";
   const color = statusColor(progress.status);
   const percent = job.progress * 100;
-  const phase = currentPhase(job);
+  const phase = ratePhase(job.phaseProgress);
   const stageIds = new Set(timeline?.stages.map((stage) => stage.id) ?? []);
   const verified = stageIds.has("VERIFYING");
   const repaired = stageIds.has("REPAIRING");
@@ -507,7 +508,13 @@ export function JobDetailPage() {
                   ? formatRate(job.downloadedBytes / (elapsedMs / 1000))
                   : EM_DASH
             }
-            note={inQueue ? "this phase" : "end to end, including post-processing"}
+            note={
+              inQueue
+                ? phase
+                  ? `while ${phase.phase.toLowerCase()}`
+                  : "this phase"
+                : "end to end, including post-processing"
+            }
           />
           <MetricCell
             variant="stat"
