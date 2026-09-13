@@ -25,6 +25,11 @@
 //! discover EOF from part completion. Plain split files use the same sequential
 //! reader once topology supplies their ordered part list.
 //!
+//! RAR4/RAR5 open physical header prefixes and follow each member's packed
+//! stream across volume boundaries. Mixed direct-store sets publish committed
+//! virtual-volume views; their chaser writes only the tolerated members.
+//! Stored member output remains owned by the direct router.
+//!
 //! Admission is retried, not latched, while the answer is merely "not yet" — no
 //! bytes on part one, no topology. It latches permanently on a real refusal, so
 //! a malformed archive is examined once and never again.
@@ -67,6 +72,8 @@ const CHASE_BUFFER_BYTES: usize = 128 * 1024;
 enum ChaseFormat {
     SevenZip { end_header_bytes: u64 },
     Zip,
+    Rar,
+    RarVirtual { set_index: usize },
     Sequential(crate::pipeline::completion::finalize::SimpleArchiveKind),
 }
 
@@ -276,6 +283,7 @@ impl DirectUnpackCounters {
 /// One set currently being chased.
 struct ArmedSet {
     coverage: Arc<SetCoverage>,
+    virtual_source: Option<(usize, super::rar_virtual::VirtualRarInput)>,
     budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
     staging_dir: PathBuf,
     handle: tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
@@ -294,6 +302,7 @@ struct ArmedSet {
 /// A chase that has not finished yet, handed to the extraction context so it
 /// can be awaited there rather than on the orchestrator loop.
 pub(in crate::pipeline) struct PendingChase {
+    _cancel_on_drop: PendingChaseCancellation,
     pub(in crate::pipeline) budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
     pub(in crate::pipeline) handle:
         tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
@@ -303,6 +312,20 @@ pub(in crate::pipeline) struct PendingChase {
     /// finish in time rather than waiting on it forever.
     pub(in crate::pipeline) coverage: Arc<SetCoverage>,
     pub(in crate::pipeline) set_name: String,
+}
+
+struct PendingChaseCancellation {
+    coverage: Arc<SetCoverage>,
+    budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
+}
+
+impl Drop for PendingChaseCancellation {
+    fn drop(&mut self) {
+        // The completion task may be cancelled before it is ever polled. Keep
+        // this guard in the transferred ownership itself, not in its await.
+        self.coverage.abort("direct-unpack consumer dropped");
+        self.budget.cancel();
+    }
 }
 
 /// How long consumption waits for a chase that has not finished.
@@ -361,6 +384,9 @@ pub(crate) struct DirectUnpackRuntime {
     /// that ride free: when it is empty, which is every job that carries no
     /// supported single-file archives, the hot path's added cost is one `is_empty`.
     pending_single_arm: HashSet<crate::jobs::ids::NzbFileId>,
+    /// Coalesce article commits into bounded-frequency virtual source snapshots.
+    pending_virtual_refresh: HashSet<(JobId, usize)>,
+    last_virtual_refresh: Option<Instant>,
     /// Sets held parked through a PAR2 repair rather than tainted, because
     /// every byte their decoder had already consumed was vouched for by the
     /// recovery set. Released when the repair reports success.
@@ -388,12 +414,28 @@ pub(crate) struct DirectUnpackRuntime {
     counters: DirectUnpackCounters,
 }
 
+impl Drop for DirectUnpackRuntime {
+    fn drop(&mut self) {
+        // A frontier can no longer advance once its actor is gone. Dropping
+        // join handles alone detaches blocking workers and can prevent runtime
+        // shutdown forever; wake both input and memory waits first.
+        for armed in self
+            .armed
+            .values()
+            .chain(self.draining.iter().map(|(_, armed)| armed))
+        {
+            armed.coverage.abort("direct-unpack owner dropped");
+            armed.budget.cancel();
+            armed.handle.abort();
+        }
+    }
+}
+
 impl DirectUnpackRuntime {
     pub(crate) fn with_settings(settings: DirectUnpackSettings) -> Self {
-        Self {
-            settings: Some(settings),
-            ..Self::default()
-        }
+        let mut runtime = Self::default();
+        let _ = runtime.settings.insert(settings);
+        runtime
     }
 
     pub(crate) fn settings(&self) -> DirectUnpackSettings {
@@ -516,6 +558,222 @@ impl Pipeline {
         }
     }
 
+    pub(in crate::pipeline) fn rar_chase_owns_set(&self, job_id: JobId, set_name: &str) -> bool {
+        let key = (job_id, set_name.to_string());
+        self.direct_unpack.armed.contains_key(&key)
+            || self.direct_unpack.outcomes.contains_key(&key)
+    }
+
+    pub(in crate::pipeline) fn note_mixed_rar_commit(&mut self, job_id: JobId, set_index: usize) {
+        if self.direct_unpack.gate() == DirectUnpackGate::Enabled {
+            self.direct_unpack
+                .pending_virtual_refresh
+                .insert((job_id, set_index));
+        }
+    }
+
+    pub(in crate::pipeline) fn update_mixed_rar_chase(&mut self, job_id: JobId, set_index: usize) {
+        if self.direct_unpack.gate() != DirectUnpackGate::Enabled {
+            return;
+        }
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return;
+        };
+        if set.is_demoted() || set.is_finalized() || set.router.tolerated_members().is_empty() {
+            return;
+        }
+        let set_name = set.set_name().to_string();
+        let key = (job_id, set_name.clone());
+        if !self.rar_chase_owns_set(job_id, &set_name)
+            && !self.direct_unpack.latched.contains_key(&key)
+        {
+            let Some(state) = self.jobs.get(&job_id) else {
+                return;
+            };
+            if matches!(
+                state.status,
+                crate::JobStatus::Paused
+                    | crate::JobStatus::Failed { .. }
+                    | crate::JobStatus::Complete
+            ) {
+                return;
+            }
+            let mut paths = Vec::new();
+            for (expected, (&volume, &file_index)) in set.plan().volumes.iter().enumerate() {
+                if volume != expected as u32 {
+                    return;
+                }
+                let Some(file) = state
+                    .assembly
+                    .file(crate::jobs::ids::NzbFileId { job_id, file_index })
+                else {
+                    return;
+                };
+                let filename = self.current_filename_for_file(job_id, file);
+                let Some(path) = self.resolve_job_input_path(job_id, &filename) else {
+                    return;
+                };
+                paths.push(path);
+            }
+            if paths.is_empty() {
+                return;
+            }
+            self.arm_prepared_direct_unpack(
+                job_id,
+                &set_name,
+                paths,
+                None,
+                ChaseFormat::RarVirtual { set_index },
+            );
+        }
+        let Some((_, input)) = self
+            .direct_unpack
+            .armed
+            .get(&key)
+            .and_then(|armed| armed.virtual_source.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        let Some(set) = self.direct_store.set(job_id, set_index) else {
+            return;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let mut lengths = std::collections::BTreeMap::new();
+        let mut complete = Vec::new();
+        for (&volume, &file_index) in &set.plan().volumes {
+            let Some(file) = state
+                .assembly
+                .file(crate::jobs::ids::NzbFileId { job_id, file_index })
+            else {
+                return;
+            };
+            let len = set.virtual_volume_len(volume, file.received_bytes());
+            lengths.insert(volume, len);
+            if file.is_complete() {
+                complete.push((volume as usize, len));
+            }
+        }
+        let extracted: HashSet<_> = set
+            .router
+            .tolerated_members()
+            .into_iter()
+            .map(|member| member.name)
+            .collect();
+        let mut known = extracted.clone();
+        known.extend(
+            set.router
+                .member_partials()
+                .into_iter()
+                .map(|(_, name, _)| name.to_string()),
+        );
+        if let Err(error) = input.publish(
+            set.virtual_volumes(&lengths),
+            extracted,
+            known,
+            &complete,
+            &self.process_memory_budget,
+        ) {
+            input.coverage.abort(error);
+        }
+    }
+
+    fn abort_virtual_rar_chases(&mut self, job_id: JobId, reason: &str) {
+        let sets: Vec<_> = self
+            .direct_unpack
+            .armed
+            .iter()
+            .filter(|((job, _), armed)| *job == job_id && armed.virtual_source.is_some())
+            .map(|((_, name), _)| name.clone())
+            .collect();
+        for set in sets {
+            self.direct_unpack_abort_set(
+                job_id,
+                &set,
+                reason,
+                AbortLatch::Permanent,
+                DemotionReason::RepairRewrote,
+            );
+        }
+        let names: Vec<_> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .map(|set| set.set_name().to_string())
+            .collect();
+        for name in names {
+            self.taint_direct_unpack_set(job_id, &name);
+        }
+    }
+
+    pub(in crate::pipeline) fn try_arm_rar_chase(&mut self, job_id: JobId, set_name: &str) {
+        let key = (job_id, set_name.to_string());
+        if self.direct_unpack.gate() != DirectUnpackGate::Enabled
+            || self.rar_chase_owns_set(job_id, set_name)
+            || self.direct_unpack.latched.contains_key(&key)
+            || self
+                .direct_store
+                .sets_for(job_id)
+                .iter()
+                .any(|set| set.set_name() == set_name && !set.is_demoted())
+            || self
+                .rar_sets
+                .get(&key)
+                .is_some_and(|set| set.active_workers > 0)
+            || self
+                .extracted_members
+                .get(&job_id)
+                .is_some_and(|members| !members.is_empty())
+        {
+            return;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if matches!(
+            state.status,
+            crate::JobStatus::Paused | crate::JobStatus::Failed { .. } | crate::JobStatus::Complete
+        ) {
+            return;
+        }
+        let mut parts = std::collections::BTreeMap::new();
+        for file in state.assembly.files() {
+            let weaver_model::files::FileRole::RarVolume { volume_number } =
+                self.classified_role_for_file(job_id, file)
+            else {
+                continue;
+            };
+            if self
+                .classified_archive_set_name_for_file(job_id, file)
+                .as_deref()
+                != Some(set_name)
+            {
+                continue;
+            }
+            let filename = self.current_filename_for_file(job_id, file);
+            let Some(path) = self.resolve_job_input_path(job_id, &filename) else {
+                return;
+            };
+            if parts.insert(volume_number, path).is_some() {
+                return;
+            }
+        }
+        if parts.is_empty() || parts.keys().copied().ne(0..parts.len() as u32) {
+            return;
+        }
+        let paths: Vec<_> = parts.into_values().collect();
+        if self
+            .direct_unpack_progress_floor(job_id, &paths[0])
+            .unwrap_or(0)
+            < SIGNATURE_HEADER_LEN
+        {
+            return;
+        }
+        self.arm_prepared_direct_unpack(job_id, set_name, paths, None, ChaseFormat::Rar);
+    }
+
     /// Arm a set over an explicit ordered part list.
     ///
     /// Split sets reach this through the topology, which is the only thing that
@@ -605,7 +863,10 @@ impl Pipeline {
         }
         let end_header_bytes = match format {
             ChaseFormat::SevenZip { end_header_bytes } => end_header_bytes,
-            ChaseFormat::Zip | ChaseFormat::Sequential(_) => 0,
+            ChaseFormat::Zip
+            | ChaseFormat::Rar
+            | ChaseFormat::RarVirtual { .. }
+            | ChaseFormat::Sequential(_) => 0,
         };
 
         // Admission control, and it is a liveness requirement rather than a
@@ -681,6 +942,14 @@ impl Pipeline {
         }
 
         let coverage = Arc::new(SetCoverage::new(paths.len()));
+        let virtual_source = if let ChaseFormat::RarVirtual { set_index } = format {
+            Some((
+                set_index,
+                super::rar_virtual::VirtualRarInput::new(Arc::clone(&coverage)),
+            ))
+        } else {
+            None
+        };
         if let Some(total_len) = total_len {
             coverage.set_total_len(total_len);
         }
@@ -690,6 +959,9 @@ impl Pipeline {
         // invented: the reader parks on it until completion supplies it.
         let mut targets: HashMap<String, (String, usize)> = HashMap::new();
         for (index, path) in paths.iter().enumerate() {
+            if virtual_source.is_some() {
+                continue;
+            }
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                 targets.insert(name.to_string(), (set_name.to_string(), index));
             }
@@ -771,6 +1043,7 @@ impl Pipeline {
             password,
             Arc::clone(&counters),
             format,
+            virtual_source.as_ref().map(|(_, input)| input.clone()),
         );
 
         self.direct_unpack
@@ -783,6 +1056,7 @@ impl Pipeline {
             ArmedSet {
                 aborted_at: None,
                 zombie_announced: false,
+                virtual_source,
                 coverage,
                 budget,
                 staging_dir: output_dir,
@@ -804,7 +1078,9 @@ impl Pipeline {
         let tail_hint = match format {
             ChaseFormat::Zip => 8 * 1024 * 1024,
             ChaseFormat::SevenZip { end_header_bytes } => end_header_bytes,
-            ChaseFormat::Sequential(_) => return,
+            ChaseFormat::Rar | ChaseFormat::RarVirtual { .. } | ChaseFormat::Sequential(_) => {
+                return;
+            }
         };
         if let Some(total_len) = total_len {
             self.boost_direct_unpack_tail_window(job_id, &boost_paths, total_len, tail_hint);
@@ -938,6 +1214,17 @@ impl Pipeline {
             return;
         };
         let role = self.classified_role_for_file(job_id, file_asm);
+        if matches!(role, weaver_model::files::FileRole::RarVolume { .. }) {
+            if let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file_asm) {
+                self.try_arm_rar_chase(job_id, &set_name);
+                if self.rar_chase_owns_set(job_id, &set_name)
+                    || self.direct_unpack.latched.contains_key(&(job_id, set_name))
+                {
+                    self.direct_unpack.pending_single_arm.remove(&file_id);
+                }
+            }
+            return;
+        }
         if !matches!(role, weaver_model::files::FileRole::SplitFile { .. })
             && crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(&role).is_some()
         {
@@ -969,11 +1256,12 @@ impl Pipeline {
             return;
         }
         for (file_index, file) in spec.files.iter().enumerate() {
-            if matches!(file.role, weaver_model::files::FileRole::SevenZipArchive)
-                || (!matches!(file.role, weaver_model::files::FileRole::SplitFile { .. })
-                    && crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(
-                        &file.role,
-                    )
+            if matches!(
+                file.role,
+                weaver_model::files::FileRole::SevenZipArchive
+                    | weaver_model::files::FileRole::RarVolume { .. }
+            ) || (!matches!(file.role, weaver_model::files::FileRole::SplitFile { .. })
+                && crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(&file.role)
                     .is_some())
             {
                 self.direct_unpack
@@ -1010,6 +1298,12 @@ impl Pipeline {
         // set that turns out to be split after all. Either way it is no longer
         // this path's business.
         let role = self.classified_role_for_file(job_id, file_asm);
+        if matches!(role, weaver_model::files::FileRole::RarVolume { .. }) {
+            if let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file_asm) {
+                self.try_arm_rar_chase(job_id, &set_name);
+            }
+            return;
+        }
         let simple_kind =
             crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(&role);
         if matches!(role, weaver_model::files::FileRole::SplitFile { .. })
@@ -1221,6 +1515,7 @@ impl Pipeline {
         password: Option<String>,
         counters: Arc<crate::jobs::PhaseCounters>,
         format: ChaseFormat,
+        virtual_source: Option<super::rar_virtual::VirtualRarInput>,
     ) -> tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>> {
         // The chase's own pool, never the shared post-processing one: `install`
         // holds a worker for as long as the closure runs, and this closure parks.
@@ -1251,6 +1546,38 @@ impl Pipeline {
                     coverage
                         .resolve_position(0, 0)
                         .map_err(|error| error.to_string())?;
+                    if matches!(format, ChaseFormat::Rar) {
+                        let provider = super::rar_reader::RarVolumeProvider {
+                            paths,
+                            coverage: Arc::clone(&coverage),
+                        };
+                        return super::rar::extract(
+                            super::rar::RarChaseContext {
+                                provider: &provider,
+                                volume_count: provider.paths.len(),
+                                root: &root,
+                                output_dir: &output_dir,
+                                budget: &budget,
+                                password,
+                                counters: &counters,
+                            },
+                            |_| Ok(true),
+                        );
+                    }
+                    if let Some(input) = virtual_source {
+                        return super::rar::extract(
+                            super::rar::RarChaseContext {
+                                provider: &input,
+                                volume_count: paths.len(),
+                                root: &root,
+                                output_dir: &output_dir,
+                                budget: &budget,
+                                password,
+                                counters: &counters,
+                            },
+                            |name| input.should_extract(name),
+                        );
+                    }
                     if let ChaseFormat::Sequential(kind) = format {
                         use crate::pipeline::completion::finalize::extract::sequential::{
                             SequentialExtractionContext, decoder_memory_bytes,
@@ -1411,10 +1738,9 @@ impl Pipeline {
         else {
             return false;
         };
-        crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(
-            &self.classified_role_for_file(file_id.job_id, file),
-        )
-        .is_some()
+        let role = self.classified_role_for_file(file_id.job_id, file);
+        (matches!(role, weaver_model::files::FileRole::RarVolume { .. })
+            || crate::pipeline::completion::finalize::SimpleArchiveKind::from_role(&role).is_some())
             && (self.direct_unpack.pending_single_arm.contains(&file_id)
                 || self
                     .direct_unpack
@@ -1649,6 +1975,9 @@ impl Pipeline {
         filename: &str,
         reason: &str,
     ) {
+        // Virtual readers have no disk watermark targets. Their backing
+        // bindings are job-owned, so an identity change invalidates that view.
+        self.abort_virtual_rar_chases(job_id, reason);
         if self.direct_unpack.armed.is_empty() {
             return;
         }
@@ -1771,6 +2100,14 @@ impl Pipeline {
             .collect();
 
         for set_name in sets {
+            if self
+                .direct_unpack
+                .armed
+                .get(&(job_id, set_name.clone()))
+                .is_some_and(|armed| armed.virtual_source.is_some())
+            {
+                continue;
+            }
             let paths = match self.archive_set_part_paths(job_id, &set_name) {
                 Ok(paths) => paths,
                 Err(error) => {
@@ -1850,6 +2187,19 @@ impl Pipeline {
     /// Polled rather than awaited: the controller must not block the
     /// orchestrator on a decode that is still chasing a live download.
     pub(in crate::pipeline) async fn reap_direct_unpack(&mut self) {
+        if !self.direct_unpack.pending_virtual_refresh.is_empty()
+            && self
+                .direct_unpack
+                .last_virtual_refresh
+                .is_none_or(|last| last.elapsed() >= Duration::from_millis(100))
+        {
+            self.direct_unpack.last_virtual_refresh = Some(Instant::now());
+            for (job_id, set_index) in
+                std::mem::take(&mut self.direct_unpack.pending_virtual_refresh)
+            {
+                self.update_mixed_rar_chase(job_id, set_index);
+            }
+        }
         // Aborted workers first: they were woken with an error and return
         // almost immediately, and their staging has to go.
         if !self.direct_unpack.draining.is_empty() {
@@ -2032,6 +2382,10 @@ impl Pipeline {
         self.direct_unpack.counters.consumed += 1;
         record_event("consumed");
         ChaseDisposition::Pending(PendingChase {
+            _cancel_on_drop: PendingChaseCancellation {
+                coverage: Arc::clone(&armed.coverage),
+                budget: Arc::clone(&armed.budget),
+            },
             budget: armed.budget,
             handle: armed.handle,
             staging_dir: armed.staging_dir,
@@ -2192,6 +2546,7 @@ impl Pipeline {
         job_id: JobId,
         verification: Option<&par2_rs::VerificationResult>,
     ) {
+        self.abort_virtual_rar_chases(job_id, "direct RAR sources entering repair");
         self.direct_unpack.repairing_jobs.insert(job_id);
         if self.direct_unpack.armed.is_empty() && self.direct_unpack.outcomes.is_empty() {
             return;
@@ -2227,6 +2582,7 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn prepare_direct_unpack_for_par3_repair(&mut self, job_id: JobId) {
+        self.abort_virtual_rar_chases(job_id, "direct RAR sources entering repair");
         self.direct_unpack.repairing_jobs.insert(job_id);
         let sets: Vec<_> = self
             .direct_unpack
@@ -2757,6 +3113,9 @@ impl Pipeline {
         self.direct_unpack
             .pending_single_arm
             .retain(|file_id| file_id.job_id != job_id);
+        self.direct_unpack
+            .pending_virtual_refresh
+            .retain(|(job, _)| *job != job_id);
         self.direct_unpack
             .parked_through_repair
             .retain(|(parked_job, _)| *parked_job != job_id);

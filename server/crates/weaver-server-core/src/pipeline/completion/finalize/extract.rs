@@ -586,12 +586,14 @@ fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -
     }
 }
 
-async fn install_direct_unpack(
+pub(in crate::pipeline) async fn install_direct_unpack(
     disposition: crate::pipeline::direct_unpack::wiring::ChaseDisposition,
     staging_for_install: PathBuf,
     phase_counters_for_install: Arc<PhaseCounters>,
     job_id: JobId,
     set_name_for_channel: &str,
+    policy: Option<&crate::post_processing::model::PostProcessingSettings>,
+    expected_names: Option<&HashSet<String>>,
 ) -> Option<FullSetExtractionOutcome> {
     // Resolve the chase first: if it produced usable members there is
     // no reason to decode the archive a second time.
@@ -684,11 +686,38 @@ async fn install_direct_unpack(
     };
 
     if let Some((outcome, chase_staging, total_bytes, completed_bytes)) = chase {
+        if expected_names.is_some_and(|expected| {
+            outcome.extracted.iter().cloned().collect::<HashSet<_>>() != *expected
+        }) {
+            let _ = tokio::fs::remove_dir_all(chase_staging).await;
+            return None;
+        }
+        if policy.is_some_and(|policy| {
+            outcome
+                .extracted
+                .iter()
+                .any(|name| policy.unacceptable_extension_match(name).is_some())
+        }) {
+            let _ = tokio::fs::remove_dir_all(chase_staging).await;
+            return None;
+        }
+        // RAR supplies either its policy (whole set) or its mixed-member
+        // manifest. Other formats retain their existing installation path.
+        let rar_names =
+            (policy.is_some() || expected_names.is_some()).then(|| outcome.extracted.clone());
         let install = tokio::task::spawn_blocking(move || {
-            crate::pipeline::direct_unpack::wiring::install_chased_members(
-                &chase_staging,
-                &staging_for_install,
-            )
+            if let Some(names) = rar_names {
+                crate::pipeline::direct_unpack::rar::install(
+                    &chase_staging,
+                    &staging_for_install,
+                    &names,
+                )
+            } else {
+                crate::pipeline::direct_unpack::wiring::install_chased_members(
+                    &chase_staging,
+                    &staging_for_install,
+                )
+            }
         })
         .await;
 
@@ -1520,7 +1549,30 @@ impl Pipeline {
         // Totals are reserved per member at extraction open (see
         // extract_rar_member_to_output); topology may not be rebuilt yet here.
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
+        let disposition = self.take_direct_unpack_disposition(job_id, set_name);
+        let staging_for_install = output_dir.clone();
+        let phase_counters_for_install = Arc::clone(&phase_counters);
         tokio::task::spawn(async move {
+            if let Some(outcome) = install_direct_unpack(
+                disposition,
+                staging_for_install,
+                phase_counters_for_install,
+                job_id,
+                &set_name_for_task,
+                Some(&policy),
+                None,
+            )
+            .await
+            {
+                let _ = extract_done_tx
+                    .send(ExtractionDone::FullSet {
+                        job_id,
+                        set_name: set_name_for_task,
+                        result: Ok(outcome),
+                    })
+                    .await;
+                return;
+            }
             let result = tokio::task::spawn_blocking(move || pp_pool.install(move || {
                 let _task_permit = task_permit;
                 let root = _task_permit.root();
@@ -1824,6 +1876,8 @@ impl Pipeline {
                 phase_counters_for_install,
                 job_id,
                 &set_name_for_channel,
+                None,
+                None,
             )
             .await
             {
@@ -1992,6 +2046,8 @@ impl Pipeline {
                 phase_counters_for_install,
                 job_id,
                 &set_name_for_channel,
+                None,
+                None,
             )
             .await
             {

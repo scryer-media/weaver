@@ -77,6 +77,7 @@ impl Pipeline {
             &segment.segments,
         )
         .await;
+        self.note_mixed_rar_commit(job_id, set_index);
         DirectRouteOutcome::Routed
     }
 
@@ -1512,16 +1513,11 @@ impl Pipeline {
     /// through the hybrid virtual-volume provider, straight to their
     /// destinations.
     ///
-    /// # This is the tolerance's whole remaining cost
-    ///
-    /// One blocking task, once, after the set's last article. Nothing here is
-    /// I/O amplification — the tolerated bytes are read once out of the
-    /// envelope they were routed to, and the stored members are not touched at
-    /// all — but it is a *serial tail*, and with the tolerance's size ceiling
-    /// gone the list it walks can be large. The conventional incremental
-    /// scheduler already runs the same decode volume by volume as chains close;
-    /// feeding it this provider instead of files is the seam that would retire
-    /// the tail, and it is not opened here.
+    /// The ticket first consumes an eligible virtual-volume chase, checking
+    /// its produced names against the final tolerated-member list. If no
+    /// usable chase exists, one blocking task decodes those members from their
+    /// envelopes after the last article. Stored members remain router-owned
+    /// on both paths.
     ///
     /// Returns the raw member names that were produced, for
     /// `extracted_members`. The distinction that separates this from the
@@ -1748,7 +1744,22 @@ impl Pipeline {
             "submitting a direct tolerated-extraction ticket"
         );
         let done_tx = self.direct_tolerated_done_tx.clone();
+        self.update_mixed_rar_chase(job_id, set_index);
+        let disposition = self.take_direct_unpack_disposition(job_id, &set_name);
+        let install_root = staging.clone();
+        let expected_names: HashSet<_> = targets.iter().map(|target| target.name.clone()).collect();
         tokio::spawn(async move {
+            let chased = crate::pipeline::completion::finalize::extract::install_direct_unpack(
+                disposition,
+                install_root,
+                std::sync::Arc::new(crate::jobs::PhaseCounters::default()),
+                job_id,
+                &set_name,
+                None,
+                Some(&expected_names),
+            )
+            .await
+            .is_some();
             let joined = tokio::task::spawn_blocking(move || {
                 let reader = provider
                     .open(first_volume)
@@ -1781,11 +1792,19 @@ impl Pipeline {
                     max_dict_bytes,
                 )
                 .map_err(|error| format!("RAR dictionary admission failed: {error}"))?;
-                let _memory_permit = extraction_budget
-                    .reserve_memory_wait(crate::pipeline::extraction::rar_decoder_memory_bytes(
-                        &archive,
-                    ))
-                    .map_err(|error| format!("RAR decoder memory admission failed: {error}"))?;
+                let _memory_permit = if chased {
+                    None
+                } else {
+                    Some(
+                        extraction_budget
+                            .reserve_memory_wait(
+                                crate::pipeline::extraction::rar_decoder_memory_bytes(&archive),
+                            )
+                            .map_err(|error| {
+                                format!("RAR decoder memory admission failed: {error}")
+                            })?,
+                    )
+                };
                 let options = unrar_rs::ExtractOptions {
                     verify: true,
                     password: password.clone(),
@@ -1831,6 +1850,10 @@ impl Pipeline {
                     // free-space limits. A rejection fails the tolerated extraction,
                     // which demotes the set to a conventional extraction that will
                     // meet the very same budget.
+                    if chased {
+                        produced.push(name.clone());
+                        continue;
+                    }
                     let mut file = root.create_file(&target.relative, &extraction_budget)?;
                     // The provider is the set's, keyed by the set's own volume
                     // indices, which is what the entry asks for — a member
