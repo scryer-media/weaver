@@ -10,9 +10,10 @@ import {
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
-import { NumberField, SecondaryButton, Select, TextField, Toggle } from "../../../components/controls";
+import { NumberField, SecondaryButton, Select, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
+import { PathField } from "../../../features/DirectoryBrowserDialog";
 import {
   PanelControls,
   SettingsBlocks,
@@ -499,10 +500,10 @@ export function PostProcessingPanel() {
             kind: "custom",
             control: (
               <div className="flex min-w-0 flex-wrap items-center gap-3">
-                <TextField
+                <PathField
                   label="Scripts directory"
                   value={scriptDirectory}
-                  className="w-[268px] max-w-full"
+                  className="w-[360px] max-w-full"
                   onChange={setDirectory}
                 />
                 <SecondaryButton

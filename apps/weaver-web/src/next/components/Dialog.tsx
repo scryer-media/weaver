@@ -1,6 +1,12 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
+
+/**
+ * Dialogs open right now, oldest first. A dialog can open another — a folder
+ * picker over the record editor it fills — and Escape closes only the top one.
+ */
+const openDialogs: object[] = [];
 
 /**
  * A modal panel.
@@ -27,18 +33,27 @@ export function Dialog({
   width?: number;
   children: ReactNode;
 }) {
+  // Read through a ref so a re-render with a fresh callback keeps this
+  // dialog's place in the stack instead of re-registering it on top.
+  const dismissRef = useRef(onDismiss);
+  dismissRef.current = onDismiss;
   useEffect(() => {
     if (!open) {
       return;
     }
+    const layer = {};
+    openDialogs.push(layer);
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        onDismiss();
+      if (event.key === "Escape" && openDialogs[openDialogs.length - 1] === layer) {
+        dismissRef.current();
       }
     };
     document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onDismiss, open]);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      openDialogs.splice(openDialogs.indexOf(layer), 1);
+    };
+  }, [open]);
 
   if (!open) {
     return null;

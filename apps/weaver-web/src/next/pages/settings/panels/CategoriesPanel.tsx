@@ -178,7 +178,7 @@ export function CategoriesPanel() {
                 label: "Destination",
                 help: `Leave blank to use ${completeDir || "the completed folder"}/${form.name || "<name>"}.`,
                 control: {
-                  kind: "text",
+                  kind: "path",
                   value: form.destDir,
                   placeholder: completeDir ? `${completeDir}/${form.name || "name"}` : "",
                   onChange: (next) => setForm((current) => ({ ...current, destDir: next })),

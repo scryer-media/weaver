@@ -5,9 +5,10 @@ import { SETTINGS_QUERY } from "@/graphql/queries";
 import { saveResponseAsDownload } from "@/lib/download";
 import { KeyValueRow } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { DangerButton, SecondaryButton, TextField } from "../../../components/controls";
+import { DangerButton, SecondaryButton } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatDate } from "../../../data/format";
+import { PathField } from "../../../features/DirectoryBrowserDialog";
 import {
   PanelControls,
   SettingsBlocks,
@@ -321,14 +322,14 @@ export function BackupPanel() {
       label: "Data directory",
       help: "Where the restored database and state are written on this machine.",
       keywords: dataDir,
-      control: { kind: "text", value: dataDir, onChange: setDataDir },
+      control: { kind: "path", value: dataDir, onChange: setDataDir },
     },
     {
       id: "intermediateDir",
       label: "Intermediate directory",
       help: `Blank uses ${dataDir || currentDataDir || "the data directory"}/intermediate.`,
       control: {
-        kind: "text",
+        kind: "path",
         value: intermediateDir,
         placeholder: `${dataDir || currentDataDir}/intermediate`,
         onChange: setIntermediateDir,
@@ -339,7 +340,7 @@ export function BackupPanel() {
       label: "Completed directory",
       help: `Blank uses ${dataDir || currentDataDir || "the data directory"}/complete.`,
       control: {
-        kind: "text",
+        kind: "path",
         value: completeDir,
         placeholder: `${dataDir || currentDataDir}/complete`,
         onChange: setCompleteDir,
@@ -526,11 +527,12 @@ export function BackupPanel() {
               <Cell key="was" mono className="text-wv-muted" title={entry.current_dest_dir}>
                 {entry.current_dest_dir}
               </Cell>,
-              <TextField
+              <PathField
                 key="now"
+                compact
                 label={`Destination for ${entry.category_name}`}
                 value={remaps[entry.category_name] ?? ""}
-                className="h-7 w-full"
+                className="w-full"
                 placeholder="/media/library"
                 onChange={(next) =>
                   setRemaps((current) => ({ ...current, [entry.category_name]: next }))

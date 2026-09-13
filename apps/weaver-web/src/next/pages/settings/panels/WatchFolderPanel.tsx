@@ -167,7 +167,7 @@ export function WatchFolderPanel() {
           help: "Every .nzb dropped here is queued and then moved aside.",
           keywords: values.path,
           control: {
-            kind: "text",
+            kind: "path",
             value: values.path,
             placeholder: "/downloads/watch",
             onChange: (next) => draft.set({ path: next }),

@@ -254,7 +254,7 @@ export function GeneralPanel() {
               help: "Where downloads are assembled before post-processing. Blank uses the data directory.",
               keywords: `${values.intermediateDir} incomplete temporary`,
               control: {
-                kind: "text",
+                kind: "path",
                 value: values.intermediateDir,
                 placeholder: `${values.dataDir}/intermediate`,
                 onChange: (next) => draft.set({ intermediateDir: next }),
@@ -266,7 +266,7 @@ export function GeneralPanel() {
               help: "Where finished downloads land. Categories are relative to this folder.",
               keywords: `${values.completeDir} destination`,
               control: {
-                kind: "text",
+                kind: "path",
                 value: values.completeDir,
                 placeholder: `${values.dataDir}/complete`,
                 onChange: (next) => draft.set({ completeDir: next }),

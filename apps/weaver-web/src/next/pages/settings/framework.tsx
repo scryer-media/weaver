@@ -9,6 +9,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { Eyebrow, EmptyState, SectionHeader } from "@/next/components/chrome";
+import { PathField } from "@/next/features/DirectoryBrowserDialog";
 import {
   NumberField,
   Segmented,
@@ -69,6 +70,13 @@ export type FieldControl =
       mono?: boolean;
       type?: "text" | "password" | "url";
       className?: string;
+    }
+  /** A folder on the daemon's filesystem: typed, or picked with Browse. */
+  | {
+      kind: "path";
+      value: string;
+      onChange: (next: string) => void;
+      placeholder?: string;
     }
   | {
       kind: "number";
@@ -151,6 +159,15 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           mono={control.mono ?? true}
           type={control.type}
           className={control.className ?? "w-[268px] max-w-full"}
+        />
+      );
+    case "path":
+      return (
+        <PathField
+          value={control.value}
+          onChange={control.onChange}
+          label={spec.label}
+          placeholder={control.placeholder}
         />
       );
     case "number":
