@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { Menu, MenuItem } from "./Menu";
 
@@ -276,6 +276,11 @@ export function Segmented<T extends string>({
 /**
  * A real dropdown, styled like the Downloads menus — the prototype cycled
  * options on click, which the handoff explicitly calls out as prototype-only.
+ *
+ * The menu is pinned to the viewport under its trigger rather than placed
+ * inside the trigger's box: a Select near the foot of a scrolling panel — a
+ * dialog's body, a settings list — would otherwise have its options cut off at
+ * the panel's edge.
  */
 export function Select<T extends string>({
   value,
@@ -292,18 +297,43 @@ export function Select<T extends string>({
   className?: string;
   menuClassName?: string;
 }) {
-  const [open, setOpen] = useState(false);
+  const [placement, setPlacement] = useState<MenuPlacement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const open = placement !== null;
   const current = options.find((option) => option.value === value);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    // Pinned to the viewport, the menu would drift off its trigger as anything
+    // under it scrolls, so it follows — except when the scroll is its own list.
+    const follow = (event: Event) => {
+      if ((event.target as Element | null)?.closest?.('[role="menu"]')) {
+        return;
+      }
+      if (triggerRef.current) {
+        setPlacement(placeMenu(triggerRef.current));
+      }
+    };
+    window.addEventListener("scroll", follow, true);
+    window.addEventListener("resize", follow);
+    return () => {
+      window.removeEventListener("scroll", follow, true);
+      window.removeEventListener("resize", follow);
+    };
+  }, [open]);
 
   return (
     <div className="relative">
       <button
+        ref={triggerRef}
         type="button"
         data-wv-menu-trigger=""
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label={label}
-        onClick={() => setOpen((previous) => !previous)}
+        onClick={(event) => setPlacement(open ? null : placeMenu(event.currentTarget))}
         className={cn(
           "flex h-[34px] min-w-[208px] cursor-pointer items-center justify-between gap-3 border border-wv-control bg-wv-input px-3 text-[13px] text-wv-fg hover:border-wv-control-hover-strong",
           className,
@@ -316,9 +346,10 @@ export function Select<T extends string>({
       </button>
       <Menu
         open={open}
-        onDismiss={() => setOpen(false)}
+        onDismiss={() => setPlacement(null)}
         label={label}
-        className={cn("top-[36px] right-0 max-h-[280px] min-w-full overflow-y-auto", menuClassName)}
+        className={cn("fixed overflow-y-auto", menuClassName)}
+        style={placement ?? undefined}
       >
         {options.map((option) => (
           <MenuItem
@@ -326,7 +357,7 @@ export function Select<T extends string>({
             selected={option.value === value}
             onSelect={() => {
               onChange(option.value);
-              setOpen(false);
+              setPlacement(null);
             }}
           >
             <span className="truncate">{option.label}</span>
@@ -335,6 +366,45 @@ export function Select<T extends string>({
       </Menu>
     </div>
   );
+}
+
+interface MenuPlacement {
+  top?: number;
+  bottom?: number;
+  right: number;
+  minWidth: number;
+  maxHeight: number;
+}
+
+const MENU_GAP = 2;
+const MENU_MAX_HEIGHT = 280;
+/** Room kept between an open menu and the edge of the window. */
+const MENU_MARGIN = 8;
+
+/**
+ * Where a Select's menu goes: right-aligned under its trigger and at least as
+ * wide, or above it when the window runs out below and there is more room up.
+ */
+function placeMenu(trigger: HTMLElement): MenuPlacement {
+  const rect = trigger.getBoundingClientRect();
+  const viewport = document.documentElement;
+  const right = viewport.clientWidth - rect.right;
+  const below = viewport.clientHeight - rect.bottom - MENU_GAP - MENU_MARGIN;
+  const above = rect.top - MENU_GAP - MENU_MARGIN;
+  if (below < 160 && above > below) {
+    return {
+      bottom: viewport.clientHeight - rect.top + MENU_GAP,
+      right,
+      minWidth: rect.width,
+      maxHeight: Math.min(MENU_MAX_HEIGHT, above),
+    };
+  }
+  return {
+    top: rect.bottom + MENU_GAP,
+    right,
+    minWidth: rect.width,
+    maxHeight: Math.min(MENU_MAX_HEIGHT, below),
+  };
 }
 
 /* --------------------------------------------------------------- text input */

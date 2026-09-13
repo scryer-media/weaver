@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState, type DragEvent } from "react";
 import { useMutation, useQuery } from "urql";
 import {
   PAUSE_ALL_MUTATION,
@@ -109,6 +109,12 @@ export function DownloadsPage() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [sortOpen, setSortOpen] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
+  // NZBs dropped on the list, handed to the dialog so it opens with them staged.
+  const [droppedFiles, setDroppedFiles] = useState<readonly File[] | null>(null);
+  const [dropping, setDropping] = useState(false);
+  // dragenter and dragleave fire for every child the pointer crosses, so the
+  // highlight tracks how deep inside the pane the drag is, not the last event.
+  const dragDepth = useRef(0);
   // Cancelling is not instant; hide the row until the refetch confirms it.
   const [removedIds, setRemovedIds] = useState<ReadonlySet<number>>(() => new Set());
 
@@ -345,46 +351,88 @@ export function DownloadsPage() {
       // the release names it exists to explain.
       contentClassName="flex-col xl:flex-row"
     >
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-        {queue.isLoading ? (
-          <EmptyState loading title="Loading" body="Fetching the queue." />
-        ) : visibleGroups.length === 0 ? (
-          <EmptyState
-            title="Nothing matches this view"
-            body="Clear the search or pick another filter."
-          />
-        ) : (
-          visibleGroups.map((group) => {
-            const rows = sortJobs(grouped.get(group)!, sort, etaById);
-            return (
-              <section key={group} className="flex flex-none flex-col">
-                <SectionHeader
-                  label={DOWNLOAD_GROUP_LABEL[group]}
-                  count={rows.length}
-                  note={DOWNLOAD_GROUP_NOTE[group] || undefined}
-                />
-                {rows.map((job) => (
-                  <DownloadRow
-                    key={job.id}
-                    job={job}
-                    selected={job.id === selectedId}
-                    onSelect={setSelectedId}
-                    statusLabel={statusLabel}
-                    wait={waitValue(job)}
-                    hold={blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null}
-                    statusTitle={
-                      job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
-                        ? t("status.propagationUntil", {
-                            time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
-                          })
-                        : undefined
-                    }
+      <div
+        className="relative flex min-h-0 flex-1 flex-col"
+        onDragEnter={(event) => {
+          if (!carriesFiles(event)) return;
+          event.preventDefault();
+          dragDepth.current += 1;
+          setDropping(true);
+        }}
+        onDragOver={(event) => {
+          if (!carriesFiles(event)) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "copy";
+        }}
+        onDragLeave={(event) => {
+          if (!carriesFiles(event)) return;
+          dragDepth.current = Math.max(0, dragDepth.current - 1);
+          if (dragDepth.current === 0) setDropping(false);
+        }}
+        onDrop={(event) => {
+          if (!carriesFiles(event)) return;
+          event.preventDefault();
+          dragDepth.current = 0;
+          setDropping(false);
+          const files = Array.from(event.dataTransfer.files);
+          if (files.length === 0) return;
+          setDroppedFiles(files);
+          setUploadOpen(true);
+        }}
+      >
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
+          {queue.isLoading ? (
+            <EmptyState loading title="Loading" body="Fetching the queue." />
+          ) : jobs.length === 0 ? (
+            <EmptyState
+              centered
+              title="No active downloads"
+              body="Add an NZB, or drop one anywhere on this list."
+              action={<PrimaryButton onClick={() => setUploadOpen(true)}>Add NZB</PrimaryButton>}
+            />
+          ) : visibleGroups.length === 0 ? (
+            <EmptyState
+              title="Nothing matches this view"
+              body="Clear the search or pick another filter."
+            />
+          ) : (
+            visibleGroups.map((group) => {
+              const rows = sortJobs(grouped.get(group)!, sort, etaById);
+              return (
+                <section key={group} className="flex flex-none flex-col">
+                  <SectionHeader
+                    label={DOWNLOAD_GROUP_LABEL[group]}
+                    count={rows.length}
+                    note={DOWNLOAD_GROUP_NOTE[group] || undefined}
                   />
-                ))}
-              </section>
-            );
-          })
-        )}
+                  {rows.map((job) => (
+                    <DownloadRow
+                      key={job.id}
+                      job={job}
+                      selected={job.id === selectedId}
+                      onSelect={setSelectedId}
+                      statusLabel={statusLabel}
+                      wait={waitValue(job)}
+                      hold={blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null}
+                      statusTitle={
+                        job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
+                          ? t("status.propagationUntil", {
+                              time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
+                            })
+                          : undefined
+                      }
+                    />
+                  ))}
+                </section>
+              );
+            })
+          )}
+        </div>
+        {dropping ? (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center border border-dashed border-wv-accent bg-wv-selected">
+            <span className="text-[13px] font-medium text-wv-strong">Drop to add these NZBs</span>
+          </div>
+        ) : null}
       </div>
 
       {selected === null ? null : (
@@ -397,7 +445,19 @@ export function DownloadsPage() {
         />
       )}
 
-      <AddNzbDialog open={uploadOpen} onClose={() => setUploadOpen(false)} />
+      <AddNzbDialog
+        open={uploadOpen}
+        initialFiles={droppedFiles}
+        onClose={() => {
+          setUploadOpen(false);
+          setDroppedFiles(null);
+        }}
+      />
     </NextShell>
   );
+}
+
+/** Whether a drag is carrying files from the desktop, not text or a link from the page. */
+function carriesFiles(event: DragEvent): boolean {
+  return Array.from(event.dataTransfer.types).includes("Files");
 }

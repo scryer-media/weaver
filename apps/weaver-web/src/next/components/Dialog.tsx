@@ -62,13 +62,16 @@ export function Dialog({
           "flex max-h-full max-w-full flex-col border border-wv-control bg-wv-chrome text-wv-fg shadow-wv-menu",
         )}
       >
-        <header className="flex h-14 flex-none items-baseline gap-[10px] border-b border-wv-line-strong px-4 sm:px-6">
-          <h2 className="flex-none font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
-            {title}
-          </h2>
-          {note === undefined ? null : (
-            <span className="truncate font-wv-mono text-[11.5px] text-wv-muted">{note}</span>
-          )}
+        {/* Centred in the bar as a group; the title and note share a baseline inside it. */}
+        <header className="flex h-14 flex-none items-center border-b border-wv-line-strong px-4 sm:px-6">
+          <div className="flex min-w-0 items-baseline gap-[10px]">
+            <h2 className="flex-none font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
+              {title}
+            </h2>
+            {note === undefined ? null : (
+              <span className="truncate font-wv-mono text-[11.5px] text-wv-muted">{note}</span>
+            )}
+          </div>
         </header>
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{children}</div>
         {footer === undefined ? null : (

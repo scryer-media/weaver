@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, type CSSProperties, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 /**
@@ -16,10 +16,13 @@ export function Menu({
   className,
   children,
   label,
+  style,
 }: {
   open: boolean;
   onDismiss: () => void;
   className?: string;
+  /** Placement worked out at runtime, for a menu that cannot sit at a fixed offset. */
+  style?: CSSProperties;
   children: ReactNode;
   label?: string;
 }) {
@@ -61,6 +64,7 @@ export function Menu({
       ref={ref}
       role="menu"
       aria-label={label}
+      style={style}
       className={cn(
         "absolute z-20 flex flex-col border border-wv-control bg-wv-chrome shadow-wv-menu",
         className,

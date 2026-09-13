@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useUploadNzb, type UploadNzbEntry } from "@/features/upload/hooks/use-upload-nzb";
 import { NZB_UPLOAD_ACCEPT } from "@/features/upload/upload-file-types";
@@ -28,11 +29,37 @@ function entryTone(entry: UploadNzbEntry): string {
  *
  * The whole upload pipeline — staging, duplicate scoring, submission — is the
  * existing `useUploadNzb` hook untouched; this is only a second view of it, so
- * the two interfaces cannot drift in behaviour.
+ * the two interfaces cannot drift in behaviour. Files picked or dropped here
+ * are added to the list rather than replacing it, so a second trip through the
+ * file browser keeps the first.
  */
-export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function AddNzbDialog({
+  open,
+  onClose,
+  initialFiles = null,
+}: {
+  open: boolean;
+  onClose: () => void;
+  /** Files dropped somewhere else that opened the dialog, staged as it opens. */
+  initialFiles?: readonly File[] | null;
+}) {
   const t = useTranslate();
   const upload = useUploadNzb({ open, resetOnOpen: true, onSubmitted: onClose });
+  const { addFiles } = upload;
+
+  // The hook clears the list as the dialog opens; this runs after that, and
+  // only once for a given drop.
+  const stagedDrop = useRef<readonly File[] | null>(null);
+  useEffect(() => {
+    if (!open) {
+      stagedDrop.current = null;
+      return;
+    }
+    if (initialFiles && initialFiles.length > 0 && stagedDrop.current !== initialFiles) {
+      stagedDrop.current = initialFiles;
+      addFiles([...initialFiles]);
+    }
+  }, [addFiles, initialFiles, open]);
 
   const categoryOptions = [
     { value: NO_CATEGORY_VALUE, label: "No category" },
@@ -41,17 +68,11 @@ export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => 
       label: entry.name,
     })),
   ];
-  const pending = upload.entries.length - upload.readyCount - upload.failedCount;
 
   return (
     <Dialog
       open={open}
       title="Add NZB"
-      note={
-        upload.entries.length > 0
-          ? `${upload.readyCount} ready · ${pending} staging · ${upload.failedCount} failed`
-          : NZB_UPLOAD_ACCEPT
-      }
       onDismiss={onClose}
       width={620}
       footer={
@@ -75,7 +96,11 @@ export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => 
             upload.setDragging(true);
           }}
           onDragLeave={() => upload.setDragging(false)}
-          onDrop={upload.handleDrop}
+          onDrop={(event) => {
+            event.preventDefault();
+            upload.setDragging(false);
+            addFiles(Array.from(event.dataTransfer.files));
+          }}
           className={cn(
             "flex h-[104px] flex-none cursor-pointer flex-col items-center justify-center gap-2 border border-dashed text-[13px]",
             "mx-6 mt-5",
@@ -90,14 +115,17 @@ export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => 
             accept={NZB_UPLOAD_ACCEPT}
             multiple
             className="hidden"
-            onChange={upload.onFileInputChange}
+            onChange={(event) => {
+              addFiles(Array.from(event.target.files ?? []));
+              event.target.value = "";
+            }}
           />
           <span className="font-medium text-wv-fg">Drop NZB files here, or click to choose</span>
-          <span className="font-wv-mono text-[11px] text-wv-faint">
-            {upload.entries.length > 0
-              ? `${upload.entries.length} selected · ${formatSize(upload.totalBytes)}`
-              : NZB_UPLOAD_ACCEPT}
-          </span>
+          {upload.entries.length === 0 ? null : (
+            <span className="font-wv-mono text-[11px] text-wv-faint">
+              {`${upload.entries.length} selected · ${formatSize(upload.totalBytes)}`}
+            </span>
+          )}
         </button>
 
         {upload.error === null ? null : (
@@ -137,7 +165,7 @@ export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => 
                   type="button"
                   onClick={() => upload.removeFile(entry.localId)}
                   aria-label={t("upload.removeFile")}
-                  className="flex-none text-[12px] text-wv-faint hover:text-wv-fg"
+                  className="flex-none text-[12px] text-wv-error-text hover:text-wv-error"
                 >
                   Remove
                 </button>
@@ -147,7 +175,7 @@ export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => 
         )}
 
         <div className="mt-2 flex flex-col">
-          <FormRow label="Category" help="Where the finished files are filed.">
+          <FormRow label="Category">
             <Select
               label="Category"
               value={upload.category}
@@ -155,7 +183,7 @@ export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => 
               onChange={upload.setCategory}
             />
           </FormRow>
-          <FormRow label="Priority" help="Higher priority downloads start first.">
+          <FormRow label="Priority">
             <Select
               label="Priority"
               value={upload.priority}
@@ -163,7 +191,7 @@ export function AddNzbDialog({ open, onClose }: { open: boolean; onClose: () => 
               onChange={upload.setPriority}
             />
           </FormRow>
-          <FormRow label="Password" help="Only needed for encrypted archives.">
+          <FormRow label="Password">
             <TextField
               label="Password"
               type="password"

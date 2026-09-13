@@ -604,17 +604,35 @@ export function blockFill(color: string, cell = 6): string {
 }
 
 /** A content region with nothing to list yet; `loading` marks it as still on its way. */
-export function EmptyState({ title, body, loading = false }: { title: string; body: string; loading?: boolean }) {
+export function EmptyState({
+  title,
+  body,
+  loading = false,
+  centered = false,
+  action,
+}: {
+  title: string;
+  body: string;
+  loading?: boolean;
+  /** Fill the pane and sit in the middle of it: for a screen with nothing at all to show. */
+  centered?: boolean;
+  /** What to do about it, under the words. */
+  action?: ReactNode;
+}) {
   return (
     <div
       role={loading ? "status" : undefined}
-      className="flex items-center gap-4 px-4 sm:px-6 py-10"
+      className={cn(
+        "flex gap-4 px-4 sm:px-6 py-10",
+        centered ? "flex-1 flex-col items-center justify-center text-center" : "items-center",
+      )}
     >
       {loading ? <LoadingMark className="h-8" /> : null}
-      <div className="flex min-w-0 flex-col gap-1.5">
+      <div className={cn("flex min-w-0 flex-col gap-1.5", centered && "items-center")}>
         <div className="font-wv-title text-[14px] font-semibold text-wv-fg">{title}</div>
         <div className="text-[13px] text-wv-muted">{body}</div>
       </div>
+      {action}
     </div>
   );
 }
