@@ -1968,10 +1968,10 @@ impl Pipeline {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
                     // 7z can encode its own header and payload with different codecs. Reserve
-                    // the configured ceiling while this decoder is live so large archives do
-                    // not inherit a hardcoded small allowance and concurrent decoders cannot
-                    // exceed the shared job budget.
-                    let _memory_permit = budget.reserve_memory_wait(budget.max_memory_bytes())?;
+                    // the ceiling using retained state at admission, rather than the stale
+                    // snapshot from budget construction. Other active decoders still make
+                    // this wait; metadata growth cannot permanently strand the allowance.
+                    let _memory_permit = budget.reserve_memory_ceiling_wait()?;
                     if file_paths.is_empty() {
                         return Err(format!("no 7z files found for set '{set_name_owned}'"));
                     }

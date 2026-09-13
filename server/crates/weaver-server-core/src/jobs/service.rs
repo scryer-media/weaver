@@ -596,10 +596,11 @@ impl Pipeline {
 
     pub(crate) fn check_job_memory_admission(
         &mut self,
-        _job_id: JobId,
+        job_id: JobId,
         spec: &JobSpec,
     ) -> Result<crate::pipeline::ProcessMemoryPermit, crate::SchedulerError> {
         self.process_memory_budget
+            .for_job(job_id.0)
             .try_reserve_retained(spec.scheduling_memory_estimate())
             .map_err(|error| {
                 crate::SchedulerError::InvalidInput(format!(

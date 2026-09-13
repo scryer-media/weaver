@@ -687,7 +687,7 @@ impl Pipeline {
             extracted,
             known,
             &complete,
-            &self.process_memory_budget,
+            &self.process_memory_budget.for_job(job_id.0),
         ) {
             input.coverage.abort(error);
         }
@@ -1456,7 +1456,7 @@ impl Pipeline {
             Arc::clone(&self.extraction_limits),
             // Coverage waits yield the decoder under contention, so speculative
             // chases can safely share the normal extraction allowance.
-            Arc::clone(&self.process_memory_budget),
+            self.process_memory_budget.for_job(job_id.0),
             staging.to_path_buf(),
             declared_archive_bytes,
             initial_entries,

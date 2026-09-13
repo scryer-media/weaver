@@ -167,31 +167,61 @@ const PROCESS_MEMORY_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
 /// Shared reservations for scheduling state, PAR2 packet metadata, and archive
 /// decoders in this pipeline. Normal extraction and direct chases use one pool.
 ///
-/// Retained allocations cannot be freed merely by waiting for another decoder,
-/// so codec ceilings exclude that state. A direct chase parked on unavailable
+/// Retained allocations survive individual decoder operations. Their ownership
+/// separates intrinsic job limits from contention with peers. Whole-decoder
+/// ceiling admissions exclude all currently retained state. A chase on unavailable
 /// input yields under contention by unwinding its decoder and releasing its
 /// permit. These estimates do not cover allocations made by archive parsers
 /// before their metadata is available for inspection.
 #[derive(Debug)]
 pub(crate) struct ProcessMemoryBudget {
     limit: u64,
-    reserved: AtomicU64,
-    retained: AtomicU64,
-    waiting: AtomicU64,
-    idle: Mutex<()>,
-    released: Condvar,
+    reserved: Arc<AtomicU64>,
+    retained: Arc<AtomicU64>,
+    total_retained: Arc<AtomicU64>,
+    waiting: Arc<AtomicU64>,
+    idle: Arc<Mutex<()>>,
+    released: Arc<Condvar>,
+    owners: Arc<Mutex<std::collections::HashMap<u64, std::sync::Weak<AtomicU64>>>>,
 }
 
 impl ProcessMemoryBudget {
     pub(crate) fn new(limit: u64) -> Self {
         Self {
             limit,
-            reserved: AtomicU64::new(0),
-            retained: AtomicU64::new(0),
-            waiting: AtomicU64::new(0),
-            idle: Mutex::new(()),
-            released: Condvar::new(),
+            reserved: Arc::new(AtomicU64::new(0)),
+            retained: Arc::new(AtomicU64::new(0)),
+            total_retained: Arc::new(AtomicU64::new(0)),
+            waiting: Arc::new(AtomicU64::new(0)),
+            idle: Arc::new(Mutex::new(())),
+            released: Arc::new(Condvar::new()),
+            owners: Arc::default(),
         }
+    }
+
+    /// Share physical admission and wakeups, but only count this job's retained
+    /// state when deciding whether waiting for a decoder can ever succeed.
+    pub(crate) fn for_job(&self, job: u64) -> Arc<Self> {
+        let mut owners = self.owners.lock().expect("process memory owners poisoned");
+        let retained = owners
+            .get(&job)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| {
+                owners.retain(|_, owner| owner.strong_count() != 0);
+                let retained = Arc::new(AtomicU64::new(0));
+                owners.insert(job, Arc::downgrade(&retained));
+                retained
+            });
+        Arc::new(Self {
+            limit: self.limit,
+            reserved: Arc::clone(&self.reserved),
+            retained,
+            total_retained: Arc::clone(&self.total_retained),
+            waiting: Arc::clone(&self.waiting),
+            idle: Arc::clone(&self.idle),
+            released: Arc::clone(&self.released),
+            owners: Arc::clone(&self.owners),
+        })
     }
 
     /// Admission never blocks the actor behind an extraction worker. The lease
@@ -205,6 +235,7 @@ impl ProcessMemoryBudget {
             "WEAVER_RESOURCE_LIMIT[memory]: reservation would reach {requested} bytes; process limit is {}", self.limit
         ))?;
         self.retained.fetch_add(bytes, Ordering::AcqRel);
+        self.total_retained.fetch_add(bytes, Ordering::AcqRel);
         Ok(ProcessMemoryPermit {
             budget: Arc::clone(self),
             bytes,
@@ -216,6 +247,7 @@ impl ProcessMemoryBudget {
         self.waiting.load(Ordering::Acquire) != 0
     }
 
+    #[cfg(test)]
     fn reserve_wait<F>(
         self: &Arc<Self>,
         bytes: u64,
@@ -224,7 +256,7 @@ impl ProcessMemoryBudget {
     where
         F: FnMut() -> Result<(), String>,
     {
-        self.reserve_wait_kind(bytes, false, check_active)
+        self.reserve_wait_kind(bytes, false, false, check_active)
     }
 
     /// Blocking metadata workers may wait for decoders to release memory.
@@ -237,18 +269,22 @@ impl ProcessMemoryBudget {
     where
         F: FnMut() -> Result<(), String>,
     {
-        self.reserve_wait_kind(bytes, true, check_active)
+        self.reserve_wait_kind(bytes, true, false, check_active)
     }
 
     fn reserve_wait_kind<F>(
         self: &Arc<Self>,
         bytes: u64,
         retained: bool,
+        ceiling: bool,
         mut check_active: F,
     ) -> Result<ProcessMemoryPermit, String>
     where
         F: FnMut() -> Result<(), String>,
     {
+        if ceiling && bytes == 0 {
+            return Err("WEAVER_RESOURCE_LIMIT[memory]: no decoder allowance remains".into());
+        }
         if bytes > self.limit {
             return Err(format!(
                 "decoder requires {bytes} bytes, process limit is {}",
@@ -268,18 +304,32 @@ impl ProcessMemoryBudget {
         let mut announced = false;
         loop {
             check_active()?;
-            // Retained job metadata cannot be released by a decoder finishing.
-            // Waiting for impossible capacity would strand the same job forever.
-            if bytes
-                > self
-                    .limit
-                    .saturating_sub(self.retained.load(Ordering::Acquire))
-            {
+            // A ceiling is an optional allowance, not a dictionary's measured
+            // requirement. Recompute it under the admission lock so metadata
+            // published since the budget was created cannot strand all waiters.
+            // Active decoder reservations still cause a wait, never a shrink.
+            let granted = if ceiling {
+                bytes.min(
+                    self.limit
+                        .saturating_sub(self.total_retained.load(Ordering::Acquire)),
+                )
+            } else {
+                bytes
+            };
+            // Only this owner's metadata makes the request intrinsically too
+            // large. Other jobs can release their retained state while we wait.
+            let own_available = self
+                .limit
+                .saturating_sub(self.retained.load(Ordering::Acquire));
+            if (ceiling && own_available == 0) || (!ceiling && bytes > own_available) {
                 return Err("WEAVER_RESOURCE_LIMIT[memory]: decoder and retained job state exceed the process limit".to_string());
             }
-            if reserve_atomic(&self.reserved, bytes, self.limit).is_ok() {
+            if (granted != 0 || bytes == 0)
+                && reserve_atomic(&self.reserved, granted, self.limit).is_ok()
+            {
                 if retained {
-                    self.retained.fetch_add(bytes, Ordering::AcqRel);
+                    self.retained.fetch_add(granted, Ordering::AcqRel);
+                    self.total_retained.fetch_add(granted, Ordering::AcqRel);
                 }
                 if announced {
                     info!(
@@ -290,7 +340,7 @@ impl ProcessMemoryBudget {
                 }
                 return Ok(ProcessMemoryPermit {
                     budget: Arc::clone(self),
-                    bytes,
+                    bytes: granted,
                     retained,
                 });
             }
@@ -393,8 +443,9 @@ impl JobExtractionBudget {
                 "extraction root capacity is unknown; the disk reserve is not enforced until a reading arrives"
             );
         }
-        // Freeze the codec ceiling so releasing another job's metadata cannot
-        // increase a decoder's limit after its reservation was taken.
+        // Freeze the job's codec ceiling independently of temporary peer state.
+        // Exact dictionary admissions wait for peers; optional whole-ceiling
+        // admissions account for all retained state when the permit is granted.
         let decoder_memory_limit = limits.max_memory_bytes.min(
             process_memory
                 .limit
@@ -488,6 +539,17 @@ impl JobExtractionBudget {
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<MemoryPermit, String> {
+        self.reserve_memory(bytes, false)
+    }
+
+    /// Reserve an optional full-decoder allowance using current retained state.
+    /// Only ceiling-based callers may use this; measured dictionary requests
+    /// must use `reserve_memory_wait` and are never reduced.
+    pub(crate) fn reserve_memory_ceiling_wait(self: &Arc<Self>) -> Result<MemoryPermit, String> {
+        self.reserve_memory(self.max_memory_bytes(), true)
+    }
+
+    fn reserve_memory(self: &Arc<Self>, bytes: u64, ceiling: bool) -> Result<MemoryPermit, String> {
         if bytes > self.limits.max_memory_bytes {
             return Err(self
                 .reject(
@@ -518,7 +580,7 @@ impl JobExtractionBudget {
                 }
                 let process_memory = self
                     .process_memory
-                    .reserve_wait(bytes, || {
+                    .reserve_wait_kind(bytes, false, ceiling, || {
                         self.check_active().map_err(|error| error.to_string())
                     })
                     .map_err(|error| {
@@ -527,10 +589,13 @@ impl JobExtractionBudget {
                         self.reject(ExtractionRejectionReason::Memory, error)
                             .to_string()
                     })?;
+                let granted = process_memory.bytes;
+                self.memory_reserved
+                    .fetch_sub(bytes - granted, Ordering::AcqRel);
                 return Ok(MemoryPermit {
                     budget: Arc::clone(self),
                     _process_memory: process_memory,
-                    bytes,
+                    bytes: granted,
                 });
             }
             // The per-job stage had no wait announcement at all, only the
@@ -922,6 +987,9 @@ impl Drop for ProcessMemoryPermit {
         self.budget.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
         if self.retained {
             self.budget.retained.fetch_sub(self.bytes, Ordering::AcqRel);
+            self.budget
+                .total_retained
+                .fetch_sub(self.bytes, Ordering::AcqRel);
         }
         self.budget.released.notify_all();
     }
@@ -1770,6 +1838,113 @@ mod tests {
         );
         assert_eq!(pool.reserved_bytes(), 0);
         assert!(!pool.has_waiters());
+    }
+
+    #[test]
+    fn ceiling_admission_rechecks_metadata_growth_without_waiting_on_peer_completion() {
+        let pool = Arc::new(ProcessMemoryBudget::new(64 * MIB));
+        let root = tempfile::tempdir().unwrap();
+        let budget = JobExtractionBudget::new_with_process_memory(
+            limits(),
+            pool.for_job(1),
+            root.path().into(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        assert_eq!(budget.max_memory_bytes(), 64 * MIB);
+        // Both this job and its peers publish more metadata after the decoder
+        // budget was created. None needs to finish before extraction can start.
+        let own = pool.for_job(1).try_reserve_retained(4 * MIB).unwrap();
+        let peer = pool.for_job(2).try_reserve_retained(8 * MIB).unwrap();
+        let permit = budget.reserve_memory_ceiling_wait().unwrap();
+        assert_eq!(permit.bytes, 52 * MIB);
+        assert_eq!(pool.reserved_bytes(), 64 * MIB);
+        assert_eq!(budget.memory_reserved.load(Ordering::Acquire), 52 * MIB);
+        assert!(!pool.has_waiters());
+        drop(permit);
+        assert_eq!(budget.memory_reserved.load(Ordering::Acquire), 0);
+        drop((own, peer));
+        assert_eq!(pool.total_retained.load(Ordering::Acquire), 0);
+        assert_eq!(pool.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn owner_recreation_preserves_growing_reservations_and_cancellation_refunds() {
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let mut metadata = pool.for_job(1).try_reserve_retained(100).unwrap();
+        metadata.grow_retained_wait(200, || Ok(())).unwrap();
+        assert_eq!(pool.for_job(1).retained.load(Ordering::Acquire), 300);
+        assert_eq!(pool.total_retained.load(Ordering::Acquire), 300);
+        let peer = pool.for_job(2).try_reserve_retained(700).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let owner = pool.for_job(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let waiter = std::thread::spawn(move || {
+            owner.reserve_wait(400, || {
+                if flag.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    Err("cancelled".into())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        while !pool.has_waiters() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(pool.has_waiters());
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(waiter.join().unwrap().unwrap_err(), "cancelled");
+        assert!(!pool.has_waiters());
+        assert_eq!(pool.reserved_bytes(), 1000);
+        drop((metadata, peer));
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert_eq!(pool.total_retained.load(Ordering::Acquire), 0);
+        assert_eq!(pool.for_job(1).retained.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn retained_peer_memory_waits_but_same_job_overflow_fails() {
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let peer = pool.for_job(1).try_reserve_retained(700).unwrap();
+        let own = pool.for_job(2).try_reserve_retained(100).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let owner = pool.for_job(2);
+        let waiter = std::thread::spawn(move || {
+            owner.reserve_wait(800, || {
+                if Instant::now() < deadline {
+                    Ok(())
+                } else {
+                    Err("test deadline".into())
+                }
+            })
+        });
+        while !pool.has_waiters() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            pool.has_waiters(),
+            "another job's retained state is temporary contention"
+        );
+        drop(peer);
+        let decoder = waiter.join().unwrap().unwrap();
+        assert_eq!(pool.reserved_bytes(), 900);
+        assert!(!pool.has_waiters());
+        drop(decoder);
+        assert!(
+            pool.for_job(2)
+                .reserve_wait(1000, || Ok(()))
+                .unwrap_err()
+                .contains("retained job state")
+        );
+        drop(own);
+        assert_eq!(pool.reserved_bytes(), 0);
+        let decoder = pool.for_job(2).reserve_wait(1024, || Ok(())).unwrap();
+        drop(decoder);
+        assert_eq!(pool.reserved_bytes(), 0);
     }
 
     #[test]

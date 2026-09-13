@@ -577,7 +577,7 @@ pub(crate) struct Par2FileBinding {
 
 impl Pipeline {
     fn par2_scan_budget(&mut self, job_id: JobId) -> SharedPar2ScanBudget {
-        let process = Arc::clone(&self.process_memory_budget);
+        let process = self.process_memory_budget.for_job(job_id.0);
         let cancellation = self.par2_cancellation_token(job_id);
         self.ensure_par2_runtime(job_id)
             .scan_budget

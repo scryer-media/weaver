@@ -688,6 +688,68 @@ async fn consumption_attributes_the_chase_bytes_to_the_extracting_phase_once() {
 }
 
 #[tokio::test]
+async fn conventional_split_7z_jobs_finish_after_peer_metadata_grows() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    disable_direct_unpack(&mut pipeline);
+    let set = "generated_split_store_plain.7z";
+    let files = sevenz_fixture_bytes(set);
+    let jobs = [JobId(41118), JobId(41119)];
+    for job in jobs {
+        insert_active_job(
+            &mut pipeline,
+            job,
+            rar_job_spec("Retained Peer Split", &files),
+        )
+        .await;
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job, index as u32, name, bytes).await;
+        }
+        let staging = pipeline.extraction_staging_dir(job);
+        pipeline.extraction_budget(job, &staging).unwrap();
+    }
+    // Model PAR2/scheduling metadata arriving after both budgets were created.
+    // Keep it alive until both real decoders finish: neither can rely on the
+    // other job completing to release this retained state.
+    let metadata = pipeline
+        .process_memory_budget
+        .for_job(41117)
+        .try_reserve_retained(1024 * 1024)
+        .unwrap();
+    for job in jobs {
+        pipeline.extract_7z_set(job, set).await.unwrap();
+    }
+    let mut completed = std::collections::HashSet::new();
+    for _ in jobs {
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            next_extraction_done(&mut pipeline),
+        )
+        .await
+        .expect("decoder admission must progress");
+        let ExtractionDone::FullSet { job_id, result, .. } = done else {
+            panic!("full set required")
+        };
+        let outcome = result.expect("peer metadata must not fail extraction");
+        assert_eq!(outcome.extracted.len(), 1);
+        let member = &outcome.extracted[0];
+        assert_eq!(
+            std::fs::read(pipeline.extraction_staging_dir(job_id).join(member)).unwrap(),
+            std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/sevenz/originals")
+                    .join(member)
+            )
+            .unwrap()
+        );
+        completed.insert(job_id);
+    }
+    assert_eq!(completed, jobs.into_iter().collect());
+    drop(metadata);
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
+}
+
+#[tokio::test]
 async fn a_tainted_outcome_is_discarded_and_the_set_is_extracted_conventionally() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

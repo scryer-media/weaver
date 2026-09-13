@@ -73,7 +73,7 @@ impl Pipeline {
             Err(error) => {
                 let budget = JobExtractionBudget::new_with_process_memory(
                     Arc::clone(&self.extraction_limits),
-                    Arc::clone(&self.process_memory_budget),
+                    self.process_memory_budget.for_job(job_id.0),
                     staging.to_path_buf(),
                     declared_archive_bytes,
                     0,
@@ -90,7 +90,7 @@ impl Pipeline {
         };
         let budget = JobExtractionBudget::new_with_process_memory(
             Arc::clone(&self.extraction_limits),
-            Arc::clone(&self.process_memory_budget),
+            self.process_memory_budget.for_job(job_id.0),
             staging.to_path_buf(),
             declared_archive_bytes,
             initial_entries,

@@ -413,7 +413,7 @@ impl Pipeline {
         if let Some(cache) = RepeatedArticles::new(
             &state.spec,
             &state.working_dir,
-            self.process_memory_budget.clone(),
+            self.process_memory_budget.for_job(state.job_id.0),
         )
         .map_err(crate::SchedulerError::InvalidInput)?
         {
