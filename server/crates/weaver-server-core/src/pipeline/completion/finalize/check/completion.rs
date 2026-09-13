@@ -307,6 +307,7 @@ impl Pipeline {
             }
         }
 
+        self.maybe_prefetch_par3_recovery(job_id);
         let working_dir = self.jobs[&job_id].working_dir.clone();
         match self
             .recover_placement_before_verification(job_id, working_dir)
@@ -344,9 +345,7 @@ impl Pipeline {
         }
 
         if matches!(current_status, JobStatus::QueuedRepair) {
-            if self.active_repair_jobs() == 0 {
-                self.promote_queued_repairs();
-            }
+            self.promote_queued_repairs();
             return;
         }
 

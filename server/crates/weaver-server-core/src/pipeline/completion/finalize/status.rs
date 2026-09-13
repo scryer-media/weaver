@@ -142,6 +142,7 @@ impl Pipeline {
         self.jobs
             .iter()
             .filter(|(_, state)| matches!(state.status, JobStatus::QueuedRepair))
+            .filter(|(job_id, _)| self.repair_phase_has_capacity(**job_id))
             .min_by(|(job_id_a, state_a), (job_id_b, state_b)| {
                 state_a
                     .queued_repair_at_epoch_ms
@@ -704,6 +705,40 @@ impl Pipeline {
     }
 
     pub(crate) async fn maybe_start_repair(&mut self, job_id: JobId) -> bool {
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            runtime.set_repair_phase(job_id, false);
+        }
+        self.start_repair_phase(job_id)
+    }
+
+    pub(crate) async fn maybe_start_par3_repair(&mut self, job_id: JobId) -> bool {
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            runtime.set_repair_phase(job_id, true);
+        }
+        self.start_repair_phase(job_id)
+    }
+
+    fn repair_phase_has_capacity(&self, job_id: JobId) -> bool {
+        let par3_owned = |id| {
+            self.par3_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.owns_repair_phase(id))
+        };
+        let limit = if par3_owned(job_id)
+            && self
+                .jobs
+                .iter()
+                .filter(|(_, state)| matches!(state.status, JobStatus::Repairing))
+                .all(|(&id, _)| par3_owned(id))
+        {
+            2
+        } else {
+            MAX_CONCURRENT_REPAIRS
+        };
+        self.active_repair_jobs() < limit
+    }
+
+    fn start_repair_phase(&mut self, job_id: JobId) -> bool {
         let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
             return false;
         };
@@ -722,7 +757,7 @@ impl Pipeline {
         if matches!(status, JobStatus::Repairing) {
             return true;
         }
-        if self.active_repair_jobs() >= MAX_CONCURRENT_REPAIRS {
+        if !self.repair_phase_has_capacity(job_id) {
             self.transition_postprocessing_status(
                 job_id,
                 JobStatus::QueuedRepair,
@@ -775,9 +810,6 @@ impl Pipeline {
     }
 
     pub(crate) fn promote_queued_repairs(&mut self) {
-        if self.active_repair_jobs() >= MAX_CONCURRENT_REPAIRS {
-            return;
-        }
         let Some(job_id) = self.next_queued_repair_job() else {
             return;
         };

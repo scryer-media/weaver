@@ -3477,9 +3477,9 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "babf22e684e010ce2df662e32c16d290bb79db2ce778535f1ae9da2551f13e8b"
+checksum = "149eee4bf758f8c50555b9867bb3d91acdb665143922bb9f3e6be4baba3adb44"
 dependencies = [
  "blake3",
  "crc-fast",

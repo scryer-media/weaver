@@ -137,6 +137,45 @@ fn par3_virtual_publication_detects_same_length_backing_changes() {
 }
 
 #[test]
+fn par3_interleaved_encrypted_sources_keep_independent_frontiers() {
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let (posted, plain, crypt, covered) = encrypted_member_facts(256 << 10, 4096);
+    let facts = crypt.cipher_facts(plain.len() as u64, &covered).unwrap();
+    let mut options = ExecutionOptions::default();
+    options.handles = HandleBudget::new(6);
+    let cache = Arc::new(ReaderCache::default());
+    let first = access(
+        cipher_volume(first_dir.path(), &plain, facts.clone(), plain.len() as u64),
+        &options,
+        &cache,
+    );
+    let volume = cipher_volume(second_dir.path(), &plain, facts, plain.len() as u64);
+    let second = VirtualSource::new(
+        SourceId(8),
+        VirtualInput::new(volume, &options).unwrap(),
+        options.clone(),
+        cache.clone(),
+    )
+    .unwrap();
+    for offset in (0..plain.len()).step_by(4096) {
+        for (source, id) in [(&first, SOURCE), (&second, SourceId(8))] {
+            let mut bytes = vec![0; (plain.len() - offset).min(4096)];
+            assert_eq!(
+                source.read_at(id, offset as u64, &mut bytes).unwrap(),
+                bytes.len()
+            );
+            assert_eq!(bytes, posted[offset..offset + bytes.len()]);
+        }
+    }
+    assert_eq!(first.cipher_counters().chained_bytes(), 0);
+    assert_eq!(second.cipher_counters().chained_bytes(), 0);
+    drop(first);
+    drop(second);
+    assert_eq!(options.handles.used(), 0);
+}
+
+#[test]
 fn par3_virtual_reader_limits_and_cancellation_remain_typed() {
     let mut coverage = ByteRanges::new();
     coverage.insert(0, 100_000);
@@ -162,6 +201,67 @@ fn par3_virtual_reader_limits_and_cancellation_remain_typed() {
 }
 
 #[test]
+fn par3_idle_cache_is_bounded_and_evicts_before_handle_fallback() {
+    for limit in [2, 64] {
+        let mut coverage = ByteRanges::new();
+        coverage.insert(0, 100_000);
+        let fixture = provider_fixture(coverage);
+        let mut options = ExecutionOptions::default();
+        options.handles = HandleBudget::new(limit);
+        let cache = Arc::new(ReaderCache::default());
+        let mut sources = Vec::new();
+        for number in 0..20 {
+            let id = SourceId(number);
+            let source = VirtualSource::new(
+                id,
+                VirtualInput::new(fixture.volume.clone(), &options).unwrap(),
+                options.clone(),
+                cache.clone(),
+            )
+            .unwrap();
+            let mut bytes = [0; 16];
+            source.read_at(id, 0, &mut bytes).unwrap();
+            assert_eq!(bytes, fixture.conventional[..16]);
+            sources.push(source);
+            assert_eq!(
+                options.handles.used(),
+                (sources.len().min(16) * 2).min(limit)
+            );
+        }
+        // The oldest evicted publication can still reopen safely.
+        assert_eq!(
+            sources[0].read_at(SourceId(0), 0, &mut [0; 16]).unwrap(),
+            16
+        );
+        drop(sources);
+        assert_eq!(options.handles.used(), 0);
+    }
+}
+
+#[test]
+fn par3_cache_pressure_never_reclaims_an_in_use_reader() {
+    let mut coverage = ByteRanges::new();
+    coverage.insert(0, 100_000);
+    let fixture = provider_fixture(coverage);
+    let mut options = ExecutionOptions::default();
+    options.handles = HandleBudget::new(2);
+    let cache = Arc::new(ReaderCache::default());
+    let source = access(fixture.volume.clone(), &options, &cache);
+    let mut active = source.open_sequential(SOURCE).unwrap().unwrap();
+    assert!(matches!(
+        EngineError::from(source.read_at(SOURCE, 0, &mut [0; 16]).unwrap_err()),
+        EngineError::ResourceLimit(_)
+    ));
+    let mut bytes = [0; 16];
+    active.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes, fixture.conventional[..16]);
+    drop(active);
+    source.read_at(SOURCE, 0, &mut bytes).unwrap();
+    drop(source);
+    assert_eq!(options.handles.used(), 0);
+}
+
+#[test]
 fn par3_replacing_a_virtual_source_cannot_reuse_the_old_reader_image() {
     let mut coverage = ByteRanges::new();
     coverage.insert(0, 100_000);
@@ -180,4 +280,54 @@ fn par3_replacing_a_virtual_source_cannot_reuse_the_old_reader_image() {
     assert_eq!(bytes, [0xAB; 16]);
     assert_eq!(source.read_at(SOURCE, 0, &mut bytes).unwrap(), 16);
     assert_eq!(bytes, fixture.conventional[..16]);
+}
+#[test]
+#[ignore = "explicit encrypted-read performance counter experiment"]
+fn par3_encrypted_interleave_counter_experiment() {
+    for stripe in [64 << 10, 1 << 20] {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let (posted, plain, crypt, covered) = encrypted_member_facts(4 << 20, 4096);
+        let facts = crypt.cipher_facts(plain.len() as u64, &covered).unwrap();
+        let options = ExecutionOptions::default();
+        let cache = Arc::new(ReaderCache::default());
+        let first = access(
+            cipher_volume(first_dir.path(), &plain, facts.clone(), plain.len() as u64),
+            &options,
+            &cache,
+        );
+        let second = VirtualSource::new(
+            SourceId(8),
+            VirtualInput::new(
+                cipher_volume(second_dir.path(), &plain, facts, plain.len() as u64),
+                &options,
+            )
+            .unwrap(),
+            options.clone(),
+            cache.clone(),
+        )
+        .unwrap();
+        let mut requested = 0u64;
+        for offset in (0..plain.len()).step_by(stripe) {
+            for (source, id) in [(&first, SOURCE), (&second, SourceId(8))] {
+                let mut bytes = vec![0; (plain.len() - offset).min(stripe)];
+                let mut read = 0;
+                while read < bytes.len() {
+                    requested += (bytes.len() - read) as u64;
+                    let count = source
+                        .read_at(id, (offset + read) as u64, &mut bytes[read..])
+                        .unwrap();
+                    assert!(count != 0);
+                    read += count;
+                }
+                assert_eq!(bytes, posted[offset..offset + bytes.len()]);
+            }
+        }
+        println!(
+            "PAR3_READER_SAMPLE stripe={stripe} requested={requested} reencrypted={} chained={}",
+            first.cipher_counters().reencrypted_bytes()
+                + second.cipher_counters().reencrypted_bytes(),
+            first.cipher_counters().chained_bytes() + second.cipher_counters().chained_bytes()
+        );
+    }
 }

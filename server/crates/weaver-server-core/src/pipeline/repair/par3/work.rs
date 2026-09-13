@@ -8,9 +8,10 @@ use tokio::sync::mpsc;
 const MAX_JOBS: usize = 256;
 const MAX_PENDING: usize = 4096;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WorkKey {
     Source(SourceId),
+    Assess,
     Donors,
     Repair(par3_rs::InputSetId),
     Readback,
@@ -33,6 +34,7 @@ pub(super) struct RepairCompletion {
 }
 
 enum PendingInput {
+    Assess,
     Donors,
     Readback(Box<readback::Installation>),
     Virtual {
@@ -67,7 +69,7 @@ enum PendingInput {
 impl PendingInput {
     fn retained_cost(&self) -> EngineResult<usize> {
         let (path, extra) = match self {
-            Self::Donors => return Ok(1024),
+            Self::Donors | Self::Assess => return Ok(1024),
             Self::Readback(_) => return Ok(readback::STRIPE_RESERVATION),
             Self::Virtual { name, .. } => {
                 return name
@@ -117,10 +119,63 @@ impl PendingInput {
 struct QueuedInput {
     input: PendingInput,
     reservation: assessment::ViewReservation,
+    queued_at: std::time::Instant,
+}
+
+impl QueuedInput {
+    fn new(input: PendingInput, reservation: assessment::ViewReservation) -> Self {
+        Self {
+            input,
+            reservation,
+            queued_at: std::time::Instant::now(),
+        }
+    }
+}
+
+struct WorkTiming {
+    job_id: JobId,
+    key: WorkKey,
+    queued_at: std::time::Instant,
+    started: std::time::Instant,
+}
+
+impl Drop for WorkTiming {
+    fn drop(&mut self) {
+        tracing::info!(job_id = self.job_id.0, operation = ?self.key,
+            queue_wait_us = self.started.duration_since(self.queued_at).as_micros() as u64,
+            execution_us = self.started.elapsed().as_micros() as u64,
+            "PAR3 native work finished");
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Acquisition {
+    pub batch: Option<RecoveryBatch>,
+    pub prefetched: bool,
+}
+
+pub(super) struct RecoveryBatch {
+    pub articles: Vec<crate::jobs::ids::SegmentId>,
+    job_id: JobId,
+    cohorts: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, u64)>,
+    epoch: u64,
+    assessment: u64,
+    admitted_at: std::time::Instant,
+    _reservation: assessment::ViewReservation,
+}
+
+impl Drop for RecoveryBatch {
+    fn drop(&mut self) {
+        tracing::debug!(job_id = self.job_id.0, articles = self.articles.len(),
+            cohorts = ?self.cohorts, epoch = self.epoch, assessment = self.assessment,
+            retained_us = self.admitted_at.elapsed().as_micros() as u64,
+            "PAR3 acquisition window retired");
+    }
 }
 
 struct KnownSource {
     carrier: bool,
+    protected: bool,
     embedded_start: Option<u64>,
     complete_disk_image: bool,
     promoted: BTreeMap<u32, assessment::ViewReservation>,
@@ -139,6 +194,10 @@ struct MaterializedRanges {
 pub(super) struct MaterializedSources(BTreeMap<SourceId, EngineResult<MaterializedRanges>>);
 
 struct JobSlot {
+    acquisition: Acquisition,
+    repair_phase: bool,
+    retry_serial: Option<WorkKey>,
+    retry_repair: bool,
     runtime: Option<Par3Job>,
     sources: PublishedSources,
     epoch: u64,
@@ -163,6 +222,10 @@ impl Default for JobSlot {
         let runtime = Par3Job::default();
         Self {
             sources: runtime.sources.clone(),
+            acquisition: Acquisition::default(),
+            repair_phase: false,
+            retry_serial: None,
+            retry_repair: false,
             runtime: Some(runtime),
             epoch: 0,
             last_used: 0,
@@ -192,12 +255,15 @@ pub(crate) struct WorkDone {
     result: EngineResult<WorkOutput>,
 }
 
-/// Created only on PAR3 admission. One carrier worker bounds dispatch even
+/// Created only on PAR3 admission. Two job workers bound dispatch even
 /// when many jobs arrive together. Retired tickets hold capacity until their
 /// cancelled workers return; recreating a job cannot evade that bound.
 pub(in crate::pipeline) struct Coordinator {
     jobs: BTreeMap<JobId, JobSlot>,
     in_flight: BTreeMap<u64, (JobId, CancellationToken)>,
+    worker_allowances: BTreeMap<u64, usize>,
+    contended: std::collections::BTreeSet<u64>,
+    cpu_limit: usize,
     next_ticket: u64,
     last_job: Option<JobId>,
     tx: mpsc::Sender<RepairWorkDone>,
@@ -216,10 +282,58 @@ impl Default for Coordinator {
 }
 
 impl Coordinator {
+    pub(super) fn acquisition(&self, job_id: JobId) -> Option<&Acquisition> {
+        self.jobs.get(&job_id).map(|job| &job.acquisition)
+    }
+
+    pub(super) fn begin_recovery_batch(
+        &mut self,
+        job_id: JobId,
+        articles: Vec<crate::jobs::ids::SegmentId>,
+        prefetch: bool,
+    ) -> EngineResult<()> {
+        let cohort_count = self
+            .assessments(job_id)
+            .map(|(_, view)| view.requirements.len())
+            .sum::<usize>();
+        let reservation =
+            assessment::ViewReservation::acquire(512 + articles.len() * 64 + cohort_count * 64)?;
+        let cohorts: Vec<_> = self
+            .assessments(job_id)
+            .flat_map(|(set, view)| {
+                view.requirements
+                    .iter()
+                    .filter(|need| need.additional != 0)
+                    .map(move |need| (set, need.matrix, need.cohort))
+            })
+            .collect();
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(EngineError::InvalidState("unknown PAR3 job"))?;
+        job.acquisition.prefetched |= prefetch;
+        job.acquisition.batch = Some(RecoveryBatch {
+            articles,
+            job_id,
+            cohorts,
+            epoch: job.epoch,
+            assessment: job.last_used,
+            admitted_at: std::time::Instant::now(),
+            _reservation: reservation,
+        });
+        Ok(())
+    }
+
     pub(in crate::pipeline) fn new(tx: mpsc::Sender<RepairWorkDone>) -> Self {
         Self {
             jobs: BTreeMap::new(),
             in_flight: BTreeMap::new(),
+            worker_allowances: BTreeMap::new(),
+            contended: std::collections::BTreeSet::new(),
+            cpu_limit: std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .saturating_sub(1)
+                .max(1),
             next_ticket: 0,
             last_job: None,
             tx,
@@ -364,7 +478,7 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn admit(&mut self, job_id: JobId) -> EngineResult<()> {
+    pub(in crate::pipeline) fn admit(&mut self, job_id: JobId) -> EngineResult<()> {
         if !self.jobs.contains_key(&job_id) && self.jobs.len() >= MAX_JOBS {
             return Err(EngineError::ResourceLimit("PAR3 job count"));
         }
@@ -425,12 +539,22 @@ impl Coordinator {
             .get_mut(&job_id)
             .expect("assessed job")
             .pending
-            .insert(WorkKey::Repair(set), QueuedInput { input, reservation });
+            .insert(WorkKey::Repair(set), QueuedInput::new(input, reservation));
         self.dispatch()
     }
 
     pub(super) fn is_installing(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|job| job.installing)
+    }
+
+    pub(in crate::pipeline) fn set_repair_phase(&mut self, job_id: JobId, owned: bool) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.repair_phase = owned;
+        }
+    }
+
+    pub(in crate::pipeline) fn owns_repair_phase(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|job| job.repair_phase)
     }
 
     pub(super) fn queue_readback(
@@ -450,10 +574,7 @@ impl Coordinator {
         job.installing = true;
         job.pending.insert(
             WorkKey::Readback,
-            QueuedInput {
-                input: PendingInput::Readback(installation),
-                reservation,
-            },
+            QueuedInput::new(PendingInput::Readback(installation), reservation),
         );
         self.dispatch()
     }
@@ -468,11 +589,31 @@ impl Coordinator {
     pub(super) fn finish_installation(&mut self, job_id: JobId) {
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.installing = false;
+            job.repair_phase = false;
         }
     }
 
     pub(super) fn take_repair_result(&mut self, job_id: JobId) -> Option<RepairCompletion> {
         self.jobs.get_mut(&job_id)?.completed_repair.take()
+    }
+
+    pub(super) fn take_repair_retry(&mut self, job_id: JobId) -> bool {
+        self.jobs
+            .get_mut(&job_id)
+            .is_some_and(|job| std::mem::take(&mut job.retry_repair))
+    }
+
+    pub(super) fn queue_reassessment(&mut self, job_id: JobId) -> EngineResult<()> {
+        let reservation = assessment::ViewReservation::acquire(1024)?;
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(EngineError::InvalidState("unknown PAR3 job"))?;
+        job.pending.insert(
+            WorkKey::Assess,
+            QueuedInput::new(PendingInput::Assess, reservation),
+        );
+        self.dispatch()
     }
 
     pub(super) fn error(&self, job_id: JobId) -> Option<&EngineError> {
@@ -562,10 +703,7 @@ impl Coordinator {
             .pending
             .insert(
                 WorkKey::Donors,
-                QueuedInput {
-                    input: PendingInput::Donors,
-                    reservation,
-                },
+                QueuedInput::new(PendingInput::Donors, reservation),
             );
         self.dispatch()?;
         Ok(true)
@@ -626,6 +764,7 @@ impl Coordinator {
                 source,
                 KnownSource {
                     carrier: true,
+                    protected: false,
                     embedded_start: None,
                     complete_disk_image: false,
                     promoted: BTreeMap::new(),
@@ -645,6 +784,15 @@ impl Coordinator {
             .get(&job_id)
             .and_then(|job| job.known.get(&source))
             .is_some_and(|source| source.carrier)
+    }
+
+    /// Identity learned from an authenticated layout, not a verification claim.
+    /// Ordinary publication changes invalidate evidence but preserve this binding.
+    pub(super) fn protects_source(&self, job_id: JobId, source: SourceId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.known.get(&source))
+            .is_some_and(|source| source.protected)
     }
 
     pub(super) fn knows_source(&self, job_id: JobId, source: SourceId) -> bool {
@@ -723,6 +871,9 @@ impl Coordinator {
     pub(super) fn invalidate_bindings(&mut self, job_id: JobId) -> EngineResult<()> {
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.materialized.clear();
+            for source in job.known.values_mut() {
+                source.protected = false;
+            }
         }
         let sources: Vec<_> = self
             .jobs
@@ -918,6 +1069,7 @@ impl Coordinator {
                 source,
                 KnownSource {
                     carrier,
+                    protected: false,
                     embedded_start,
                     complete_disk_image,
                     promoted: BTreeMap::new(),
@@ -925,8 +1077,10 @@ impl Coordinator {
                 },
             );
         }
-        job.pending
-            .insert(WorkKey::Source(source), QueuedInput { input, reservation });
+        job.pending.insert(
+            WorkKey::Source(source),
+            QueuedInput::new(input, reservation),
+        );
         Ok(())
     }
 
@@ -1004,11 +1158,29 @@ impl Coordinator {
     }
 
     pub(super) fn dispatch(&mut self) -> EngineResult<()> {
-        if !self.in_flight.is_empty() {
+        for _ in 0..2 {
+            self.dispatch_one()?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_one(&mut self) -> EngineResult<()> {
+        let available = self
+            .cpu_limit
+            .saturating_sub(self.worker_allowances.values().sum::<usize>());
+        if self.in_flight.len() >= 2
+            || available == 0
+            || self.in_flight.values().any(|(id, _)| {
+                self.jobs
+                    .get(id)
+                    .is_some_and(|job| job.retry_serial.is_some())
+            })
+        {
             return Ok(());
         }
         let ready = |job: &&JobSlot| {
             job.ticket.is_none()
+                && (job.retry_serial.is_none() || self.in_flight.is_empty())
                 && (job.spill.is_none() || job.installing)
                 && if job.installing {
                     job.pending.contains_key(&WorkKey::Readback)
@@ -1026,6 +1198,26 @@ impl Coordinator {
         let Some(job_id) = next else {
             return Ok(());
         };
+        if self.jobs[&job_id].retry_serial.is_some() {
+            // A peer may have returned its worker while retaining idle readers.
+            // Return those cache leases too before the isolated retry; checked-
+            // out readers remain owned until they actually return.
+            for (&id, job) in &self.jobs {
+                if id != job_id
+                    && job.ticket.is_none()
+                    && let Some(runtime) = &job.runtime
+                {
+                    runtime.virtual_readers.clear()?;
+                }
+            }
+        }
+        let contenders = self
+            .jobs
+            .values()
+            .filter(ready)
+            .count()
+            .min(2 - self.in_flight.len());
+        let workers = (available / contenders.max(1)).max(1);
         self.evict_idle_sessions(job_id, budget::budgets().native.limit() / 2);
         let job = self.jobs.get_mut(&job_id).expect("selected ready job");
         let ticket = self
@@ -1037,6 +1229,26 @@ impl Coordinator {
                 "PAR3 session already owned by a worker",
             ));
         };
+        runtime.options.workers = workers;
+        runtime.options.progress.get_or_insert_with(|| {
+            par3_rs::runtime::ProgressCallback::new(move |event| {
+                if matches!(event.phase, par3_rs::runtime::ProgressPhase::End) {
+                    tracing::debug!(job_id = job_id.0, operation = event.operation,
+                        stage = ?event.stage, completed = event.completed,
+                        execution_us = event.elapsed.as_micros() as u64,
+                        "PAR3 engine stage finished");
+                }
+            })
+        });
+        for set in runtime.sets.values_mut() {
+            if let Err(error) = set
+                .native
+                .set_execution_limits(workers, runtime.options.stripe_bytes)
+            {
+                job.runtime = Some(runtime);
+                return Err(error);
+            }
+        }
         if !runtime.dormant_views.is_empty() {
             job.verification = None;
         }
@@ -1058,13 +1270,32 @@ impl Coordinator {
         job.ticket = Some(ticket);
         self.in_flight
             .insert(ticket, (job_id, runtime.options.cancel.clone()));
+        if self.in_flight.len() > 1 {
+            self.contended.extend(self.in_flight.keys());
+        }
+        self.worker_allowances.insert(ticket, workers);
+        tracing::debug!(
+            job_id = job_id.0,
+            ticket,
+            workers,
+            active_jobs = self.in_flight.len(),
+            "PAR3 worker admitted"
+        );
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
+                let _timing = WorkTiming {
+                    job_id,
+                    key,
+                    queued_at: input.queued_at,
+                    started: std::time::Instant::now(),
+                };
                 // Keep the queue lease live while the worker owns its input;
                 // successful publication transfers it into retained state.
-                if matches!(input.input, PendingInput::Donors) {
-                    runtime.donor_search.exhaustive = true;
+                if matches!(input.input, PendingInput::Donors | PendingInput::Assess) {
+                    if matches!(input.input, PendingInput::Donors) {
+                        runtime.donor_search.exhaustive = true;
+                    }
                     let result = runtime.assess().map(|()| WorkOutput::Published);
                     return (runtime, result);
                 }
@@ -1156,7 +1387,8 @@ impl Coordinator {
                     }
                     PendingInput::Repair { .. }
                     | PendingInput::Readback(_)
-                    | PendingInput::Donors => {
+                    | PendingInput::Donors
+                    | PendingInput::Assess => {
                         unreachable!("repair dispatched above")
                     }
                     PendingInput::CompleteFile { path, name } => std::fs::metadata(&path)
@@ -1232,6 +1464,8 @@ impl Coordinator {
             return None;
         }
         self.in_flight.remove(&done.ticket);
+        self.worker_allowances.remove(&done.ticket);
+        let contended = self.contended.remove(&done.ticket);
         let job = self.jobs.get_mut(&done.job_id)?;
         if job.ticket != Some(done.ticket) {
             return None;
@@ -1255,6 +1489,15 @@ impl Coordinator {
         } else if let WorkKey::Source(source) = done.key {
             job.dirty.remove(&source);
         }
+        if done.epoch == job.epoch {
+            for view in runtime.sets.values().filter_map(|set| set.view.as_ref()) {
+                for source in view.files.iter().filter_map(|file| file.source) {
+                    if let Some(known) = job.known.get_mut(&source) {
+                        known.protected = true;
+                    }
+                }
+            }
+        }
         job.sources = runtime.sources.clone();
         job.runtime = Some(runtime);
         if done.epoch != job.epoch {
@@ -1275,6 +1518,48 @@ impl Coordinator {
                 )));
             }
             return Some(done.job_id);
+        }
+        let native_pressure = match &done.result {
+            Err(error) => budget::is_native_pressure(error),
+            Ok(WorkOutput::Repaired(completion)) => completion
+                .result
+                .as_ref()
+                .err()
+                .is_some_and(budget::is_native_pressure),
+            _ => false,
+        };
+        // A repair retry can perform an assessment first. Only the operation
+        // that needed isolation consumes the reservation; afterward this job
+        // participates in ordinary shared scheduling again.
+        if !contended && job.retry_serial == Some(done.key) {
+            job.retry_serial = None;
+        }
+        if contended && native_pressure {
+            job.retry_serial = Some(done.key);
+            job.retry_repair = matches!(done.key, WorkKey::Repair(_));
+            if let WorkKey::Source(source) = done.key {
+                job.dirty.insert(source);
+                job.errors.remove(&source);
+                return Some(done.job_id);
+            }
+            if matches!(done.key, WorkKey::Assess | WorkKey::Donors) {
+                let input = if done.key == WorkKey::Donors {
+                    PendingInput::Donors
+                } else {
+                    PendingInput::Assess
+                };
+                match assessment::ViewReservation::acquire(1024) {
+                    Ok(reservation) => {
+                        job.pending
+                            .insert(done.key, QueuedInput::new(input, reservation));
+                    }
+                    Err(error) => {
+                        job.donor_error = Some(error);
+                    }
+                }
+                return Some(done.job_id);
+            }
+            // Repair reports still pass through installation reconciliation.
         }
         let pressure = match &done.result {
             Err(error)
@@ -1312,7 +1597,7 @@ impl Coordinator {
             );
         }
         match (done.key, done.result) {
-            (WorkKey::Donors, result) => {
+            (WorkKey::Donors | WorkKey::Assess, result) => {
                 job.donor_error = if pressure.is_some() {
                     None
                 } else {
