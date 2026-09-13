@@ -1,3 +1,4 @@
+import type { Translate } from "@/lib/context/translate-context";
 import type { ParsedReleaseData } from "@/lib/job-types";
 
 /**
@@ -15,39 +16,41 @@ export interface ReleaseField {
 }
 
 export function releaseFields(
+  t: Translate,
   parsed: ParsedReleaseData,
   category: string | null | undefined,
 ): ReleaseField[] {
   const fields: (ReleaseField | null)[] = [
-    parsed.year ? { label: "Year", value: String(parsed.year) } : null,
-    parsed.quality ? { label: "Quality", value: parsed.quality } : null,
-    parsed.source ? { label: "Source", value: parsed.source } : null,
-    parsed.videoCodec ? { label: "Video", value: parsed.videoCodec } : null,
-    parsed.videoEncoding ? { label: "Encoding", value: parsed.videoEncoding } : null,
-    parsed.audio ? { label: "Audio", value: parsed.audio } : null,
-    parsed.audioChannels ? { label: "Channels", value: parsed.audioChannels } : null,
-    parsed.releaseGroup ? { label: "Group", value: parsed.releaseGroup } : null,
-    parsed.streamingService ? { label: "Service", value: parsed.streamingService } : null,
-    parsed.edition ? { label: "Edition", value: parsed.edition } : null,
+    parsed.year ? { label: t("next.release.year"), value: String(parsed.year) } : null,
+    parsed.quality ? { label: t("next.release.quality"), value: parsed.quality } : null,
+    parsed.source ? { label: t("next.release.source"), value: parsed.source } : null,
+    parsed.videoCodec ? { label: t("next.release.video"), value: parsed.videoCodec } : null,
+    parsed.videoEncoding ? { label: t("next.release.encoding"), value: parsed.videoEncoding } : null,
+    parsed.audio ? { label: t("next.release.audio"), value: parsed.audio } : null,
+    parsed.audioChannels ? { label: t("next.release.channels"), value: parsed.audioChannels } : null,
+    parsed.releaseGroup ? { label: t("next.release.group"), value: parsed.releaseGroup } : null,
+    parsed.streamingService ? { label: t("next.release.service"), value: parsed.streamingService } : null,
+    parsed.edition ? { label: t("next.release.edition"), value: parsed.edition } : null,
     parsed.episode?.raw && category !== "movies"
-      ? { label: "Episode", value: parsed.episode.raw }
+      ? { label: t("next.release.episode"), value: parsed.episode.raw }
       : null,
     parsed.languagesAudio.length > 0
-      ? { label: "Audio lang", value: parsed.languagesAudio.join(", ") }
+      ? { label: t("next.release.audioLanguages"), value: parsed.languagesAudio.join(", ") }
       : null,
     parsed.languagesSubtitles.length > 0
-      ? { label: "Subtitle lang", value: parsed.languagesSubtitles.join(", ") }
+      ? { label: t("next.release.subtitleLanguages"), value: parsed.languagesSubtitles.join(", ") }
       : null,
     parsed.parseConfidence > 0
-      ? { label: "Parse", value: `${Math.round(parsed.parseConfidence * 100)}% confident` }
+      ? { label: t("next.release.parse"), value: t("next.release.confidence", { percent: Math.round(parsed.parseConfidence * 100) }) }
       : null,
   ];
   return fields.filter((field): field is ReleaseField => field !== null);
 }
 
-export function releaseFlags(parsed: ParsedReleaseData): string[] {
+/** Format names such as Atmos, HDR10+ or Remux read the same in every language; the rest translate. */
+export function releaseFlags(t: Translate, parsed: ParsedReleaseData): string[] {
   const flags = [
-    parsed.isDualAudio ? "Dual audio" : null,
+    parsed.isDualAudio ? t("next.release.dualAudio") : null,
     parsed.isAtmos ? "Atmos" : null,
     parsed.isDolbyVision ? "Dolby Vision" : null,
     parsed.detectedHdr ? "HDR" : null,
@@ -56,9 +59,9 @@ export function releaseFlags(parsed: ParsedReleaseData): string[] {
     parsed.isProperUpload ? "Proper" : null,
     parsed.isRepack ? "Repack" : null,
     parsed.isRemux ? "Remux" : null,
-    parsed.isBdDisk ? "Full disc" : null,
-    parsed.isAiEnhanced ? "AI enhanced" : null,
-    parsed.isHardcodedSubs ? "Hardcoded subs" : null,
+    parsed.isBdDisk ? t("next.release.fullDisc") : null,
+    parsed.isAiEnhanced ? t("next.release.aiEnhanced") : null,
+    parsed.isHardcodedSubs ? t("next.release.hardcodedSubs") : null,
     parsed.animeVersion ? `v${parsed.animeVersion}` : null,
   ];
   return flags.filter((flag): flag is string => flag !== null);

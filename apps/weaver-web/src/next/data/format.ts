@@ -6,6 +6,8 @@
  * string. Everything else returns display text ready for a mono span.
  */
 
+import type { Translate } from "@/lib/context/translate-context";
+
 export interface SplitValue {
   value: string;
   unit: string;
@@ -176,17 +178,17 @@ export function formatClockSeconds(epochMs: number | null | undefined): string {
  * The label above a day group: `TODAY`, `YESTERDAY`, then `TUE 9 SEP` and,
  * once the year turns over, `TUE 9 SEP 2025`.
  */
-export function formatDayLabel(epochMs: number): string {
+export function formatDayLabel(t: Translate, epochMs: number): string {
   const day = new Date(epochMs);
   const today = new Date();
   const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
   const startOfDay = new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
   const daysBack = Math.round((startOfToday - startOfDay) / 86_400_000);
   if (daysBack === 0) {
-    return "Today";
+    return t("next.day.today");
   }
   if (daysBack === 1) {
-    return "Yesterday";
+    return t("next.day.yesterday");
   }
   return day.toLocaleDateString([], {
     weekday: "short",

@@ -6,10 +6,7 @@ import {
   parentPath,
   pathCrumbs,
 } from "../src/next/data/directory-browser.ts";
-import { interpolate } from "../src/lib/i18n/types.ts";
-import { nextEn } from "../src/next/i18n/en.ts";
-
-const t = (key: string, values?: Record<string, string | number>) => interpolate(nextEn[key] ?? key, values);
+import { englishTranslate as t } from "./english-translate.ts";
 
 test("crumbs walk a POSIX path from the root", () => {
   assert.deepEqual(pathCrumbs("/media/library/shows/"), [

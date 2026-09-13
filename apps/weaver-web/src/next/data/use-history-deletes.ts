@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
+import { useTranslate } from "@/lib/context/translate-context";
 import {
   ACCEPT_HISTORY_DELETE_MUTATION,
   HISTORY_DELETE_OPERATIONS_QUERY,
@@ -32,6 +33,7 @@ export function useHistoryDeletes<T extends { id: number; deleteOperation: RowDe
   rows: readonly T[];
   onDrained: () => void;
 }) {
+  const t = useTranslate();
   const [locks, setLocks] = useState(NO_LOCKS);
   // The target count of an acceptance the operation list has not caught up with.
   const [pendingTargets, setPendingTargets] = useState(0);
@@ -103,7 +105,7 @@ export function useHistoryDeletes<T extends { id: number; deleteOperation: RowDe
       const result = await acceptHistoryDelete({ input: { mode: "IDS", ids: [...ids], deleteFiles } });
       const acceptance = result.data?.acceptHistoryDelete;
       if (result.error || !acceptance) {
-        return result.error?.message ?? "The delete was not accepted.";
+        return result.error?.message ?? t("next.deletes.notAccepted");
       }
       setPendingTargets(acceptance.totalTargets);
       setAwaitingRefresh("requested");
@@ -117,7 +119,7 @@ export function useHistoryDeletes<T extends { id: number; deleteOperation: RowDe
       pollOperations();
       return null;
     },
-    [acceptHistoryDelete, pollOperations],
+    [acceptHistoryDelete, pollOperations, t],
   );
 
   const lockedRows = useMemo(() => withDeleteLocks(rows, settled), [rows, settled]);

@@ -16,6 +16,7 @@ import {
   RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
 import {
@@ -51,6 +52,7 @@ import { releaseFields, releaseFlags } from "../data/release";
 import { eventTone, useStatusLabel } from "../data/status";
 import { buildTimelineView, type JobTimelineData } from "../data/timeline";
 import { useNextData } from "../data/next-data";
+import { countLabel } from "../i18n/labels";
 import { NextShell, RailBlock } from "../shell/NextShell";
 import { JumpListBlock } from "../shell/rail-blocks";
 
@@ -152,6 +154,7 @@ function sentenceCase(value: string): string {
 }
 
 export function JobDetailPage() {
+  const t = useTranslate();
   const { id } = useParams();
   const jobId = Number(id);
   const navigate = useNavigate();
@@ -217,8 +220,8 @@ export function JobDetailPage() {
   // finished one is fixed and needs no clock at all.
   const now = useNow(1000, inQueue);
   const timeline = useMemo(
-    () => buildTimelineView(snapshot?.jobTimeline, now, job?.status === "PROPAGATING"),
-    [job?.status, now, snapshot?.jobTimeline],
+    () => buildTimelineView(t, snapshot?.jobTimeline, now, job?.status === "PROPAGATING"),
+    [job?.status, now, snapshot?.jobTimeline, t],
   );
 
   const files = filesData?.jobOutputFiles?.files ?? [];
@@ -227,14 +230,11 @@ export function JobDetailPage() {
 
   if (!Number.isFinite(jobId) || (!job && !fetching)) {
     return (
-      <NextShell title="Job" note={`#${id}`}>
+      <NextShell title={t("next.job.title")} note={`#${id}`}>
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-          <EmptyState
-            title="No such job"
-            body="It was deleted from history, or the link points at an id weaver does not hold."
-          />
+          <EmptyState title={t("next.job.missingTitle")} body={t("next.job.missingBody")} />
           <div className="px-4 sm:px-6">
-            <SecondaryButton icon="back" onClick={() => navigate("/history")}>Back to Completed</SecondaryButton>
+            <SecondaryButton icon="back" onClick={() => navigate("/history")}>{t("next.job.backToCompleted")}</SecondaryButton>
           </div>
         </div>
       </NextShell>
@@ -243,9 +243,9 @@ export function JobDetailPage() {
 
   if (!job) {
     return (
-      <NextShell title="Job" note={`#${id}`}>
+      <NextShell title={t("next.job.title")} note={`#${id}`}>
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-          <EmptyState loading title="Loading" body="Fetching this job's snapshot." />
+          <EmptyState loading title={t("next.common.loading")} body={t("next.job.loadingBody")} />
         </div>
       </NextShell>
     );
@@ -270,28 +270,31 @@ export function JobDetailPage() {
   );
 
   const outcome = failed
-    ? "Failed — incomplete, nothing moved"
+    ? t("next.job.outcomeFailed")
     : done
       ? repaired
-        ? "Complete — repaired, moved, scripts run"
-        : "Complete — verified, moved, scripts run"
-      : `${statusLabel(progress.status)} — ${Math.round(percent)}% of this job`;
+        ? t("next.job.outcomeRepaired")
+        : t("next.job.outcomeVerified")
+      : t("next.job.outcomeRunning", { status: statusLabel(progress.status), percent: Math.round(percent) });
 
   const statusSentence = failed
-    ? `Stopped ${formatClockSeconds(job.completedAt)} · ${job.error || "the pipeline could not finish this job"}`
+    ? t("next.job.stopped", {
+        time: formatClockSeconds(job.completedAt),
+        reason: job.error || t("next.job.stoppedReason"),
+      })
     : done
       ? [
-          `Finished ${formatClockSeconds(job.completedAt)}`,
-          elapsedMs === null ? null : `${formatSpan(elapsedMs)} end to end`,
-          repaired ? "repaired before moving" : verified ? "verified without repair" : null,
+          t("next.job.finished", { time: formatClockSeconds(job.completedAt) }),
+          elapsedMs === null ? null : t("next.job.endToEnd", { span: formatSpan(elapsedMs) }),
+          repaired ? t("next.job.repairedBeforeMoving") : verified ? t("next.job.verifiedWithoutRepair") : null,
         ]
           .filter(Boolean)
           .join(" · ")
       : [
-          `Started ${formatClockSeconds(job.createdAt)}`,
+          t("next.job.started", { time: formatClockSeconds(job.createdAt) }),
           phase?.rateBps ? formatRate(phase.rateBps) : null,
           phase?.estimatedRemainingMs
-            ? `${formatDuration(phase.estimatedRemainingMs / 1000)} remaining`
+            ? t("next.job.remaining", { duration: formatDuration(phase.estimatedRemainingMs / 1000) })
             : null,
         ]
           .filter(Boolean)
@@ -317,7 +320,7 @@ export function JobDetailPage() {
       )
       .join("\n");
     void navigator.clipboard?.writeText(text);
-    setReport(`Copied ${events.length} events to the clipboard`);
+    setReport(countLabel(t, "next.job.copiedEvents", events.length));
   };
 
   return (
@@ -330,7 +333,7 @@ export function JobDetailPage() {
               className="flex flex-none items-center gap-[5px] font-wv-mono text-[11.5px] text-wv-muted hover:text-wv-fg"
             >
               <Icon name="back" size={13} />
-              {inQueue ? "Downloads" : "Completed"}
+              {inQueue ? t("next.nav.downloads") : t("next.nav.completed")}
             </Link>
             <span aria-hidden="true" className="flex-none text-wv-dim">
               /
@@ -348,10 +351,10 @@ export function JobDetailPage() {
                 size="compact"
                 disabled={busy}
                 onClick={() => {
-                  void run("Stopped post-processing", () => cancelPostProcessing({ jobId: job.id }));
+                  void run(t("next.job.report.stoppedScripts"), () => cancelPostProcessing({ jobId: job.id }));
                 }}
               >
-                Stop scripts
+                {t("next.inspector.stopScripts")}
               </SecondaryButton>
             ) : null}
             {inQueue ? (
@@ -362,27 +365,27 @@ export function JobDetailPage() {
                   disabled={busy}
                   onClick={() => {
                     void run(
-                      token === "paused" ? "Resumed" : "Paused",
+                      token === "paused" ? t("next.job.report.resumed") : t("next.job.report.paused"),
                       () => (token === "paused" ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })),
                     );
                   }}
                 >
-                  {token === "paused" ? "Resume" : "Pause"}
+                  {token === "paused" ? t("action.resume") : t("action.pause")}
                 </SecondaryButton>
                 <SecondaryButton
                   icon="postProcessing"
                   size="compact"
                   disabled={busy}
                   onClick={() => {
-                    void run("Re-running post-processing", () =>
+                    void run(t("next.job.report.rerunning"), () =>
                       rerunPostProcessing({ jobId: job.id }),
                     );
                   }}
                 >
-                  Re-run scripts
+                  {t("next.completed.rerunScripts")}
                 </SecondaryButton>
                 <DangerButton icon="cancelDownload" size="compact" disabled={busy} onClick={() => setConfirm("cancel")}>
-                  Cancel
+                  {t("action.cancel")}
                 </DangerButton>
               </>
             ) : (
@@ -392,37 +395,37 @@ export function JobDetailPage() {
                   size="compact"
                   disabled={busy}
                   onClick={() => {
-                    void run("Queued again for download", () => redownloadJob({ id: job.id }));
+                    void run(t("next.job.report.requeued"), () => redownloadJob({ id: job.id }));
                   }}
                 >
-                  Re-download
+                  {t("next.completed.redownload")}
                 </SecondaryButton>
                 <SecondaryButton
                   icon="postProcessing"
                   size="compact"
                   disabled={busy}
                   onClick={() => {
-                    void run("Re-running post-processing", () =>
+                    void run(t("next.job.report.rerunning"), () =>
                       rerunPostProcessing({ jobId: job.id }),
                     );
                   }}
                 >
-                  Re-run scripts
+                  {t("next.completed.rerunScripts")}
                 </SecondaryButton>
                 <SecondaryButton
                   icon="reprocess"
                   size="compact"
                   disabled={busy}
                   onClick={() => {
-                    void run("Reprocessing from what is on disk", () =>
+                    void run(t("next.job.report.reprocessing"), () =>
                       reprocessJob({ id: job.id }),
                     );
                   }}
                 >
-                  Reprocess
+                  {t("next.job.reprocess")}
                 </SecondaryButton>
                 <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
-                  Delete
+                  {t("action.delete")}
                 </DangerButton>
               </>
             )}
@@ -431,30 +434,30 @@ export function JobDetailPage() {
       }
       railMiddle={
         <JumpListBlock
-          eyebrow="This job"
+          eyebrow={t("next.job.thisJob")}
           items={[
-            { id: "pipeline", label: "Pipeline", meta: timeline?.stages.length ?? 0 },
-            { id: "files", label: "Output files", meta: files.length },
-            { id: "log", label: "Event log", meta: events.length },
-            { id: "release", label: "Release details" },
-            { id: "metadata", label: "Metadata" },
-            { id: "providers", label: "Providers", meta: providers.length },
+            { id: "pipeline", label: t("next.job.pipeline"), meta: timeline?.stages.length ?? 0 },
+            { id: "files", label: t("next.job.outputFiles"), meta: files.length },
+            { id: "log", label: t("next.job.eventLog"), meta: events.length },
+            { id: "release", label: t("next.job.releaseDetails") },
+            { id: "metadata", label: t("next.job.metadata") },
+            { id: "providers", label: t("next.rail.providers"), meta: providers.length },
           ]}
         />
       }
       railFooter={
-        <RailBlock eyebrow="Saved bandwidth">
+        <RailBlock eyebrow={t("next.job.savedBandwidth")}>
           <div className="text-[20px] font-semibold tracking-[-0.02em] text-wv-accent">
             {job.optionalRecoveryBytes > 0 ? formatSize(savedBytes) : EM_DASH}
           </div>
           <div className="font-wv-mono text-[10.5px] leading-[1.5] text-wv-faint">
             {job.optionalRecoveryBytes === 0
-              ? "No recovery set was posted with this release."
+              ? t("next.job.saved.noSet")
               : job.optionalRecoveryDownloadedBytes === 0
-                ? "par2 recovery set never downloaded — every article arrived intact."
+                ? t("next.job.saved.untouched")
                 : savedBytes === 0
-                  ? "The whole recovery set had to be fetched."
-                  : "Part of the recovery set was enough — the rest was never fetched."}
+                  ? t("next.job.saved.wholeSet")
+                  : t("next.job.saved.partSet")}
           </div>
         </RailBlock>
       }
@@ -474,7 +477,7 @@ export function JobDetailPage() {
           </span>
         )
       }
-      statusRight={`job #${job.id}`}
+      statusRight={t("next.job.statusId", { id: job.id })}
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <div className="flex flex-none flex-col gap-[14px] border-b border-wv-line-strong px-4 sm:px-[22px] pt-[18px] pb-5">
@@ -495,13 +498,13 @@ export function JobDetailPage() {
         <MetricStrip min={168}>
           <MetricCell
             variant="stat"
-            eyebrow="Downloaded"
+            eyebrow={t("next.job.downloaded")}
             value={formatSize(job.downloadedBytes)}
-            note={`of ${formatSize(job.totalBytes)} posted`}
+            note={t("next.job.ofPosted", { size: formatSize(job.totalBytes) })}
           />
           <MetricCell
             variant="stat"
-            eyebrow="Integrity"
+            eyebrow={t("next.job.integrity")}
             value={verified || done || failed ? `${(job.health / 10).toFixed(1)}%` : EM_DASH}
             valueClassName={
               !verified && !done && !failed
@@ -513,14 +516,14 @@ export function JobDetailPage() {
             note={
               verified || done || failed
                 ? job.failedBytes > 0
-                  ? `${formatSize(job.failedBytes)} never recovered`
-                  : "no damaged bytes"
-                : "verifies after download"
+                  ? t("next.job.neverRecovered", { size: formatSize(job.failedBytes) })
+                  : t("next.job.noDamage")
+                : t("next.job.verifiesAfter")
             }
           />
           <MetricCell
             variant="stat"
-            eyebrow={inQueue ? "Current rate" : "Average rate"}
+            eyebrow={inQueue ? t("next.job.currentRate") : t("next.job.averageRate")}
             value={
               inQueue
                 ? phase?.rateBps
@@ -533,14 +536,14 @@ export function JobDetailPage() {
             note={
               inQueue
                 ? phase
-                  ? `while ${phase.phase.toLowerCase()}`
-                  : "this phase"
-                : "end to end, including post-processing"
+                  ? t(`next.job.while.${phase.phase}`)
+                  : t("next.job.thisPhase")
+                : t("next.job.endToEndWithScripts")
             }
           />
           <MetricCell
             variant="stat"
-            eyebrow={job.optionalRecoveryDownloadedBytes > 0 ? "Recovery" : "Saved"}
+            eyebrow={job.optionalRecoveryDownloadedBytes > 0 ? t("next.job.recovery") : t("next.job.saved")}
             value={
               job.optionalRecoveryBytes === 0
                 ? EM_DASH
@@ -557,15 +560,15 @@ export function JobDetailPage() {
             }
             note={
               job.optionalRecoveryBytes === 0
-                ? "no recovery set posted"
+                ? t("next.job.noSetPosted")
                 : job.optionalRecoveryDownloadedBytes > 0
-                  ? `of ${formatSize(job.optionalRecoveryBytes)} fetched`
-                  : "par2 set skipped"
+                  ? t("next.job.ofFetched", { size: formatSize(job.optionalRecoveryBytes) })
+                  : t("next.job.setSkipped")
             }
           />
         </MetricStrip>
 
-        <DetailBlock id="pipeline" title="Pipeline" note={timeline?.note} bodyClassName="gap-0">
+        <DetailBlock id="pipeline" title={t("next.job.pipeline")} note={timeline?.note} bodyClassName="gap-0">
           {timeline ? (
             <Waterfall
               stages={timeline.stages}
@@ -576,24 +579,24 @@ export function JobDetailPage() {
             />
           ) : (
             <span className="text-[12.5px] text-wv-muted">
-              No stage has started yet — the pipeline appears once the job is picked up.
+              {t("next.job.noStages")}
             </span>
           )}
         </DetailBlock>
 
         <DetailBlock
           id="files"
-          title="Output files"
+          title={t("next.job.outputFiles")}
           note={
             files.length === 0
-              ? "nothing written yet"
-              : `${files.length} ${files.length === 1 ? "file" : "files"} · ${formatSize(filesData?.jobOutputFiles?.totalBytes ?? 0)}`
+              ? t("next.job.nothingWritten")
+              : `${countLabel(t, "next.job.fileCount", files.length)} · ${formatSize(filesData?.jobOutputFiles?.totalBytes ?? 0)}`
           }
           right={outputDir ?? undefined}
         >
           {files.length === 0 ? (
             <span className="text-[12.5px] text-wv-muted">
-              Files appear here once the job reaches its destination.
+              {t("next.job.filesAppear")}
             </span>
           ) : (
             files.map((file) => (
@@ -612,14 +615,14 @@ export function JobDetailPage() {
                 </div>
                 <button
                   type="button"
-                  title="Copy the full path"
+                  title={t("next.job.copyPathTitle")}
                   onClick={() => {
                     void navigator.clipboard?.writeText(file.path);
-                    setReport(`Copied ${file.name}'s path`);
+                    setReport(t("next.job.copiedPath", { name: file.name }));
                   }}
                   className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
                 >
-                  Copy
+                  {t("next.job.copy")}
                 </button>
               </GridRow>
             ))
@@ -628,8 +631,8 @@ export function JobDetailPage() {
 
         <DetailBlock
           id="log"
-          title="Event log"
-          note={`${events.length} ${events.length === 1 ? "event" : "events"}`}
+          title={t("next.job.eventLog")}
+          note={countLabel(t, "next.job.eventCount", events.length)}
           right={
             events.length === 0 ? undefined : (
               <button
@@ -637,14 +640,14 @@ export function JobDetailPage() {
                 onClick={copyLog}
                 className="cursor-pointer text-wv-dim hover:text-wv-fg"
               >
-                Copy as text
+                {t("next.job.copyAsText")}
               </button>
             )
           }
         >
           {events.length === 0 ? (
             <span className="text-[12.5px] text-wv-muted">
-              The engine has not recorded anything for this job.
+              {t("next.job.noEvents")}
             </span>
           ) : (
             events.map((event) => (
@@ -672,12 +675,12 @@ export function JobDetailPage() {
         </DetailBlock>
 
         <PanelGrid>
-          <DetailBlock id="release" title="Release" tone="panel" bodyClassName="gap-[13px]">
+          <DetailBlock id="release" title={t("next.completed.release")} tone="panel" bodyClassName="gap-[13px]">
             <div
               className="grid gap-x-4 gap-y-[13px]"
               style={{ gridTemplateColumns: "repeat(auto-fit, minmax(104px, 1fr))" }}
             >
-              {releaseFields(job.parsedRelease, job.category).map((field) => (
+              {releaseFields(t, job.parsedRelease, job.category).map((field) => (
                 <Field
                   key={field.label}
                   label={field.label}
@@ -686,9 +689,9 @@ export function JobDetailPage() {
                 />
               ))}
             </div>
-            {releaseFlags(job.parsedRelease).length === 0 ? null : (
+            {releaseFlags(t, job.parsedRelease).length === 0 ? null : (
               <div className="flex flex-wrap gap-1.5">
-                {releaseFlags(job.parsedRelease).map((flag) => (
+                {releaseFlags(t, job.parsedRelease).map((flag) => (
                   <Tag key={flag}>{flag}</Tag>
                 ))}
               </div>
@@ -697,24 +700,24 @@ export function JobDetailPage() {
 
           <DetailBlock
             id="identity"
-            title="Duplicate identity"
+            title={t("next.job.duplicateIdentity")}
             tone="panel"
             bodyClassName="gap-[9px]"
           >
             <Field
               variant="inline"
-              label="Lifecycle"
+              label={t("next.job.lifecycle")}
               value={duplicate?.lifecycle ? sentenceCase(duplicate.lifecycle) : EM_DASH}
             />
             <Field
               variant="inline"
-              label="Normalised"
+              label={t("next.job.normalised")}
               value={duplicate?.normalizedName || EM_DASH}
               title={duplicate?.normalizedName ?? undefined}
             />
             <Field
               variant="inline"
-              label="Group"
+              label={t("next.job.group")}
               value={
                 duplicate?.semantic?.state
                   ? `${sentenceCase(duplicate.semantic.state)}${
@@ -722,7 +725,7 @@ export function JobDetailPage() {
                         ? ""
                         : ` · ${Math.round(duplicate.semantic.score * 100)}%`
                     }`
-                  : "no semantic group"
+                  : t("next.job.noGroup")
               }
             />
             <DangerButton
@@ -731,18 +734,22 @@ export function JobDetailPage() {
               disabled={busy || !duplicate}
               onClick={() => setConfirm("forget")}
             >
-              Forget identity
+              {t("next.job.forgetIdentity")}
             </DangerButton>
           </DetailBlock>
 
-          <DetailBlock id="metadata" title="Metadata" tone="panel" bodyClassName="gap-[11px]">
-            <Field variant="stacked" label="Job id" value={String(job.id)} />
+          <DetailBlock id="metadata" title={t("next.job.metadata")} tone="panel" bodyClassName="gap-[11px]">
+            <Field variant="stacked" label={t("next.job.jobId")} value={String(job.id)} />
             <Field
               variant="stacked"
-              label="Original NZB title"
+              label={t("next.job.originalTitle")}
               value={job.originalTitle || job.name}
             />
-            <Field variant="stacked" label="Category" value={job.category || "uncategorised"} />
+            <Field
+              variant="stacked"
+              label={t("table.category")}
+              value={job.category || t("next.categories.uncategorised")}
+            />
             {job.metadata.map((entry) => (
               <Field
                 key={entry.key}
@@ -761,26 +768,23 @@ export function JobDetailPage() {
           */}
           <DetailBlock
             id="providers"
-            title="Providers used"
+            title={t("next.job.providersUsed")}
             tone="panel"
-            note={
-              providers.length === 0
-                ? undefined
-                : "Shares are of the payload whose provider was recorded."
-            }
+            note={providers.length === 0 ? undefined : t("next.job.providersNote")}
             bodyClassName="gap-[11px]"
           >
             {providers.length === 0 ? (
               <div className="text-[12.5px] leading-[1.5] text-wv-muted">
-                Not recorded for this job — either nothing has landed yet, or it
-                finished before weaver kept per-provider counts.
+                {t("next.job.providersEmpty")}
               </div>
             ) : (
               providers.map((provider, index) => (
                 <ShareRow
                   key={provider.serverId}
-                  label={provider.serverHost ?? `Server ${provider.serverId}`}
-                  title={`${provider.articles.toLocaleString()} articles`}
+                  label={provider.serverHost ?? t("next.job.serverId", { id: provider.serverId })}
+                  title={countLabel(t, "next.job.articles", provider.articles, {
+                    count: provider.articles.toLocaleString(),
+                  })}
                   note={`${formatSize(provider.wireBytes)} · ${Math.round(provider.share)}%`}
                   percent={provider.share}
                   color={PROVIDER_COLORS[index % PROVIDER_COLORS.length]}
@@ -789,19 +793,22 @@ export function JobDetailPage() {
             )}
           </DetailBlock>
 
-          <DetailBlock id="recovery" title="Bytes" tone="panel" bodyClassName="gap-[11px]">
+          <DetailBlock id="recovery" title={t("next.job.bytes")} tone="panel" bodyClassName="gap-[11px]">
             <ShareRow
-              label="Payload"
-              note={`${formatSize(job.downloadedBytes)} of ${formatSize(job.totalBytes)}`}
+              label={t("next.job.payload")}
+              note={t("next.job.sizeOf", { done: formatSize(job.downloadedBytes), total: formatSize(job.totalBytes) })}
               percent={job.totalBytes > 0 ? (job.downloadedBytes / job.totalBytes) * 100 : 0}
               color={color}
             />
             <ShareRow
-              label="Recovery set"
+              label={t("next.job.recoverySet")}
               note={
                 job.optionalRecoveryBytes === 0
-                  ? "none posted"
-                  : `${formatSize(job.optionalRecoveryDownloadedBytes)} of ${formatSize(job.optionalRecoveryBytes)}`
+                  ? t("next.job.nonePosted")
+                  : t("next.job.sizeOf", {
+                      done: formatSize(job.optionalRecoveryDownloadedBytes),
+                      total: formatSize(job.optionalRecoveryBytes),
+                    })
               }
               percent={
                 job.optionalRecoveryBytes > 0
@@ -811,8 +818,8 @@ export function JobDetailPage() {
               color={WV.info}
             />
             <ShareRow
-              label="Unrecovered"
-              note={job.failedBytes > 0 ? formatSize(job.failedBytes) : "none"}
+              label={t("next.job.unrecovered")}
+              note={job.failedBytes > 0 ? formatSize(job.failedBytes) : t("next.job.none")}
               percent={job.totalBytes > 0 ? (job.failedBytes / job.totalBytes) * 100 : 0}
               color={WV.error}
             />
@@ -822,15 +829,15 @@ export function JobDetailPage() {
 
       <ConfirmDialog
         open={confirm === "delete"}
-        title="Delete from history"
+        title={t("next.job.deleteTitle")}
         note={job.displayTitle || job.name}
         busy={busy}
-        confirmLabel="Delete from history"
-        body="The entry leaves history and its files stay on disk."
+        confirmLabel={t("next.job.deleteTitle")}
+        body={t("next.job.deleteBody")}
         onDismiss={() => setConfirm(null)}
         onConfirm={() => {
           setConfirm(null);
-          void run("Removed from history", async () => {
+          void run(t("next.job.report.removed"), async () => {
             const result = await acceptHistoryDelete({
               input: { mode: "IDS", ids: [job.id], deleteFiles: false },
             });
@@ -844,29 +851,29 @@ export function JobDetailPage() {
 
       <ConfirmDialog
         open={confirm === "cancel"}
-        title="Cancel download"
+        title={t("next.job.cancelTitle")}
         note={job.displayTitle || job.name}
         busy={busy}
-        confirmLabel="Cancel download"
-        body="The download stops and leaves the queue. Partial data is cleaned up as usual."
+        confirmLabel={t("next.job.cancelTitle")}
+        body={t("next.job.cancelBody")}
         onDismiss={() => setConfirm(null)}
         onConfirm={() => {
           setConfirm(null);
-          void run("Download cancelled", () => cancelJob({ id: job.id }));
+          void run(t("next.job.report.cancelled"), () => cancelJob({ id: job.id }));
         }}
       />
 
       <ConfirmDialog
         open={confirm === "forget"}
-        title="Forget identity"
+        title={t("next.job.forgetIdentity")}
         note={duplicate?.normalizedName ?? undefined}
         busy={busy}
-        confirmLabel="Forget identity"
-        body="weaver stops recognising this release as a duplicate of anything it has seen. A future grab of the same release will be treated as new."
+        confirmLabel={t("next.job.forgetIdentity")}
+        body={t("next.job.forgetBody")}
         onDismiss={() => setConfirm(null)}
         onConfirm={() => {
           setConfirm(null);
-          void run("Identity forgotten", async () => {
+          void run(t("next.job.report.forgotten"), async () => {
             const result = await forgetDuplicateIdentity({ id: job.id });
             void refetchDuplicate({ requestPolicy: "network-only" });
             return result;

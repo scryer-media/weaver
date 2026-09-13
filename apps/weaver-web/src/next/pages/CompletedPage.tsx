@@ -6,6 +6,7 @@ import {
   RERUN_POST_PROCESSING_MUTATION,
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, normalizeGraphqlTimestamp } from "@/lib/job-types";
 import { saveBlobAsDownload } from "@/lib/download";
 import { cn } from "@/lib/utils";
@@ -33,6 +34,7 @@ import {
   startOfDay,
 } from "../data/format";
 import { WV } from "../data/palette";
+import { countLabel } from "../i18n/labels";
 import { useStatusLabel } from "../data/status";
 import { NextShell, RailBlock } from "../shell/NextShell";
 import { CategoryListBlock } from "../shell/rail-blocks";
@@ -79,13 +81,14 @@ type SortId = "newest" | "largest" | "integrity";
 
 const SORT_OPTIONS: {
   value: SortId;
+  /** Translation key. */
   label: string;
   field: string;
   direction: "ASC" | "DESC";
 }[] = [
-  { value: "newest", label: "Newest first", field: "COMPLETED_AT", direction: "DESC" },
-  { value: "largest", label: "Largest first", field: "SIZE", direction: "DESC" },
-  { value: "integrity", label: "Lowest integrity first", field: "HEALTH", direction: "ASC" },
+  { value: "newest", label: "next.completed.sort.newest", field: "COMPLETED_AT", direction: "DESC" },
+  { value: "largest", label: "next.completed.sort.largest", field: "SIZE", direction: "DESC" },
+  { value: "integrity", label: "next.completed.sort.integrity", field: "HEALTH", direction: "ASC" },
 ];
 
 const TAB_STATUS: Record<TabId, "ALL" | "SUCCESS" | "FAILURE"> = {
@@ -139,7 +142,7 @@ function elapsedMs(row: HistoryRow): number | null {
   return finished - started;
 }
 
-function groupByDay(rows: readonly HistoryRow[]): DayGroup[] {
+function groupByDay(t: Translate, rows: readonly HistoryRow[]): DayGroup[] {
   const groups = new Map<number, DayGroup>();
   for (const row of rows) {
     const finished = millis(row.completedAt);
@@ -151,7 +154,7 @@ function groupByDay(rows: readonly HistoryRow[]): DayGroup[] {
     } else {
       groups.set(key, {
         key,
-        label: finished === null ? "Undated" : formatDayLabel(finished),
+        label: finished === null ? t("next.day.undated") : formatDayLabel(t, finished),
         rows: [row],
         bytes: row.totalBytes,
       });
@@ -166,6 +169,7 @@ function csvCell(value: string | number): string {
 }
 
 export function CompletedPage() {
+  const t = useTranslate();
   const navigate = useNavigate();
   const statusLabel = useStatusLabel();
   const { categories: configured } = useNextData();
@@ -261,7 +265,7 @@ export function CompletedPage() {
     setPicked(new Set([...picked].filter((id) => !lockedIds.has(id))));
   }
 
-  const days = useMemo(() => groupByDay(rows), [rows]);
+  const days = useMemo(() => groupByDay(t, rows), [rows, t]);
 
   const reset = (change: () => void) => {
     change();
@@ -281,7 +285,8 @@ export function CompletedPage() {
       todayCount: today.length,
       todayBytes: today.reduce((total, row) => total + row.totalBytes, 0),
       rate: seconds > 0 ? bytes / seconds : 0,
-      rateScope: today.length > 0 ? "end to end, today" : `end to end, last ${timed.length} jobs`,
+      rateScope: today.length > 0 ? "today" : "recent",
+      timedCount: timed.length,
       capped: sample.length >= SAMPLE_SIZE,
     };
   }, [midnight, sample]);
@@ -338,7 +343,7 @@ export function CompletedPage() {
   };
 
   const runOnPicked = async (
-    label: string,
+    kind: "requeued" | "rerun",
     run: (id: number) => Promise<{ error?: unknown }>,
   ) => {
     const ids = [...picked];
@@ -349,8 +354,12 @@ export function CompletedPage() {
     setPicked(new Set());
     setReport(
       failures === 0
-        ? `${label} ${formatCount(ids.length)} ${ids.length === 1 ? "entry" : "entries"}`
-        : `${label} ${formatCount(ids.length - failures)} of ${formatCount(ids.length)} — ${formatCount(failures)} refused`,
+        ? countLabel(t, `next.completed.bulk.${kind}`, ids.length, { count: formatCount(ids.length) })
+        : t(`next.completed.bulk.${kind}Partial`, {
+            done: formatCount(ids.length - failures),
+            total: formatCount(ids.length),
+            refused: formatCount(failures),
+          }),
     );
     refresh();
   };
@@ -377,19 +386,19 @@ export function CompletedPage() {
         icon="redownload"
         disabled={actionsBusy}
         onClick={() => {
-          void runOnPicked("Re-queued", (id) => redownloadJob({ id }));
+          void runOnPicked("requeued", (id) => redownloadJob({ id }));
         }}
       >
-        Re-download
+        {t("next.completed.redownload")}
       </BulkButton>
       <BulkButton
         icon="postProcessing"
         disabled={actionsBusy}
         onClick={() => {
-          void runOnPicked("Re-ran scripts for", (id) => rerunPostProcessing({ jobId: id }));
+          void runOnPicked("rerun", (id) => rerunPostProcessing({ jobId: id }));
         }}
       >
-        Re-run scripts
+        {t("next.completed.rerunScripts")}
       </BulkButton>
       <BulkButton
         icon="remove"
@@ -400,7 +409,7 @@ export function CompletedPage() {
           setConfirmDelete(true);
         }}
       >
-        Delete
+        {t("action.delete")}
       </BulkButton>
     </>
   );
@@ -437,27 +446,27 @@ export function CompletedPage() {
       new Blob([[header.join(","), ...lines].join("\n")], { type: "text/csv;charset=utf-8" }),
       `weaver-history-${stamp}.csv`,
     );
-    setReport(`Exported this page — ${formatCount(rows.length)} entries`);
+    setReport(countLabel(t, "next.completed.exported", rows.length, { count: formatCount(rows.length) }));
   };
 
   const rate = splitSpeed(metrics.rate);
 
   return (
     <NextShell
-      title="Completed"
-      note={`${formatCount(counts.all)} jobs kept`}
+      title={t("next.nav.completed")}
+      note={countLabel(t, "next.completed.kept", counts.all, { count: formatCount(counts.all) })}
       controls={
         <>
           <TextField
-            label="Filter completed by name"
-            placeholder="Filter by name"
+            label={t("next.completed.filterLabel")}
+            placeholder={t("next.completed.filterPlaceholder")}
             mono={false}
             value={query}
             onChange={(next) => reset(() => setQuery(next))}
             className="w-[118px] min-w-[80px] sm:w-[172px] sm:min-w-[96px]"
           />
           <SecondaryButton icon="downloadFile" onClick={exportList} disabled={rows.length === 0}>
-            Export list
+            {t("next.completed.export")}
           </SecondaryButton>
         </>
       }
@@ -470,7 +479,7 @@ export function CompletedPage() {
         />
       }
       railFooter={
-        <RailBlock eyebrow="Archive">
+        <RailBlock eyebrow={t("next.completed.archive")}>
           <StorageMounts volumes={volumes} layout="stack" />
         </RailBlock>
       }
@@ -479,40 +488,46 @@ export function CompletedPage() {
           <MetricStrip>
             <MetricCell
               variant="strip"
-              eyebrow="Today"
+              eyebrow={t("next.day.today")}
               value={metrics.capped && metrics.todayCount >= SAMPLE_SIZE
                 ? `${SAMPLE_SIZE}+`
                 : formatCount(metrics.todayCount)}
-              unit={metrics.todayCount === 1 ? "job" : "jobs"}
-              note={`${formatSize(metrics.todayBytes)} downloaded`}
+              unit={countLabel(t, "next.completed.jobsUnit", metrics.todayCount)}
+              note={t("next.completed.downloaded", { size: formatSize(metrics.todayBytes) })}
             />
             <MetricCell
               variant="strip"
-              eyebrow="Complete"
+              eyebrow={t("next.completed.complete")}
               value={formatCount(counts.success)}
-              unit={`of ${formatCount(counts.all)}`}
+              unit={t("next.completed.ofTotal", { total: formatCount(counts.all) })}
             />
             <MetricCell
               variant="strip"
-              eyebrow="Failed"
+              eyebrow={t("status.failed")}
               value={formatCount(counts.failure)}
-              unit={`of ${formatCount(counts.all)}`}
+              unit={t("next.completed.ofTotal", { total: formatCount(counts.all) })}
               valueClassName={counts.failure > 0 ? "text-wv-error" : undefined}
             />
             <MetricCell
               variant="strip"
-              eyebrow="Avg throughput"
+              eyebrow={t("next.completed.avgThroughput")}
               value={metrics.rate > 0 ? rate.value : EM_DASH}
               unit={metrics.rate > 0 ? rate.unit : undefined}
-              note={metrics.rate > 0 ? metrics.rateScope : "nothing finished yet"}
+              note={
+                metrics.rate <= 0
+                  ? t("next.completed.nothingFinished")
+                  : metrics.rateScope === "today"
+                    ? t("next.completed.rateToday")
+                    : countLabel(t, "next.completed.rateRecent", metrics.timedCount)
+              }
             />
           </MetricStrip>
 
           <Tabs
             tabs={[
-              { id: "all", label: "All", count: counts.all },
-              { id: "success", label: "Complete", count: counts.success },
-              { id: "failure", label: "Failed", count: counts.failure },
+              { id: "all", label: t("history.filterAll"), count: counts.all },
+              { id: "success", label: t("next.completed.complete"), count: counts.success },
+              { id: "failure", label: t("status.failed"), count: counts.failure },
             ]}
             active={tab}
             onSelect={(next) => reset(() => setTab(next))}
@@ -533,13 +548,13 @@ export function CompletedPage() {
                   onClick={() => setSortOpen((previous) => !previous)}
                   className="flex cursor-pointer items-center gap-[7px] font-wv-mono text-[11px] text-wv-muted hover:text-wv-fg"
                 >
-                  {sortOption.label}
+                  {t(sortOption.label)}
                   <Icon name="dropdown" size={12} className="text-wv-disabled" />
                 </button>
                 <Menu
                   open={sortOpen}
                   onDismiss={() => setSortOpen(false)}
-                  label="Sort completed"
+                  label={t("next.completed.sortMenu")}
                   className="top-[26px] right-0 w-[196px]"
                 >
                   {SORT_OPTIONS.map((option) => (
@@ -551,7 +566,7 @@ export function CompletedPage() {
                         setSortOpen(false);
                       }}
                     >
-                      {option.label}
+                      {t(option.label)}
                     </MenuItem>
                   ))}
                 </Menu>
@@ -575,17 +590,17 @@ export function CompletedPage() {
             cells={[
               <CheckBox
                 key="all"
-                label="Select every entry on this page"
+                label={t("next.completed.selectPage")}
                 checked={allPicked}
                 onChange={toggleAll}
               />,
-              "Release",
-              "Outcome",
+              t("next.completed.release"),
+              t("next.completed.outcome"),
               <span key="size" className="block text-right">
-                Size
+                {t("table.size")}
               </span>,
               <span key="done" className="block text-right">
-                Done
+                {t("next.completed.done")}
               </span>,
               "",
             ]}
@@ -606,36 +621,32 @@ export function CompletedPage() {
       }
       statusNote={
         deletes.active
-          ? describeDeleteProgress(deletes.progress)
+          ? describeDeleteProgress(t, deletes.progress)
           : report
-          ?? `${formatCount(totalCount)} of ${formatCount(counts.all)} entries match · history is kept until an entry is deleted`
+          ?? t("next.completed.statusNote", { shown: formatCount(totalCount), total: formatCount(counts.all) })
       }
       statusRight={
         mounts.length === 0
           ? undefined
           : mounts.length === 1
-            ? `${formatSize(freeAcross)} free on ${mounts[0].label}`
-            : `${formatSize(freeAcross)} free across ${mounts.length} volumes`
+            ? t("next.completed.freeOn", { size: formatSize(freeAcross), volume: mounts[0].label })
+            : t("next.completed.freeAcross", { size: formatSize(freeAcross), count: mounts.length })
       }
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         {rows.length === 0 ? (
           <EmptyState
             loading={fetching}
-            title={fetching ? "Loading" : "Nothing matches this view"}
-            body={
-              fetching
-                ? "Fetching the history page."
-                : "Clear the filter or pick another outcome."
-            }
+            title={fetching ? t("next.common.loading") : t("next.downloads.noMatchTitle")}
+            body={fetching ? t("next.completed.loadingBody") : t("next.completed.noMatchBody")}
           />
         ) : (
           days.map((day) => (
             <section key={day.key} className="flex flex-none flex-col">
               <SectionHeader
                 label={day.label}
-                count={`${day.rows.length} ${day.rows.length === 1 ? "item" : "items"}`}
-                note={`${formatSize(day.bytes)} archived`}
+                count={countLabel(t, "next.completed.items", day.rows.length)}
+                note={t("next.completed.archived", { size: formatSize(day.bytes) })}
               />
               {day.rows.map((row) => {
                 const token = statusToken(row.status);
@@ -661,7 +672,7 @@ export function CompletedPage() {
                     )}
                   >
                     <CheckBox
-                      label={`Select ${formatJobReleaseName(row)}`}
+                      label={t("next.common.selectItem", { name: formatJobReleaseName(row) })}
                       checked={picked.has(row.id)}
                       disabled={locked}
                       onChange={() => togglePicked(row.id)}
@@ -675,11 +686,11 @@ export function CompletedPage() {
                       />
                       <span className="truncate text-[12.5px] text-wv-secondary">
                         {removing
-                          ? "Deleting"
+                          ? t("next.completed.deleting")
                           : token === "completed"
-                            ? "Complete"
+                            ? t("next.completed.complete")
                             : failed
-                              ? "Failed"
+                              ? t("status.failed")
                               : statusLabel(row.status)}
                       </span>
                     </div>
@@ -691,7 +702,7 @@ export function CompletedPage() {
                         {formatClock(finished)}
                       </span>
                       <span className="font-wv-mono text-[10.5px] whitespace-nowrap text-wv-faint">
-                        {elapsed === null ? EM_DASH : `took ${formatElapsed(elapsed)}`}
+                        {elapsed === null ? EM_DASH : t("next.completed.took", { span: formatElapsed(elapsed) })}
                       </span>
                     </div>
                     <div className="flex justify-end text-wv-dim">
@@ -707,21 +718,19 @@ export function CompletedPage() {
 
       <ConfirmDialog
         open={confirmDelete}
-        title="Delete"
-        note={`${picked.size} selected`}
+        title={t("action.delete")}
+        note={t("bulk.selected", { count: picked.size })}
         busy={actionsBusy}
         body={
           <>
-            Delete history only removes the entries and leaves their files on disk. Delete with
-            files removes the downloaded files too. Both run in the background; the entries stay
-            here, locked, until they are gone.
+            {t("next.completed.deleteBody")}
             {deleteError === null ? null : (
               <span className="mt-3 block text-wv-error-text">{deleteError}</span>
             )}
           </>
         }
-        alternative={{ label: "Delete history only", onConfirm: () => void deletePicked(false) }}
-        confirmLabel="Delete with files"
+        alternative={{ label: t("next.completed.deleteHistoryOnly"), onConfirm: () => void deletePicked(false) }}
+        confirmLabel={t("next.completed.deleteWithFiles")}
         onConfirm={() => void deletePicked(true)}
         onDismiss={() => setConfirmDelete(false)}
       />

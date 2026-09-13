@@ -1,3 +1,4 @@
+import type { Translate } from "@/lib/context/translate-context";
 import type { WaterfallSegment, WaterfallStage } from "../components/Waterfall";
 import { formatClockSeconds, formatSpan } from "./format";
 import { WV } from "./palette";
@@ -74,18 +75,6 @@ const STAGE_ORDER = [
   "INTERRUPTED",
 ] as const;
 
-const STAGE_LABEL: Record<string, string> = {
-  PENDING_DOWNLOAD: "Waiting to start",
-  DOWNLOADING: "Downloading",
-  PAUSED: "Paused",
-  FINALIZING_DOWNLOAD: "Finalising",
-  VERIFYING: "Verifying",
-  REPAIRING: "Repairing",
-  EXTRACTING: "Extracting",
-  FINAL_MOVE: "Final move",
-  INTERRUPTED: "Interrupted",
-};
-
 const STAGE_COLOR: Record<string, string> = {
   PENDING_DOWNLOAD: WV.idle,
   DOWNLOADING: WV.info,
@@ -98,24 +87,10 @@ const STAGE_COLOR: Record<string, string> = {
   INTERRUPTED: WV.error,
 };
 
-const MEMBER_SPAN_LABEL: Record<ExtractionMemberSpan["kind"], string> = {
-  EXTRACTING: "Extracting",
-  WAITING_FOR_VOLUME: "Waiting for volume",
-  APPENDING: "Appending",
-};
-
 const MEMBER_SPAN_COLOR: Record<ExtractionMemberSpan["kind"], string> = {
   EXTRACTING: WV.violet,
   WAITING_FOR_VOLUME: WV.idle,
   APPENDING: WV.info,
-};
-
-const MEMBER_STATE_LABEL: Record<ExtractionMember["state"], string> = {
-  RUNNING: "running",
-  INTERRUPTED: "interrupted",
-  COMPLETE: "complete",
-  AWAITING_REPAIR: "awaiting repair",
-  FAILED: "failed",
 };
 
 const MEMBER_STATE_COLOR: Record<ExtractionMember["state"], string> = {
@@ -138,7 +113,14 @@ export interface TimelineView {
   running: boolean;
 }
 
+/** The label under `key`, or the engine's own word made readable when there is no key for it. */
+function engineLabel(t: Translate, key: string, value: string): string {
+  const label = t(key);
+  return label === key ? value.toLowerCase().replace(/_/g, " ") : label;
+}
+
 export function buildTimelineView(
+  t: Translate,
   timeline: JobTimelineData | null | undefined,
   now: number,
   /** The job is waiting out its propagation delay, which is what its pending lane is. */
@@ -170,7 +152,7 @@ export function buildTimelineView(
       color,
       dashed,
       title: `${title} · ${formatClockSeconds(entry.startedAt)} → ${
-        entry.endedAt === null ? "now" : formatClockSeconds(entry.endedAt)
+        entry.endedAt === null ? t("next.timeline.now") : formatClockSeconds(entry.endedAt)
       } · ${formatSpan(ended - entry.startedAt)}`,
     };
   };
@@ -178,8 +160,8 @@ export function buildTimelineView(
   const stages = lanes.map((lane): WaterfallStage => {
     const label =
       propagating && lane.stage === "PENDING_DOWNLOAD"
-        ? "Propagating"
-        : (STAGE_LABEL[lane.stage] ?? lane.stage.toLowerCase().replace(/_/g, " "));
+        ? t("next.timeline.propagating")
+        : engineLabel(t, `next.timeline.stage.${lane.stage}`, lane.stage);
     const color = STAGE_COLOR[lane.stage] ?? WV.slate;
     const failed = lane.spans.some((entry) => entry.state === "FAILED");
     const pending = lane.spans.length === 0;
@@ -190,7 +172,7 @@ export function buildTimelineView(
       start: pending ? 0 : percentOf(extent.started),
       end: pending ? 0 : percentOf(extent.ended),
       color: failed ? WV.error : color,
-      duration: pending ? "pending" : formatSpan(runTime(lane.spans, to)),
+      duration: pending ? t("next.timeline.pending") : formatSpan(runTime(lane.spans, to)),
       pending,
       segments: lane.spans.map((entry) =>
         segmentOf(
@@ -209,7 +191,7 @@ export function buildTimelineView(
       group.members.map((member) => {
         const name = member.member.split("/").pop() || member.member;
         const extent = extentOf(member.spans, to);
-        const state = MEMBER_STATE_LABEL[member.state] ?? member.state.toLowerCase();
+        const state = engineLabel(t, `next.timeline.member.${member.state}`, member.state);
         const stage: WaterfallStage = {
           id: `${group.setName}:${member.member}`,
           label: name,
@@ -221,16 +203,17 @@ export function buildTimelineView(
               ? formatSpan(runTime(member.spans, to))
               : `${formatSpan(runTime(member.spans, to))} · ${state}`,
           pending: member.spans.length === 0,
-          title: [member.member, `set ${group.setName}`, state, member.error]
+          title: [member.member, t("next.timeline.set", { name: group.setName }), state, member.error]
             .filter(Boolean)
             .join(" · "),
-          segments: member.spans.map((entry) =>
-            segmentOf(
+          segments: member.spans.map((entry) => {
+            const kind = engineLabel(t, `next.timeline.span.${entry.kind}`, entry.kind);
+            return segmentOf(
               entry,
               entry.state === "FAILED" ? WV.error : MEMBER_SPAN_COLOR[entry.kind],
-              entry.label ? `${MEMBER_SPAN_LABEL[entry.kind]} · ${entry.label}` : MEMBER_SPAN_LABEL[entry.kind],
-            ),
-          ),
+              entry.label ? `${kind} · ${entry.label}` : kind,
+            );
+          }),
         };
         return { stage, startedAt: extent.started };
       }),
@@ -249,12 +232,12 @@ export function buildTimelineView(
       quarter === 0 ? "0s" : formatSpan((span * quarter) / 4),
     ),
     window: running
-      ? `started ${formatClockSeconds(from)} · still running`
+      ? t("next.timeline.windowRunning", { time: formatClockSeconds(from) })
       : `${formatClockSeconds(from)} → ${formatClockSeconds(to)}`,
-    total: running ? `${formatSpan(span)} so far` : formatSpan(span),
+    total: running ? t("next.timeline.soFar", { span: formatSpan(span) }) : formatSpan(span),
     note: running
-      ? `stage ${active} of ${stages.length} · ${formatSpan(span)} elapsed`
-      : `${active} ${active === 1 ? "stage" : "stages"} · ${formatSpan(span)} total`,
+      ? t("next.timeline.noteRunning", { stage: active, stages: stages.length, span: formatSpan(span) })
+      : t(`next.timeline.noteDone.${active === 1 ? "one" : "other"}`, { count: active, span: formatSpan(span) }),
     running,
   };
 }

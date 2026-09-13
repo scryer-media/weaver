@@ -8,6 +8,7 @@ import {
   type DeleteLock,
   type HistoryDeleteOperation,
 } from "../src/next/data/history-deletes.ts";
+import { englishTranslate as t } from "./english-translate.ts";
 
 const row = (id: number, deleteOperation: { state: string; locked: boolean } | null = null) => ({
   id,
@@ -70,7 +71,7 @@ test("progress sums the active operations", () => {
   );
   assert.deepEqual(progress, { total: 13, queued: 8, running: 2, completed: 2, failed: 1 });
   assert.equal(
-    describeDeleteProgress(progress),
+    describeDeleteProgress(t, progress),
     "Deleting history items · 13 tracked · 2 running · 8 queued · 1 failed",
   );
 });
@@ -78,5 +79,5 @@ test("progress sums the active operations", () => {
 test("an accepted delete the operation list has not caught up with counts as queued", () => {
   const progress = deleteProgress([], 4);
   assert.deepEqual(progress, { total: 4, queued: 4, running: 0, completed: 0, failed: 0 });
-  assert.equal(describeDeleteProgress(progress), "Deleting history items · 4 tracked · 4 queued");
+  assert.equal(describeDeleteProgress(t, progress), "Deleting history items · 4 tracked · 4 queued");
 });

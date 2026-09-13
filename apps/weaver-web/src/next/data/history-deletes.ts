@@ -9,6 +9,8 @@
  * These are the pure parts of that; `useHistoryDeletes` is the wiring.
  */
 
+import type { Translate } from "@/lib/context/translate-context";
+
 export interface HistoryDeleteOperation {
   id: number;
   state: "QUEUED" | "RUNNING" | "COMPLETED" | "COMPLETED_WITH_ERRORS";
@@ -106,13 +108,13 @@ export function deleteProgress(
 }
 
 /** `Deleting history items · 12 tracked · 3 running · 8 queued · 1 failed`. */
-export function describeDeleteProgress(progress: DeleteProgress): string {
+export function describeDeleteProgress(t: Translate, progress: DeleteProgress): string {
   return [
-    "Deleting history items",
-    `${progress.total} tracked`,
-    progress.running > 0 && `${progress.running} running`,
-    progress.queued > 0 && `${progress.queued} queued`,
-    progress.failed > 0 && `${progress.failed} failed`,
+    t("next.deletes.title"),
+    t("next.deletes.tracked", { count: progress.total }),
+    progress.running > 0 && t("next.deletes.running", { count: progress.running }),
+    progress.queued > 0 && t("next.deletes.queued", { count: progress.queued }),
+    progress.failed > 0 && t("next.deletes.failed", { count: progress.failed }),
   ]
     .filter(Boolean)
     .join(" · ");
