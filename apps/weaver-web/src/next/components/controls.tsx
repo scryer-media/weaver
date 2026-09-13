@@ -83,12 +83,15 @@ export function DangerButton({
   disabled,
   className,
   size = "default",
+  solid = false,
 }: {
   children: ReactNode;
   onClick?: () => void;
   disabled?: boolean;
   className?: string;
   size?: "default" | "compact";
+  /** Filled red, for the most destructive of two destructive choices side by side. */
+  solid?: boolean;
 }) {
   return (
     <button
@@ -96,11 +99,16 @@ export function DangerButton({
       onClick={onClick}
       disabled={disabled}
       className={cn(
-        "flex cursor-pointer items-center justify-center border border-wv-danger-border bg-wv-button font-medium text-wv-error-text",
+        "flex cursor-pointer items-center justify-center border font-medium whitespace-nowrap",
+        solid
+          ? "!border-wv-error bg-wv-error text-wv-on-accent"
+          : "!border-wv-danger-border bg-wv-button text-wv-error-text",
         size === "compact" ? "h-8 px-3 text-[12.5px]" : "h-[34px] text-[13px]",
         disabled
           ? "cursor-default opacity-50"
-          : "hover:border-wv-danger-border-hover hover:bg-wv-danger-bg-hover",
+          : solid
+            ? "hover:!border-wv-error-text hover:bg-wv-error-text"
+            : "hover:!border-wv-danger-border-hover hover:bg-wv-danger-bg-hover",
         className,
       )}
     >
@@ -185,12 +193,14 @@ export function CheckBox({
   checked,
   onChange,
   label,
+  disabled = false,
   className,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   /** Accessible name; the box itself carries no visible text. */
   label: string;
+  disabled?: boolean;
   className?: string;
 }) {
   return (
@@ -199,11 +209,14 @@ export function CheckBox({
       role="checkbox"
       aria-checked={checked}
       aria-label={label}
+      disabled={disabled}
       onClick={(event) => {
         event.stopPropagation();
-        onChange(!checked);
+        if (!disabled) {
+          onChange(!checked);
+        }
       }}
-      className={cn("flex cursor-pointer items-center", className)}
+      className={cn("flex items-center", disabled ? "cursor-default opacity-40" : "cursor-pointer", className)}
     >
       <span
         aria-hidden="true"

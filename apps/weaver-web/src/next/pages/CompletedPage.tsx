@@ -2,16 +2,16 @@ import { useCallback, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
-  ACCEPT_HISTORY_DELETE_MUTATION,
   REDOWNLOAD_JOB_MUTATION,
   RERUN_POST_PROCESSING_MUTATION,
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
 import { formatJobReleaseName, normalizeGraphqlTimestamp } from "@/lib/job-types";
 import { saveBlobAsDownload } from "@/lib/download";
+import { cn } from "@/lib/utils";
 import { statusToken } from "@/lib/status-tokens";
 import { EmptyState, MetricCell, MetricStrip, SectionHeader, Square } from "../components/chrome";
-import { BulkBar, BulkButton } from "../components/BulkBar";
+import { BulkBar, BulkButton, BulkCluster } from "../components/BulkBar";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { Pagination } from "../components/Pagination";
 import { CheckBox, SecondaryButton, TextField } from "../components/controls";
@@ -42,6 +42,8 @@ import {
   toggleFacet,
 } from "../data/categories";
 import { useNextData } from "../data/next-data";
+import { describeDeleteProgress } from "../data/history-deletes";
+import { useHistoryDeletes } from "../data/use-history-deletes";
 
 /**
  * Completed — the archive of finished work.
@@ -177,6 +179,7 @@ export function CompletedPage() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const midnight = useStartOfToday();
 
   const sortOption = SORT_OPTIONS.find((option) => option.value === sort)!;
@@ -220,14 +223,12 @@ export function CompletedPage() {
 
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
-  const [, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
 
   const page = data?.historyPage;
-  const rows = useMemo(() => page?.items ?? [], [page?.items]);
+  const pageRows = useMemo(() => page?.items ?? [], [page?.items]);
   const counts = page?.counts ?? { all: 0, success: 0, failure: 0 };
   const totalCount = page?.totalCount ?? 0;
   const pageCount = Math.max(1, Math.ceil(totalCount / pageSize));
-  const days = useMemo(() => groupByDay(rows), [rows]);
 
   // A filter that shrinks the set can leave the page index past the end.
   const clampedPage = Math.min(pageIndex, pageCount - 1);
@@ -239,6 +240,20 @@ export function CompletedPage() {
     void reexecute({ requestPolicy: "network-only" });
     void reexecuteSample({ requestPolicy: "network-only" });
   }, [reexecute, reexecuteSample]);
+
+  // Deletes run as background operations: rows handed to one stay on the page,
+  // locked, until the last operation drains and the page is fetched again.
+  const deletes = useHistoryDeletes({ rows: pageRows, onDrained: refresh });
+  const rows = deletes.rows;
+  const lockedIds = useMemo(
+    () => new Set(rows.filter((row) => row.deleteOperation?.locked).map((row) => row.id)),
+    [rows],
+  );
+  if ([...picked].some((id) => lockedIds.has(id))) {
+    setPicked(new Set([...picked].filter((id) => !lockedIds.has(id))));
+  }
+
+  const days = useMemo(() => groupByDay(rows), [rows]);
 
   const reset = (change: () => void) => {
     change();
@@ -282,8 +297,10 @@ export function CompletedPage() {
     0,
   );
 
-  const pickedOnPage = rows.filter((row) => picked.has(row.id));
-  const allPicked = rows.length > 0 && pickedOnPage.length === rows.length;
+  // A row already being deleted cannot be picked, so select-all passes over it.
+  const selectable = rows.filter((row) => !lockedIds.has(row.id));
+  const pickedOnPage = selectable.filter((row) => picked.has(row.id));
+  const allPicked = selectable.length > 0 && pickedOnPage.length === selectable.length;
 
   const togglePicked = (id: number) => {
     setPicked((current) => {
@@ -301,7 +318,7 @@ export function CompletedPage() {
   const toggleAll = () => {
     setPicked((current) => {
       const next = new Set(current);
-      for (const row of rows) {
+      for (const row of selectable) {
         if (allPicked) {
           next.delete(row.id);
         } else {
@@ -330,22 +347,52 @@ export function CompletedPage() {
     refresh();
   };
 
-  const deletePicked = async () => {
+  const deletePicked = async (deleteFiles: boolean) => {
     const ids = [...picked];
-    setBusy(true);
-    const result = await acceptHistoryDelete({
-      input: { mode: "IDS", ids, deleteFiles: false },
-    });
-    setBusy(false);
+    setDeleteError(null);
+    const error = await deletes.accept(ids, deleteFiles);
+    if (error !== null) {
+      setDeleteError(error);
+      return;
+    }
     setConfirmDelete(false);
-    setPicked(new Set());
-    setReport(
-      result.error
-        ? result.error.message
-        : `Removing ${formatCount(ids.length)} ${ids.length === 1 ? "entry" : "entries"} from history`,
-    );
-    refresh();
+    setReport(null);
+    setPicked((current) => new Set([...current].filter((id) => !ids.includes(id))));
   };
+
+  const actionsBusy = busy || deletes.accepting;
+
+  // One set of actions, shown in the tab row where it fits and in its own bar where it does not.
+  const bulkActions = (
+    <>
+      <BulkButton
+        disabled={actionsBusy}
+        onClick={() => {
+          void runOnPicked("Re-queued", (id) => redownloadJob({ id }));
+        }}
+      >
+        Re-download
+      </BulkButton>
+      <BulkButton
+        disabled={actionsBusy}
+        onClick={() => {
+          void runOnPicked("Re-ran scripts for", (id) => rerunPostProcessing({ jobId: id }));
+        }}
+      >
+        Re-run scripts
+      </BulkButton>
+      <BulkButton
+        tone="danger"
+        disabled={actionsBusy}
+        onClick={() => {
+          setDeleteError(null);
+          setConfirmDelete(true);
+        }}
+      >
+        Delete
+      </BulkButton>
+    </>
+  );
 
   const exportList = () => {
     const header = [
@@ -458,6 +505,13 @@ export function CompletedPage() {
             ]}
             active={tab}
             onSelect={(next) => reset(() => setTab(next))}
+            center={
+              picked.size === 0 ? undefined : (
+                <BulkCluster count={picked.size} onClear={() => setPicked(new Set())}>
+                  {bulkActions}
+                </BulkCluster>
+              )
+            }
             right={
               <div className="relative">
                 <button
@@ -496,27 +550,14 @@ export function CompletedPage() {
             }
           />
 
+          {/* From xl the actions sit in the tab row instead; below it there is no room. */}
           {picked.size === 0 ? null : (
-            <BulkBar count={picked.size} onClear={() => setPicked(new Set())}>
-              <BulkButton
-                disabled={busy}
-                onClick={() => {
-                  void runOnPicked("Re-queued", (id) => redownloadJob({ id }));
-                }}
-              >
-                Re-download
-              </BulkButton>
-              <BulkButton
-                disabled={busy}
-                onClick={() => {
-                  void runOnPicked("Re-ran scripts for", (id) => rerunPostProcessing({ jobId: id }));
-                }}
-              >
-                Re-run scripts
-              </BulkButton>
-              <BulkButton tone="danger" disabled={busy} onClick={() => setConfirmDelete(true)}>
-                Delete from history
-              </BulkButton>
+            <BulkBar
+              count={picked.size}
+              onClear={() => setPicked(new Set())}
+              className="xl:hidden"
+            >
+              {bulkActions}
             </BulkBar>
           )}
 
@@ -555,7 +596,9 @@ export function CompletedPage() {
         />
       }
       statusNote={
-        report
+        deletes.active
+          ? describeDeleteProgress(deletes.progress)
+          : report
           ?? `${formatCount(totalCount)} of ${formatCount(counts.all)} entries match · history is kept until an entry is deleted`
       }
       statusRight={
@@ -589,6 +632,7 @@ export function CompletedPage() {
                 const token = statusToken(row.status);
                 const failed = token === "failed";
                 const removing = row.deleteOperation !== null;
+                const locked = lockedIds.has(row.id);
                 const finished = millis(row.completedAt);
                 const elapsed = elapsedMs(row);
                 return (
@@ -602,11 +646,15 @@ export function CompletedPage() {
                         ? `${formatJobReleaseName(row)}\n${row.error}`
                         : formatJobReleaseName(row)
                     }
-                    className="border-b border-wv-hairline px-4 sm:px-[22px] py-[11px]"
+                    className={cn(
+                      "border-b border-wv-hairline px-4 sm:px-[22px] py-[11px]",
+                      locked && "opacity-60",
+                    )}
                   >
                     <CheckBox
                       label={`Select ${formatJobReleaseName(row)}`}
                       checked={picked.has(row.id)}
+                      disabled={locked}
                       onChange={() => togglePicked(row.id)}
                     />
                     <div className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">
@@ -618,7 +666,7 @@ export function CompletedPage() {
                       />
                       <span className="truncate text-[12.5px] text-wv-secondary">
                         {removing
-                          ? "Removing"
+                          ? "Deleting"
                           : token === "completed"
                             ? "Complete"
                             : failed
@@ -650,12 +698,22 @@ export function CompletedPage() {
 
       <ConfirmDialog
         open={confirmDelete}
-        title="Delete from history"
+        title="Delete"
         note={`${picked.size} selected`}
-        busy={busy}
-        confirmLabel="Delete from history"
-        body="The entries leave history and their files stay on disk. Anything still being removed finishes in the background."
-        onConfirm={() => void deletePicked()}
+        busy={actionsBusy}
+        body={
+          <>
+            Delete history only removes the entries and leaves their files on disk. Delete with
+            files removes the downloaded files too. Both run in the background; the entries stay
+            here, locked, until they are gone.
+            {deleteError === null ? null : (
+              <span className="mt-3 block text-wv-error-text">{deleteError}</span>
+            )}
+          </>
+        }
+        alternative={{ label: "Delete history only", onConfirm: () => void deletePicked(false) }}
+        confirmLabel="Delete with files"
+        onConfirm={() => void deletePicked(true)}
         onDismiss={() => setConfirmDelete(false)}
       />
     </NextShell>

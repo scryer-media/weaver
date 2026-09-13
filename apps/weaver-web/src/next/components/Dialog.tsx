@@ -75,7 +75,7 @@ export function Dialog({
         </header>
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{children}</div>
         {footer === undefined ? null : (
-          <div className="flex flex-none items-center justify-end gap-[10px] border-t border-wv-line-strong px-4 sm:px-6 py-4">
+          <div className="flex flex-none flex-wrap items-center justify-end gap-[10px] border-t border-wv-line-strong px-4 sm:px-6 py-4">
             {footer}
           </div>
         )}

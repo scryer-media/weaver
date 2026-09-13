@@ -12,28 +12,71 @@ export function BulkBar({
   count,
   onClear,
   children,
+  className,
 }: {
   count: number;
   onClear: () => void;
   /** The actions themselves, as `BulkButton`s. */
   children: ReactNode;
+  className?: string;
 }) {
   return (
-    <div className="flex min-h-[42px] flex-none flex-wrap items-center gap-x-[14px] gap-y-1 border-b border-wv-bulk-line bg-wv-bulk px-4 py-1 sm:px-6 sm:py-0">
-      <span className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-accent">
-        {count} selected
-      </span>
+    <div
+      className={cn(
+        "flex min-h-[42px] flex-none flex-wrap items-center gap-x-[14px] gap-y-1 border-b border-wv-bulk-line bg-wv-bulk px-4 py-1 sm:px-6 sm:py-0",
+        className,
+      )}
+    >
+      <SelectedCount count={count} />
       <div className="ml-auto flex items-center gap-2">
         {children}
-        <button
-          type="button"
-          onClick={onClear}
-          className="flex h-[26px] cursor-pointer items-center px-[11px] text-[12.5px] whitespace-nowrap text-wv-muted hover:text-wv-fg"
-        >
-          Clear
-        </button>
+        <ClearButton onClear={onClear} />
       </div>
     </div>
+  );
+}
+
+/**
+ * The same count, actions and Clear as a `BulkBar`, inline: for a bar that
+ * already exists — the tab row — so selecting rows does not push the list down.
+ */
+export function BulkCluster({
+  count,
+  onClear,
+  children,
+}: {
+  count: number;
+  onClear: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="pr-[6px]">
+        <SelectedCount count={count} />
+      </span>
+      {children}
+      <ClearButton onClear={onClear} />
+    </div>
+  );
+}
+
+function SelectedCount({ count }: { count: number }) {
+  return (
+    <span className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-accent">
+      {count} selected
+    </span>
+  );
+}
+
+function ClearButton({ onClear }: { onClear: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClear}
+      className="flex h-[26px] cursor-pointer items-center px-[11px] text-[12.5px] whitespace-nowrap text-wv-muted hover:text-wv-fg"
+    >
+      Clear
+    </button>
   );
 }
 
