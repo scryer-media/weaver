@@ -133,7 +133,10 @@ export default function FontTrial() {
   };
 
   return (
-    <div className="fixed right-3 bottom-[46px] z-30 flex flex-col items-end gap-1">
+    // Centred in the status bar, the one strip of chrome with nothing to click
+    // in its middle: a corner of the content region covers real controls, such
+    // as the inspector's last row of buttons.
+    <div className="fixed bottom-[6px] left-1/2 z-30 flex -translate-x-1/2 flex-col items-center gap-1">
       {open ? (
         <div
           role="group"
@@ -164,7 +167,7 @@ export default function FontTrial() {
         type="button"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
-        className="cursor-pointer border border-wv-control bg-wv-chrome px-2.5 py-1 text-[11px] text-wv-muted shadow-wv-menu hover:text-wv-fg"
+        className="cursor-pointer border border-wv-control bg-wv-chrome px-2.5 py-0.5 text-[11px] text-wv-muted hover:text-wv-fg"
       >
         Font: {active.label}
       </button>
