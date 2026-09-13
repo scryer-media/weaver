@@ -3397,6 +3397,7 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
                 "article not found on source server",
             )),
             attempts: vec![weaver_nntp::client::FetchAttemptTrace {
+                connection_health: None,
                 server_idx: 0,
                 remote_ip: None,
                 elapsed: Duration::from_millis(5),

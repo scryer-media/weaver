@@ -93,7 +93,7 @@ fn concurrent_group_discovery_keeps_the_provider_eligible_for_a_grouped_retry() 
     );
     drop(retry);
     server.join().unwrap();
-    // Real transport failures must still disable an unhealthy provider.
+    // Replaying one socket's outstanding articles is one transport failure.
     for _ in 0..LANES {
         client.record_blocking_attempts(&timeout.attempts);
     }
@@ -104,8 +104,8 @@ fn concurrent_group_discovery_keeps_the_provider_eligible_for_a_grouped_retry() 
             .blocking_lock()
             .server(0)
             .failure_count,
-        LANES as u64
+        1
     );
-    assert!(!client.has_blocking_body_lane_candidate(&[]));
+    assert!(client.has_blocking_body_lane_candidate(&[]));
     crate::server_caps::forget("127.0.0.1", port);
 }

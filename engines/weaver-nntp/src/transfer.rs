@@ -333,6 +333,8 @@ impl ServerTransferRegistry {
 /// Shared transfer state for one durable server.
 pub struct ServerTransferControl {
     id: StableServerId,
+    pub(crate) socket_budget: Arc<crate::socket_budget::SocketBudget>,
+    pub(crate) recovery: Arc<crate::recovery::RecoveryGate>,
     state: Mutex<TransferState>,
     blocking_changed: Condvar,
     capacity_changed: watch::Sender<u64>,
@@ -414,6 +416,8 @@ impl ServerTransferControl {
         let (capacity_changed, _) = watch::channel(1);
         Self {
             id,
+            socket_budget: crate::socket_budget::SocketBudget::new(0),
+            recovery: Arc::default(),
             state: Mutex::new(TransferState {
                 initialized: false,
                 config: ServerTransferConfig::default(),

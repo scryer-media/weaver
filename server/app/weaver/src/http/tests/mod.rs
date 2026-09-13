@@ -1123,6 +1123,8 @@ fn sample_server_health() -> metrics::ServerHealthInfo {
         connections_configured: 80,
         capacity_penalty_until_epoch_ms: 0,
         premature_deaths: 0,
+        sockets: Default::default(),
+        recovery: Default::default(),
     }
 }
 

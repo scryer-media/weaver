@@ -2,6 +2,34 @@
 use crate::route_stream::BlockingSocket;
 use std::io::{self, Read, Write};
 
+pub(super) struct IdleInput<'a> {
+    pub tcp: &'a std::net::TcpStream,
+    pub remaining: usize,
+}
+
+pub(super) unsafe extern "C" fn idle_recv(
+    context: *mut libc::c_void,
+    buffer: *mut u8,
+    length: u32,
+) -> libc::c_int {
+    result(|| {
+        if context.is_null() || buffer.is_null() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // The synchronous caller holds this context and socket until recv
+        // returns and restores s2n's normal fd callback immediately afterward.
+        let input = unsafe { &mut *context.cast::<IdleInput<'_>>() };
+        if input.remaining == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let length = (length as usize).min(input.remaining);
+        let buffer = unsafe { std::slice::from_raw_parts_mut(buffer, length) };
+        let count = input.tcp.read(buffer)?;
+        input.remaining -= count;
+        Ok(count)
+    })
+}
+
 fn result(operation: impl FnOnce() -> io::Result<usize>) -> libc::c_int {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
         .unwrap_or_else(|_| Err(io::Error::other("tunnel I/O panicked")));

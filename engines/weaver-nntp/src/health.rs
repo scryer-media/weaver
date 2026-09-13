@@ -7,6 +7,7 @@
 //! - **CoolingDown** — short-lived quarantine after transport/capacity problems
 //! - **Disabled** — temporarily taken out of rotation (auth failure or too many consecutive errors)
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The current operational state of a server.
@@ -87,7 +88,7 @@ impl Default for HealthConfig {
             degraded_threshold: 5,
             disable_threshold: 10,
             base_backoff: Duration::from_secs(30),
-            max_backoff: Duration::from_hours(1),
+            max_backoff: Duration::from_secs(60),
             auth_disable_duration: Duration::from_mins(5),
             transient_cooldown: Duration::from_secs(10),
             capacity_cooldown: Duration::from_secs(5),
@@ -111,8 +112,12 @@ pub struct ServerHealth {
     pub failure_count: u64,
     /// Current run of consecutive failures (reset on success).
     pub consecutive_failures: u32,
-    /// Number of times this server has been disabled (used for exponential backoff).
+    /// Lifetime disable transitions, independent of the current episode backoff.
     disable_count: u32,
+    recovery_attempts: u32,
+    recovery_pending: bool,
+    recovery_event: Option<(u64, u64)>,
+    pub(crate) recovery: std::sync::Arc<crate::recovery::RecoveryGate>,
     config: HealthConfig,
     /// Exponentially weighted moving average of latency in microseconds.
     latency_ewma_us: f64,
@@ -143,6 +148,10 @@ impl ServerHealth {
             failure_count: 0,
             consecutive_failures: 0,
             disable_count: 0,
+            recovery_attempts: 0,
+            recovery_pending: false,
+            recovery_event: None,
+            recovery: std::sync::Arc::default(),
             config,
             latency_ewma_us: 0.0,
             latency_samples: 0,
@@ -156,6 +165,9 @@ impl ServerHealth {
     /// Record a successful operation — resets consecutive failures and returns to Healthy.
     pub fn record_success(&mut self) {
         self.success_count += 1;
+        if self.recovery_pending {
+            return;
+        }
         self.consecutive_failures = 0;
         self.note_ratio_attempt(false, false);
         // In-flight fetches routinely land right after a failure-ratio trip —
@@ -172,6 +184,7 @@ impl ServerHealth {
             return;
         }
         self.state = ServerState::Healthy;
+        self.recovery_attempts = 0;
     }
 
     /// Record one attempt into the failure-ratio window; returns `true` when
@@ -207,12 +220,7 @@ impl ServerHealth {
         {
             return false;
         }
-        let backoff = self.compute_backoff();
-        self.disable_count += 1;
-        self.state = ServerState::Disabled {
-            until: now + backoff,
-            reason: DisableReason::FailureRatio,
-        };
+        self.quarantine(DisableReason::FailureRatio);
         self.ratio_window_started = None;
         self.ratio_attempts = 0;
         self.ratio_failures = 0;
@@ -238,20 +246,21 @@ impl ServerHealth {
         self.failure_count += 1;
         self.consecutive_failures += 1;
 
-        if matches!(
-            self.state,
-            ServerState::Disabled {
-                reason: DisableReason::AuthFailure,
-                ..
-            }
-        ) {
+        if matches!(self.state, ServerState::Disabled { .. }) {
             return;
         }
 
         if is_auth {
+            let Some(until) = self
+                .recovery
+                .quarantine(self.config.auth_disable_duration, self.recovery_event)
+            else {
+                return;
+            };
             self.disable_count += 1;
+            self.recovery_pending = true;
             self.state = ServerState::Disabled {
-                until: Instant::now() + self.config.auth_disable_duration,
+                until,
                 reason: DisableReason::AuthFailure,
             };
             return;
@@ -262,13 +271,8 @@ impl ServerHealth {
             return;
         }
 
-        if self.consecutive_failures >= self.config.disable_threshold {
-            let backoff = self.compute_backoff();
-            self.disable_count += 1;
-            self.state = ServerState::Disabled {
-                until: Instant::now() + backoff,
-                reason: DisableReason::ConsecutiveFailures,
-            };
+        if self.recovery_pending || self.consecutive_failures >= self.config.disable_threshold {
+            self.quarantine(DisableReason::ConsecutiveFailures);
         } else if self.consecutive_failures >= self.config.degraded_threshold {
             self.state = ServerState::Degraded {
                 consecutive_failures: self.consecutive_failures,
@@ -290,13 +294,7 @@ impl ServerHealth {
     pub fn record_cooldown_gated(&mut self, reason: CooldownReason, allow_ratio_trip: bool) {
         self.failure_count += 1;
 
-        if matches!(
-            self.state,
-            ServerState::Disabled {
-                reason: DisableReason::AuthFailure,
-                ..
-            }
-        ) {
+        if matches!(self.state, ServerState::Disabled { .. }) {
             return;
         }
 
@@ -318,13 +316,10 @@ impl ServerHealth {
             CooldownReason::Transport => {
                 self.consecutive_failures += 1;
 
-                if self.consecutive_failures >= self.config.disable_threshold {
-                    let backoff = self.compute_backoff();
-                    self.disable_count += 1;
-                    self.state = ServerState::Disabled {
-                        until: Instant::now() + backoff,
-                        reason: DisableReason::ConsecutiveFailures,
-                    };
+                if self.recovery_pending
+                    || self.consecutive_failures >= self.config.disable_threshold
+                {
+                    self.quarantine(DisableReason::ConsecutiveFailures);
                     return;
                 }
 
@@ -381,16 +376,12 @@ impl ServerHealth {
     }
 
     /// If the server is disabled and the backoff period has elapsed, transition
-    /// back to Degraded for a probationary period. The consecutive failure count
-    /// is set to one below the disable threshold so that a single additional
-    /// failure immediately re-disables the server (with increased backoff),
-    /// while a success resets the server to Healthy.
+    /// back to Degraded. A separate gate admits one fresh demanded connection;
+    /// cached stragglers cannot decide the recovery outcome.
     pub fn check_reenable(&mut self) {
         match self.state {
             ServerState::Disabled { until, .. } if Instant::now() >= until => {
-                // Re-enter as Degraded just below the disable threshold so one
-                // more failure trips the circuit breaker again immediately.
-                let probe_failures = self.config.disable_threshold.saturating_sub(1);
+                let probe_failures = 0;
                 self.consecutive_failures = probe_failures;
                 self.state = ServerState::Degraded {
                     consecutive_failures: probe_failures,
@@ -459,9 +450,63 @@ impl ServerHealth {
 
     /// Compute the exponential backoff duration capped at `max_backoff`.
     fn compute_backoff(&self) -> Duration {
-        let multiplier = 2u32.saturating_pow(self.disable_count);
+        let multiplier = 2u32.saturating_pow(self.recovery_attempts);
         let backoff = self.config.base_backoff.saturating_mul(multiplier);
         backoff.min(self.config.max_backoff)
+    }
+
+    fn quarantine(&mut self, reason: DisableReason) {
+        let duration = self.compute_backoff();
+        let Some(until) = self.recovery.quarantine(duration, self.recovery_event) else {
+            return;
+        };
+        self.recovery_attempts = self.recovery_attempts.saturating_add(1);
+        self.disable_count = self.disable_count.saturating_add(1);
+        self.recovery_pending = true;
+        self.state = ServerState::Disabled { until, reason };
+    }
+
+    pub(crate) fn record_connection_outcome(
+        &mut self,
+        ticket: &crate::recovery::ConnectionHealth,
+        success: bool,
+        auth: bool,
+        allow_ratio_trip: bool,
+    ) {
+        if !success && !ticket.first_failure() {
+            return;
+        }
+        if !ticket.current() {
+            if success {
+                self.success_count += 1;
+            } else {
+                self.failure_count += 1;
+            }
+            return;
+        }
+        if success {
+            if ticket.complete_recovery() || (self.recovery_pending && !self.recovery.quarantined())
+            {
+                self.recovery_pending = false;
+                self.recovery_attempts = 0;
+                self.state = ServerState::Healthy;
+                self.ratio_window_started = None;
+            }
+            self.record_success();
+        } else {
+            if ticket.probing() {
+                self.recovery_pending = true;
+                self.recovery_attempts = self.recovery_attempts.max(1);
+                // Probe admission is authoritative even if no ranking pass
+                // has refreshed this generation's expired health snapshot.
+                self.state = ServerState::Degraded {
+                    consecutive_failures: 0,
+                };
+            }
+            self.recovery_event = Some(ticket.event_key());
+            self.record_failure_gated(auth, allow_ratio_trip);
+            self.recovery_event = None;
+        }
     }
 }
 
@@ -477,6 +522,49 @@ pub struct HealthTracker {
 }
 
 impl HealthTracker {
+    pub(crate) fn set_recovery_gate(
+        &mut self,
+        idx: usize,
+        gate: Arc<crate::recovery::RecoveryGate>,
+    ) {
+        self.servers[idx].recovery = gate;
+    }
+
+    pub(crate) fn record_connection_outcome(
+        &mut self,
+        server_idx: usize,
+        ticket: &crate::recovery::ConnectionHealth,
+        success: bool,
+        auth: bool,
+    ) {
+        let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
+        self.servers[server_idx].record_connection_outcome(ticket, success, auth, allow_ratio_trip);
+    }
+
+    pub(crate) fn record_connection_cooldown(
+        &mut self,
+        idx: usize,
+        ticket: &crate::recovery::ConnectionHealth,
+        reason: CooldownReason,
+    ) {
+        if !ticket.first_failure() {
+            return;
+        }
+        if !ticket.current() {
+            self.servers[idx].failure_count += 1;
+            return;
+        }
+        if ticket.probing() {
+            self.servers[idx].recovery_pending = true;
+            self.servers[idx].recovery_attempts = self.servers[idx].recovery_attempts.max(1);
+            self.servers[idx].state = ServerState::Degraded {
+                consecutive_failures: 0,
+            };
+        }
+        self.servers[idx].recovery_event = Some(ticket.event_key());
+        self.record_cooldown(idx, reason);
+        self.servers[idx].recovery_event = None;
+    }
     /// Create a tracker for `server_count` servers, all starting Healthy and
     /// all treated as fill servers.
     pub fn new(server_count: usize, config: HealthConfig) -> Self {
@@ -586,6 +674,10 @@ impl HealthTracker {
         &self.servers[server_idx]
     }
 }
+
+#[cfg(test)]
+#[path = "health/recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -954,15 +1046,14 @@ mod tests {
         // Re-enables as Degraded (probationary), not Healthy.
         assert!(matches!(health.state(), ServerState::Degraded { .. }));
         assert!(health.is_available());
-        // consecutive_failures is set to disable_threshold - 1 so one more
-        // failure immediately re-disables.
-        assert_eq!(
-            health.consecutive_failures,
-            test_config().disable_threshold - 1
-        );
+        // A new recovery attempt starts without stale failure debt.
+        assert_eq!(health.consecutive_failures, 0);
 
-        // A success should fully reset to Healthy.
+        // Untagged success (or handshake alone) cannot prove recovery.
         health.record_success();
+        assert!(matches!(health.state(), ServerState::Degraded { .. }));
+        let probe = health.recovery.admit(true).unwrap();
+        health.record_connection_outcome(&probe.0, true, false, false);
         assert_eq!(*health.state(), ServerState::Healthy);
         assert_eq!(health.consecutive_failures, 0);
     }

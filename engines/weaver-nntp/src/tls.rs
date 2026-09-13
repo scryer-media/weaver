@@ -329,6 +329,12 @@ pub(crate) struct RustlsSession {
 }
 
 impl RustlsSession {
+    /// Idle NNTP has no application data. EOF, plaintext, and fatal TLS
+    /// errors all mean the cached transport must not serve another command.
+    pub(crate) fn idle_terminal(&mut self) -> bool {
+        !matches!(self.tls.reader().read(&mut [0; 1]), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+    }
+
     pub(crate) fn new(
         config: Arc<ClientConfig>,
         server_name: ServerName<'static>,
@@ -368,6 +374,69 @@ impl RustlsSession {
 }
 
 impl NntpTransport {
+    /// Inspect only idle transport state: no NNTP commands, waits, or more
+    /// than 64 KiB of ciphertext. Fragmented TLS state stays in the session.
+    pub(crate) fn idle_terminal(&mut self) -> bool {
+        let poll = |stream: &mut (dyn AsyncRead + Unpin)| {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut byte = [0; 1];
+            let mut buf = ReadBuf::new(&mut byte);
+            std::pin::Pin::new(stream)
+                .poll_read(&mut cx, &mut buf)
+                .is_ready()
+        };
+        match self {
+            Self::Plain { inner, .. } => poll(inner),
+            Self::Tls { inner, .. } => {
+                inner.get_mut().0.begin_inspection();
+                let terminal = poll(inner);
+                inner.get_mut().0.end_inspection();
+                terminal
+            }
+            #[cfg(not(windows))]
+            Self::S2nTls { inner, .. } => {
+                inner.get_mut().begin_inspection();
+                let terminal = poll(inner);
+                inner.get_mut().end_inspection();
+                terminal
+            }
+            #[cfg(windows)]
+            Self::S2nTls { inner, .. } => match *inner {},
+            Self::ManualTls { inner, .. } => {
+                let mut input = [0; 4096];
+                let mut plaintext = BytesMut::new();
+                for _ in 0..16 {
+                    if inner.session.idle_terminal() {
+                        return true;
+                    }
+                    match inner.tcp.try_read(&mut input) {
+                        Ok(0) => return true,
+                        Ok(n) => {
+                            if inner
+                                .session
+                                .feed_ciphertext_slice(&input[..n], &mut plaintext, None)
+                                .is_err()
+                                || !plaintext.is_empty()
+                            {
+                                return true;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            return false;
+                        }
+                        Err(_) => return true,
+                    }
+                }
+                inner.session.idle_terminal()
+            }
+        }
+    }
+
     /// Returns `true` if this transport is TLS-encrypted.
     pub fn is_tls(&self) -> bool {
         matches!(

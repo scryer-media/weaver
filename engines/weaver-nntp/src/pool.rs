@@ -81,13 +81,14 @@ pub struct NntpPool {
     stable_ids: Vec<StableServerId>,
     transfer_controls: Vec<Option<Arc<ServerTransferControl>>>,
     semaphores: Vec<Arc<Semaphore>>,
+    socket_budgets: Vec<Arc<crate::socket_budget::SocketBudget>>,
     shutdown: CancellationToken,
     max_idle_age: Duration,
     health: Arc<Mutex<HealthTracker>>,
+    recovery_gates: Vec<Arc<crate::recovery::RecoveryGate>>,
     /// Per-server timestamp of the last failed connection attempt.
     last_connect_failure: Vec<Arc<Mutex<Option<Instant>>>>,
     reconnect_delay: Duration,
-    stale_check_age: Duration,
     /// Priority group for each server (parallel to pools/configs).
     groups: Vec<u32>,
     /// Backfill flag for each server (parallel to pools/configs).
@@ -176,6 +177,8 @@ impl AuthAdmission {
 
 pub struct BlockingConnectionPermit {
     _permit: OwnedSemaphorePermit,
+    pub(crate) socket_slot: crate::socket_budget::SocketSlot,
+    pub(crate) health_lease: Arc<crate::recovery::ConnectionHealthLease>,
 }
 
 #[cfg(test)]
@@ -188,6 +191,14 @@ impl BlockingConnectionPermit {
             _permit: semaphore
                 .try_acquire_owned()
                 .expect("a fresh semaphore always has its one permit"),
+            socket_slot: crate::socket_budget::SocketBudget::new(1)
+                .try_acquire()
+                .unwrap(),
+            health_lease: Arc::new(
+                Arc::new(crate::recovery::RecoveryGate::default())
+                    .admit(true)
+                    .unwrap(),
+            ),
         }
     }
 }
@@ -343,6 +354,7 @@ impl NntpPool {
         let mut blocking_connect_warn_after = Vec::with_capacity(server_count);
         let mut blocking_connect_failures_since_warning = Vec::with_capacity(server_count);
         let mut connect_cursors = Vec::with_capacity(server_count);
+        let mut socket_budgets = Vec::with_capacity(server_count);
 
         // A config where every server is backfill has no fill tier to
         // exhaust; treat it as an all-fill config so downloads can proceed.
@@ -352,6 +364,12 @@ impl NntpPool {
         }
 
         for spc in &config.servers {
+            let budget = spc.transfer_control.as_ref().map_or_else(
+                || crate::socket_budget::SocketBudget::new(spc.max_connections),
+                |control| Arc::clone(&control.socket_budget),
+            );
+            budget.configure(spc.max_connections);
+            socket_budgets.push(budget);
             if let Some(control) = &spc.transfer_control {
                 assert_eq!(
                     spc.stable_id,
@@ -382,11 +400,17 @@ impl NntpPool {
         }
 
         let auth_cooldown = config.health_config.auth_disable_duration;
-        let health = Arc::new(Mutex::new(HealthTracker::new_with_backfill(
-            server_count,
-            config.health_config,
-            backfill.clone(),
-        )));
+        let mut health =
+            HealthTracker::new_with_backfill(server_count, config.health_config, backfill.clone());
+        for (idx, control) in transfer_controls.iter().enumerate() {
+            if let Some(control) = control {
+                health.set_recovery_gate(idx, Arc::clone(&control.recovery));
+            }
+        }
+        let recovery_gates = (0..server_count)
+            .map(|idx| Arc::clone(&health.server(idx).recovery))
+            .collect();
+        let health = Arc::new(Mutex::new(health));
 
         NntpPool {
             pools,
@@ -394,12 +418,13 @@ impl NntpPool {
             stable_ids,
             transfer_controls,
             semaphores,
+            socket_budgets,
             shutdown: CancellationToken::new(),
             max_idle_age: config.max_idle_age,
             health,
+            recovery_gates,
             last_connect_failure,
             reconnect_delay: config.reconnect_delay,
-            stale_check_age: config.stale_check_age,
             groups,
             backfill,
             retention_days,
@@ -488,22 +513,35 @@ impl NntpPool {
         self.acquire_for_group(server, None).await
     }
 
+    async fn acquire_dispatch_permit(&self, idx: usize) -> Result<OwnedSemaphorePermit> {
+        let semaphore = self.semaphores.get(idx).ok_or(NntpError::PoolExhausted)?;
+        loop {
+            let mut changed = self.socket_budgets[idx].subscribe();
+            if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+                return Ok(permit);
+            }
+            self.socket_budgets[idx].recall_idle();
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return Err(NntpError::PoolShutdown),
+                permit = semaphore.clone().acquire_owned() => return permit.map_err(|_| NntpError::PoolShutdown),
+                _ = changed.changed() => {},
+            }
+        }
+    }
+
     pub(crate) async fn acquire_before_deadline(
         &self,
         server: ServerId,
         initial_group: Option<&str>,
+        demanded: bool,
         deadline: &mut tokio::time::Instant,
     ) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
         }
         let idx = server.0;
-        let semaphore = self.semaphores.get(idx).ok_or(NntpError::PoolExhausted)?;
-        let permit = tokio::time::timeout_at(*deadline, semaphore.clone().acquire_owned())
-            .await
-            .map_err(|_| NntpError::AcquireTimeout(0))?
-            .map_err(|_| NntpError::PoolShutdown)?;
-        self.acquire_with_permit_budget(idx, Some(permit), initial_group, Some(deadline))
+        let permit = acquisition_budget(Some(deadline), self.acquire_dispatch_permit(idx)).await?;
+        self.acquire_with_permit_budget(idx, Some(permit), initial_group, Some(deadline), demanded)
             .await
     }
 
@@ -538,12 +576,7 @@ impl NntpPool {
             return Err(NntpError::PoolExhausted);
         }
 
-        // Wait for a permit (limits total connections to this server).
-        let permit = self.semaphores[idx]
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| NntpError::PoolShutdown)?;
+        let permit = self.acquire_dispatch_permit(idx).await?;
 
         self.acquire_with_permit(idx, Some(permit), initial_group)
             .await
@@ -598,7 +631,7 @@ impl NntpPool {
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         initial_group: Option<&str>,
     ) -> Result<PooledConnection> {
-        self.acquire_with_permit_budget(idx, permit, initial_group, None)
+        self.acquire_with_permit_budget(idx, permit, initial_group, None, false)
             .await
     }
 
@@ -608,9 +641,12 @@ impl NntpPool {
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         initial_group: Option<&str>,
         mut deadline: Option<&mut tokio::time::Instant>,
+        demanded: bool,
     ) -> Result<PooledConnection> {
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
+            // Subscribe before inspecting the cache and physical capacity.
+            let mut changed = self.socket_budgets[idx].subscribe();
             if deadline
                 .as_deref()
                 .is_some_and(|deadline| tokio::time::Instant::now() >= *deadline)
@@ -624,27 +660,27 @@ impl NntpPool {
 
             match candidate {
                 Some(mut c) => {
-                    // If the connection is older than stale_check_age, probe it.
-                    if c.last_used().elapsed() > self.stale_check_age {
-                        trace!(server = idx, "pinging stale idle connection");
-                        match acquisition_budget(deadline.as_deref(), c.ping()).await {
-                            Ok(()) => break c,
-                            Err(error @ NntpError::AcquireTimeout(_)) => return Err(error),
-                            Err(e) => {
-                                trace!(server = idx, error = %e, "stale ping failed, dropping that connection");
-                                // Only this socket has proven itself dead. Its
-                                // siblings are pinged on their own way out of
-                                // the idle list if they are stale too, so the
-                                // loop simply takes the next one rather than
-                                // throwing away warm capacity on suspicion.
-                                continue;
-                            }
-                        }
-                    } else {
-                        break c;
+                    if c.idle_terminal() {
+                        trace!(server = idx, "discarding terminal idle transport");
+                        continue;
                     }
+                    break c;
                 }
                 None => {
+                    let slot = match self.socket_budgets[idx].try_acquire() {
+                        Some(slot) => slot,
+                        None => {
+                            self.socket_budgets[idx].recall_idle();
+                            acquisition_budget(deadline.as_deref(), async {
+                                tokio::select! {
+                                    _ = self.shutdown.cancelled() => Err(NntpError::PoolShutdown),
+                                    _ = changed.changed() => Ok(()),
+                                }
+                            })
+                            .await?;
+                            continue;
+                        }
+                    };
                     // No idle connections available — need to create a new one.
                     // If a recent connection attempt failed, wait until the
                     // reconnect delay has passed before trying again. This
@@ -668,6 +704,9 @@ impl NntpPool {
                     }
 
                     debug!(server = idx, "creating new connection");
+                    let health_lease = self.recovery_gates[idx]
+                        .admit(demanded)
+                        .ok_or(NntpError::PoolExhausted)?;
                     let started = tokio::time::Instant::now();
                     let connect = self.connect_server_excluding(idx, &[], initial_group);
                     let connected = if self.configs[idx].proxy.is_some() {
@@ -680,13 +719,39 @@ impl NntpPool {
                         acquisition_budget(deadline.as_deref(), connect).await
                     };
                     match connected {
-                        Ok(c) => {
+                        Ok(mut c) => {
+                            slot.active();
+                            c.socket_slot = Some(slot);
+                            c.health_lease = Some(Arc::new(health_lease));
                             // Clear the failure timestamp on success.
                             let mut last_failure = self.last_connect_failure[idx].lock().await;
                             *last_failure = None;
                             break c;
                         }
                         Err(e) => {
+                            if !matches!(
+                                e,
+                                NntpError::TooManyConnections
+                                    | NntpError::ServerOverLimit { .. }
+                                    | NntpError::PoolExhausted
+                                    | NntpError::PoolShutdown
+                                    | NntpError::AcquireTimeout(_)
+                            ) {
+                                let auth = matches!(
+                                    e,
+                                    NntpError::AuthenticationFailed
+                                        | NntpError::AuthenticationRejected
+                                        | NntpError::AuthenticationRequired
+                                        | NntpError::AccessDenied
+                                );
+                                self.health.lock().await.record_connection_outcome(
+                                    idx,
+                                    &health_lease.0,
+                                    false,
+                                    auth,
+                                );
+                                self.retire_quarantined_idle(idx);
+                            }
                             // Record the failure timestamp.
                             let mut last_failure = self.last_connect_failure[idx].lock().await;
                             *last_failure = Some(Instant::now());
@@ -741,6 +806,13 @@ impl NntpPool {
         }
 
         debug!(server = idx, "creating fresh over-max connection");
+        // An IP replacement is never a transport-recovery probe.
+        let health_lease = self.recovery_gates[idx]
+            .admit(false)
+            .ok_or(NntpError::PoolExhausted)?;
+        let slot = self.socket_budgets[idx]
+            .try_acquire_replacement()
+            .ok_or(NntpError::PoolExhausted)?;
         let started = tokio::time::Instant::now();
         let connect = self.connect_server_excluding(idx, excluded_ips, initial_group);
         let connected = if self.configs[idx].proxy.is_some() {
@@ -753,7 +825,10 @@ impl NntpPool {
             acquisition_budget(deadline.as_deref(), connect).await
         };
         let conn = match connected {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                slot.active();
+                conn.socket_slot = Some(slot);
+                conn.health_lease = Some(Arc::new(health_lease));
                 let mut last_failure = self.last_connect_failure[idx].lock().await;
                 *last_failure = None;
                 conn
@@ -1115,6 +1190,9 @@ impl NntpPool {
     /// from [`OVER_LIMIT_HOLDOFF_INITIAL`] up to [`OVER_LIMIT_HOLDOFF_MAX`].
     pub fn note_provider_over_limit(&self, server: ServerId) {
         let idx = server.0;
+        if let Some(budget) = self.socket_budgets.get(idx) {
+            budget.note_provider_refusal();
+        }
         let Some(deadline_slot) = self.over_limit_until.get(idx) else {
             return;
         };
@@ -1281,6 +1359,14 @@ impl NntpPool {
         &self,
         server: ServerId,
     ) -> Result<BlockingConnectionPermit> {
+        self.try_acquire_blocking_permit_for_work(server, true)
+    }
+
+    pub(crate) fn try_acquire_blocking_permit_for_work(
+        &self,
+        server: ServerId,
+        demanded: bool,
+    ) -> Result<BlockingConnectionPermit> {
         let idx = server.0;
         if idx >= self.semaphores.len() {
             return Err(NntpError::PoolExhausted);
@@ -1289,7 +1375,22 @@ impl NntpPool {
             .clone()
             .try_acquire_owned()
             .map_err(|_| NntpError::PoolExhausted)?;
-        Ok(BlockingConnectionPermit { _permit: permit })
+        let budget = &self.socket_budgets[idx];
+        let health_lease = self.recovery_gates[idx]
+            .admit(demanded)
+            .ok_or(NntpError::PoolExhausted)?;
+        let socket_slot = budget
+            .try_acquire()
+            .or_else(|| {
+                budget.recall_idle();
+                budget.try_acquire()
+            })
+            .ok_or(NntpError::PoolExhausted)?;
+        Ok(BlockingConnectionPermit {
+            _permit: permit,
+            socket_slot,
+            health_lease: Arc::new(health_lease),
+        })
     }
 
     pub(crate) fn with_blocking_connect_admission<T>(
@@ -1345,6 +1446,28 @@ impl NntpPool {
         )
     }
 
+    pub fn socket_budget_snapshot(&self, idx: usize) -> crate::socket_budget::SocketBudgetSnapshot {
+        self.socket_budgets[idx].snapshot()
+    }
+
+    pub fn recovery_snapshot(&self, idx: usize) -> crate::recovery::RecoverySnapshot {
+        self.recovery_gates[idx].snapshot()
+    }
+
+    pub fn requires_recovery(&self, idx: usize) -> bool {
+        self.recovery_gates[idx].quarantined()
+    }
+
+    pub(crate) fn retire_quarantined_idle(&self, idx: usize) {
+        if self.requires_recovery(idx) {
+            for _ in 0..self.socket_budgets[idx].snapshot().physical {
+                if !self.socket_budgets[idx].recall_idle() {
+                    break;
+                }
+            }
+        }
+    }
+
     /// Currently leased connections for the given server.
     pub fn active_connections(&self, idx: usize) -> usize {
         self.max_connections[idx].saturating_sub(self.semaphores[idx].available_permits())
@@ -1364,6 +1487,9 @@ impl NntpPool {
     /// Take a healthy idle connection, evicting stale/poisoned ones.
     fn take_healthy_idle(&self, pool: &mut ServerPool) -> Option<NntpConnection> {
         while let Some(conn) = pool.idle.pop_front() {
+            if !conn.accepts_new_work() {
+                continue;
+            }
             if conn.is_poisoned() {
                 trace!("evicting poisoned idle connection");
                 continue;
@@ -1371,6 +1497,9 @@ impl NntpPool {
             if conn.last_used().elapsed() > self.max_idle_age {
                 trace!("evicting stale idle connection");
                 continue;
+            }
+            if let Some(slot) = &conn.socket_slot {
+                slot.active();
             }
             return Some(conn);
         }
@@ -1440,7 +1569,7 @@ impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let server_idx = self.server_idx;
-            let healthy = conn.is_healthy();
+            let healthy = conn.is_healthy() && conn.accepts_new_work();
             let poisoned = conn.is_poisoned();
             let return_to_pool = self.return_to_pool;
 
@@ -1457,6 +1586,21 @@ impl Drop for PooledConnection {
                 } else if retired {
                     trace!(server = server_idx, "dropped retired-ip connection");
                 } else {
+                    if let Some(slot) = &conn.socket_slot {
+                        let owner = Arc::downgrade(&self.pool);
+                        slot.idle(
+                            crate::socket_budget::SocketPhase::AsyncIdle,
+                            Arc::new(move |id| {
+                                if let Some(owner) = owner.upgrade() {
+                                    // Immediate local close is bounded and acknowledges
+                                    // the recall only when the transport has dropped.
+                                    lock_recovering(&owner).idle.retain(|conn| {
+                                        conn.socket_slot.as_ref().is_none_or(|slot| slot.id() != id)
+                                    });
+                                }
+                            }),
+                        );
+                    }
                     pool.idle.push_back(conn);
                     trace!(server = server_idx, "returned connection to pool");
                 }
@@ -1470,6 +1614,10 @@ impl Drop for PooledConnection {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "pool/recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {

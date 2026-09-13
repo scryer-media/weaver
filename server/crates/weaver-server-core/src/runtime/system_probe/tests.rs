@@ -124,9 +124,21 @@ fn startup_profile_defers_random_read_measurement() {
     assert_eq!(profile.disk.random_read_iops, 0.0);
 }
 
-/// The Windows arms read the machine, not the defaults the other arms fall
-/// back to: real memory figures, and a storage class and filesystem for the
-/// temp directory that the seek-penalty and volume queries actually answered.
+#[test]
+fn storage_seek_penalty_requires_device_evidence() {
+    assert_eq!(
+        storage_class_from_seek_penalty(Some(true)),
+        StorageClass::Hdd
+    );
+    assert_eq!(
+        storage_class_from_seek_penalty(Some(false)),
+        StorageClass::Ssd
+    );
+    assert_eq!(storage_class_from_seek_penalty(None), StorageClass::Unknown);
+}
+
+/// Memory and filesystem queries must answer on the runner. A device may
+/// decline the optional seek-penalty query, so its class can remain Unknown.
 #[cfg(windows)]
 #[test]
 fn windows_probes_read_real_memory_and_disk() {
@@ -140,13 +152,6 @@ fn windows_probes_read_real_memory_and_disk() {
 
     let dir = std::env::temp_dir();
     let (storage_class, filesystem) = windows_disk_info(&dir);
-    assert!(
-        matches!(
-            storage_class,
-            StorageClass::Ssd | StorageClass::Hdd | StorageClass::Network
-        ),
-        "temp dir storage class must be probed, got {storage_class:?}"
-    );
     assert!(
         !matches!(&filesystem, FilesystemType::Unknown(name) if name.is_empty()),
         "temp dir filesystem must be named, got {filesystem:?}"
