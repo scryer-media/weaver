@@ -178,11 +178,23 @@ pub(super) fn source_pressure(source: SourceId, error: EngineError) -> std::io::
 }
 
 pub(super) fn pressure_source(error: &std::io::Error) -> Option<SourceId> {
-    error
-        .get_ref()?
-        .downcast_ref::<SourcePressure>()
-        .filter(|pressure| is_host_pressure(&pressure.1))
-        .map(|pressure| pressure.0)
+    let inner = error.get_ref()?;
+    if let Some(pressure) = inner.downcast_ref::<SourcePressure>() {
+        return is_host_pressure(&pressure.1).then_some(pressure.0);
+    }
+    inner
+        .downcast_ref::<EngineError>()
+        .and_then(error_pressure_source)
+}
+
+/// Native repair wraps source errors after staging or installing output.
+/// The caller must reconcile those installations before acting on the source.
+pub(super) fn error_pressure_source(error: &EngineError) -> Option<SourceId> {
+    match error {
+        EngineError::Io(error) => pressure_source(error),
+        EngineError::RepairInterrupted { cause, .. } => error_pressure_source(cause),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

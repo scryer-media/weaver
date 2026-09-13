@@ -482,7 +482,7 @@ impl Coordinator {
 
     pub(super) fn take_spill(&mut self, job_id: JobId) -> Option<SourceId> {
         let job = self.jobs.get_mut(&job_id)?;
-        if job.ticket.is_some() || job.installing {
+        if job.ticket.is_some() || job.installing || job.completed_repair.is_some() {
             return None;
         }
         job.spill.take()
@@ -1009,7 +1009,7 @@ impl Coordinator {
         }
         let ready = |job: &&JobSlot| {
             job.ticket.is_none()
-                && job.spill.is_none()
+                && (job.spill.is_none() || job.installing)
                 && if job.installing {
                     job.pending.contains_key(&WorkKey::Readback)
                 } else {
@@ -1276,9 +1276,48 @@ impl Coordinator {
             }
             return Some(done.job_id);
         }
+        let pressure = match &done.result {
+            Err(error)
+                if matches!(
+                    done.key,
+                    WorkKey::Source(_) | WorkKey::Donors | WorkKey::Repair(_)
+                ) =>
+            {
+                budget::error_pressure_source(error).or_else(|| match done.key {
+                    WorkKey::Source(source) if budget::is_host_pressure(error) => Some(source),
+                    _ => None,
+                })
+            }
+            Ok(WorkOutput::Repaired(completion)) => completion
+                .result
+                .as_ref()
+                .err()
+                .and_then(budget::error_pressure_source),
+            _ => None,
+        };
+        if let Some(source) = pressure {
+            // Fence dispatch now, but preserve repair reports: installed files
+            // must still pass reconciliation before the completion gate spills.
+            job.spill.get_or_insert(source);
+            let stage = match done.key {
+                WorkKey::Donors => "donor_search",
+                WorkKey::Repair(_) => "repair",
+                _ => "assessment",
+            };
+            tracing::debug!(
+                job_id = done.job_id.0,
+                source = source.0,
+                stage,
+                "PAR3 virtual reader requires disk fallback"
+            );
+        }
         match (done.key, done.result) {
             (WorkKey::Donors, result) => {
-                job.donor_error = result.err();
+                job.donor_error = if pressure.is_some() {
+                    None
+                } else {
+                    result.err()
+                };
             }
             (WorkKey::Readback, result) => {
                 job.completed_readback = Some(result.and_then(|output| match output {
@@ -1303,14 +1342,7 @@ impl Coordinator {
                 job.errors.remove(&source);
             }
             (WorkKey::Source(source), Err(error)) => {
-                if budget::is_host_pressure(&error) {
-                    let refused = match &error {
-                        EngineError::Io(error) => budget::pressure_source(error).unwrap_or(source),
-                        _ => source,
-                    };
-                    job.spill.get_or_insert(refused);
-                    tracing::debug!(job_id = done.job_id.0, source = refused.0, %error,
-                        stage = "assessment", "PAR3 virtual reader requires disk fallback");
+                if pressure.is_some() {
                     job.errors.remove(&source);
                 } else {
                     tracing::warn!(job_id = done.job_id.0, source = source.0, %error, "PAR3 carrier discovery incomplete");
@@ -1341,5 +1373,7 @@ impl Drop for Coordinator {
 
 mod verification;
 
+#[cfg(test)]
+mod pressure_tests;
 #[cfg(test)]
 mod tests;
