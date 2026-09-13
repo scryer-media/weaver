@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router";
 import { BrandLockup } from "@/lib/brand";
+import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { useNextData } from "../data/next-data";
 import { splitSpeed } from "../data/format";
@@ -70,6 +71,7 @@ export function NextShell({
   contentClassName?: string;
   children: ReactNode;
 }) {
+  const t = useTranslate();
   const { version, update, queue, historyCount, connection } = useNextData();
   const [navOpen, setNavOpen] = useState(false);
   const { pathname } = useLocation();
@@ -96,12 +98,12 @@ export function NextShell({
   // different subsets. In the product the list is always whole — otherwise
   // Monitoring is unreachable from Downloads.
   const nav: NavEntry[] = [
-    { to: "/", label: "Downloads", icon: "downloads", count: queue.summary.totalItems, end: false },
-    { to: "/history", label: "Completed", icon: "completed", count: historyCount },
-    { to: "/monitoring", label: "Monitoring", icon: "monitoring" },
-    { to: "/system-info", label: "System info", icon: "systemInfo" },
-    { to: "/logs", label: "Logs", icon: "logs" },
-    { to: "/settings", label: "Settings", icon: "settings" },
+    { to: "/", label: t("next.nav.downloads"), icon: "downloads", count: queue.summary.totalItems, end: false },
+    { to: "/history", label: t("next.nav.completed"), icon: "completed", count: historyCount },
+    { to: "/monitoring", label: t("next.nav.monitoring"), icon: "monitoring" },
+    { to: "/system-info", label: t("next.nav.systemInfo"), icon: "systemInfo" },
+    { to: "/logs", label: t("next.nav.logs"), icon: "logs" },
+    { to: "/settings", label: t("nav.settings"), icon: "settings" },
   ];
 
   // Not a component: the aside and the drawer must render the same blocks, and
@@ -116,7 +118,7 @@ export function NextShell({
             <button
               type="button"
               onClick={onDismiss}
-              aria-label="Close navigation"
+              aria-label={t("next.shell.closeNavigation")}
               className="-mr-[7px] flex size-7 flex-none cursor-pointer items-center justify-center text-[15px] text-wv-muted hover:text-wv-fg"
             >
               <Icon name="close" size={16} />
@@ -190,7 +192,7 @@ export function NextShell({
         <button
           type="button"
           onClick={() => setNavOpen(true)}
-          aria-label="Open navigation"
+          aria-label={t("next.shell.openNavigation")}
           aria-expanded={navOpen}
           className="absolute top-0 left-0 z-20 flex h-14 w-12 cursor-pointer items-center justify-center text-wv-muted hover:text-wv-fg lg:hidden"
         >
@@ -242,9 +244,9 @@ export function NextShell({
             />
             {connection.isDisconnected
               ? connection.isPolling
-                ? "Reconnecting — polling"
-                : "Reconnecting"
-              : "Connected"}
+                ? t("next.shell.reconnectingPolling")
+                : t("next.shell.reconnecting")
+              : t("next.shell.connected")}
           </span>
           {statusNote === undefined ? null : (
             // The note is the first thing to go: on a phone the connection chip
@@ -277,21 +279,24 @@ export function NextShell({
  * act on.
  */
 function UpdateBlock({ version, url }: { version: string; url: string }) {
+  const t = useTranslate();
   return (
     <div className="flex-none border-t border-wv-line-strong px-[10px] py-[10px]">
       <a
         href={url}
         target="_blank"
         rel="noreferrer noopener"
-        aria-label={`Open Weaver v${version} on GitHub in a new tab`}
+        aria-label={t("update.newVersionAria", { version })}
         className="wv-ping flex items-center gap-3 bg-wv-accent px-[12px] py-[11px] text-wv-on-accent hover:bg-wv-accent-hover"
       >
         <Icon name="update" size={22} className="flex-none" />
         <span className="flex min-w-0 flex-col gap-[3px]">
           <span className="text-[13.5px] leading-none font-semibold tracking-[-0.005em]">
-            Update available
+            {t("next.shell.updateAvailable")}
           </span>
-          <span className="truncate font-wv-mono text-[11px] leading-none">v{version} is out</span>
+          <span className="truncate font-wv-mono text-[11px] leading-none">
+            {t("next.shell.updateVersion", { version })}
+          </span>
         </span>
         <Icon name="external" size={15} className="ml-auto flex-none" />
       </a>
@@ -300,15 +305,20 @@ function UpdateBlock({ version, url }: { version: string; url: string }) {
 }
 
 function ThroughputBlock() {
+  const t = useTranslate();
   const { speed, peakSpeed } = useNextData();
   const now = splitSpeed(speed);
   const peak = splitSpeed(peakSpeed);
   return (
-    <RailBlock eyebrow="Throughput">
+    <RailBlock eyebrow={t("next.shell.throughput")}>
       <RailMetric
         value={now.value}
         unit={now.unit}
-        note={peakSpeed > 0 ? `peak ${peak.value} ${peak.unit}` : "no traffic yet"}
+        note={
+          peakSpeed > 0
+            ? t("next.shell.peak", { value: peak.value, unit: peak.unit })
+            : t("next.shell.noTraffic")
+        }
       />
     </RailBlock>
   );

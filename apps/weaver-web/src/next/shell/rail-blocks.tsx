@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { Link, NavLink } from "react-router";
 import { useQuery } from "urql";
 import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { RailBlock, RailMetric } from "./NextShell";
 import { Bar, Square } from "../components/chrome";
@@ -10,6 +11,7 @@ import { UNCATEGORISED, type CategoryEntry } from "../data/categories";
 import { useNextData, type ProviderHealth } from "../data/next-data";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
 import { formatClock, formatLatency, splitUptime } from "../data/format";
+import { countLabel, providerStateLabel } from "../i18n/labels";
 
 /**
  * The rail's reusable bottom blocks.
@@ -29,6 +31,7 @@ export function providerLoadPercent(provider: ProviderHealth): number {
 }
 
 export function ProvidersBlock() {
+  const t = useTranslate();
   const { providers, providersLoaded } = useNextData();
 
   // Server health lists the live pool, and the pool leaves out every server
@@ -44,11 +47,11 @@ export function ProvidersBlock() {
   const configured = healthEmpty ? configuredData?.servers : undefined;
 
   return (
-    <RailBlock eyebrow="Providers" className="gap-3">
+    <RailBlock eyebrow={t("next.rail.providers")} className="gap-3">
       {providers.length === 0 ? (
         <>
           <div className="font-wv-mono text-[11px] text-wv-muted">
-            {configured?.length ? "none enabled" : "none configured"}
+            {configured?.length ? t("next.rail.noneEnabled") : t("next.rail.noneConfigured")}
           </div>
           {configured?.length === 0 ? <AddProviderButton /> : null}
         </>
@@ -62,7 +65,7 @@ export function ProvidersBlock() {
                 <span className="truncate text-wv-tertiary">{provider.host}</span>
                 <span className="flex-none font-wv-mono text-[11px] text-wv-muted">
                   {idle
-                    ? "idle"
+                    ? t("next.rail.idle")
                     : `${provider.connectionsActive} / ${provider.connectionsMax || provider.connectionsConfigured}`}
                 </span>
               </div>
@@ -81,6 +84,7 @@ export function ProvidersBlock() {
  * form itself instead of the list the form sits behind.
  */
 function AddProviderButton() {
+  const t = useTranslate();
   return (
     <Link
       to="/settings/servers?add"
@@ -88,7 +92,7 @@ function AddProviderButton() {
     >
       <span className="flex items-center gap-2">
         <Icon name="add" size={15} className="-ml-[1px] flex-none" />
-        Add provider
+        {t("next.rail.addProvider")}
       </span>
       <Icon name="go" size={16} className="flex-none" />
     </Link>
@@ -110,14 +114,15 @@ export interface AttentionItem {
  * block — rather than from a dedicated alerts API.
  */
 export function useAttentionItems(): AttentionItem[] {
+  const t = useTranslate();
   const { providers, holdoffs, downloadBlock, isPaused } = useNextData();
   const items: AttentionItem[] = [];
 
   for (const holdoff of holdoffs) {
     items.push({
       id: `holdoff:${holdoff.label}`,
-      text: `${holdoff.label} is over its connection limit`,
-      meta: `backing off until ${formatClock(holdoff.untilEpochMs)}`,
+      text: t("next.attention.overLimit", { server: holdoff.label }),
+      meta: t("next.attention.backingOff", { time: formatClock(holdoff.untilEpochMs) }),
       color: WV.warn,
     });
   }
@@ -129,11 +134,11 @@ export function useAttentionItems(): AttentionItem[] {
     const consecutive = provider.consecutiveFailures;
     items.push({
       id: `provider:${provider.host}:${provider.port}`,
-      text:
-        provider.state === "disabled"
-          ? `${provider.host} is disabled`
-          : `${provider.host} is ${provider.state.replace("_", " ")}`,
-      meta: `${consecutive} consecutive ${consecutive === 1 ? "failure" : "failures"} · ${formatLatency(provider.latencyMs)}`,
+      text: t("next.attention.providerState", {
+        host: provider.host,
+        state: providerStateLabel(t, provider.state),
+      }),
+      meta: `${countLabel(t, "next.attention.consecutiveFailures", consecutive)} · ${formatLatency(provider.latencyMs)}`,
       color: provider.state === "disabled" ? WV.error : WV.warn,
     });
   }
@@ -143,13 +148,13 @@ export function useAttentionItems(): AttentionItem[] {
       id: "download-block",
       text:
         downloadBlock.kind === "ISP_CAP"
-          ? "Download cap reached"
+          ? t("next.attention.capReached")
           : downloadBlock.kind === "SERVER_QUOTA"
-            ? "Provider quota reached"
-            : "Downloads are held by a schedule",
+            ? t("next.attention.quotaReached")
+            : t("next.attention.scheduleHold"),
       meta: downloadBlock.windowEndsAtEpochMs
-        ? `resumes ${formatClock(downloadBlock.windowEndsAtEpochMs)}`
-        : "see Settings → Bandwidth",
+        ? t("next.attention.resumes", { time: formatClock(downloadBlock.windowEndsAtEpochMs) })
+        : t("next.attention.seeBandwidth"),
       color: WV.warn,
     });
   }
@@ -158,14 +163,15 @@ export function useAttentionItems(): AttentionItem[] {
 }
 
 export function AttentionBlock() {
+  const t = useTranslate();
   const items = useAttentionItems();
 
   return (
-    <RailBlock eyebrow="Attention" position="middle" className="gap-3">
+    <RailBlock eyebrow={t("next.attention.title")} position="middle" className="gap-3">
       {items.length === 0 ? (
         <div className="flex items-center gap-[9px] text-[12.5px] text-wv-muted">
           <Square color={WV.accent} />
-          <span>Nothing needs attention</span>
+          <span>{t("next.attention.nothing")}</span>
         </div>
       ) : (
         items.map((item) => (
@@ -185,14 +191,15 @@ export function AttentionBlock() {
 }
 
 export function UptimeBlock() {
+  const t = useTranslate();
   const [{ data }] = useQuery<{ systemInfo: { uptimeSeconds: number; version: string } }>({
     query: SYSTEM_INFO_QUERY,
   });
   const uptime = splitUptime(data?.systemInfo?.uptimeSeconds ?? 0);
 
   return (
-    <RailBlock eyebrow="Uptime">
-      <RailMetric value={uptime.value} unit={uptime.unit} note="since the last restart" />
+    <RailBlock eyebrow={t("next.rail.uptime")}>
+      <RailMetric value={uptime.value} unit={uptime.unit} note={t("next.rail.sinceRestart")} />
     </RailBlock>
   );
 }
@@ -242,8 +249,9 @@ export function CategoryListBlock({
   onToggle: (key: string) => void;
   onClear: () => void;
 }) {
+  const t = useTranslate();
   return (
-    <RailBlock eyebrow="Categories" position="middle" className="gap-[9px]">
+    <RailBlock eyebrow={t("categories.title")} position="middle" className="gap-[9px]">
       {items.map((item) => {
         const isActive = item.key === null ? selected.size === 0 : selected.has(item.key);
         // A facet's colour is the rail's business, not the list's: "all" and
@@ -269,7 +277,13 @@ export function CategoryListBlock({
               of eight categories does not grow a column of empty boxes.
             */}
             <Square color={color} hollow={!isActive} />
-            <span className="min-w-0 truncate">{item.label}</span>
+            <span className="min-w-0 truncate">
+              {item.key === null
+                ? t("next.categories.all")
+                : item.key === UNCATEGORISED
+                  ? t("next.categories.uncategorised")
+                  : item.label}
+            </span>
             {item.count === undefined ? null : (
               <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">
                 {item.count}

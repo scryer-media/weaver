@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type Ref } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { Icon, type IconName } from "./icons";
 import { Menu, MenuItem } from "./Menu";
@@ -159,6 +160,7 @@ export function Toggle({
   size?: "form" | "table";
   disabled?: boolean;
 }) {
+  const t = useTranslate();
   const table = size === "table";
   return (
     <div className="flex items-center gap-[11px]">
@@ -170,7 +172,7 @@ export function Toggle({
             checked ? "text-wv-fg" : "text-wv-muted",
           )}
         >
-          {checked ? "On" : "Off"}
+          {checked ? t("next.common.on") : t("next.common.off")}
         </span>
       )}
       <button

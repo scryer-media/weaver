@@ -1,6 +1,7 @@
 import { useQuery } from "urql";
 import { Link } from "react-router";
 import { PROXY_PROFILES_QUERY } from "@/graphql/proxies";
+import { useTranslate } from "@/lib/context/translate-context";
 import {
   appendProxy,
   moveProxy,
@@ -28,6 +29,7 @@ export function RoutingEditor({
   value: RoutingPolicy;
   onChange: (next: RoutingPolicy) => void;
 }) {
+  const t = useTranslate();
   const [{ data, error }] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
     query: PROXY_PROFILES_QUERY,
   });
@@ -38,12 +40,12 @@ export function RoutingEditor({
     <div className="flex w-full flex-col gap-3">
       {error ? (
         <div className="font-wv-mono text-[11.5px] text-wv-error-text">
-          Proxy profiles could not be read. Existing assignments are kept as they are.
+          {t("next.routing.profilesUnreadable")}
         </div>
       ) : null}
 
       {value.proxyIds.length === 0 ? (
-        <div className="font-wv-mono text-[11.5px] text-wv-muted">no proxy routes</div>
+        <div className="font-wv-mono text-[11.5px] text-wv-muted">{t("next.routing.noRoutes")}</div>
       ) : (
         <ol className="flex flex-col">
           {value.proxyIds.map((id, index) => {
@@ -56,17 +58,17 @@ export function RoutingEditor({
                 <Square color={profile?.enabled === false ? WV.inert : WV.accent} />
                 <span className="font-wv-mono text-[11px] text-wv-faint">{index + 1}</span>
                 <span className="min-w-0 flex-1 truncate">
-                  {profile?.name ?? `Proxy #${id}`}
+                  {profile?.name ?? t("next.routing.proxyId", { id })}
                   {profile ? (
                     <span className="ml-2 font-wv-mono text-[11px] text-wv-muted">
                       {proxyLabels[profile.kind]}
-                      {profile.enabled ? "" : " · disabled"}
+                      {profile.enabled ? "" : ` · ${t("next.routing.disabled")}`}
                     </span>
                   ) : null}
                 </span>
                 <SecondaryButton
                   className="h-7 px-2"
-                  title="Move up"
+                  title={t("next.routing.moveUp")}
                   disabled={index === 0}
                   onClick={() => onChange(moveProxy(value, index, -1))}
                 >
@@ -74,7 +76,7 @@ export function RoutingEditor({
                 </SecondaryButton>
                 <SecondaryButton
                   className="h-7 px-2"
-                  title="Move down"
+                  title={t("next.routing.moveDown")}
                   disabled={index === value.proxyIds.length - 1}
                   onClick={() => onChange(moveProxy(value, index, 1))}
                 >
@@ -87,7 +89,7 @@ export function RoutingEditor({
                     onChange({ ...value, proxyIds: value.proxyIds.filter((entry) => entry !== id) })
                   }
                 >
-                  Remove
+                  {t("next.common.remove")}
                 </SecondaryButton>
               </li>
             );
@@ -97,14 +99,17 @@ export function RoutingEditor({
 
       <div className="flex items-center justify-between gap-3">
         <Select
-          label="Add a proxy route"
+          label={t("next.routing.addRoute")}
           value=""
           className="min-w-[240px]"
           options={[
-            { value: "", label: available.length === 0 ? "No proxies available" : "Add a proxy…" },
+            {
+              value: "",
+              label: available.length === 0 ? t("next.routing.noneAvailable") : t("next.routing.addProxy"),
+            },
             ...available.map((profile) => ({
               value: String(profile.id),
-              label: `${profile.name} · ${proxyLabels[profile.kind]}${profile.enabled ? "" : " (disabled)"}`,
+              label: `${profile.name} · ${proxyLabels[profile.kind]}${profile.enabled ? "" : ` (${t("next.routing.disabled")})`}`,
             })),
           ]}
           onChange={(next) => {
@@ -117,23 +122,23 @@ export function RoutingEditor({
           to="/settings/proxies"
           className="font-wv-mono text-[11.5px] text-wv-accent hover:underline"
         >
-          Manage proxies
+          {t("next.routing.manage")}
         </Link>
       </div>
 
       <div className="flex items-center justify-between gap-3 border-t border-wv-hairline pt-3">
         <span className="text-[12.5px] text-wv-muted">
-          Final route: {value.allowDirect ? "direct" : "blocked"}
+          {value.allowDirect ? t("next.routing.finalDirect") : t("next.routing.finalBlocked")}
         </span>
         <Toggle
           checked={value.allowDirect}
           onChange={(next) => onChange({ ...value, allowDirect: next })}
-          label="Allow a direct connection as the final fallback"
+          label={t("next.routing.allowDirect")}
         />
       </div>
       {!value.allowDirect && value.proxyIds.length === 0 ? (
         <div className="text-[12px] text-wv-warn">
-          With no proxy and no direct fallback this consumer cannot connect at all.
+          {t("next.routing.cannotConnect")}
         </div>
       ) : null}
     </div>
@@ -142,13 +147,18 @@ export function RoutingEditor({
 
 /** The live outcome of the policy above, for a row or a header. */
 export function RoutingState({ status }: { status?: RoutingStatus }) {
+  const t = useTranslate();
   if (!status) {
     return null;
   }
+  const stateKey = `next.routing.state.${status.state.toLowerCase()}`;
+  const state = t(stateKey);
   return (
     <span className="font-wv-mono text-[11px] text-wv-muted">
-      route {status.state.toLowerCase()}
-      {status.selectedProxyId == null ? "" : ` · proxy #${status.selectedProxyId}`}
+      {state === stateKey ? status.state.toLowerCase() : state}
+      {status.selectedProxyId == null
+        ? ""
+        : ` · ${t("next.routing.proxyId", { id: status.selectedProxyId })}`}
     </span>
   );
 }

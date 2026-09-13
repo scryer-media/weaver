@@ -11,14 +11,9 @@ import { FormRow } from "@/next/components/rows";
 import { PrimaryButton, SecondaryButton, Select, TextField } from "@/next/components/controls";
 import { formatSize } from "@/next/data/format";
 import { WV } from "@/next/data/palette";
+import { countLabel } from "@/next/i18n/labels";
 
 const NO_CATEGORY_VALUE = "__none__";
-
-const PRIORITIES: { value: string; label: string }[] = [
-  { value: "HIGH", label: "High" },
-  { value: "NORMAL", label: "Normal" },
-  { value: "LOW", label: "Low" },
-];
 
 /** Staged, but the duplicate policy turned its submission away; only a forced submit takes it. */
 function isBlocked(entry: UploadNzbEntry): boolean {
@@ -90,8 +85,14 @@ export function AddNzbDialog({
     }
   }, [addFiles, initialFiles, open]);
 
+  const priorities = [
+    { value: "HIGH", label: t("upload.priorityHigh") },
+    { value: "NORMAL", label: t("upload.priorityNormal") },
+    { value: "LOW", label: t("upload.priorityLow") },
+  ];
+
   const categoryOptions = [
-    { value: NO_CATEGORY_VALUE, label: "No category" },
+    { value: NO_CATEGORY_VALUE, label: t("upload.noCategory") },
     ...(upload.categories as { id: number; name: string }[]).map((entry) => ({
       value: entry.name,
       label: entry.name,
@@ -101,17 +102,19 @@ export function AddNzbDialog({
   return (
     <Dialog
       open={open}
-      title="Add NZB"
+      title={t("next.addNzb.title")}
       onDismiss={onClose}
       width={620}
       footer={
         <>
-          <SecondaryButton onClick={onClose}>Cancel</SecondaryButton>
+          <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
           <PrimaryButton
             disabled={upload.readyCount === 0 || upload.staging || upload.fetching}
             onClick={() => void submit()}
           >
-            {upload.readyCount > 1 ? `Add ${upload.readyCount} downloads` : "Add download"}
+            {upload.readyCount > 1
+              ? t("next.addNzb.submitMany", { count: upload.readyCount })
+              : t("next.addNzb.submitOne")}
           </PrimaryButton>
         </>
       }
@@ -149,10 +152,10 @@ export function AddNzbDialog({
               event.target.value = "";
             }}
           />
-          <span className="font-medium text-wv-fg">Drop NZB files here, or click to choose</span>
+          <span className="font-medium text-wv-fg">{t("next.addNzb.dropZone")}</span>
           {upload.entries.length === 0 ? null : (
             <span className="font-wv-mono text-[11px] text-wv-faint">
-              {`${upload.entries.length} selected · ${formatSize(upload.totalBytes)}`}
+              {`${t("bulk.selected", { count: upload.entries.length })} · ${formatSize(upload.totalBytes)}`}
             </span>
           )}
         </button>
@@ -166,7 +169,7 @@ export function AddNzbDialog({
         {upload.entries.length === 0 ? null : (
           <div className="mt-5 flex flex-col">
             <div className="flex h-[30px] flex-none items-center border-y border-wv-hairline bg-wv-section px-4 sm:px-6">
-              <Eyebrow>Files</Eyebrow>
+              <Eyebrow>{t("next.common.files")}</Eyebrow>
             </div>
             {upload.entries.map((entry) => (
               <div
@@ -185,7 +188,7 @@ export function AddNzbDialog({
                   style={{ color: entryTone(entry) }}
                   className="flex-none font-wv-mono text-[10.5px] tracking-[0.1em] uppercase"
                 >
-                  {isBlocked(entry) ? "blocked" : entry.status}
+                  {t(`next.addNzb.status.${isBlocked(entry) ? "blocked" : entry.status}`)}
                 </span>
                 <span className="w-[72px] flex-none text-right font-wv-mono text-[11.5px] text-wv-muted">
                   {formatSize(entry.file.size)}
@@ -196,7 +199,7 @@ export function AddNzbDialog({
                   aria-label={t("upload.removeFile")}
                   className="flex-none text-[12px] text-wv-error-text hover:text-wv-error"
                 >
-                  Remove
+                  {t("next.common.remove")}
                 </button>
               </div>
             ))}
@@ -204,29 +207,29 @@ export function AddNzbDialog({
         )}
 
         <div className="mt-2 flex flex-col">
-          <FormRow label="Category">
+          <FormRow label={t("table.category")}>
             <Select
-              label="Category"
+              label={t("table.category")}
               value={upload.category}
               options={categoryOptions}
               onChange={upload.setCategory}
             />
           </FormRow>
-          <FormRow label="Priority">
+          <FormRow label={t("table.priority")}>
             <Select
-              label="Priority"
+              label={t("table.priority")}
               value={upload.priority}
-              options={PRIORITIES}
+              options={priorities}
               onChange={upload.setPriority}
             />
           </FormRow>
-          <FormRow label="Password">
+          <FormRow label={t("servers.password")}>
             <TextField
-              label="Password"
+              label={t("servers.password")}
               type="password"
               value={upload.password}
               onChange={upload.setPassword}
-              placeholder="optional"
+              placeholder={t("next.common.optional")}
               className="w-[268px] max-w-full"
             />
           </FormRow>
@@ -234,16 +237,14 @@ export function AddNzbDialog({
       </div>
       <ConfirmDialog
         open={confirmForce}
-        title="Add duplicates anyway?"
-        note={`${blocked.length} blocked`}
+        title={t("next.addNzb.forceTitle")}
+        note={t("next.addNzb.forceNote", { count: blocked.length })}
         destructive={false}
         busy={upload.fetching}
         body={
           <>
             <span className="block">
-              {blocked.length === 1
-                ? "This NZB was turned away by the duplicate policy:"
-                : `These ${blocked.length} NZBs were turned away by the duplicate policy:`}
+              {countLabel(t, "next.addNzb.forceBody", blocked.length)}
             </span>
             <span className="mt-3 flex flex-col gap-1 font-wv-mono text-[11.5px] text-wv-fg">
               {blocked.slice(0, 6).map((entry) => (
@@ -252,14 +253,14 @@ export function AddNzbDialog({
                 </span>
               ))}
               {blocked.length > 6 ? (
-                <span className="text-wv-muted">{`and ${blocked.length - 6} more`}</span>
+                <span className="text-wv-muted">{t("next.addNzb.andMore", { count: blocked.length - 6 })}</span>
               ) : null}
             </span>
             <span className="mt-3 block">{t("upload.forceDesc")}</span>
           </>
         }
-        confirmLabel={blocked.length === 1 ? "Add anyway" : `Add ${blocked.length} anyway`}
-        dismissLabel={blocked.length === 1 ? "Leave it out" : "Leave them out"}
+        confirmLabel={countLabel(t, "next.addNzb.forceConfirm", blocked.length)}
+        dismissLabel={countLabel(t, "next.addNzb.forceDismiss", blocked.length)}
         onConfirm={() => {
           const ids = blocked.map((entry) => entry.localId);
           setConfirmForce(false);

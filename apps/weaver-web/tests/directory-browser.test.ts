@@ -6,6 +6,10 @@ import {
   parentPath,
   pathCrumbs,
 } from "../src/next/data/directory-browser.ts";
+import { interpolate } from "../src/lib/i18n/types.ts";
+import { nextEn } from "../src/next/i18n/en.ts";
+
+const t = (key: string, values?: Record<string, string | number>) => interpolate(nextEn[key] ?? key, values);
 
 test("crumbs walk a POSIX path from the root", () => {
   assert.deepEqual(pathCrumbs("/media/library/shows/"), [
@@ -63,7 +67,7 @@ test("filtering matches names without regard to case", () => {
 });
 
 test("the count says how much a filter hides", () => {
-  assert.equal(describeEntryCount(1204, 1204), "1,204 folders");
-  assert.equal(describeEntryCount(12, 1204), "12 of 1,204 folders");
-  assert.equal(describeEntryCount(1, 1), "1 folder");
+  assert.equal(describeEntryCount(t, 1204, 1204), "1,204 folders");
+  assert.equal(describeEntryCount(t, 12, 1204), "12 of 1,204 folders");
+  assert.equal(describeEntryCount(t, 1, 1), "1 folder");
 });

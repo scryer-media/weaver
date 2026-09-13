@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextZh } from "@/next/i18n/zh";
 
 const zh: LocaleDictionary = {
   // Brand
@@ -637,6 +638,7 @@ const zh: LocaleDictionary = {
   "systemInfo.diagnosticsHint": "收集大约需要 15 秒：指标会间隔十秒采样两次。密码、API 密钥等机密信息会被移除。",
   "systemInfo.diagnosticsFailed": "无法创建诊断包。",
   ...duplicateLocaleEntries.zho,
+  ...nextZh,
 };
 
 export default zh;

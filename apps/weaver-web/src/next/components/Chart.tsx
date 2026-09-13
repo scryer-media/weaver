@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { SectionHeader, Square, useSettledFlag } from "./chrome";
 
@@ -73,6 +74,7 @@ export function Chart({
   /** The history is still on its way: the plot holds the loading mark, not a flat line. */
   loading?: boolean;
 }) {
+  const t = useTranslate();
   const max = series.reduce(
     (highest, entry) => entry.values.reduce((inner, value) => (value > inner ? value : inner), highest),
     0,
@@ -104,7 +106,7 @@ export function Chart({
               {loading ? (
                 <div role="status" className="absolute inset-0 flex items-center justify-center">
                   {showLoader ? <LoadingMark className="h-8" /> : null}
-                  <span className="sr-only">Loading {title.toLowerCase()}</span>
+                  <span className="sr-only">{t("next.chart.loading", { title })}</span>
                 </div>
               ) : null}
               {series.map((entry) => {

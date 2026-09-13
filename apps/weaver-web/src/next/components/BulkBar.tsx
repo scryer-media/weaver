@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { Icon, type IconName } from "./icons";
 import { Menu, MenuItem } from "./Menu";
@@ -63,21 +64,23 @@ export function BulkCluster({
 }
 
 function SelectedCount({ count }: { count: number }) {
+  const t = useTranslate();
   return (
     <span className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-accent">
-      {count} selected
+      {t("bulk.selected", { count })}
     </span>
   );
 }
 
 function ClearButton({ onClear }: { onClear: () => void }) {
+  const t = useTranslate();
   return (
     <button
       type="button"
       onClick={onClear}
       className="flex h-[26px] cursor-pointer items-center px-[11px] text-[12.5px] whitespace-nowrap text-wv-muted hover:text-wv-fg"
     >
-      Clear
+      {t("next.common.clear")}
     </button>
   );
 }

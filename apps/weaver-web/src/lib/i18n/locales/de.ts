@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextDe } from "@/next/i18n/de";
 
 const de: LocaleDictionary = {
   // Brand
@@ -638,6 +639,7 @@ const de: LocaleDictionary = {
   "systemInfo.diagnosticsHint": "Die Erfassung dauert etwa 15 Sekunden: Metriken werden zweimal im Abstand von zehn Sekunden erfasst. Passwörter, API-Schlüssel und andere Geheimnisse werden entfernt.",
   "systemInfo.diagnosticsFailed": "Das Diagnosepaket konnte nicht erstellt werden.",
   ...duplicateLocaleEntries.deu,
+  ...nextDe,
 };
 
 export default de;

@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextEn } from "@/next/i18n/en";
 
 const en: LocaleDictionary = {
   "settings.proxies": "Proxies",
@@ -785,6 +786,7 @@ const en: LocaleDictionary = {
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "Higher scores win within the same duplicate key; ties keep the existing candidate.",
   ...duplicateLocaleEntries.eng,
+  ...nextEn,
 };
 
 export default en;

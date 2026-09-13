@@ -40,6 +40,7 @@ import {
   useStatusLabel,
   type DownloadGroup,
 } from "../data/status";
+import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
 import { CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
@@ -50,19 +51,17 @@ import { SpeedLimitControl } from "./downloads/SpeedLimitControl";
 type TabId = "all" | "active" | "queued" | "paused";
 type SortId = "priority" | "name" | "size" | "progress" | "eta";
 
+/** Each sort and the key of its label. */
 const SORT_OPTIONS: { value: SortId; label: string }[] = [
-  { value: "priority", label: "Priority" },
-  { value: "name", label: "Name" },
-  { value: "size", label: "Size" },
-  { value: "progress", label: "Progress" },
-  { value: "eta", label: "Time left" },
+  { value: "priority", label: "table.priority" },
+  { value: "name", label: "table.name" },
+  { value: "size", label: "table.size" },
+  { value: "progress", label: "table.progress" },
+  { value: "eta", label: "next.common.timeLeft" },
 ];
 
-const PRIORITY_OPTIONS = [
-  { value: "HIGH", label: "High" },
-  { value: "NORMAL", label: "Normal" },
-  { value: "LOW", label: "Low" },
-] as const;
+/** The bulk edits a report names, each with its `.one`/`.other` and `Partial` keys. */
+type BulkReport = "paused" | "resumed" | "priority" | "category" | "cancelled";
 
 /** The statuses a global pause or a download block holds back. */
 const HELD_BACK_STATUSES = new Set(["DOWNLOADING", "QUEUED", "PROPAGATING"]);
@@ -248,8 +247,13 @@ export function DownloadsPage() {
    * One aliased mutation for the whole selection, so a hundred ticked rows are
    * one request; each alias answers for its own id.
    */
+  const bulkReport = (kind: BulkReport, total: number, refused: number) =>
+    refused === 0
+      ? countLabel(t, `next.downloads.bulk.${kind}`, total)
+      : t(`next.downloads.bulk.${kind}Partial`, { done: total - refused, total, refused });
+
   const runOnPicked = async (
-    label: string,
+    kind: BulkReport,
     definition: Omit<Parameters<typeof executeAliasedIdMutation>[0], "client" | "ids">,
   ) => {
     const ids = [...picked];
@@ -257,27 +261,23 @@ export function DownloadsPage() {
     const result = await executeAliasedIdMutation<boolean>({ client, ids, ...definition });
     setBulkBusy(false);
     if (result.error) {
-      setReport(`${label} failed — ${result.error.message}`);
+      setReport(t("next.downloads.bulk.failed", { message: result.error.message }));
       return;
     }
     const refused = ids.filter((_id, index) => result.data?.[`${definition.aliasPrefix}${index}`] !== true);
     setPicked(new Set());
-    setReport(
-      refused.length === 0
-        ? `${label} ${ids.length} ${ids.length === 1 ? "download" : "downloads"}`
-        : `${label} ${ids.length - refused.length} of ${ids.length} — ${refused.length} refused`,
-    );
+    setReport(bulkReport(kind, ids.length, refused.length));
     queue.refresh();
   };
 
   const pausePicked = () =>
-    runOnPicked("Paused", { operationName: "PauseSelectedJobs", aliasPrefix: "pauseJob", fieldName: "pauseJob" });
+    runOnPicked("paused", { operationName: "PauseSelectedJobs", aliasPrefix: "pauseJob", fieldName: "pauseJob" });
 
   const resumePicked = () =>
-    runOnPicked("Resumed", { operationName: "ResumeSelectedJobs", aliasPrefix: "resumeJob", fieldName: "resumeJob" });
+    runOnPicked("resumed", { operationName: "ResumeSelectedJobs", aliasPrefix: "resumeJob", fieldName: "resumeJob" });
 
-  const editPicked = (label: string, category: string | null, priority: string | null) =>
-    runOnPicked(label, {
+  const editPicked = (kind: BulkReport, category: string | null, priority: string | null) =>
+    runOnPicked(kind, {
       operationName: "UpdateSelectedJobs",
       aliasPrefix: "updateJob",
       fieldName: "updateJobs",
@@ -311,16 +311,18 @@ export function DownloadsPage() {
     setBulkBusy(false);
     setConfirmCancel(false);
     setPicked(new Set());
-    setReport(
-      failed.length === 0
-        ? `Cancelled ${ids.length} ${ids.length === 1 ? "download" : "downloads"}`
-        : `Cancelled ${cancelled.length} of ${ids.length} — ${failed.length} refused`,
-    );
+    setReport(bulkReport("cancelled", ids.length, failed.length));
     queue.refresh();
   };
 
+  const priorityOptions = [
+    { value: "HIGH", label: t("upload.priorityHigh") },
+    { value: "NORMAL", label: t("upload.priorityNormal") },
+    { value: "LOW", label: t("upload.priorityLow") },
+  ];
+
   const categoryOptions = [
-    { value: "", label: "Uncategorised" },
+    { value: "", label: t("next.categories.uncategorised") },
     ...configured.map((category) => ({ value: category.name, label: category.name })),
   ];
 
@@ -328,31 +330,31 @@ export function DownloadsPage() {
   const bulkActions = (
     <>
       <BulkButton icon="pause" disabled={bulkBusy} onClick={() => void pausePicked()}>
-        Pause
+        {t("action.pause")}
       </BulkButton>
       <BulkButton icon="resume" disabled={bulkBusy} onClick={() => void resumePicked()}>
-        Resume
+        {t("action.resume")}
       </BulkButton>
       <BulkMenu
         icon="priority"
-        label="Set priority"
+        label={t("next.downloads.setPriority")}
         disabled={bulkBusy}
-        options={PRIORITY_OPTIONS}
-        onSelect={(value) => void editPicked("Set priority on", null, value)}
+        options={priorityOptions}
+        onSelect={(value) => void editPicked("priority", null, value)}
       >
-        Priority
+        {t("table.priority")}
       </BulkMenu>
       <BulkMenu
         icon="categories"
-        label="Set category"
+        label={t("next.downloads.setCategory")}
         disabled={bulkBusy}
         options={categoryOptions}
-        onSelect={(value) => void editPicked("Set category on", value, null)}
+        onSelect={(value) => void editPicked("category", value, null)}
       >
-        Category
+        {t("table.category")}
       </BulkMenu>
       <BulkButton icon="cancelDownload" tone="danger" disabled={bulkBusy} onClick={() => setConfirmCancel(true)}>
-        Cancel
+        {t("action.cancel")}
       </BulkButton>
     </>
   );
@@ -389,24 +391,24 @@ export function DownloadsPage() {
   /** What stands in for time left: a hold, or an estimate; null when there is neither. */
   const waitValue = useCallback(
     (job: JobData): string | null => {
-      if (statusToken(job.status) === "paused") return "paused";
+      if (statusToken(job.status) === "paused") return t("next.downloads.waitPaused");
       if (HELD_BACK_STATUSES.has(job.status)) {
         if (blocked) return blockEta;
-        if (isPaused) return "paused";
+        if (isPaused) return t("next.downloads.waitPaused");
       }
       return etaById.get(job.id) ?? null;
     },
-    [blockEta, blocked, etaById, isPaused],
+    [blockEta, blocked, etaById, isPaused, t],
   );
 
   return (
     <NextShell
-      title="Downloads"
+      title={t("next.nav.downloads")}
       controls={
         <>
           <TextField
-            label="Search downloads"
-            placeholder="Search downloads"
+            label={t("next.downloads.search")}
+            placeholder={t("next.downloads.search")}
             mono={false}
             value={query}
             onChange={setQuery}
@@ -418,10 +420,10 @@ export function DownloadsPage() {
               void (isPaused ? resumeAll({}) : pauseAll({}));
             }}
           >
-            {isPaused ? "Resume all" : "Pause all"}
+            {isPaused ? t("next.downloads.resumeAll") : t("next.downloads.pauseAll")}
           </SecondaryButton>
           <SpeedLimitControl />
-          <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>Add NZB</PrimaryButton>
+          <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>
         </>
       }
       railMiddle={
@@ -437,7 +439,7 @@ export function DownloadsPage() {
         <>
           <div className="flex flex-none border-b border-wv-hairline bg-wv-app">
             <MetricCell
-              eyebrow="Complete in"
+              eyebrow={t("next.downloads.completeIn")}
               value={
                 remainingBytes > 0
                   ? formatEtaFromRemainingBytes(remainingBytes, etaSpeed)
@@ -445,10 +447,10 @@ export function DownloadsPage() {
               }
               note={
                 remainingBytes > 0
-                  ? `${formatSize(remainingBytes)} left to fetch`
+                  ? t("next.downloads.leftToFetch", { size: formatSize(remainingBytes) })
                   : queue.isLoading
-                    ? "fetching the queue"
-                    : "queue is clear"
+                    ? t("next.downloads.fetchingQueue")
+                    : t("next.downloads.queueClear")
               }
             />
             <StorageMounts
@@ -459,10 +461,10 @@ export function DownloadsPage() {
 
           <Tabs
             tabs={[
-              { id: "all", label: "All", count: tabCounts.all },
-              { id: "active", label: "Active", count: tabCounts.active },
-              { id: "queued", label: "Queued", count: tabCounts.queued },
-              { id: "paused", label: "Paused", count: tabCounts.paused },
+              { id: "all", label: t("history.filterAll"), count: tabCounts.all },
+              { id: "active", label: t("next.downloads.tabActive"), count: tabCounts.active },
+              { id: "queued", label: t("status.queued"), count: tabCounts.queued },
+              { id: "paused", label: t("status.paused"), count: tabCounts.paused },
             ]}
             active={tab}
             onSelect={setTab}
@@ -483,16 +485,16 @@ export function DownloadsPage() {
                   onClick={() => setSortOpen((previous) => !previous)}
                   className="flex items-center gap-[6px] font-wv-mono text-[11.5px] text-wv-muted hover:text-wv-fg"
                 >
-                  Sort by
+                  {t("next.downloads.sortBy")}
                   <span className="font-semibold text-wv-fg">
-                    {SORT_OPTIONS.find((option) => option.value === sort)!.label}
+                    {t(SORT_OPTIONS.find((option) => option.value === sort)!.label)}
                   </span>
                   <Icon name="dropdown" size={12} />
                 </button>
                 <Menu
                   open={sortOpen}
                   onDismiss={() => setSortOpen(false)}
-                  label="Sort downloads"
+                  label={t("next.downloads.sortMenu")}
                   className="top-[26px] right-0 w-[164px]"
                 >
                   {SORT_OPTIONS.map((option) => (
@@ -504,7 +506,7 @@ export function DownloadsPage() {
                         setSortOpen(false);
                       }}
                     >
-                      {option.label}
+                      {t(option.label)}
                     </MenuItem>
                   ))}
                 </Menu>
@@ -523,8 +525,8 @@ export function DownloadsPage() {
       statusNote={report ?? undefined}
       statusRight={
         queue.totalCount > queue.jobs.length
-          ? `showing ${queue.jobs.length} of ${queue.totalCount} downloads`
-          : `${inCategory.length} of ${jobs.length} downloads shown`
+          ? t("next.downloads.showingPage", { shown: queue.jobs.length, total: queue.totalCount })
+          : t("next.downloads.shown", { shown: inCategory.length, total: jobs.length })
       }
       // The list and the inspector are side by side only where both fit; below
       // that the inspector becomes a panel under the list rather than squeezing
@@ -562,18 +564,18 @@ export function DownloadsPage() {
       >
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
           {queue.isLoading ? (
-            <EmptyState loading title="Loading" body="Fetching the queue." />
+            <EmptyState loading title={t("next.common.loading")} body={t("next.downloads.loadingBody")} />
           ) : jobs.length === 0 ? (
             <EmptyState
               centered
-              title="No active downloads"
-              body="Add an NZB, or drop one anywhere on this list."
-              action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>Add NZB</PrimaryButton>}
+              title={t("next.downloads.emptyTitle")}
+              body={t("next.downloads.emptyBody")}
+              action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>}
             />
           ) : visibleGroups.length === 0 ? (
             <EmptyState
-              title="Nothing matches this view"
-              body="Clear the search or pick another filter."
+              title={t("next.downloads.noMatchTitle")}
+              body={t("next.downloads.noMatchBody")}
             />
           ) : (
             visibleGroups.map((group) => {
@@ -583,14 +585,14 @@ export function DownloadsPage() {
                   <SectionHeader
                     lead={
                       <CheckBox
-                        label={`Select every ${DOWNLOAD_GROUP_LABEL[group].toLowerCase()} download`}
+                        label={t("next.downloads.selectGroup", { group: t(DOWNLOAD_GROUP_LABEL[group]) })}
                         checked={rows.every((job) => picked.has(job.id))}
                         onChange={() => toggleGroup(rows)}
                       />
                     }
-                    label={DOWNLOAD_GROUP_LABEL[group]}
+                    label={t(DOWNLOAD_GROUP_LABEL[group])}
                     count={rows.length}
-                    note={DOWNLOAD_GROUP_NOTE[group] || undefined}
+                    note={DOWNLOAD_GROUP_NOTE[group] === null ? undefined : t(DOWNLOAD_GROUP_NOTE[group])}
                   />
                   {rows.map((job) => (
                     <DownloadRow
@@ -605,7 +607,7 @@ export function DownloadsPage() {
                       hold={blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null}
                       statusTitle={
                         job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
-                          ? t("status.propagationUntil", {
+                          ? t("next.status.propagationUntil", {
                               time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
                             })
                           : undefined
@@ -619,7 +621,7 @@ export function DownloadsPage() {
         </div>
         {dropping ? (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center border border-dashed border-wv-accent bg-wv-selected">
-            <span className="text-[13px] font-medium text-wv-strong">Drop to add these NZBs</span>
+            <span className="text-[13px] font-medium text-wv-strong">{t("next.downloads.dropHint")}</span>
           </div>
         ) : null}
       </div>
@@ -636,13 +638,13 @@ export function DownloadsPage() {
 
       <ConfirmDialog
         open={confirmCancel}
-        title="Cancel downloads"
-        note={`${picked.size} selected`}
+        title={t("next.downloads.cancelTitle")}
+        note={t("bulk.selected", { count: picked.size })}
         busy={bulkBusy}
         destructive
-        body="These downloads will be stopped and cannot be resumed."
-        confirmLabel="Cancel downloads"
-        dismissLabel="Keep downloading"
+        body={t("confirm.cancelSelectedMessage")}
+        confirmLabel={t("next.downloads.cancelTitle")}
+        dismissLabel={t("next.downloads.keepDownloading")}
         onConfirm={() => void cancelPicked()}
         onDismiss={() => setConfirmCancel(false)}
       />

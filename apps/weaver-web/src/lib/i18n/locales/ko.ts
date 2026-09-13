@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextKo } from "@/next/i18n/ko";
 
 const ko: LocaleDictionary = {
   // Brand
@@ -637,6 +638,7 @@ const ko: LocaleDictionary = {
   "systemInfo.diagnosticsHint": "수집에는 약 15초가 걸립니다. 메트릭은 10초 간격으로 두 번 샘플링됩니다. 비밀번호, API 키 등의 비밀 정보는 제거됩니다.",
   "systemInfo.diagnosticsFailed": "진단 패키지를 만들 수 없습니다.",
   ...duplicateLocaleEntries.kor,
+  ...nextKo,
 };
 
 export default ko;

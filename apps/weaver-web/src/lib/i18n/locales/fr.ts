@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextFr } from "@/next/i18n/fr";
 
 const fr: LocaleDictionary = {
   // Brand
@@ -637,6 +638,7 @@ const fr: LocaleDictionary = {
   "systemInfo.diagnosticsHint": "La collecte prend environ 15 secondes : les métriques sont échantillonnées deux fois, à dix secondes d'intervalle. Les mots de passe, clés d'API et autres secrets sont supprimés.",
   "systemInfo.diagnosticsFailed": "Le paquet de diagnostic n'a pas pu être créé.",
   ...duplicateLocaleEntries.fra,
+  ...nextFr,
 };
 
 export default fr;

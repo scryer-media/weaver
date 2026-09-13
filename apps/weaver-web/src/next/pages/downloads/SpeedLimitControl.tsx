@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { SETTINGS_QUERY, UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import { NumberField, PrimaryButton, SecondaryButton, Toggle } from "@/next/components/controls";
 import { Dialog } from "@/next/components/Dialog";
 import { FormRow } from "@/next/components/rows";
@@ -18,6 +19,7 @@ const MIB = 1024 * 1024;
  * because it is the one actually in force.
  */
 export function SpeedLimitControl() {
+  const t = useTranslate();
   const { downloadBlock } = useNextData();
   const [{ data }, reexecute] = useQuery<{ settings: { maxDownloadSpeed: number } }>({
     query: SETTINGS_QUERY,
@@ -44,7 +46,7 @@ export function SpeedLimitControl() {
     setError(null);
     void updateSettings({ input: { maxDownloadSpeed: bytes } }).then((result) => {
       if (result.error || !result.data?.updateSettings) {
-        setError(result.error?.message ?? "Could not save the speed limit.");
+        setError(result.error?.message ?? t("next.speedLimit.saveFailed"));
         return;
       }
       setOpen(false);
@@ -56,35 +58,35 @@ export function SpeedLimitControl() {
     <>
       <SecondaryButton
         icon="bandwidth"
-        title={scheduled > 0 ? "Speed limit set by a schedule" : "Download speed limit"}
+        title={scheduled > 0 ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle")}
         onClick={openDialog}
       >
-        {inForce > 0 ? formatRate(inForce) : "Unlimited"}
+        {inForce > 0 ? formatRate(inForce) : t("settings.unlimited")}
       </SecondaryButton>
       <Dialog
         open={open}
-        title="Speed limit"
+        title={t("next.speedLimit.title")}
         width={580}
-        note="persists across restarts"
+        note={t("next.speedLimit.note")}
         onDismiss={() => setOpen(false)}
         footer={
           <>
-            <SecondaryButton onClick={() => setOpen(false)}>Cancel</SecondaryButton>
+            <SecondaryButton onClick={() => setOpen(false)}>{t("action.cancel")}</SecondaryButton>
             <PrimaryButton
               disabled={saveState.fetching || (limited && megabytes <= 0)}
               onClick={save}
             >
-              {saveState.fetching ? "Saving" : "Apply"}
+              {saveState.fetching ? t("settings.saving") : t("action.apply")}
             </PrimaryButton>
           </>
         }
       >
-        <FormRow label="Limit download speed" help="Off lets every download run as fast as the providers allow.">
-          <Toggle checked={limited} onChange={setLimited} label="Limit download speed" />
+        <FormRow label={t("next.speedLimit.limit")} help={t("next.speedLimit.limitHelp")}>
+          <Toggle checked={limited} onChange={setLimited} label={t("next.speedLimit.limit")} />
         </FormRow>
-        <FormRow label="Ceiling" help="Shared by every download, applied immediately.">
+        <FormRow label={t("next.speedLimit.ceiling")} help={t("next.speedLimit.ceilingHelp")}>
           <NumberField
-            label="Speed limit in megabytes per second"
+            label={t("next.speedLimit.ceilingAria")}
             value={megabytes}
             onChange={setMegabytes}
             min={0.1}
@@ -95,7 +97,7 @@ export function SpeedLimitControl() {
         </FormRow>
         {scheduled > 0 ? (
           <div className="border-b border-wv-hairline px-4 py-3 text-[12.5px] text-wv-warn sm:px-6">
-            A schedule is holding downloads to {formatRate(scheduled)} right now.
+            {t("next.speedLimit.scheduleHolding", { rate: formatRate(scheduled) })}
           </div>
         ) : null}
         {error === null ? null : (

@@ -1,3 +1,4 @@
+import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { Eyebrow } from "./chrome";
 import { Segmented } from "./controls";
@@ -34,6 +35,7 @@ export function Pagination({
   onPageSize: (next: number) => void;
   total: number;
 }) {
+  const t = useTranslate();
   const from = total === 0 ? 0 : pageIndex * pageSize + 1;
   const to = Math.min(total, (pageIndex + 1) * pageSize);
   const windowStart = Math.max(0, Math.min(pageIndex - 2, pageCount - PAGE_WINDOW));
@@ -45,21 +47,27 @@ export function Pagination({
   return (
     <div className="flex min-h-[44px] flex-none flex-wrap items-center gap-x-[14px] gap-y-1 border-t border-wv-line-strong bg-wv-list px-4 py-1 sm:px-[22px] sm:py-0">
       <Eyebrow tone="rail" className="tracking-[0.12em] whitespace-nowrap">
-        Rows
+        {t("next.pagination.rows")}
       </Eyebrow>
       <Segmented
         size="compact"
-        label="Rows per page"
+        label={t("table.rowsPerPage")}
         value={String(pageSize)}
         options={pageSizes.map((size) => ({ value: String(size), label: String(size) }))}
         onChange={(next) => onPageSize(Number(next))}
       />
       <span className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-muted">
-        {total === 0 ? "0 of 0" : `${formatCount(from)}–${formatCount(to)} of ${formatCount(total)}`}
+        {total === 0
+          ? t("next.pagination.empty")
+          : t("next.pagination.range", {
+              from: formatCount(from),
+              to: formatCount(to),
+              total: formatCount(total),
+            })}
       </span>
 
       <div className="ml-auto flex items-center gap-2">
-        <Step label="Previous" before="previous" disabled={pageIndex === 0} onClick={() => onPage(pageIndex - 1)} />
+        <Step label={t("action.previous")} before="previous" disabled={pageIndex === 0} onClick={() => onPage(pageIndex - 1)} />
         <div className="flex items-center gap-1">
           {pages.map((page) => (
             <button
@@ -79,7 +87,7 @@ export function Pagination({
           ))}
         </div>
         <Step
-          label="Next"
+          label={t("action.next")}
           after="next"
           disabled={pageIndex + 1 >= pageCount}
           onClick={() => onPage(pageIndex + 1)}

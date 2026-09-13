@@ -9,6 +9,7 @@ import {
   RESUME_JOB_MUTATION,
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import type { JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
 import { Eyebrow } from "@/next/components/chrome";
@@ -34,12 +35,6 @@ interface OutputFilesResponse {
 }
 
 type Priority = "HIGH" | "NORMAL" | "LOW";
-
-const PRIORITY_OPTIONS: { value: Priority; label: string }[] = [
-  { value: "HIGH", label: "High" },
-  { value: "NORMAL", label: "Normal" },
-  { value: "LOW", label: "Low" },
-];
 
 /** Priority rides in the job's metadata; anything unset or unknown is Normal. */
 function jobPriority(job: JobData): Priority {
@@ -84,6 +79,7 @@ export function DownloadInspector({
   rate: number;
   onRemoved: (id: number) => void;
 }) {
+  const t = useTranslate();
   const statusLabel = useStatusLabel();
   const [{ data }] = useQuery<OutputFilesResponse>({
     query: JOB_OUTPUT_FILES_QUERY,
@@ -129,8 +125,14 @@ export function DownloadInspector({
     });
   };
 
+  const priorityOptions: { value: Priority; label: string }[] = [
+    { value: "HIGH", label: t("upload.priorityHigh") },
+    { value: "NORMAL", label: t("upload.priorityNormal") },
+    { value: "LOW", label: t("upload.priorityLow") },
+  ];
+
   const categoryOptions = [
-    { value: "", label: "Uncategorised" },
+    { value: "", label: t("next.categories.uncategorised") },
     ...categories.map((entry) => ({ value: entry.name, label: entry.name })),
     // A category that has since been removed from settings is still the job's.
     ...(category !== "" && !categories.some((entry) => entry.name === category)
@@ -143,6 +145,7 @@ export function DownloadInspector({
   const files = data?.jobOutputFiles?.files ?? [];
   // Only a phase with a bar is one the inspector says the job is in.
   const detail = statusDetail(
+    t,
     job,
     progress.bars.find((bar) => bar.phase === progress.status) ?? progress.bars.at(-1) ?? null,
     progress.status,
@@ -153,7 +156,7 @@ export function DownloadInspector({
     <aside className="flex max-h-[46vh] min-h-0 w-full flex-none flex-col border-t border-wv-line-strong bg-wv-input xl:max-h-none xl:w-[344px] xl:border-t-0 xl:border-l">
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         <div className="flex flex-none flex-col gap-3 border-b border-wv-hairline px-5 py-[22px]">
-          <Eyebrow tone="rail">Selected download</Eyebrow>
+          <Eyebrow tone="rail">{t("next.inspector.selected")}</Eyebrow>
           <div className="font-wv-title text-[15px] leading-[1.35] font-semibold tracking-[-0.01em] text-wv-strong">
             {job.displayTitle || job.name}
           </div>
@@ -173,32 +176,32 @@ export function DownloadInspector({
             to={`/jobs/${job.id}`}
             className="flex items-center gap-[3px] font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
           >
-            Open job detail
+            {t("next.inspector.openDetail")}
             <Icon name="open" size={13} />
           </Link>
         </div>
 
         <div className="flex flex-none flex-col gap-[9px] border-b border-wv-hairline px-5 py-[18px]">
           <Field
-            label="Status"
+            label={t("table.status")}
             value={
               detail ? `${statusLabel(progress.status)} — ${detail}` : statusLabel(progress.status)
             }
           />
-          <EditField label="Category">
+          <EditField label={t("table.category")}>
             <Select
-              label="Category"
+              label={t("table.category")}
               value={category}
               options={categoryOptions}
               onChange={(next) => edit({ category: next })}
               className="h-[30px] w-full min-w-0 text-[12.5px]"
             />
           </EditField>
-          <EditField label="Priority">
+          <EditField label={t("table.priority")}>
             <Select
-              label="Priority"
+              label={t("table.priority")}
               value={priority}
-              options={PRIORITY_OPTIONS}
+              options={priorityOptions}
               onChange={(next) => edit({ priority: next })}
               className="h-[30px] w-full min-w-0 text-[12.5px]"
             />
@@ -206,17 +209,17 @@ export function DownloadInspector({
           {failure === null ? null : (
             <div className="text-[12px] text-wv-error-text">{failure}</div>
           )}
-          <Field label="Total size" value={formatSize(job.totalBytes)} />
-          <Field label="Rate" value={rate > 0 ? formatRate(rate) : EM_DASH} />
-          <Field label="Time left" value={eta} />
-          <Field label="Destination" value={data?.jobOutputFiles?.outputDir || EM_DASH} />
+          <Field label={t("next.inspector.totalSize")} value={formatSize(job.totalBytes)} />
+          <Field label={t("next.inspector.rate")} value={rate > 0 ? formatRate(rate) : EM_DASH} />
+          <Field label={t("next.common.timeLeft")} value={eta} />
+          <Field label={t("next.inspector.destination")} value={data?.jobOutputFiles?.outputDir || EM_DASH} />
         </div>
 
         <div className="flex flex-none flex-col gap-[13px] px-5 py-[18px]">
-          <Eyebrow tone="rail">Files</Eyebrow>
+          <Eyebrow tone="rail">{t("next.common.files")}</Eyebrow>
           {files.length === 0 ? (
             <div className="text-[12.5px] text-wv-muted">
-              Nothing written yet — files appear once the download reaches its destination.
+              {t("next.inspector.noFiles")}
             </div>
           ) : (
             files.map((file) => (
@@ -245,7 +248,7 @@ export function DownloadInspector({
               void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id }));
             }}
           >
-            {isPaused ? "Resume" : "Pause"}
+            {isPaused ? t("action.resume") : t("action.pause")}
           </SecondaryButton>
           <SecondaryButton
             icon="topOfQueue"
@@ -254,7 +257,7 @@ export function DownloadInspector({
               void updateJobs({ ids: [job.id], priority: "HIGH" });
             }}
           >
-            Top of queue
+            {t("next.inspector.topOfQueue")}
           </SecondaryButton>
         </div>
         {/* Only while scripts run: a job waiting for a script slot reports itself as queued. */}
@@ -272,7 +275,7 @@ export function DownloadInspector({
               });
             }}
           >
-            Stop scripts
+            {t("next.inspector.stopScripts")}
           </SecondaryButton>
         ) : null}
         <DangerButton
@@ -283,7 +286,7 @@ export function DownloadInspector({
             void cancelJob({ id: job.id });
           }}
         >
-          Remove download
+          {t("next.inspector.removeDownload")}
         </DangerButton>
       </div>
     </aside>

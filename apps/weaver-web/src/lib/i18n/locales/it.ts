@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextIt } from "@/next/i18n/it";
 
 const it: LocaleDictionary = {
   // Brand
@@ -637,6 +638,7 @@ const it: LocaleDictionary = {
   "systemInfo.diagnosticsHint": "La raccolta richiede circa 15 secondi: le metriche vengono campionate due volte, a dieci secondi di distanza. Password, chiavi API e altri segreti vengono rimossi.",
   "systemInfo.diagnosticsFailed": "Non è stato possibile creare il pacchetto diagnostico.",
   ...duplicateLocaleEntries.ita,
+  ...nextIt,
 };
 
 export default it;

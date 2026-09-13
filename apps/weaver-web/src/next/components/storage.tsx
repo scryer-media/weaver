@@ -7,6 +7,7 @@ import {
 } from "../data/storage-mounts";
 import { usageColor, WV } from "../data/palette";
 import { formatSize } from "../data/format";
+import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 
 export { mountUsedPercent, storageMounts };
@@ -43,6 +44,7 @@ export function StorageUsage({
   size?: number;
   className?: string;
 }) {
+  const t = useTranslate();
   const percent = capacity && capacity.totalBytes > 0 ? (capacity.usedBytes / capacity.totalBytes) * 100 : 0;
   return (
     <div className={cn("flex min-w-0 items-center gap-2.5", className)}>
@@ -53,8 +55,11 @@ export function StorageUsage({
         </div>
         <div className="truncate text-[11px] text-wv-muted" title={capacity ? undefined : (error ?? undefined)}>
           {capacity
-            ? `${Math.round(percent)}% full · ${formatSize(capacity.freeBytes)} free`
-            : (error ?? "no capacity reported")}
+            ? t("next.storage.usage", {
+                percent: Math.round(percent),
+                free: formatSize(capacity.freeBytes),
+              })
+            : (error ?? t("next.storage.noCapacity"))}
         </div>
       </div>
     </div>
@@ -70,21 +75,22 @@ export function StorageMounts({
   layout?: "row" | "stack";
   className?: string;
 }) {
+  const t = useTranslate();
   const mounts = storageMounts(volumes);
   const stacked = layout === "stack";
 
   if (mounts.length === 0) {
     return (
       <div className={cn("min-w-0", className)}>
-        {stacked ? null : <Eyebrow tone="rail">Storage</Eyebrow>}
-        <div className="mt-1.5 text-[12px] text-wv-muted">no storage configured</div>
+        {stacked ? null : <Eyebrow tone="rail">{t("next.storage.title")}</Eyebrow>}
+        <div className="mt-1.5 text-[12px] text-wv-muted">{t("next.storage.noneConfigured")}</div>
       </div>
     );
   }
 
   return (
     <div className={cn("min-w-0", className)}>
-      {stacked ? null : <Eyebrow tone="rail">Storage</Eyebrow>}
+      {stacked ? null : <Eyebrow tone="rail">{t("next.storage.title")}</Eyebrow>}
       <div
         className={cn(
           "min-w-0",

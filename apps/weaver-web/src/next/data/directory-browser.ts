@@ -6,6 +6,8 @@
  * rather than from the browser the picker runs in.
  */
 
+import type { Translate } from "@/lib/context/translate-context";
+
 export interface DirectoryEntry {
   name: string;
   path: string;
@@ -66,9 +68,10 @@ export function filterEntries<T extends DirectoryEntry>(entries: readonly T[], q
 }
 
 /** "1,204 folders", or "12 of 1,204 folders" while a filter hides some. */
-export function describeEntryCount(shown: number, total: number): string {
-  const noun = total === 1 ? "folder" : "folders";
+export function describeEntryCount(t: Translate, shown: number, total: number): string {
+  const plural = total === 1 ? "one" : "other";
+  const count = total.toLocaleString("en-US");
   return shown === total
-    ? `${total.toLocaleString("en-US")} ${noun}`
-    : `${shown.toLocaleString("en-US")} of ${total.toLocaleString("en-US")} ${noun}`;
+    ? t(`next.folders.count.${plural}`, { count })
+    : t(`next.folders.filtered.${plural}`, { shown: shown.toLocaleString("en-US"), count });
 }

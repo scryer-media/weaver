@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
 import { Dialog } from "./Dialog";
 import { DangerButton, PrimaryButton, SecondaryButton } from "./controls";
 import { SectionHeader } from "./chrome";
@@ -27,12 +28,12 @@ export function RecordEditor({
   sections,
   error,
   busy = false,
-  saveLabel = "Save",
+  saveLabel,
   saveDisabled = false,
   onSave,
   onDismiss,
   onDelete,
-  deleteLabel = "Delete",
+  deleteLabel,
   extraActions,
   width = 560,
   children,
@@ -55,6 +56,7 @@ export function RecordEditor({
   /** Anything that is not a field: a test result, a warning, a sub-table. */
   children?: ReactNode;
 }) {
+  const t = useTranslate();
   return (
     <Dialog
       open={open}
@@ -66,13 +68,13 @@ export function RecordEditor({
         <>
           {onDelete === undefined ? null : (
             <DangerButton onClick={onDelete} disabled={busy} className="mr-auto px-[14px]">
-              {deleteLabel}
+              {deleteLabel ?? t("action.delete")}
             </DangerButton>
           )}
           {extraActions}
-          <SecondaryButton onClick={onDismiss}>Cancel</SecondaryButton>
+          <SecondaryButton onClick={onDismiss}>{t("action.cancel")}</SecondaryButton>
           <PrimaryButton onClick={onSave} disabled={busy || saveDisabled}>
-            {busy ? "Saving…" : saveLabel}
+            {busy ? t("settings.saving") : (saveLabel ?? t("action.save"))}
           </PrimaryButton>
         </>
       }

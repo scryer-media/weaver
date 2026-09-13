@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { blockFill, blockPeriod } from "./chrome";
 import { Icon } from "./icons";
@@ -79,6 +80,7 @@ export function Waterfall({
   window: string;
   total: string;
 }) {
+  const t = useTranslate();
   const [membersOpen, setMembersOpen] = useState(false);
 
   return (
@@ -121,7 +123,7 @@ export function Waterfall({
               size={12}
               className={cn("flex-none transition-transform", membersOpen && "rotate-90")}
             />
-            Extracted files ({members.length})
+            {t("next.waterfall.extractedFiles", { count: members.length })}
           </button>
           {membersOpen
             ? members.map((member) => <StageRow key={member.id} stage={member} tone="member" />)
@@ -134,7 +136,7 @@ export function Waterfall({
         style={columnStyle(COLUMNS)}
       >
         <span className="font-wv-mono text-[10.5px] tracking-[0.08em] text-wv-disabled uppercase">
-          Total
+          {t("timeline.totalDuration")}
         </span>
         <div className="flex min-w-0 items-baseline gap-[10px] font-wv-mono text-[10.5px] text-wv-faint">
           <span className="truncate">{window}</span>

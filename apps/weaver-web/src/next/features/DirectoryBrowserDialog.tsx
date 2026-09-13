@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useClient } from "urql";
 import { BROWSE_DIRECTORIES_QUERY, CREATE_DIRECTORY_MUTATION } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { cn } from "@/lib/utils";
 import { Dialog } from "@/next/components/Dialog";
@@ -40,7 +41,7 @@ function failureMessage(error: { graphQLErrors: { message: string }[]; message: 
 export function DirectoryBrowserDialog({
   open,
   initialPath,
-  title = "Choose a folder",
+  title,
   onClose,
   onChoose,
 }: {
@@ -50,6 +51,7 @@ export function DirectoryBrowserDialog({
   onClose: () => void;
   onChoose: (path: string) => void;
 }) {
+  const t = useTranslate();
   const client = useClient();
   const [listing, setListing] = useState<DirectoryListing | null>(null);
   const [typedPath, setTypedPath] = useState("");
@@ -95,13 +97,13 @@ export function DirectoryBrowserDialog({
           return;
         }
         setLoading(false);
-        setError(result.error ? failureMessage(result.error) : "The folder could not be read.");
+        setError(result.error ? failureMessage(result.error) : t("next.folders.readFailed"));
         return;
       }
       setLoading(false);
       show(result.data.browseDirectories);
     },
-    [client, show],
+    [client, show, t],
   );
 
   useEffect(() => {
@@ -141,7 +143,7 @@ export function DirectoryBrowserDialog({
       .toPromise();
     setCreating(false);
     if (result.error || !result.data?.createDirectory) {
-      setCreateError(result.error ? failureMessage(result.error) : "The folder was not created.");
+      setCreateError(result.error ? failureMessage(result.error) : t("next.folders.createFailed"));
       return;
     }
     requestRef.current += 1;
@@ -179,7 +181,7 @@ export function DirectoryBrowserDialog({
   return (
     <Dialog
       open={open}
-      title={title}
+      title={title ?? t("next.folders.choose")}
       onDismiss={onClose}
       width={720}
       footer={
@@ -196,9 +198,9 @@ export function DirectoryBrowserDialog({
           >
             {createError ?? currentPath}
           </span>
-          <SecondaryButton onClick={onClose}>Cancel</SecondaryButton>
+          <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
           <PrimaryButton disabled={busy || !listing} onClick={() => listing && onChoose(listing.currentPath)}>
-            Use this folder
+            {t("next.folders.use")}
           </PrimaryButton>
         </>
       }
@@ -234,7 +236,7 @@ export function DirectoryBrowserDialog({
           <div className="flex min-w-0 flex-[1_1_320px] gap-2">
             <TextField
               ref={pathInputRef}
-              label="Folder path"
+              label={t("next.folders.path")}
               value={typedPath}
               onChange={setTypedPath}
               onKeyDown={(event) => {
@@ -250,12 +252,12 @@ export function DirectoryBrowserDialog({
               disabled={busy || typedPath.trim() === ""}
               onClick={() => void browse(typedPath.trim())}
             >
-              Go
+              {t("next.folders.go")}
             </SecondaryButton>
           </div>
           <TextField
-            label="Filter folders"
-            placeholder="filter"
+            label={t("next.folders.filter")}
+            placeholder={t("next.folders.filterPlaceholder")}
             value={filter}
             onChange={setFilter}
             onKeyDown={(event) => {
@@ -271,7 +273,10 @@ export function DirectoryBrowserDialog({
 
         <GridHeader
           columns={COLUMNS}
-          cells={["Folder", listing && !loading && error === null ? describeEntryCount(shown.length, entries.length) : ""]}
+          cells={[
+            t("next.folders.folder"),
+            listing && !loading && error === null ? describeEntryCount(t, shown.length, entries.length) : "",
+          ]}
           cellClassNames={[undefined, "text-right"]}
         />
         {/* Always drawn, so the dialog keeps its height at a root or mid-load. */}
@@ -285,7 +290,7 @@ export function DirectoryBrowserDialog({
             ..
           </Cell>
           <Cell mono className="text-right text-[11px] text-wv-faint">
-            {listing !== null && parent === null ? "top level" : "up one level"}
+            {listing !== null && parent === null ? t("next.folders.topLevel") : t("next.folders.upOne")}
           </Cell>
         </GridRow>
 
@@ -296,13 +301,13 @@ export function DirectoryBrowserDialog({
           {loading ? (
             <div role="status" className="flex items-center gap-3 px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
               <LoadingMark reveal />
-              Reading folder…
+              {t("next.folders.reading")}
             </div>
           ) : error !== null ? (
             <div className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">{error}</div>
           ) : shown.length === 0 ? (
             <div className="px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
-              {entries.length === 0 ? "No folders in here." : "No folders match the filter."}
+              {entries.length === 0 ? t("next.folders.empty") : t("next.folders.noMatch")}
             </div>
           ) : (
             <div style={{ height: virtualizer.getTotalSize() }} className="relative w-full">
@@ -332,8 +337,8 @@ export function DirectoryBrowserDialog({
 
         <div className="flex flex-none flex-wrap items-center gap-2 border-t border-wv-line-strong px-4 py-3 sm:px-6">
           <TextField
-            label="New folder name"
-            placeholder="new folder name"
+            label={t("next.folders.newName")}
+            placeholder={t("next.folders.newNamePlaceholder")}
             value={newFolder}
             mono={false}
             onChange={(next) => {
@@ -353,7 +358,7 @@ export function DirectoryBrowserDialog({
             disabled={busy || !listing || newFolder.trim() === ""}
             onClick={() => void createFolder()}
           >
-            Create folder
+            {t("next.folders.create")}
           </SecondaryButton>
         </div>
       </div>
@@ -382,6 +387,7 @@ export function PathField({
   compact?: boolean;
   className?: string;
 }) {
+  const t = useTranslate();
   const [browsing, setBrowsing] = useState(false);
   const [startPath, setStartPath] = useState<string | null>(null);
   const fieldRef = useRef<HTMLInputElement | null>(null);
@@ -435,7 +441,7 @@ export function PathField({
         className={compact ? "h-7" : undefined}
         onClick={openPicker}
       >
-        Browse
+        {t("next.folders.browse")}
       </SecondaryButton>
       <DirectoryBrowserDialog
         open={browsing}

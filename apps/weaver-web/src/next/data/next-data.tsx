@@ -21,6 +21,7 @@ import {
 } from "@/graphql/queries";
 import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
+import { useTranslate } from "@/lib/context/translate-context";
 import type { DownloadBlockState } from "@/lib/context/live-data-context";
 import { formatRate } from "./format";
 import { useLiveQueue, type LiveQueue } from "./use-live-queue";
@@ -278,9 +279,14 @@ const TITLE_HOLD_MS = 2500;
  * of state — pausing, going idle — shows at once.
  */
 function useDocumentTitle(speed: number, isPaused: boolean) {
+  const t = useTranslate();
   const lastUpdate = useRef(0);
   useEffect(() => {
-    const title = isPaused ? "Paused - Weaver" : speed > 0 ? `${formatRate(speed)} - Weaver` : "Weaver";
+    const title = isPaused
+      ? t("next.title.paused")
+      : speed > 0
+        ? t("next.title.speed", { speed: formatRate(speed) })
+        : "Weaver";
     const apply = () => {
       lastUpdate.current = Date.now();
       document.title = title;
@@ -294,7 +300,7 @@ function useDocumentTitle(speed: number, isPaused: boolean) {
     }
     const timer = window.setTimeout(apply, wait);
     return () => window.clearTimeout(timer);
-  }, [isPaused, speed]);
+  }, [isPaused, speed, t]);
 
   useEffect(
     () => () => {

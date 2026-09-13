@@ -1,4 +1,5 @@
 import { memo } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
 import { Square } from "@/next/components/chrome";
 import { CheckBox } from "@/next/components/controls";
@@ -39,6 +40,7 @@ export const DownloadRow = memo(function DownloadRow({
   /** A longer account of the wait, shown on hover. */
   statusTitle?: string;
 }) {
+  const t = useTranslate();
   const progress = useJobProgress(job);
   const name = formatJobReleaseName(job);
   // The phase the label names, or failing that the last one with a bar; a
@@ -56,7 +58,7 @@ export const DownloadRow = memo(function DownloadRow({
       onClick={() => onSelect(job.id)}
       title={name}
       lead={
-        <CheckBox label={`Select ${name}`} checked={picked} onChange={() => onPick(job.id)} />
+        <CheckBox label={t("next.common.selectItem", { name })} checked={picked} onChange={() => onPick(job.id)} />
       }
       left={
         <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px]">

@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
 import { Dialog } from "./Dialog";
 import { DangerButton, PrimaryButton, SecondaryButton } from "./controls";
 
@@ -14,8 +15,8 @@ export function ConfirmDialog({
   title,
   note,
   body,
-  confirmLabel = "Remove",
-  dismissLabel = "Cancel",
+  confirmLabel,
+  dismissLabel,
   destructive = true,
   busy = false,
   onConfirm,
@@ -35,6 +36,7 @@ export function ConfirmDialog({
   onDismiss: () => void;
   alternative?: { label: string; onConfirm: () => void };
 }) {
+  const t = useTranslate();
   return (
     <Dialog
       open={open}
@@ -44,7 +46,7 @@ export function ConfirmDialog({
       onDismiss={onDismiss}
       footer={
         <>
-          <SecondaryButton onClick={onDismiss}>{dismissLabel}</SecondaryButton>
+          <SecondaryButton onClick={onDismiss}>{dismissLabel ?? t("action.cancel")}</SecondaryButton>
           {alternative === undefined ? null : (
             <DangerButton onClick={alternative.onConfirm} disabled={busy} className="px-[14px]">
               {alternative.label}
@@ -57,11 +59,11 @@ export function ConfirmDialog({
               solid={alternative !== undefined}
               className="px-[14px]"
             >
-              {confirmLabel}
+              {confirmLabel ?? t("next.common.remove")}
             </DangerButton>
           ) : (
             <PrimaryButton onClick={onConfirm} disabled={busy}>
-              {confirmLabel}
+              {confirmLabel ?? t("next.common.remove")}
             </PrimaryButton>
           )}
         </>

@@ -1,5 +1,6 @@
 import { isRouteErrorResponse, useNavigate, useRouteError } from "react-router";
 import { BrandLockup } from "@/lib/brand";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { NextShell } from "./NextShell";
 import { EmptyState } from "../components/chrome";
@@ -24,32 +25,36 @@ export function NextRouteFallback() {
   );
 }
 
-function describe(error: unknown): { title: string; body: string } {
+function describe(error: unknown, t: Translate): { title: string; body: string } {
   if (isRouteErrorResponse(error)) {
     return {
-      title: error.status === 404 ? "Page not found" : `Request failed (${error.status})`,
+      title:
+        error.status === 404
+          ? t("next.routeError.notFound")
+          : t("next.routeError.requestFailed", { status: error.status }),
       body:
         typeof error.statusText === "string" && error.statusText.trim() !== ""
           ? error.statusText
-          : "Weaver hit a routing error before the page could finish loading.",
+          : t("next.routeError.routingBody"),
     };
   }
   if (error instanceof Error) {
     return {
-      title: "Something went wrong",
-      body: error.message || "Weaver hit an unexpected error while rendering this screen.",
+      title: t("next.routeError.title"),
+      body: error.message || t("next.routeError.renderBody"),
     };
   }
   return {
-    title: "Something went wrong",
-    body: "Weaver hit an unexpected error while rendering this screen.",
+    title: t("next.routeError.title"),
+    body: t("next.routeError.renderBody"),
   };
 }
 
 export function NextRouteError() {
+  const t = useTranslate();
   const error = useRouteError();
   const navigate = useNavigate();
-  const { title, body } = describe(error);
+  const { title, body } = describe(error, t);
   const detail = error instanceof Error ? error.stack : null;
 
   return (
@@ -60,8 +65,12 @@ export function NextRouteError() {
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <EmptyState title={title} body={body} />
         <div className="flex gap-[10px] px-4 sm:px-6">
-          <SecondaryButton icon="back" onClick={() => void navigate(-1)}>Go back</SecondaryButton>
-          <PrimaryButton icon="refresh" onClick={() => window.location.reload()}>Reload</PrimaryButton>
+          <SecondaryButton icon="back" onClick={() => void navigate(-1)}>
+            {t("next.routeError.goBack")}
+          </SecondaryButton>
+          <PrimaryButton icon="refresh" onClick={() => window.location.reload()}>
+            {t("pwa.reload")}
+          </PrimaryButton>
         </div>
         {detail === null ? null : (
           <pre className="mt-6 overflow-x-auto border-t border-wv-hairline px-4 sm:px-6 py-5 font-wv-mono text-[11.5px] leading-[1.55] whitespace-pre-wrap text-wv-faint">

@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextJa } from "@/next/i18n/ja";
 
 const ja: LocaleDictionary = {
   // Brand
@@ -634,6 +635,7 @@ const ja: LocaleDictionary = {
   "systemInfo.diagnosticsHint": "収集には約15秒かかります。メトリクスは10秒間隔で2回サンプリングされます。パスワードやAPIキーなどの秘密情報は削除されます。",
   "systemInfo.diagnosticsFailed": "診断パッケージを作成できませんでした。",
   ...duplicateLocaleEntries.jpn,
+  ...nextJa,
 };
 
 export default ja;
