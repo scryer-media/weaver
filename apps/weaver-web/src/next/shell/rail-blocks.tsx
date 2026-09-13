@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
-import { NavLink } from "react-router";
+import { Link, NavLink } from "react-router";
 import { useQuery } from "urql";
-import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { cn } from "@/lib/utils";
 import { RailBlock, RailMetric } from "./NextShell";
 import { Bar, Square } from "../components/chrome";
@@ -42,12 +42,29 @@ export function providerLoadPercent(provider: ProviderHealth): number {
 }
 
 export function ProvidersBlock() {
-  const { providers } = useNextData();
+  const { providers, providersLoaded } = useNextData();
+
+  // Server health lists the live pool, and the pool leaves out every server
+  // that is switched off, so only the configured list can say there are none.
+  // It is asked only once health has answered empty. Reading it takes the same
+  // admin rights as adding a provider, so a viewer who could not act on the
+  // call to action never sees it.
+  const healthEmpty = providersLoaded && providers.length === 0;
+  const [{ data: configuredData }] = useQuery<{ servers: { id: number }[] }>({
+    query: SERVERS_QUERY,
+    pause: !healthEmpty,
+  });
+  const configured = healthEmpty ? configuredData?.servers : undefined;
 
   return (
     <RailBlock eyebrow="Providers" className="gap-3">
       {providers.length === 0 ? (
-        <div className="font-wv-mono text-[11px] text-wv-muted">none configured</div>
+        <>
+          <div className="font-wv-mono text-[11px] text-wv-muted">
+            {configured?.length ? "none enabled" : "none configured"}
+          </div>
+          {configured?.length === 0 ? <AddProviderButton /> : null}
+        </>
       ) : (
         providers.map((provider) => {
           const load = providerLoadPercent(provider);
@@ -68,6 +85,23 @@ export function ProvidersBlock() {
         })
       )}
     </RailBlock>
+  );
+}
+
+/**
+ * The rail's one loud control. With no provider nothing can download, so the
+ * empty state is an instruction rather than a caption, and it opens the add
+ * form itself instead of the list the form sits behind.
+ */
+function AddProviderButton() {
+  return (
+    <Link
+      to="/settings/servers?add"
+      className="wv-ping flex h-[40px] items-center justify-between gap-2 bg-wv-accent px-3 text-[13px] font-medium tracking-[0.08em] text-wv-on-accent uppercase hover:bg-wv-accent-hover"
+    >
+      <span>Add provider</span>
+      <span aria-hidden="true">→</span>
+    </Link>
   );
 }
 

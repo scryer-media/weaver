@@ -370,7 +370,9 @@ export function DownloadsPage() {
                               percent={percent}
                               color={color}
                               height={10}
-                              className="max-w-[196px] min-w-[56px] flex-1"
+                              // 49 whole cells of the 7px period a 10px bar takes; a cap
+                              // off that multiple leaves dead track before the percentage.
+                              className="max-w-[343px] min-w-[56px] flex-1"
                             />
                             <span className="w-[34px] flex-none font-wv-mono text-[11.5px] text-wv-muted">
                               {percent}%
