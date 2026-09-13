@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { isActiveStatus, statusI18nKey, statusToken } from "@/lib/status-tokens";
 import type { JobData } from "@/lib/job-types";
+import { latestPhase } from "./phase-bars";
 
 /**
  * Status vocabulary shared by every Next screen.
@@ -53,7 +54,9 @@ export function useStatusLabel(): (status: string) => string {
 export function statusDetail(
   job: JobData,
   /** The phase the screen is showing; by default, the one that last reported. */
-  phase = currentPhase(job),
+  phase = latestPhase(job.phaseProgress),
+  /** The status the screen labels the job with, which the detail does not repeat. */
+  shownStatus = job.status,
 ): string | null {
   if (job.error) {
     return job.error;
@@ -62,20 +65,10 @@ export function statusDetail(
     return job.downloadWaitReason.toLowerCase().replace(/_/g, " ");
   }
   if (phase && phase.totalBytes > 0) {
-    return `${Math.round(phase.progressPercent)}% of ${phase.phase.toLowerCase()}`;
+    const percent = `${Math.round(phase.progressPercent)}%`;
+    return phase.phase === shownStatus ? percent : `${percent} of ${phase.phase.toLowerCase()}`;
   }
   return null;
-}
-
-/** The phase that last reported progress; `phaseProgress` is ordered by start. */
-export function currentPhase(job: JobData) {
-  let latest = null as JobData["phaseProgress"][number] | null;
-  for (const phase of job.phaseProgress) {
-    if (!latest || phase.updatedAtEpochMs >= latest.updatedAtEpochMs) {
-      latest = phase;
-    }
-  }
-  return latest;
 }
 
 /**

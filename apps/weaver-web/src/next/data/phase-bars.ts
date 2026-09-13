@@ -12,7 +12,8 @@ import type { JobPhase, JobPhaseProgressData } from "@/lib/job-types";
  * phase shorter than that never reaches the queue at all; the job's timeline is
  * where it is recorded.
  *
- * This file is the clock and nothing else, so it can be tested without React.
+ * This file is the clock, and the choice of which phase a figure is quoted
+ * from, and nothing else, so it can be tested without React.
  */
 
 export const PHASE_SETTLE_MS = 2_000;
@@ -28,14 +29,41 @@ export const PHASE_ORDER: readonly JobPhase[] = ["DOWNLOADING", "REPAIRING", "EX
  * the extraction's, so it does not count as a running extraction.
  */
 export function runningPhases(phases: readonly JobPhaseProgressData[]): JobPhaseProgressData[] {
-  const downloading = phases.some(
-    (phase) =>
-      phase.phase === "DOWNLOADING" && phase.totalBytes > 0 && phase.completedBytes < phase.totalBytes,
-  );
+  const downloading = runningDownload(phases) !== undefined;
   return phases.filter(
     (phase) =>
       phase.totalBytes > 0
       && !(phase.phase === "EXTRACTING" && downloading && phase.completedBytes >= phase.totalBytes),
+  );
+}
+
+/** The phase that last reported progress; ties go to the one that started later. */
+export function latestPhase(phases: readonly JobPhaseProgressData[]): JobPhaseProgressData | null {
+  let latest: JobPhaseProgressData | null = null;
+  for (const phase of phases) {
+    if (!latest || phase.updatedAtEpochMs >= latest.updatedAtEpochMs) {
+      latest = phase;
+    }
+  }
+  return latest;
+}
+
+/**
+ * The phase whose rate and time left a screen quotes.
+ *
+ * Weaver stamps every phase in a sample with the same time, so the phase that
+ * reported last is only the one that started last: an archive extracting
+ * mid-download would win, and it has no download rate to give. While a download
+ * is running, its rate is the one that means something.
+ */
+export function ratePhase(phases: readonly JobPhaseProgressData[]): JobPhaseProgressData | null {
+  return runningDownload(phases) ?? latestPhase(phases);
+}
+
+function runningDownload(phases: readonly JobPhaseProgressData[]) {
+  return phases.find(
+    (phase) =>
+      phase.phase === "DOWNLOADING" && phase.totalBytes > 0 && phase.completedBytes < phase.totalBytes,
   );
 }
 

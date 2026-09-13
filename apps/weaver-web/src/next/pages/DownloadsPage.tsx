@@ -20,6 +20,7 @@ import { StorageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
 import { EM_DASH, formatDayClock, formatSize } from "../data/format";
+import { ratePhase } from "../data/phase-bars";
 import {
   categoryFacets,
   facetKey,
@@ -31,7 +32,6 @@ import {
   DOWNLOAD_GROUP_LABEL,
   DOWNLOAD_GROUP_NOTE,
   DOWNLOAD_GROUP_ORDER,
-  currentPhase,
   downloadGroup,
   useStatusLabel,
   type DownloadGroup,
@@ -212,7 +212,8 @@ export function DownloadsPage() {
     downloadBlock.kind === "SERVER_QUOTA"
       ? t("jobs.serverQuotaEta")
       : t("jobs.bandwidthCapEta", { resetAt: formatDayClock(downloadBlock.windowEndsAtEpochMs) });
-  const blockLabel = t("jobs.bandwidthCapShort");
+  const blockLabel =
+    downloadBlock.kind === "SERVER_QUOTA" ? t("jobs.serverQuotaBadge") : t("jobs.bandwidthCapShort");
 
   /** What stands in for time left: a hold, or an estimate; null when there is neither. */
   const waitValue = useCallback(
@@ -390,7 +391,7 @@ export function DownloadsPage() {
           key={selected.id}
           job={selected}
           eta={waitValue(selected) ?? EM_DASH}
-          rate={currentPhase(selected)?.rateBps ?? 0}
+          rate={ratePhase(selected.phaseProgress)?.rateBps ?? 0}
           onRemoved={handleRemoved}
         />
       )}

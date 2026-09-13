@@ -74,6 +74,7 @@ export function DownloadInspector({
   const detail = statusDetail(
     job,
     progress.bars.find((bar) => bar.phase === progress.status) ?? progress.bars.at(-1) ?? null,
+    progress.status,
   );
   const isPaused = token === "paused";
 

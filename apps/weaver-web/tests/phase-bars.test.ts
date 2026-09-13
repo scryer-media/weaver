@@ -4,6 +4,8 @@ import {
   NO_PROGRESS_STATE,
   PHASE_SETTLE_MS,
   advanceJobProgress,
+  latestPhase,
+  ratePhase,
   runningPhases,
   settlePhases,
   settleStatus,
@@ -167,4 +169,20 @@ test("a page opened mid-phase shows the phases weaver says have already run", ()
   assert.deepEqual(kinds(later.bars), ["DOWNLOADING", "EXTRACTING"]);
   assert.equal(later.status?.shown, "EXTRACTING");
   assert.equal(later.nextChangeAt, null);
+});
+
+test("rate and time left come from a running download, not an extraction that reported with it", () => {
+  const download = { ...phase("DOWNLOADING", 40), rateBps: 12_000_000, updatedAtEpochMs: 5 };
+  const extraction = { ...phase("EXTRACTING", 10), rateBps: null, updatedAtEpochMs: 5 };
+
+  assert.equal(latestPhase([download, extraction]), extraction);
+  assert.equal(ratePhase([download, extraction]), download);
+});
+
+test("once the download is done, the rate is quoted from the phase still working", () => {
+  const download = { ...phase("DOWNLOADING", 100), updatedAtEpochMs: 4 };
+  const extraction = { ...phase("EXTRACTING", 60), rateBps: 80_000_000, updatedAtEpochMs: 9 };
+
+  assert.equal(ratePhase([download, extraction]), extraction);
+  assert.equal(ratePhase([]), null);
 });
