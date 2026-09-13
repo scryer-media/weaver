@@ -20,6 +20,30 @@ async fn mixed_chase_invalidated_by_repair_uses_conventional_fallback() {
 }
 
 #[tokio::test]
+async fn solid_members_demote_direct_store_before_mixed_chase_can_skip_them() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+        gate: DirectUnpackGate::Enabled,
+    });
+    let volumes = vec![("solid.rar".into(), rar5_fixture_bytes("rar5_solid.rar"))];
+    let par2_bytes = par2_index_over_volumes(&volumes);
+    let (spec, _) = par2_bearing_job_spec("Solid admission", &volumes, &par2_bytes);
+    let job_id = JobId(41953);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for segment in 0..2 {
+        submit_volume_article(&mut pipeline, job_id, &volumes, 0, segment).await;
+    }
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .expect("candidate set was admitted")
+            .is_demoted()
+    );
+}
+
+#[tokio::test]
 async fn dropping_the_pipeline_wakes_a_partial_rar_chase() {
     drop_partial_chase(false).await;
 }
@@ -27,6 +51,60 @@ async fn dropping_the_pipeline_wakes_a_partial_rar_chase() {
 #[tokio::test]
 async fn dropping_an_unpolled_consumer_wakes_a_partial_rar_chase() {
     drop_partial_chase(true).await;
+}
+
+#[tokio::test]
+async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
+    for gate in [DirectStoreGate::Disabled, DirectStoreGate::Enabled] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_store.set_gate(gate);
+        pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+            gate: DirectUnpackGate::Enabled,
+        });
+        pipeline
+            .db
+            .save_post_processing_settings(&crate::post_processing::model::PostProcessingSettings {
+                unacceptable_extensions: vec!["bin".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let volumes = vec![(
+            "mixed.rar".into(),
+            rar5_fixture_bytes("rar5_multifile_lz.rar"),
+        )];
+        let job_id = JobId(41952);
+        let par2_bytes = par2_index_over_volumes(&volumes);
+        let (spec, _) = par2_bearing_job_spec("Blocked chase", &volumes, &par2_bytes);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        for segment in 0..2 {
+            submit_volume_article(&mut pipeline, job_id, &volumes, 0, segment).await;
+        }
+        if gate == DirectStoreGate::Enabled {
+            pipeline.update_mixed_rar_chase(job_id, 0);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                pipeline.reap_direct_unpack().await;
+                if pipeline.direct_unpack.outcome(job_id, "mixed").is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let outcome = pipeline.direct_unpack.outcome(job_id, "mixed").unwrap();
+        assert!(
+            outcome
+                .result
+                .as_ref()
+                .err()
+                .expect("chase must reject the blocked member")
+                .contains("unacceptable extension 'bin'")
+        );
+        assert!(!outcome.staging_dir.join("zeros_64k.bin").exists());
+    }
 }
 
 async fn drop_partial_chase(transfer_to_consumer: bool) {
@@ -179,6 +257,13 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
                 .tainted,
             "repair must make speculative output unusable"
         );
+    } else if gate == DirectStoreGate::Enabled {
+        // A completed, verified chase no longer needs a decoder. Reducing
+        // the allowance now must not make the tolerated ticket reopen and
+        // reject the archive's dictionary instead of installing its output.
+        let mut limits = (*pipeline.extraction_limits).clone();
+        limits.max_memory_bytes = 1;
+        pipeline.extraction_limits = std::sync::Arc::new(limits);
     }
     submit_decoded_segment(
         &mut pipeline,

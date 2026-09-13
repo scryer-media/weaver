@@ -1520,8 +1520,23 @@ impl Pipeline {
         // The chase's own pool, never the shared post-processing one: `install`
         // holds a worker for as long as the closure runs, and this closure parks.
         let pp_pool = self.chase_pool.clone();
+        let db = self.db.clone();
+        let cached_policy = self.unacceptable_extension_policies.get(&job_id).cloned();
         coverage.yield_to_memory_pressure(Arc::clone(&self.process_memory_budget));
         tokio::task::spawn_blocking(move || {
+            // Resolve the policy off the actor, before a parked decoder can
+            // occupy a chase thread. Loading failure refuses speculation.
+            let rar_policy = if matches!(format, ChaseFormat::Rar | ChaseFormat::RarVirtual { .. })
+            {
+                Some(match cached_policy {
+                    Some(policy) => policy,
+                    None => Arc::new(db.post_processing_settings().map_err(|error| {
+                        format!("could not load unacceptable extension policy: {error}")
+                    })?),
+                })
+            } else {
+                None
+            };
             // Between here and the line below sits `install`, which queues
             // behind occupied workers with no logging, no timeout, and no
             // sensitivity to this set's abort — the closure has not touched the
@@ -1560,6 +1575,7 @@ impl Pipeline {
                                 budget: &budget,
                                 password,
                                 counters: &counters,
+                                policy: rar_policy.as_deref().expect("RAR policy loaded above"),
                             },
                             |_| Ok(true),
                         );
@@ -1574,6 +1590,7 @@ impl Pipeline {
                                 budget: &budget,
                                 password,
                                 counters: &counters,
+                                policy: rar_policy.as_deref().expect("RAR policy loaded above"),
                             },
                             |name| input.should_extract(name),
                         );

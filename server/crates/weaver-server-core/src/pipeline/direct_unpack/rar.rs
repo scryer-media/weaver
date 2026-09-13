@@ -11,8 +11,8 @@ use crate::jobs::PhaseCounters;
 use crate::pipeline::FullSetExtractionOutcome;
 use crate::pipeline::extraction::{
     ExtractionRoot, JobExtractionBudget, apply_rar_member_filesystem_metadata,
-    apply_server_rar_limits_with_memory_limit, ensure_rar_dictionary_within_limit,
-    rar_decoder_memory_bytes, rar_entry_via, validate_sanitized_rar_member_path,
+    apply_server_rar_limits_with_memory_limit, rar_entry_via, rar_member_decoder_memory_bytes,
+    validate_sanitized_rar_member_path,
 };
 
 pub(crate) struct RarChaseContext<'a> {
@@ -23,6 +23,7 @@ pub(crate) struct RarChaseContext<'a> {
     pub budget: &'a Arc<JobExtractionBudget>,
     pub password: Option<String>,
     pub counters: &'a PhaseCounters,
+    pub policy: &'a crate::post_processing::model::PostProcessingSettings,
 }
 
 pub(crate) fn extract(
@@ -37,6 +38,7 @@ pub(crate) fn extract(
         budget,
         password,
         counters,
+        policy,
     } = context;
     let first = provider.get_volume(0).map_err(|error| error.to_string())?;
     let mut archive =
@@ -55,6 +57,8 @@ pub(crate) fn extract(
     // too, including while it waits for headers or the next volume.
     let mut reservations = Vec::new();
     let mut reserved = 0;
+    let ceiling =
+        apply_server_rar_limits_with_memory_limit(&mut archive, budget.max_memory_bytes());
     for volume in 0..volume_count {
         let mut requested = NonZeroUsize::MIN;
         loop {
@@ -67,15 +71,6 @@ pub(crate) fn extract(
                     requested,
                 )
                 .map_err(|error| error.to_string())?;
-            let ceiling =
-                apply_server_rar_limits_with_memory_limit(&mut archive, budget.max_memory_bytes());
-            ensure_rar_dictionary_within_limit(&archive, ceiling)
-                .map_err(|error| error.to_string())?;
-            let needed = rar_decoder_memory_bytes(&archive);
-            if needed > reserved {
-                reservations.push(budget.reserve_memory_wait(needed - reserved)?);
-                reserved = needed;
-            }
             while next_member < archive.len() {
                 let index = next_member;
                 next_member += 1;
@@ -94,6 +89,13 @@ pub(crate) fn extract(
                         "RAR members resolve to the same destination: {name}"
                     ));
                 }
+                if !info.is_directory
+                    && let Some(pattern) = policy.unacceptable_extension_match(&name)
+                {
+                    return Err(budget.reject_content_policy(format!(
+                        "unacceptable extension '{pattern}' matched RAR member '{name}' before extraction"
+                    )));
+                }
                 if !should_extract(&name)? {
                     if archive.is_solid() {
                         return Err(
@@ -101,6 +103,18 @@ pub(crate) fn extract(
                         );
                     }
                     continue;
+                }
+                let needed = rar_member_decoder_memory_bytes(&info);
+                if needed > ceiling {
+                    return Err(unrar_rs::RarError::DictionaryTooLarge {
+                        size: needed,
+                        max: ceiling,
+                    }
+                    .to_string());
+                }
+                if needed > reserved {
+                    reservations.push(budget.reserve_memory_wait(needed - reserved)?);
+                    reserved = needed;
                 }
                 if info.is_directory {
                     root.create_dir(&relative, budget)?;

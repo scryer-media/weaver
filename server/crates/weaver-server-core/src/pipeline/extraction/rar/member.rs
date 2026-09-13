@@ -280,10 +280,17 @@ pub(crate) fn rar_decoder_memory_bytes(archive: &unrar_rs::RarArchive) -> u64 {
         .metadata()
         .members
         .iter()
-        .filter(|member| member.compression.method != unrar_rs::CompressionMethod::Store)
-        .map(|member| member.compression.dict_size.max(RAR_MIN_LZ_WINDOW_BYTES))
+        .map(rar_member_decoder_memory_bytes)
         .max()
         .unwrap_or(0)
+}
+
+pub(crate) fn rar_member_decoder_memory_bytes(member: &unrar_rs::MemberInfo) -> u64 {
+    if member.compression.method == unrar_rs::CompressionMethod::Store {
+        0
+    } else {
+        member.compression.dict_size.max(RAR_MIN_LZ_WINDOW_BYTES)
+    }
 }
 
 pub(crate) fn ensure_rar_dictionary_within_limit(

@@ -22,7 +22,7 @@ pub(crate) use member::apply_rar_member_filesystem_metadata;
 
 pub(crate) use member::{
     apply_server_rar_limits_with_memory_limit, ensure_rar_dictionary_within_limit,
-    rar_decoder_memory_bytes,
+    rar_decoder_memory_bytes, rar_member_decoder_memory_bytes,
 };
 
 #[cfg(test)]
