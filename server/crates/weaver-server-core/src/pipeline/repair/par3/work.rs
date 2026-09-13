@@ -196,7 +196,7 @@ pub(super) struct MaterializedSources(BTreeMap<SourceId, EngineResult<Materializ
 struct JobSlot {
     acquisition: Acquisition,
     repair_phase: bool,
-    retry_serial: bool,
+    retry_serial: Option<WorkKey>,
     retry_repair: bool,
     runtime: Option<Par3Job>,
     sources: PublishedSources,
@@ -224,7 +224,7 @@ impl Default for JobSlot {
             sources: runtime.sources.clone(),
             acquisition: Acquisition::default(),
             repair_phase: false,
-            retry_serial: false,
+            retry_serial: None,
             retry_repair: false,
             runtime: Some(runtime),
             epoch: 0,
@@ -1170,16 +1170,17 @@ impl Coordinator {
             .saturating_sub(self.worker_allowances.values().sum::<usize>());
         if self.in_flight.len() >= 2
             || available == 0
-            || self
-                .in_flight
-                .values()
-                .any(|(id, _)| self.jobs.get(id).is_some_and(|job| job.retry_serial))
+            || self.in_flight.values().any(|(id, _)| {
+                self.jobs
+                    .get(id)
+                    .is_some_and(|job| job.retry_serial.is_some())
+            })
         {
             return Ok(());
         }
         let ready = |job: &&JobSlot| {
             job.ticket.is_none()
-                && (!job.retry_serial || self.in_flight.is_empty())
+                && (job.retry_serial.is_none() || self.in_flight.is_empty())
                 && (job.spill.is_none() || job.installing)
                 && if job.installing {
                     job.pending.contains_key(&WorkKey::Readback)
@@ -1197,7 +1198,7 @@ impl Coordinator {
         let Some(job_id) = next else {
             return Ok(());
         };
-        if self.jobs[&job_id].retry_serial {
+        if self.jobs[&job_id].retry_serial.is_some() {
             // A peer may have returned its worker while retaining idle readers.
             // Return those cache leases too before the isolated retry; checked-
             // out readers remain owned until they actually return.
@@ -1527,8 +1528,14 @@ impl Coordinator {
                 .is_some_and(budget::is_native_pressure),
             _ => false,
         };
+        // A repair retry can perform an assessment first. Only the operation
+        // that needed isolation consumes the reservation; afterward this job
+        // participates in ordinary shared scheduling again.
+        if !contended && job.retry_serial == Some(done.key) {
+            job.retry_serial = None;
+        }
         if contended && native_pressure {
-            job.retry_serial = true;
+            job.retry_serial = Some(done.key);
             job.retry_repair = matches!(done.key, WorkKey::Repair(_));
             if let WorkKey::Source(source) = done.key {
                 job.dirty.insert(source);

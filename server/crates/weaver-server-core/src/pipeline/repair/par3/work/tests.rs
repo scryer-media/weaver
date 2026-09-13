@@ -29,7 +29,7 @@ async fn peer_pressure_waits_for_retirement_then_retries_once_in_isolation() {
     failed.result = Err(EngineError::ResourceLimit("memory budget"));
     assert_eq!(coordinator.settle(failed), Some(id));
     assert!(coordinator.error(id).is_none());
-    assert!(coordinator.jobs[&id].retry_serial);
+    assert!(coordinator.jobs[&id].retry_serial.is_some());
     coordinator.enqueue(id, SourceId(0), path).unwrap();
     coordinator.dispatch().unwrap();
     assert!(
@@ -52,6 +52,40 @@ async fn peer_pressure_waits_for_retirement_then_retries_once_in_isolation() {
         "a solo failure cannot become an unbounded retry loop"
     );
     assert!(coordinator.worker_allowances.is_empty());
+}
+
+#[tokio::test]
+async fn successful_isolated_retry_restores_shared_scheduling() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    let mut coordinator = Coordinator::default();
+    coordinator.cpu_limit = 4;
+    for id in [JobId(1), JobId(2)] {
+        coordinator.enqueue(id, SourceId(0), path.clone()).unwrap();
+    }
+    coordinator.dispatch().unwrap();
+    let mut failed = next(&mut coordinator).await;
+    let peer = next(&mut coordinator).await;
+    let id = failed.job_id;
+    failed.result = Err(EngineError::ResourceLimit("memory budget"));
+    coordinator.settle(failed);
+    coordinator.settle(peer);
+    coordinator.enqueue(id, SourceId(0), path.clone()).unwrap();
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    assert!(done.result.is_ok());
+    coordinator.settle(done);
+    assert!(coordinator.jobs[&id].retry_serial.is_none());
+    for id in [JobId(1), JobId(2)] {
+        coordinator.enqueue(id, SourceId(1), path.clone()).unwrap();
+    }
+    coordinator.dispatch().unwrap();
+    assert_eq!(coordinator.in_flight.len(), 2);
+    assert_eq!(coordinator.worker_allowances.values().sum::<usize>(), 4);
+    for _ in 0..2 {
+        let done = next(&mut coordinator).await;
+        coordinator.settle(done);
+    }
 }
 
 #[tokio::test]
