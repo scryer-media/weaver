@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { useMutation, useQuery } from "urql";
+import { useClient, useMutation, useQuery } from "urql";
 import {
   ADD_CATEGORY_MUTATION,
   ADD_SERVER_MUTATION,
@@ -7,6 +7,7 @@ import {
   CATEGORIES_QUERY,
   FINISH_FIRST_RUN_SETUP_MUTATION,
   FIRST_RUN_SETUP_QUERY,
+  PATH_STORAGE_QUERY,
   REMOVE_CATEGORY_MUTATION,
   SERVERS_QUERY,
   SETTINGS_QUERY,
@@ -249,7 +250,7 @@ function StepBody({
   footer,
 }: {
   title: string;
-  body: string;
+  body?: string;
   children: ReactNode;
   footer: ReactNode;
 }) {
@@ -258,7 +259,7 @@ function StepBody({
       <div className="flex flex-col gap-5 px-5 py-6 sm:px-7">
         <div className="flex flex-col gap-1.5">
           <h1 className="font-wv-title text-[19px] font-semibold text-wv-strong">{title}</h1>
-          <p className="text-[13px] leading-[1.55] text-wv-muted">{body}</p>
+          {body ? <p className="text-[13px] leading-[1.55] text-wv-muted">{body}</p> : null}
         </div>
         {children}
       </div>
@@ -626,6 +627,46 @@ function useStorageCheck() {
   };
 }
 
+/**
+ * How full the disks under folders picked on this step are, before they are
+ * saved, so a folder on another disk shows that disk straight away.
+ *
+ * Best effort: a folder whose disk cannot be read, or does not answer in time,
+ * just gets no pie, and nothing waits on the answer.
+ */
+function usePickedStorage(paths: readonly string[]): StorageVolume[] {
+  const client = useClient();
+  const [probed, setProbed] = useState<Record<string, StorageVolume>>({});
+  const key = paths.join("\n");
+
+  useEffect(() => {
+    if (!key) {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      for (const path of key.split("\n")) {
+        void client
+          .query<{ pathStorage: StorageVolume }>(PATH_STORAGE_QUERY, { path }, { requestPolicy: "network-only" })
+          .toPromise()
+          .then((result) => {
+            const storage = result.data?.pathStorage;
+            if (!cancelled && storage?.capacity) {
+              setProbed((previous) => ({ ...previous, [path]: { ...storage, path } }));
+            }
+          })
+          .catch(() => undefined);
+      }
+    }, 500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [client, key]);
+
+  return paths.flatMap((path) => (probed[path] ? [probed[path]] : []));
+}
+
 function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: () => void }) {
   const t = useTranslate();
   const [{ data: settingsData }] = useQuery<FolderSettings>({
@@ -659,6 +700,28 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
   const categories = [...(categoryData?.categories ?? [])].sort((left, right) =>
     left.name.localeCompare(right.name),
   );
+  // A folder changed here stands in for the saved one until the step saves it.
+  const edited = [
+    { saved: settings?.intermediateDir ?? "", picked: folders?.intermediateDir.trim() ?? "" },
+    { saved: settings?.completeDir ?? "", picked: folders?.completeDir.trim() ?? "" },
+  ].filter((folder) => settings && folders && folder.picked && folder.picked !== folder.saved);
+  const pickedStorage = usePickedStorage(edited.map((folder) => folder.picked));
+  const replaced = new Set(edited.map((folder) => folder.saved));
+  const savedComplete = settings?.completeDir ?? "";
+  if (replaced.has(savedComplete)) {
+    // Categories without a destination of their own move with the completed folder.
+    for (const category of categoryData?.categories ?? []) {
+      if (!category.destDir) {
+        replaced.add(`${savedComplete}/${category.name}`);
+      }
+    }
+  }
+  const volumes = storage.volumes
+    ? [
+        ...storage.volumes.filter((volume) => !(volume.labels.length === 1 && replaced.has(volume.path))),
+        ...pickedStorage,
+      ]
+    : null;
   const dataDir = settings?.dataDir ?? "";
   const completeDir = folders?.completeDir.trim() || (dataDir ? `${dataDir}/complete` : "");
 
@@ -721,7 +784,6 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
   return (
     <StepBody
       title={t("next.firstRun.folders.title")}
-      body={t("next.firstRun.folders.body")}
       footer={
         <>
           <SecondaryButton onClick={onBack}>{t("next.firstRun.back")}</SecondaryButton>
@@ -763,7 +825,7 @@ function FoldersStep({ onBack, onContinue }: { onBack: () => void; onContinue: (
         </div>
       )}
 
-      {storage.volumes ? <StorageMounts volumes={storage.volumes} /> : null}
+      {volumes ? <StorageMounts volumes={volumes} /> : null}
 
       <div className="flex flex-col gap-3 border-t border-wv-hairline pt-5">
         <div className="flex flex-col gap-1.5">

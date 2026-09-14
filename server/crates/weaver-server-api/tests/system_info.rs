@@ -174,3 +174,38 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
     assert!(missing["capacity"].is_null());
     assert!(missing["error"].as_str().unwrap().contains("unavailable"));
 }
+
+#[tokio::test]
+async fn path_storage_reports_the_disk_a_missing_folder_would_be_created_on() {
+    let h = TestHarness::new().await;
+    let data_dir = std::path::PathBuf::from(&h.config.read().await.data_dir);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let missing = data_dir.join("not-yet").join("complete");
+
+    let mut variables = async_graphql::Variables::default();
+    variables.insert(
+        async_graphql::Name::new("path"),
+        async_graphql::Value::String(missing.display().to_string()),
+    );
+    let response = h
+        .execute_with_variables(
+            "query($path: String!) { pathStorage(path: $path) { path error capacity { totalBytes freeBytes } } }",
+            variables,
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let storage = &data["pathStorage"];
+    assert_eq!(storage["path"].as_str(), missing.to_str());
+    assert!(storage["error"].is_null(), "{storage}");
+    assert!(storage["capacity"]["totalBytes"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn path_storage_is_admin_only() {
+    let h = TestHarness::new().await;
+    let response = h
+        .execute_as(r#"{ pathStorage(path: "/") { path } }"#, CallerScope::Read)
+        .await;
+    assert!(!response.errors.is_empty());
+}

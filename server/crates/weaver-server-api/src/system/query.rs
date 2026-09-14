@@ -238,6 +238,42 @@ impl SystemQuery {
 
         Ok(listing.into())
     }
+    /// How full the disk under a folder is, for a folder that is not saved yet.
+    ///
+    /// A folder that does not exist yet reports the disk it would be created
+    /// on. The answer is best effort: a network mount that does not answer
+    /// within a few seconds reports an error instead of holding the request.
+    #[graphql(guard = "AdminGuard")]
+    async fn path_storage(&self, path: String) -> ConfiguredStorage {
+        let requested = PathBuf::from(path.trim());
+        let label = requested.display().to_string();
+        let probe = tokio::task::spawn_blocking(move || {
+            probe_configured_storage(ConfiguredStorageInput {
+                labels: Vec::new(),
+                path: nearest_existing_ancestor(&requested),
+                error: None,
+            })
+        });
+        let result = match tokio::time::timeout(PATH_STORAGE_TIMEOUT, probe).await {
+            Ok(Ok(storage)) => storage,
+            Ok(Err(error)) => ConfiguredStorage {
+                labels: Vec::new(),
+                path: label.clone(),
+                capacity: None,
+                error: Some(error.to_string()),
+            },
+            Err(_) => ConfiguredStorage {
+                labels: Vec::new(),
+                path: label.clone(),
+                capacity: None,
+                error: Some("Filesystem capacity did not answer in time.".to_string()),
+            },
+        };
+        ConfiguredStorage {
+            path: label,
+            ..result
+        }
+    }
     /// Return recent log lines from the in-memory ring buffer.
     #[graphql(guard = "AdminGuard")]
     async fn service_logs(
@@ -388,6 +424,16 @@ fn push_storage_input(
             error: None,
         });
     }
+}
+
+const PATH_STORAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The folder itself when it exists, otherwise the deepest parent that does.
+fn nearest_existing_ancestor(path: &std::path::Path) -> PathBuf {
+    path.ancestors()
+        .find(|candidate| !candidate.as_os_str().is_empty() && candidate.exists())
+        .unwrap_or(path)
+        .to_path_buf()
 }
 
 fn probe_configured_storage(input: ConfiguredStorageInput) -> ConfiguredStorage {

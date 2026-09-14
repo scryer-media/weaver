@@ -796,6 +796,21 @@ export const SYSTEM_INFO_QUERY = gql`
   }
 `;
 
+export const PATH_STORAGE_QUERY = gql`
+  query PathStorage($path: String!) {
+    pathStorage(path: $path) {
+      labels
+      path
+      error
+      capacity {
+        totalBytes
+        usedBytes
+        freeBytes
+      }
+    }
+  }
+`;
+
 export const SERVER_HEALTH_QUERY = gql`
   query ServerHealth {
     serverHealth {
