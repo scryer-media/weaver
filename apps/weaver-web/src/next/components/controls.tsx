@@ -19,6 +19,7 @@ export function PrimaryButton({
   disabled,
   className,
   title,
+  type = "button",
 }: {
   children: ReactNode;
   /** A leading icon, named by the action. */
@@ -27,10 +28,12 @@ export function PrimaryButton({
   disabled?: boolean;
   className?: string;
   title?: string;
+  /** `submit` only inside a real form, where Enter should press it. */
+  type?: "button" | "submit";
 }) {
   return (
     <button
-      type="button"
+      type={type}
       title={title}
       onClick={onClick}
       disabled={disabled}
@@ -458,6 +461,9 @@ export function TextField({
   onFocus,
   onKeyDown,
   ref,
+  id,
+  autoComplete,
+  autoFocus,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -470,10 +476,16 @@ export function TextField({
   onFocus?: () => void;
   onKeyDown?: (event: React.KeyboardEvent<HTMLInputElement>) => void;
   ref?: Ref<HTMLInputElement>;
+  id?: string;
+  autoComplete?: string;
+  autoFocus?: boolean;
 }) {
   return (
     <input
       ref={ref}
+      id={id}
+      autoComplete={autoComplete}
+      autoFocus={autoFocus}
       type={type}
       aria-label={label}
       placeholder={placeholder}
