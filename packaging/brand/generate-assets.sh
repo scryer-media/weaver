@@ -151,9 +151,25 @@ emit_icon "$MARK_COLOR" "$web/favicon.ico" 16 32 48 64 128 256
 
 # The installed-app icons sit on a plate because a home screen or app launcher
 # composites them over wallpaper, where a transparent mark would disappear.
-emit "$MARK_COLOR" 180 80 "#323232" "$web/apple-touch-icon.png"
 emit "$MARK_COLOR" 192 80 "#323232" "$web/app-icon-dark-192.png"
 emit "$MARK_COLOR" 512 80 "#323232" "$web/app-icon-dark-512.png"
+
+# Android crops a maskable icon to whatever shape the launcher uses, and only a
+# centred circle 80% across is promised to survive. The mark is about 1.52
+# times as wide as it is tall, so its corners reach that circle at 67% of the
+# canvas; 64% keeps them inside it with a little air.
+emit "$MARK_COLOR" 192 64 "#323232" "$web/app-icon-maskable-192.png"
+emit "$MARK_COLOR" 512 64 "#323232" "$web/app-icon-maskable-512.png"
+
+# Home-screen icons for iPhone and iPad: 180 (iPhone @3x), 167 (iPad Pro), 152
+# (iPad) and 120 (iPhone @2x). iOS rounds the corners itself and fills any
+# transparency with black, so each is the plated drawing, full bleed, rendered
+# at its own size. The unsized name is the 180 again, for the browsers that
+# fetch that path by convention without reading the document head.
+for size in 180 167 152 120; do
+  emit "$MARK_COLOR" "$size" 80 "#323232" "$web/apple-touch-icon-$size.png"
+done
+cp "$destination/$web/apple-touch-icon-180.png" "$destination/$web/apple-touch-icon.png"
 emit "$MARK_COLOR" 192 80 "#b9b9b9" "$web/app-icon-light-192.png"
 emit "$MARK_COLOR" 512 80 "#b9b9b9" "$web/app-icon-light-512.png"
 cp "$destination/$web/app-icon-light-192.png" "$destination/$web/icon-192.png"

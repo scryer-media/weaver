@@ -33,7 +33,9 @@ What comes out, and from which source:
 
 - `apps/weaver-web/public/` — favicons, the `.ico`, and the installed-app icons,
   from the colour mark. The plated ones sit on `#323232` or `#b9b9b9` because a
-  launcher composites them over wallpaper.
+  launcher composites them over wallpaper. The manifest's maskable pair draws the
+  mark smaller, inside the circle Android promises not to crop, and the Apple
+  home-screen icons come in 180, 167, 152 and 120, each rendered at its size.
 - `server/app/weaver/resources/macos/menubar-*.png` — the mono marks. Each file
   is named for the menu-bar appearance it serves, so the dark-named one holds
   the white drawing.
