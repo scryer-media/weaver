@@ -416,7 +416,7 @@ export function SettingsBlocks({
 /**
  * A settings table scrolls sideways rather than folding.
  *
- * These tables are five columns of machine values — host, threads, transport,
+ * These tables are five columns of machine values — host, connections, transport,
  * role, actions — and the widest of them wants about 640px before its tracks
  * start lying about what they hold. Dropping columns would hide configuration
  * the panel exists to edit, so the table keeps them all and takes its own

@@ -237,7 +237,7 @@ export function MonitoringPage() {
             }
           />
           <MetricCell
-            eyebrow={t("next.monitoring.threads")}
+            eyebrow={t("next.monitoring.connections")}
             value={formatCount(connectionsActive)}
             unit={`/ ${connectionsMax}`}
             note={countLabel(t, "next.monitoring.providersActive", activeProviders)}

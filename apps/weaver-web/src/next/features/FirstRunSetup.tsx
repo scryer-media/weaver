@@ -455,7 +455,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
                   </span>
                   <span className="font-wv-mono text-[11px] text-wv-muted">
                     {server.tls ? "TLS · " : ""}
-                    {t("next.providers.threads")} {server.connections}
+                    {t("next.providers.connections")} {server.connections}
                   </span>
                 </li>
               ))}
@@ -522,9 +522,9 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
               </FormField>
             </div>
 
-            <FormField label={t("next.providers.threads")} help={t("next.providers.threadsHelp")}>
+            <FormField label={t("next.providers.connections")} help={t("next.providers.connectionsHelp")}>
               <NumberField
-                label={t("next.providers.threads")}
+                label={t("next.providers.connections")}
                 value={form.connections}
                 min={1}
                 max={200}

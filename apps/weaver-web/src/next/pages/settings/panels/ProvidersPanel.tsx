@@ -428,10 +428,10 @@ export function ProvidersPanel() {
       id: "servers",
       title: t("next.providers.servers"),
       note: t("next.settings.panel.serversNote"),
-      columns: "minmax(0, 1fr) 92px 190px 150px 44px",
+      columns: "minmax(0, 1fr) 132px 190px 150px 44px",
       headers: [
         t("next.providers.host"),
-        t("next.providers.threads"),
+        t("next.providers.connections"),
         t("next.providers.transport"),
         t("next.providers.role"),
         "",
@@ -452,7 +452,7 @@ export function ProvidersPanel() {
             <span className="min-w-0 truncate font-wv-mono text-[12.5px]">{server.host}</span>
             <span className="flex-none font-wv-mono text-[11px] text-wv-faint">:{server.port}</span>
           </span>,
-          <Cell key="threads" mono>
+          <Cell key="connections" mono>
             {server.connections}
           </Cell>,
           <Cell key="transport" mono className="text-wv-secondary">
@@ -534,8 +534,8 @@ export function ProvidersPanel() {
             },
             {
               id: "connections",
-              label: t("next.providers.threads"),
-              help: t("next.providers.threadsHelp"),
+              label: t("next.providers.connections"),
+              help: t("next.providers.connectionsHelp"),
               control: {
                 kind: "number",
                 value: values.connections,
