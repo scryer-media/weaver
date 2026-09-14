@@ -1744,11 +1744,13 @@ fn the_env_override_recognises_both_directions_and_defers_when_it_cannot() {
 
 #[test]
 fn settings_resolve_env_over_config_over_default() {
-    use super::super::DirectStoreSettings;
     use super::super::router::HOLDS_SCRATCH_CEILING_BYTES;
+    use super::super::{DirectStoreEnv, DirectStoreSettings, HostFacts};
+    use crate::settings::DirectStoreOverrides;
 
+    let unknown = HostFacts::UNKNOWN;
     // Nothing configured anywhere: on, at the 1 GiB default ceiling.
-    let defaults = DirectStoreSettings::resolve_parts(None, None, None, None);
+    let defaults = DirectStoreSettings::resolve_parts(None, DirectStoreEnv::default(), unknown);
     assert_eq!(defaults, DirectStoreSettings::default());
     assert!(defaults.gate.is_enabled(), "the default is on");
     assert_eq!(
@@ -1758,21 +1760,151 @@ fn settings_resolve_env_over_config_over_default() {
     assert_eq!(HOLDS_SCRATCH_CEILING_BYTES, 1024 * 1024 * 1024);
 
     // Config alone decides when the environment says nothing.
-    let configured = DirectStoreSettings::resolve_parts(Some(true), Some(4096), None, None);
+    let config = DirectStoreOverrides {
+        enabled: Some(true),
+        holds_scratch_ceiling_bytes: Some(4096),
+        ..Default::default()
+    };
+    let configured =
+        DirectStoreSettings::resolve_parts(Some(&config), DirectStoreEnv::default(), unknown);
     assert!(configured.gate.is_enabled());
     assert_eq!(configured.holds_scratch_ceiling_bytes, 4096);
 
     // The env override wins in both directions — that is what makes it a kill
     // switch rather than a second way to say the same thing.
-    let killed =
-        DirectStoreSettings::resolve_parts(Some(true), Some(4096), Some(false), Some(8192));
+    let killed = DirectStoreSettings::resolve_parts(
+        Some(&config),
+        DirectStoreEnv {
+            enabled: Some(false),
+            scratch_ceiling: Some(8192),
+            ..Default::default()
+        },
+        unknown,
+    );
     assert!(!killed.gate.is_enabled(), "env off beats config on");
     assert_eq!(killed.holds_scratch_ceiling_bytes, 8192);
-    let forced = DirectStoreSettings::resolve_parts(Some(false), None, Some(true), None);
+    let forced = DirectStoreSettings::resolve_parts(
+        Some(&DirectStoreOverrides {
+            enabled: Some(false),
+            ..Default::default()
+        }),
+        DirectStoreEnv {
+            enabled: Some(true),
+            ..Default::default()
+        },
+        unknown,
+    );
     assert!(forced.gate.is_enabled(), "env on beats config off");
     assert_eq!(
         forced.holds_scratch_ceiling_bytes, HOLDS_SCRATCH_CEILING_BYTES,
         "an unset ceiling override falls through config to the default"
+    );
+}
+
+/// The process-wide limits follow the host when nothing configures them, and
+/// config and the environment override them like every other field.
+#[test]
+fn settings_derive_the_shared_limits_from_the_host() {
+    use super::super::router::HOLDS_SCRATCH_CEILING_BYTES;
+    use super::super::{DirectStoreEnv, DirectStoreSettings, HostFacts};
+    use crate::settings::DirectStoreOverrides;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let resolve = |config: Option<&DirectStoreOverrides>, env, host| {
+        DirectStoreSettings::resolve_parts(config, env, host)
+    };
+    let none = DirectStoreEnv::default();
+
+    // A host that says nothing: four sets' worth of RAM, four sets' worth of
+    // scratch, and the extractor's smallest reserve.
+    let unknown = resolve(None, none, HostFacts::UNKNOWN);
+    assert_eq!(unknown.holds_resident_limit_bytes, 256 * MIB);
+    assert_eq!(
+        unknown.holds_scratch_total_bytes,
+        4 * HOLDS_SCRATCH_CEILING_BYTES
+    );
+    assert_eq!(unknown.holds_disk_reserve_bytes, 512 * MIB);
+
+    // A sixteenth of usable memory, clamped to one set's budget below and
+    // sixteen above: an 8 GiB box, a 512 MiB container, a 64 GiB server.
+    let host = |memory: u64, fs: u64| HostFacts {
+        total_memory_bytes: Some(memory),
+        working_fs_total_bytes: Some(fs),
+    };
+    assert_eq!(
+        resolve(None, none, host(8 * GIB, 100 * GIB)).holds_resident_limit_bytes,
+        512 * MIB
+    );
+    assert_eq!(
+        resolve(None, none, host(512 * MIB, 100 * GIB)).holds_resident_limit_bytes,
+        64 * MIB,
+        "a small container still affords one set its whole budget"
+    );
+    assert_eq!(
+        resolve(None, none, host(64 * GIB, 100 * GIB)).holds_resident_limit_bytes,
+        GIB,
+        "a large box does not turn holds into a RAM cache"
+    );
+    // A twentieth of the filesystem, on the extractor's clamp.
+    assert_eq!(
+        resolve(None, none, host(8 * GIB, 100 * GIB)).holds_disk_reserve_bytes,
+        5 * GIB
+    );
+    assert_eq!(
+        resolve(None, none, host(8 * GIB, 2 * GIB)).holds_disk_reserve_bytes,
+        512 * MIB
+    );
+    assert_eq!(
+        resolve(None, none, host(8 * GIB, 2048 * GIB)).holds_disk_reserve_bytes,
+        20 * GIB
+    );
+
+    // The scratch total tracks the per-set ceiling it multiplies, wherever
+    // that ceiling came from.
+    let config = DirectStoreOverrides {
+        holds_scratch_ceiling_bytes: Some(4096),
+        ..Default::default()
+    };
+    assert_eq!(
+        resolve(Some(&config), none, HostFacts::UNKNOWN).holds_scratch_total_bytes,
+        4 * 4096
+    );
+
+    // Config beats the host, and the environment beats config, field by field.
+    let config = DirectStoreOverrides {
+        holds_resident_limit_bytes: Some(1000),
+        holds_scratch_total_bytes: Some(2000),
+        holds_disk_reserve_bytes: Some(0),
+        ..Default::default()
+    };
+    let configured = resolve(Some(&config), none, host(8 * GIB, 100 * GIB));
+    assert_eq!(configured.holds_resident_limit_bytes, 1000);
+    assert_eq!(configured.holds_scratch_total_bytes, 2000);
+    assert_eq!(
+        configured.holds_disk_reserve_bytes, 0,
+        "zero is a real answer: no reserve"
+    );
+    let overridden = resolve(
+        Some(&config),
+        DirectStoreEnv {
+            resident_limit: Some(10),
+            scratch_total: Some(20),
+            disk_reserve: Some(30),
+            ..Default::default()
+        },
+        host(8 * GIB, 100 * GIB),
+    );
+    assert_eq!(overridden.holds_resident_limit_bytes, 10);
+    assert_eq!(overridden.holds_scratch_total_bytes, 20);
+    assert_eq!(overridden.holds_disk_reserve_bytes, 30);
+    assert_eq!(
+        overridden.holds_limits(),
+        super::super::accountant::HoldsLimits {
+            resident_bytes: 10,
+            scratch_bytes: 20,
+            disk_reserve_bytes: 30,
+        }
     );
 }
 
@@ -1786,13 +1918,13 @@ fn settings_resolve_reads_the_config_table() {
         intermediate_dir: None,
         complete_dir: None,
         buffer_pool: None,
-        tuner: None,
         servers: Vec::new(),
         categories: Vec::new(),
         retry: None,
         max_download_speed: None,
         cleanup_after_extract: None,
         isp_bandwidth_cap: None,
+        propagation_delay_secs: None,
         ip_replacement_trial_extra_connections: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: crate::jobs::DuplicatePolicy::default(),
@@ -1805,7 +1937,7 @@ fn settings_resolve_reads_the_config_table() {
     // Skipped rather than asserted when the developer running the suite has an
     // override exported: `resolve` reads the real process environment, and the
     // precedence rule itself is covered above with the environment injected.
-    if super::super::env_override().is_some() || super::super::env_scratch_ceiling().is_some() {
+    if super::super::env().any_set() {
         return;
     }
 
@@ -1818,6 +1950,7 @@ fn settings_resolve_reads_the_config_table() {
     config.direct_store = Some(DirectStoreOverrides {
         enabled: Some(false),
         holds_scratch_ceiling_bytes: Some(64 * 1024 * 1024),
+        ..Default::default()
     });
     assert!(
         !DirectStoreSettings::resolve(&config).gate.is_enabled(),
@@ -1827,6 +1960,7 @@ fn settings_resolve_reads_the_config_table() {
     config.direct_store = Some(DirectStoreOverrides {
         enabled: Some(true),
         holds_scratch_ceiling_bytes: Some(64 * 1024 * 1024),
+        ..Default::default()
     });
     let resolved = DirectStoreSettings::resolve(&config);
     assert!(
@@ -2392,6 +2526,78 @@ fn retiring_a_set_that_never_built_a_barrier_still_deletes_its_row() {
 }
 
 #[test]
+fn repair_batches_do_not_recreate_a_checkpoint_between_replacement_stripes() {
+    repair_batch_checkpoint(false);
+}
+
+#[test]
+fn repair_batches_keep_checkpoints_fenced_after_a_failed_closing_stripe() {
+    repair_batch_checkpoint(true);
+}
+
+fn repair_batch_checkpoint(corrupt: bool) {
+    use super::super::set::DirectSet;
+
+    let image = vec![42; 400];
+    let (router, _) = straddle_router(&image, 64);
+    let mut set = DirectSet::new(JOB, router.plan().clone());
+    set.router = router;
+    set.router.stage_for_test(0, 64, &image);
+    let spans = set.router.drain_for_test(0).unwrap();
+    set.record_writes(&spans, Instant::now());
+    let recorder = Recorder::default();
+    let checkpoint = |set: &mut DirectSet| {
+        set.run_barrier(
+            BarrierTrigger::Demand(BarrierDemand::RepairRecreate),
+            Instant::now(),
+            &mut recorder.clone(),
+            &mut recorder.clone(),
+            &mut recorder.clone(),
+        )
+    };
+    checkpoint(&mut set).unwrap().unwrap();
+    assert!(recorder.committed().is_some());
+    set.delete_checkpoint_row(&mut recorder.clone()).unwrap();
+    assert!(recorder.committed().is_none());
+
+    let spans = set
+        .router
+        .route_repaired_batch(0, &[(64, Arc::from(&image[..200]))], &[], false, false)
+        .unwrap();
+    set.record_writes(&spans, Instant::now());
+    let operations = recorder.ops();
+    assert!(checkpoint(&mut set).is_none());
+    assert_eq!(
+        recorder.ops(),
+        operations,
+        "no drain, sync or persist during the replacement"
+    );
+    assert!(recorder.committed().is_none());
+
+    let mut tail = image[200..].to_vec();
+    if corrupt {
+        tail[0] ^= 1;
+    }
+    let result = set
+        .router
+        .route_repaired_batch(0, &[(264, Arc::from(tail))], &[], false, true);
+    if corrupt {
+        assert!(result.is_err());
+        assert!(set.router.repair_batch_in_progress());
+        assert!(!set.router.all_members_verified());
+        assert!(checkpoint(&mut set).is_none());
+        assert_eq!(recorder.ops(), operations);
+        assert!(recorder.committed().is_none());
+        return;
+    }
+    let spans = result.unwrap();
+    set.record_writes(&spans, Instant::now());
+    assert!(set.router.all_members_verified());
+    checkpoint(&mut set).unwrap().unwrap();
+    assert!(recorder.committed().is_some());
+}
+
+#[test]
 fn a_finalized_set_refuses_to_be_demoted() {
     // The two terminal states are mutually exclusive, and finalization is the
     // one that already renamed members onto their destinations. Demoting after
@@ -2424,7 +2630,9 @@ fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
     covered.insert(140, total - 140);
     let mut fixture = provider_fixture(covered.clone());
     let held: Arc<[u8]> = Arc::from(&fixture.conventional[100..140]);
-    fixture.volume.held = Arc::new(vec![(100u64, held)]);
+    fixture.volume.held = Arc::new(vec![super::super::provider::HeldRun::memory(
+        100, held, 0, 40,
+    )]);
 
     assert_eq!(
         fixture.volume.readable_prefix(),
@@ -2462,6 +2670,57 @@ fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
     .expect("every article composes once the hold is in the coverage");
     assert_eq!(rebuilt[0].contiguous, fixture.conventional.len() as u64);
     assert_eq!(std::fs::read(&path).unwrap(), fixture.conventional);
+}
+
+/// A hold the budget paged out is served from the scratch image, positionally,
+/// when a read lands on it. The provider owns no copy: what the budget paged
+/// out stays out, whatever the size of the holds.
+#[test]
+fn a_virtual_volume_reads_a_paged_hold_from_the_scratch_on_demand() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let total = whole_volume_covered().end();
+    let mut covered = ByteRanges::new();
+    covered.insert(0, 100);
+    covered.insert(140, total - 140);
+    let mut fixture = provider_fixture(covered);
+
+    // The router paged the hold behind an earlier region, so the run's scratch
+    // offset is not its physical offset and a read has to use the right one.
+    let mut scratch = super::super::router::HoldsScratch::new(
+        fixture._dir.path().join(".weaver-holds.silver.horizon.f0"),
+        1 << 20,
+    );
+    scratch
+        .append(b"an earlier hold that was placed since")
+        .unwrap();
+    let paged_at = scratch.append(&fixture.conventional[100..140]).unwrap();
+    let pin = scratch.pin().unwrap();
+    fixture.volume.held = Arc::new(vec![super::super::provider::HeldRun::scratch(
+        100, pin, paged_at, 40,
+    )]);
+
+    assert_eq!(
+        fixture.volume.readable_prefix(),
+        Some(fixture.conventional.len() as u64),
+        "a paged hold claims and sources its bytes exactly like a resident one"
+    );
+    let provider = super::super::provider::HybridVolumeProvider::new(vec![fixture.volume.clone()]);
+    let mut reader = provider.open(0).expect("volume 0 is registered");
+    let mut read = Vec::new();
+    reader
+        .read_to_end(&mut read)
+        .expect("the whole volume reads");
+    assert_eq!(
+        read, fixture.conventional,
+        "the paged hold reads back exactly as posted, through the scratch"
+    );
+
+    // A read starting inside the run offsets into the scratch region.
+    reader.seek(SeekFrom::Start(120)).unwrap();
+    let mut tail = [0u8; 20];
+    reader.read_exact(&mut tail).unwrap();
+    assert_eq!(&tail, &fixture.conventional[120..140]);
 }
 
 #[test]

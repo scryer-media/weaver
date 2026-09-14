@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextIt } from "@/next/i18n/it";
 
 const it: LocaleDictionary = {
   // Brand
@@ -9,6 +10,8 @@ const it: LocaleDictionary = {
   "nav.upload": "Carica",
   "nav.settings": "Impostazioni",
   "nav.sponsor": "Sostieni",
+  "update.newVersion": "Nuova versione v{{version}}",
+  "update.newVersionAria": "Apri Weaver v{{version}} su GitHub in una nuova scheda",
 
   // Status labels
   "status.queued": "In coda",
@@ -209,7 +212,7 @@ const it: LocaleDictionary = {
   "settings.generalPageDesc": "Regola velocità di download, percorsi di archiviazione, comportamento di pulizia e politica di riprova da un unico posto.",
   "settings.language": "Lingua",
   "settings.languageDesc": "Scegli la lingua di visualizzazione dell'interfaccia di Weaver.",
-  "settings.bandwidthCap": "Limite Banda ISP",
+  "settings.bandwidthCap": "Larghezza di banda",
   "settings.bandwidthCapDesc": "Blocca l'invio di nuovi download quando la quota ISP è esaurita. I job in coda mantengono la posizione e il post-processing già in corso può continuare.",
   "settings.bandwidthCapEnabled": "Abilita limite ISP",
   "settings.bandwidthCapEnabledDesc": "Traccia l'utilizzo continuamente e blocca solo i nuovi download di articoli quando la finestra attiva è esaurita.",
@@ -628,7 +631,14 @@ const it: LocaleDictionary = {
   "upload.duplicateScore": "Punteggio duplicato",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "I punteggi più alti vincono nella stessa chiave; a parità resta il candidato esistente.",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "Scarica il pacchetto diagnostico",
+  "systemInfo.diagnosticsBusy": "Raccolta dei dati diagnostici…",
+  "systemInfo.diagnosticsHint": "La raccolta richiede circa 15 secondi: le metriche vengono campionate due volte, a dieci secondi di distanza. Password, chiavi API e altri segreti vengono rimossi.",
+  "systemInfo.diagnosticsFailed": "Non è stato possibile creare il pacchetto diagnostico.",
   ...duplicateLocaleEntries.ita,
+  ...nextIt,
 };
 
 export default it;

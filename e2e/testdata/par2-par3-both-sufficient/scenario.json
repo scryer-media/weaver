@@ -1,0 +1,16 @@
+{
+  "slug": "par2-par3-both-sufficient",
+  "title": "E2E.Test.PAR2.PAR3.Both.Sufficient.Jasper.Ferry.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A payload with both a PAR2 set and a PAR3 set, each able to repair the two damaged blocks alone. Either set may do the repair; the payload must be delivered intact.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "jasper.ferry.s01e02.mkv": "bc39a540b64c657372d9c3961b03cfcd0c6aed623a7d9ad56295fbda406e6edd"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

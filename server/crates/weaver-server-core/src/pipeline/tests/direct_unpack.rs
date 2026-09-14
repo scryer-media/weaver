@@ -13,6 +13,8 @@ use crate::pipeline::direct_unpack::settings::{DirectUnpackGate, DirectUnpackSet
 use crate::pipeline::direct_unpack::start_header::MAGIC;
 use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
 
+mod repair_guards;
+
 /// Turn the feature on for one pipeline, the way config would.
 fn enable_direct_unpack(pipeline: &mut Pipeline) {
     pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
@@ -683,6 +685,68 @@ async fn consumption_attributes_the_chase_bytes_to_the_extracting_phase_once() {
         expected_total,
         "the phase must report the chase's real bytes, attributed exactly once"
     );
+}
+
+#[tokio::test]
+async fn conventional_split_7z_jobs_finish_after_peer_metadata_grows() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    disable_direct_unpack(&mut pipeline);
+    let set = "generated_split_store_plain.7z";
+    let files = sevenz_fixture_bytes(set);
+    let jobs = [JobId(41118), JobId(41119)];
+    for job in jobs {
+        insert_active_job(
+            &mut pipeline,
+            job,
+            rar_job_spec("Retained Peer Split", &files),
+        )
+        .await;
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job, index as u32, name, bytes).await;
+        }
+        let staging = pipeline.extraction_staging_dir(job);
+        pipeline.extraction_budget(job, &staging).unwrap();
+    }
+    // Model PAR2/scheduling metadata arriving after both budgets were created.
+    // Keep it alive until both real decoders finish: neither can rely on the
+    // other job completing to release this retained state.
+    let metadata = pipeline
+        .process_memory_budget
+        .for_job(41117)
+        .try_reserve_retained(1024 * 1024)
+        .unwrap();
+    for job in jobs {
+        pipeline.extract_7z_set(job, set).await.unwrap();
+    }
+    let mut completed = std::collections::HashSet::new();
+    for _ in jobs {
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            next_extraction_done(&mut pipeline),
+        )
+        .await
+        .expect("decoder admission must progress");
+        let ExtractionDone::FullSet { job_id, result, .. } = done else {
+            panic!("full set required")
+        };
+        let outcome = result.expect("peer metadata must not fail extraction");
+        assert_eq!(outcome.extracted.len(), 1);
+        let member = &outcome.extracted[0];
+        assert_eq!(
+            std::fs::read(pipeline.extraction_staging_dir(job_id).join(member)).unwrap(),
+            std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/sevenz/originals")
+                    .join(member)
+            )
+            .unwrap()
+        );
+        completed.insert(job_id);
+    }
+    assert_eq!(completed, jobs.into_iter().collect());
+    drop(metadata);
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
 }
 
 #[tokio::test]
@@ -1486,6 +1550,57 @@ async fn a_set_armed_after_its_download_ended_is_not_killed_by_the_settle() {
     );
 }
 
+/// A set that learned another part after it armed.
+///
+/// The coverage is sized at arming. When the set's parts later resolve to a
+/// different count — an obfuscated volume bound to the set after the chase
+/// started — the settle used to walk the new part list against the old
+/// coverage and address a part it never had. The chase has to stop instead,
+/// retryably, and leave the set to extraction.
+#[tokio::test]
+async fn a_set_whose_parts_changed_after_arming_is_aborted_by_the_settle() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let job_id = JobId(41615);
+    let set_name = "generated_split_store_plain.7z";
+
+    let files = sevenz_fixture_bytes(set_name);
+    assert!(files.len() > 1, "the fixture is a split set");
+    let spec = rar_job_spec("Silver Horizon Split", &files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
+    }
+    assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
+
+    // Stand in for the arming that happened while the set knew one part fewer.
+    let stale = std::sync::Arc::new(crate::pipeline::direct_unpack::SetCoverage::new(
+        files.len() - 1,
+    ));
+    let running = pipeline
+        .direct_unpack
+        .replace_armed_coverage(job_id, set_name, std::sync::Arc::clone(&stale))
+        .expect("armed");
+
+    pipeline.settle_direct_unpack_after_download(job_id);
+
+    let armed = pipeline.direct_unpack.is_armed(job_id, set_name);
+    let latched = pipeline.direct_unpack.latched_reason(job_id, set_name);
+    let demoted = pipeline.direct_unpack.counters().demoted_part_unreadable;
+    running.abort("test teardown".to_string());
+    pipeline.direct_unpack_shutdown("test teardown").await;
+
+    assert!(!armed, "a chase over a set that changed shape must end");
+    assert!(
+        stale.abort_reason().is_some(),
+        "and its coverage must say why"
+    );
+    assert_eq!(latched, None, "the set may arm again with its real parts");
+    assert_eq!(demoted, 1);
+}
+
 /// The panic, at the seam that caused it.
 ///
 /// The download drains while a part's writes are still flushing, so the file on
@@ -2232,7 +2347,7 @@ async fn a_late_par2_registration_leaves_the_chase_able_to_resolve_its_parts() {
         "the topology must survive a registration that lands after the data does"
     );
     assert!(
-        pipeline.sevenz_set_part_paths(job_id, set_name).is_ok(),
+        pipeline.archive_set_part_paths(job_id, set_name).is_ok(),
         "and the chase must still be able to resolve its parts"
     );
 
@@ -2736,6 +2851,27 @@ async fn consumption_gives_up_on_a_chase_that_never_finishes() {
     let outcome = result.expect("conventional extraction must finish after the deadline");
     assert_eq!(outcome.extracted.len(), 1);
 
+    // Whatever the parked chase showed in the Extracting phase while it was
+    // awaited is taken back out when it is given up on, so the phase holds the
+    // fallback's bytes and nothing twice.
+    let installed_len = std::fs::metadata(
+        pipeline
+            .extraction_staging_dir(job_id)
+            .join(&outcome.extracted[0]),
+    )
+    .unwrap()
+    .len();
+    let counters = pipeline
+        .phase_progress
+        .get(&(job_id, JobPhase::Extracting))
+        .map(|runtime| Arc::clone(&runtime.counters))
+        .expect("the Extracting phase exists");
+    assert_eq!(counters.total_bytes.load(Ordering::Relaxed), installed_len);
+    assert_eq!(
+        counters.completed_bytes.load(Ordering::Relaxed),
+        installed_len
+    );
+
     let reason = coverage
         .abort_reason()
         .expect("the deadline must end the chase's coverage");
@@ -3082,7 +3218,7 @@ async fn parked_chases_share_the_decoder_memory_pool() {
     let pool = std::sync::Arc::new(crate::pipeline::extraction::ProcessMemoryBudget::new(
         256 * MIB,
     ));
-    pipeline.direct_unpack_process_memory = std::sync::Arc::clone(&pool);
+    pipeline.process_memory_budget = std::sync::Arc::clone(&pool);
     let set_name = "silver_horizon.7z";
 
     let archive = std::fs::read(

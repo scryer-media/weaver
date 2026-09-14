@@ -34,7 +34,7 @@ async function expectRejectedSignIn(page: Page, password: string): Promise<void>
   );
   await page.getByRole("button", { name: "Sign In" }).click();
   expect((await loginResponse).status()).toBe(401);
-  await expect(page.locator("#error")).toContainText("invalid credentials");
+  await expect(page.locator("#error")).toContainText(/invalid credentials/i);
 }
 
 test.describe.serial("security product behavior", () => {
@@ -116,7 +116,9 @@ test.describe.serial("security product behavior", () => {
       maxCount: 8,
     });
     await page.getByRole("button", { name: "Enable Login" }).click();
-    await expect(page.getByText("Login protection enabled")).toBeVisible();
+    // The first query refused after the switch takes this very tab to the
+    // sign-in page.
+    await expect(page.getByRole("button", { name: "Sign In" })).toBeVisible();
 
     await page.goto("/");
     await expect(page.getByRole("button", { name: "Sign In" })).toBeVisible();

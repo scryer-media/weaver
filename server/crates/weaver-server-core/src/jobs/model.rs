@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::JobId;
 use crate::jobs::record::ActiveFileIdentity;
+use crate::jobs::server_attribution::JobServerAttribution;
 use crate::pipeline::download::queue::{DownloadQueue, DownloadWork};
 use weaver_model::files::FileRole;
 
@@ -127,6 +128,30 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
+    /// Conservative admission estimate for the spec, queue entries, assembly
+    /// indexes, and their cloned strings. Count placements even when message
+    /// IDs repeat: each placement still owns scheduling and output state.
+    pub(crate) fn scheduling_memory_estimate(&self) -> u64 {
+        let per_file = (8 * std::mem::size_of::<crate::jobs::assembly::FileAssembly>()
+            + 4 * std::mem::size_of::<FileSpec>()) as u64;
+        let per_segment = (4 * std::mem::size_of::<crate::DownloadWork>()
+            + 2 * std::mem::size_of::<SegmentSpec>()
+            + 64) as u64;
+        self.files.iter().fold(0u64, |total, file| {
+            let file_bytes = file.groups.iter().fold(
+                per_file.saturating_add((file.filename.len() as u64).saturating_mul(4)),
+                |bytes, group| bytes.saturating_add((group.len() as u64).saturating_mul(4)),
+            );
+            file.segments
+                .iter()
+                .fold(total.saturating_add(file_bytes), |bytes, segment| {
+                    bytes
+                        .saturating_add(per_segment)
+                        .saturating_add((segment.message_id.len() as u64).saturating_mul(4))
+                })
+        })
+    }
+
     /// Total bytes of PAR2 recovery files in this spec.
     pub fn par2_bytes(&self) -> u64 {
         self.files
@@ -560,6 +585,12 @@ pub struct JobState {
     /// the download-phase rate, which must integrate the same bytes as the
     /// global speed gauge so a queue row and the nav counter agree.
     pub downloaded_wire_bytes: u64,
+    /// Which servers served this job's articles, counted as they land.
+    ///
+    /// Reporting only: nothing in the scheduling or failover path reads it.
+    /// An article whose server cannot be named is left uncounted, so this
+    /// understates rather than misattributes.
+    pub server_attribution: JobServerAttribution,
     /// Conservative restored progress floor from persisted file-write checkpoints.
     /// This is only used for reporting after restart and must not affect scheduling.
     pub restored_download_floor_bytes: u64,
@@ -585,6 +616,28 @@ pub struct JobState {
     pub health_probing: bool,
     /// Probe activation counter used to rotate sampled segments across rounds.
     pub health_probe_round: u32,
+    /// How many files had already lost a segment when the last probe round was
+    /// armed.
+    ///
+    /// A round is armed on a state change, not on every terminal segment: the
+    /// failed-byte watermark below, or a file that had not failed before. The
+    /// tenth dead article in a volume nobody posted tells the policy nothing
+    /// the first one did not.
+    pub health_probe_failing_files: usize,
+    /// Indexes of the health-counted files this job has lost at least one
+    /// segment of, kept on the booking edge alongside `failed_bytes`.
+    ///
+    /// The probe policy reads its file count on every terminal segment; a
+    /// count derived by walking the terminal-state ledger there would be a
+    /// scan of every failure per failure, quadratic on exactly the release
+    /// the probe exists to abandon quickly.
+    pub health_failing_files: std::collections::HashSet<u32>,
+    /// Recovery blocks early promotion has already asked the queues for.
+    ///
+    /// Promotion walks the parked and queued recovery work to select blocks,
+    /// so it runs only when the shortfall has grown past this figure, not on
+    /// every failure that leaves it unchanged.
+    pub early_recovery_requested_blocks: u32,
     /// Highest failed-byte watermark that has already been health-probed.
     pub last_health_probe_failed_bytes: u64,
     /// Minimum failed-byte watermark required before arming another probe round.

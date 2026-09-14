@@ -1,0 +1,17 @@
+{
+  "slug": "par3-rar5-repair",
+  "title": "E2E.Test.PAR3.RAR5.Repair.Carmine.Hollow.S01E04.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A compressed three-volume RAR5 set with an external PAR3 set and two blocks of the interior volume zeroed. Repair runs before extraction.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "carmine.hollow.s01e04.mkv": "1c64df2535200736bde100df2d8fb81cc0507f2757d678d0c7225e40cec11616"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

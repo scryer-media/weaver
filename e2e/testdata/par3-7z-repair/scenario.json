@@ -1,0 +1,17 @@
+{
+  "slug": "par3-7z-repair",
+  "title": "E2E.Test.PAR3.7z.Repair.Pewter.Canal.S01E03.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "An LZMA2 7z with an external PAR3 set and two blocks zeroed well past the header. Repair runs before extraction.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "pewter.canal.s01e03.mkv": "8d5408731186de4dd5a03666b5f22bd3333ab7c6b26a6bf197f9d24040aba12e"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

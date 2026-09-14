@@ -1,0 +1,14 @@
+{
+  "slug": "par3-inside-7z-repair",
+  "title": "E2E.Test.PAR3.Inside.7z.Repair.Cinder.Atlas.S01E04.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "An uncompressed 7z with PAR3 protection inserted by the reference and 100 bytes of packed data overwritten before posting.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "cinder.atlas.s01e04.mkv": "3c395524b262a63cd8a0c2bc75f766673d5d250b1690f0dc374697e363d2b1a9"
+  },
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

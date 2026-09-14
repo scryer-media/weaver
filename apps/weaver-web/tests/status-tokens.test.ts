@@ -5,6 +5,7 @@ import { isActiveStatus, statusI18nKey, statusToken } from "../src/lib/status-to
 test("every queue API state has an explicit first-party presentation", () => {
   const cases = [
     ["QUEUED", "queued", "status.queued"],
+    ["PROPAGATING", "queued", "status.propagating"],
     ["DOWNLOADING", "downloading", "status.downloading"],
     ["FETCHING_REPAIR_DATA", "repairing", "status.fetchingRepairData"],
     ["FINALIZING_DOWNLOAD", "downloading", "timeline.finalizingDownload"],

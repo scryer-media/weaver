@@ -25,8 +25,6 @@ pub struct Config {
     #[serde(default)]
     pub buffer_pool: Option<BufferPoolOverrides>,
     #[serde(default)]
-    pub tuner: Option<TunerOverrides>,
-    #[serde(default)]
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub categories: Vec<CategoryConfig>,
@@ -35,6 +33,9 @@ pub struct Config {
     /// Maximum download speed in bytes/sec. 0 or absent means unlimited.
     #[serde(default)]
     pub max_download_speed: Option<u64>,
+    /// Minimum post age before downloading. Zero disables the hold.
+    #[serde(default)]
+    pub propagation_delay_secs: Option<u32>,
     /// Whether to delete intermediate files (NZB articles, PAR2, RAR volumes)
     /// after successful extraction. Defaults to true.
     #[serde(default)]
@@ -55,7 +56,7 @@ pub struct Config {
     /// RAR direct-store routing. Absent means "every default".
     #[serde(default)]
     pub direct_store: Option<DirectStoreOverrides>,
-    /// 7z direct unpack. Absent means "every default".
+    /// 7z and ZIP/ZIP64 direct unpack. Absent means "every default".
     #[serde(default)]
     pub direct_unpack: Option<DirectUnpackOverrides>,
     /// Naming policy for the files a finished job delivers. Absent means
@@ -122,6 +123,17 @@ impl Config {
         self.ip_replacement_trial_extra_connections
             .unwrap_or(0)
             .min(1)
+    }
+
+    /// A saved setting takes precedence over the legacy environment override.
+    pub fn propagation_delay_secs(&self) -> u32 {
+        self.propagation_delay_secs
+            .or_else(|| {
+                std::env::var("WEAVER_PROPAGATION_DELAY_SECS")
+                    .ok()
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .unwrap_or(0)
     }
 
     /// Validate the configuration, returning any issues found.
@@ -226,11 +238,25 @@ pub struct DirectStoreOverrides {
     pub enabled: Option<bool>,
     /// Per-set ceiling on the holds scratch file, in bytes. Decoded bytes whose
     /// destination is not yet known are held in RAM and paged here on a breach;
-    /// breaching *this* ceiling demotes that one set. Defaults to 512 MiB.
+    /// breaching *this* ceiling demotes that one set. Defaults to 1 GiB.
     pub holds_scratch_ceiling_bytes: Option<u64>,
+    /// Process-wide ceiling on RAM-resident holds across every set, in bytes.
+    /// Over it, the set that is routing pages its holds to scratch. Defaults
+    /// to a sixteenth of the memory the process can use, between 64 MiB and
+    /// 1 GiB.
+    pub holds_resident_limit_bytes: Option<u64>,
+    /// Process-wide ceiling on holds scratch across every set, in bytes. A
+    /// spill that would exceed it demotes the set that asked. Defaults to four
+    /// times the per-set ceiling.
+    pub holds_scratch_total_bytes: Option<u64>,
+    /// Free space the working directory's filesystem must keep, in bytes. A
+    /// spill that would leave less demotes the set that asked. Defaults to a
+    /// twentieth of the filesystem, between 512 MiB and 20 GiB; zero disables
+    /// the check.
+    pub holds_disk_reserve_bytes: Option<u64>,
 }
 
-/// Operator-facing switches for 7z direct unpack (`[direct_unpack]`).
+/// Operator-facing switches for 7z and ZIP/ZIP64 direct unpack (`[direct_unpack]`).
 ///
 /// Same precedence as `[direct_store]` — **environment over config over
 /// default** — resolved in `pipeline::direct_unpack::DirectUnpackSettings::resolve`;
@@ -240,7 +266,7 @@ pub struct DirectStoreOverrides {
 /// filled one and an older config file all mean "use the defaults".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirectUnpackOverrides {
-    /// Begin extracting a 7z set while its parts are still downloading, instead
+    /// Begin extracting a 7z or ZIP set while its parts are still downloading, instead
     /// of waiting for the whole set to land.
     ///
     /// **Defaults to on.** Set to `false` here, or export the environment
@@ -327,15 +353,6 @@ pub struct RetryOverrides {
     pub multiplier: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TunerOverrides {
-    pub max_concurrent_downloads: Option<usize>,
-    pub decode_thread_count: Option<usize>,
-    /// Number of threads in the post-processing pool (extraction, PAR2 verify/repair).
-    /// Defaults to `(physical_cores / 2).max(1)`.
-    pub extract_thread_count: Option<usize>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,7 +364,6 @@ mod tests {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: vec![ServerConfig {
                 id: 1,
                 host: "news.example.com".to_string(),
@@ -372,6 +388,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
+            propagation_delay_secs: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),

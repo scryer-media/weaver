@@ -1,0 +1,19 @@
+{
+  "slug": "par3-obfuscated-names",
+  "title": "E2E.Test.PAR3.Obfuscated.Names.Indigo.Vale.S01E08.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "The payload posted under an obfuscated hex name, with one block damaged. The name the PAR3 set records is the only trustworthy one, so the delivered file must carry it.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "indigo.vale.s01e08.mkv": "5c0eba8bbfdd683635fef458bc3f4626c1c918a7211e1c3fca10a63baf17efc9"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ],
+  "forbiddenOutputPaths": [
+    "51273aad56a8b904e96928935278a627.201"
+  ]
+}

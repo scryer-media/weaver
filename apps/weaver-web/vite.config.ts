@@ -19,8 +19,14 @@ const PUBLIC_PWA_ASSETS = [
   "/favicon-light-32.png",
   "/favicon-dark-32.png",
   "/apple-touch-icon.png",
+  "/apple-touch-icon-180.png",
+  "/apple-touch-icon-167.png",
+  "/apple-touch-icon-152.png",
+  "/apple-touch-icon-120.png",
   "/app-icon-dark-192.png",
   "/app-icon-dark-512.png",
+  "/app-icon-maskable-192.png",
+  "/app-icon-maskable-512.png",
 ];
 
 function buildManualPwaPlugin(): Plugin {

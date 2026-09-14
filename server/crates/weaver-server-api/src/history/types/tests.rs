@@ -31,6 +31,7 @@ fn history_item_roundtrips_attributes_and_client_request_id() {
             ])
             .unwrap(),
         ),
+        server_attribution: None,
     };
 
     let item = history_item_from_row(&row, None);
@@ -64,6 +65,7 @@ fn history_item_builds_when_release_parse_is_not_media() {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: None,
+        server_attribution: None,
     };
 
     let item = history_item_from_row(&row, None);
@@ -98,6 +100,7 @@ fn history_filter_supports_exact_attribute_matches() {
             )])
             .unwrap(),
         ),
+        server_attribution: None,
     };
 
     let item = history_item_from_row(&row, None);

@@ -36,7 +36,7 @@ impl Pipeline {
                 let _ = reply.send(result);
             }
             SchedulerCommand::ResumeJob { job_id, reply } => {
-                let result = self.resume_job_runtime(job_id);
+                let result = self.resume_restored_job(job_id).await;
                 if result.is_ok() {
                     self.publish_snapshot();
                     let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
@@ -145,6 +145,10 @@ impl Pipeline {
                         } else {
                             serde_json::to_string(&state.spec.metadata).ok()
                         },
+                        // A cancelled job keeps whatever it managed to pull
+                        // before the cancel: the servers did the work, and the
+                        // row is the only place left to say so.
+                        server_attribution: state.server_attribution.to_storage_json(),
                     };
                     let archive_result = self
                         .db_blocking({
@@ -169,6 +173,7 @@ impl Pipeline {
                             .jobs
                             .remove(&job_id)
                             .expect("job was retained until archive completed");
+                        self.retire_stalled_download_lanes(job_id);
                         self.job_order.retain(|id| *id != job_id);
                         self.remove_pending_completion_check(job_id);
                         self.update_queue_metrics();
@@ -186,6 +191,8 @@ impl Pipeline {
                         self.active_decodes_by_job.remove(&job_id);
                         self.active_decodes_by_file
                             .retain(|file_id, _| file_id.job_id != job_id);
+                        self.active_decode_bytes
+                            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
                         self.pending_retries_by_job.remove(&job_id);
                         self.pending_retries_by_segment
                             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
@@ -390,6 +397,7 @@ impl Pipeline {
             SchedulerCommand::PauseAll { reply } => {
                 self.global_paused = true;
                 self.scheduled_pause = false;
+                self.download_restart_durable_lead_retry_after.clear();
                 self.shared_state.set_paused(true);
                 self.shared_state.set_download_block(
                     self.bandwidth_cap
@@ -452,6 +460,16 @@ impl Pipeline {
                 self.configured_rate_limit = bytes_per_sec;
                 if self.scheduled_rate_limit.is_none() {
                     self.rate_limiter.set_rate(bytes_per_sec);
+                }
+                let _ = reply.send(());
+            }
+            SchedulerCommand::SetPropagationDelay { seconds, reply } => {
+                let delay = Duration::from_secs(u64::from(seconds));
+                if self.propagation_delay != delay {
+                    self.propagation_delay = delay;
+                    self.propagation_ready_at.clear();
+                    self.dispatch_downloads();
+                    self.publish_snapshot();
                 }
                 let _ = reply.send(());
             }
@@ -557,7 +575,13 @@ impl Pipeline {
                     // totals carry across the rebuild.
                     self.server_counters =
                         Self::activate_server_counters(&self.metrics, &self.nntp);
+                    // Depth explorers are keyed by pool position, so they are
+                    // rebuilt against the new layout. A server that survived
+                    // the rebuild keeps what it had measured, matched by
+                    // stable id rather than by position.
+                    self.seed_download_lane_explorers();
                     let recovery_requeues = self.wake_all_infrastructure_retries();
+                    self.reset_owned_download_lanes();
                     self.clear_retention_exclude_cache();
                     for state in self.jobs.values_mut() {
                         state.download_queue.clear_exclude_servers();
@@ -566,7 +590,6 @@ impl Pipeline {
                     self.metrics
                         .nntp_generation_recovery_requeues
                         .fetch_add(recovery_requeues as u64, Ordering::Relaxed);
-                    self.owned_download_lane_pool.reset();
                     self.owned_download_lane_pool
                         .resize(total_connections.max(1));
                     self.tuner.set_connection_limit(total_connections);
@@ -776,6 +799,9 @@ impl Pipeline {
                 self.finished_jobs.clear();
                 self.publish_snapshot();
                 let _ = reply.send(cleanup_error.map_or(Ok(()), Err));
+            }
+            SchedulerCommand::PipelineDiagnostics { reply } => {
+                let _ = reply.send(Box::new(self.diagnostics_snapshot()));
             }
             SchedulerCommand::Shutdown => unreachable!("handled in select"),
         }

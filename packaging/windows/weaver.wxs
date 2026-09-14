@@ -65,9 +65,8 @@
               Condition="NOT Installed AND UILevel &gt;= 4" />
     </InstallExecuteSequence>
 
-    <!-- These commands affect only the installing user's HKCU Run entry and the tray
-         process it owns. Application data and Credential Manager entries are not MSI
-         resources and are intentionally retained on uninstall. -->
+    <!-- These commands affect only the uninstalling user: their HKCU Run entry, the
+         tray process they own, and their Weaver profile. -->
     <CustomAction
         Id="StopTrayBeforeRemoval"
         FileRef="WeaverTrayExe"
@@ -82,9 +81,21 @@
         Execute="immediate"
         Return="ignore"
         Impersonate="yes" />
+    <!-- An uninstall also removes the user's database, logs, WebView2 profile and
+         Credential Manager key; download folders in the profile survive unless empty.
+         A major upgrade removes the old version the same way, so it is excluded: an
+         upgrade keeps the user's settings and queue. -->
+    <CustomAction
+        Id="RemoveProfileOnUninstall"
+        FileRef="WeaverTrayExe"
+        ExeCommand="--uninstall-cleanup"
+        Execute="immediate"
+        Return="ignore"
+        Impersonate="yes" />
     <InstallExecuteSequence>
       <Custom Action="StopTrayBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
       <Custom Action="RemoveTrayStartupBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RemoveProfileOnUninstall" After="StopTrayBeforeRemoval" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

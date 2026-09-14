@@ -10,7 +10,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use tracing::{info, warn};
 
-use crate::operations::disk::disk_space;
+use crate::operations::disk::{Capacity, CapacitySampler, probe_nearest_disk_space};
 use crate::operations::metrics::PipelineMetrics;
 
 const MIB: u64 = 1024 * 1024;
@@ -33,10 +33,13 @@ pub(crate) struct ExtractionLimits {
 
 impl ExtractionLimits {
     pub(crate) fn from_env(complete_dir: &Path) -> Result<Self, String> {
-        let total_filesystem_bytes = disk_space(complete_dir).map(|space| space.total_bytes);
-        let default_min_free = total_filesystem_bytes
-            .map(|total| (total / 20).clamp(512 * MIB, 20 * GIB))
-            .unwrap_or(512 * MIB);
+        // The completed-download directory may not exist yet at startup; its
+        // nearest existing ancestor answers for the filesystem the reserve is
+        // derived from.
+        let total_filesystem_bytes = probe_nearest_disk_space(complete_dir)
+            .ok()
+            .map(|space| space.total_bytes);
+        let default_min_free = default_disk_reserve_bytes(total_filesystem_bytes);
         let detected_memory = crate::runtime::system_probe::detect_total_memory_bytes()
             .unwrap_or(2 * MAX_MEMORY_LIMIT);
         let default_memory = (detected_memory / 2).clamp(MIN_MEMORY_LIMIT, MAX_MEMORY_LIMIT);
@@ -57,6 +60,16 @@ impl ExtractionLimits {
             )?,
         })
     }
+}
+
+/// The free space a filesystem of `total_filesystem_bytes` should keep: a
+/// twentieth of it, between 512 MiB and 20 GiB, and 512 MiB when the size is
+/// unknown. The extractor's default output reserve, and the same rule the
+/// direct-store holds scratch keeps for the working directory.
+pub(crate) fn default_disk_reserve_bytes(total_filesystem_bytes: Option<u64>) -> u64 {
+    total_filesystem_bytes
+        .map(|total| (total / 20).clamp(512 * MIB, 20 * GIB))
+        .unwrap_or(512 * MIB)
 }
 
 fn parse_positive_u64(name: &str, default: u64) -> Result<u64, String> {
@@ -125,10 +138,18 @@ impl std::fmt::Display for ExtractionFailure {
     }
 }
 
+/// Free-space accounting for the extraction root.
+///
+/// The sampler re-reads the filesystem at most once per
+/// [`DISK_REFRESH_INTERVAL`] and holds the last good reading across probe
+/// failures, so a transient stat error (a NAS hiccup, a path that is briefly
+/// unreachable) never rejects a write on its own. Only a fresh reading that
+/// confirms the reserve would be breached rejects; while the filesystem cannot
+/// be read the reserve check stands down and the write itself is the last
+/// line of defence.
 #[derive(Debug)]
 struct DiskBudgetState {
-    estimated_available: u64,
-    last_refresh: Instant,
+    sampler: CapacitySampler,
 }
 
 #[derive(Debug, Default)]
@@ -143,42 +164,127 @@ struct ActiveState {
 /// ordinary contention.
 const PROCESS_MEMORY_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
 
-/// Decoder-window bytes reserved by every extraction job in this pipeline.
+/// Shared reservations for scheduling state, PAR2 packet metadata, and archive
+/// decoders in this pipeline. Normal extraction and direct chases use one pool.
 ///
-/// Decoder dictionaries are allocated inside third-party codecs, outside the
-/// ordinary output budgets. Keep one charge for the whole process so several
-/// jobs cannot each consume the configured memory allowance concurrently.
-///
-/// The limit is `ExtractionLimits::max_memory_bytes` — the same number a 7z
-/// extraction reserves in full — so 7z extractions are serialised across the
-/// whole process, and a holder that blocks blocks all of them. See
-/// `one_full_ceiling_reservation_serialises_every_job_in_the_process`.
+/// Retained allocations survive individual decoder operations. Their ownership
+/// separates intrinsic job limits from contention with peers. Whole-decoder
+/// ceiling admissions exclude all currently retained state. A chase on unavailable
+/// input yields under contention by unwinding its decoder and releasing its
+/// permit. These estimates do not cover allocations made by archive parsers
+/// before their metadata is available for inspection.
 #[derive(Debug)]
 pub(crate) struct ProcessMemoryBudget {
     limit: u64,
-    reserved: AtomicU64,
-    idle: Mutex<()>,
-    released: Condvar,
+    reserved: Arc<AtomicU64>,
+    retained: Arc<AtomicU64>,
+    total_retained: Arc<AtomicU64>,
+    waiting: Arc<AtomicU64>,
+    idle: Arc<Mutex<()>>,
+    released: Arc<Condvar>,
+    owners: Arc<Mutex<std::collections::HashMap<u64, std::sync::Weak<AtomicU64>>>>,
 }
 
 impl ProcessMemoryBudget {
     pub(crate) fn new(limit: u64) -> Self {
         Self {
             limit,
-            reserved: AtomicU64::new(0),
-            idle: Mutex::new(()),
-            released: Condvar::new(),
+            reserved: Arc::new(AtomicU64::new(0)),
+            retained: Arc::new(AtomicU64::new(0)),
+            total_retained: Arc::new(AtomicU64::new(0)),
+            waiting: Arc::new(AtomicU64::new(0)),
+            idle: Arc::new(Mutex::new(())),
+            released: Arc::new(Condvar::new()),
+            owners: Arc::default(),
         }
     }
 
+    /// Share physical admission and wakeups, but only count this job's retained
+    /// state when deciding whether waiting for a decoder can ever succeed.
+    pub(crate) fn for_job(&self, job: u64) -> Arc<Self> {
+        let mut owners = self.owners.lock().expect("process memory owners poisoned");
+        let retained = owners
+            .get(&job)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| {
+                owners.retain(|_, owner| owner.strong_count() != 0);
+                let retained = Arc::new(AtomicU64::new(0));
+                owners.insert(job, Arc::downgrade(&retained));
+                retained
+            });
+        Arc::new(Self {
+            limit: self.limit,
+            reserved: Arc::clone(&self.reserved),
+            retained,
+            total_retained: Arc::clone(&self.total_retained),
+            waiting: Arc::clone(&self.waiting),
+            idle: Arc::clone(&self.idle),
+            released: Arc::clone(&self.released),
+            owners: Arc::clone(&self.owners),
+        })
+    }
+
+    /// Admission never blocks the actor behind an extraction worker. The lease
+    /// follows the retained allocation until its owning job or session drops.
+    pub(crate) fn try_reserve_retained(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<ProcessMemoryPermit, String> {
+        let _guard = self.idle.lock().expect("process memory state poisoned");
+        reserve_atomic(&self.reserved, bytes, self.limit).map_err(|requested| format!(
+            "WEAVER_RESOURCE_LIMIT[memory]: reservation would reach {requested} bytes; process limit is {}", self.limit
+        ))?;
+        self.retained.fetch_add(bytes, Ordering::AcqRel);
+        self.total_retained.fetch_add(bytes, Ordering::AcqRel);
+        Ok(ProcessMemoryPermit {
+            budget: Arc::clone(self),
+            bytes,
+            retained: true,
+        })
+    }
+
+    pub(crate) fn has_waiters(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) != 0
+    }
+
+    #[cfg(test)]
     fn reserve_wait<F>(
         self: &Arc<Self>,
         bytes: u64,
+        check_active: F,
+    ) -> Result<ProcessMemoryPermit, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        self.reserve_wait_kind(bytes, false, false, check_active)
+    }
+
+    /// Blocking metadata workers may wait for decoders to release memory.
+    /// Actor admission uses the nonblocking reservation instead.
+    pub(crate) fn reserve_retained_wait<F>(
+        self: &Arc<Self>,
+        bytes: u64,
+        check_active: F,
+    ) -> Result<ProcessMemoryPermit, String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        self.reserve_wait_kind(bytes, true, false, check_active)
+    }
+
+    fn reserve_wait_kind<F>(
+        self: &Arc<Self>,
+        bytes: u64,
+        retained: bool,
+        ceiling: bool,
         mut check_active: F,
     ) -> Result<ProcessMemoryPermit, String>
     where
         F: FnMut() -> Result<(), String>,
     {
+        if ceiling && bytes == 0 {
+            return Err("WEAVER_RESOURCE_LIMIT[memory]: no decoder allowance remains".into());
+        }
         if bytes > self.limit {
             return Err(format!(
                 "decoder requires {bytes} bytes, process limit is {}",
@@ -186,12 +292,45 @@ impl ProcessMemoryBudget {
             ));
         }
 
+        struct Waiting<'a>(&'a AtomicU64);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let mut waiting = None;
         let mut wait_guard = self.idle.lock().expect("process memory state poisoned");
         let started = Instant::now();
         let mut announced = false;
         loop {
             check_active()?;
-            if reserve_atomic(&self.reserved, bytes, self.limit).is_ok() {
+            // A ceiling is an optional allowance, not a dictionary's measured
+            // requirement. Recompute it under the admission lock so metadata
+            // published since the budget was created cannot strand all waiters.
+            // Active decoder reservations still cause a wait, never a shrink.
+            let granted = if ceiling {
+                bytes.min(
+                    self.limit
+                        .saturating_sub(self.total_retained.load(Ordering::Acquire)),
+                )
+            } else {
+                bytes
+            };
+            // Only this owner's metadata makes the request intrinsically too
+            // large. Other jobs can release their retained state while we wait.
+            let own_available = self
+                .limit
+                .saturating_sub(self.retained.load(Ordering::Acquire));
+            if (ceiling && own_available == 0) || (!ceiling && bytes > own_available) {
+                return Err("WEAVER_RESOURCE_LIMIT[memory]: decoder and retained job state exceed the process limit".to_string());
+            }
+            if (granted != 0 || bytes == 0)
+                && reserve_atomic(&self.reserved, granted, self.limit).is_ok()
+            {
+                if retained {
+                    self.retained.fetch_add(granted, Ordering::AcqRel);
+                    self.total_retained.fetch_add(granted, Ordering::AcqRel);
+                }
                 if announced {
                     info!(
                         requested_bytes = bytes,
@@ -201,8 +340,13 @@ impl ProcessMemoryBudget {
                 }
                 return Ok(ProcessMemoryPermit {
                     budget: Arc::clone(self),
-                    bytes,
+                    bytes: granted,
+                    retained,
                 });
+            }
+            if waiting.is_none() {
+                self.waiting.fetch_add(1, Ordering::AcqRel);
+                waiting = Some(Waiting(&self.waiting));
             }
             // This wait has no deadline, by design: the holder will finish. But
             // an extraction that reserves the whole process allowance and then
@@ -239,6 +383,7 @@ impl ProcessMemoryBudget {
 pub(crate) struct JobExtractionBudget {
     limits: Arc<ExtractionLimits>,
     process_memory: Arc<ProcessMemoryBudget>,
+    decoder_memory_limit: u64,
     root_path: PathBuf,
     ratio_limit_bytes: u64,
     effective_job_limit_bytes: u64,
@@ -288,13 +433,28 @@ impl JobExtractionBudget {
             .saturating_mul(limits.max_ratio)
             .max(GIB);
         let effective_job_limit_bytes = limits.max_job_bytes.min(ratio_limit_bytes);
-        let initial_disk_space = disk_space(&root_path);
-        let estimated_available = initial_disk_space
-            .map(|space| space.available_bytes)
-            .unwrap_or(0);
+        let mut sampler = CapacitySampler::new(root_path.clone(), DISK_REFRESH_INTERVAL);
+        if sampler.refresh() == Capacity::Unknown {
+            // The sampler already logged the operating-system reason. The job
+            // proceeds without a reserve check until a reading arrives; the
+            // extraction root's own writes surface a full disk.
+            warn!(
+                root = %root_path.display(),
+                "extraction root capacity is unknown; the disk reserve is not enforced until a reading arrives"
+            );
+        }
+        // Freeze the job's codec ceiling independently of temporary peer state.
+        // Exact dictionary admissions wait for peers; optional whole-ceiling
+        // admissions account for all retained state when the permit is granted.
+        let decoder_memory_limit = limits.max_memory_bytes.min(
+            process_memory
+                .limit
+                .saturating_sub(process_memory.retained.load(Ordering::Acquire)),
+        );
         let budget = Arc::new(Self {
             limits,
             process_memory,
+            decoder_memory_limit,
             root_path,
             ratio_limit_bytes,
             effective_job_limit_bytes,
@@ -304,10 +464,7 @@ impl JobExtractionBudget {
             memory_reserved: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
             failure: Mutex::new(None),
-            disk: Mutex::new(DiskBudgetState {
-                estimated_available,
-                last_refresh: Instant::now(),
-            }),
+            disk: Mutex::new(DiskBudgetState { sampler }),
             active: Mutex::new(ActiveState::default()),
             idle: Condvar::new(),
             metrics,
@@ -329,18 +486,18 @@ impl JobExtractionBudget {
                 .reject_job_bytes(initial_bytes, "existing staging output")
                 .to_string());
         }
-        if initial_disk_space.is_none() {
-            return Err(budget
-                .reject(
-                    ExtractionRejectionReason::DiskReserve,
-                    format!(
-                        "failed to determine available space for extraction root '{}'",
-                        budget.root_path.display()
-                    ),
-                )
-                .to_string());
-        }
         Ok(budget)
+    }
+
+    /// Whether the extraction root has produced at least one capacity reading.
+    #[cfg(all(test, unix))]
+    pub(crate) fn disk_capacity_known(&self) -> bool {
+        self.disk
+            .lock()
+            .expect("extraction disk state poisoned")
+            .sampler
+            .current()
+            != Capacity::Unknown
     }
 
     pub(crate) fn is_rejection(error: &str) -> bool {
@@ -382,6 +539,17 @@ impl JobExtractionBudget {
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<MemoryPermit, String> {
+        self.reserve_memory(bytes, false)
+    }
+
+    /// Reserve an optional full-decoder allowance using current retained state.
+    /// Only ceiling-based callers may use this; measured dictionary requests
+    /// must use `reserve_memory_wait` and are never reduced.
+    pub(crate) fn reserve_memory_ceiling_wait(self: &Arc<Self>) -> Result<MemoryPermit, String> {
+        self.reserve_memory(self.max_memory_bytes(), true)
+    }
+
+    fn reserve_memory(self: &Arc<Self>, bytes: u64, ceiling: bool) -> Result<MemoryPermit, String> {
         if bytes > self.limits.max_memory_bytes {
             return Err(self
                 .reject(
@@ -412,7 +580,7 @@ impl JobExtractionBudget {
                 }
                 let process_memory = self
                     .process_memory
-                    .reserve_wait(bytes, || {
+                    .reserve_wait_kind(bytes, false, ceiling, || {
                         self.check_active().map_err(|error| error.to_string())
                     })
                     .map_err(|error| {
@@ -421,10 +589,13 @@ impl JobExtractionBudget {
                         self.reject(ExtractionRejectionReason::Memory, error)
                             .to_string()
                     })?;
+                let granted = process_memory.bytes;
+                self.memory_reserved
+                    .fetch_sub(bytes - granted, Ordering::AcqRel);
                 return Ok(MemoryPermit {
                     budget: Arc::clone(self),
                     _process_memory: process_memory,
-                    bytes,
+                    bytes: granted,
                 });
             }
             // The per-job stage had no wait announcement at all, only the
@@ -450,7 +621,7 @@ impl JobExtractionBudget {
     }
 
     pub(crate) fn max_memory_bytes(&self) -> u64 {
-        self.limits.max_memory_bytes
+        self.decoder_memory_limit
     }
 
     pub(crate) fn check_member_metadata(&self, member: &str, bytes: u64) -> Result<(), String> {
@@ -465,6 +636,41 @@ impl JobExtractionBudget {
                     ),
                 )
                 .to_string());
+        }
+        Ok(())
+    }
+
+    /// Preflight formats with a member table. Writers still reserve atomically
+    /// before mutation, including implicit directories and concurrent siblings.
+    pub(crate) fn check_archive_metadata(
+        &self,
+        entries: u64,
+        bytes: Option<u64>,
+    ) -> Result<(), String> {
+        self.check_active().map_err(|error| error.to_string())?;
+        if self
+            .entry_count
+            .load(Ordering::Acquire)
+            .checked_add(entries)
+            .is_none_or(|count| count > self.limits.max_entries)
+        {
+            return Err(self
+                .reject(
+                    ExtractionRejectionReason::Entries,
+                    "declared archive entries exceed the remaining job budget".to_string(),
+                )
+                .to_string());
+        }
+        if let Some(bytes) = bytes {
+            let total = self
+                .total_written
+                .load(Ordering::Acquire)
+                .checked_add(bytes);
+            if total.is_none_or(|total| total > self.effective_job_limit_bytes) {
+                return Err(self
+                    .reject_job_bytes(total.unwrap_or(u64::MAX), "declared archive output")
+                    .to_string());
+            }
         }
         Ok(())
     }
@@ -588,21 +794,14 @@ impl JobExtractionBudget {
 
     fn reserve_disk(&self, bytes: u64) -> Result<(), ExtractionFailure> {
         let mut disk = self.disk.lock().expect("extraction disk state poisoned");
-        if disk.last_refresh.elapsed() >= DISK_REFRESH_INTERVAL {
-            let space = disk_space(&self.root_path).ok_or_else(|| {
-                self.reject(
-                    ExtractionRejectionReason::DiskReserve,
-                    format!(
-                        "failed to refresh available space for extraction root '{}'",
-                        self.root_path.display()
-                    ),
-                )
-            })?;
-            disk.estimated_available = space.available_bytes;
-            disk.last_refresh = Instant::now();
-        }
-        let remaining = disk.estimated_available.saturating_sub(bytes);
-        if remaining < self.limits.min_free_bytes {
+        let Some(reading) = disk.sampler.sample().reading() else {
+            // No reading has ever succeeded for this root: nothing to account
+            // against, and refusing on ignorance would fail the job for a
+            // problem the filesystem never reported.
+            return Ok(());
+        };
+        let remaining = reading.available_bytes.saturating_sub(bytes);
+        if remaining < self.limits.min_free_bytes && !reading.stale {
             return Err(self.reject(
                 ExtractionRejectionReason::DiskReserve,
                 format!(
@@ -611,7 +810,10 @@ impl JobExtractionBudget {
                 ),
             ));
         }
-        disk.estimated_available = remaining;
+        // A stale reading keeps being debited so the estimate stays honest,
+        // but only a fresh reading may reject: the next successful probe
+        // confirms or clears the breach within one refresh interval.
+        disk.sampler.debit(bytes);
         Ok(())
     }
 
@@ -620,8 +822,11 @@ impl JobExtractionBudget {
             return;
         }
         self.total_written.fetch_sub(bytes, Ordering::AcqRel);
-        let mut disk = self.disk.lock().expect("extraction disk state poisoned");
-        disk.estimated_available = disk.estimated_available.saturating_add(bytes);
+        self.disk
+            .lock()
+            .expect("extraction disk state poisoned")
+            .sampler
+            .credit(bytes);
     }
 
     fn reject_job_bytes(&self, requested: u64, context: &str) -> ExtractionFailure {
@@ -749,14 +954,43 @@ impl Drop for MemoryPermit {
 }
 
 #[derive(Debug)]
-struct ProcessMemoryPermit {
+pub(crate) struct ProcessMemoryPermit {
     budget: Arc<ProcessMemoryBudget>,
     bytes: u64,
+    retained: bool,
+}
+
+impl ProcessMemoryPermit {
+    pub(crate) fn grow_retained_wait<F>(
+        &mut self,
+        bytes: u64,
+        check_active: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> Result<(), String>,
+    {
+        assert!(self.retained);
+        let mut extra = self.budget.reserve_retained_wait(bytes, check_active)?;
+        self.bytes += extra.bytes;
+        extra.bytes = 0;
+        Ok(())
+    }
 }
 
 impl Drop for ProcessMemoryPermit {
     fn drop(&mut self) {
+        let _guard = self
+            .budget
+            .idle
+            .lock()
+            .expect("process memory state poisoned");
         self.budget.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.retained {
+            self.budget.retained.fetch_sub(self.bytes, Ordering::AcqRel);
+            self.budget
+                .total_retained
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
         self.budget.released.notify_all();
     }
 }
@@ -1239,14 +1473,6 @@ fn scan_capability_directory(
 }
 
 #[cfg(target_os = "windows")]
-fn is_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-        != 0
-}
-
-#[cfg(target_os = "windows")]
 fn is_windows_cap_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
     use cap_std::fs::MetadataExt;
     metadata.file_attributes()
@@ -1351,6 +1577,23 @@ mod tests {
                 .unwrap_err()
                 .contains("entries")
         );
+    }
+
+    #[test]
+    fn archive_preflight_uses_the_remaining_shared_budget() {
+        for (entries, bytes, accepted) in [(7, 16, true), (8, 16, false), (7, 17, false)] {
+            let (_temp, root, budget) = root_and_budget();
+            let mut writer = root
+                .create_file(Path::new("existing.bin"), &budget)
+                .unwrap();
+            writer.write_all(&[0; 16]).unwrap();
+            drop(writer);
+            assert_eq!(
+                budget.check_archive_metadata(entries, Some(bytes)).is_ok(),
+                accepted
+            );
+            assert_eq!(std::fs::read_dir(&root.path).unwrap().count(), 1);
+        }
     }
 
     #[test]
@@ -1505,6 +1748,236 @@ mod tests {
     }
 
     #[test]
+    fn decoder_ceiling_stays_with_its_reservation_when_metadata_is_released() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = Arc::new(ProcessMemoryBudget::new(8 * MIB));
+        let metadata = process.try_reserve_retained(2 * MIB).unwrap();
+        let budget = JobExtractionBudget::new_with_process_memory(
+            Arc::new(ExtractionLimits {
+                max_memory_bytes: 8 * MIB,
+                ..(*limits()).clone()
+            }),
+            Arc::clone(&process),
+            temp.path().to_path_buf(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        assert_eq!(budget.max_memory_bytes(), 6 * MIB);
+        let decoder = budget
+            .reserve_memory_wait(budget.max_memory_bytes())
+            .unwrap();
+        assert_eq!(process.reserved_bytes(), 8 * MIB);
+        assert!(process.try_reserve_retained(1).is_err());
+        drop(metadata);
+        assert_eq!(budget.max_memory_bytes(), 6 * MIB);
+        assert_eq!(process.reserved_bytes(), 6 * MIB);
+        drop(decoder);
+        assert_eq!(process.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn parked_chase_yields_its_memory_to_a_waiting_extraction() {
+        assert_parked_chase_yields_memory(false);
+    }
+
+    #[test]
+    fn parked_chase_yields_its_memory_to_waiting_metadata() {
+        assert_parked_chase_yields_memory(true);
+    }
+
+    fn assert_parked_chase_yields_memory(retained: bool) {
+        use crate::pipeline::direct_unpack::coverage::SetCoverage;
+
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let coverage = Arc::new(SetCoverage::new(1));
+        coverage.yield_to_memory_pressure(Arc::clone(&pool));
+        let permit = pool.reserve_wait(1024, || Ok(())).unwrap();
+        let chase_coverage = Arc::clone(&coverage);
+        let chase = std::thread::spawn(move || {
+            let _permit = permit;
+            chase_coverage.resolve_position(0, 0)
+        });
+        let waiter_pool = Arc::clone(&pool);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let waiter = std::thread::spawn(move || {
+            let check_active = || {
+                if Instant::now() >= deadline {
+                    Err("wait timed out".to_string())
+                } else {
+                    Ok(())
+                }
+            };
+            let result = if retained {
+                waiter_pool.reserve_retained_wait(1024, check_active)
+            } else {
+                waiter_pool.reserve_wait(1024, check_active)
+            };
+            if result.is_ok() {
+                assert_eq!(waiter_pool.reserved_bytes(), 1024);
+                assert_eq!(
+                    waiter_pool.retained.load(Ordering::Acquire),
+                    if retained { 1024 } else { 0 }
+                );
+            }
+            done_tx.send(result.map(drop)).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(6));
+        coverage.abort("test teardown");
+        let chase_result = chase.join().unwrap();
+        waiter.join().unwrap();
+        result.expect("memory waiter should finish").unwrap();
+        assert!(
+            chase_result
+                .unwrap_err()
+                .to_string()
+                .contains("memory pressure")
+        );
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert!(!pool.has_waiters());
+    }
+
+    #[test]
+    fn ceiling_admission_rechecks_metadata_growth_without_waiting_on_peer_completion() {
+        let pool = Arc::new(ProcessMemoryBudget::new(64 * MIB));
+        let root = tempfile::tempdir().unwrap();
+        let budget = JobExtractionBudget::new_with_process_memory(
+            limits(),
+            pool.for_job(1),
+            root.path().into(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        assert_eq!(budget.max_memory_bytes(), 64 * MIB);
+        // Both this job and its peers publish more metadata after the decoder
+        // budget was created. None needs to finish before extraction can start.
+        let own = pool.for_job(1).try_reserve_retained(4 * MIB).unwrap();
+        let peer = pool.for_job(2).try_reserve_retained(8 * MIB).unwrap();
+        let permit = budget.reserve_memory_ceiling_wait().unwrap();
+        assert_eq!(permit.bytes, 52 * MIB);
+        assert_eq!(pool.reserved_bytes(), 64 * MIB);
+        assert_eq!(budget.memory_reserved.load(Ordering::Acquire), 52 * MIB);
+        assert!(!pool.has_waiters());
+        drop(permit);
+        assert_eq!(budget.memory_reserved.load(Ordering::Acquire), 0);
+        drop((own, peer));
+        assert_eq!(pool.total_retained.load(Ordering::Acquire), 0);
+        assert_eq!(pool.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn owner_recreation_preserves_growing_reservations_and_cancellation_refunds() {
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let mut metadata = pool.for_job(1).try_reserve_retained(100).unwrap();
+        metadata.grow_retained_wait(200, || Ok(())).unwrap();
+        assert_eq!(pool.for_job(1).retained.load(Ordering::Acquire), 300);
+        assert_eq!(pool.total_retained.load(Ordering::Acquire), 300);
+        let peer = pool.for_job(2).try_reserve_retained(700).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let owner = pool.for_job(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let waiter = std::thread::spawn(move || {
+            owner.reserve_wait(400, || {
+                if flag.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    Err("cancelled".into())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        while !pool.has_waiters() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(pool.has_waiters());
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(waiter.join().unwrap().unwrap_err(), "cancelled");
+        assert!(!pool.has_waiters());
+        assert_eq!(pool.reserved_bytes(), 1000);
+        drop((metadata, peer));
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert_eq!(pool.total_retained.load(Ordering::Acquire), 0);
+        assert_eq!(pool.for_job(1).retained.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn retained_peer_memory_waits_but_same_job_overflow_fails() {
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let peer = pool.for_job(1).try_reserve_retained(700).unwrap();
+        let own = pool.for_job(2).try_reserve_retained(100).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let owner = pool.for_job(2);
+        let waiter = std::thread::spawn(move || {
+            owner.reserve_wait(800, || {
+                if Instant::now() < deadline {
+                    Ok(())
+                } else {
+                    Err("test deadline".into())
+                }
+            })
+        });
+        while !pool.has_waiters() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            pool.has_waiters(),
+            "another job's retained state is temporary contention"
+        );
+        drop(peer);
+        let decoder = waiter.join().unwrap().unwrap();
+        assert_eq!(pool.reserved_bytes(), 900);
+        assert!(!pool.has_waiters());
+        drop(decoder);
+        assert!(
+            pool.for_job(2)
+                .reserve_wait(1000, || Ok(()))
+                .unwrap_err()
+                .contains("retained job state")
+        );
+        drop(own);
+        assert_eq!(pool.reserved_bytes(), 0);
+        let decoder = pool.for_job(2).reserve_wait(1024, || Ok(())).unwrap();
+        drop(decoder);
+        assert_eq!(pool.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn cancelled_metadata_scan_leaves_memory_wait_and_releases_waiter() {
+        let pool = Arc::new(ProcessMemoryBudget::new(1024));
+        let holder = pool.reserve_wait(1024, || Ok(())).unwrap();
+        let cancellation = par2_rs::CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker_pool = Arc::clone(&pool);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let worker = std::thread::spawn(move || {
+            worker_pool.reserve_retained_wait(128, || {
+                if worker_cancellation.is_cancelled() || Instant::now() >= deadline {
+                    Err("metadata scan cancelled".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        while !pool.has_waiters() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(pool.has_waiters());
+        cancellation.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert!(!pool.has_waiters());
+        assert_eq!(pool.reserved_bytes(), 1024);
+        assert_eq!(pool.retained.load(Ordering::Acquire), 0);
+        drop(holder);
+        assert_eq!(pool.reserved_bytes(), 0);
+    }
+
+    #[test]
     fn cancelled_job_leaves_shared_memory_wait_before_holder_releases() {
         let temp = tempfile::tempdir().unwrap();
         let limits = Arc::new(ExtractionLimits {
@@ -1593,14 +2066,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unavailable_disk_probe_rejects_budget_creation() {
+    fn unavailable_disk_probe_stands_the_reserve_down_instead_of_rejecting() {
         use std::os::unix::ffi::OsStringExt;
 
         let invalid_path = PathBuf::from(std::ffi::OsString::from_vec(b"bad\0path".to_vec()));
-        let error =
-            JobExtractionBudget::new(limits(), invalid_path, 1, 0, 0, PipelineMetrics::new())
-                .unwrap_err();
-        assert!(error.contains("disk_reserve"));
+        let budget = JobExtractionBudget::new(
+            Arc::new(ExtractionLimits {
+                min_free_bytes: u64::MAX,
+                ..(*limits()).clone()
+            }),
+            invalid_path,
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .expect("an unreadable root must not reject the job up front");
+        assert!(!budget.disk_capacity_known());
+        budget
+            .reserve_write(0, 1)
+            .expect("without any reading the reserve cannot be judged breached");
     }
 
     #[cfg(unix)]

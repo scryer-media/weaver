@@ -1,4 +1,4 @@
-//! Encryption at rest for sensitive values (NNTP passwords, RSS credentials).
+//! Encryption at rest for credentials, including NNTP, RSS and archive passwords.
 //!
 //! Uses AES-256-GCM with a 32-byte master key stored in platform-native secure storage.
 //! Encrypted values use the format `enc:v1:<base64(nonce || ciphertext || tag)>`.
@@ -6,7 +6,6 @@
 
 pub(crate) mod keystore;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod key_file;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -193,6 +192,15 @@ pub fn key_store_description(data_dir: Option<PathBuf>) -> String {
     } else {
         names.join(" -> ")
     }
+}
+
+/// Delete the master key Weaver keeps for `data_dir` in the Windows Credential
+/// Manager. Only the desktop app's uninstaller should call this: every secret
+/// encrypted under the key is unreadable afterwards.
+#[cfg(target_os = "windows")]
+pub fn delete_windows_credential_key(data_dir: &std::path::Path) -> Result<(), String> {
+    use keystore::KeyStore as _;
+    windows::WindowsCredentialManager::for_data_dir(Some(data_dir)).delete_key()
 }
 
 /// Ensure a key is available without ever replacing a missing key when

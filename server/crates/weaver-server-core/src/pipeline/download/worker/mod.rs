@@ -3,11 +3,13 @@ use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 mod completion;
+mod direct_store;
 mod hot;
 mod ip_replacement;
 mod lanes;
 mod leases;
 mod metrics;
+mod ownership;
 mod pressure;
 mod refill;
 mod spawn;
@@ -95,6 +97,12 @@ const HOT_LEASE_TARGET_RUNWAY_SECS: u64 = 2;
 const HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
 const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_FETCH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// How long the servers must stay below their connection cap, with work
+/// queued, before that is reported. Short enough to catch a lane that never
+/// opens, long enough that ordinary refill gaps between batches say nothing.
+const DOWNLOAD_LANES_UNDER_CAP_WINDOW: Duration = Duration::from_secs(5);
+const DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 // Short debounce before the first spillover lane opens: this is slowness
 // DETECTION, not easing. A hot job hitting a brief refill hiccup should not
 // spray a lane onto another job for the few hundred milliseconds it takes to
@@ -119,18 +127,17 @@ const IP_REPLACEMENT_CANDIDATE_BETTER_RATIO: f64 = 0.85;
 const IP_REPLACEMENT_CANDIDATE_BETTER_MS: f64 = 40.0;
 const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
-    state: DownloadPressureState,
+    pub(in crate::pipeline) state: DownloadPressureState,
     reason: DownloadPressureReason,
     decode_backlog_bytes: u64,
-    /// Resident bytes: this alone controls hard write pressure.
+    /// Resident bytes control shared write pressure.
     write_buffered_bytes: u64,
-    /// Resident plus UU-spooled bytes: this controls soft pacing.
-    write_pending_bytes: u64,
-    /// Aggregate UU spool admission is capped; only cursor-closing work may run.
+    /// Known UU files may dispatch only their cursor-closing work while capped.
     uu_spool_admission_capped: bool,
     decode_hard_limit_bytes: u64,
     write_hard_limit_bytes: u64,
@@ -151,26 +158,13 @@ impl Pipeline {
         if self.propagation_hold_until(job_id).is_some() {
             return DispatchAttempt::NoWork;
         }
-        if let Some(ready_at) = self
+        if self
             .download_restart_durable_lead_retry_after
-            .get(&job_id)
-            .copied()
-            && ready_at > Instant::now()
+            .contains_key(&job_id)
         {
-            let backlog = self.download_pipeline_backlog_for_job(job_id);
-            if backlog.has_durable_catch_up_work() {
-                if self.next_queued_download_exceeds_restart_durable_lead(job_id) {
-                    self.flush_file_progress_batch(
-                        "download.file_progress.flush.restart_durable_lead_retry_recheck",
-                    );
-                }
-                if self.next_queued_download_exceeds_restart_durable_lead(job_id) {
-                    self.update_queue_metrics();
-                    return DispatchAttempt::NoWork;
-                }
-            }
-            self.download_restart_durable_lead_retry_after
-                .remove(&job_id);
+            self.flush_file_progress_batch(
+                "download.file_progress.flush.restart_durable_lead_retry_recheck",
+            );
         }
         self.apply_rar_unlock_priorities_if_dirty(job_id);
         let mut lease = match self.try_lease_initial_download_batch(job_id, pressure, selection) {
@@ -182,7 +176,64 @@ impl Pipeline {
         let activation_items = Self::activation_items(&lease);
         self.activate_download_batch_lease(&lease, &activation_items, true);
         self.spawn_download_batch(lease);
+        self.warm_idle_download_lanes_for_barrier(job_id);
         DispatchAttempt::Dispatched
+    }
+
+    /// Open the connections a barred job is about to need, while it is barred.
+    ///
+    /// A job whose first wave is held behind a barrier — the PAR2 index
+    /// bootstrap is the standing case — may only lease the barrier's own work,
+    /// so dispatch cuts one batch and stops. Nothing in the barrier requires
+    /// the *connections* to wait: without this, the moment the grid publishes
+    /// and payload leases go out, each lane pays a TCP, TLS, greeting and
+    /// authentication exchange before its first BODY, one after another, on a
+    /// job that has been waiting on exactly those bytes.
+    ///
+    /// A warm lane is idle, not active: it is counted in no connection gauge,
+    /// and if the barrier never lifts it parks with the rest of the pool. The
+    /// dial is asked for after the lease has been handed to a worker, and each
+    /// warm runs on its own worker thread, so nothing already leased waits on
+    /// one.
+    fn warm_idle_download_lanes_for_barrier(&mut self, job_id: JobId) {
+        let capacity = self
+            .effective_download_connection_capacity(self.tuner.params().max_concurrent_downloads);
+        let free = capacity.saturating_sub(self.active_download_connections);
+        if free == 0 {
+            return;
+        }
+        // Only while the job is actually holding work back. Ordinary dispatch
+        // needs no help: it leases into every free connection itself.
+        if self.par2_metadata_bootstrap_files(job_id).is_none() {
+            return;
+        }
+        // The groups a payload lease would ask for, falling back to the
+        // barrier's own class when the payload queue has not been built yet.
+        let Some(groups) = self.jobs.get(&job_id).and_then(|state| {
+            state
+                .download_queue
+                .peek_in_class(false)
+                .or_else(|| state.download_queue.peek_in_class(true))
+                .map(|work| (Arc::clone(&work.groups), work.byte_estimate))
+        }) else {
+            return;
+        };
+        let (groups, byte_estimate) = groups;
+        let exclude_servers: Arc<[usize]> = Arc::from(self.effective_exclude_servers(job_id, &[]));
+        let warmed = self.owned_download_lane_pool.warm(
+            &self.nntp,
+            groups,
+            exclude_servers,
+            Self::bandwidth_reservation_estimate(byte_estimate),
+            free,
+        );
+        if warmed > 0 {
+            debug!(
+                job_id = job_id.0,
+                lanes = warmed,
+                "warming idle download lanes behind a job barrier"
+            );
+        }
     }
 
     fn mark_download_pass_started(&mut self, job_id: JobId) {
@@ -424,8 +475,7 @@ impl Pipeline {
 
         // Prefer higher submitted priority first. Within the top runnable band,
         // keep the already-active job hot when possible; otherwise choose FIFO
-        // submission order. This matches NZBGet/SAB-style hot reuse more closely
-        // than same-band round-robin.
+        // submission order.
         let mut eligible = self
             .job_order
             .iter()
@@ -712,6 +762,7 @@ impl Pipeline {
         if active_connections_before_dispatch == 0 && self.active_download_connections == 0 {
             self.log_download_dispatch_liveness_stall(now, pressure, max, eligible_count);
         }
+        self.log_download_lanes_under_cap(now, max);
 
         self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();

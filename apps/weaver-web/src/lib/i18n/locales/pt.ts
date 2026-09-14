@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextPt } from "@/next/i18n/pt";
 
 const pt: LocaleDictionary = {
   // Brand
@@ -9,6 +10,8 @@ const pt: LocaleDictionary = {
   "nav.upload": "Enviar",
   "nav.settings": "Configurações",
   "nav.sponsor": "Patrocinar",
+  "update.newVersion": "Nova versão v{{version}}",
+  "update.newVersionAria": "Abrir o Weaver v{{version}} no GitHub em uma nova aba",
 
   // Status labels
   "status.queued": "Na fila",
@@ -209,7 +212,7 @@ const pt: LocaleDictionary = {
   "settings.generalPageDesc": "Ajuste velocidade de download, caminhos de armazenamento, comportamento de limpeza e política de retentativas em um só lugar.",
   "settings.language": "Idioma",
   "settings.languageDesc": "Escolha o idioma de exibição da interface do Weaver.",
-  "settings.bandwidthCap": "Limite de Banda do Provedor",
+  "settings.bandwidthCap": "Largura de banda",
   "settings.bandwidthCapDesc": "Bloquear o envio de novos downloads quando a franquia do provedor for consumida. Jobs na fila mantêm posição e pós-processamento já em andamento pode continuar.",
   "settings.bandwidthCapEnabled": "Ativar limite do provedor",
   "settings.bandwidthCapEnabledDesc": "Rastrear uso continuamente e bloquear apenas novos downloads de artigos quando a janela ativa for esgotada.",
@@ -626,7 +629,14 @@ const pt: LocaleDictionary = {
   "upload.duplicateScore": "Pontuação de duplicado",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "Pontuações maiores vencem na mesma chave de duplicado; em empate, o candidato existente é mantido.",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "Baixar pacote de diagnóstico",
+  "systemInfo.diagnosticsBusy": "Coletando diagnósticos…",
+  "systemInfo.diagnosticsHint": "A coleta leva cerca de 15 segundos: as métricas são amostradas duas vezes, com dez segundos de intervalo. Senhas, chaves de API e outros segredos são removidos.",
+  "systemInfo.diagnosticsFailed": "Não foi possível criar o pacote de diagnóstico.",
   ...duplicateLocaleEntries.por,
+  ...nextPt,
 };
 
 export default pt;

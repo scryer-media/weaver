@@ -1,0 +1,13 @@
+{
+  "slug": "par3-aligned-dedup",
+  "title": "E2E.Test.PAR3.Aligned.Dedup.Harbor.Glyph.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A payload of repeated 32 KiB chunks on the block grid under aligned deduplication (`-d1`). One chunk is zeroed and another scrambled; intact repeats elsewhere in the file can supply every damaged block.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "harbor.glyph.s01e02.mkv": "efe919c0e2e7fad45de56a0033201eb3acd7b2bfe7ae9008ab827ec6bc2c52e7"
+  },
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "slug": "par3-inside-zip-missing-article",
+  "title": "E2E.Test.PAR3.Inside.ZIP.Missing.Article.Azure.Kiln.S01E05.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A self-protected ZIP posted as 16 KiB articles with one interior article deleted. The hole is much smaller than the inserted protection, so the container is restored from inside itself.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "segment_size": 16384,
+  "deleteSegmentSubjectContains": [
+    "archive.zip"
+  ],
+  "deleteSegmentNumbers": [
+    100
+  ],
+  "expectedOutputBLAKE3": {
+    "azure.kiln.s01e05.mkv": "7dd724c7f2b1386fd188555b0a0722a0929ed7443e005d8e6de965438ee3d81a"
+  },
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

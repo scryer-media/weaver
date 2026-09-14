@@ -15,6 +15,44 @@ use crate::persistence::sql_runtime::{
 };
 use sqlx::{Postgres, QueryBuilder, Sqlite};
 
+/// Submission values are always plaintext, even when they resemble our stored
+/// envelope prefix. Encrypt them once at the database boundary.
+pub(super) fn encrypt_archive_password(
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+    password: Option<&str>,
+) -> Result<Option<String>, StateError> {
+    let Some(password) = password else {
+        return Ok(None);
+    };
+    if password.is_empty() {
+        return Ok(Some(String::new()));
+    }
+    let key = key.ok_or_else(|| {
+        StateError::Database("encryption key is required to store archive passwords".into())
+    })?;
+    crate::persistence::encryption::encrypt_value(key, password)
+        .map(Some)
+        .map_err(StateError::Database)
+}
+
+pub(super) fn decrypt_archive_password(
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+    password: Option<String>,
+) -> Result<Option<String>, StateError> {
+    let Some(password) = password else {
+        return Ok(None);
+    };
+    if !crate::persistence::encryption::is_encrypted(&password) {
+        return Ok(Some(password));
+    }
+    let key = key.ok_or_else(|| {
+        StateError::Database("encryption key is required to restore archive passwords".into())
+    })?;
+    crate::persistence::encryption::decrypt_value(key, &password)
+        .map(Some)
+        .map_err(StateError::Database)
+}
+
 async fn active_job_exists_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Result<bool, StateError> {
     let sql = match tx {
         SqlTx::Postgres(_) => "SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE",
@@ -506,6 +544,10 @@ impl Database {
             SqlArg::OptText(job.paused_resume_status.map(str::to_string)),
             SqlArg::OptText(job.paused_resume_download_state.map(str::to_string)),
             SqlArg::OptText(job.paused_resume_post_state.map(str::to_string)),
+            SqlArg::OptText(encrypt_archive_password(
+                self.encryption_key(),
+                job.password_override.as_deref(),
+            )?),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "create_active_job", |tx| {
@@ -513,8 +555,8 @@ impl Database {
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO active_jobs
-                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                         &args,
                     )
                     .await?;
@@ -550,6 +592,10 @@ impl Database {
             SqlArg::OptText(job.paused_resume_status.map(str::to_string)),
             SqlArg::OptText(job.paused_resume_download_state.map(str::to_string)),
             SqlArg::OptText(job.paused_resume_post_state.map(str::to_string)),
+            SqlArg::OptText(encrypt_archive_password(
+                self.encryption_key(),
+                job.password_override.as_deref(),
+            )?),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
@@ -561,8 +607,8 @@ impl Database {
                     Box::pin(async move {
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
@@ -660,6 +706,10 @@ impl Database {
             SqlArg::OptText(job.paused_resume_status.map(str::to_string)),
             SqlArg::OptText(job.paused_resume_download_state.map(str::to_string)),
             SqlArg::OptText(job.paused_resume_post_state.map(str::to_string)),
+            SqlArg::OptText(encrypt_archive_password(
+                self.encryption_key(),
+                job.password_override.as_deref(),
+            )?),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
@@ -775,8 +825,8 @@ impl Database {
                         .await?;
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
@@ -791,7 +841,11 @@ impl Database {
 
     pub fn update_active_job(&self, job_id: JobId, update: &JobUpdate) -> Result<(), StateError> {
         let datastore = self.datastore();
-        let update = update.clone();
+        let mut update = update.clone();
+        if let FieldUpdate::Set(password) = &mut update.password {
+            *password = encrypt_archive_password(self.encryption_key(), Some(password))?
+                .expect("supplied password");
+        }
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "update_active_job", |tx| {
                 let update = update.clone();
@@ -837,7 +891,7 @@ impl Database {
 
                     // Password override column: NULL = no override (restore
                     // keeps the NZB-derived password), '' = explicitly no
-                    // password, anything else = the override itself.
+                    // password, anything else = the encrypted override.
                     match update.password {
                         FieldUpdate::Unchanged => {}
                         FieldUpdate::Clear => {
@@ -3195,7 +3249,262 @@ mod tests {
             paused_resume_status: None,
             paused_resume_download_state: None,
             paused_resume_post_state: None,
+            password_override: None,
         }
+    }
+
+    fn raw_archive_password(db: &Database, id: JobId) -> Option<String> {
+        let datastore = db.datastore();
+        db.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT password FROM active_jobs WHERE job_id = {}",
+                &[SqlArg::I64(id.0 as i64)],
+            )
+            .await?
+            .unwrap()
+            .opt_text("password")
+        })
+        .unwrap()
+    }
+
+    fn replace_stored_archive_password(db: &Database, id: JobId, value: &str) {
+        let datastore = db.datastore();
+        let value = value.to_string();
+        db.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE active_jobs SET password = {} WHERE job_id = {}",
+                &[SqlArg::Text(value), SqlArg::I64(id.0 as i64)],
+            )
+            .await
+            .map(|_| ())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn archive_password_is_encrypted_on_every_active_admission_path() {
+        let db = Database::open_in_memory().unwrap();
+        // A user's literal password may resemble a stored envelope. It must
+        // still be encrypted, then restored exactly rather than interpreted.
+        let plaintext = "enc:v1:literal archive password";
+        for id in 1..=3 {
+            let mut job = sample_active_job(id);
+            job.password_override = Some(plaintext.into());
+            match id {
+                1 => db.create_active_job(&job).unwrap(),
+                2 => db
+                    .create_active_job_with_file_identities(&job, &[])
+                    .unwrap(),
+                _ => assert!(
+                    db.materialize_active_job_with_file_identities(&job, &[], None, None)
+                        .unwrap()
+                ),
+            }
+            let stored = raw_archive_password(&db, job.job_id).unwrap();
+            assert!(crate::persistence::encryption::is_encrypted(&stored));
+            assert_ne!(stored, plaintext);
+            assert_eq!(
+                crate::persistence::encryption::decrypt_value(
+                    db.encryption_key().unwrap(),
+                    &stored
+                )
+                .unwrap(),
+                plaintext
+            );
+            assert_eq!(
+                db.load_active_jobs().unwrap()[&job.job_id]
+                    .password_override
+                    .as_deref(),
+                Some(plaintext)
+            );
+        }
+        assert!(db.has_encrypted_credentials().unwrap());
+        db.validate_encrypted_credentials(db.encryption_key().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn archive_password_updates_preserve_null_empty_and_encrypted_overrides() {
+        let db = Database::open_in_memory().unwrap();
+        let job = sample_active_job(1);
+        db.create_active_job(&job).unwrap();
+        assert_eq!(raw_archive_password(&db, job.job_id), None);
+        for password in ["first-password", "enc:v1:another-literal-password"] {
+            db.update_active_job(
+                job.job_id,
+                &JobUpdate {
+                    password: FieldUpdate::Set(password.into()),
+                    ..JobUpdate::default()
+                },
+            )
+            .unwrap();
+            assert_ne!(raw_archive_password(&db, job.job_id).unwrap(), password);
+            assert_eq!(
+                db.load_active_jobs().unwrap()[&job.job_id]
+                    .password_override
+                    .as_deref(),
+                Some(password)
+            );
+        }
+        let encrypted = raw_archive_password(&db, job.job_id);
+        db.update_active_job(job.job_id, &JobUpdate::default())
+            .unwrap();
+        assert_eq!(raw_archive_password(&db, job.job_id), encrypted);
+        db.update_active_job(
+            job.job_id,
+            &JobUpdate {
+                password: FieldUpdate::Clear,
+                ..JobUpdate::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(raw_archive_password(&db, job.job_id).as_deref(), Some(""));
+        assert_eq!(
+            db.load_active_jobs().unwrap()[&job.job_id]
+                .password_override
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn archive_password_rejects_missing_wrong_and_corrupt_keys_or_values() {
+        use crate::persistence::encryption::EncryptionKey;
+        assert!(encrypt_archive_password(None, Some("secret")).is_err());
+        let mut db = Database::open_in_memory().unwrap();
+        let key = db.encryption_key().unwrap().clone();
+        let mut job = sample_active_job(1);
+        job.password_override = Some("secret".into());
+        db.create_active_job(&job).unwrap();
+        let stored = raw_archive_password(&db, job.job_id).unwrap();
+        assert!(decrypt_archive_password(None, Some(stored)).is_err());
+        let wrong_key = EncryptionKey::generate();
+        assert!(db.validate_encrypted_credentials(&wrong_key).is_err());
+        db.set_encryption_key(wrong_key);
+        assert!(db.load_active_jobs().is_err());
+        db.set_encryption_key(key.clone());
+        replace_stored_archive_password(&db, job.job_id, "enc:v1:corrupted");
+        assert!(db.load_active_jobs().is_err());
+        assert!(db.validate_encrypted_credentials(&key).is_err());
+    }
+
+    #[test]
+    fn par3_content_identity_and_completed_name_survive_reopen() {
+        use crate::jobs::ids::NzbFileId;
+        use crate::jobs::record::FileIdentitySource;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("content-identity.db");
+        let job = sample_active_job(1);
+        let identity = ActiveFileIdentity {
+            file_index: 0,
+            source_filename: "obfuscated.dat".into(),
+            current_filename: "archive.zip".into(),
+            canonical_filename: Some("archive.zip".into()),
+            classification: None,
+            classification_source: FileIdentitySource::Par3,
+        };
+        {
+            let db = Database::open(&path).unwrap();
+            db.create_active_job(&job).unwrap();
+            db.complete_files(
+                job.job_id,
+                &[(0, "obfuscated.dat".into(), None)],
+                CompletedHashProvenance::Verified,
+            )
+            .unwrap();
+            let mut intent = identity.clone();
+            intent.current_filename = intent.source_filename.clone();
+            intent.classification_source = FileIdentitySource::Par3Pending;
+            db.save_file_identity(job.job_id, &intent).unwrap();
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let restored = db.load_active_jobs().unwrap();
+            let intent = &restored[&job.job_id].file_identities[&0];
+            assert_eq!(
+                intent.classification_source,
+                FileIdentitySource::Par3Pending
+            );
+            assert_eq!(intent.current_filename, "obfuscated.dat");
+            assert_eq!(intent.canonical_filename.as_deref(), Some("archive.zip"));
+            db.save_file_identity(job.job_id, &identity).unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        let jobs = db.load_active_jobs().unwrap();
+        let restored = &jobs[&job.job_id];
+        assert_eq!(restored.file_identities[&0], identity);
+        assert!(restored.complete_files.contains(&NzbFileId {
+            job_id: job.job_id,
+            file_index: 0
+        }));
+        let datastore = db.datastore();
+        let name = db
+            .run_sql_blocking_read(async move {
+                SqlRuntime::fetch_optional(
+                    datastore.read_exec(),
+                    "SELECT filename FROM active_files WHERE job_id = {} AND file_index = {}",
+                    &[SqlArg::I64(1), SqlArg::I64(0)],
+                )
+                .await?
+                .unwrap()
+                .opt_text("filename")
+            })
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("archive.zip"));
+    }
+
+    #[test]
+    fn archive_password_persistence_requires_the_same_key_after_reopen() {
+        use crate::persistence::encryption::EncryptionKey;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("archive-password.db");
+        let key = EncryptionKey::generate();
+        let mut job = sample_active_job(1);
+        job.password_override = Some("restart-password".into());
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert!(db.create_active_job(&job).is_err());
+            assert!(db.load_active_jobs().unwrap().is_empty());
+            db.set_encryption_key(key.clone());
+            db.create_active_job(&job).unwrap();
+        }
+        let mut db = Database::open(&path).unwrap();
+        assert!(db.has_encrypted_credentials().unwrap());
+        assert!(db.load_active_jobs().is_err());
+        db.validate_encrypted_credentials(&key).unwrap();
+        db.set_encryption_key(key);
+        assert_eq!(
+            db.load_active_jobs().unwrap()[&job.job_id]
+                .password_override
+                .as_deref(),
+            Some("restart-password")
+        );
+    }
+
+    #[test]
+    fn legacy_archive_password_migration_is_encrypted_and_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+        let job = sample_active_job(1);
+        db.create_active_job(&job).unwrap();
+        replace_stored_archive_password(&db, job.job_id, "legacy-password");
+        assert!(!db.has_encrypted_credentials().unwrap());
+        db.migrate_plaintext_credentials().unwrap();
+        let stored = raw_archive_password(&db, job.job_id).unwrap();
+        assert_ne!(stored, "legacy-password");
+        assert!(db.has_encrypted_credentials().unwrap());
+        assert_eq!(
+            db.load_active_jobs().unwrap()[&job.job_id]
+                .password_override
+                .as_deref(),
+            Some("legacy-password")
+        );
+        db.migrate_plaintext_credentials().unwrap();
+        assert_eq!(
+            raw_archive_password(&db, job.job_id).as_deref(),
+            Some(stored.as_str())
+        );
     }
 
     #[test]

@@ -435,8 +435,7 @@ impl FusedYencArticleDecoder {
             return Ok(true);
         }
 
-        // SABnzbd and nzbget scan the body for `=ybegin` instead of demanding it
-        // on the first line, so leading junk (stray headers, banners, blank
+        // Scan the body for `=ybegin` so leading junk (stray headers, banners, blank
         // lines) does not kill an otherwise decodable article. Skip whole lines
         // until one of them is a real `=ybegin` control line.
         if !header::is_control_line(&self.line_buf, b"=ybegin") {
@@ -793,8 +792,7 @@ impl FusedYencArticleDecoder {
     /// With a header-sized reservation that growth is pure waste: the batch
     /// was already sized for the whole part, and the doubling lands exactly on
     /// the last chunk, whose decoded bytes fit the room that is left. So the
-    /// input is trimmed to the spare capacity first — the same policy as
-    /// sabctools ("prefer trimming the chunk over growing the buffer"). Once a
+    /// input is trimmed to the spare capacity first. Once a
     /// sized batch is full the only truthful continuation is the trailer, so
     /// the input is trimmed to a short probe that decodes through scratch (see
     /// [`Self::decode_body_tail`]) rather than doubling a finished batch to
@@ -1352,8 +1350,8 @@ mod tests {
 
     // ── Broken-poster corpus, verified at every split point ──────────────
     //
-    // Each of these decodes in SABnzbd/nzbget and used to hard-fail in the
-    // fused path. The every-split-point sweep is the acceptance guard: the
+    // These recoverable articles used to hard-fail in the fused path.
+    // The every-split-point sweep is the acceptance guard: the
     // fused decoder must agree with the streaming path *and* leave the next
     // pipelined response's bytes in `src` no matter where the chunk boundary
     // lands.
@@ -1490,8 +1488,8 @@ mod tests {
         }
     }
 
-    /// An over-long but parseable CRC keeps its low 32 bits, as sabctools does
-    /// deliberately for posters that emit wide hashes -- and still verifies.
+    /// An over-long but parseable CRC keeps its low 32 bits for posters that
+    /// emit wide hashes, and still verifies.
     #[test]
     fn fused_truncates_over_long_crc_and_still_verifies() {
         let article = broken_poster_article(

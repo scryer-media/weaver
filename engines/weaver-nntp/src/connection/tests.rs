@@ -112,13 +112,18 @@ async fn connect_tls_drain_client(
     let remote_addr = tcp.peer_addr().unwrap();
     let connector = TlsConnector::from(client_config);
     let server_name = ServerName::try_from("localhost").unwrap();
-    let tls = connector.connect(server_name, tcp).await.unwrap();
+    let tls = connector
+        .connect(server_name, crate::route_stream::RouteStream::from(tcp))
+        .await
+        .unwrap();
     let now = Instant::now();
 
     NntpConnection {
+        _route_socket: None,
+        route_outcome: None,
         transport: Some(NntpTransport::Tls {
             inner: tls,
-            remote_addr,
+            remote_addr: Some(remote_addr),
         }),
         codec: NntpCodec::new(),
         read_buf: BytesMut::with_capacity(256 * 1024),
@@ -130,7 +135,7 @@ async fn connect_tls_drain_client(
         capabilities: Capabilities::default(),
         host: "localhost".to_string(),
         port: remote_addr.port(),
-        remote_addr,
+        remote_addr: Some(remote_addr),
         created_at: now,
         last_used: now,
         command_timeout: Duration::from_secs(5),
@@ -142,9 +147,11 @@ async fn connect_tls_drain_client(
         tls_cipher_preference: crate::tls::TlsCipherPreference::Auto,
         transfer_control: None,
         body_accounting: VecDeque::new(),
+        socket_slot: None,
+        health_lease: None,
         checkpoint_plan: CheckpointPlan::None,
         last_response_line_wait: Duration::ZERO,
-        prologue_probe: None,
+        group_probe_armed: false,
     }
 }
 
@@ -672,7 +679,10 @@ async fn manual_tls_transport_bulk_drain_probe() {
     let inner = ManualTlsStream::connect(tcp, client_config, server_name)
         .await
         .unwrap();
-    let mut transport = NntpTransport::ManualTls { inner, remote_addr };
+    let mut transport = NntpTransport::ManualTls {
+        inner,
+        remote_addr: Some(remote_addr),
+    };
 
     flushed_rx.await.expect("test server flushed TLS payload");
 
@@ -722,7 +732,10 @@ async fn manual_tls_transport_bounds_each_turn_and_preserves_stream() {
     let inner = ManualTlsStream::connect(tcp, client_config, server_name)
         .await
         .unwrap();
-    let mut transport = NntpTransport::ManualTls { inner, remote_addr };
+    let mut transport = NntpTransport::ManualTls {
+        inner,
+        remote_addr: Some(remote_addr),
+    };
     let mut received = Vec::with_capacity(payload_len);
     let mut read_buf = BytesMut::with_capacity(TLS_READ_TURN_LIMIT);
     let mut read_calls = 0usize;
@@ -835,21 +848,21 @@ fn pipelined_setup_config(port: u16) -> ServerConfig {
     }
 }
 
-/// A server that has already proven it needs both prologue commands gets
-/// them in one write, after the serial AUTHINFO exchange.
+/// A server that has proven it needs a selected group gets the GROUP in the
+/// same write, after the serial AUTHINFO exchange. Nothing else is ever added
+/// to that write — MODE READER in particular is never sent to anyone.
 #[tokio::test]
-async fn known_pipelining_servers_authenticate_then_get_mode_reader_and_group_in_one_write() {
+async fn known_pipelining_servers_authenticate_then_get_the_group_in_one_write() {
     let port = spawn_pipelined_setup_server(
         vec![
             ("AUTHINFO USER user", b"381 password\r\n"),
             ("AUTHINFO PASS pass", b"281 welcome\r\n"),
         ],
-        vec!["MODE READER", "GROUP alt.test"],
-        b"200 reader\r\n211 1 1 1 alt.test\r\n",
+        vec!["GROUP alt.test"],
+        b"211 1 1 1 alt.test\r\n",
     )
     .await;
-    crate::prologue::note_mode_reader_required("127.0.0.1", port);
-    crate::prologue::note_group_required("127.0.0.1", port);
+    crate::server_caps::note_group_required("127.0.0.1", port);
 
     let conn = NntpConnection::connect_with_ip_policy_for_group(
         &pipelined_setup_config(port),
@@ -862,12 +875,12 @@ async fn known_pipelining_servers_authenticate_then_get_mode_reader_and_group_in
 
     assert!(conn.is_healthy());
     assert_eq!(conn.current_group(), Some("alt.test"));
-    crate::prologue::forget("127.0.0.1", port);
+    crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// The default prologue is authentication and nothing else: a lane reaches
-/// its first command in four round trips, so nothing may be written between
-/// the last AUTHINFO answer and the caller's own command.
+/// Session setup is authentication and nothing else: a lane reaches its first
+/// command in four round trips, so nothing may be written between the last
+/// AUTHINFO answer and the caller's own command.
 #[tokio::test]
 async fn an_unproven_server_gets_no_mode_reader_and_no_group() {
     let port = spawn_pipelined_setup_server(
@@ -897,13 +910,15 @@ async fn an_unproven_server_gets_no_mode_reader_and_no_group() {
         matches!(error, NntpError::ArticleNotFound),
         "unexpected error: {error:?}"
     );
-    crate::prologue::forget("127.0.0.1", port);
+    crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// A server that answers the first post-setup command as though it were in
-/// the wrong mode teaches the process, once, to send MODE READER to it.
+/// A 500 to BODY is the server refusing the command, and that is all it is.
+/// It surfaces as a plain error on that server; it must not silently rewrite
+/// how weaver talks to the server from then on, and it must not be read as a
+/// hint to start sending MODE READER.
 #[tokio::test]
-async fn a_refusal_after_setup_teaches_the_process_to_send_mode_reader() {
+async fn a_500_after_setup_surfaces_as_an_error_and_teaches_nothing() {
     let port = spawn_pipelined_setup_server(
         vec![
             ("AUTHINFO USER user", b"381 password\r\n"),
@@ -922,19 +937,17 @@ async fn a_refusal_after_setup_teaches_the_process_to_send_mode_reader() {
     )
     .await
     .unwrap();
-    assert!(!crate::prologue::prologue_for("127.0.0.1", port).mode_reader);
 
-    let _ = conn.body_by_id("<first@example.com>").await;
-
+    let error = conn.body_by_id("<first@example.com>").await.unwrap_err();
     assert!(
-        crate::prologue::prologue_for("127.0.0.1", port).mode_reader,
-        "the refusal should have been recorded against the server"
+        matches!(error, NntpError::CommandNotRecognized),
+        "unexpected error: {error:?}"
     );
     assert!(
-        !conn.is_healthy(),
-        "the probed connection is discarded so the retry opens a taught one"
+        !conn.needs_group_prologue(),
+        "a refused BODY says nothing about groups"
     );
-    crate::prologue::forget("127.0.0.1", port);
+    crate::server_caps::forget("127.0.0.1", port);
 }
 
 /// A 412 for a message-id fetch is the server insisting on a selected group,
@@ -969,21 +982,20 @@ async fn a_412_after_setup_teaches_the_process_to_select_a_group() {
         "the 412 should have been recorded against the server"
     );
     assert!(!conn.is_healthy());
-    crate::prologue::forget("127.0.0.1", port);
+    crate::server_caps::forget("127.0.0.1", port);
 }
 
 #[tokio::test]
 async fn pipelined_setup_skips_the_password_after_281_on_user() {
-    // The next line the server reads after 281 must be the prologue it asked
+    // The next line the server reads after 281 must be the GROUP it asked
     // for, not a surplus AUTHINFO PASS.
     let port = spawn_pipelined_setup_server(
         vec![("AUTHINFO USER user", b"281 welcome\r\n")],
-        vec!["MODE READER", "GROUP alt.test"],
-        b"200 reader\r\n211 1 1 1 alt.test\r\n",
+        vec!["GROUP alt.test"],
+        b"211 1 1 1 alt.test\r\n",
     )
     .await;
-    crate::prologue::note_mode_reader_required("127.0.0.1", port);
-    crate::prologue::note_group_required("127.0.0.1", port);
+    crate::server_caps::note_group_required("127.0.0.1", port);
 
     let conn = NntpConnection::connect_with_ip_policy_for_group(
         &pipelined_setup_config(port),
@@ -995,7 +1007,7 @@ async fn pipelined_setup_skips_the_password_after_281_on_user() {
     .unwrap();
 
     assert_eq!(conn.current_group(), Some("alt.test"));
-    crate::prologue::forget("127.0.0.1", port);
+    crate::server_caps::forget("127.0.0.1", port);
 }
 
 #[tokio::test]
@@ -1115,7 +1127,7 @@ fn server_config_defaults() {
 
 #[tokio::test]
 async fn probe_fetches_capabilities_once_after_authentication() {
-    // Authentication is the whole default prologue, so CAPABILITIES is the
+    // Authentication is the whole of session setup, so CAPABILITIES is the
     // next line after it — nothing is inserted ahead of either.
     let port = spawn_scripted_server(
         vec![

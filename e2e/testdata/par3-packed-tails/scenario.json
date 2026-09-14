@@ -1,0 +1,18 @@
+{
+  "slug": "par3-packed-tails",
+  "title": "E2E.Test.PAR3.Packed.Tails.Copper.Meadow.S01E01.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Three files whose short tails the set packs into shared 8 KiB blocks, with damage inside one sidecar's packed tail and inside the main payload. All three files must be delivered intact.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "copper.meadow.s01e01.en.srt": "627777ff6aa8874e120fb20a8e7c599e5e10030995d99aacf16e4c5c5cd7c299",
+    "copper.meadow.s01e01.forced.srt": "de5bdfc876d153d8593db0f96c06e9067cbc50f9c8cab10bcb8a501b8bffa686",
+    "copper.meadow.s01e01.mkv": "b803f7b572462780631816afaa181fdd3c56f6ded68d6c9d69c1cba7a71bc2ee"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

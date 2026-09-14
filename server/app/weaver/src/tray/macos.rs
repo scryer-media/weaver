@@ -720,19 +720,13 @@ impl WeaverDelegate {
 
     /// Used by the menu items that only need a server, not a window.
     fn ensure_server_ready(&self) -> Result<(), String> {
-        self.ivars().supervisor.borrow_mut().start()?;
-        if shared::wait_for_server(
-            self.ivars().supervisor.borrow().port(),
-            SERVER_READY_TIMEOUT,
-        ) {
-            self.show_setup_code_if_needed();
-            Ok(())
-        } else {
-            Err(format!(
-                "timed out waiting for Weaver to become ready at {}",
-                self.ivars().origin
-            ))
+        {
+            let mut supervisor = self.ivars().supervisor.borrow_mut();
+            supervisor.start()?;
+            supervisor.wait_until_ready()?;
         }
+        self.show_setup_code_if_needed();
+        Ok(())
     }
 
     fn show_setup_code_if_needed(&self) {
@@ -1111,6 +1105,7 @@ impl WeaverDelegate {
     }
 
     fn load_app(&self) {
+        self.show_setup_code_if_needed();
         let Some(url) = NSURL::URLWithString(&NSString::from_str(&self.ivars().url)) else {
             self.load_html(&startup_failure_html());
             return;

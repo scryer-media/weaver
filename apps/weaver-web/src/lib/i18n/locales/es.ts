@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextEs } from "@/next/i18n/es";
 
 const es: LocaleDictionary = {
   // Brand
@@ -9,6 +10,8 @@ const es: LocaleDictionary = {
   "nav.upload": "Subir",
   "nav.settings": "Ajustes",
   "nav.sponsor": "Patrocinar",
+  "update.newVersion": "Nueva versión v{{version}}",
+  "update.newVersionAria": "Abrir Weaver v{{version}} en GitHub en una pestaña nueva",
 
   // Status labels
   "status.queued": "En cola",
@@ -209,7 +212,7 @@ const es: LocaleDictionary = {
   "settings.generalPageDesc": "Ajusta la velocidad de descarga, rutas de almacenamiento, comportamiento de limpieza y política de reintentos desde un solo lugar.",
   "settings.language": "Idioma",
   "settings.languageDesc": "Elige el idioma de la interfaz de Weaver.",
-  "settings.bandwidthCap": "Límite de ancho de banda del ISP",
+  "settings.bandwidthCap": "Ancho de banda",
   "settings.bandwidthCapDesc": "Bloquea el envío de nuevas descargas cuando se agote la cuota del ISP. Las tareas en cola mantienen su posición y el posprocesamiento en curso puede continuar.",
   "settings.bandwidthCapEnabled": "Activar límite del ISP",
   "settings.bandwidthCapEnabledDesc": "Controla el uso continuamente y bloquea solo las nuevas descargas de artículos cuando se agote la ventana activa.",
@@ -629,7 +632,14 @@ const es: LocaleDictionary = {
   "upload.duplicateScore": "Puntuación de duplicado",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "Las puntuaciones más altas ganan dentro de la misma clave de duplicado; en empate se conserva el candidato existente.",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "Descargar paquete de diagnóstico",
+  "systemInfo.diagnosticsBusy": "Recopilando diagnósticos…",
+  "systemInfo.diagnosticsHint": "La recopilación tarda unos 15 segundos: las métricas se muestrean dos veces, con diez segundos de diferencia. Las contraseñas, claves de API y otros secretos se eliminan.",
+  "systemInfo.diagnosticsFailed": "No se pudo crear el paquete de diagnóstico.",
   ...duplicateLocaleEntries.spa,
+  ...nextEs,
 };
 
 export default es;

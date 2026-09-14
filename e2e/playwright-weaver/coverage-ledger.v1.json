@@ -72,6 +72,11 @@
       "oracle": "browser"
     },
     {
+      "path": "/settings/proxies",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
       "path": "/settings/rss",
       "owner": "ui-ingress-automation",
       "oracle": "browser"
@@ -103,6 +108,29 @@
     }
   ],
   "mutations": [
+    {
+      "name": "saveProxyProfile",
+      "owner": "proxy-routing",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "deleteProxyProfile",
+      "owner": "proxy-routing",
+      "oracle": "unit-only",
+      "rationale": "Profile deletion is outside this runtime ladder flow, which retains its assigned profiles for failure and recovery assertions."
+    },
+    {
+      "name": "resetProxyHostKey",
+      "owner": "proxy-routing",
+      "oracle": "unit-only",
+      "rationale": "SSH host-key trust uses the Rust SSH fixtures; this application flow uses HTTP CONNECT and SOCKS5."
+    },
+    {
+      "name": "testProxyProfile",
+      "owner": "proxy-routing",
+      "oracle": "unit-only",
+      "rationale": "The flow exercises configured-server connection tests and actual consumer traffic rather than profile-level diagnostics."
+    },
     {
       "name": "resetServerDownloadQuotaUsage",
       "owner": "bandwidth-and-server-quotas",
@@ -475,6 +503,11 @@
     }
   ],
   "behaviors": [
+    {
+      "name": "proxy-ladder-fallback-and-no-host-bypass",
+      "owner": "proxy-routing",
+      "oracle": "api-metrics"
+    },
     {
       "name": "encrypted-backup-restore-matrix",
       "owner": "ui-backup-restore-sqlite-to-sqlite",

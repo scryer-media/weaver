@@ -3,8 +3,8 @@ use crate::observability::with_timed_config_read;
 use crate::system::metrics_history::{build_metrics_history, tier_for_range};
 use crate::system::types::{
     ConfiguredStorage, DatabaseEngineGql, DecoderTierGql, DeploymentEnvironmentGql, DiskCapacity,
-    MetricsHistoryRangeGql, OperatingSystemGql, ServerRestartCapability, SystemComputeInfo,
-    SystemInfo, SystemMemoryInfo, SystemStorageProfile,
+    KernelComponentGql, KernelSelectionInfo, MetricsHistoryRangeGql, OperatingSystemGql,
+    ServerRestartCapability, SystemComputeInfo, SystemInfo, SystemMemoryInfo, SystemStorageProfile,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +18,12 @@ impl SystemQuery {
     /// The running weaver binary version.
     async fn version(&self) -> &str {
         env!("CARGO_PKG_VERSION")
+    }
+    /// Latest stable Weaver release information observed by the background checker.
+    #[graphql(guard = "ReadGuard")]
+    async fn update_status(&self, ctx: &Context<'_>) -> Result<UpdateStatus> {
+        let service = ctx.data::<weaver_server_core::update_check::UpdateCheckService>()?;
+        Ok(service.status().into())
     }
     /// Safe runtime and storage facts for the built-in troubleshooting UI.
     #[graphql(guard = "ReadGuard")]
@@ -82,6 +88,10 @@ impl SystemQuery {
                 cgroup_limit: profile.cpu.cgroup_limit,
                 decoder_tier: decoder_tier_gql(weaver_yenc::simd::selected_decoder_tier()),
                 simd_features,
+                kernels: weaver_server_core::runtime::kernels::selected_kernels()
+                    .into_iter()
+                    .map(kernel_selection_info)
+                    .collect(),
             },
             memory: SystemMemoryInfo {
                 total_bytes: profile.memory.total_bytes,
@@ -292,8 +302,13 @@ impl SystemQuery {
         let usage = tokio::task::spawn_blocking(move || {
             dirs.into_iter()
                 .filter_map(|(label, path)| -> Option<DiskUsage> {
-                    let space =
-                        weaver_server_core::operations::disk_space(std::path::Path::new(&path))?;
+                    let space = weaver_server_core::operations::probe_disk_space(
+                        std::path::Path::new(&path),
+                    )
+                    .map_err(|error| {
+                        tracing::debug!(%label, %path, %error, "disk usage row omitted");
+                    })
+                    .ok()?;
                     Some(DiskUsage {
                         label,
                         total_bytes: space.total_bytes,
@@ -386,8 +401,8 @@ fn probe_configured_storage(input: ConfiguredStorageInput) -> ConfiguredStorage 
         };
     }
 
-    match weaver_server_core::operations::disk_space(&input.path) {
-        Some(space) => ConfiguredStorage {
+    match weaver_server_core::operations::probe_disk_space(&input.path) {
+        Ok(space) => ConfiguredStorage {
             labels: input.labels,
             path,
             capacity: Some(DiskCapacity {
@@ -397,11 +412,13 @@ fn probe_configured_storage(input: ConfiguredStorageInput) -> ConfiguredStorage 
             }),
             error: None,
         },
-        None => ConfiguredStorage {
+        Err(error) => ConfiguredStorage {
             labels: input.labels,
             path,
             capacity: None,
-            error: Some("Filesystem capacity is unavailable for this path".to_string()),
+            error: Some(format!(
+                "Filesystem capacity is unavailable for this path: {error}"
+            )),
         },
     }
 }
@@ -426,6 +443,29 @@ fn operating_system_gql(
         OperatingSystem::Macos => OperatingSystemGql::Macos,
         OperatingSystem::Windows => OperatingSystemGql::Windows,
         OperatingSystem::Unknown => OperatingSystemGql::Unknown,
+    }
+}
+
+fn kernel_selection_info(
+    value: weaver_server_core::runtime::kernels::KernelSelection,
+) -> KernelSelectionInfo {
+    use weaver_server_core::runtime::kernels::KernelComponent;
+    KernelSelectionInfo {
+        component: match value.component {
+            KernelComponent::YencDecode => KernelComponentGql::YencDecode,
+            KernelComponent::YencCrc32 => KernelComponentGql::YencCrc32,
+            KernelComponent::Par2Repair => KernelComponentGql::Par2Repair,
+            KernelComponent::Par2Md5 => KernelComponentGql::Par2Md5,
+            KernelComponent::Par2Crc32 => KernelComponentGql::Par2Crc32,
+            KernelComponent::RarRecovery => KernelComponentGql::RarRecovery,
+            KernelComponent::RarCrc32 => KernelComponentGql::RarCrc32,
+            KernelComponent::RarSha1 => KernelComponentGql::RarSha1,
+            KernelComponent::RarAes => KernelComponentGql::RarAes,
+        },
+        library: value.library.to_string(),
+        ladder: value.ladder.into_iter().map(str::to_string).collect(),
+        kernel: value.kernel.to_string(),
+        pinned_by: value.pinned_by.map(str::to_string),
     }
 }
 

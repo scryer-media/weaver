@@ -276,7 +276,28 @@ impl Pipeline {
         true
     }
 
-    pub(crate) fn release_download_result(&mut self, result: &DownloadResult) {
+    pub(crate) fn release_download_result(&mut self, result: &DownloadResult) -> bool {
+        if !self.accept_lane_work(result.lane_id, result.segment_id) {
+            let bytes = match &result.data {
+                Ok(DownloadPayload::Raw(raw)) => raw.len() as u64,
+                Ok(DownloadPayload::Decoded(decoded)) => decoded.raw_size,
+                Err(DownloadError::Decode { raw_size, .. }) => *raw_size,
+                Err(_) => 0,
+            };
+            self.rate_limiter.consume(bytes);
+            if let Err(error) = self.record_download_bandwidth_usage(bytes) {
+                error!(%error, "failed to account for retired lane transport usage");
+            }
+            return false;
+        }
+        if result.release_connection_slot
+            && let Some(owner) = self.download_lane_owners.get_mut(&result.lane_id)
+        {
+            owner.connection = false;
+            if owner.outstanding.is_empty() && !owner.ip_replacement {
+                self.download_lane_owners.remove(&result.lane_id);
+            }
+        }
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.release_result");
         let stale_generation = result.runtime_generation != self.pool_generation;
         let policy_outcome = matches!(
@@ -354,7 +375,9 @@ impl Pipeline {
         let actual_raw_bytes = match &result.data {
             Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
             Ok(DownloadPayload::Decoded(decoded)) => Some(decoded.raw_size),
-            Err(DownloadError::Decode { raw_size, .. }) => Some(*raw_size),
+            Err(DownloadError::Decode { raw_size, .. } | DownloadError::Local { raw_size, .. }) => {
+                Some(*raw_size)
+            }
             Err(_) => None,
         };
         if result.origin.counts_for_hot_primary()
@@ -379,12 +402,13 @@ impl Pipeline {
             );
         }
         self.publish_hot_dispatch_metrics(Instant::now());
+        true
     }
 
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
-        self.release_download_result(&result);
-        self.process_download_done(result).await;
-        self.maybe_service_deferred_lane_refills();
+        if self.release_download_result(&result) {
+            self.process_download_done(result).await;
+        }
     }
 
     pub(crate) fn released_download_result_lead_bytes(result: &DownloadResult) -> u64 {
@@ -446,10 +470,31 @@ impl Pipeline {
         let lead_bytes = Self::released_download_result_lead_bytes(&result);
         self.process_download_done(result).await;
         self.finish_released_download_result_processing(job_id, lead_bytes);
-        self.maybe_service_deferred_lane_refills();
+        // `process_download_done` ran the drain sequence for this job while
+        // *this* result was still booked as a pending released result — pending
+        // download work by definition — so every drain-conditional step in it
+        // was necessarily refused. That is why an in-flight health probe was
+        // never retired at drain: the last article of a job is very often one
+        // that failed, which produces no decode, and the decode seam is the
+        // only other place that re-runs the sequence.
+        //
+        // So it is re-run once this result's own accounting is closed. The
+        // sequence's `in_flight == 0 && nothing queued` gate makes this a no-op
+        // for every result that is not the job's last, and each step inside it
+        // is idempotent.
+        if self.jobs.contains_key(&job_id) {
+            self.maybe_finish_download_pass(job_id);
+        }
     }
 
     pub(crate) async fn process_download_done(&mut self, result: DownloadResult) {
+        let segment_id = result.segment_id;
+        let lane_id = result.lane_id;
+        self.process_download_done_inner(result).await;
+        self.finish_checkpoint_progress_article(lane_id, segment_id);
+    }
+
+    async fn process_download_done_inner(&mut self, result: DownloadResult) {
         let job_id = result.segment_id.file_id.job_id;
         if self
             .jobs
@@ -520,7 +565,8 @@ impl Pipeline {
                     FetchAttemptOutcome::AuthenticationFailure => {
                         crate::operations::instrumentation::ServerAttemptOutcomeKind::AuthFailure
                     }
-                    FetchAttemptOutcome::TransientFailure => {
+                    FetchAttemptOutcome::TransientFailure
+                    | FetchAttemptOutcome::GroupSelectionRequired => {
                         crate::operations::instrumentation::ServerAttemptOutcomeKind::TransientFailure
                     }
                     FetchAttemptOutcome::PermanentFailure => {
@@ -555,7 +601,8 @@ impl Pipeline {
                     FetchAttemptOutcome::AuthenticationFailure => {
                         crate::events::model::ServerAttemptOutcome::AuthenticationFailure
                     }
-                    FetchAttemptOutcome::TransientFailure => {
+                    FetchAttemptOutcome::TransientFailure
+                    | FetchAttemptOutcome::GroupSelectionRequired => {
                         crate::events::model::ServerAttemptOutcome::TransientFailure
                     }
                     FetchAttemptOutcome::PermanentFailure => {
@@ -577,6 +624,15 @@ impl Pipeline {
             (excluded_servers, source_server_idx)
         };
 
+        // Per-job attribution reads the same runtime index the per-server
+        // counters above do, and carries the same caveat: after a pool rebuild
+        // the index may name a different server, so a result dispatched under a
+        // superseded generation is left uncounted rather than charged to
+        // whoever now holds its slot. One integer compare per result.
+        let attributed_server_idx = (result.runtime_generation == self.pool_generation)
+            .then_some(source_server_idx)
+            .flatten();
+
         if result.data.is_ok() {
             self.refresh_server_quota_block_presentation();
         }
@@ -592,7 +648,7 @@ impl Pipeline {
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
 
-                self.note_job_wire_bytes(result.segment_id, raw_size_bytes);
+                self.note_job_wire_bytes(result.segment_id, raw_size_bytes, attributed_server_idx);
 
                 self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                     segment_id: result.segment_id,
@@ -621,7 +677,11 @@ impl Pipeline {
                     self.metrics
                         .segments_downloaded
                         .fetch_add(1, Ordering::Relaxed);
-                    self.note_job_wire_bytes(result.segment_id, raw_size_bytes);
+                    self.note_job_wire_bytes(
+                        result.segment_id,
+                        raw_size_bytes,
+                        attributed_server_idx,
+                    );
                     self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
                         segment_id: result.segment_id,
                         raw_size,
@@ -649,7 +709,7 @@ impl Pipeline {
                 self.metrics
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
-                self.note_job_wire_bytes(result.segment_id, raw_size);
+                self.note_job_wire_bytes(result.segment_id, raw_size, attributed_server_idx);
                 if crc_mismatch {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
                 }
@@ -666,6 +726,13 @@ impl Pipeline {
                     &excluded_servers,
                     source_server_idx,
                 );
+            }
+            Err(DownloadError::Local { raw_size, error }) => {
+                self.metrics
+                    .bytes_downloaded
+                    .fetch_add(raw_size, Ordering::Relaxed);
+                self.note_job_wire_bytes(result.segment_id, raw_size, attributed_server_idx);
+                self.fail_job(job_id, error);
             }
             Err(DownloadError::Fetch(failure)) => {
                 if matches!(
@@ -830,7 +897,13 @@ impl Pipeline {
                         weaver_nntp::pool::BodyServerAvailability::WaitingUntil(delay) => {
                             Some(delay)
                         }
-                        weaver_nntp::pool::BodyServerAvailability::Blocked => None,
+                        // Eligibility can change without rebuilding the
+                        // client (for example, a quota reservation refund).
+                        // Keep a bounded recheck so these articles cannot
+                        // become an indefinite wait with no wake source.
+                        weaver_nntp::pool::BodyServerAvailability::Blocked => {
+                            Some(BODY_SERVER_BLOCKED_RECHECK_DELAY)
+                        }
                     };
                     if self
                         .last_no_eligible_server_warn

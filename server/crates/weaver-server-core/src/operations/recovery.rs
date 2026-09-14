@@ -137,6 +137,10 @@ pub async fn recover_server_state(
                 category: recovered.category,
                 metadata: recovered.metadata,
                 output_dir: Some(recovered.output_dir.display().to_string()),
+                // Recovered from the active-job snapshot, which carries no
+                // attribution: the ledger lives with the finished job's
+                // history row.
+                server_attribution: Vec::new(),
                 created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
             });
         } else {
@@ -298,6 +302,9 @@ pub async fn recover_server_state(
                         .and_then(|metadata| serde_json::from_str(&metadata).ok())
                         .unwrap_or_default(),
                     output_dir: row.output_dir,
+                    server_attribution: crate::jobs::server_attribution::contributions_from_storage(
+                        row.server_attribution.as_deref(),
+                    ),
                     created_at_epoch_ms: row.created_at as f64 * 1000.0,
                 });
             }
@@ -378,7 +385,7 @@ fn cleanup_unreferenced_intermediate_dirs(
         if referenced_dirs.contains(&path) {
             continue;
         }
-        std::fs::remove_dir_all(&path)?;
+        crate::jobs::working_dir::remove_weaver_owned_working_dir(intermediate_dir, &path)?;
         removed += 1;
     }
 
@@ -414,6 +421,7 @@ mod tests {
             paused_resume_status: None,
             paused_resume_download_state: None,
             paused_resume_post_state: None,
+            password_override: None,
         }
     }
 
@@ -478,7 +486,12 @@ mod tests {
         std::fs::create_dir_all(&unrelated_output_dir).unwrap();
         std::fs::write(working_dir_marker_path(&active_output_dir), []).unwrap();
         std::fs::write(working_dir_marker_path(&history_output_dir), []).unwrap();
-        std::fs::write(working_dir_marker_path(&orphan_output_dir), []).unwrap();
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(
+            &intermediate_dir,
+            &orphan_output_dir,
+            JobId(3),
+        )
+        .unwrap();
 
         let nzb_path = data_dir.join("active-job.nzb");
         std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();
@@ -514,6 +527,7 @@ mod tests {
             created_at: 1_700_000_000,
             completed_at: 1_700_000_100,
             metadata: None,
+            server_attribution: None,
         })
         .unwrap();
 

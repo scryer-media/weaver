@@ -861,6 +861,34 @@ pub struct PersistedQueueEvent {
     pub global_state: Option<GlobalQueueState>,
 }
 
+/// How many of a job's articles one server served.
+///
+/// `serverId` is the configured server's own id. `serverHost` is resolved from
+/// the current configuration at read time rather than stored per job, so a
+/// server that has since been deleted keeps its counts and reports a null host;
+/// clients render those by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SimpleObject)]
+pub struct JobServerContribution {
+    pub server_id: u32,
+    pub server_host: Option<String>,
+    pub articles: u32,
+    pub wire_bytes: u64,
+}
+
+impl JobServerContribution {
+    pub fn from_core(
+        value: weaver_server_core::jobs::server_attribution::JobServerContribution,
+        hosts: &std::collections::HashMap<u32, String>,
+    ) -> Self {
+        Self {
+            server_id: value.server_id,
+            server_host: hosts.get(&value.server_id).cloned(),
+            articles: value.articles,
+            wire_bytes: value.wire_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct JobOutputFile {
     pub name: String,

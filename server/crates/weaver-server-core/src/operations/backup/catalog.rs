@@ -40,6 +40,8 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("weaver_internal_metadata", Ignore, Replace),
     table!("settings", Export, Replace),
     table!("servers", Export, Replace),
+    table!("proxy_profiles", Export, RequireEmpty),
+    table!("proxy_routes", Export, RequireEmpty),
     table!("server_download_usage", Export, RequireZeroUsage),
     table!("server_tls_diagnostics", Export, Replace),
     table!("categories", Export, Replace),
@@ -82,6 +84,7 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     // discarded with every other `active_*` table. `Export`
     // would be actively wrong here.
     table!("active_direct_coverage", ResetOnRestore, RequireEmpty),
+    table!("active_repair_outputs", ResetOnRestore, RequireEmpty),
     table!("integration_events", ResetOnRestore, Replace),
     table!("metrics_history_chunks", ResetOnRestore, Replace),
     table!("async_operations", ResetOnRestore, Replace),

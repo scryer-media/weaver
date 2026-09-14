@@ -250,6 +250,10 @@ async function discardStagedNzbs(
   }
 }
 
+function fileIdentity(file: File): string {
+  return `${file.name}\u0000${file.size}\u0000${file.lastModified}`;
+}
+
 function makeLocalId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `upload-${Date.now()}-${Math.random()}`;
 }
@@ -469,6 +473,31 @@ export function useUploadNzb(options?: {
       replaceEntries(nextFiles);
     },
     [replaceEntries, t],
+  );
+
+  const addFiles = useCallback(
+    (nextFiles: File[]) => {
+      setError(
+        nextFiles.some((file) => !isSupportedNzbUploadFilename(file.name))
+          ? t("upload.invalidFiles")
+          : null,
+      );
+      // Picking the same file a second time adds nothing: it is already listed.
+      const listed = new Set(entriesRef.current.map((entry) => fileIdentity(entry.file)));
+      const added = nextFiles
+        .filter((file) => isSupportedNzbUploadFilename(file.name))
+        .filter((file) => !listed.has(fileIdentity(file)))
+        .map<UploadNzbEntry>((file) => ({ localId: makeLocalId(), file, status: "queued" }));
+      if (added.length === 0) {
+        return;
+      }
+      const generation = generationRef.current;
+      setEntriesState((current) => [...current, ...added]);
+      added.forEach((entry) => {
+        void stageEntry(entry, generation);
+      });
+    },
+    [setEntriesState, stageEntry, t],
   );
 
   const removeFile = useCallback(
@@ -719,6 +748,7 @@ export function useUploadNzb(options?: {
     setDuplicateScore,
     handleDrop,
     handleFiles,
+    addFiles,
     removeFile,
     retryFile,
     forceSubmitFile: (localId: string) => submit({ force: true, localIds: [localId] }),

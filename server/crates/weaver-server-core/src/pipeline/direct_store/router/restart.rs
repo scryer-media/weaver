@@ -3,6 +3,7 @@
 //! that is not simply a method of the same type.
 
 use super::*;
+use crate::pipeline::direct_store::provider::HeldRun;
 
 impl DirectSetRouter {
     // ---- Restart ----------------------------------------------------------
@@ -382,6 +383,57 @@ impl DirectSetRouter {
         self.reread_plan(|member| &member.stale_gaps)
     }
 
+    /// Select one stale run without allocating a plan or a part-boundary list.
+    /// The caller supplies both the I/O stripe and retained path ceilings.
+    pub(crate) fn next_stale_gap(
+        &self,
+        max_bytes: u64,
+        max_path_bytes: usize,
+    ) -> Result<Option<RestartReadRun>, DemotionReason> {
+        if max_bytes == 0 {
+            return Err(DemotionReason::RepairGapUnreadable);
+        }
+        for member_id in &self.member_order {
+            let Some(member) = self.members.get(member_id) else {
+                continue;
+            };
+            let Some(&(start, end)) = member.stale_gaps.ranges().first() else {
+                continue;
+            };
+            if member.relative_partial.len() > max_path_bytes {
+                return Err(DemotionReason::RepairGapUnreadable);
+            }
+            let layout = self
+                .layout_index_for_member(*member_id)
+                .and_then(|index| self.layout_members().get(index))
+                .ok_or(DemotionReason::RepairGapUnreadable)?;
+            let boundary = layout
+                .parts
+                .iter()
+                .filter_map(|part| {
+                    let low = part.logical_offset?;
+                    let high = low.checked_add(part.data_size)?;
+                    (start >= low && start < high).then_some(high)
+                })
+                .next()
+                .ok_or(DemotionReason::RepairGapUnreadable)?;
+            let stop = end.min(boundary).min(start.saturating_add(max_bytes));
+            if stop <= start {
+                return Err(DemotionReason::RepairGapUnreadable);
+            }
+            return Ok(Some(RestartReadRun {
+                member_id: *member_id,
+                relative_partial: member.relative_partial.clone(),
+                logical_offset: start,
+                len: stop - start,
+            }));
+        }
+        if self.has_stale_gaps() {
+            return Err(DemotionReason::RepairGapUnreadable);
+        }
+        Ok(None)
+    }
+
     pub(super) fn reread_plan(
         &self,
         pick: impl Fn(&MemberRouting) -> &ByteRanges,
@@ -713,8 +765,8 @@ impl DirectSetRouter {
             .unwrap_or_default()
     }
 
-    /// The holds of one volume with their bytes, as `(physical offset, bytes)`
-    /// runs in ascending order.
+    /// The holds of one volume as runs a provider reads on demand, ascending by
+    /// physical offset.
     ///
     /// Posted bytes, verbatim: an article's yEnc-verified payload waiting for
     /// something before it can be routed — a header the walk has not reached,
@@ -723,21 +775,64 @@ impl DirectSetRouter {
     /// is what lets a set carry a hole through a repair: the cipher block on
     /// either side of a lost article is held precisely because its other half
     /// is in the article that never came, and without these the volume reads
-    /// as if that block were missing too. Bounded by the holds budget, and in
-    /// practice by one article per member per gap.
-    pub(crate) fn held_runs(&self, volume_index: u32) -> Vec<(u64, std::sync::Arc<[u8]>)> {
+    /// as if that block were missing too.
+    ///
+    /// Nothing is copied here. A run in RAM is shared by reference, and a run
+    /// the budget paged out carries a pin on the scratch image and its offset
+    /// in it, so the provider's RAM cost is what the holds budget already
+    /// bounds and not the size of the holds. Copying instead was how a set
+    /// with a gigabyte of holds on disk — a volume whose header article never
+    /// came, or an encrypted member above a hole — put that gigabyte back in
+    /// RAM the moment its PAR2 pass built a provider. One run per staged chunk
+    /// rather than per pending range: the reader treats adjacent runs as one
+    /// source anyway, and a chunk is the unit that has a single backing.
+    pub(crate) fn held_runs(&self, volume_index: u32) -> Vec<HeldRun> {
         let Some(staging) = self.staging.get(&volume_index) else {
             return Vec::new();
         };
-        staging
-            .pending
-            .ranges()
-            .iter()
-            .filter_map(|&(start, end)| {
-                let bytes = staging.slice(start, end - start, &self.scratch)?;
-                Some((start, std::sync::Arc::from(bytes)))
-            })
-            .collect()
+        let pin = self.scratch.pin();
+        let mut runs = Vec::new();
+        for &(pending_start, pending_end) in staging.pending.ranges() {
+            // From the chunk containing the range's first byte, which may
+            // start below it, to the last chunk starting inside the range.
+            let first_chunk = staging
+                .chunks
+                .range(..=pending_start)
+                .next_back()
+                .map(|(start, _)| *start)
+                .unwrap_or(pending_start);
+            for (&chunk_start, chunk) in staging.chunks.range(first_chunk..pending_end) {
+                let start = chunk_start.max(pending_start);
+                let end = chunk_start.saturating_add(chunk.len()).min(pending_end);
+                if start >= end {
+                    continue;
+                }
+                let inside = start - chunk_start;
+                let len = end - start;
+                let run = match chunk {
+                    StagedChunk::Memory(bytes) => {
+                        HeldRun::memory(start, std::sync::Arc::clone(bytes), inside, len)
+                    }
+                    StagedChunk::Scratch { offset, .. } => {
+                        // A scratch chunk with no image to pin cannot happen —
+                        // the chunk was written to that image — but a hole is
+                        // the honest answer if it ever did, and the pass then
+                        // reports damage at bytes that *are* unreadable.
+                        let Some(pin) = pin.as_ref() else {
+                            continue;
+                        };
+                        HeldRun::scratch(
+                            start,
+                            std::sync::Arc::clone(pin),
+                            offset.saturating_add(inside),
+                            len,
+                        )
+                    }
+                };
+                runs.push(run);
+            }
+        }
+        runs
     }
 
     // There is deliberately no accessor for the router's own routed map. It

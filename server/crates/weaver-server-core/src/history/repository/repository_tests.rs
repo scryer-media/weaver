@@ -22,6 +22,7 @@ fn sample_history() -> JobHistoryRow {
         created_at: 1700000000,
         completed_at: 1700001000,
         metadata: None,
+        server_attribution: None,
     }
 }
 

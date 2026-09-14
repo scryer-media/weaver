@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextZh } from "@/next/i18n/zh";
 
 const zh: LocaleDictionary = {
   // Brand
@@ -9,6 +10,8 @@ const zh: LocaleDictionary = {
   "nav.upload": "上传",
   "nav.settings": "设置",
   "nav.sponsor": "赞助",
+  "update.newVersion": "新版本 v{{version}}",
+  "update.newVersionAria": "在新标签页中打开 GitHub 上的 Weaver v{{version}}",
 
   // Status labels
   "status.queued": "排队中",
@@ -209,7 +212,7 @@ const zh: LocaleDictionary = {
   "settings.generalPageDesc": "在此集中调整下载速度、存储路径、清理行为和重试策略。",
   "settings.language": "语言",
   "settings.languageDesc": "选择 Weaver 界面的显示语言。",
-  "settings.bandwidthCap": "ISP 流量限额",
+  "settings.bandwidthCap": "带宽",
   "settings.bandwidthCapDesc": "当前 ISP 配额用尽时阻止新的下载调度。排队中的任务仍保持位置，已在进行中的后处理可继续。",
   "settings.bandwidthCapEnabled": "启用 ISP 限额",
   "settings.bandwidthCapEnabledDesc": "持续跟踪用量，仅在当前窗口配额耗尽时阻止新的文章下载。",
@@ -628,7 +631,14 @@ const zh: LocaleDictionary = {
   "upload.duplicateScore": "重复评分",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "同一重复键内分数较高者胜出；分数相同则保留现有候选。",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "下载诊断包",
+  "systemInfo.diagnosticsBusy": "正在收集诊断信息…",
+  "systemInfo.diagnosticsHint": "收集大约需要 15 秒：指标会间隔十秒采样两次。密码、API 密钥等机密信息会被移除。",
+  "systemInfo.diagnosticsFailed": "无法创建诊断包。",
   ...duplicateLocaleEntries.zho,
+  ...nextZh,
 };
 
 export default zh;

@@ -66,20 +66,22 @@ pub(crate) mod crypt;
 
 /// Default RAM ceiling for holds across one set. A breach pages to the set's
 /// holds scratch; only a paging failure demotes.
+///
+/// Per set. The process-wide sum is bounded separately, by the
+/// [`super::accountant::HoldsAccountant`] every set charges to, whose limit
+/// follows the host's memory.
 pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The **explicit** scratch ceiling, counted against the disk acceptance target
 /// rather than derived from RAM the way the oracle's auto 4×-RAM rule is.
 ///
 /// **Per archive set, not per job or per process.** Each set owns one scratch
-/// file and one [`HoldsScratch`] carrying its own copy of this number, so a job
-/// with three sets can have three times this on disk at once, and a busy server
-/// that multiple. That is the same shape [`DEFAULT_HOLDS_BUDGET_BYTES`] has for
-/// RAM, and it is deliberate at this size: the ceiling exists to stop one
-/// pathological set from filling the disk, not to be a global disk quota — which
-/// would need a shared accountant across sets and jobs, and a policy for what a
-/// set does when another set is using the budget. If the aggregate ever needs
-/// bounding, that is the design, not a smaller constant.
+/// file and one [`HoldsScratch`] carrying its own copy of this number: the
+/// ceiling exists to stop one pathological set from filling the disk. The
+/// aggregate — every set's scratch together, and the free space the working
+/// directory's filesystem must keep — is bounded by the
+/// [`super::accountant::HoldsAccountant`] every set charges to, which a spill
+/// consults before it is written.
 ///
 /// This is the fallback when no per-set override applies. The environment
 /// override is resolved before a router is constructed, so every set still owns
@@ -232,6 +234,8 @@ pub(crate) enum DemotionReason {
     /// pageable run is already in scratch and RAM is still over, which means one
     /// staged run is larger than the whole budget.
     HoldsBudgetExceeded,
+    /// PAR3 cannot retain the virtual image; preserve its posted bytes on disk.
+    Par3MemoryPressure,
     /// The holds scratch file could not be created, written or read.
     HoldsScratchFailed,
     /// Paging would push the holds scratch past its configured ceiling. Counted
@@ -239,6 +243,12 @@ pub(crate) enum DemotionReason {
     /// one is the *disk* claim direct-store makes against its own 1.05×
     /// acceptance target.
     HoldsScratchCeiling,
+    /// Paging would leave the working directory's filesystem with less than
+    /// the free space it must keep. Named apart from
+    /// [`Self::HoldsScratchCeiling`] because the disk, not this set's holds,
+    /// is what ran out — and the set that asked is simply the one that asked
+    /// last.
+    HoldsScratchDiskReserve,
     /// A confirming parse disagreed with the provisional one, or a volume was
     /// re-added with facts that are not an extension of what it stated before.
     ConflictingVolumeFacts,
@@ -507,12 +517,14 @@ impl DemotionReason {
             // Handing the conventional extractor the same image to fail against
             // is not a fallback; real files are.
             Self::ToleratedExtractionFailed => VolumeDemand::Real,
+            Self::Par3MemoryPressure => VolumeDemand::Real,
             // Holds are staged, unrouted bytes: a budget or scratch failure
             // ends *routing* and says nothing about the layout or about the
             // bytes already placed.
-            Self::HoldsBudgetExceeded | Self::HoldsScratchFailed | Self::HoldsScratchCeiling => {
-                VolumeDemand::Virtual
-            }
+            Self::HoldsBudgetExceeded
+            | Self::HoldsScratchFailed
+            | Self::HoldsScratchCeiling
+            | Self::HoldsScratchDiskReserve => VolumeDemand::Virtual,
             // Two parses of one volume disagree. Nothing says which is true, so
             // no overlay built from either may be read as the archive.
             Self::ConflictingVolumeFacts => VolumeDemand::Real,
@@ -612,8 +624,10 @@ impl DemotionReason {
             Self::Par2Unbindable => "par2_unbindable",
             Self::ToleratedExtractionFailed => "tolerated_extraction_failed",
             Self::HoldsBudgetExceeded => "holds_budget",
+            Self::Par3MemoryPressure => "par3_memory_pressure",
             Self::HoldsScratchFailed => "holds_scratch_io",
             Self::HoldsScratchCeiling => "holds_scratch_ceiling",
+            Self::HoldsScratchDiskReserve => "holds_scratch_disk_reserve",
             Self::ConflictingVolumeFacts => "conflicting_volume_facts",
             Self::QuickOpenMismatch => "quick_open_mismatch",
             Self::UnconfirmedRestoredVolume => "unconfirmed_restored_volume",
@@ -890,12 +904,12 @@ impl CrcRuns {
 
 /// One staged run, in RAM or paged out to the set's holds scratch.
 ///
-/// A scratch region is **write-once and append-only** for the life of the set,
-/// so an offset handed out here is valid until the set closes — which is what
-/// makes reading one back a single positioned read with no locking and no
-/// re-validation. Nothing is ever reclaimed or compacted: the file's high-water
-/// is bounded by the total bytes the set ever held, and a later pass revisits
-/// that if measurement says the bound is too loose in practice.
+/// A scratch region is **write-once**: an offset handed out here reads back
+/// with a single positioned read, no locking and no re-validation, for as long
+/// as the image it was taken from exists. The one thing that moves a region is
+/// compaction, which rewrites the router's own index in the same call — and
+/// which, while a reader holds a [`HoldsScratchPin`] on the image, relocates
+/// into a fresh file rather than rewriting the one the reader is on.
 #[derive(Debug, Clone)]
 enum StagedChunk {
     Memory(std::sync::Arc<[u8]>),
@@ -997,15 +1011,18 @@ fn write_at(file: &std::fs::File, offset: u64, bytes: &[u8]) -> std::io::Result<
 
 /// The per-set holds scratch file.
 ///
-/// Append-only, write-once, with an in-memory index that lives in the staging
-/// map: a paged chunk *is* its `(offset, len)`. There is no free list and no
-/// compaction, deliberately — reclaiming space in a file whose regions are
-/// handed out as stable offsets means either rewriting them (which breaks the
-/// write-once property the lock-free read depends on) or a free-list allocator,
-/// and neither is worth building before measurement says the append-only bound
-/// hurts. The bound is stated rather than hidden: **scratch never exceeds the
-/// total bytes the set holds over its life**, and the ceiling below is what
-/// keeps that from being unbounded.
+/// Append-only and write-once per region, with an in-memory index that lives in
+/// the staging map: a paged chunk *is* its `(offset, len)`. There is no free
+/// list. Space that placed holds leave behind is reclaimed only by
+/// [`Self::compact`], and only when an append would otherwise breach the
+/// ceiling — the bound is stated rather than hidden: **scratch never exceeds
+/// the live holds plus what compaction has not yet reclaimed**, and the ceiling
+/// below is what keeps that from being unbounded.
+///
+/// A reader that keeps offsets past the call that handed them out takes a
+/// [`HoldsScratchPin`]. The pin is what makes those offsets safe to keep:
+/// compaction under a pin relocates into a fresh file and leaves the pinned
+/// image untouched, so the reader's offsets stay true for the image it holds.
 #[derive(Debug)]
 pub(crate) struct HoldsScratch {
     path: std::path::PathBuf,
@@ -1018,6 +1035,155 @@ pub(crate) struct HoldsScratch {
     /// it inherits the same rule: marked at creation, before a byte is written,
     /// and a marking failure demotes rather than proceeding.
     sparse: SparseMarking,
+    /// Live pins over the **current** image. Replaced, not reset, whenever the
+    /// image is: the pins of a relocated-away image keep decrementing their own
+    /// counter, and the fresh file starts unpinned.
+    pins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Images a pinned compaction relocated away from, still allocated on disk
+    /// for as long as their readers hold them. Their bytes stay charged to the
+    /// process-wide accountant until the last pin drops — they are real disk
+    /// the scratch ceiling and the reserve were promised to bound — and are
+    /// forgotten at the next publication after that.
+    retired: Vec<RetiredScratchImage>,
+}
+
+/// One relocated-away scratch image: its pin counter, and the bytes it holds
+/// on disk until that counter reaches zero.
+#[derive(Debug)]
+struct RetiredScratchImage {
+    pins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    bytes: u64,
+}
+
+/// A reader's hold on one scratch image: the handle, and the promise that the
+/// offsets handed out against that image stay true while the pin lives.
+///
+/// The provider carries one of these inside every scratch-backed held run so
+/// that PAR2 can read holds on demand, positionally, instead of the router
+/// copying every hold into RAM at provider construction — which is what let a
+/// set's holds bypass the budget the scratch exists to enforce. Two things can
+/// happen to the image underneath a pin, and both are safe: compaction
+/// relocates into a fresh file and leaves this one alone, and `discard`
+/// unlinks the path while the handle keeps the bytes readable until the last
+/// pin drops.
+#[derive(Debug)]
+pub(crate) struct HoldsScratchPin {
+    file: std::sync::Arc<std::fs::File>,
+    pins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HoldsScratchPin {
+    /// Positioned read from the pinned image; a short file is an I/O error,
+    /// never a hole, because a region handed out was written in full.
+    pub(crate) fn read_at(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        read_at(&self.file, offset, out)
+    }
+}
+
+impl Drop for HoldsScratchPin {
+    fn drop(&mut self) {
+        self.pins.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The path a pinned compaction packs into before taking over `path`. It
+/// keeps the holds-scratch prefix, so a copy a crash leaves behind is swept at
+/// restart exactly like the scratch itself.
+fn compacting_scratch_path(path: &std::path::Path) -> std::path::PathBuf {
+    scratch_sibling_path(path, "compacting")
+}
+
+/// The path the pinned image is moved aside to while the packed copy takes
+/// over `path`. Same prefix, same sweep, for the same reason.
+fn retired_scratch_path(path: &std::path::Path) -> std::path::PathBuf {
+    scratch_sibling_path(path, "retired")
+}
+
+fn scratch_sibling_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.{suffix}"))
+}
+
+/// Puts `packed` at `path` while a reader still holds the file that is there.
+///
+/// Not a rename over the path. A pinned image is an *open* file, and on
+/// Windows an open file cannot be replaced, only moved or unlinked — both of
+/// which its share-delete handle allows. So the pinned image steps aside
+/// first, the packed copy takes the path, and the retired image is unlinked
+/// last: immediately on POSIX, and on Windows the moment its last handle
+/// closes, which is what the pin is. A failure between the two moves puts the
+/// image back where it was, so the caller sees the file it had.
+fn take_over_scratch_path(
+    packed: &std::path::Path,
+    path: &std::path::Path,
+    retired: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(path, retired)?;
+    if let Err(error) = std::fs::rename(packed, path) {
+        let _ = std::fs::rename(retired, path);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::remove_file(retired) {
+        // The path keeps the scratch prefix, so a restart sweeps it; nothing
+        // reads it by name in the meantime.
+        tracing::debug!(
+            retired_path = %retired.display(),
+            error = %error,
+            "direct-store could not unlink a retired holds scratch image"
+        );
+    }
+    Ok(())
+}
+
+/// Creates (or truncates) a scratch file, read/write, marked sparse before a
+/// byte is written. On Windows it is opened share-delete: `discard` unlinks
+/// the scratch under live pins, and a pinned compaction renames its packed copy
+/// over the path, and neither is allowed against a handle opened without it.
+fn open_scratch_file(
+    path: &std::path::Path,
+    sparse: &SparseMarking,
+) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        options.share_mode(0x1 | 0x2 | 0x4);
+    }
+    let file = options.open(path)?;
+    if let Err(error) = super::sparse::SparseMarker::mark_sparse(sparse, &file) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Copies `len` bytes from `src` at `src_offset` to `dst` at `dst_offset`,
+/// front to back in bounded slices. `src` and `dst` may be the same file: an
+/// in-place pack only ever moves a region toward the front, and front-to-back
+/// order keeps the destination behind the not-yet-read source.
+fn copy_scratch_region(
+    src: &std::fs::File,
+    src_offset: u64,
+    dst: &std::fs::File,
+    dst_offset: u64,
+    len: u64,
+) -> Option<()> {
+    const COPY_SLICE_BYTES: u64 = 1024 * 1024;
+    let mut copied = 0u64;
+    while copied < len {
+        let take = COPY_SLICE_BYTES.min(len - copied);
+        let mut buffer = vec![0u8; take as usize];
+        read_at(src, src_offset.saturating_add(copied), &mut buffer).ok()?;
+        write_at(dst, dst_offset.saturating_add(copied), &buffer).ok()?;
+        copied += take;
+    }
+    Some(())
 }
 
 impl HoldsScratch {
@@ -1028,15 +1194,49 @@ impl HoldsScratch {
             len: 0,
             ceiling,
             sparse: SparseMarking::default(),
+            pins: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retired: Vec::new(),
         }
     }
 
+    /// The current image's length: what this set's own ceiling bounds.
     pub(super) fn bytes(&self) -> u64 {
         self.len
     }
 
+    /// What this scratch occupies on disk: the current image, plus every
+    /// relocated-away image a reader still pins. This is the figure the
+    /// process-wide accountant is told, because it is the disk that is
+    /// actually in use; the images whose last pin has dropped are forgotten
+    /// here, and their bytes with them.
+    pub(super) fn charged_bytes(&mut self) -> u64 {
+        self.retired
+            .retain(|image| image.pins.load(std::sync::atomic::Ordering::Acquire) > 0);
+        self.retired
+            .iter()
+            .fold(self.len, |total, image| total.saturating_add(image.bytes))
+    }
+
     fn handle(&self) -> Option<std::sync::Arc<std::fs::File>> {
         self.file.clone()
+    }
+
+    /// Pins the current image for a reader. `None` when nothing has been paged
+    /// yet — there is no image to pin, and no scratch-backed chunk to read.
+    pub(super) fn pin(&self) -> Option<std::sync::Arc<HoldsScratchPin>> {
+        let file = std::sync::Arc::clone(self.file.as_ref()?);
+        self.pins.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(std::sync::Arc::new(HoldsScratchPin {
+            file,
+            pins: std::sync::Arc::clone(&self.pins),
+        }))
+    }
+
+    /// Whether a reader holds the current image. Read on the router's own
+    /// thread, which is also the only thread that hands pins out, so the answer
+    /// cannot change between this and the compaction that acts on it.
+    pub(super) fn is_pinned(&self) -> bool {
+        self.pins.load(std::sync::atomic::Ordering::Acquire) > 0
     }
 
     /// Appends one run and returns its offset. `None` on a ceiling breach, which
@@ -1054,12 +1254,13 @@ impl HoldsScratch {
             // Marked sparse before the first `write_at`. A killed run's scratch
             // is swept at restart, so an existing file here is not state to
             // preserve — truncating it is what keeps the append cursor (`len`,
-            // reset to zero by `discard`) agreeing with the file.
-            let file = super::sparse::create_sparse(&self.path, &self.sparse)
-                .map_err(|_| DemotionReason::HoldsScratchFailed)?;
-            file.set_len(0)
+            // reset to zero by `discard`) agreeing with the file. A fresh image
+            // starts unpinned: whatever pins a discarded image still has are
+            // on their own counter.
+            let file = open_scratch_file(&self.path, &self.sparse)
                 .map_err(|_| DemotionReason::HoldsScratchFailed)?;
             self.file = Some(std::sync::Arc::new(file));
+            self.pins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             tracing::debug!(
                 scratch_path = %self.path.display(),
                 ceiling_bytes = self.ceiling,
@@ -1086,12 +1287,21 @@ impl HoldsScratch {
     /// source and never lands on a source that has not been read yet. Copying
     /// each extent front to back keeps that true inside an extent too.
     ///
+    /// While a [`HoldsScratchPin`] is alive the rewrite is **not** in place:
+    /// the live extents are packed into a fresh file that is renamed over the
+    /// path, the router carries on with that copy, and the pinned readers keep
+    /// the handle to the image their offsets were taken from. The old image's
+    /// space is returned when the last pin drops. This is what lets a provider
+    /// read holds from the scratch on demand rather than copying them out
+    /// first.
+    ///
     /// `None` means the file is now in an unknown state: the caller must
     /// demote rather than trust any offset, including the ones it already had.
     pub(super) fn compact(&mut self, live: &[(u64, u64)]) -> Option<Vec<u64>> {
-        const COPY_SLICE_BYTES: u64 = 1024 * 1024;
-
         let file = std::sync::Arc::clone(self.file.as_ref()?);
+        if self.is_pinned() {
+            return self.compact_relocating(&file, live);
+        }
         let mut new_offsets = Vec::with_capacity(live.len());
         let mut cursor = 0u64;
         for (offset, len) in live.iter().copied() {
@@ -1101,14 +1311,7 @@ impl HoldsScratch {
                 return None;
             }
             if cursor < offset {
-                let mut copied = 0u64;
-                while copied < len {
-                    let take = COPY_SLICE_BYTES.min(len - copied);
-                    let mut buffer = vec![0u8; take as usize];
-                    read_at(&file, offset.saturating_add(copied), &mut buffer).ok()?;
-                    write_at(&file, cursor.saturating_add(copied), &buffer).ok()?;
-                    copied += take;
-                }
+                copy_scratch_region(&file, offset, &file, cursor, len)?;
             }
             new_offsets.push(cursor);
             cursor = cursor.checked_add(len)?;
@@ -1116,6 +1319,61 @@ impl HoldsScratch {
         file.set_len(cursor).ok()?;
         self.len = cursor;
         Some(new_offsets)
+    }
+
+    /// [`Self::compact`] under a pin: pack into a fresh file, then take it over.
+    ///
+    /// The take-over is what keeps everything outside this type unchanged —
+    /// the path is the path, `discard` deletes it, the restart sweep recognises
+    /// it. A failure at any step leaves the current image exactly as it was
+    /// and removes the half-written copy; the caller demotes on `None` as
+    /// before. The caller has already had the packed copy's bytes admitted by
+    /// the accountant: while the pins live, both images are on disk.
+    fn compact_relocating(&mut self, old: &std::fs::File, live: &[(u64, u64)]) -> Option<Vec<u64>> {
+        let packing_path = compacting_scratch_path(&self.path);
+        let retired_path = retired_scratch_path(&self.path);
+        let fresh = open_scratch_file(&packing_path, &self.sparse).ok()?;
+        let packed = (|| {
+            let mut new_offsets = Vec::with_capacity(live.len());
+            let mut cursor = 0u64;
+            for (offset, len) in live.iter().copied() {
+                if cursor > offset {
+                    return None;
+                }
+                copy_scratch_region(old, offset, &fresh, cursor, len)?;
+                new_offsets.push(cursor);
+                cursor = cursor.checked_add(len)?;
+            }
+            take_over_scratch_path(&packing_path, &self.path, &retired_path).ok()?;
+            Some((new_offsets, cursor))
+        })();
+        match packed {
+            Some((new_offsets, cursor)) => {
+                tracing::debug!(
+                    scratch_path = %self.path.display(),
+                    old_bytes = self.len,
+                    packed_bytes = cursor,
+                    pins = self.pins.load(std::sync::atomic::Ordering::Acquire),
+                    "direct-store relocated the holds scratch under a live reader"
+                );
+                let pins = std::mem::replace(
+                    &mut self.pins,
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                );
+                self.retired.push(RetiredScratchImage {
+                    pins,
+                    bytes: self.len,
+                });
+                self.file = Some(std::sync::Arc::new(fresh));
+                self.len = cursor;
+                Some(new_offsets)
+            }
+            None => {
+                drop(fresh);
+                let _ = std::fs::remove_file(&packing_path);
+                None
+            }
+        }
     }
 
     pub(super) fn read(&self, offset: u64, len: u64) -> Option<Vec<u8>> {
@@ -1408,6 +1666,21 @@ pub(super) struct VolumeStaging {
     /// Cleared as the range drains, so the mark lives exactly as long as the
     /// bytes it describes.
     repaired: ByteRanges,
+    /// The offset the last header walk over this volume ran out of bytes at,
+    /// as the walk itself reported it; `None` before the first walk and
+    /// whenever one stopped for a reason more bytes cannot change.
+    ///
+    /// **The re-parse gate.** A store volume's end-of-archive record sits past
+    /// every member's payload, so the confirming walk cannot succeed until the
+    /// volume's *last* article lands — and without this the router walked the
+    /// headers again for every article in between, each walk stopping at the
+    /// same byte. On a `-hp` set each of those walks also re-derived the
+    /// archive key.
+    ///
+    /// The number is a lower bound on what the walk needs: waiting for it can
+    /// still cost a walk that comes up short, and can never skip one that
+    /// would have succeeded.
+    parse_short_at: Option<u64>,
     /// Physical end of the last member extent the walk has reached.
     ///
     /// **The frontier of proven classification.** Below it the walk arrived
@@ -1464,6 +1737,32 @@ pub(super) fn restored_volume_is_confirmed(
 }
 
 impl VolumeStaging {
+    /// Whether the volume image now reaches `short_at`, the offset the last
+    /// header walk reported it could not read.
+    ///
+    /// `short_at` is the **first** offset the walk could not read, so what the
+    /// walk needs is every byte *below* it, and the byte to ask after is the
+    /// one at `short_at - 1`: either it is staged, or it was routed away — in
+    /// which case the walk's own answer may have moved and the gate must not
+    /// hold it back. Asking after the byte *at* `short_at` is off by one, and
+    /// not harmlessly so: the walk reports the least a header could occupy
+    /// from where it stopped, and a `-hp` end-of-archive record is exactly
+    /// that minimum, so its `short_at` is the volume's own length — an offset
+    /// no image ever holds a byte at. A volume whose end record arrived by
+    /// repair rather than by its last article would then never be re-walked,
+    /// never confirmed, and never able to file the record it was repaired for.
+    fn parse_can_reach(&self, short_at: u64) -> bool {
+        let Some(last_needed) = short_at.checked_sub(1) else {
+            return true;
+        };
+        let staged = self
+            .chunks
+            .range(..=last_needed)
+            .next_back()
+            .is_some_and(|(start, chunk)| last_needed < start.saturating_add(chunk.len()));
+        staged || self.routed.missing(last_needed, 1).is_empty()
+    }
+
     /// Stores the parts of `[offset, offset + len)` that are neither routed nor
     /// already pending, and marks them pending. Returns the newly staged bytes.
     fn stage(&mut self, offset: u64, data: &[u8]) -> u64 {
@@ -1554,7 +1853,6 @@ impl VolumeStaging {
         }
     }
 
-    #[cfg(test)]
     fn staged_bytes(&self) -> u64 {
         self.chunks
             .values()
@@ -1842,6 +2140,11 @@ pub(crate) struct DirectSetRouter {
     /// per volume — where the read is per span.
     member_order_stale: bool,
     holds_budget: u64,
+    /// The process-wide accountant every set of the pipeline charges its holds
+    /// to, and this set's standing charge against it. Unbounded until the
+    /// runtime installs its own — see [`super::accountant`].
+    accountant: std::sync::Arc<super::accountant::HoldsAccountant>,
+    charge: super::accountant::HoldsCharge,
     /// The paging destination. Opened on the first breach and never before, so
     /// a set that stays inside its RAM budget — which is nearly all of them —
     /// touches the filesystem for it exactly zero times.
@@ -1854,6 +2157,19 @@ pub(crate) struct DirectSetRouter {
     /// headers: it is only consulted when a header parse comes back
     /// `EncryptedArchive`.
     header_crypt: HeaderKeyRing,
+    /// The key derivations every header walk over this set's volumes shares.
+    ///
+    /// A `-hp` volume's archive key comes from (password, salt, KDF count),
+    /// and all three are properties of the volume rather than of the parse —
+    /// so a walk that derives its own throws the work away and the next
+    /// article's walk pays for it again. On a set whose volumes are staged
+    /// article by article that is one PBKDF2 run of up to 2^24 iterations per
+    /// article, per volume, for nothing.
+    ///
+    /// Held for the life of the router, which is the set: the cache is keyed
+    /// by password as well as by salt, so it is derived key material and its
+    /// lifetime is deliberately this unit of work and not the process.
+    kdf_cache: std::sync::Arc<unrar_rs::KdfCache>,
     /// Envelope spans produced by a member **migration** (the small-member
     /// tolerance), waiting to be handed to the caller.
     ///
@@ -1914,6 +2230,11 @@ pub(crate) struct DirectSetRouter {
     /// prove a cache the library never adopted does not cost a second parse.
     #[cfg(test)]
     quick_open_walks: u64,
+    /// How many header walks this set has run over a staged image, so a test
+    /// can prove the re-parse gate holds: the count is a property of the
+    /// volumes, not of how many articles they arrived in.
+    #[cfg(test)]
+    parse_walks: u64,
     /// Does the job that owns this set carry PAR2 at all?
     ///
     /// The one fact that turns a part-checksum mismatch from a verdict into a
@@ -1928,6 +2249,9 @@ pub(crate) struct DirectSetRouter {
     /// already true when this is consulted. See
     /// [`super::plan::spec_carries_par2`] for why an index alone counts.
     par2_available: bool,
+    /// A PAR3-only job may defer archive checksum failures until its native
+    /// verifier settles. Resolved verdicts never earn another deferral.
+    par3_verification_pending: bool,
     /// Volumes whose posted bytes failed an archive-level checksum that the
     /// wire's own yEnc CRC could not see.
     ///
@@ -1936,7 +2260,7 @@ pub(crate) struct DirectSetRouter {
     /// evidence (the wire is exactly what lied), and any member spanning the
     /// volume holds its whole-member gate until the repair has had its say.
     ///
-    /// Empty unless [`Self::par2_available`], and emptied per volume
+    /// Empty unless PAR2 or PAR3 can answer, and emptied per volume
     /// by [`Self::route_repaired`] — the repair's answer supersedes the
     /// question.
     damaged_volumes: std::collections::BTreeSet<u32>,
@@ -1947,6 +2271,25 @@ pub(crate) struct DirectSetRouter {
     /// recording it again would park the set on a question that has already
     /// been asked and lost, so the second one demotes.
     repair_rerouted: bool,
+    /// Is [`Self::route_repaired`] mid-drain?
+    ///
+    /// A rewrite reaches the compositions in pieces — an encrypted slice as its
+    /// edge blocks and aligned middle, a volume with several damaged slices as
+    /// one run per slice — and between two of those pieces a part's runs still
+    /// tile: the pieces already fed carry the repaired values and the rest still
+    /// carry the wire-damaged ones. A gate that fires there composes a mixture
+    /// that describes no bytes that ever existed, and with `repair_rerouted`
+    /// set its mismatch is the demotion, not a question. So while this is set
+    /// both integrity layers only record; [`Self::settle_repair_gates`] runs
+    /// them once, over the finished rewrite.
+    repair_draining: bool,
+    /// A volume whose replacement spans are arriving across several calls.
+    /// Its integrity gates and durable coverage remain pending until the last
+    /// batch arrives. A different volume cannot finish this replacement.
+    repair_batch: Option<u32>,
+    /// Ordered volumes still awaiting replacement within a set-wide transaction.
+    /// An empty queue remains a fence until the caller confirms placement.
+    repair_transaction: Option<std::collections::VecDeque<u32>>,
     demoted: Option<DemotionReason>,
 }
 
@@ -1966,8 +2309,20 @@ impl std::fmt::Debug for DirectSetRouter {
     }
 }
 
+impl Drop for DirectSetRouter {
+    /// A set's bytes go with it. The accountant is charged with live holds,
+    /// and a router that is dropped — its job removed, its set cleared — has
+    /// none left.
+    fn drop(&mut self) {
+        self.accountant.release(&mut self.charge);
+    }
+}
+
 impl DirectSetRouter {
     pub(crate) fn new(plan: DirectSetPlan) -> Self {
+        // One cache for the whole set: the key rings verify and derive into
+        // it, and every header walk over every volume shares it.
+        let kdf_cache = std::sync::Arc::new(unrar_rs::KdfCache::new());
         Self {
             scratch: HoldsScratch::new(plan.holds_scratch_path(), HOLDS_SCRATCH_CEILING_BYTES),
             plan,
@@ -1983,8 +2338,11 @@ impl DirectSetRouter {
             member_order: Vec::new(),
             member_order_stale: false,
             holds_budget: DEFAULT_HOLDS_BUDGET_BYTES,
-            crypt: KeyRing::new(),
-            header_crypt: HeaderKeyRing::new(),
+            accountant: std::sync::Arc::new(super::accountant::HoldsAccountant::unbounded()),
+            charge: super::accountant::HoldsCharge::default(),
+            crypt: KeyRing::with_shared_kdf_cache(std::sync::Arc::clone(&kdf_cache)),
+            header_crypt: HeaderKeyRing::with_shared_kdf_cache(std::sync::Arc::clone(&kdf_cache)),
+            kdf_cache,
             migrated: Vec::new(),
             retired_destinations: Vec::new(),
             member_facts_revision: 0,
@@ -1995,9 +2353,15 @@ impl DirectSetRouter {
             blocks_held: 0,
             #[cfg(test)]
             quick_open_walks: 0,
+            #[cfg(test)]
+            parse_walks: 0,
             par2_available: false,
+            par3_verification_pending: false,
             damaged_volumes: std::collections::BTreeSet::new(),
             repair_rerouted: false,
+            repair_draining: false,
+            repair_batch: None,
+            repair_transaction: None,
             demoted: None,
         }
     }
@@ -2010,7 +2374,49 @@ impl DirectSetRouter {
         self.par2_available = available;
     }
 
-    /// Volumes carrying a recorded part-checksum mismatch, awaiting PAR2's
+    pub(crate) fn note_par3_available(&mut self, available: bool) {
+        self.par3_verification_pending = available;
+    }
+
+    pub(crate) fn awaits_par3_verdict(&self) -> bool {
+        self.par3_verification_pending
+    }
+
+    /// Native verification has settled all protected sources. Re-run archive
+    /// checks once; disagreement must now fail rather than defer indefinitely.
+    pub(crate) fn settle_par3_verification(&mut self) -> Result<(), DemotionReason> {
+        if let Some(reason) = self.demoted {
+            return Err(reason);
+        }
+        if self.repair_batch_in_progress() {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        self.par3_verification_pending = false;
+        self.damaged_volumes.clear();
+        self.settle_repair_gates()
+            .map_err(|reason| self.fail(reason))
+    }
+
+    fn record_member_checksum_damage(&mut self, member_id: u32) -> bool {
+        if !self.par3_verification_pending || self.repair_rerouted {
+            return false;
+        }
+        let Some(index) = self.layout_index_for_member(member_id) else {
+            return false;
+        };
+        let volumes: Vec<_> = self.layout_members()[index]
+            .parts
+            .iter()
+            .map(|part| part.volume)
+            .collect();
+        self.damaged_volumes.extend(volumes);
+        if let Some(member) = self.member_mut(member_id) {
+            member.verified = false;
+        }
+        true
+    }
+
+    /// Volumes carrying an archive-checksum mismatch, awaiting native recovery's
     /// answer. See [`Self::damaged_volumes`].
     pub(crate) fn damaged_volumes(&self) -> &std::collections::BTreeSet<u32> {
         &self.damaged_volumes
@@ -2036,7 +2442,7 @@ impl DirectSetRouter {
         member_id: u32,
         part_position: u32,
     ) -> bool {
-        if !self.par2_available || self.repair_rerouted {
+        if !(self.par2_available || self.par3_verification_pending) || self.repair_rerouted {
             return false;
         }
         self.damaged_volumes.insert(volume_index);
@@ -2082,6 +2488,26 @@ impl DirectSetRouter {
     #[cfg(test)]
     pub(crate) fn quick_open_walks(&self) -> u64 {
         self.quick_open_walks
+    }
+
+    /// Header walks over a staged image run so far. Test-only; see the field.
+    #[cfg(test)]
+    pub(crate) fn parse_walks(&self) -> u64 {
+        self.parse_walks
+    }
+
+    /// Key derivations this set has actually paid for — RAR5 and RAR4 alike —
+    /// as opposed to the ones served from its cache.
+    ///
+    /// The cost this measures is not incidental: one RAR5 derivation is a
+    /// PBKDF2 run of up to 2^24 iterations, and a set that pays one per
+    /// arriving article spends more time on it than on everything else the
+    /// router does.
+    #[cfg(test)]
+    pub(crate) fn kdf_derivations(&self) -> u64 {
+        self.kdf_cache
+            .rar5_derivation_count()
+            .saturating_add(self.kdf_cache.rar4_derivation_count())
     }
 
     /// Whether the set would still take a job password.
@@ -2273,8 +2699,19 @@ impl DirectSetRouter {
     /// from the neighbour's own destination reproduces exactly what was posted)
     /// and hands back to [`Self::route_repaired`] as unrepaired lead-in.
     pub(crate) fn cipher_edge_reads(&self, volume_index: u32) -> Vec<(u32, u64, u64)> {
+        self.cipher_edge_reads_bounded(volume_index, usize::MAX)
+            .expect("unbounded edge plan")
+    }
+
+    /// Refuse before allocating more than `limit` edge requests. The caller
+    /// reserves their metadata and bytes before requesting this plan.
+    pub(crate) fn cipher_edge_reads_bounded(
+        &self,
+        volume_index: u32,
+        limit: usize,
+    ) -> Option<Vec<(u32, u64, u64)>> {
         let mut reads = Vec::new();
-        for extent in self.volume_member_extents(volume_index) {
+        for extent in self.routed_extents.get(&volume_index).into_iter().flatten() {
             let Some(member) = self.members.get(&extent.member_id) else {
                 continue;
             };
@@ -2294,46 +2731,31 @@ impl DirectSetRouter {
                 if from >= to {
                     continue;
                 }
-                reads.extend(self.locate_member_cipher(extent.member_id, from, to - from));
-            }
-        }
-        reads.retain(|(volume, _, _)| *volume != volume_index);
-        reads
-    }
-
-    /// Where a member-logical (== cipher) range physically lives, as
-    /// `(volume, physical offset, length)` per volume it crosses.
-    ///
-    /// Read off the **routed extent history** rather than the layout's part
-    /// table, for the same reason: the history is what the destinations
-    /// actually are, and a member that turned ineligible after routing would
-    /// otherwise map its own bytes to the envelope.
-    fn locate_member_cipher(
-        &self,
-        member_id: u32,
-        logical_offset: u64,
-        len: u64,
-    ) -> Vec<(u32, u64, u64)> {
-        let end = logical_offset.saturating_add(len);
-        let mut found = Vec::new();
-        for (volume, extents) in &self.routed_extents {
-            for extent in extents {
-                if extent.member_id != member_id {
-                    continue;
-                }
-                let extent_end = extent.logical_offset.saturating_add(extent.len);
-                let from = logical_offset.max(extent.logical_offset);
-                let to = end.min(extent_end);
-                if from < to {
-                    found.push((
-                        *volume,
-                        extent.physical_offset + (from - extent.logical_offset),
-                        to - from,
-                    ));
+                for (volume, extents) in &self.routed_extents {
+                    if *volume == volume_index {
+                        continue;
+                    }
+                    for candidate in extents
+                        .iter()
+                        .filter(|candidate| candidate.member_id == extent.member_id)
+                    {
+                        let begin = from.max(candidate.logical_offset);
+                        let end = to.min(candidate.logical_offset.saturating_add(candidate.len));
+                        if begin < end {
+                            if reads.len() == limit {
+                                return None;
+                            }
+                            reads.push((
+                                *volume,
+                                candidate.physical_offset + (begin - candidate.logical_offset),
+                                end - begin,
+                            ));
+                        }
+                    }
                 }
             }
         }
-        found
+        Some(reads)
     }
 
     /// Whether some encrypted member this set has **routed bytes for** cannot
@@ -2433,6 +2855,15 @@ impl DirectSetRouter {
     /// and demotion.
     pub(crate) fn discard_scratch(&mut self) {
         self.scratch.discard();
+        self.publish_holds();
+    }
+
+    /// Whether a reader still pins the set's scratch image. A pin outlives
+    /// [`Self::discard_scratch`]: the path is gone, the bytes are not, until
+    /// the last reader drops.
+    #[cfg(test)]
+    pub(crate) fn scratch_is_pinned(&self) -> bool {
+        self.scratch.is_pinned()
     }
 
     /// Pages RAM-resident staged runs out to scratch until the holds budget is
@@ -2454,7 +2885,7 @@ impl DirectSetRouter {
         candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.0));
 
         for (_, volume_index, offset) in candidates {
-            if self.resident_bytes() <= self.holds_budget {
+            if !self.holds_over_budget() {
                 return Ok(());
             }
             let bytes = match self
@@ -2468,7 +2899,7 @@ impl DirectSetRouter {
             let resident_bytes = self.resident_bytes();
             let scratch_bytes = self.scratch.bytes();
             let chunk_bytes = bytes.len() as u64;
-            let scratch_offset = match self.scratch.append(&bytes) {
+            let scratch_offset = match self.spill_to_scratch(&bytes) {
                 Ok(offset) => offset,
                 // A ceiling breach is not automatically a full scratch: reclaim
                 // what placed holds left behind and try the append once more.
@@ -2510,7 +2941,7 @@ impl DirectSetRouter {
                         scratch_ceiling_bytes = self.scratch.ceiling,
                         "direct-store compacted holds scratch before retrying the spill"
                     );
-                    match self.scratch.append(&bytes) {
+                    match self.spill_to_scratch(&bytes) {
                         Ok(retry_scratch_offset) => {
                             tracing::debug!(
                                 set_name = %self.plan.set_name,
@@ -2551,10 +2982,12 @@ impl DirectSetRouter {
                 );
             }
         }
-        if self.resident_bytes() > self.holds_budget {
+        if self.publish_holds() > self.holds_budget {
             // Everything pageable is paged and RAM is still over: the budget is
             // smaller than one staged run, which is a configuration the set
-            // cannot route inside.
+            // cannot route inside. The *shared* limit is not judged here: with
+            // nothing left to page, this set has done what it can, and the
+            // remainder is other sets' to page when they next route.
             return Err(DemotionReason::HoldsBudgetExceeded);
         }
         Ok(())
@@ -2612,6 +3045,16 @@ impl DirectSetRouter {
             return Ok(false);
         }
 
+        // Under a pin the pack is a second file beside the first, and the
+        // first stays on disk until its readers let go. That copy is scratch
+        // like any other spill: admitted against the shared total and the
+        // reserve before it is written, and charged for as long as both
+        // images exist. A refusal is a demotion, as it is for a spill.
+        if self.scratch.is_pinned() {
+            self.publish_holds();
+            self.accountant
+                .admit_scratch(live_bytes, &self.plan.working_dir)?;
+        }
         let ranges: Vec<(u64, u64)> = extents
             .iter()
             .map(|extent| (extent.scratch_offset, extent.len))
@@ -2632,6 +3075,7 @@ impl DirectSetRouter {
                 );
             }
         }
+        self.publish_holds();
         Ok(true)
     }
 
@@ -2647,6 +3091,50 @@ impl DirectSetRouter {
         self.plan.bind_identity_volume(volume_index, file_index)
     }
 
+    /// Installs the process-wide accountant this set charges its holds to.
+    /// Applied by the runtime to every set it admits, restore included; what
+    /// the set had charged elsewhere moves with it.
+    pub(crate) fn set_holds_accountant(
+        &mut self,
+        accountant: std::sync::Arc<super::accountant::HoldsAccountant>,
+    ) {
+        self.accountant.release(&mut self.charge);
+        self.accountant = accountant;
+        self.publish_holds();
+    }
+
+    /// Publishes this set's resident and scratch bytes to the accountant.
+    /// Called wherever staging changes size, so the process total is current
+    /// whenever a set consults it.
+    ///
+    /// Returns the resident figure it published, so the caller that needs it
+    /// next does not walk the staging map a second time: the article path
+    /// pays exactly the one fold it paid before the accountant existed.
+    fn publish_holds(&mut self) -> u64 {
+        let resident = self.resident_bytes();
+        let scratch = self.scratch.charged_bytes();
+        self.accountant.publish(&mut self.charge, resident, scratch);
+        resident
+    }
+
+    /// Whether this set must page: over its own budget, or holding anything
+    /// at all while the process is over the limit every set shares.
+    fn holds_over_budget(&mut self) -> bool {
+        let resident = self.publish_holds();
+        resident > self.holds_budget || (resident > 0 && self.accountant.resident_over_limit())
+    }
+
+    /// One spill: admitted by the accountant — the shared scratch total and
+    /// the disk reserve — then appended to this set's own scratch, under its
+    /// own ceiling. Published either way.
+    fn spill_to_scratch(&mut self, bytes: &[u8]) -> Result<u64, DemotionReason> {
+        self.accountant
+            .admit_scratch(bytes.len() as u64, &self.plan.working_dir)?;
+        let appended = self.scratch.append(bytes);
+        self.publish_holds();
+        appended
+    }
+
     /// Lowers the holds ceiling so a test can breach it without staging tens of
     /// megabytes.
     #[cfg(test)]
@@ -2659,6 +3147,21 @@ impl DirectSetRouter {
     /// back — every repaired byte re-enters the router as a hold.
     pub(crate) fn holds_budget(&self) -> u64 {
         self.holds_budget
+    }
+
+    /// Stop ordinary lookahead before the hard paging ceiling. The remaining
+    /// quarter absorbs estimate error and permits serialized routing probes.
+    pub(crate) fn holds_admission_limit(&self) -> u64 {
+        let capacity = self.holds_budget.saturating_add(self.scratch.ceiling);
+        capacity.saturating_sub(capacity / 4)
+    }
+
+    /// An incomplete header walk can still release retained bytes, including
+    /// bytes from later volumes whose split-member offsets depend on this one.
+    pub(crate) fn volume_needs_header(&self, volume: u32) -> bool {
+        self.staging
+            .get(&volume)
+            .is_none_or(|staging| !staging.confirmed)
     }
 
     /// Test hook: force-stage a range without draining it, so a test can build
@@ -2734,7 +3237,6 @@ impl DirectSetRouter {
     /// `-rr` volume's recovery record is envelope-classified and is a percentage
     /// of the volume, per volume — and the point of paging is to move that term
     /// from the one ceiling to the other rather than to demote the set.
-    #[cfg(test)]
     pub(crate) fn staged_bytes(&self) -> u64 {
         self.staging.values().fold(0u64, |total, staging| {
             total.saturating_add(staging.staged_bytes())
@@ -2851,7 +3353,9 @@ impl DirectSetRouter {
 
     /// Whether every learned member has passed its whole-member gate.
     pub(crate) fn all_members_verified(&self) -> bool {
-        !self.members.is_empty() && self.members.values().all(|member| member.verified)
+        !self.repair_batch_in_progress()
+            && !self.members.is_empty()
+            && self.members.values().all(|member| member.verified)
     }
 }
 

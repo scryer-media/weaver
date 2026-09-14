@@ -22,6 +22,7 @@ fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
         created_at,
         completed_at,
         metadata: None,
+        server_attribution: None,
     }
 }
 
@@ -142,6 +143,7 @@ fn job(status: JobStatus) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_000.0,
+        server_attribution: Vec::new(),
     }
 }
 
@@ -474,6 +476,48 @@ fn download_resumes_after_pause_without_explicit_second_start() {
     assert_eq!(download_lane.spans[0].ended_at, Some(4_000.0));
     assert_eq!(download_lane.spans[1].started_at, 6_000.0);
     assert_eq!(download_lane.spans[1].ended_at, Some(10_000.0));
+}
+
+#[test]
+fn propagation_wait_is_pending_until_the_actual_download_start() {
+    let mut held = job(JobStatus::Downloading);
+    held.download_state = weaver_server_core::DownloadState::Queued;
+    held.download_wait_reason =
+        Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON.to_owned());
+    held.download_retry_at_epoch_ms = Some(301_000.0);
+    let created = event("JobCreated", 1_000, None, "");
+    let waiting = build_job_timeline(&held, None, std::slice::from_ref(&created));
+    assert_eq!(waiting.outcome, JobStatusGql::Queued);
+    assert_eq!(waiting.lanes.len(), 1);
+    assert_eq!(waiting.lanes[0].stage, TimelineStage::PendingDownload);
+    assert_eq!(waiting.lanes[0].spans[0].started_at, 1_000.0);
+    assert_eq!(waiting.lanes[0].spans[0].ended_at, None);
+
+    held.status = JobStatus::Paused;
+    held.run_state = weaver_server_core::RunState::Paused;
+    assert_eq!(
+        build_job_timeline(&held, None, std::slice::from_ref(&created)).outcome,
+        JobStatusGql::Paused
+    );
+
+    let running = build_job_timeline(
+        &job(JobStatus::Downloading),
+        None,
+        &[created, event("DownloadStarted", 301_000, None, "")],
+    );
+    assert_eq!(running.outcome, JobStatusGql::Downloading);
+    let pending = running
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::PendingDownload)
+        .unwrap();
+    assert_eq!(pending.spans[0].ended_at, Some(301_000.0));
+    let downloading = running
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Downloading)
+        .unwrap();
+    assert_eq!(downloading.spans[0].started_at, 301_000.0);
 }
 
 #[test]
@@ -840,4 +884,104 @@ fn verifying_lane_splits_when_targeted_recovery_download_restarts() {
     assert_eq!(download_lane.spans.len(), 1);
     assert_eq!(download_lane.spans[0].started_at, 4_000.0);
     assert_eq!(download_lane.spans[0].ended_at, Some(5_000.0));
+}
+
+fn extracting_lane(timeline: &JobTimeline) -> &JobTimelineLane {
+    timeline
+        .lanes
+        .iter()
+        .find(|lane| lane.stage == TimelineStage::Extracting)
+        .expect("extracting lane")
+}
+
+#[test]
+fn extracting_lane_covers_extraction_that_reports_no_members() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Complete),
+        Some(&history(1, 10)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event("DownloadFinished", 5_000, None, ""),
+            event("DownloadPipelineDrained", 5_000, None, ""),
+            event("ExtractionReady", 5_010, None, ""),
+            event("ExtractionComplete", 9_000, None, ""),
+            event("MoveToCompleteStarted", 9_005, None, ""),
+            event("MoveToCompleteFinished", 9_008, None, ""),
+            event("JobCompleted", 9_010, None, ""),
+        ],
+    );
+
+    assert!(timeline.extraction_groups.is_empty());
+    let lane = extracting_lane(&timeline);
+    assert_eq!(lane.spans.len(), 1);
+    assert_eq!(lane.spans[0].started_at, 5_010.0);
+    assert_eq!(lane.spans[0].ended_at, Some(9_000.0));
+    assert_eq!(lane.spans[0].state, TimelineSpanState::Complete);
+}
+
+#[test]
+fn extracting_lane_runs_while_the_job_is_extracting_without_members() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Extracting),
+        None,
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event("DownloadFinished", 5_000, None, ""),
+            event("ExtractionReady", 5_010, None, ""),
+        ],
+    );
+
+    let lane = extracting_lane(&timeline);
+    assert_eq!(lane.spans.len(), 1);
+    assert_eq!(lane.spans[0].started_at, 5_010.0);
+    assert_eq!(lane.spans[0].state, TimelineSpanState::Running);
+}
+
+#[test]
+fn extracting_lane_ends_at_the_final_move_without_a_completion_event() {
+    let timeline = build_job_timeline(
+        &job(JobStatus::Complete),
+        Some(&history(1, 10)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("ExtractionReady", 5_000, None, ""),
+            event("MoveToCompleteStarted", 7_000, None, ""),
+            event("MoveToCompleteFinished", 7_500, None, ""),
+            event("JobCompleted", 8_000, None, ""),
+        ],
+    );
+
+    let lane = extracting_lane(&timeline);
+    assert_eq!(lane.spans.len(), 1);
+    assert_eq!(lane.spans[0].ended_at, Some(7_000.0));
+}
+
+#[test]
+fn extracting_lane_joins_member_activity_and_the_extracting_status() {
+    let member =
+        crate::history::types::encode_timeline_member_subject("set", "episode05.mkv", None);
+    let timeline = build_job_timeline(
+        &job(JobStatus::Complete),
+        Some(&history(1, 10)),
+        &[
+            event("JobCreated", 1_000, None, ""),
+            event("DownloadStarted", 2_000, None, ""),
+            event("ExtractionMemberStarted", 3_000, member.clone(), ""),
+            event("ExtractionMemberFinished", 4_000, member, ""),
+            event("DownloadFinished", 5_000, None, ""),
+            event("ExtractionReady", 6_000, None, ""),
+            event("ExtractionFailed", 8_000, None, "crc failed"),
+            event("JobCompleted", 9_000, None, ""),
+        ],
+    );
+
+    let lane = extracting_lane(&timeline);
+    assert_eq!(lane.spans.len(), 2);
+    assert_eq!(lane.spans[0].started_at, 3_000.0);
+    assert_eq!(lane.spans[0].ended_at, Some(4_000.0));
+    assert_eq!(lane.spans[1].started_at, 6_000.0);
+    assert_eq!(lane.spans[1].ended_at, Some(8_000.0));
+    assert_eq!(lane.spans[1].state, TimelineSpanState::Failed);
 }

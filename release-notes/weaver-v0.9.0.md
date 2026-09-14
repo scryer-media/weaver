@@ -1,9 +1,5 @@
 # Weaver 0.9.0 release notes
 
-> Draft — these notes describe the net change from `weaver-v0.8.3` to
-> `weaver-v0.9.0`. They intentionally describe the completed release rather
-> than the order individual release-branch changes landed.
-
 ## Highlights
 
 Weaver 0.9.0 is a substantial download-pipeline, repair, and operations release.

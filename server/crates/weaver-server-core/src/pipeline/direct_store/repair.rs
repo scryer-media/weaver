@@ -101,7 +101,7 @@ pub(crate) struct DamagedDirectVolume {
     pub(crate) len: u64,
     /// Where the materialized copy goes, and what is deleted afterwards.
     pub(crate) path: PathBuf,
-    /// Physical ranges the repair is expected to rewrite, already widened to
+    /// Physical `(start, end)` ranges the repair is expected to rewrite, already widened to
     /// whole articles wherever the decoded geometry is known.
     ///
     /// Widening is not cosmetic. The composition runs are article-shaped and a
@@ -144,13 +144,15 @@ impl DamagedDirectVolume {
             return false;
         }
         let mut cursor = 0u64;
-        for &(offset, len) in &self.rewrite {
-            if offset > cursor {
+        let mut previous_start = 0u64;
+        for &(start, end) in &self.rewrite {
+            if start > cursor || start < previous_start || start >= end || end > self.len {
                 return false;
             }
-            cursor = cursor.max(offset.saturating_add(len));
+            previous_start = start;
+            cursor = cursor.max(end);
         }
-        cursor >= self.len
+        cursor == self.len
     }
 }
 
@@ -191,6 +193,18 @@ pub(crate) struct RepairedSpan {
     /// article-shaped composition over a range that is not article-shaped — the
     /// one thing [`widen_to_articles`] exists to prevent.
     pub(crate) lead_in: Option<super::router::RepairedChunk>,
+    /// Up to [`CIPHER_LEAD_OUT_BYTES`] posted bytes immediately **above** the
+    /// span, the mirror of `lead_in` and staged the same unrepaired way.
+    ///
+    /// A span's last byte lands anywhere in a cipher block, and the drain can
+    /// only decrypt that block once it holds all sixteen of its bytes. The ones
+    /// below come with the span; the ones above belong to the next article,
+    /// which was routed and dropped from staging long before the repair ran. So
+    /// without them the block resolves for nobody: the repaired bytes inside it
+    /// hold, and the "every repaired byte finds a destination" rule turns that
+    /// into a whole-set demotion after the recovery has already been
+    /// downloaded.
+    pub(crate) lead_out: Option<super::router::RepairedChunk>,
 }
 
 /// What the repaired volumes came out as.
@@ -393,6 +407,14 @@ pub(crate) fn widen_to_articles(
 /// The bytes come off the **materialized** volume, so they are the posted ones.
 const CIPHER_LEAD_IN_BYTES: u64 = 32;
 
+/// How many posted bytes are read back **above** a repaired span, for the same
+/// reason [`CIPHER_LEAD_IN_BYTES`] reads them below.
+///
+/// One block is exactly enough: the span's last byte sits at most 15 bytes short
+/// of its block's end, and nothing above that block is needed — CBC decryption
+/// looks backwards, so the block's own predecessor is inside the span.
+const CIPHER_LEAD_OUT_BYTES: u64 = 16;
+
 /// Materializes the damaged volumes and repairs them. Blocking: call it on the
 /// blocking pool.
 ///
@@ -575,26 +597,14 @@ pub(crate) fn read_repaired_spans(
 ) -> Result<Vec<RepairedSpan>, DirectRepairFailure> {
     let mut spans = Vec::with_capacity(volume.rewrite.len());
     for &(start, end) in &volume.rewrite {
-        match read_span_chunked(&volume.path, start, end.saturating_sub(start)) {
-            Ok(Some(span)) => {
-                let lead_in = match cipher_lead_in && start > 0 {
-                    true => {
-                        let from = start.saturating_sub(CIPHER_LEAD_IN_BYTES);
-                        read_span_chunked(&volume.path, from, start - from)
-                            .map_err(|error| DirectRepairFailure::ReadBackFailed {
-                                volume_index: volume.volume_index,
-                                error: error.to_string(),
-                            })?
-                            .and_then(|lead| lead.chunks.into_iter().next())
-                    }
-                    false => None,
-                };
-                spans.push(RepairedSpan {
-                    volume_index: volume.volume_index,
-                    lead_in,
-                    ..span
-                });
-            }
+        match read_repaired_range(
+            &volume.path,
+            volume.volume_index,
+            volume.len,
+            start..end,
+            cipher_lead_in,
+        ) {
+            Ok(Some(span)) => spans.push(span),
             Ok(None) => {}
             Err(error) => {
                 return Err(DirectRepairFailure::ReadBackFailed {
@@ -605,6 +615,50 @@ pub(crate) fn read_repaired_spans(
         }
     }
     Ok(spans)
+}
+
+/// Reads a file-coordinate repair range without interpreting codec identities
+/// or proofs. The caller must already have verified the installed image.
+///
+/// The returned chunks retain the entire requested range, plus at most 48 CBC
+/// edge bytes. A streaming caller bounds its read-back allocation by requesting
+/// one stripe at a time; the existing PAR2 caller retains one volume's rewrite.
+/// Underlying filesystem errors remain available to the caller.
+pub(crate) fn read_repaired_range(
+    path: &std::path::Path,
+    volume_index: u32,
+    volume_len: u64,
+    range: std::ops::Range<u64>,
+    cipher_edges: bool,
+) -> std::io::Result<Option<RepairedSpan>> {
+    let std::ops::Range { start, end } = range;
+    if start > end || end > volume_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "repair read-back range exceeds its verified volume",
+        ));
+    }
+    let Some(span) = read_span_chunked(path, start, end - start)? else {
+        return Ok(None);
+    };
+    let lead_in = if cipher_edges && start > 0 {
+        let from = start.saturating_sub(CIPHER_LEAD_IN_BYTES);
+        read_span_chunked(path, from, start - from)?.and_then(|lead| lead.chunks.into_iter().next())
+    } else {
+        None
+    };
+    let lead_out = if cipher_edges && end < volume_len {
+        let to = end.saturating_add(CIPHER_LEAD_OUT_BYTES).min(volume_len);
+        read_span_chunked(path, end, to - end)?.and_then(|lead| lead.chunks.into_iter().next())
+    } else {
+        None
+    };
+    Ok(Some(RepairedSpan {
+        volume_index,
+        lead_in,
+        lead_out,
+        ..span
+    }))
 }
 
 /// Reads exactly `len` bytes at `offset` as bounded chunks, combining their
@@ -649,6 +703,7 @@ fn read_span_chunked(
         len,
         crc32,
         lead_in: None,
+        lead_out: None,
     }))
 }
 

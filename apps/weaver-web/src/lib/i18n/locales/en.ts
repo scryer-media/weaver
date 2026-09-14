@@ -1,7 +1,10 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextEn } from "@/next/i18n/en";
 
 const en: LocaleDictionary = {
+  "settings.proxies": "Proxies",
+  "settings.proxiesDesc": "Reusable proxy profiles and private routes for servers and RSS feeds.",
   // Brand
 
   // Navigation
@@ -11,6 +14,8 @@ const en: LocaleDictionary = {
   "nav.upload": "Upload",
   "nav.settings": "Settings",
   "nav.sponsor": "Sponsor",
+  "update.newVersion": "New version v{{version}}",
+  "update.newVersionAria": "Open Weaver v{{version}} on GitHub in a new tab",
   "nav.logs": "Logs",
 
   // System information
@@ -45,10 +50,16 @@ const en: LocaleDictionary = {
   "systemInfo.capacityUnavailable": "Filesystem capacity is unavailable for this path.",
   "systemInfo.notLimited": "Not limited",
   "systemInfo.noneDetected": "None detected",
+  "systemInfo.downloadDiagnostics": "Download diagnostics package",
+  "systemInfo.diagnosticsBusy": "Collecting diagnostics…",
+  "systemInfo.diagnosticsHint": "Collection takes about 15 seconds: metrics are sampled twice, ten seconds apart. Passwords, API keys and other secrets are removed.",
+  "systemInfo.diagnosticsFailed": "The diagnostics package could not be created.",
 
   // Status labels
   "status.queued": "Queued",
   "status.downloading": "Downloading",
+  "status.propagating": "Propagating",
+  "status.propagationUntil": "Waiting for propagation. Download starts at {{time}}.",
   "status.fetchingRepairData": "Fetching repair data",
   "status.verifying": "Verifying",
   "status.repairing": "Repairing",
@@ -186,6 +197,10 @@ const en: LocaleDictionary = {
   "job.notFound": "Job not found.",
   "job.passwordProtected": "Password protected",
   "job.eventLog": "Event Log",
+  "job.providersUsed": "Providers Used",
+  "job.providersUsedNote": "Shares are of the articles whose serving provider was recorded.",
+  "job.providerUnnamed": "Server {{id}}",
+  "job.providerArticles": "{{count}} articles",
   "job.metadata": "Metadata",
   "job.savedBandwidthSkipped": "Skipped unneeded PAR2 recovery download",
   "job.savedBandwidthUsedAll": "All optional PAR2 recovery was needed",
@@ -260,7 +275,7 @@ const en: LocaleDictionary = {
   "settings.generalPageDesc": "Tune download speed, storage paths, cleanup behavior, and retry policy from one place.",
   "settings.language": "Language",
   "settings.languageDesc": "Choose the display language for the Weaver interface.",
-  "settings.bandwidthCap": "ISP Bandwidth Cap",
+  "settings.bandwidthCap": "Bandwidth",
   "settings.bandwidthCapDesc": "Block new download dispatch once the current ISP allowance is used. Queued jobs still hold position and post-processing already in flight can continue.",
   "settings.bandwidthCapConfiguration": "Configuration",
   "settings.bandwidthCapEnabled": "Enable ISP cap",
@@ -417,6 +432,8 @@ const en: LocaleDictionary = {
   "settings.dataDirDesc": "Weaver stores its database, NZB cache, and internal state here.",
   "settings.cleanupAfterExtract": "Cleanup After Extract",
   "settings.cleanupDesc": "Delete intermediate files after successful extraction",
+  "settings.propagationDelay": "Propagation delay (seconds)",
+  "settings.propagationDelayDesc": "Wait until a post is this old before downloading. 0 starts immediately. Changes apply to waiting downloads without a restart.",
   "settings.maxRetries": "Max Retries",
   "settings.maxRetriesDesc": "How many times Weaver should retry an article before marking it permanently missing.",
   "settings.ipReplacementTrialExtraConnections": "IP Replacement Burst",
@@ -765,6 +782,7 @@ const en: LocaleDictionary = {
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "Higher scores win within the same duplicate key; ties keep the existing candidate.",
   ...duplicateLocaleEntries.eng,
+  ...nextEn,
 };
 
 export default en;

@@ -1873,8 +1873,10 @@ pub(super) async fn auth_status_handler(
     } else {
         false
     };
-    let trusted_peer =
-        !security.authenticated_access_mode() && security.is_trusted_client(peer, &headers);
+    // Trusted networks stand in for a login only in credential-less legacy mode.
+    let trusted_peer = !security.authenticated_access_mode()
+        && creds.is_none()
+        && security.is_trusted_client(peer, &headers);
     // Setup is offered to exactly the browsers that could complete it:
     // `setup_handler` admits loopback-or-trusted, and a trusted peer skips
     // the wizard entirely (it is already admitted), which leaves loopback.

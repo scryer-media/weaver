@@ -144,6 +144,7 @@ fn nzbget_history_row(
         created_at: 1_700_000_000,
         completed_at,
         metadata,
+        server_attribution: None,
     }
 }
 
@@ -160,13 +161,13 @@ fn test_config() -> SharedConfig {
         intermediate_dir: None,
         complete_dir: None,
         buffer_pool: None,
-        tuner: None,
         servers: vec![],
         categories: vec![],
         retry: None,
         max_download_speed: None,
         cleanup_after_extract: None,
         isp_bandwidth_cap: None,
+        propagation_delay_secs: None,
         ip_replacement_trial_extra_connections: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -441,6 +442,7 @@ fn scheduler_handle_with_mock_commands_with_db(
                                 } else {
                                     serde_json::to_string(&job.metadata).ok()
                                 },
+                                server_attribution: None,
                             });
                         }
                         state.publish_jobs(jobs);
@@ -512,6 +514,7 @@ fn job_info_from_spec(job_id: JobId, spec: JobSpec) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
+        server_attribution: Vec::new(),
     }
 }
 
@@ -589,6 +592,7 @@ fn nzbget_test_job(
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
+        server_attribution: Vec::new(),
     }
 }
 
@@ -1078,6 +1082,7 @@ fn sample_job(job_id: u64, name: &str, status: JobStatus) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
+        server_attribution: Vec::new(),
     }
 }
 
@@ -1121,6 +1126,8 @@ fn sample_server_health() -> metrics::ServerHealthInfo {
         connections_configured: 80,
         capacity_penalty_until_epoch_ms: 0,
         premature_deaths: 0,
+        sockets: Default::default(),
+        recovery: Default::default(),
     }
 }
 

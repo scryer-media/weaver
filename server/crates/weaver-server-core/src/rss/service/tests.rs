@@ -1,4 +1,7 @@
 use super::*;
+use std::time::Duration;
+mod proxy_body;
+mod proxy_routing;
 
 use std::io::Write;
 use std::path::Path;
@@ -732,12 +735,12 @@ fn build_service_with_security(
         intermediate_dir: None,
         complete_dir: None,
         buffer_pool: None,
-        tuner: None,
         servers: vec![],
         categories: vec![],
         retry: None,
         max_download_speed: None,
         isp_bandwidth_cap: None,
+        propagation_delay_secs: None,
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),

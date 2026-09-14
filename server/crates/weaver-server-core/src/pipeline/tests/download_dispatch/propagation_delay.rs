@@ -23,6 +23,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_async_fallback() 
     let segment_id = work.segment_id;
     let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
+        lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
@@ -110,6 +111,7 @@ async fn owned_download_lane_selection_contention_requeues_without_async_fallbac
     let segment_id = work.segment_id;
     let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
+        lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
@@ -357,6 +359,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: first_segment,
             data: quota_data,
@@ -371,6 +374,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
         .await;
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: tail_segment,
             data: unrequested_data,
@@ -402,6 +406,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
     pipeline.ip_replacement_burst_active = true;
     pipeline.metrics.set_ip_replacement_burst_active(true);
     pipeline.handle_download_lane_parked(DownloadLaneParked {
+        lane_id: 0,
         job_id,
         mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,
@@ -456,6 +461,7 @@ async fn release_download_result_excludes_ip_replacement_trial_from_hot_success_
         .insert(segment_id.file_id, 1);
 
     pipeline.release_download_result(&DownloadResult {
+        lane_id: 0,
         runtime_generation: 0,
         segment_id,
         data: Ok(DownloadPayload::Raw(Bytes::from_static(b"trial-article"))),
@@ -490,8 +496,10 @@ async fn accepted_ip_replacement_trial_samples_update_per_ip_ewma() {
     pipeline.ip_replacement_trial_extra_connections = 1;
     pipeline.ip_replacement_burst_active = true;
     pipeline.handle_ip_replacement_trial_event(IpReplacementTrialEvent::CandidateAccepted {
+        lane_id: 0,
         old_key,
         samples: vec![weaver_nntp::client::FetchAttemptTrace {
+            connection_health: None,
             server_idx: 0,
             remote_ip: Some(candidate_ip),
             elapsed: Duration::from_millis(25),
@@ -536,8 +544,10 @@ async fn disabled_ip_replacement_ignores_late_candidate_acceptance() {
     pipeline.ip_replacement_trial_extra_connections = 0;
     pipeline.ip_replacement_burst_active = false;
     pipeline.handle_ip_replacement_trial_event(IpReplacementTrialEvent::CandidateAccepted {
+        lane_id: 0,
         old_key,
         samples: vec![weaver_nntp::client::FetchAttemptTrace {
+            connection_health: None,
             server_idx: 0,
             remote_ip: Some(candidate_ip),
             elapsed: Duration::from_millis(25),
@@ -573,10 +583,11 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
 
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: JobId(21004),
         server_idx: old_key.server_idx,
-        remote_ip: old_key.ip,
+        remote_ip: Some(old_key.ip),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,
@@ -597,7 +608,7 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
 }
 
 #[tokio::test]
-async fn ip_replacement_trial_starts_when_recovery_reserve_leaves_normal_capacity_full() {
+async fn ip_replacement_trial_starts_when_every_connection_is_busy() {
     let temp_dir = tempfile::tempdir().unwrap();
     let configured_download_capacity = 4;
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
@@ -612,14 +623,10 @@ async fn ip_replacement_trial_starts_when_recovery_reserve_leaves_normal_capacit
     .await;
     pipeline.ip_replacement_trial_extra_connections = 1;
 
-    let mut snapshot = pipeline.metrics.raw_snapshot();
-    snapshot.current_download_speed = 200 * 1024 * 1024;
-    assert!(pipeline.tuner.adjust(&snapshot));
-    let params = pipeline.tuner.params();
-    let normal_download_capacity = configured_download_capacity
-        .saturating_sub(params.recovery_slots.min(configured_download_capacity));
+    // Nothing is held back from the ordinary budget any more, so the trial's
+    // precondition is simply that every configured connection is busy.
+    let normal_download_capacity = configured_download_capacity;
     assert!(normal_download_capacity > 0);
-    assert!(normal_download_capacity < configured_download_capacity);
 
     let job_id = JobId(21005);
     insert_active_job(
@@ -1499,6 +1506,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
     pipeline.active_downloads += 1;
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Decoded(DecodeResult {
@@ -2567,6 +2575,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 500]))),
@@ -2604,6 +2613,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 1_600]))),
@@ -2644,6 +2654,33 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     pipeline.bandwidth_cap.reserve(256);
     pipeline.bandwidth_reservations.insert(segment_id, 256);
     pipeline.rate_limit_reservations.insert(segment_id, 256);
+    let lane_id = Pipeline::next_download_lane_id();
+    pipeline.download_lane_owners.insert(
+        lane_id,
+        DownloadLaneOwner {
+            job_id,
+            mode: DownloadLaneMode::Sequential,
+            spillover_loan_kind: None,
+            completion_critical: false,
+            connection: false,
+            ip_replacement: false,
+            outstanding: HashMap::from([(
+                segment_id,
+                DownloadWork {
+                    segment_id,
+                    message_id: crate::jobs::ids::MessageId::new("stalled-article"),
+                    groups: Arc::from(vec![]),
+                    priority: 0,
+                    byte_estimate: 256,
+                    retry_count: 0,
+                    is_recovery: false,
+                    completion_critical: false,
+                    exclude_servers: vec![],
+                    avoid_server: None,
+                },
+            )]),
+        },
+    );
     pipeline.job_last_download_activity.insert(
         job_id,
         std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
@@ -2832,6 +2869,17 @@ async fn a_freshly_posted_job_defers_until_its_articles_have_propagated() {
     // `dispatch_downloads` never reaches per-job dispatch, so a status or queue
     // assertion here would hold whether or not the gate exists.
 
+    let snapshot = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .unwrap();
+    assert_eq!(
+        snapshot.download_wait_reason.as_deref(),
+        Some(crate::jobs::handle::PROPAGATION_WAIT_REASON)
+    );
+    assert!(snapshot.download_retry_at_epoch_ms.is_some());
+
     // The run loop is told when to wake, rather than rediscovering this by
     // polling.
     let wake = pipeline
@@ -2839,6 +2887,116 @@ async fn a_freshly_posted_job_defers_until_its_articles_have_propagated() {
         .expect("a deferred job must expose its wakeup");
     assert!(wake <= Duration::from_secs(3600));
     assert!(wake > Duration::from_secs(3500));
+}
+
+#[tokio::test]
+async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immediately() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+    pipeline.propagation_delay = Duration::from_secs(600);
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(20220);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        posted_job_spec("Propagation setting", Some(now_epoch_secs() + 60)),
+    )
+    .await;
+    pipeline.dispatch_downloads();
+    pipeline.publish_snapshot();
+    let held = pipeline.shared_state.get_job(job_id).unwrap();
+    assert_eq!(held.download_state, crate::DownloadState::Queued);
+    assert_eq!(
+        held.download_wait_reason.as_deref(),
+        Some(crate::jobs::handle::PROPAGATION_WAIT_REASON)
+    );
+    let initial_deadline = held.download_retry_at_epoch_ms.unwrap();
+    let initial_hold = pipeline.propagation_ready_at[&job_id];
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetPropagationDelay {
+            seconds: 600,
+            reply,
+        })
+        .await;
+    done.await.unwrap();
+    assert_eq!(
+        pipeline.propagation_ready_at[&job_id], initial_hold,
+        "saving unchanged settings must preserve the timer"
+    );
+    assert_eq!(pipeline.active_downloads, 0);
+    let drain_wait_updates = |events: &mut broadcast::Receiver<PipelineEvent>| {
+        let mut count = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, PipelineEvent::PhaseProgressUpdated { job_id: id } if id == job_id) {
+                count += 1;
+            }
+        }
+        count
+    };
+    assert_eq!(drain_wait_updates(&mut events), 1);
+    pipeline.publish_snapshot();
+    assert_eq!(drain_wait_updates(&mut events), 0);
+    assert_eq!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .download_retry_at_epoch_ms,
+        Some(initial_deadline)
+    );
+
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetPropagationDelay {
+            seconds: 1200,
+            reply,
+        })
+        .await;
+    done.await.unwrap();
+    let held = pipeline.shared_state.get_job(job_id).unwrap();
+    assert!(held.download_retry_at_epoch_ms.unwrap() > initial_deadline + 500_000.0);
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(drain_wait_updates(&mut events), 1);
+
+    set_job_status_for_test(&mut pipeline, job_id, JobStatus::Paused);
+    let paused = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .unwrap();
+    assert_eq!(paused.status, JobStatus::Paused);
+    assert!(paused.download_wait_reason.is_none());
+    set_job_status_for_test(&mut pipeline, job_id, JobStatus::Downloading);
+    assert!(
+        pipeline
+            .list_jobs()
+            .iter()
+            .any(|job| job.job_id == job_id && job.download_wait_reason.is_some())
+    );
+
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetPropagationDelay { seconds: 0, reply })
+        .await;
+    done.await.unwrap();
+    assert_eq!(pipeline.active_downloads, 1);
+    assert!(pipeline.propagation_ready_at.is_empty());
+    assert!(pipeline.next_propagation_delay().is_none());
+    let released = pipeline.shared_state.get_job(job_id).unwrap();
+    assert!(released.download_wait_reason.is_none());
+    assert!(released.download_retry_at_epoch_ms.is_none());
+    assert_eq!(released.download_state, crate::DownloadState::Downloading);
+    assert_eq!(drain_wait_updates(&mut events), 1);
 }
 
 #[tokio::test]

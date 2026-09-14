@@ -107,7 +107,13 @@ async fn async_main() {
     let log_file_writer = match log_file_config.as_ref() {
         Some(config) => {
             match weaver_server_core::runtime::log_buffer::open_log_file(&config.path) {
-                Ok(writer) => Some(writer),
+                Ok(writer) => {
+                    // Record the path the resolution above actually picked, so
+                    // the diagnostics package copies the real log files rather
+                    // than re-deriving the rules and guessing.
+                    weaver_server_core::runtime::log_buffer::set_log_file_path(config.path.clone());
+                    Some(writer)
+                }
                 Err(error) if config.explicit => {
                     eprintln!(
                         "failed to open Weaver log file at {}: {error}",
@@ -258,11 +264,15 @@ async fn async_main() {
 
     let intermediate_dir = PathBuf::from(config.intermediate_dir());
     let complete_dir = PathBuf::from(config.complete_dir());
-    if let Err(error) = bootstrap::ensure_runtime_directories(&[
-        ("data_dir", &data_dir),
-        ("intermediate_dir", &intermediate_dir),
-        ("complete_dir", &complete_dir),
-    ]) {
+    // Only the data folder is required to serve: a saved download folder on a
+    // drive that is gone must not stop Weaver from starting, or it could never
+    // be pointed at another one. A one-shot download needs them up front.
+    let mut required_directories = vec![("data_dir", data_dir.as_path())];
+    if matches!(command, Command::Download { .. }) {
+        required_directories.push(("intermediate_dir", intermediate_dir.as_path()));
+        required_directories.push(("complete_dir", complete_dir.as_path()));
+    }
+    if let Err(error) = bootstrap::ensure_runtime_directories(&required_directories) {
         error!("{error}");
         std::process::exit(1);
     }
@@ -403,12 +413,12 @@ fn resolve_log_file_config(
 fn default_windows_log_file_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        return std::env::var_os("LOCALAPPDATA").map(|base| {
+        std::env::var_os("LOCALAPPDATA").map(|base| {
             PathBuf::from(base)
                 .join("weaver")
                 .join("logs")
                 .join("weaver.log")
-        });
+        })
     }
 
     #[cfg(not(windows))]

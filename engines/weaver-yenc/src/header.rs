@@ -16,16 +16,9 @@ pub struct YendFields {
 /// Match `keyword` at the start of `line`, requiring a space or tab separator
 /// immediately after it.
 ///
-/// Both reference decoders detect control lines with a literal, case-sensitive
-/// prefix that *includes* the trailing space (sabctools `starts_with(line,
-/// "=ybegin ")`, nzbget `strncmp(buffer, "=ybegin ", 8)`), so a bare `=ybegin`
-/// with no separator is deliberately not a header there and is not one here
-/// either. The separator requirement is also what keeps junk lines that merely
+/// A bare `=ybegin` with no separator is not a header.
+/// The separator requirement also keeps junk lines that merely
 /// share a prefix (`=yb`, `=ybeginner notes`) from being mistaken for headers.
-///
-/// Weaver additionally accepts a tab separator, where both references accept
-/// only a space. That is a strict superset: it decodes articles they would
-/// treat as non-binary and cannot change how any article they accept is parsed.
 ///
 /// Returns the field content after the keyword, line ending trimmed.
 fn strip_keyword<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
@@ -62,11 +55,8 @@ pub fn parse_ybegin_line(line: &[u8]) -> Result<YencMetadata, YencError> {
         }
     });
 
-    // Reference decoders do not require any =ybegin field: sabctools reads
-    // `part`/`begin`/`end` and hands the rest to Python, and SABnzbd falls back
-    // to the NZB/subject when `name=` or `size=` are missing. Missing or
-    // unparseable fields therefore degrade to a neutral value and are recorded
-    // in `defects` rather than failing the article.
+    // Missing or unparseable =ybegin fields degrade to a neutral value and
+    // are recorded in `defects` rather than failing the article.
     let mut defects = YencHeaderDefects::default();
     let (size, size_missing, size_invalid) = tolerant_u64(fields.size);
     defects.missing_size = size_missing;
@@ -121,8 +111,7 @@ pub fn apply_ypart_line(line: &[u8], metadata: &mut YencMetadata) -> Result<(), 
             reason: format!("end ({end}) < begin ({begin})"),
         });
     }
-    // `end > size` is a broken-poster class the ecosystem shrugs off: neither
-    // sabctools nor nzbget cross-checks =ypart against =ybegin size=. The part
+    // Tolerate posters that declare `end > size`. The part
     // length (end - begin + 1) is still authoritative and still verified
     // against the decoded byte count, so record the inconsistency and continue.
     if end > metadata.size {
@@ -438,9 +427,8 @@ fn required_u64_field(field: Option<&[u8]>, label: &str) -> Result<u64, YencErro
 /// Parse an unsigned decimal field value. Zero-alloc and overflow-checked:
 /// `None` for empty, non-digit, or wider-than-`u64` input.
 ///
-/// Digits only, matching sabctools' `extract_int`, which requires a digit
-/// immediately after the field name and therefore rejects `size=-1000` and
-/// `size= 10` rather than storing a nonsense value.
+/// After trimming surrounding whitespace, every character must be a digit.
+/// Negative values such as `size=-1000` are rejected.
 fn parse_u64_opt(value: &[u8]) -> Option<u64> {
     let value = value.trim_ascii();
     if value.is_empty() {
@@ -473,20 +461,16 @@ fn parse_u64_bytes(value: &[u8], label: &str) -> Result<u64, YencError> {
 ///
 /// Returns `None` for anything that is not a usable CRC. Callers treat `None`
 /// as "the poster did not give us a CRC": an unparseable CRC carries no
-/// verification value, and failing the whole article over it is exactly the
-/// strictness the reference decoders do not have.
+/// verification value.
 ///
-/// Matching sabctools (`from_chars` into a `uint64_t`, then truncated):
+/// Accepted representations:
 ///  * fewer than 8 digits is fine — some encoders omit leading zeros;
-///  * up to 16 digits is accepted and truncated to the low 32 bits, which
-///    sabctools does deliberately for posters that emit over-long hashes;
+///  * up to 16 digits is accepted and truncated to the low 32 bits for
+///    posters that emit over-long hashes;
 ///  * wider than 64 bits is unusable.
 ///
-/// Two deliberate divergences, both toward tolerance, because sabctools turns
-/// these into a *wrong* expected CRC that then fails the article:
-///  * an empty value is absent here, where sabctools yields `0`;
-///  * a value with non-hex bytes is absent here, where sabctools keeps the
-///    leading hex run (`1234ZZZZ` -> `0x1234`).
+/// Empty values and values containing non-hex bytes are treated as absent;
+/// neither supplies a usable expected CRC.
 fn parse_crc_hex_bytes(value: &[u8]) -> Option<u32> {
     let value = value.trim_ascii();
     if value.is_empty() {
@@ -537,8 +521,7 @@ pub fn parse_headers_with_options(
     input: &[u8],
     options: DecodeOptions,
 ) -> Result<ParsedHeaders, YencError> {
-    // Scan for the =ybegin line: SABnzbd and nzbget both search the article for
-    // it rather than demanding it be the first line, so leading junk (headers
+    // Scan for the =ybegin line so leading junk (headers
     // left in the body, poster banners, blank lines) does not kill the article.
     //
     // Bounded at the same 64 KiB the streaming and fused decoders use, so all
@@ -662,8 +645,7 @@ mod tests {
     }
 
     /// `=ypart end=` past `=ybegin size=` is a known broken-poster class.
-    /// Neither sabctools nor nzbget cross-checks the two, so weaver records the
-    /// inconsistency instead of failing the article.
+    /// Weaver records the inconsistency instead of failing the article.
     #[test]
     fn apply_ypart_line_tolerates_end_past_declared_file_size() {
         let mut metadata =
@@ -830,8 +812,7 @@ mod tests {
         assert_eq!(parsed.data_end, input.len());
     }
 
-    /// No `=ybegin` field is required. sabctools defaults every numeric
-    /// field to 0 and leaves `file_name` unset; nothing raises.
+    /// Missing `=ybegin size=` defaults to zero.
     #[test]
     fn missing_size_field_is_tolerated() {
         let input = b"=ybegin line=128 name=test.bin\r\ndata\r\n=yend size=100\r\n";
@@ -945,7 +926,7 @@ mod tests {
             b"1234ZZZZ".as_slice(),
             b"0x1234".as_slice(),
             b"-1".as_slice(),
-            // Wider than 64 bits: sabctools' from_chars reports out_of_range.
+            // Wider than 64 bits is out of range.
             b"DEADBEEFDEADBEEF0".as_slice(),
         ] {
             assert_eq!(
@@ -957,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn crc_hex_over_long_truncates_to_low_32_bits_like_sabctools() {
+    fn crc_hex_over_long_truncates_to_low_32_bits() {
         assert_eq!(parse_crc_hex_bytes(b"AAAAAAAADEADBEEF"), Some(0xDEADBEEF));
     }
 
@@ -1022,7 +1003,6 @@ mod tests {
 
     #[test]
     fn unparseable_ybegin_numbers_read_as_absent() {
-        // sabctools' extract_int requires a digit right after the needle, so
         // `size=-1000` leaves file_size at its default rather than storing -1000.
         let metadata = parse_ybegin_line(b"=ybegin line=abc size=-1000 name=neg.bin\r\n").unwrap();
 

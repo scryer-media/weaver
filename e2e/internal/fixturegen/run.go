@@ -394,7 +394,7 @@ func updateLedger(root string, ledger *corpus.Ledger, lock Lock, results []Resul
 		Toolchains:       merged,
 		ByteReproducible: false,
 		Notes: "The Go fixture generator. Payload synthesis, every byte edit, and the zip, tar, gzip, DEFLATE, zstd, bzip2 and brotli containers are Go; " +
-			"RAR comes only from RARLAB's own writer, PAR2 from par2cmdline-turbo, 7z from the official 7-Zip console binary and video from the pinned FFmpeg image. " +
+			"RAR comes only from RARLAB's own writer, PAR2 from par2cmdline-turbo, PAR3 from the par3cmdline reference, 7z from the official 7-Zip console binary and video from the pinned FFmpeg image. " +
 			"Not byte-reproducible as a whole: RAR and 7z stamp creation times and draw encryption salts, and the video encoders are not bit-exact across builds. " +
 			"The zip, tar and stream-codec families are byte-reproducible from their recipe alone.",
 	}

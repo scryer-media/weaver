@@ -40,6 +40,7 @@ type GeneralSettings = {
   cleanupAfterExtract: boolean;
   maxDownloadSpeed: number;
   maxRetries: number;
+  propagationDelaySecs: number;
   ipReplacementTrialExtraConnections: number;
   enableSrrdbLookup: boolean;
   duplicatePolicy: DuplicatePolicy;
@@ -50,6 +51,7 @@ type StorageBehaviorDraft = {
   completeDir: string;
   cleanupAfterExtract: boolean;
   maxRetries: number;
+  propagationDelaySecs: number;
 };
 
 function normalizeGeneralSettings(settings: GeneralSettings): GeneralSettings {
@@ -65,6 +67,8 @@ function normalizeStorageBehaviorDraft(draft: StorageBehaviorDraft): StorageBeha
     completeDir: draft.completeDir.trim(),
     cleanupAfterExtract: draft.cleanupAfterExtract,
     maxRetries: Number.isFinite(draft.maxRetries) ? Math.max(0, Math.min(20, draft.maxRetries)) : 0,
+    propagationDelaySecs: Number.isFinite(draft.propagationDelaySecs)
+      ? Math.max(0, Math.min(4_294_967_295, Math.floor(draft.propagationDelaySecs))) : 0,
   };
 }
 
@@ -74,6 +78,7 @@ function storageBehaviorDraftFromSettings(settings: GeneralSettings): StorageBeh
     completeDir: settings.completeDir ?? "",
     cleanupAfterExtract: settings.cleanupAfterExtract ?? true,
     maxRetries: settings.maxRetries ?? 3,
+    propagationDelaySecs: settings.propagationDelaySecs ?? 0,
   });
 }
 
@@ -95,6 +100,7 @@ export function GeneralSettingsPage() {
   const [completeDir, setCompleteDir] = useState("");
   const [cleanup, setCleanup] = useState(true);
   const [maxRetries, setMaxRetries] = useState(3);
+  const [propagationDelaySecs, setPropagationDelaySecs] = useState(0);
   const [ipReplacementBurst, setIpReplacementBurst] = useState(false);
   const [srrdbLookup, setSrrdbLookup] = useState(false);
   const [duplicatePolicySaveStatus, setDuplicatePolicySaveStatus] = useState<
@@ -117,6 +123,7 @@ export function GeneralSettingsPage() {
     setCompleteDir(settings.completeDir ?? "");
     setCleanup(settings.cleanupAfterExtract ?? true);
     setMaxRetries(settings.maxRetries ?? 3);
+    setPropagationDelaySecs(settings.propagationDelaySecs ?? 0);
     setIpReplacementBurst((settings.ipReplacementTrialExtraConnections ?? 0) > 0);
     setSrrdbLookup(settings.enableSrrdbLookup ?? false);
   }, [settings]);
@@ -143,8 +150,9 @@ export function GeneralSettingsPage() {
       completeDir,
       cleanupAfterExtract: cleanup,
       maxRetries,
+      propagationDelaySecs,
     }),
-    [cleanup, completeDir, intermediateDir, maxRetries],
+    [cleanup, completeDir, intermediateDir, maxRetries, propagationDelaySecs],
   );
 
   const persistedStorageDraft = useMemo(
@@ -169,6 +177,7 @@ export function GeneralSettingsPage() {
           completeDir: nextDraft.completeDir || null,
           cleanupAfterExtract: nextDraft.cleanupAfterExtract,
           maxRetries: nextDraft.maxRetries,
+          propagationDelaySecs: nextDraft.propagationDelaySecs,
         },
       });
 
@@ -435,6 +444,21 @@ export function GeneralSettingsPage() {
                   max={20}
                   value={maxRetries}
                   onChange={(event) => setMaxRetries(Number(event.target.value))}
+                  className="max-w-32"
+                />
+              </SettingField>
+              <SettingField
+                label={t("settings.propagationDelay")}
+                description={t("settings.propagationDelayDesc")}
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  max={4_294_967_295}
+                  step={1}
+                  value={propagationDelaySecs}
+                  onChange={(event) => setPropagationDelaySecs(Number(event.target.value))}
+                  aria-label={t("settings.propagationDelay")}
                   className="max-w-32"
                 />
               </SettingField>

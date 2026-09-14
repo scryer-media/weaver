@@ -103,9 +103,14 @@ export function JobPhaseProgressBars({
             : phase.rateBps;
         const rate = rateBps && rateBps > 0 ? formatSpeed(rateBps) : null;
         return (
-          <div key={phase.phase} className="space-y-1">
+          <div key={phase.phase} className="w-full min-w-0 space-y-1">
             <div className="flex items-center justify-between gap-2 text-[10px] font-medium text-muted-foreground">
-              <span className="truncate">{rate ? `${label} · ${rate}` : label}</span>
+              <span className="min-w-0 truncate">{label}</span>
+              {rate ? (
+                <span className="w-[11ch] shrink-0 truncate text-right font-mono tabular-nums">
+                  {rate}
+                </span>
+              ) : null}
               <span className="shrink-0 tabular-nums">{pct.toFixed(0)}%</span>
             </div>
             <Progress

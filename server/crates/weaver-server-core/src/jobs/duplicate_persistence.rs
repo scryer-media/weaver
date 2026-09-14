@@ -213,7 +213,13 @@ impl Database {
         request: &DuplicateAdmissionRequest,
     ) -> Result<DuplicateAdmission, StateError> {
         let datastore = self.datastore();
-        let request = request.clone();
+        let mut request = request.clone();
+        if let Some(source) = &mut request.semantic_source {
+            source.password = super::persistence::encrypt_archive_password(
+                self.encryption_key(),
+                source.password.as_deref(),
+            )?;
+        }
         let now = epoch_seconds();
         let outcome = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "admit_duplicate_submission", |tx| {
@@ -619,10 +625,14 @@ impl Database {
         trigger_job_id: JobId,
     ) -> Result<Option<SemanticPromotionClaim>, StateError> {
         let datastore = self.datastore();
+        let key = self.encryption_key().cloned();
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "claim_semantic_promotion", |tx| {
-                Box::pin(async move { claim_semantic_promotion_tx(tx, trigger_job_id, now).await })
+                let key = key.clone();
+                Box::pin(async move {
+                    claim_semantic_promotion_tx(tx, trigger_job_id, now, key.as_ref()).await
+                })
             })
             .await
         })
@@ -636,9 +646,11 @@ impl Database {
         expected_generation: i64,
     ) -> Result<Option<SemanticPromotionClaim>, StateError> {
         let datastore = self.datastore();
+        let key = self.encryption_key().cloned();
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "reclaim_semantic_promotion_claim", |tx| {
+                let key = key.clone();
                 Box::pin(async move {
                     let lock = match tx {
                         SqlTx::Postgres(_) => " FOR UPDATE",
@@ -690,7 +702,7 @@ impl Database {
                     else {
                         return Ok(None);
                     };
-                    let source = semantic_candidate_source_from_row(candidate)?;
+                    let source = semantic_candidate_source_from_row(candidate, key.as_ref())?;
                     let generation = expected_generation + 1;
                     let changed = tx
                         .execute(
@@ -1817,6 +1829,7 @@ async fn claim_semantic_promotion_tx(
     tx: &mut SqlTx<'_>,
     trigger_job_id: JobId,
     now: i64,
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
 ) -> Result<Option<SemanticPromotionClaim>, StateError> {
     let Some(trigger) = tx
         .fetch_optional(
@@ -1910,7 +1923,7 @@ async fn claim_semantic_promotion_tx(
     };
     let job_id = JobId(candidate.i64("job_id")? as u64);
     let generation = candidate.i64("promotion_generation")? + 1;
-    let source = semantic_candidate_source_from_row(candidate)?;
+    let source = semantic_candidate_source_from_row(candidate, key)?;
     tx.execute(
         "UPDATE semantic_duplicate_candidates
          SET candidate_state = {}, promotion_state = {}, promotion_generation = {},
@@ -1951,6 +1964,7 @@ async fn claim_semantic_promotion_tx(
 
 fn semantic_candidate_source_from_row(
     row: crate::persistence::sql_runtime::SqlRow,
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
 ) -> Result<SemanticCandidateSource, StateError> {
     let metadata = row
         .opt_text("source_metadata_json")?
@@ -1965,7 +1979,10 @@ fn semantic_candidate_source_from_row(
             StateError::Database("semantic candidate source NZB is missing".to_string())
         })?,
         filename: row.opt_text("source_filename")?,
-        password: row.opt_text("source_password")?,
+        password: super::persistence::decrypt_archive_password(
+            key,
+            row.opt_text("source_password")?,
+        )?,
         category: row.opt_text("source_category")?,
         metadata,
     })

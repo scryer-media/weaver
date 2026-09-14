@@ -173,7 +173,8 @@ impl HistoryQuery {
     ) -> Result<JobDetailSnapshot> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
-        load_job_detail_snapshot(handle, db, job_id).await
+        let server_hosts = server_hosts_by_id(ctx.data::<SharedConfig>()?).await;
+        load_job_detail_snapshot(handle, db, job_id, server_hosts).await
     }
     /// Active or recent background history delete operations.
     #[graphql(guard = "ReadGuard")]
@@ -246,10 +247,27 @@ impl HistoryQuery {
     }
 }
 
+/// Host label per configured server id, for naming a job's contributing servers
+/// without denormalizing the host into every archived job.
+pub(crate) async fn server_hosts_by_id(config: &SharedConfig) -> HashMap<u32, String> {
+    crate::observability::with_timed_config_read(
+        config,
+        "history.query.job_detail_server_hosts",
+        |cfg| {
+            cfg.servers
+                .iter()
+                .map(|server| (server.id, server.host.clone()))
+                .collect()
+        },
+    )
+    .await
+}
+
 pub(crate) async fn load_job_detail_snapshot(
     handle: SchedulerHandle,
     db: weaver_server_core::Database,
     job_id: u64,
+    server_hosts: HashMap<u32, String>,
 ) -> Result<JobDetailSnapshot> {
     let snapshot_started = Instant::now();
     let live_job = match handle.get_job(JobId(job_id)) {
@@ -281,6 +299,31 @@ pub(crate) async fn load_job_detail_snapshot(
     .await
     .map_err(|error| async_graphql::Error::new(error.to_string()))?
     .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+
+    // Prefer the live counters while the job is still resident; once it has been
+    // archived they only exist in the history row. Both are already aggregated
+    // per server, so this is a sort over a handful of entries.
+    let mut server_attribution: Vec<crate::jobs::types::JobServerContribution> = live_job
+        .as_ref()
+        .map(|job| job.server_attribution.clone())
+        .or_else(|| {
+            history.as_ref().map(|row| {
+                weaver_server_core::jobs::server_attribution::contributions_from_storage(
+                    row.server_attribution.as_deref(),
+                )
+            })
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|contribution| {
+            crate::jobs::types::JobServerContribution::from_core(contribution, &server_hosts)
+        })
+        .collect();
+    server_attribution.sort_by(|a, b| {
+        b.articles
+            .cmp(&a.articles)
+            .then_with(|| a.server_id.cmp(&b.server_id))
+    });
 
     let queue_item = live_job.as_ref().map(queue_item_from_job);
     let history_item = history.as_ref().map(|row| {
@@ -332,6 +375,7 @@ pub(crate) async fn load_job_detail_snapshot(
         history_item,
         job_timeline,
         job_events,
+        server_attribution,
     })
 }
 
@@ -401,6 +445,14 @@ impl HistoryPageSqlPlan {
         // display titles; SQL LOWER/LIKE has ASCII-only + Unicode divergence and
         // cannot see the computed fields, so it must not be approximated in SQL.
         if normalize_history_search(input.search.clone()).is_some() {
+            return None;
+        }
+        // A category filter could be pushed into SQL, but the fast path exists
+        // for the default view and the completion-driven refetch, neither of
+        // which sets one. Keeping it on the Rust path means the two paths stay
+        // one predicate apart instead of two, and a facet pays exactly what a
+        // search already pays.
+        if normalize_history_categories(input.categories.clone()).is_some() {
             return None;
         }
         // Only the default `completed_at DESC` ordering matches the indexed SQL
@@ -568,6 +620,7 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
     let page_size = sanitize_page_size(input.page_size);
     let page_index = input.page_index as usize;
     let search = normalize_history_search(input.search);
+    let categories = normalize_history_categories(input.categories);
     let status = input.status.unwrap_or(HistoryStatusFilter::All);
     let sort_field = input.sort_field.unwrap_or(HistorySortField::CompletedAt);
     let sort_direction = input.sort_direction.unwrap_or(HistorySortDirection::Desc);
@@ -586,6 +639,7 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
             }
         })
         .filter(|item| history_matches_search(item, search.as_deref()))
+        .filter(|item| history_matches_categories(item, categories.as_deref()))
         .collect();
 
     let counts = HistoryPageCounts {
@@ -649,6 +703,31 @@ fn history_matches_search(item: &HistoryItem, search: Option<&str>) -> bool {
     ]
     .into_iter()
     .any(|value| value.to_lowercase().contains(search))
+}
+
+/// Drop blank entries and an empty list, so a request that filters by nothing
+/// is indistinguishable from one that omits the filter.
+///
+/// A blank entry is not dropped: the empty string is how a caller asks for rows
+/// with no category, so it is trimmed but kept.
+fn normalize_history_categories(categories: Option<Vec<String>>) -> Option<Vec<String>> {
+    let trimmed: Vec<String> = categories?
+        .into_iter()
+        .map(|category| category.trim().to_string())
+        .collect();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn history_matches_categories(item: &HistoryItem, categories: Option<&[String]>) -> bool {
+    let Some(categories) = categories else {
+        return true;
+    };
+    let category = item.category.as_deref().unwrap_or_default();
+    categories.iter().any(|wanted| wanted == category)
 }
 
 fn history_matches_status(item: &HistoryItem, status: HistoryStatusFilter) -> bool {
@@ -777,6 +856,10 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
+        server_attribution:
+            weaver_server_core::jobs::server_attribution::contributions_from_storage(
+                row.server_attribution.as_deref(),
+            ),
     }
 }
 
@@ -804,6 +887,7 @@ mod tests {
             created_at: completed_at - 10,
             completed_at,
             metadata: None,
+            server_attribution: None,
         }
     }
 
@@ -835,6 +919,7 @@ mod tests {
             page_size,
             search: None,
             status,
+            categories: None,
             sort_field: None,
             sort_direction: None,
         }
@@ -912,6 +997,64 @@ mod tests {
         // Whitespace-only search is normalized away and stays SQL-eligible.
         input.search = Some("   ".to_string());
         assert!(HistoryPageSqlPlan::for_input(&input).is_some());
+    }
+
+    #[test]
+    fn category_filter_forces_rust_path() {
+        let mut input = page_input(0, 25, None);
+        input.categories = Some(vec!["movies".to_string()]);
+        assert!(
+            HistoryPageSqlPlan::for_input(&input).is_none(),
+            "a category filter must not take the SQL path"
+        );
+        // An empty list filters by nothing, so it stays SQL-eligible.
+        input.categories = Some(Vec::new());
+        assert!(HistoryPageSqlPlan::for_input(&input).is_some());
+    }
+
+    #[test]
+    fn category_filter_unions_and_scopes_the_counts() {
+        let db = Database::open_in_memory().unwrap();
+        let mut rows = [
+            history_row(1, "complete", 1_000),
+            history_row(2, "failed", 1_100),
+            history_row(3, "complete", 1_200),
+            history_row(4, "complete", 1_300),
+        ];
+        rows[0].category = Some("movies".to_string());
+        rows[1].category = Some("movies".to_string());
+        rows[2].category = Some("tv".to_string());
+        // Row 4 keeps `None`, which the empty string selects.
+        for row in &rows {
+            db.insert_job_history(row).unwrap();
+        }
+
+        let mut input = page_input(0, 25, None);
+        input.categories = Some(vec!["movies".to_string()]);
+        let page = rust_page(&db, input.clone());
+        assert_eq!(page.total_count, 2);
+        assert_eq!(page.counts.all, 2, "counts describe the filtered set");
+        assert_eq!(page.counts.success, 1);
+        assert_eq!(page.counts.failure, 1);
+
+        // A second facet widens rather than narrows.
+        input.categories = Some(vec!["movies".to_string(), "tv".to_string()]);
+        let page = rust_page(&db, input.clone());
+        assert_eq!(page.total_count, 3);
+        assert_eq!(page.counts.success, 2);
+
+        // The empty string is how a caller asks for rows with no category.
+        input.categories = Some(vec![String::new()]);
+        let page = rust_page(&db, input.clone());
+        let ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![4]);
+
+        // A status filter still applies on top of the facets.
+        input.categories = Some(vec!["movies".to_string(), "tv".to_string()]);
+        input.status = Some(HistoryStatusFilter::Failure);
+        let page = rust_page(&db, input);
+        let ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec![2]);
     }
 
     #[test]

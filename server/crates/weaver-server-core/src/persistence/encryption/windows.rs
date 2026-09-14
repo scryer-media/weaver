@@ -201,6 +201,19 @@ mod tests {
         }
     }
 
+    /// The Credential Manager is only reachable from an interactive logon;
+    /// a service or SSH session has none and every call reports
+    /// ERROR_NO_SUCH_LOGON_SESSION.
+    fn credential_store_unavailable(store: &WindowsCredentialManager) -> bool {
+        match store.get_key() {
+            Err(error) if error.contains("NO_SUCH_LOGON_SESSION") => {
+                eprintln!("skipping: {error}");
+                true
+            }
+            _ => false,
+        }
+    }
+
     #[test]
     fn generated_key_is_created_once_and_reused() {
         let account = format!(
@@ -212,6 +225,9 @@ mod tests {
                 .as_nanos()
         );
         let store = WindowsCredentialManager::with_identifiers("weaver-test".into(), account);
+        if credential_store_unavailable(&store) {
+            return;
+        }
         let _cleanup = CredentialCleanup(&store);
         let first = EncryptionKey::generate().to_base64();
         let second = EncryptionKey::generate().to_base64();
@@ -241,6 +257,9 @@ mod tests {
                 .as_nanos()
         );
         let store = WindowsCredentialManager::with_identifiers("weaver-test".into(), account);
+        if credential_store_unavailable(&store) {
+            return;
+        }
         let _cleanup = CredentialCleanup(&store);
         store.entry().unwrap().set_password("   ").unwrap();
 

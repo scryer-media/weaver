@@ -665,6 +665,16 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                     "verification found damage".into()
                 },
             },
+            PipelineEvent::Par3VerificationComplete { job_id, passed } => Self {
+                kind: EventKind::JobVerificationComplete,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: if *passed {
+                    "PAR3 verification passed".into()
+                } else {
+                    "PAR3 verification found incomplete protected data".into()
+                },
+            },
             PipelineEvent::RepairStarted { job_id } => Self {
                 kind: EventKind::RepairStarted,
                 job_id: Some(job_id.0),
@@ -679,6 +689,17 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 job_id: Some(job_id.0),
                 file_id: None,
                 message: format!("{slices_repaired} slices repaired"),
+            },
+            PipelineEvent::EmbeddedProtectionReplaced {
+                job_id,
+                blocks_repaired,
+            } => Self {
+                kind: EventKind::RepairComplete,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: format!(
+                    "{blocks_repaired} blocks repaired. Embedded PAR3 protection replaced after verified repair. Available authenticated packets were preserved; the original carrier could not be restored byte for byte."
+                ),
             },
             PipelineEvent::RepairFailed { job_id, error } => Self {
                 kind: EventKind::RepairFailed,
@@ -851,6 +872,36 @@ pub struct SystemStatus {
     pub summary: QueueSummary,
 }
 
+/// Latest stable release observed by the background release checker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+pub struct UpdateStatus {
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    pub release_url: Option<String>,
+    pub published_at_epoch_ms: Option<i64>,
+    pub checking: bool,
+    pub last_checked_at_epoch_ms: Option<i64>,
+    pub last_successful_check_at_epoch_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+impl From<weaver_server_core::update_check::UpdateStatus> for UpdateStatus {
+    fn from(value: weaver_server_core::update_check::UpdateStatus) -> Self {
+        Self {
+            current_version: value.current_version,
+            latest_version: value.latest_version,
+            update_available: value.update_available,
+            release_url: value.release_url,
+            published_at_epoch_ms: value.published_at_epoch_ms,
+            checking: value.checking,
+            last_checked_at_epoch_ms: value.last_checked_at_epoch_ms,
+            last_successful_check_at_epoch_ms: value.last_successful_check_at_epoch_ms,
+            last_error: value.last_error,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
 pub enum DeploymentEnvironmentGql {
     Native,
@@ -891,6 +942,45 @@ pub struct SystemComputeInfo {
     pub cgroup_limit: Option<f64>,
     pub decoder_tier: DecoderTierGql,
     pub simd_features: Vec<String>,
+    /// The kernel each hot-path library dispatches to on this host.
+    pub kernels: Vec<KernelSelectionInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum KernelComponentGql {
+    #[graphql(name = "YENC_DECODE")]
+    YencDecode,
+    #[graphql(name = "YENC_CRC32")]
+    YencCrc32,
+    #[graphql(name = "PAR2_REPAIR")]
+    Par2Repair,
+    #[graphql(name = "PAR2_MD5")]
+    Par2Md5,
+    #[graphql(name = "PAR2_CRC32")]
+    Par2Crc32,
+    #[graphql(name = "RAR_RECOVERY")]
+    RarRecovery,
+    #[graphql(name = "RAR_CRC32")]
+    RarCrc32,
+    #[graphql(name = "RAR_SHA1")]
+    RarSha1,
+    #[graphql(name = "RAR_AES")]
+    RarAes,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct KernelSelectionInfo {
+    pub component: KernelComponentGql,
+    /// The crate that owns the dispatch.
+    pub library: String,
+    /// Every kernel this build can select on this architecture, in the order
+    /// the dispatcher tries them.
+    pub ladder: Vec<String>,
+    /// The rung the dispatcher selected; always an entry of `ladder`.
+    pub kernel: String,
+    /// The environment variable that moved the selection off the rung the CPU
+    /// alone would have picked, when one did.
+    pub pinned_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, SimpleObject)]

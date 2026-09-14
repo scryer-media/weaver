@@ -580,6 +580,7 @@ fn classify_sql(template: &str) -> String {
         "active_detected_archives",
         "active_archive_headers",
         "active_direct_coverage",
+        "active_repair_outputs",
         "active_volume_status",
         "active_files",
         "active_jobs",

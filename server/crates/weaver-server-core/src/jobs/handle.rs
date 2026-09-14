@@ -18,6 +18,7 @@ use crate::jobs::model::{JobSpec, JobStatus, JobUpdate};
 use crate::operations::metrics::{MetricsSnapshot, PipelineMetrics};
 
 pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
+pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
 
 type JobCancellationCallback = Arc<dyn Fn() + Send + Sync>;
 
@@ -103,6 +104,7 @@ pub struct SharedPipelineState {
     metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     download_block: Arc<RwLock<DownloadBlockState>>,
     server_quota_blocked: Arc<AtomicBool>,
+    proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
     server_transfer_policy:
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
     nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
@@ -142,6 +144,7 @@ impl SharedPipelineState {
             metrics_snapshot: Arc::new(RwLock::new(metrics_snapshot)),
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
             server_quota_blocked: Arc::new(AtomicBool::new(false)),
+            proxy_runtime: Arc::new(RwLock::new(None)),
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
             nntp_runtime_activation: Arc::new(RwLock::new(None)),
@@ -512,6 +515,7 @@ impl Default for DownloadBlockState {
 }
 
 /// Commands sent to the scheduler's main loop.
+#[derive(Clone)]
 pub struct RestoreJobRequest {
     pub job_id: JobId,
     pub job_hash: [u8; 32],
@@ -629,6 +633,11 @@ pub enum SchedulerCommand {
         bytes_per_sec: u64,
         reply: oneshot::Sender<()>,
     },
+    /// Change the minimum post age and recalculate pending propagation holds.
+    SetPropagationDelay {
+        seconds: u32,
+        reply: oneshot::Sender<()>,
+    },
     /// Set global over-max latent-IP replacement burst budget. v1 allows 0 or 1.
     SetIpReplacementTrialExtraConnections {
         extra_connections: u8,
@@ -686,6 +695,14 @@ pub enum SchedulerCommand {
     DeleteAllHistory {
         delete_files: bool,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
+    /// Copy a read-only diagnostics snapshot out of the pipeline actor.
+    ///
+    /// Answered from the same command loop as everything else, so the snapshot
+    /// is coherent with the turn it lands in rather than being stitched
+    /// together from fields read while the actor was running.
+    PipelineDiagnostics {
+        reply: oneshot::Sender<Box<crate::pipeline::diagnostics::PipelineDiagnostics>>,
     },
     /// Shutdown the scheduler gracefully.
     Shutdown,
@@ -759,6 +776,13 @@ pub struct JobInfo {
     pub metadata: Vec<(String, String)>,
     /// Output directory where extracted files land.
     pub output_dir: Option<String>,
+    /// Which servers served this job's articles, and how much each carried.
+    ///
+    /// Reporting only, and only as far as attribution reached: articles
+    /// Weaver could not name a server for are absent, so these counts are a
+    /// floor. Empty for a job downloaded before this was recorded.
+    #[serde(default)]
+    pub server_attribution: Vec<crate::jobs::server_attribution::JobServerContribution>,
     /// Error message (only set when status is Failed).
     pub error: Option<String>,
     #[serde(default)]
@@ -1104,6 +1128,20 @@ impl SchedulerHandle {
         self.state.note_server_probe_latency(server_id, latency);
     }
 
+    /// Read-only pipeline internals for the diagnostics package.
+    pub async fn pipeline_diagnostics(
+        &self,
+    ) -> Result<crate::pipeline::diagnostics::PipelineDiagnostics, SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::PipelineDiagnostics { reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await
+            .map(|diagnostics| *diagnostics)
+            .map_err(|_| SchedulerError::ChannelClosed)
+    }
+
     /// Pause all download dispatch globally.
     pub async fn pause_all(&self) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
@@ -1190,6 +1228,16 @@ impl SchedulerHandle {
         Ok(())
     }
 
+    pub async fn set_propagation_delay(&self, seconds: u32) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::SetPropagationDelay { seconds, reply: tx })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        Ok(())
+    }
+
     pub async fn set_ip_replacement_trial_extra_connections(
         &self,
         extra_connections: u8,
@@ -1242,6 +1290,18 @@ impl SchedulerHandle {
         &self,
     ) -> Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>> {
         self.state.server_transfer_policy()
+    }
+
+    pub fn set_proxy_runtime(&self, runtime: Arc<crate::proxies::ProxyRuntime>) {
+        *self.state.proxy_runtime.write().expect("proxy runtime") = Some(runtime);
+    }
+
+    pub fn proxy_runtime(&self) -> Option<Arc<crate::proxies::ProxyRuntime>> {
+        self.state
+            .proxy_runtime
+            .read()
+            .expect("proxy runtime")
+            .clone()
     }
 
     pub fn set_nntp_pool(&self, pool: Arc<weaver_nntp::pool::NntpPool>) {

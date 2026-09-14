@@ -76,6 +76,22 @@ test("allows additive nullable fields", () => {
   assert.equal(hasSchemaCompatibilityFailure(changes), false);
 });
 
+test("allows additive optional input fields", () => {
+  const changes = changesFor(BASE_SCHEMA.replace(
+    "reason: String",
+    "reason: String\n    propagationDelaySecs: Int",
+  ));
+  assert.equal(hasSchemaCompatibilityFailure(changes), false);
+});
+
+test("optional input additions do not hide breaking changes", () => {
+  const changes = changesFor(BASE_SCHEMA
+    .replace("reason: String", "reason: String\n    propagationDelaySecs: Int")
+    .replace("name: String!", "name: Int!"));
+  assert.equal(hasSchemaCompatibilityFailure(changes), true);
+  assert.ok(changes.breaking.some((change) => change.description.includes("name")));
+});
+
 test("rejects removed fields", () => {
   const changes = changesFor(`
     type Query {

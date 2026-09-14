@@ -839,8 +839,7 @@ async fn a_header_encrypted_set_does_not_try_a_placeholder_spec_password() {
     // `archive_password_candidates_for_job` normalizes, or the two routes
     // disagree about what a password even *is*.
     //
-    // The case is not hypothetical: indexers have written `password=yes` since
-    // the NZBGet era to mean "this post is passworded", and
+    // Indexers use `password=yes` to mean "this post is passworded", and
     // `normalize_archive_password_candidate` drops that whole family. Offering
     // it here anyway would spend a PBKDF2 derivation proving nothing — and
     // would report the refusal as `NoVerifiedCandidate`, "everything we tried

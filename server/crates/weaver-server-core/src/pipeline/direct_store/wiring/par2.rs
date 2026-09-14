@@ -92,6 +92,29 @@ impl Pipeline {
             })
     }
 
+    /// File indices whose queued articles are held back while a demotion
+    /// sweep owns them, or `None` when no sweep is in flight for the job.
+    ///
+    /// An article for a sweep-owned file cannot be written when it lands: the
+    /// decode seam parks it in the write buffer, and neither relief path may
+    /// spill it, since a flush would commit over the image the sweep is
+    /// still rebuilding. Fetching more of them while the sweep runs only
+    /// grows that parked backlog toward the write-pressure latch, which then
+    /// stops every other file too. Dispatch skips them until the handback.
+    pub(crate) fn demotion_sweep_held_file_indices(&self, job_id: JobId) -> Option<Vec<u32>> {
+        let sets = self.direct_demotion_in_flight.get(&job_id)?;
+        let held: Vec<u32> = sets
+            .values()
+            .flat_map(|work| {
+                work.plan
+                    .volume_files
+                    .iter()
+                    .map(|file_id| file_id.file_index)
+            })
+            .collect();
+        (!held.is_empty()).then_some(held)
+    }
+
     /// The virtual volume behind one direct source file, as a **one-volume**
     /// provider plus its logical length.
     ///
@@ -880,6 +903,16 @@ impl Pipeline {
             }
             DirectRepairAnswer::Deferred => DirectPar2Resolution::Deferred,
             DirectRepairAnswer::Declined => {
+                if self.par3_direct_checks_available(job_id)
+                    && !self.job_has_pending_download_pipeline_work(job_id)
+                    && let par2_rs::verify::Repairability::Insufficient { blocks_needed, .. } =
+                        verification.repairable
+                {
+                    return DirectPar2Resolution::RecoveryExhausted {
+                        needed: blocks_needed,
+                        available: verification.recovery_blocks_available,
+                    };
+                }
                 // The other end of the safety valve above. The repair refused,
                 // so the parked set has run out of help; it demotes under the
                 // routing gate's own reason rather than under the generic
@@ -1833,8 +1866,8 @@ impl Pipeline {
             // burn the latch, the checkpoint row and the live-PAR2 state on
             // its way to the same refusal — and the set would then face its
             // retry already latched. Declining from here costs the sets
-            // nothing, and the demotion answers exactly as it always did. The
-            // wave budget goes with it: it belongs to the wait that just
+            // nothing. The caller can demote or preserve the virtual sources
+            // for an eligible PAR3 handoff. The wave budget belongs to the wait that just
             // ended, and the next damage verdict starts its own.
             self.direct_store.repair_defer_waves.remove(&job_id);
             let any_live_settled = by_set.keys().any(|set_index| {
@@ -1854,7 +1887,7 @@ impl Pipeline {
                 warn!(
                     job_id = job_id.0,
                     failure = %super::super::repair::DirectRepairFailure::Unrepairable,
-                    "repairing a direct set in place was not possible; demoting it"
+                    "direct PAR2 repair exhausted reachable recovery"
                 );
             }
             return DirectRepairAnswer::Declined;
@@ -2486,7 +2519,8 @@ impl Pipeline {
                     .collect();
                 let mut lead_in: Vec<(u32, u64, std::sync::Arc<[u8]>)> = spans
                     .iter()
-                    .filter_map(|span| span.lead_in.clone())
+                    .flat_map(|span| [span.lead_in.clone(), span.lead_out.clone()])
+                    .flatten()
                     .map(|(offset, data)| (volume_index, offset, data))
                     .collect();
                 lead_in.extend(edges);
@@ -2709,6 +2743,13 @@ impl Pipeline {
                 self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id)
                     && !set.is_demoted()
                     && !set.is_finalized()
+                    // Insufficient PAR2 recovery can hand off to PAR3 without
+                    // materializing every virtual source in this archive.
+                    && !(set.router.awaits_par3_verdict()
+                        && matches!(
+                            verification.repairable,
+                            par2_rs::verify::Repairability::Insufficient { .. }
+                        ))
             }) {
                 continue;
             }
@@ -2781,6 +2822,9 @@ impl Pipeline {
             .filter(|(_, set)| self.direct_set_binds_to_par2_set(job_id, set, recovery_set_id))
             .filter(|(_, set)| {
                 !set.is_demoted() && !set.is_finalized() && !set.router.damaged_volumes().is_empty()
+                    // The PAR3 completion gate still owes this archive its
+                    // native verdict, including any eligible fallback repair.
+                    && !set.router.awaits_par3_verdict()
             })
             .map(|(index, _)| index)
             .collect();

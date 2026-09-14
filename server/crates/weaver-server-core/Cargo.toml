@@ -10,6 +10,8 @@ repository.workspace = true
 slow-tests = []
 
 [dependencies]
+weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
+async-trait = "0.1"
 weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
@@ -17,6 +19,11 @@ weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false 
 par2-rs = { workspace = true, features = [
     "native-crypto",
 ] }
+par3-rs = { workspace = true }
+# Already in the graph through par2-rs; named directly so System info can read
+# the XOR-JIT gate, which par2-rs does not re-export. The RAR3 recovery-volume
+# tests also author their `.rev` fixture with its RS coder.
+reedsolomon-rs = { version = "0.4.5", default-features = false }
 unrar-rs = { workspace = true, features = [
     "crypto-aws-lc",
 ] }
@@ -40,6 +47,8 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true, default-features = false }
 reqwest = { workspace = true }
+semver = { workspace = true }
+httpdate = { workspace = true }
 regex = { workspace = true }
 ipnet = { workspace = true }
 quick-xml = { workspace = true }
@@ -72,9 +81,10 @@ security-framework-sys = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true }
 keyring-core = { workspace = true }
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
+weaver-tunnel = { path = "../../../engines/weaver-tunnel", features = ["test-support"] }
 serde_json = { workspace = true }
 # `test-util` for the paused clock: the health-probe reclaim tests assert on
 # multi-second timeout budgets, which only a mocked clock can settle without
@@ -89,10 +99,6 @@ sevenz-rust2 = { workspace = true, features = ["compress"] }
 axum = { workspace = true }
 criterion = "0.8"
 lzma-rust2 = { workspace = true, features = ["encoder"] }
-# The RAR3 recovery-volume tests author their `.rev` fixture in-process with
-# the same RS coder the restorer decodes with. Test-only: the shipped binary
-# only ever restores from recovery volumes, it never writes one.
-reedsolomon-rs = { version = "0.4.3", default-features = false }
 
 [[bench]]
 name = "infrastructure_retry"

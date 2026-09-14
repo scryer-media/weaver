@@ -38,6 +38,7 @@ const LSOF_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const TCP_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(200);
 const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
 const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
+#[cfg(unix)]
 const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
 const LOCAL_AGENT_API_KEY_NAME: &str = "xtask-local-agent";
 const LOCAL_AGENT_API_KEY_SCOPE: &str = "admin";
@@ -252,6 +253,12 @@ impl Drop for SignalForwarder {
 #[cfg(not(unix))]
 struct SignalForwarder;
 
+impl SignalForwarder {
+    /// Put the previous signal handlers back. Where none were installed
+    /// there is nothing to restore.
+    fn uninstall(self) {}
+}
+
 #[derive(Args)]
 struct DeployArgs {
     #[command(subcommand)]
@@ -324,6 +331,8 @@ struct PgoCollectArgs {
 
 #[derive(Subcommand)]
 enum PerfCommand {
+    /// Compare matched PAR2 verification and repair workloads.
+    Par2Compare(perf::compare::Options),
     #[command(name = "par2-x86", disable_help_flag = true)]
     Par2X86(ForwardArgs),
     #[command(name = "real-download", disable_help_flag = true)]
@@ -433,6 +442,7 @@ fn main() -> Result<()> {
             ProfileCommand::Local(args) => profile_local::run(&ctx, args),
         },
         Commands::Perf(args) => match args.command {
+            PerfCommand::Par2Compare(args) => perf::compare::run(args),
             PerfCommand::Par2X86(args) => perf::run_par2_x86(&ctx, args.args),
             PerfCommand::RealDownload(args) => perf::run_real_download(&ctx, args.args),
         },
@@ -1624,7 +1634,7 @@ PackageVersion: {version}\n\
 InstallerType: msi\n\
 InstallModes:\n\
 - silent\n\
-UpgradeBehavior: uninstallPrevious\n\
+UpgradeBehavior: install\n\
 ReleaseDate: {release_date}\n\
 Installers:\n\
 {installers}\n\
@@ -2178,9 +2188,9 @@ fn run_weaver_rust_prep_validation(ctx: &TaskContext, prefix: &'static str) -> R
     run_streaming(&mut fmt, prefix)?;
     prefixed_ok(prefix, "cargo fmt passed");
 
-    prefixed_step(prefix, "Updating Cargo.lock (cargo update)");
+    prefixed_step(prefix, "Updating workspace packages in Cargo.lock");
     let mut update = ctx.command_in("cargo", &ctx.repo_root);
-    update.arg("update");
+    update.args(["update", "--workspace"]);
     run_streaming(&mut update, prefix)?;
     prefixed_ok(prefix, "Cargo.lock updated");
 
@@ -2916,7 +2926,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     let backend_pid = backend.id();
     let backend_signal_forwarder = install_backend_signal_forwarder(backend_pid)?;
     if let Err(error) = wait_for_backend(backend_pid, backend_port, &backend_log) {
-        drop(backend_signal_forwarder);
+        backend_signal_forwarder.uninstall();
         terminate_backend(&mut backend);
         if !keep_data {
             drop(temp_dir);
@@ -2957,7 +2967,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         ]);
     let result = run_status(&mut vite);
 
-    drop(backend_signal_forwarder);
+    backend_signal_forwarder.uninstall();
     terminate_backend(&mut backend);
     if !keep_data {
         drop(temp_dir);

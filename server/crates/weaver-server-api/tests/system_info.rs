@@ -19,6 +19,7 @@ const SYSTEM_INFO_QUERY: &str = r#"
       cgroupLimit
       decoderTier
       simdFeatures
+      kernels { component library ladder kernel pinnedBy }
     }
     memory {
       totalBytes
@@ -62,6 +63,37 @@ async fn system_info_exposes_safe_runtime_profile_to_read_scope() {
     assert_eq!(info["databaseEngine"].as_str().unwrap(), "SQLITE");
     assert_eq!(info["compute"]["physicalCores"].as_u64().unwrap(), 4);
     assert_eq!(info["compute"]["logicalCores"].as_u64().unwrap(), 8);
+    let kernels = info["compute"]["kernels"].as_array().unwrap();
+    let components: Vec<&str> = kernels
+        .iter()
+        .map(|kernel| kernel["component"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        components,
+        [
+            "YENC_DECODE",
+            "YENC_CRC32",
+            "PAR2_REPAIR",
+            "PAR2_MD5",
+            "PAR2_CRC32",
+            "RAR_RECOVERY",
+            "RAR_CRC32",
+            "RAR_SHA1",
+            "RAR_AES",
+        ]
+    );
+    for kernel in kernels {
+        let selected = kernel["kernel"].as_str().unwrap();
+        assert!(
+            kernel["ladder"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rung| rung.as_str() == Some(selected)),
+            "{kernel} selected a kernel off its ladder"
+        );
+        assert!(!kernel["library"].as_str().unwrap().is_empty());
+    }
     assert_eq!(
         info["memory"]["effectiveLimitBytes"].as_u64().unwrap(),
         8 * 1024 * 1024 * 1024

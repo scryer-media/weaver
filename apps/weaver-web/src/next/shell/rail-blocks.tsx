@@ -1,0 +1,324 @@
+import type { ReactNode } from "react";
+import { Link, NavLink } from "react-router";
+import { useQuery } from "urql";
+import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import { useTranslate } from "@/lib/context/translate-context";
+import { cn } from "@/lib/utils";
+import { RailBlock, RailMetric } from "./NextShell";
+import { Bar, Square } from "../components/chrome";
+import { Icon, type IconName } from "../components/icons";
+import { UNCATEGORISED, type CategoryEntry } from "../data/categories";
+import { useNextData, type ProviderHealth } from "../data/next-data";
+import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
+import { formatClock, formatLatency, splitUptime } from "../data/format";
+import { countLabel, providerStateLabel } from "../i18n/labels";
+
+/**
+ * The rail's reusable bottom blocks.
+ *
+ * Screens pick the ones that belong to them rather than each building its own:
+ * Downloads takes Providers, Settings takes the config path, and the diagnostic
+ * screens take Attention + Uptime. Throughput is not among them; the shell pins
+ * it under whatever a screen picks.
+ */
+
+export function providerLoadPercent(provider: ProviderHealth): number {
+  const max = provider.connectionsMax || provider.connectionsConfigured;
+  if (!max) {
+    return 0;
+  }
+  return (provider.connectionsActive / max) * 100;
+}
+
+export function ProvidersBlock() {
+  const t = useTranslate();
+  const { providers, providersLoaded } = useNextData();
+
+  // Server health lists the live pool, and the pool leaves out every server
+  // that is switched off, so only the configured list can say there are none.
+  // It is asked only once health has answered empty. Reading it takes the same
+  // admin rights as adding a provider, so a viewer who could not act on the
+  // call to action never sees it.
+  const healthEmpty = providersLoaded && providers.length === 0;
+  const [{ data: configuredData }] = useQuery<{ servers: { id: number }[] }>({
+    query: SERVERS_QUERY,
+    pause: !healthEmpty,
+  });
+  const configured = healthEmpty ? configuredData?.servers : undefined;
+
+  return (
+    <RailBlock eyebrow={t("next.rail.providers")} className="gap-3">
+      {providers.length === 0 ? (
+        <>
+          <div className="font-wv-mono text-[11px] text-wv-muted">
+            {configured?.length ? t("next.rail.noneEnabled") : t("next.rail.noneConfigured")}
+          </div>
+          {configured?.length === 0 ? <AddProviderButton /> : null}
+        </>
+      ) : (
+        providers.map((provider) => {
+          const load = providerLoadPercent(provider);
+          const idle = provider.connectionsActive === 0;
+          return (
+            <div key={`${provider.host}:${provider.port}`} className="flex flex-col gap-[5px]">
+              <div className="flex items-baseline justify-between gap-2 text-[12.5px]">
+                <span className="truncate text-wv-tertiary">{provider.host}</span>
+                <span className="flex-none font-wv-mono text-[11px] text-wv-muted">
+                  {idle
+                    ? t("next.rail.idle")
+                    : `${provider.connectionsActive} / ${provider.connectionsMax || provider.connectionsConfigured}`}
+                </span>
+              </div>
+              <Bar percent={load} color={idle ? WV.inert : WV.accent} height={10} />
+            </div>
+          );
+        })
+      )}
+    </RailBlock>
+  );
+}
+
+/**
+ * The rail's one loud control. With no provider nothing can download, so the
+ * empty state is an instruction rather than a caption, and it opens the add
+ * form itself instead of the list the form sits behind.
+ */
+function AddProviderButton() {
+  const t = useTranslate();
+  return (
+    <Link
+      to="/settings/servers?add"
+      className="wv-ping flex h-[40px] items-center justify-between gap-2 bg-wv-accent px-3 text-[13px] font-medium tracking-[0.08em] text-wv-on-accent uppercase hover:bg-wv-accent-hover"
+    >
+      <span className="flex items-center gap-2">
+        <Icon name="add" size={15} className="-ml-[1px] flex-none" />
+        {t("next.rail.addProvider")}
+      </span>
+      <Icon name="go" size={16} className="flex-none" />
+    </Link>
+  );
+}
+
+export interface AttentionItem {
+  id: string;
+  text: string;
+  meta: string;
+  color: string;
+}
+
+/**
+ * What the daemon currently wants someone to know.
+ *
+ * Derived from state weaver already publishes — provider holdoffs from the
+ * metrics stream, unhealthy servers from server health, and an active download
+ * block — rather than from a dedicated alerts API.
+ */
+export function useAttentionItems(): AttentionItem[] {
+  const t = useTranslate();
+  const { providers, holdoffs, downloadBlock, isPaused } = useNextData();
+  const items: AttentionItem[] = [];
+
+  for (const holdoff of holdoffs) {
+    items.push({
+      id: `holdoff:${holdoff.label}`,
+      text: t("next.attention.overLimit", { server: holdoff.label }),
+      meta: t("next.attention.backingOff", { time: formatClock(holdoff.untilEpochMs) }),
+      color: WV.warn,
+    });
+  }
+
+  for (const provider of providers) {
+    if (provider.state === "healthy") {
+      continue;
+    }
+    const consecutive = provider.consecutiveFailures;
+    items.push({
+      id: `provider:${provider.host}:${provider.port}`,
+      text: t("next.attention.providerState", {
+        host: provider.host,
+        state: providerStateLabel(t, provider.state),
+      }),
+      meta: `${countLabel(t, "next.attention.consecutiveFailures", consecutive)} · ${formatLatency(provider.latencyMs)}`,
+      color: provider.state === "disabled" ? WV.error : WV.warn,
+    });
+  }
+
+  if (downloadBlock.kind !== "NONE" && !isPaused) {
+    items.push({
+      id: "download-block",
+      text:
+        downloadBlock.kind === "ISP_CAP"
+          ? t("next.attention.capReached")
+          : downloadBlock.kind === "SERVER_QUOTA"
+            ? t("next.attention.quotaReached")
+            : t("next.attention.scheduleHold"),
+      meta: downloadBlock.windowEndsAtEpochMs
+        ? t("next.attention.resumes", { time: formatClock(downloadBlock.windowEndsAtEpochMs) })
+        : t("next.attention.seeBandwidth"),
+      color: WV.warn,
+    });
+  }
+
+  return items;
+}
+
+export function AttentionBlock() {
+  const t = useTranslate();
+  const items = useAttentionItems();
+
+  // An empty block is noise: the rail only speaks up when something is wrong.
+  if (items.length === 0) {
+    return null;
+  }
+
+  return (
+    <RailBlock eyebrow={t("next.attention.title")} position="middle" className="gap-3">
+      {items.map((item) => (
+        <div key={item.id} className="flex gap-[9px]">
+          <Square color={item.color} className="mt-[5px]" />
+          <div className="flex min-w-0 flex-col gap-1">
+            <div className="text-[12.5px] leading-[1.35] text-wv-secondary">{item.text}</div>
+            <div className="font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
+              {item.meta}
+            </div>
+          </div>
+        </div>
+      ))}
+    </RailBlock>
+  );
+}
+
+export function UptimeBlock() {
+  const t = useTranslate();
+  const [{ data }] = useQuery<{ systemInfo: { uptimeSeconds: number; version: string } }>({
+    query: SYSTEM_INFO_QUERY,
+  });
+  const uptime = splitUptime(data?.systemInfo?.uptimeSeconds ?? 0);
+
+  return (
+    <RailBlock eyebrow={t("next.rail.uptime")}>
+      <RailMetric value={uptime.value} unit={uptime.unit} note={t("next.rail.sinceRestart")} />
+    </RailBlock>
+  );
+}
+
+/**
+ * The rail's contextual middle block on the list screens: the configured
+ * categories, as facets.
+ *
+ * Facets are additive and they union — picking Movies and TV asks for both,
+ * not for the empty intersection. "All categories" is the cleared state rather
+ * than a facet of its own, so it reads as selected exactly when nothing else
+ * is, and clicking it clears the rest.
+ *
+ * A count is the size of that facet alone, computed before any facet is
+ * applied, so the numbers beside the other rows never move as you select.
+ */
+export function CategoryListBlock({
+  items,
+  selected,
+  onToggle,
+  onClear,
+}: {
+  items: readonly CategoryEntry[];
+  selected: ReadonlySet<string>;
+  onToggle: (key: string) => void;
+  onClear: () => void;
+}) {
+  const t = useTranslate();
+  return (
+    <RailBlock eyebrow={t("categories.title")} position="middle" className="gap-[9px]">
+      {items.map((item) => {
+        const isActive = item.key === null ? selected.size === 0 : selected.has(item.key);
+        // A facet's colour is the rail's business, not the list's: "all" and
+        // "uncategorised" are the absence of a category and share its grey.
+        const color =
+          item.key === null || item.key === UNCATEGORISED
+            ? UNCATEGORISED_COLOR
+            : categoryColor(item.key);
+        return (
+          <button
+            key={item.key ?? "*"}
+            type="button"
+            onClick={() => (item.key === null ? onClear() : onToggle(item.key))}
+            aria-pressed={isActive}
+            className={cn(
+              "flex items-center gap-[9px] text-left text-[12.5px]",
+              isActive ? "font-medium text-wv-strong" : "text-wv-fg hover:text-wv-secondary",
+            )}
+          >
+            {/*
+              The swatch doubles as the checkbox: solid once the facet is on,
+              a ring of the same colour while it is off. One glyph, so a rail
+              of eight categories does not grow a column of empty boxes.
+            */}
+            <Square color={color} hollow={!isActive} />
+            <span className="min-w-0 truncate">
+              {item.key === null
+                ? t("next.categories.all")
+                : item.key === UNCATEGORISED
+                  ? t("next.categories.uncategorised")
+                  : item.label}
+            </span>
+            {item.count === undefined ? null : (
+              <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">
+                {item.count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </RailBlock>
+  );
+}
+
+/**
+ * The rail's contextual middle block on Settings: one row per panel, with the
+ * active background bleeding to the rail's edge.
+ */
+export function PanelListBlock({
+  eyebrow,
+  items,
+}: {
+  eyebrow: string;
+  items: readonly { to: string; label: string; icon?: IconName; tag?: ReactNode }[];
+}) {
+  return (
+    <RailBlock eyebrow={eyebrow} position="middle" className="gap-0">
+      {items.map((item) => (
+        <NavLink
+          key={item.to}
+          to={item.to}
+          className={({ isActive }) =>
+            cn(
+              "-mx-[10px] flex h-[30px] items-center gap-[10px] px-[10px] text-[12.5px] hover:bg-wv-nav-hover",
+              isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
+            )
+          }
+        >
+          {({ isActive }) => (
+            <>
+              <span
+                aria-hidden="true"
+                className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
+              />
+              {item.icon === undefined ? null : (
+                <Icon
+                  name={item.icon}
+                  size={15}
+                  className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
+                />
+              )}
+              <span className="min-w-0 truncate">{item.label}</span>
+              {item.tag === undefined ? null : (
+                <span className="ml-auto flex-none font-wv-mono text-[10.5px] tracking-[0.1em] text-wv-faint uppercase">
+                  {item.tag}
+                </span>
+              )}
+            </>
+          )}
+        </NavLink>
+      ))}
+    </RailBlock>
+  );
+}

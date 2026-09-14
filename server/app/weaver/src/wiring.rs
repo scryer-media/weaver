@@ -61,7 +61,8 @@ pub(crate) fn build_nntp_client(
     config: &Config,
     profile: &SystemProfile,
     policy_registry: &weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
-) -> NntpClient {
+    proxies: &weaver_server_core::proxies::ProxyRuntime,
+) -> Result<NntpClient, String> {
     let transfer_registry = policy_registry.transfer_registry();
     let mut active: Vec<&ServerConfig> = config
         .servers
@@ -81,35 +82,41 @@ pub(crate) fn build_nntp_client(
         weaver_nntp::connection::NntpBufferProfile::adaptive(effective_memory, total_connections);
     let servers = active
         .iter()
-        .map(|server| weaver_nntp::pool::ServerPoolConfig {
-            server: weaver_nntp::ServerConfig {
-                host: server.host.clone(),
-                port: server.port,
-                tls: server.tls,
-                username: server.username.clone(),
-                password: server.password.clone(),
-                tls_ca_cert: server.tls_ca_cert.clone(),
-                buffer_profile,
-                pipelining: weaver_nntp::PipeliningCapability::Known(server.supports_pipelining),
-                ..Default::default()
-            },
-            max_connections: server.connections as usize,
-            group: server.priority,
-            backfill: server.backfill,
-            retention_days: server.retention_days,
-            stable_id: weaver_nntp::transfer::StableServerId(server.id),
-            transfer_control: Some(
-                transfer_registry.control(weaver_nntp::transfer::StableServerId(server.id)),
-            ),
+        .map(|server| {
+            Ok::<_, String>(weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    proxy: proxies.nntp_bridge(server.id)?,
+                    revocation: Some(proxies.nntp_sockets(server.id)?),
+                    host: server.host.clone(),
+                    port: server.port,
+                    tls: server.tls,
+                    username: server.username.clone(),
+                    password: server.password.clone(),
+                    tls_ca_cert: server.tls_ca_cert.clone(),
+                    buffer_profile,
+                    pipelining: weaver_nntp::PipeliningCapability::Known(
+                        server.supports_pipelining,
+                    ),
+                    ..Default::default()
+                },
+                max_connections: server.connections as usize,
+                group: server.priority,
+                backfill: server.backfill,
+                retention_days: server.retention_days,
+                stable_id: weaver_nntp::transfer::StableServerId(server.id),
+                transfer_control: Some(
+                    transfer_registry.control(weaver_nntp::transfer::StableServerId(server.id)),
+                ),
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
-    NntpClient::new(weaver_nntp::client::NntpClientConfig {
+    Ok(NntpClient::new(weaver_nntp::client::NntpClientConfig {
         servers,
         max_idle_age: std::time::Duration::from_secs(300),
         max_retries_per_server: 1,
         soft_timeout: std::time::Duration::from_secs(15),
-    })
+    }))
 }
 
 pub(crate) async fn flush_server_transfer_usage(
@@ -173,6 +180,14 @@ async fn persist_events(
 
         match recv {
             Ok(event) => {
+                let barrier = matches!(
+                    event,
+                    PipelineEvent::RepairComplete { .. }
+                        | PipelineEvent::EmbeddedProtectionReplaced { .. }
+                        | PipelineEvent::JobCompleted { .. }
+                        | PipelineEvent::JobFailed { .. }
+                        | PipelineEvent::JobCancelled { .. }
+                );
                 if should_record_job_event(&event) {
                     let gql = PipelineEventGql::from(&event);
                     if let Some(job_id) = gql.job_id {
@@ -190,8 +205,11 @@ async fn persist_events(
                     }
                 }
 
-                if batch.len() >= 50 {
+                if batch.len() >= 50 || barrier {
                     flush_job_event_batch(&db, &mut batch).await;
+                }
+                if barrier && let Err(error) = db.flush_write_queue().await {
+                    tracing::warn!(%error, "failed to flush lifecycle event boundary");
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -255,6 +273,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedded_repair_warning_survives_database_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("events.db");
+        let db = Database::open(&path).unwrap();
+        let (tx, rx) = broadcast::channel(8);
+        let task = tokio::spawn(persist_events(
+            rx,
+            db.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        let warning = PipelineEvent::EmbeddedProtectionReplaced {
+            job_id: JobId(7),
+            blocks_repaired: 3,
+        };
+        assert_eq!(
+            weaver_server_core::events::publish::pipeline_job_id(&warning),
+            Some(7)
+        );
+        tx.send(warning).unwrap();
+        tx.send(PipelineEvent::JobCompleted { job_id: JobId(7) })
+            .unwrap();
+        drop(tx);
+        task.await.unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        let events = reopened.get_job_events(7).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "RepairComplete");
+        assert!(events[0].message.starts_with("3 blocks repaired."));
+        assert!(
+            events[0]
+                .message
+                .contains("original carrier could not be restored byte for byte")
+        );
+        assert_eq!(events[1].kind, "JobCompleted");
+        assert!(events[0].file_id.is_none());
+    }
+
+    #[tokio::test]
     async fn persist_events_flushes_partial_batches_while_events_continue() {
         let db = Database::open_in_memory().unwrap();
         let (tx, rx) = broadcast::channel(64);
@@ -281,6 +339,45 @@ mod tests {
 
         sender.await.unwrap();
         drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repair_boundary_flushes_before_the_periodic_deadline_or_shutdown() {
+        let db = Database::open_in_memory().unwrap();
+        let (tx, rx) = broadcast::channel(64);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(persist_events(rx, db.clone(), shutdown.clone()));
+        // Let the interval's immediate first tick finish before sending a batch.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let started = tokio::time::Instant::now();
+        for id in [7, 8] {
+            tx.send(PipelineEvent::JobPaused { job_id: JobId(id) })
+                .unwrap();
+            tx.send(PipelineEvent::RepairComplete {
+                job_id: JobId(id),
+                slices_repaired: 3,
+            })
+            .unwrap();
+        }
+        // Yield to the subscriber and SQLite worker, without advancing time,
+        // closing the channel, reaching the batch size or notifying shutdown.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if db.get_job_events(8).unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(tokio::time::Instant::now(), started);
+        for id in [7, 8] {
+            let events = db.get_job_events(id).unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1].kind, "RepairComplete");
+        }
+        shutdown.notify_one();
         task.await.unwrap();
     }
 }

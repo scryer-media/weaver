@@ -63,6 +63,15 @@
     "sha256": "6f2cb042f23d9b0c93f14cc0e16de5bd6e98bf36d8be1f8f2e886fa85ad1b972",
     "dockerfile": "internal/fixturegen/docker/par2/Dockerfile"
   },
+  "par3_generator": {
+    "id": "par3cmdline-2971702e",
+    "image": "weaver-e2e-par3cmdline:2971702e",
+    "platform": "linux/amd64",
+    "url": "https://github.com/Parchive/par3cmdline/archive/2971702e501f1350b1c7b9d11369af9157d6ed56.tar.gz",
+    "sha256": "41695d424730bfa4838bada4f2750928f895ff8cf5cb6e6dc81ebe89731c6e8d",
+    "dockerfile": "internal/fixturegen/docker/par3/Dockerfile",
+    "notes": "The official PAR3 reference implementation, par3cmdline, built from one pinned revision. Writes loose PAR3 sets and inserts self-protection into ZIP and 7z containers; its own verify and repair commands prove every damaged fixture is repairable before it is published."
+  },
   "uu_codec": {
     "id": "uudeview-0.5.20",
     "image": "weaver-e2e-uudeview:0.5.20",

@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 fn capacity_test_client(port: u16, connections: usize) -> NntpClient {
     NntpClient::new(NntpClientConfig::single(
@@ -28,7 +28,7 @@ async fn spawn_capacity_limited_body_server(
     total_segments: usize,
 ) -> (
     u16,
-    Arc<AtomicBool>,
+    tokio::sync::watch::Sender<bool>,
     Arc<AtomicUsize>,
     Arc<std::sync::Mutex<Vec<String>>>,
     tokio::task::JoinHandle<()>,
@@ -38,7 +38,7 @@ async fn spawn_capacity_limited_body_server(
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let fast_bodies = Arc::new(AtomicBool::new(false));
+    let (release_final_body, final_body_released) = tokio::sync::watch::channel(false);
     let active_connections = Arc::new(AtomicUsize::new(0));
     let body_commands: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -63,7 +63,6 @@ async fn spawn_capacity_limited_body_server(
     let part_size = payload.len();
     let total_size = part_size * total_segments;
 
-    let fast_bodies_for_server = Arc::clone(&fast_bodies);
     let active_for_server = Arc::clone(&active_connections);
     let body_commands_for_server = Arc::clone(&body_commands);
     let server = tokio::spawn(async move {
@@ -71,7 +70,7 @@ async fn spawn_capacity_limited_body_server(
             let (socket, _) = listener.accept().await.unwrap();
             let active = active_for_server.fetch_add(1, Ordering::SeqCst) + 1;
             let active_for_connection = Arc::clone(&active_for_server);
-            let fast_bodies = Arc::clone(&fast_bodies_for_server);
+            let mut final_body_released = final_body_released.clone();
             let encoded_body = Arc::clone(&encoded_body);
             let part_crc = Arc::clone(&part_crc);
             let body_commands = Arc::clone(&body_commands_for_server);
@@ -85,7 +84,7 @@ async fn spawn_capacity_limited_body_server(
 
                 if writer.write_all(b"200 test server ready\r\n").await.is_ok() {
                     let mut lines = BufReader::new(reader).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
+                    'commands: while let Ok(Some(line)) = lines.next_line().await {
                         if line == "CAPABILITIES" {
                             if writer
                                 .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
@@ -121,9 +120,6 @@ async fn spawn_capacity_limited_body_server(
                                 }
                                 continue;
                             };
-                            if !fast_bodies.load(Ordering::Acquire) {
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-                            }
                             let part_index = message_id
                                 .split("segment-")
                                 .nth(1)
@@ -131,6 +127,21 @@ async fn spawn_capacity_limited_body_server(
                                 .and_then(|index| index.parse::<usize>().ok())
                                 .unwrap();
                             let part_number = part_index + 1;
+                            // Keep the job active until the test changes its
+                            // generation, without slowing every BODY into a
+                            // transport timeout. This server is sequential;
+                            // a closed old-generation socket must release its
+                            // provider slot even while the final body is held.
+                            while part_number == total_segments && !*final_body_released.borrow() {
+                                tokio::select! {
+                                    changed = final_body_released.changed() => {
+                                        if changed.is_err() {
+                                            break 'commands;
+                                        }
+                                    }
+                                    _ = lines.next_line() => break 'commands,
+                                }
+                            }
                             let part_begin = part_index * part_size + 1;
                             let part_end = part_begin + part_size - 1;
                             let header = format!(
@@ -159,7 +170,91 @@ async fn spawn_capacity_limited_body_server(
         }
     });
 
-    (port, fast_bodies, active_connections, body_commands, server)
+    (
+        port,
+        release_final_body,
+        active_connections,
+        body_commands,
+        server,
+    )
+}
+
+#[tokio::test]
+async fn metrics_refresh_advances_during_continuous_download_result_turns() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    tokio::time::pause();
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    let mut pending = VecDeque::new();
+    // Results already accepted before cancellation still traverse this seam.
+    // Keep more than one bounded batch queued for every observed refresh.
+    for segment_number in 0..160 {
+        pending.push_back(DownloadResult {
+            lane_id: 0,
+            runtime_generation: 0,
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id: JobId(991),
+                    file_index: 0,
+                },
+                segment_number,
+            },
+            data: Ok(DownloadPayload::Raw(Bytes::new())),
+            attempts: vec![],
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: vec![],
+            release_connection_slot: false,
+        });
+    }
+    for downloaded in 1..=3 {
+        pipeline
+            .metrics
+            .bytes_downloaded
+            .store(downloaded, Ordering::Relaxed);
+        pipeline.snapshot_publish_pending = true;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(
+            pipeline
+                .process_download_result_turn(&mut pending, &mut interval)
+                .await,
+            16
+        );
+        assert!(!pending.is_empty());
+        assert_eq!(
+            pipeline.shared_state.metrics_snapshot().bytes_downloaded,
+            downloaded
+        );
+        assert!(!pipeline.snapshot_publish_pending);
+    }
+    // Busy turns before the deadline must not oversample or reset the cadence.
+    pipeline
+        .metrics
+        .bytes_downloaded
+        .store(99, Ordering::Relaxed);
+    assert_eq!(
+        pipeline
+            .process_download_result_turn(&mut pending, &mut interval)
+            .await,
+        16
+    );
+    assert_eq!(pipeline.shared_state.metrics_snapshot().bytes_downloaded, 3);
+    pending.clear();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        pipeline
+            .process_download_result_turn(&mut pending, &mut interval)
+            .await,
+        0
+    );
+    assert_eq!(
+        pipeline.shared_state.metrics_snapshot().bytes_downloaded,
+        99
+    );
 }
 
 #[tokio::test]
@@ -372,11 +467,14 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
+// The provider must keep serving while the pipeline handles an 80-lane
+// connection burst; sharing one executor thread turns scheduler contention
+// into fake provider timeouts and can park every article before any progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_change() {
     const TOTAL_SEGMENTS: usize = 1_000;
     let payload = vec![b'A'; 1024];
-    let (port, fast_bodies, active_connections, _body_commands, server) =
+    let (port, release_final_body, active_connections, body_commands, server) =
         spawn_capacity_limited_body_server(20, payload.clone(), TOTAL_SEGMENTS).await;
     let initial_client = capacity_test_client(port, 80);
     let old_pool = Arc::clone(initial_client.pool());
@@ -407,7 +505,16 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
         })
     })
     .await
-    .expect("job should begin downloading before the generation correction");
+    .unwrap_or_else(|error| {
+        panic!(
+            "job should begin downloading before the generation correction: {error}; job={:?} metrics={:?} active={} bodies={} held_off={}",
+            harness.handle.get_job(job_id),
+            harness.handle.get_live_metrics(),
+            active_connections.load(Ordering::Acquire),
+            body_commands.lock().unwrap().len(),
+            old_pool.is_over_limit(weaver_nntp::ServerId(0)),
+        )
+    });
 
     wait_until(Duration::from_secs(20), || {
         old_pool.is_over_limit(weaver_nntp::ServerId(0))
@@ -431,7 +538,7 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
         .unwrap();
     assert_eq!(activation.generation, 1);
     assert_eq!(activation.configured_connections, 20);
-    fast_bodies.store(true, Ordering::Release);
+    release_final_body.send_replace(true);
 
     wait_until(Duration::from_secs(15), || {
         harness
@@ -496,6 +603,38 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
     const CONNECTIONS: usize = 8;
     let client = capacity_test_client(port, CONNECTIONS);
     let pool = Arc::clone(client.pool());
+    // Finish one real rejection before dispatching the concurrent workload.
+    // Sockets admitted before holdoff may reach accept() after it is armed;
+    // counting those as reconnects made this assertion depend on scheduling.
+    assert!(matches!(
+        pool.acquire(weaver_nntp::ServerId(0)).await,
+        Err(weaver_nntp::NntpError::TooManyConnections)
+    ));
+    assert!(pool.is_over_limit(weaver_nntp::ServerId(0)));
+    assert_eq!(pool.active_connections(0), 0);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    // Exercise both acquisition paths after the admission boundary is known.
+    for _ in 0..CONNECTIONS {
+        assert!(matches!(
+            pool.acquire(weaver_nntp::ServerId(0)).await,
+            Err(weaver_nntp::NntpError::ServerOverLimit { .. })
+        ));
+    }
+    let client = tokio::task::spawn_blocking(move || {
+        for _ in 0..CONNECTIONS {
+            assert!(matches!(
+                client.try_acquire_blocking_body_lane(&[], &[]),
+                Err(
+                    weaver_nntp::client::BlockingBodyLaneAcquireError::ProviderCapacity(
+                        weaver_nntp::NntpError::ServerOverLimit { .. }
+                    )
+                )
+            ));
+        }
+        client
+    })
+    .await
+    .unwrap();
     let harness = TestHarness::new_with_nntp(client, CONNECTIONS).await;
     let job_id = JobId(80_021);
     let spec = segmented_job_spec("held off provider", "held-off.bin", &vec![1024_u32; 64]);
@@ -506,19 +645,11 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
         .await
         .unwrap();
 
-    wait_until(Duration::from_secs(10), || {
-        pool.is_over_limit(weaver_nntp::ServerId(0))
-    })
-    .await
-    .expect("the provider rejection should park fresh connects");
-
-    // Every dispatch inside the window is answered from the deadline, so the
-    // provider sees no further sockets even though lanes keep asking.
-    let accepted_after_holdoff = accepted.load(Ordering::SeqCst);
+    // The scheduler also keeps the queued workload off the held-off provider.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
         accepted.load(Ordering::SeqCst),
-        accepted_after_holdoff,
+        1,
         "a held-off server must not be reconnected inside its window"
     );
 
@@ -532,6 +663,7 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
 
     harness.shutdown().await;
     server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]
@@ -749,6 +881,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
         tokio::time::timeout(
             Duration::from_secs(1),
             pipeline.handle_download_done(DownloadResult {
+                lane_id: 0,
                 runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
@@ -803,6 +936,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
     pipeline.active_downloads += 1;
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -902,6 +1036,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
         pipeline.active_downloads += 1;
         pipeline
             .handle_download_done(DownloadResult {
+                lane_id: 0,
                 runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
@@ -991,6 +1126,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
         pipeline.active_downloads += 1;
         pipeline
             .handle_download_done(DownloadResult {
+                lane_id: 0,
                 runtime_generation: 0,
                 segment_id: SegmentId {
                     file_id: NzbFileId {
@@ -1385,9 +1521,9 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
 async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
     const TOTAL_SEGMENTS: usize = 4;
     let payload = vec![b'Z'; 1024];
-    let (port, fast_bodies, _active_connections, body_commands, server) =
+    let (port, release_final_body, _active_connections, body_commands, server) =
         spawn_capacity_limited_body_server(8, payload.clone(), TOTAL_SEGMENTS).await;
-    fast_bodies.store(true, Ordering::Release);
+    release_final_body.send_replace(true);
 
     let harness = TestHarness::new_with_nntp(capacity_test_client(port, 4), 4).await;
     let job_id = JobId(80_021);
@@ -1441,4 +1577,117 @@ async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
 
     harness.shutdown().await;
     server.abort();
+}
+
+#[tokio::test]
+async fn repeated_articles_fetch_once_and_preserve_every_admitted_file() {
+    repeated_article_case(false).await;
+}
+
+#[tokio::test]
+async fn repeated_uuencode_articles_preserve_each_file_and_wire_accounting() {
+    repeated_article_case(true).await;
+}
+
+async fn repeated_article_case(uuencode: bool) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let payload: &[u8] = if uuencode {
+        b"abc"
+    } else {
+        b"one article, several independent file placements"
+    };
+    let mut body = Vec::new();
+    if uuencode {
+        body.extend_from_slice(b"begin 644 shared.bin\r\n#86)C\r\n`\r\nend\r\n");
+    } else {
+        weaver_yenc::encode(payload, &mut body, 128, "shared.bin").unwrap();
+    }
+    let expected_wire = body.len() as u64;
+    let body = Arc::new(body);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    let body = body.clone(); let counted = counted.clone();
+                    connections.spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        write.write_all(b"200 fixture ready\r\n").await.unwrap();
+                        let mut lines = BufReader::new(read).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let response: &[u8] = if line == "CAPABILITIES" {
+                                b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+                            } else if line.starts_with("GROUP ") {
+                                b"211 1 1 1 alt.binaries.test\r\n"
+                            } else if line == "BODY <shared@example.com>" {
+                                counted.fetch_add(1, Ordering::SeqCst);
+                                if write.write_all(b"222 0 <shared@example.com> body\r\n").await.is_err() { break; }
+                                if write.write_all(&body).await.is_err() { break; }
+                                b".\r\n"
+                            } else if line == "QUIT" { break; }
+                            else { b"500 unsupported\r\n" };
+                            if write.write_all(response).await.is_err() { break; }
+                        }
+                    });
+                }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
+    let harness = TestHarness::new_with_nntp(capacity_test_client(port, 4), 4).await;
+    let id = JobId(80031);
+    let mut spec = standalone_job_spec(
+        "Repeated Article",
+        &(0..4)
+            .map(|n| (format!("copy-{n}.bin"), payload.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.segments[0].message_id = "shared@example.com".to_string();
+    }
+    harness
+        .handle
+        .add_job(id, spec, PathBuf::from("repeat.nzb"), sample_nzb_zstd())
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        let job = harness.handle.get_job(id).unwrap();
+        if matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. })
+            || Instant::now() >= deadline
+        {
+            break job.status;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let output = harness._temp_dir.path().join("complete/Repeated Article");
+    let files: Vec<_> = std::fs::read_dir(&output)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().unwrap().is_file())
+        .map(|entry| std::fs::read(entry.path()).unwrap())
+        .collect();
+    let wire_bytes = harness.handle.get_live_metrics().bytes_downloaded;
+    harness.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    assert_eq!(status, JobStatus::Complete);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        files
+            .iter()
+            .filter(|bytes| bytes.as_slice() == payload)
+            .count(),
+        4
+    );
+    assert_eq!(
+        wire_bytes, expected_wire,
+        "cached placements must not count as new network transfers"
+    );
 }

@@ -153,11 +153,17 @@ impl Pipeline {
         if self.ip_replacement_trial_extra_connections == 0 || self.ip_replacement_burst_active {
             return;
         }
-        let normal_download_capacity =
-            self.normal_download_connection_capacity_limit(configured_download_capacity);
+        // Cache replays cannot measure a provider IP and must not fetch the
+        // same message again through an experimental lane.
+        if self.repeated_articles.contains_key(&hot_job_id) {
+            return;
+        }
+        // A trial is only worth an extra connection when the ordinary budget is
+        // already fully committed — and never while recovery articles are on
+        // the wire, since those are what a repair is waiting on.
         if pressure.suppresses_spillover()
             || configured_download_capacity == 0
-            || self.active_download_connections != normal_download_capacity
+            || self.active_download_connections != configured_download_capacity
             || self.active_recovery > 0
             || !self.job_has_dispatchable_work(hot_job_id)
         {
@@ -200,7 +206,11 @@ impl Pipeline {
                 .await
             {
                 Ok(lane) => {
-                    let candidate_ip = lane.remote_ip();
+                    let Some(candidate_ip) = lane.remote_ip() else {
+                        lane.discard().await;
+                        let _ = trial_tx.send(IpReplacementTrialEvent::AcquireFailed).await;
+                        return;
+                    };
                     if candidate_ip == candidate.old_key.ip {
                         lane.discard().await;
                         let _ = trial_tx.send(IpReplacementTrialEvent::SameIpRejected).await;
@@ -280,7 +290,14 @@ impl Pipeline {
                 self.ip_replacement_burst_active = false;
                 self.metrics.set_ip_replacement_burst_active(false);
             }
-            IpReplacementTrialEvent::CandidateAccepted { old_key, samples } => {
+            IpReplacementTrialEvent::CandidateAccepted {
+                lane_id,
+                old_key,
+                samples,
+            } => {
+                if !self.download_lane_is_live(lane_id) {
+                    return;
+                }
                 if self.ip_replacement_trial_extra_connections == 0
                     || !self.ip_replacement_burst_active
                 {
@@ -312,6 +329,7 @@ impl Pipeline {
             let exclude_servers = lease.compatibility.exclude_servers.clone();
             let job_id = lease.job_id;
             let runtime_generation = lease.runtime_generation;
+            let lane_id = lease.lane_id;
             let mut trial_attempts = Vec::new();
             let mut park_reason = LaneParkReason::NoWork;
             let mut policy_stopped = false;
@@ -333,6 +351,7 @@ impl Pipeline {
                 }
                 let _ = tx
                     .send(DownloadResult {
+                        lane_id,
                         segment_id,
                         runtime_generation,
                         data,
@@ -350,6 +369,7 @@ impl Pipeline {
                     for unrequested in works.by_ref() {
                         let _ = tx
                             .send(DownloadResult {
+                        lane_id,
                                 segment_id: unrequested.segment_id,
                                 runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(
@@ -447,6 +467,7 @@ impl Pipeline {
                     .collect();
                 let _ = trial_tx
                     .send(IpReplacementTrialEvent::CandidateAccepted {
+                        lane_id,
                         old_key: candidate.old_key,
                         samples: accepted_samples,
                     })
@@ -457,6 +478,7 @@ impl Pipeline {
             }
             let _ = parked_tx
                 .send(DownloadLaneParked {
+                    lane_id,
                     job_id,
                     mode,
                     spillover_loan_kind: None,

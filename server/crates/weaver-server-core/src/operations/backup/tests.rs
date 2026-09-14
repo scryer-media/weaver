@@ -29,7 +29,6 @@ fn sample_config() -> Config {
         intermediate_dir: Some("/old/data/intermediate".into()),
         complete_dir: Some("/old/data/complete".into()),
         buffer_pool: None,
-        tuner: None,
         servers: vec![ServerConfig {
             id: 1,
             host: "news.example.com".into(),
@@ -69,6 +68,7 @@ fn sample_config() -> Config {
         }),
         max_download_speed: Some(42),
         isp_bandwidth_cap: None,
+        propagation_delay_secs: None,
         ip_replacement_trial_extra_connections: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -81,6 +81,7 @@ fn sample_config() -> Config {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn backup_temp_directory_is_owner_only() {
     let directory = create_backup_temp_dir().unwrap();
@@ -137,6 +138,7 @@ async fn export_and_import_stable_state_roundtrip() {
             "[[\"k\",\"v\"],[\"__weaver_diagnostic_source_job_id\",\"77\"],[\"__weaver_diagnostic_include_server_hostnames\",\"false\"]]"
                 .into(),
         ),
+        server_attribution: None,
     })
     .unwrap();
     src.insert_job_events(&[JobEvent {
@@ -277,6 +279,7 @@ fn restore_target_is_not_pristine_with_history() {
         created_at: 1,
         completed_at: 1,
         metadata: None,
+        server_attribution: None,
     })
     .unwrap();
     assert!(!db.restore_target_is_pristine().unwrap());

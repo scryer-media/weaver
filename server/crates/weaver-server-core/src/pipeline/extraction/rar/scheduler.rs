@@ -221,6 +221,9 @@ impl Pipeline {
         set_name: &str,
         member_name: &str,
     ) -> bool {
+        if self.rar_chase_owns_set(job_id, set_name) {
+            return false;
+        }
         // The recovery latch (see `par2_recovery_evaluation_pending`). A member
         // that already failed does not go round again until PAR2 has decided
         // whether its bytes can be repaired — otherwise the failure and the
@@ -454,6 +457,15 @@ impl Pipeline {
     }
 
     pub(crate) async fn try_rar_extraction(&mut self, job_id: JobId) {
+        let sets: Vec<_> = self
+            .rar_sets
+            .keys()
+            .filter(|(job, _)| *job == job_id)
+            .map(|(_, set)| set.clone())
+            .collect();
+        for set in sets {
+            self.try_arm_rar_chase(job_id, &set);
+        }
         self.try_batch_extraction(job_id).await;
     }
 
@@ -535,6 +547,7 @@ impl Pipeline {
             .iter()
             .filter(|((jid, _), _)| *jid == job_id)
             .filter(|((_, set_name), _)| !generic_full_set_inflight.contains(set_name))
+            .filter(|((_, set_name), _)| !self.rar_chase_owns_set(job_id, set_name))
             .filter(|((_, set_name), _)| {
                 !self.pending_rar_capacity_retries.contains(&(
                     job_id,

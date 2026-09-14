@@ -66,6 +66,8 @@ export interface JobData {
   originalTitle: string;
   parsedRelease: ParsedReleaseData;
   status: string;
+  downloadWaitReason?: string | null;
+  downloadRetryAtEpochMs?: number | null;
   progress: number;
   progressPercent?: number | null;
   totalBytes: number;
@@ -135,7 +137,10 @@ export function normalizeGraphqlTimestamp(value?: string | number | null): numbe
 export function normalizeJobData<T extends GraphqlJobData>(job: T): T & JobData {
   return {
     ...job,
-    status: normalizeFacadeJobStatus(job.status),
+    status: job.downloadWaitReason === "propagation_delay"
+      && (job.status === "QUEUED" || job.status === "DOWNLOADING")
+      ? "PROPAGATING"
+      : normalizeFacadeJobStatus(job.status),
     progress: normalizeFacadeJobProgress(job.progressPercent, job.progress),
     phaseProgress: job.phaseProgress ?? [],
     createdAt: normalizeGraphqlTimestamp(job.createdAt),

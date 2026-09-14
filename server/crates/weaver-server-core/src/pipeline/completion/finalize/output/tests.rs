@@ -526,10 +526,12 @@ fn prepublication_scan_refuses_symlinked_directories() {
 
 #[test]
 fn prepublication_scan_counts_sparse_files_without_reading_them() {
+    use crate::pipeline::direct_store::sparse::{SparseMarker, SparseMarking};
     let temp = tempfile::tempdir().unwrap();
     let working = temp.path().join("working");
     std::fs::create_dir_all(&working).unwrap();
     let payload = std::fs::File::create(working.join("payload.mkv")).unwrap();
+    SparseMarking::Platform.mark_sparse(&payload).unwrap();
     payload.set_len(200 * 1024 * 1024 * 1024).unwrap();
 
     let validation =

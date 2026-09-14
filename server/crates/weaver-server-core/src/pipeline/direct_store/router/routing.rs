@@ -36,9 +36,10 @@ impl DirectSetRouter {
             spans.extend(self.drain_volume(volume)?);
         }
 
-        // A breach pages rather than demoting. Demotion is what is left when
-        // paging itself fails — a scratch I/O error, or the ceiling.
-        if self.resident_bytes() > self.holds_budget
+        // A breach — of this set's budget, or of the process-wide limit every
+        // set shares — pages rather than demoting. Demotion is what is left
+        // when paging itself fails — a scratch I/O error, or a ceiling.
+        if self.holds_over_budget()
             && let Err(reason) = self.page_holds_to_scratch()
         {
             return Err(self.fail(reason));
@@ -99,6 +100,134 @@ impl DirectSetRouter {
         chunks: &[RepairedChunk],
         lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
         whole_volume: bool,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        if self.repair_batch_in_progress() {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        self.route_repaired_batch(volume_index, chunks, lead_in, whole_volume, true)
+    }
+
+    /// Fence checks and checkpoints across an ordered set of volume rewrites.
+    /// The caller owns the bounded volume list and must place every returned
+    /// span before finishing the transaction. Failure cannot roll back bytes.
+    pub(crate) fn begin_repair_transaction(
+        &mut self,
+        volumes: Vec<u32>,
+    ) -> Result<(), DemotionReason> {
+        if let Some(reason) = self.demoted {
+            return Err(reason);
+        }
+        if self.repair_batch_in_progress()
+            || volumes.is_empty()
+            || volumes.len() > self.plan.volumes.len()
+            || volumes.windows(2).any(|pair| pair[0] >= pair[1])
+            || volumes
+                .iter()
+                .any(|volume| !self.plan.volumes.contains_key(volume))
+        {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        self.repair_transaction = Some(volumes.into());
+        self.repair_draining = true;
+        Ok(())
+    }
+
+    /// Reopen integrity gates only after every planned replacement was placed.
+    /// On failure, retain the fence until this router is retired.
+    pub(crate) fn finish_repair_transaction(&mut self) -> Result<(), DemotionReason> {
+        if let Some(reason) = self.demoted {
+            return Err(reason);
+        }
+        if self.repair_batch.is_some()
+            || !self
+                .repair_transaction
+                .as_ref()
+                .is_some_and(|volumes| volumes.is_empty())
+        {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        if let Some((volume, staging)) = self
+            .staging
+            .iter()
+            .find(|(_, staging)| !staging.repaired.is_empty())
+        {
+            tracing::debug!(volume, ranges = ?staging.repaired.ranges(), "repair transaction retained unroutable replacement bytes");
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        if self.has_stale_gaps() {
+            return Err(self.fail(DemotionReason::RepairGapUnreadable));
+        }
+        self.repair_draining = false;
+        if let Err(reason) = self.settle_repair_gates() {
+            self.repair_draining = true;
+            return Err(self.fail(reason));
+        }
+        self.repair_transaction = None;
+        Ok(())
+    }
+
+    /// Routes a batch of replacement bytes while deferring integrity checks
+    /// until `finish`. Every batch belongs to the same volume and the last
+    /// batch must carry bytes; an empty call cannot close a partial replacement.
+    ///
+    /// `whole_volume` is permitted only on the final batch. As with
+    /// [`Self::route_repaired`], the caller must establish that the combined
+    /// batches carry the complete verified image before asserting it. Held
+    /// bytes use the existing scratch budget between batches. Returned spans
+    /// must be placed before the caller submits the next batch.
+    ///
+    /// Cancellation or a placement error requires demoting/discarding this
+    /// router: a partially applied replacement cannot be rolled back here.
+    pub(crate) fn route_repaired_batch(
+        &mut self,
+        volume_index: u32,
+        chunks: &[RepairedChunk],
+        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        whole_volume: bool,
+        finish: bool,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        if let Some(reason) = self.demoted {
+            return Err(reason);
+        }
+        if self
+            .repair_batch
+            .is_some_and(|volume| volume != volume_index)
+            || self.repair_transaction.as_ref().is_some_and(|volumes| {
+                volumes.front() != Some(&volume_index)
+                    || chunks.iter().all(|(_, bytes)| bytes.is_empty())
+            })
+            || (whole_volume && !finish)
+            || (self.repair_batch.is_some() && chunks.iter().all(|(_, bytes)| bytes.is_empty()))
+        {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        self.repair_batch = Some(volume_index);
+        self.repair_draining = true;
+        let result =
+            self.route_repaired_batch_inner(volume_index, chunks, lead_in, whole_volume, finish);
+        // A failed closing drain may already have changed compositions. Keep
+        // checkpoints and finalization fenced until the failed router retires.
+        if finish && result.is_ok() {
+            self.repair_batch = None;
+            if let Some(volumes) = &mut self.repair_transaction {
+                volumes.pop_front();
+            }
+            self.repair_draining = self.repair_transaction.is_some();
+        }
+        result.map_err(|reason| self.fail(reason))
+    }
+
+    pub(crate) fn repair_batch_in_progress(&self) -> bool {
+        self.repair_batch.is_some() || self.repair_transaction.is_some()
+    }
+
+    fn route_repaired_batch_inner(
+        &mut self,
+        volume_index: u32,
+        chunks: &[RepairedChunk],
+        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        whole_volume: bool,
+        finish: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         if let Some(reason) = self.demoted {
             return Err(reason);
@@ -170,10 +299,31 @@ impl DirectSetRouter {
         let volumes: Vec<u32> = std::iter::once(volume_index)
             .chain(self.staging.keys().copied())
             .collect();
+        //
+        // The gates stay quiet for the whole of it. A rewrite lands in the
+        // compositions piece by piece — an encrypted slice as its edge blocks
+        // and aligned middle, a volume with several damaged slices as one run
+        // per slice — and a part whose articles were all on record tiles again
+        // after the *first* piece: that piece with its repaired value, the rest
+        // still with the wire-damaged ones. A gate that fires there composes a
+        // mixture no bytes ever had, and with `repair_rerouted` set its mismatch
+        // demotes a set whose bytes on disk are correct. The gates run once,
+        // below, over the finished rewrite.
+        self.repair_draining = true;
         let mut spans = self.take_migrated_spans();
+        let mut drained = Ok(());
         for volume in volumes {
-            spans.extend(self.drain_volume(volume)?);
+            match self.drain_volume(volume) {
+                Ok(routed) => spans.extend(routed),
+                Err(reason) => {
+                    drained = Err(reason);
+                    break;
+                }
+            }
         }
+        let settle = finish && self.repair_transaction.is_none();
+        self.repair_draining = !settle;
+        drained?;
 
         // Every repaired byte must have found a destination. Unlike an ordinary
         // article — whose bytes may legitimately be held above the
@@ -183,15 +333,23 @@ impl DirectSetRouter {
         // cannot place bytes it previously placed. That is a demotion, not a
         // hold: leaving it staged would sit on a repaired byte the member is
         // waiting for, forever.
-        if self
-            .staging
-            .get(&volume_index)
-            .is_some_and(|staging| !staging.repaired.is_empty())
+        if settle
+            && self
+                .staging
+                .get(&volume_index)
+                .is_some_and(|staging| !staging.repaired.is_empty())
         {
             return Err(self.fail(DemotionReason::RepairRerouteFailed));
         }
 
-        if self.resident_bytes() > self.holds_budget
+        // The deferred gates, over the rewrite as a whole. A part the rewrite
+        // half-covered still has stale gaps here and composes nothing; its
+        // gate runs when the re-read closes them.
+        if settle {
+            self.settle_repair_gates()?;
+        }
+
+        if self.holds_over_budget()
             && let Err(reason) = self.page_holds_to_scratch()
         {
             return Err(self.fail(reason));
@@ -324,7 +482,11 @@ impl DirectSetRouter {
         let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
             return Ok(false);
         };
-        let facts = match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
+        let facts = match unrar_rs::RarArchive::parse_volume_facts_with_shared_kdf_cache(
+            image,
+            self.header_password(),
+            std::sync::Arc::clone(&self.kdf_cache),
+        ) {
             Ok(facts) => facts,
             // A restored `-hp` set. The archive key is never
             // persisted, so this run has to prove one of the job's candidates
@@ -338,7 +500,11 @@ impl DirectSetRouter {
                 let Some(image) = self.volume_image(volume_index, VolumeImage::Envelope) else {
                     return Ok(false);
                 };
-                match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
+                match unrar_rs::RarArchive::parse_volume_facts_with_shared_kdf_cache(
+                    image,
+                    self.header_password(),
+                    std::sync::Arc::clone(&self.kdf_cache),
+                ) {
                     Ok(facts) => facts,
                     Err(_) => return Ok(false),
                 }
@@ -489,9 +655,34 @@ impl DirectSetRouter {
         {
             return Ok(());
         }
+        // The previous walk said which offset it ran out at. Until the image
+        // reaches that offset this walk would stop in the same place, having
+        // read the same headers and — on a `-hp` volume — derived the same
+        // archive key again. See [`VolumeStaging::parse_short_at`].
+        //
+        // Never on the volume's **last** article, whatever the gate says: a
+        // complete source image is one of the two proofs that confirm a volume
+        // (`reached_end` below), so the walk over it has to run even when it
+        // will stop exactly where the previous one did. Holding it back would
+        // leave the volume unconfirmed with no further article to reopen it,
+        // and its trailing region held for the life of the set.
+        if let Some(short_at) = staging.parse_short_at
+            && !staging.source_complete
+            && !staging.parse_can_reach(short_at)
+        {
+            return Ok(());
+        }
         let image = SparseImage::from_staged(&staging.chunks, self.scratch.handle());
-        let facts = match unrar_rs::RarArchive::parse_volume_facts(image, self.header_password()) {
-            Ok(facts) => facts,
+        #[cfg(test)]
+        {
+            self.parse_walks = self.parse_walks.saturating_add(1);
+        }
+        let walk = match unrar_rs::RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+            image,
+            self.header_password(),
+            std::sync::Arc::clone(&self.kdf_cache),
+        ) {
+            Ok(walk) => walk,
             // The one parse failure that is a *fact* rather than a shortage of
             // bytes: the volume's headers are encrypted, so the
             // layout is withheld until a key exists. Every other failure is a
@@ -516,6 +707,12 @@ impl DirectSetRouter {
             }
             Err(_) => return self.judge_unparsed_prefix(volume_index),
         };
+        let facts = walk.facts;
+        // Recorded from the walk that just ran, over the image it just read:
+        // the gate above is only ever as old as the last answer.
+        if let Some(staging) = self.staging.get_mut(&volume_index) {
+            staging.parse_short_at = walk.short_at;
+        }
         if facts.members.is_empty() {
             return self.judge_unparsed_prefix(volume_index);
         }
@@ -1015,13 +1212,17 @@ impl DirectSetRouter {
         if unrar_rs::signature::read_signature(&mut image).ok()? != ArchiveFormat::Rar5 {
             return None;
         }
-        let parsed = unrar_rs::header::parse_all_headers_with_options(
+        let parsed = unrar_rs::header::parse_all_headers_with_kdf_cache_and_options(
             &mut image,
             // The archive-header password for a `-hp` set, `None` for every
             // other. Without it this walk cannot read a `-hp` volume's headers
             // at all, so a `-hp -qo` set would refuse every parse as
             // `QuickOpenMismatch` — fail-closed, but for the wrong reason.
             self.header_password(),
+            // The set's cache, so this second walk of the same volume — one
+            // per cross-checked parse — costs a lookup rather than the whole
+            // key derivation the first walk already paid for.
+            &self.kdf_cache,
             unrar_rs::header::HeaderParseOptions {
                 allow_quick_open: false,
             },
@@ -1945,7 +2146,8 @@ impl DirectSetRouter {
         let Some(part) = self.part_for(layout_index, volume_index) else {
             return Ok(());
         };
-        let (part_position, part_logical_offset, part_len, packed_crc32) = part;
+        let (part_position, part_logical_offset, _, _) = part;
+        let defer_gates = self.repair_draining;
         let Some(member) = self.member_mut(member_id) else {
             return Ok(());
         };
@@ -1988,34 +2190,13 @@ impl DirectSetRouter {
                 .insert(part_relative, len, crc);
         }
 
-        // Layer 1: the part's packed CRC32, as soon as the part is complete.
-        //
-        // Guarded by the coverage map rather than attempted every time: the
-        // composition now walks the runs it was fed instead of reading one
-        // merged value, so asking before the part is whole would be a scan per
-        // span for an answer that cannot exist yet.
-        let part_complete = member
-            .covered
-            .missing(part_logical_offset, part_len)
-            .is_empty();
-        let part_value = part_complete
-            .then(|| {
-                member
-                    .parts
-                    .get(&part_position)
-                    .and_then(|runs| runs.compose(0, part_len))
-            })
-            .flatten();
-        if let Some(value) = part_value {
-            member.checked_parts.insert(part_position, value);
-            if let Some(expected) = packed_crc32
-                && expected != value
-                && !self.record_part_checksum_damage(volume_index, member_id, part_position)
-            {
-                return Err(self.fail(DemotionReason::PartChecksumMismatch));
-            }
+        // A repair's pieces are recorded here and judged together afterwards;
+        // see `repair_draining`.
+        if defer_gates {
+            return Ok(());
         }
-
+        // Layer 1: the part's packed CRC32, as soon as the part is complete.
+        self.gate_part(member_id, volume_index)?;
         self.try_verify_member(member_id)
     }
 }

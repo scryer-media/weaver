@@ -70,9 +70,7 @@ pub struct ServerTransferSnapshot {
 /// Kept as a deadline (`started + limit + excluded wait`) rather than as an
 /// elapsed-time subtraction, so a check is one clock read and a compare, and
 /// the read loop can share that clock read between the budget check and the
-/// read timeout it derives next. SABnzbd keeps the same shape: a deadline per
-/// response, moved when the response makes progress, not re-read per socket
-/// read.
+/// read timeout it derives next.
 #[derive(Debug)]
 pub(crate) struct ActiveTransferBudget {
     limit: Duration,
@@ -335,6 +333,8 @@ impl ServerTransferRegistry {
 /// Shared transfer state for one durable server.
 pub struct ServerTransferControl {
     id: StableServerId,
+    pub(crate) socket_budget: Arc<crate::socket_budget::SocketBudget>,
+    pub(crate) recovery: Arc<crate::recovery::RecoveryGate>,
     state: Mutex<TransferState>,
     blocking_changed: Condvar,
     capacity_changed: watch::Sender<u64>,
@@ -416,6 +416,8 @@ impl ServerTransferControl {
         let (capacity_changed, _) = watch::channel(1);
         Self {
             id,
+            socket_budget: crate::socket_budget::SocketBudget::new(0),
+            recovery: Arc::default(),
             state: Mutex::new(TransferState {
                 initialized: false,
                 config: ServerTransferConfig::default(),
@@ -515,6 +517,30 @@ impl ServerTransferControl {
             .fetch_add(1, Ordering::Relaxed);
         let state = self.state.lock().expect("server transfer state poisoned");
         self.quota_rejection_locked(&state, requested_body_bytes)
+    }
+
+    /// Check BODY admission for a dispatch that is choosing its server.
+    ///
+    /// An owned lane picks its server before it reserves, so a request that
+    /// does not fit is skipped here and never reaches `try_reserve`. That skip
+    /// is the moment this server turns the work away, and it latches
+    /// `quota_blocked` exactly as a refused reservation does; a request that
+    /// fits clears the latch the way an admitted reservation does.
+    pub fn quota_rejection_for_dispatch(
+        &self,
+        requested_body_bytes: u64,
+    ) -> Option<QuotaRejection> {
+        if self.quota_epoch.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        #[cfg(test)]
+        self.path_counters
+            .quota_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        let mut state = self.state.lock().expect("server transfer state poisoned");
+        let rejection = self.quota_rejection_locked(&state, requested_body_bytes);
+        state.quota_saturated = rejection.is_some();
+        rejection
     }
 
     pub(crate) fn start_body(
@@ -1218,6 +1244,31 @@ mod tests {
         assert!(control.try_reserve(800).is_err());
         assert!(control.snapshot().quota_blocked);
         registry.configure(StableServerId(11), quota(1_000, 2));
+        assert!(!control.snapshot().quota_blocked);
+    }
+
+    #[test]
+    fn a_dispatch_skipped_for_headroom_latches_blocked_like_a_refused_reservation() {
+        let registry = ServerTransferRegistry::new();
+        let control = registry.configure(StableServerId(12), quota(1_000, 1));
+        let mut permit = control.try_reserve(800).unwrap();
+        permit.record_blocking(650);
+        drop(permit);
+
+        // The read-only check answers without touching the signal.
+        assert!(control.quota_rejection_for(800).is_some());
+        assert!(!control.snapshot().quota_blocked);
+
+        // A dispatch that skips the server for headroom is the server turning
+        // work away, and the operator-facing signal must say so.
+        let rejection = control
+            .quota_rejection_for_dispatch(800)
+            .expect("800 cannot fit beside 650 used");
+        assert!(!rejection.snapshot.quota_blocked);
+        assert!(control.snapshot().quota_blocked);
+
+        // A dispatch the server can take clears the latch without a reset.
+        assert!(control.quota_rejection_for_dispatch(200).is_none());
         assert!(!control.snapshot().quota_blocked);
     }
 

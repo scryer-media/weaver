@@ -844,6 +844,81 @@ async fn par2_metadata_bootstrap_does_not_hold_payload_for_late_indexless_discov
     );
 }
 
+/// Recovery rides the same owned lanes as ordinary work.
+///
+/// Recovery used to be pushed onto the async pool and pinned to sequential
+/// mode: the work a job is *waiting on* to finish paid a cold dial and gave
+/// back the round trip pipelining exists to hide. A recovery lease is now an
+/// ordinary lease as far as lane selection and depth are concerned.
+#[tokio::test]
+async fn a_recovery_lease_takes_an_owned_lane_at_the_ordinary_depth() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40143);
+    // A plaintext server: an owned lane is no longer a TLS-only arrangement.
+    pipeline.nntp = std::sync::Arc::new(NntpClient::new(NntpClientConfig {
+        servers: vec![weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "plain.example.invalid".to_string(),
+                port: 119,
+                tls: false,
+                ..Default::default()
+            },
+            max_connections: 2,
+            ..Default::default()
+        }],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(1),
+    }));
+    let work = DownloadWork {
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 1,
+            },
+            segment_number: 1,
+        },
+        message_id: MessageId::new("recovery-lane@example.invalid"),
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+        priority: 0,
+        byte_estimate: 1024,
+        retry_count: 0,
+        is_recovery: true,
+        completion_critical: true,
+        exclude_servers: Vec::new(),
+        avoid_server: None,
+    };
+    let compatibility = DownloadBatchCompatibility::from_work(&work);
+    let lease = DownloadBatchLease {
+        lane_id: 0,
+        job_id,
+        runtime_generation: pipeline.pool_generation,
+        lane_mode: DownloadLaneMode::Sequential,
+        spillover_loan_kind: None,
+        server_modes: Vec::new(),
+        compatibility,
+        effective_exclude_servers: Vec::new(),
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        pressure_clear: true,
+        works: vec![work],
+    };
+
+    assert!(
+        pipeline.should_use_owned_blocking_lane(&lease),
+        "a recovery lease must be eligible for a cached owned lane"
+    );
+
+    let pressure = pipeline.refresh_download_pressure();
+    let ordinary = pipeline.choose_download_lane_mode(job_id, false, pressure);
+    let pressure = pipeline.refresh_download_pressure();
+    let recovery = pipeline.choose_download_lane_mode(job_id, true, pressure);
+    assert_eq!(
+        recovery, ordinary,
+        "recovery must not be pinned to a shallower lane than ordinary work"
+    );
+}
+
 #[tokio::test]
 async fn recovery_async_handoff_keeps_owned_lane_caches() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -868,6 +943,7 @@ async fn recovery_async_handoff_keeps_owned_lane_caches() {
     };
     let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
+        lane_id: 0,
         job_id: work.segment_id.file_id.job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
@@ -1112,6 +1188,7 @@ async fn shutdown_drain_consumes_inflight_download_results() {
     pipeline
         .download_done_tx
         .send(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1166,6 +1243,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1214,13 +1292,14 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         .download_queue
         .pop()
         .expect("transport retry should remain in the batched infrastructure queue");
-    assert_eq!(retry.retry_count, 1);
+    assert_eq!(retry.retry_count, 0);
 
     pipeline.active_downloads = 1;
     pipeline.active_download_passes.insert(job_id);
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: retry.segment_id,
             data: Err(DownloadError::fetch(
@@ -1237,25 +1316,34 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         })
         .await;
 
-    assert!(matches!(
+    assert_eq!(
         job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Failed { .. })
-    ));
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(pipeline.jobs[&job_id].failed_bytes, 0);
     assert_eq!(
         pipeline
             .metrics
             .segments_failed_permanent
             .load(Ordering::Relaxed),
-        1
+        0
     );
-    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
     assert_eq!(
         pipeline
             .metrics
             .parked_infrastructure_work
             .load(Ordering::Relaxed),
-        0
+        1
     );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
 }
 
 /// A transport-failure retry must point away from the server that just
@@ -1285,6 +1373,7 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1320,7 +1409,7 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
         retry.exclude_servers.is_empty(),
         "rotation must not enter the article-not-found exhaustion ledger"
     );
-    assert_eq!(retry.retry_count, 1);
+    assert_eq!(retry.retry_count, 0);
 }
 
 /// With a single configured server there is nowhere to rotate to: the retry
@@ -1346,6 +1435,7 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1431,6 +1521,7 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1469,6 +1560,16 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
 
 #[test]
 fn lane_acquire_failure_preserves_retry_semantics() {
+    for error in [
+        weaver_nntp::NntpError::SoftTimeout(15),
+        weaver_nntp::NntpError::TruncatedMultilineBody,
+        weaver_nntp::NntpError::MalformedMultilineTerminator,
+    ] {
+        let failure = DownloadFailure::from_nntp(error);
+        assert_eq!(failure.kind, DownloadFailureKind::EstablishedTransport);
+        assert!(failure.kind.preserves_article_retry_budget());
+        assert!(failure.kind.infrastructure_wait_reason().is_some());
+    }
     let unavailable = DownloadFailure::from_lane_acquire_failure(None);
     assert_eq!(unavailable.kind, DownloadFailureKind::LaneUnavailable);
 
@@ -1498,11 +1599,82 @@ fn lane_acquire_failure_preserves_retry_semantics() {
     assert_eq!(setup_failure.kind, DownloadFailureKind::ContentOrProtocol);
 }
 
+#[tokio::test]
+async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20024);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Group discovery", "group.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            runtime_generation: 0,
+            lane_id: 0,
+            segment_id,
+            data: Err(DownloadError::from_nntp(
+                weaver_nntp::NntpError::NoGroupSelected,
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.failed_bytes, 0);
+    assert_eq!(state.status, JobStatus::Downloading);
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(retry.segment_id, segment_id);
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
+    assert!(retry.exclude_servers.is_empty());
+    assert_eq!(
+        retry.avoid_server, None,
+        "the same provider can select the learned group"
+    );
+
+    let setup =
+        DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::NoGroupSelected));
+    assert!(setup.kind.preserves_article_retry_budget());
+}
+
 #[test]
-fn only_pre_body_infrastructure_failures_preserve_article_retry_budget() {
+fn infrastructure_failures_preserve_article_retry_budget() {
     for kind in [
         DownloadFailureKind::CapacityUnavailable,
         DownloadFailureKind::ConnectionEstablishment,
+        DownloadFailureKind::EstablishedTransport,
         DownloadFailureKind::Auth,
         DownloadFailureKind::ServerQuota,
         DownloadFailureKind::LaneUnavailable,
@@ -1511,7 +1683,6 @@ fn only_pre_body_infrastructure_failures_preserve_article_retry_budget() {
         assert!(kind.preserves_article_retry_budget(), "kind={kind:?}");
     }
     for kind in [
-        DownloadFailureKind::EstablishedTransport,
         DownloadFailureKind::ArticleNotFound,
         DownloadFailureKind::ContentOrProtocol,
     ] {
@@ -1551,6 +1722,7 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1652,6 +1824,7 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1836,6 +2009,7 @@ async fn stale_generation_transport_failure_is_requeued_without_poisoning_health
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 1,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1884,6 +2058,7 @@ async fn stale_generation_success_does_not_update_new_lane_health() {
     pipeline.active_download_connections = 1;
 
     pipeline.release_download_result(&DownloadResult {
+        lane_id: 0,
         runtime_generation: 1,
         segment_id: SegmentId {
             file_id: NzbFileId {
@@ -2305,6 +2480,7 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -2443,6 +2619,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: large_segment,
             data: Err(DownloadError::Fetch(first_failure)),
@@ -2457,6 +2634,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
         .await;
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: tail_segment,
             data: Err(DownloadError::Fetch(tail_failure)),
@@ -2562,6 +2740,7 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -2661,6 +2840,7 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -2802,6 +2982,7 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -2948,6 +3129,7 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -3072,6 +3254,7 @@ async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
     // failed bytes instead of retrying forever.
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3139,6 +3322,7 @@ async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
     // missing article, not requeued without budget forever.
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3199,6 +3383,7 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3212,6 +3397,7 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
                 "article not found on source server",
             )),
             attempts: vec![weaver_nntp::client::FetchAttemptTrace {
+                connection_health: None,
                 server_idx: 0,
                 remote_ip: None,
                 elapsed: Duration::from_millis(5),
@@ -3237,11 +3423,10 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
     );
     assert!(pipeline.pending_completion_checks.is_empty());
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let work = pipeline
-        .retry_rx
-        .try_recv()
+    let work = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+        .await
         .expect("source miss should requeue against another server")
+        .expect("retry channel must stay open")
         .work;
     assert_eq!(work.exclude_servers, vec![0]);
     assert_eq!(work.retry_count, 0);
@@ -3267,6 +3452,7 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
 
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3326,6 +3512,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3368,6 +3555,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {

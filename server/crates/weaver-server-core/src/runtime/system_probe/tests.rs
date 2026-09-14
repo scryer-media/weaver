@@ -38,6 +38,7 @@ fn startup_and_extraction_memory_consumers_share_cached_process_facts() {
     assert_eq!(cgroup_probes.load(Ordering::Relaxed), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn nested_cgroup_v2_memory_limits_include_systemd_ancestors() {
     let limit = cgroup_memory_limit_from(
@@ -56,6 +57,7 @@ fn nested_cgroup_v2_memory_limits_include_systemd_ancestors() {
     assert_eq!(limit, Some(2_u64 << 30));
 }
 
+#[cfg(unix)]
 #[test]
 fn cgroup_v1_memory_limit_ignores_unlimited_ancestors() {
     let limit = cgroup_memory_limit_from(
@@ -78,6 +80,7 @@ fn cgroup_v1_memory_limit_ignores_unlimited_ancestors() {
     assert_eq!(limit, Some(1_u64 << 30));
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn parse_filesystem_types() {
     assert_eq!(parse_filesystem_type("APFS"), FilesystemType::Apfs);
@@ -119,4 +122,41 @@ fn detect_returns_valid_profile() {
 fn startup_profile_defers_random_read_measurement() {
     let profile = detect_startup_profile(Path::new("/tmp"));
     assert_eq!(profile.disk.random_read_iops, 0.0);
+}
+
+#[test]
+fn storage_seek_penalty_requires_device_evidence() {
+    assert_eq!(
+        storage_class_from_seek_penalty(Some(true)),
+        StorageClass::Hdd
+    );
+    assert_eq!(
+        storage_class_from_seek_penalty(Some(false)),
+        StorageClass::Ssd
+    );
+    assert_eq!(storage_class_from_seek_penalty(None), StorageClass::Unknown);
+}
+
+/// Memory and filesystem queries must answer on the runner. A device may
+/// decline the optional seek-penalty query, so its class can remain Unknown.
+#[cfg(windows)]
+#[test]
+fn windows_probes_read_real_memory_and_disk() {
+    let (total, available) = windows_memory_bytes().expect("GlobalMemoryStatusEx answers");
+    assert!(total > 0, "total memory must be reported");
+    assert!(
+        available > 0 && available <= total,
+        "{available} of {total}"
+    );
+    assert_eq!(detect_total_memory_bytes(), Some(total));
+
+    let dir = std::env::temp_dir();
+    let (storage_class, filesystem) = windows_disk_info(&dir);
+    assert!(
+        !matches!(&filesystem, FilesystemType::Unknown(name) if name.is_empty()),
+        "temp dir filesystem must be named, got {filesystem:?}"
+    );
+    let (class_again, fs_again) = detect_disk_info(&dir);
+    assert_eq!(class_again, storage_class);
+    assert_eq!(fs_again, filesystem);
 }

@@ -24,6 +24,7 @@ export type PriorityToken = "high" | "normal" | "low";
 
 const STATUS_TO_TOKEN: Record<string, StatusToken> = {
   QUEUED: "queued",
+  PROPAGATING: "queued",
   QUEUED_REPAIR: "queued",
   QUEUED_EXTRACT: "queued",
   DOWNLOADING: "downloading",
@@ -47,6 +48,7 @@ const STATUS_TO_TOKEN: Record<string, StatusToken> = {
 /** i18n keys for status labels (see `lib/i18n/locales`). */
 const STATUS_TO_I18N_KEY: Record<string, string> = {
   QUEUED: "status.queued",
+  PROPAGATING: "status.propagating",
   QUEUED_REPAIR: "status.queued",
   QUEUED_EXTRACT: "status.queued",
   DOWNLOADING: "status.downloading",
@@ -184,7 +186,7 @@ export function progressDisplayKind(
 ): ProgressKind {
   const value = normalizeStatus(status);
   if (value === "COMPLETE" || value === "COMPLETED") return "complete";
-  if (value === "QUEUED") return "empty";
+  if (value === "QUEUED" || value === "PROPAGATING") return "empty";
   if (INDETERMINATE_STATUSES.has(value) && progressFraction <= 0) return "indeterminate";
   return "determinate";
 }

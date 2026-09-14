@@ -2665,10 +2665,11 @@ async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
 
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id,
         server_idx: 0,
-        remote_ip: "127.0.0.1".parse().unwrap(),
+        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,

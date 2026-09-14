@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextFr } from "@/next/i18n/fr";
 
 const fr: LocaleDictionary = {
   // Brand
@@ -9,6 +10,8 @@ const fr: LocaleDictionary = {
   "nav.upload": "Téléverser",
   "nav.settings": "Paramètres",
   "nav.sponsor": "Sponsoriser",
+  "update.newVersion": "Nouvelle version v{{version}}",
+  "update.newVersionAria": "Ouvrir Weaver v{{version}} sur GitHub dans un nouvel onglet",
 
   // Status labels
   "status.queued": "En attente",
@@ -209,7 +212,7 @@ const fr: LocaleDictionary = {
   "settings.generalPageDesc": "Réglez la vitesse de téléchargement, les chemins de stockage, le nettoyage automatique et la politique de réessai depuis un seul endroit.",
   "settings.language": "Langue",
   "settings.languageDesc": "Choisissez la langue d'affichage de l'interface Weaver.",
-  "settings.bandwidthCap": "Quota de bande passante FAI",
+  "settings.bandwidthCap": "Bande passante",
   "settings.bandwidthCapDesc": "Bloquer la distribution de nouveaux téléchargements une fois le quota FAI actuel épuisé. Les tâches en file conservent leur position et le post-traitement en cours peut continuer.",
   "settings.bandwidthCapEnabled": "Activer le quota FAI",
   "settings.bandwidthCapEnabledDesc": "Suivre la consommation en continu et bloquer uniquement les nouveaux téléchargements d'articles lorsque la fenêtre active est épuisée.",
@@ -628,7 +631,14 @@ const fr: LocaleDictionary = {
   "upload.duplicateScore": "Score de doublon",
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "Les scores les plus élevés gagnent pour la même clé ; en cas d'égalité, le candidat existant est conservé.",
+
+  // System info
+  "systemInfo.downloadDiagnostics": "Télécharger le paquet de diagnostic",
+  "systemInfo.diagnosticsBusy": "Collecte des diagnostics…",
+  "systemInfo.diagnosticsHint": "La collecte prend environ 15 secondes : les métriques sont échantillonnées deux fois, à dix secondes d'intervalle. Les mots de passe, clés d'API et autres secrets sont supprimés.",
+  "systemInfo.diagnosticsFailed": "Le paquet de diagnostic n'a pas pu être créé.",
   ...duplicateLocaleEntries.fra,
+  ...nextFr,
 };
 
 export default fr;

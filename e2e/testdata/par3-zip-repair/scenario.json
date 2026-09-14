@@ -1,0 +1,17 @@
+{
+  "slug": "par3-zip-repair",
+  "title": "E2E.Test.PAR3.ZIP.Repair.Umber.Lagoon.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A stored ZIP with an external PAR3 set and two blocks of member data zeroed.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "umber.lagoon.s01e02.mkv": "62d801f11268e940cd5512ee3257212f77f9fb4a9d2260a53d2a866aea0913ca"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

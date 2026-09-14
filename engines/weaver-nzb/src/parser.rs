@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Cursor};
 
 use quick_xml::events::Event;
@@ -19,6 +19,7 @@ struct ParserLimits {
     max_files: usize,
     max_segments: usize,
     max_declared_bytes: u64,
+    max_message_id_uses: usize,
 }
 
 const DEFAULT_LIMITS: ParserLimits = ParserLimits {
@@ -26,7 +27,36 @@ const DEFAULT_LIMITS: ParserLimits = ParserLimits {
     max_files: MAX_NZB_FILES,
     max_segments: MAX_NZB_SEGMENTS,
     max_declared_bytes: MAX_DECLARED_BYTES,
+    max_message_id_uses: MAX_NZB_SEGMENTS,
 };
+
+impl ParserLimits {
+    /// Read once per submission, before any job or network work is created.
+    fn from_env() -> Result<Self, NzbError> {
+        fn limit<T: std::str::FromStr>(name: &str, default: T) -> Result<T, NzbError> {
+            match std::env::var(name) {
+                Ok(value) => value
+                    .parse()
+                    .map_err(|_| NzbError::ResourceLimit(format!("invalid {name} limit"))),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(_) => Err(NzbError::ResourceLimit(format!("invalid {name} limit"))),
+            }
+        }
+        Ok(Self {
+            max_xml_bytes: limit("WEAVER_NZB_MAX_XML_BYTES", DEFAULT_LIMITS.max_xml_bytes)?,
+            max_files: limit("WEAVER_NZB_MAX_FILES", DEFAULT_LIMITS.max_files)?,
+            max_segments: limit("WEAVER_NZB_MAX_SEGMENTS", DEFAULT_LIMITS.max_segments)?,
+            max_declared_bytes: limit(
+                "WEAVER_NZB_MAX_DECLARED_BYTES",
+                DEFAULT_LIMITS.max_declared_bytes,
+            )?,
+            max_message_id_uses: limit(
+                "WEAVER_NZB_MAX_MESSAGE_ID_USES",
+                DEFAULT_LIMITS.max_message_id_uses,
+            )?,
+        })
+    }
+}
 
 /// Parse an NZB XML document from bytes.
 pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
@@ -40,7 +70,7 @@ fn parse_nzb_with_limits(xml: &[u8], limits: ParserLimits) -> Result<Nzb, NzbErr
 
 /// Parse an NZB XML document incrementally from a buffered reader.
 pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
-    parse_nzb_reader_limited(reader, DEFAULT_LIMITS)
+    parse_nzb_reader_limited(reader, ParserLimits::from_env()?)
 }
 
 fn parse_nzb_reader_limited<R: BufRead>(reader: R, limits: ParserLimits) -> Result<Nzb, NzbError> {
@@ -345,6 +375,22 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
 
     if files.is_empty() {
         return Err(NzbError::EmptyNzb);
+    }
+
+    // Borrow IDs from the completed document: no second copy of every ID and
+    // no bookkeeping on the download path. Placements retain their semantics.
+    if limits.max_message_id_uses < limits.max_segments {
+        let mut uses = HashMap::<&str, usize>::new();
+        for segment in files.iter().flat_map(|file| &file.segments) {
+            let count = uses.entry(&segment.message_id).or_default();
+            if *count >= limits.max_message_id_uses {
+                return Err(NzbError::ResourceLimit(format!(
+                    "message-ID fan-out exceeds {} placements",
+                    limits.max_message_id_uses
+                )));
+            }
+            *count += 1;
+        }
     }
 
     Ok(Nzb {
@@ -857,6 +903,27 @@ mod tests {
             max_files: 100,
             max_segments: 100,
             max_declared_bytes: 1024,
+            max_message_id_uses: 16,
+        }
+    }
+
+    #[test]
+    fn repeated_message_id_placements_obey_the_admission_boundary() {
+        for count in 1..=3 {
+            let file = r#"<file poster="p" subject="small"><segments><segment bytes="1" number="1">shared</segment></segments></file>"#;
+            let xml = format!("<nzb>{}</nzb>", file.repeat(count));
+            let result = parse_nzb_with_limits(
+                xml.as_bytes(),
+                ParserLimits {
+                    max_message_id_uses: 2,
+                    ..test_limits()
+                },
+            );
+            if count <= 2 {
+                assert_eq!(result.unwrap().files.len(), count);
+            } else {
+                assert!(matches!(result, Err(NzbError::ResourceLimit(_))));
+            }
         }
     }
 

@@ -66,6 +66,7 @@ impl Pipeline {
             ip_replacement_trial_extra_connections,
             direct_store_settings,
             direct_unpack_settings,
+            propagation_delay,
         ) = {
             let cfg = config.read().await;
             (
@@ -78,10 +79,14 @@ impl Pipeline {
                 // contract is that turning it off at *startup* sweeps and
                 // redownloads mid-flight direct work, not that it takes effect
                 // mid-job.
-                crate::pipeline::direct_store::DirectStoreSettings::resolve(&cfg),
+                crate::pipeline::direct_store::DirectStoreSettings::resolve_on(
+                    &cfg,
+                    crate::pipeline::direct_store::HostFacts::probe(&intermediate_dir),
+                ),
                 // Same contract, same reason: resolved once so a set admitted
                 // under an enabled gate cannot find it disabled mid-chase.
                 crate::pipeline::direct_unpack::DirectUnpackSettings::resolve(&cfg),
+                Duration::from_secs(u64::from(cfg.propagation_delay_secs())),
             )
         };
         metrics.set_ip_replacement_trial_extra_connections(ip_replacement_trial_extra_connections);
@@ -99,6 +104,9 @@ impl Pipeline {
             // `holds_scratch_ceiling` is otherwise unattributable.
             info!(
                 holds_scratch_ceiling_bytes = direct_store_settings.holds_scratch_ceiling_bytes,
+                holds_resident_limit_bytes = direct_store_settings.holds_resident_limit_bytes,
+                holds_scratch_total_bytes = direct_store_settings.holds_scratch_total_bytes,
+                holds_disk_reserve_bytes = direct_store_settings.holds_disk_reserve_bytes,
                 "RAR direct-store routing enabled"
             );
         }
@@ -107,15 +115,22 @@ impl Pipeline {
         }
 
         tokio::fs::create_dir_all(&data_dir).await?;
-        tokio::fs::create_dir_all(&intermediate_dir).await?;
-        tokio::fs::create_dir_all(&complete_dir).await?;
+        // A download folder on a drive that is gone must not stop Weaver from
+        // starting, or it could never be pointed at another one.
+        for dir in [&intermediate_dir, &complete_dir] {
+            if let Err(error) = tokio::fs::create_dir_all(dir).await {
+                warn!(path = %dir.display(), error = %error, "download folder unavailable");
+            }
+        }
         let uu_spool_root = intermediate_dir.join(".uu-park");
         let cleanup_root = uu_spool_root.clone();
-        tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await??;
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await?
+        {
+            warn!(path = %uu_spool_root.display(), error = %error, "failed to clear the stale UU spool");
+        }
         let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
         let process_memory_budget =
-            Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
-        let direct_unpack_process_memory =
             Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
 
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
@@ -135,7 +150,7 @@ impl Pipeline {
             mpsc::channel(32);
         let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
-        let (par2_analysis_done_tx, par2_analysis_done_rx) = mpsc::channel(32);
+        let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
         let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
         let post_processing_settings = db.post_processing_settings().unwrap_or_else(|error| {
             warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
@@ -205,7 +220,6 @@ impl Pipeline {
             hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
             hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
-            deferred_lane_refills: std::collections::VecDeque::new(),
             download_dispatch_wake: false,
             nntp_handoff_draining: false,
             ip_replacement_trial_extra_connections,
@@ -222,6 +236,7 @@ impl Pipeline {
             active_downloads_by_file: HashMap::new(),
             active_decodes_by_job: HashMap::new(),
             active_decodes_by_file: HashMap::new(),
+            active_decode_bytes: HashMap::new(),
             job_last_download_activity: HashMap::new(),
             pending_retries_by_job: HashMap::new(),
             pending_retries_by_segment: HashMap::new(),
@@ -233,6 +248,11 @@ impl Pipeline {
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
+            uu_spool_capacity: crate::operations::CapacitySampler::new(
+                intermediate_dir.clone(),
+                Pipeline::UU_SPOOL_DISK_SPACE_CHECK_INTERVAL,
+            ),
+            uu_spool_blocked_spill_bytes: None,
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
@@ -240,8 +260,6 @@ impl Pipeline {
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
-            uu_spool_last_free_space_check: None,
-            uu_spool_available_bytes: None,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
             pending_file_progress: HashMap::new(),
@@ -306,6 +324,7 @@ impl Pipeline {
             last_direct_verdict: None,
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
+            blocked_restores: HashMap::new(),
             download_done_tx,
             download_done_rx,
             download_refill_tx,
@@ -360,9 +379,18 @@ impl Pipeline {
             snapshot_published_at: None,
             snapshot_publish_pending: false,
             download_restart_durable_lead_retry_after: HashMap::new(),
+            checkpoint_progress_articles: HashMap::new(),
+            download_lane_owners: HashMap::new(),
             propagation_ready_at: HashMap::new(),
+            published_propagation_holds: HashMap::new(),
+            propagation_delay,
+            #[cfg(test)]
             propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
+            last_owned_lane_acquire_failure_log_at: None,
+            last_owned_lane_acquire_failure_at: None,
+            download_lanes_under_cap_since: None,
+            last_download_lanes_under_cap_log_at: None,
             write_buffered_bytes: 0,
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
@@ -374,6 +402,8 @@ impl Pipeline {
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
+            par3_runtime: None,
+            par3_inside_probes: Default::default(),
             #[cfg(test)]
             par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
@@ -386,8 +416,9 @@ impl Pipeline {
                 ),
             extraction_limits,
             process_memory_budget,
+            job_scheduling_memory: HashMap::new(),
+            repeated_articles: HashMap::new(),
             chase_pool,
-            direct_unpack_process_memory,
             extraction_budgets: HashMap::new(),
             unacceptable_extension_policies: HashMap::new(),
             extracted_members: HashMap::new(),
@@ -418,8 +449,8 @@ impl Pipeline {
             next_par2_analysis_work_id: 0,
             par2_analysis_in_flight: HashMap::new(),
             par2_analysis_results: HashMap::new(),
-            par2_analysis_done_tx,
-            par2_analysis_done_rx,
+            repair_work_done_tx,
+            repair_work_done_rx,
             next_direct_demotion_work_id: 0,
             direct_demotion_in_flight: HashMap::new(),
             direct_demotion_done_tx,
@@ -453,6 +484,10 @@ impl Pipeline {
         };
         let _ = pipeline.refresh_bandwidth_cap_window();
         pipeline.refresh_download_pressure();
+        // The very first lease a lane takes must already know the depth its
+        // server can run at; discovering it from the first response means the
+        // whole opening of every download is sequential.
+        pipeline.seed_download_lane_explorers();
         Ok(pipeline)
     }
 
@@ -693,6 +728,7 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
+        self.blocked_restores.remove(&job_id);
         self.pending_file_progress
             .retain(|file_id, _| file_id.job_id != job_id);
         self.persisted_file_progress
@@ -709,6 +745,7 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
+        self.checkpoint_progress_articles.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
         // The direct-store runtime is per-job state like every map
         // above it. Left behind, its sets keep a removed job "active" and the
@@ -755,44 +792,7 @@ impl Pipeline {
     }
 
     fn release_stalled_download_runtime(&mut self, job_id: JobId) -> usize {
-        let in_flight = self.active_downloads_by_job.remove(&job_id).unwrap_or(0);
-        let in_flight_connections = self
-            .active_download_connections_by_job
-            .remove(&job_id)
-            .unwrap_or(0);
-        let completion_critical_connections = self
-            .active_completion_critical_connections_by_job
-            .remove(&job_id)
-            .unwrap_or(0);
-        self.active_downloads = self.active_downloads.saturating_sub(in_flight);
-        self.active_download_connections = self
-            .active_download_connections
-            .saturating_sub(in_flight_connections);
-        self.active_completion_critical_connections = self
-            .active_completion_critical_connections
-            .saturating_sub(completion_critical_connections);
-        self.active_downloads_by_file
-            .retain(|file_id, _| file_id.job_id != job_id);
-
-        let reserved_segments: Vec<_> = self
-            .bandwidth_reservations
-            .keys()
-            .copied()
-            .filter(|segment_id| segment_id.file_id.job_id == job_id)
-            .collect();
-        for segment_id in reserved_segments {
-            if let Err(error) = self.release_bandwidth_reservation(segment_id) {
-                error!(
-                    error = %error,
-                    segment = %segment_id,
-                    "failed to release stalled job bandwidth reservation"
-                );
-            }
-        }
-        self.rate_limit_reservations
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-
-        in_flight
+        self.retire_stalled_download_lanes(job_id)
     }
 
     pub(crate) fn auto_pause_stalled_downloads(&mut self) {
@@ -886,6 +886,7 @@ impl Pipeline {
                 self.pump_decode_queue();
             }
 
+            self.consume_due_checkpoint_rechecks();
             self.dispatch_downloads();
             // The byte and age triggers are polled on the loop's
             // existing periodic seam rather than on a timer of their own, so an
@@ -940,23 +941,12 @@ impl Pipeline {
                 self.dispatch_downloads();
             }
 
-            let mut processed_results = 0usize;
-            while processed_results < Self::DOWNLOAD_RESULTS_PER_TURN {
-                let Some(result) = pending_download_results.pop_front() else {
-                    break;
-                };
-                self.process_released_download_done(result).await;
-                processed_results += 1;
-                // Ingesting a turn's worth of results is the longest stretch of
-                // a loop turn, and it is exactly when lanes finish their leases
-                // and park. Draining the control channel here and dispatching
-                // on the park hands the freed connection straight back out
-                // instead of holding it until the turn ends.
-                self.drain_ready_lane_control_messages();
-                if self.take_download_dispatch_wake() {
-                    self.dispatch_downloads();
-                }
-            }
+            let processed_results = self
+                .process_download_result_turn(
+                    &mut pending_download_results,
+                    &mut metrics_snapshot_interval,
+                )
+                .await;
             if processed_results == 0 {
                 tokio::select! {
                     cmd = self.cmd_rx.recv() => {
@@ -974,7 +964,7 @@ impl Pipeline {
                         }
                     }
                     Some(result) = self.download_done_rx.recv() => {
-                        self.release_download_result(&result);
+                        if !self.release_download_result(&result) { continue; }
                         self.note_released_download_result_pending(
                             result.segment_id.file_id.job_id,
                             Self::released_download_result_lead_bytes(&result),
@@ -1028,8 +1018,8 @@ impl Pipeline {
                     Some(done) = self.direct_tolerated_done_rx.recv() => {
                         self.handle_direct_tolerated_done(done).await;
                     }
-                    Some(done) = self.par2_analysis_done_rx.recv() => {
-                        self.handle_par2_analysis_done(done).await;
+                    Some(done) = self.repair_work_done_rx.recv() => {
+                        self.handle_repair_work_done(done).await;
                     }
                     Some(done) = self.direct_demotion_done_rx.recv() => {
                         self.handle_direct_demotion_done(done).await;
@@ -1048,21 +1038,19 @@ impl Pipeline {
                         self.receive_retry_work(retry);
                     }
                     _ = metrics_snapshot_interval.tick() => {
-                        self.sample_phase_progress();
-                        self.shared_state.refresh_metrics_snapshot();
-                        self.flush_pending_snapshot();
-                        // Fallback wake for refills held under hard pressure, in
-                        // case the backlog drained without a download event.
-                        self.maybe_service_deferred_lane_refills();
+                        self.refresh_periodic_snapshot();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
-                    _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {}
+                    _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
+                        self.consume_due_checkpoint_rechecks();
+                    }
                     _ = propagation_sleep, if propagation_delay.is_some() => {}
                     _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
                         self.requeue_due_infrastructure_retries();
                     }
                     _ = tune_interval.tick() => {
                         self.flush_quiescent_write_backlog().await;
+                        self.relieve_latched_write_backlog().await;
                         self.refresh_download_pressure();
                         self.publish_download_transport_health();
 
@@ -1117,13 +1105,6 @@ impl Pipeline {
                             health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                             "pipeline tick"
                         );
-
-                        if self.tuner.adjust(&snapshot) {
-                            info!(
-                                max_downloads = self.tuner.params().max_concurrent_downloads,
-                                "tuner adjusted parameters"
-                            );
-                        }
                     }
                     _ = stalled_download_interval.tick() => {
                         self.auto_pause_stalled_downloads();
@@ -1146,6 +1127,48 @@ impl Pipeline {
 
         self.drain().await;
         info!("pipeline stopped");
+    }
+
+    pub(crate) async fn process_download_result_turn(
+        &mut self,
+        pending: &mut VecDeque<DownloadResult>,
+        metrics_interval: &mut tokio::time::Interval,
+    ) -> usize {
+        let mut processed = 0;
+        while processed < Self::DOWNLOAD_RESULTS_PER_TURN {
+            let Some(result) = pending.pop_front() else {
+                break;
+            };
+            self.process_released_download_done(result).await;
+            processed += 1;
+            // Return freed connections during ingestion rather than waiting
+            // until the entire result batch has been processed.
+            self.drain_ready_lane_control_messages();
+            if self.take_download_dispatch_wake() {
+                self.dispatch_downloads();
+            }
+        }
+        if processed != 0 {
+            // A backlog can keep every actor operation immediately ready.
+            // Let the timer driver and transport tasks run between batches.
+            tokio::task::yield_now().await;
+        }
+        // Busy turns skip the blocking select. Poll the same interval here
+        // without waiting so sustained results cannot starve UI refreshes.
+        let due = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(metrics_interval.poll_tick(cx).is_ready())
+        })
+        .await;
+        if due {
+            self.refresh_periodic_snapshot();
+        }
+        processed
+    }
+
+    fn refresh_periodic_snapshot(&mut self) {
+        self.sample_phase_progress();
+        self.shared_state.refresh_metrics_snapshot();
+        self.flush_pending_snapshot();
     }
 
     /// The pause demand, at the command seam.
@@ -1177,6 +1200,21 @@ impl Pipeline {
         }
     }
 
+    pub(crate) fn consume_due_checkpoint_rechecks(&mut self) {
+        let now = Instant::now();
+        if self
+            .download_restart_durable_lead_retry_after
+            .values()
+            .any(|ready_at| *ready_at <= now)
+        {
+            self.flush_file_progress_batch(
+                "download.file_progress.flush.restart_durable_lead_retry_recheck",
+            );
+        }
+        self.download_restart_durable_lead_retry_after
+            .retain(|_, ready_at| *ready_at > now);
+    }
+
     pub(crate) fn next_restart_durable_lead_retry_delay(&self) -> Option<std::time::Duration> {
         let now = Instant::now();
         self.download_restart_durable_lead_retry_after
@@ -1190,7 +1228,32 @@ impl Pipeline {
         self.snapshot_published_at = Some(Instant::now());
         self.snapshot_publish_pending = false;
         let _ = self.refresh_bandwidth_cap_window();
-        self.shared_state.publish_jobs(self.list_jobs());
+        let jobs = self.list_jobs();
+        let holds: HashMap<_, _> = jobs
+            .iter()
+            .filter(|job| {
+                job.download_wait_reason.as_deref()
+                    == Some(crate::jobs::handle::PROPAGATION_WAIT_REASON)
+            })
+            .filter_map(|job| {
+                job.download_retry_at_epoch_ms
+                    .map(|at| (job.job_id, at as i64))
+            })
+            .collect();
+        let changed: HashSet<_> = holds
+            .keys()
+            .chain(self.published_propagation_holds.keys())
+            .copied()
+            .filter(|job_id| holds.get(job_id) != self.published_propagation_holds.get(job_id))
+            .collect();
+        self.published_propagation_holds = holds;
+        self.shared_state.publish_jobs(jobs);
+        // Publish the updated payload before notifying live queue subscribers.
+        for job_id in changed {
+            let _ = self
+                .event_tx
+                .send(PipelineEvent::PhaseProgressUpdated { job_id });
+        }
     }
 
     /// Publish the job snapshot unless one was already published inside the
@@ -1280,7 +1343,9 @@ impl Pipeline {
             let Ok(result) = self.download_done_rx.try_recv() else {
                 break;
             };
-            self.release_download_result(&result);
+            if !self.release_download_result(&result) {
+                continue;
+            }
             self.note_released_download_result_pending(
                 result.segment_id.file_id.job_id,
                 Self::released_download_result_lead_bytes(&result),
@@ -1395,7 +1460,6 @@ impl Pipeline {
         self.direct_unpack_shutdown("pipeline shutting down").await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
-        self.deferred_lane_refills.clear();
         self.drain_inflight_download_and_decode_work().await;
         self.flush_quiescent_write_backlog().await;
 
@@ -1788,9 +1852,8 @@ struct CachedDiskWriteHandle {
 ///
 /// The last close of a freshly written file is where the kernel flushes its
 /// dirty pages (tens of milliseconds for a large file on macOS), and an owner
-/// thread serves every file that hashes to it. SABnzbd and NZBGet both take
-/// that flush on the thread that wrote, but neither shares a writer across
-/// files; here the owner hands the handle off instead, so a completed file's
+/// thread serves every file that hashes to it. The owner hands the handle
+/// off so a completed file's
 /// flush never queues behind another file's writes. The closer is FIFO, so an
 /// `ack` is sent only once every close queued before it — including earlier
 /// fire-and-forget releases of the same path — has actually happened, which is
@@ -2304,8 +2367,8 @@ fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
 }
 
 pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) {
-    match crate::operations::disk_space(output_dir) {
-        Some(space) => {
+    match crate::operations::probe_nearest_disk_space(output_dir) {
+        Ok(space) => {
             let available = space.available_bytes;
             if available < needed_bytes {
                 let avail_mb = available / (1024 * 1024);
@@ -2320,7 +2383,11 @@ pub(crate) fn check_disk_space(output_dir: &std::path::Path, needed_bytes: u64) 
                 debug!(available_mb = avail_mb, "disk space check passed");
             }
         }
-        None => debug!("could not check free disk space"),
+        Err(error) => debug!(
+            path = %output_dir.display(),
+            error = %error,
+            "could not check free disk space"
+        ),
     }
 }
 

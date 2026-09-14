@@ -94,6 +94,7 @@ export const router = createBrowserRouter([
         ...lazyNamedRoute(() => import("@/pages/settings/SettingsLayout"), "SettingsLayout"),
         children: [
           { index: true, element: <Navigate to="general" replace /> },
+          { path: "proxies", ...lazyNamedRoute(() => import("@/pages/settings/ProxiesSettingsPage"), "ProxiesSettingsPage") },
           {
             path: "general",
             ...lazyNamedRoute(

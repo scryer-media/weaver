@@ -1,0 +1,18 @@
+{
+  "slug": "par3-multi-file-repair",
+  "title": "E2E.Test.PAR3.Multi.File.Repair.Garnet.Isle.S01.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "One PAR3 set over three payloads, two of them damaged, so one recovery matrix restores blocks from different files.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "garnet.isle.s01e01.mkv": "d17a91ffdc2b3aef017e9e371ed4f9a2e62562790425e5789278f1c050e46781",
+    "garnet.isle.s01e02.mkv": "fb2c720c70e0fcce15e45b5cd66c3f5b56a2da285ae008eb52ca083acc612259",
+    "garnet.isle.s01e03.mkv": "a1b8847f7bb89eaf3ae080068b86d956331e2c50e930cbbab4bb9b41943019d4"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

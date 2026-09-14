@@ -10,7 +10,7 @@ use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, StoreDatastore};
 use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 use crate::servers::ServerConfig;
-use crate::settings::{BufferPoolOverrides, Config, RetryOverrides, TunerOverrides};
+use crate::settings::{BufferPoolOverrides, Config, RetryOverrides};
 
 fn fetch_i64(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> i64 {
     let datastore = db.datastore();
@@ -73,6 +73,7 @@ fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     }
 }
 
@@ -95,6 +96,7 @@ fn postgres_sample_history(job_id: crate::jobs::ids::JobId) -> JobHistoryRow {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
+        server_attribution: None,
     }
 }
 
@@ -2099,11 +2101,6 @@ async fn postgres_runtime_smoke_when_configured() {
             medium_count: Some(3),
             large_count: Some(2),
         }),
-        tuner: Some(TunerOverrides {
-            max_concurrent_downloads: Some(8),
-            decode_thread_count: Some(2),
-            extract_thread_count: Some(1),
-        }),
         servers: vec![ServerConfig {
             id: 7,
             host: "news.example.com".to_string(),
@@ -2151,6 +2148,7 @@ async fn postgres_runtime_smoke_when_configured() {
             weekly_reset_weekday: IspBandwidthCapWeekday::Mon,
             monthly_reset_day: 7,
         }),
+        propagation_delay_secs: Some(0),
         ip_replacement_trial_extra_connections: Some(1),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -2343,6 +2341,7 @@ async fn postgres_runtime_smoke_when_configured() {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     })
     .unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {
@@ -2373,6 +2372,7 @@ async fn postgres_runtime_smoke_when_configured() {
             created_at: 1_700_000_000,
             completed_at: 1_700_000_100,
             metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
+            server_attribution: None,
         },
     )
     .unwrap();
@@ -2557,6 +2557,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
         created_at: 1,
         completed_at: 2,
         metadata: None,
+        server_attribution: None,
     })
     .unwrap();
     let results = vec![crate::post_processing::model::ScriptResult {

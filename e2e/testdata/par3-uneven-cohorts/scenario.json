@@ -1,0 +1,16 @@
+{
+  "slug": "par3-uneven-cohorts",
+  "title": "E2E.Test.PAR3.Uneven.Cohorts.Saffron.Relay.S01E04.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "FFT with two-way interleaving over a block count that does not divide evenly, so the cohorts differ in size. Three far-apart blocks are zeroed, landing damage in different cohorts.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "saffron.relay.s01e04.mkv": "59d261b8151c2861eb73e76e05e023661b7e93042e0526a677eeecb94784e633"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

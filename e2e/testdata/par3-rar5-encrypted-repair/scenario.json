@@ -1,0 +1,18 @@
+{
+  "slug": "par3-rar5-encrypted-repair",
+  "title": "E2E.Test.PAR3.RAR5.Encrypted.Repair.Garnet.Spire.S01E06.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A compressed three-volume RAR5 set with `-hp` header and data encryption, an external PAR3 set, and a damaged interior volume. PAR3 repairs ciphertext without the key; extraction with the password proves the restored bytes.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "garnet.spire.s01e06.mkv": "9c95ff3e76223ae36339c541ae994690dca6fe77be6829d2b24246aaa7c008f6"
+  },
+  "password": "e2e-test-password",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

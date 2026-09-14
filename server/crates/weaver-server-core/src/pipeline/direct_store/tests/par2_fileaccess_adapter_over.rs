@@ -723,6 +723,106 @@ fn holds_scratch_compaction_refuses_extents_it_cannot_pack_safely() {
     );
 }
 
+/// A provider that reads holds from the scratch on demand keeps offsets past
+/// the call that handed them out, and compaction is the one thing that moves
+/// a region. Under a pin it packs into a fresh image instead, so the pinned
+/// reader's offsets stay true for the image it holds while the router goes on
+/// with the packed copy at the same path.
+#[test]
+fn a_pinned_scratch_compacts_into_a_fresh_image_and_the_pin_keeps_the_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+    let packing_path = dir
+        .path()
+        .join(".weaver-holds.silver.horizon.f0.compacting");
+    let mut scratch = HoldsScratch::new(path.clone(), 64);
+
+    let first = scratch.append(b"aaaa").unwrap();
+    let placed = scratch.append(b"bbbbbb").unwrap();
+    let third = scratch.append(b"cccc").unwrap();
+
+    let pin = scratch.pin().expect("an image exists once a byte is paged");
+    assert!(scratch.is_pinned());
+
+    let new_offsets = scratch.compact(&[(first, 4), (third, 4)]).unwrap();
+    assert_eq!(new_offsets, vec![0, 4]);
+    assert_eq!(scratch.bytes(), 8);
+    assert_eq!(
+        scratch.read(4, 4).as_deref(),
+        Some(&b"cccc"[..]),
+        "the router reads the packed copy at the new offsets"
+    );
+    assert!(path.exists(), "the packed copy took over the scratch path");
+    assert!(
+        !packing_path.exists(),
+        "and the packing path did not linger"
+    );
+    assert!(
+        !scratch.is_pinned(),
+        "the fresh image starts unpinned: the pin is on the image it was taken against"
+    );
+
+    let mut moved = [0u8; 4];
+    pin.read_at(third, &mut moved).unwrap();
+    assert_eq!(
+        &moved, b"cccc",
+        "the pinned reader still reads the run at the offset it was handed"
+    );
+    let mut dead = [0u8; 6];
+    pin.read_at(placed, &mut dead).unwrap();
+    assert_eq!(
+        &dead, b"bbbbbb",
+        "the old image was left exactly as it was, dead regions included"
+    );
+
+    // Unpinned again, the next pack is in place and the offsets keep working.
+    drop(pin);
+    let fourth = scratch.append(b"dddd").unwrap();
+    let packed_again = scratch.compact(&[(4, 4), (fourth, 4)]).unwrap();
+    assert_eq!(packed_again, vec![0, 4]);
+    assert_eq!(scratch.read(0, 8).as_deref(), Some(&b"ccccdddd"[..]));
+}
+
+#[test]
+fn dropping_the_last_pin_unpins_the_scratch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut scratch = HoldsScratch::new(dir.path().join(".weaver-holds.silver.horizon.f0"), 64);
+    assert!(
+        scratch.pin().is_none(),
+        "there is no image to pin before anything is paged"
+    );
+    scratch.append(b"held").unwrap();
+
+    let first = scratch.pin().unwrap();
+    let second = scratch.pin().unwrap();
+    assert!(scratch.is_pinned());
+    drop(first);
+    assert!(scratch.is_pinned(), "one reader is still on the image");
+    drop(second);
+    assert!(!scratch.is_pinned());
+}
+
+/// A retained provider can outlive the set: finalization and demotion both
+/// discard the scratch, and a pin must keep its bytes readable through that.
+/// The handle does the keeping; the path is gone. Unix only, where an unlinked
+/// file stays readable through an open handle by contract.
+#[cfg(unix)]
+#[test]
+fn a_pin_reads_through_a_discard() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".weaver-holds.silver.horizon.f0");
+    let mut scratch = HoldsScratch::new(path.clone(), 64);
+    let offset = scratch.append(b"held bytes").unwrap();
+    let pin = scratch.pin().unwrap();
+
+    scratch.discard();
+    assert!(!path.exists());
+
+    let mut out = [0u8; 10];
+    pin.read_at(offset, &mut out).unwrap();
+    assert_eq!(&out, b"held bytes");
+}
+
 #[test]
 fn a_scratch_that_never_appended_a_byte_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
@@ -1085,6 +1185,70 @@ fn a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary() 
 // ---------------------------------------------------------------------------
 
 #[test]
+fn bounded_stale_gap_reads_make_progress_without_a_whole_plan() {
+    let repaired: Vec<u8> = (0..400).map(|index| (index % 251) as u8).collect();
+    let (mut router, member_id) = straddle_router(&repaired, 64);
+    router.stage_for_test(0, 64, &repaired[..300]);
+    router.drain_for_test(0).unwrap();
+    router.begin_repair_transaction(vec![0]).unwrap();
+    router
+        .route_repaired_batch(
+            0,
+            &[(64 + 200, Arc::from(&repaired[200..]))],
+            &[],
+            false,
+            true,
+        )
+        .unwrap();
+    assert!(router.has_stale_gaps());
+    assert!(router.next_stale_gap(0, 8192).is_err());
+    assert!(router.next_stale_gap(37, 0).is_err());
+    let mut read = 0;
+    let mut stripes = 0;
+    while let Some(run) = router.next_stale_gap(37, 8192).unwrap() {
+        assert_eq!(run.member_id, member_id);
+        assert_eq!(run.logical_offset, read);
+        assert!(run.len > 0 && run.len <= 37);
+        let end = read + run.len;
+        router
+            .note_restored_member_crc(
+                member_id,
+                read,
+                run.len,
+                par2_rs::checksum::crc32(&repaired[read as usize..end as usize]),
+            )
+            .unwrap();
+        read = end;
+        stripes += 1;
+    }
+    assert_eq!((read, stripes), (200, 6));
+    assert!(!router.has_stale_gaps());
+    assert!(router.repair_batch_in_progress());
+    assert!(!router.all_members_verified());
+    router.finish_repair_transaction().unwrap();
+    assert!(router.all_members_verified());
+}
+
+#[test]
+fn unread_stale_gap_cannot_release_a_replacement_transaction() {
+    let bytes = [42; 400];
+    let (mut router, _) = straddle_router(&bytes, 64);
+    router.stage_for_test(0, 64, &bytes[..300]);
+    router.drain_for_test(0).unwrap();
+    router.begin_repair_transaction(vec![0]).unwrap();
+    router
+        .route_repaired_batch(0, &[(264, Arc::from(&bytes[200..]))], &[], false, true)
+        .unwrap();
+    assert!(router.has_stale_gaps());
+    assert_eq!(
+        router.finish_repair_transaction(),
+        Err(DemotionReason::RepairGapUnreadable)
+    );
+    assert!(router.repair_batch_in_progress());
+    assert!(!router.all_members_verified());
+}
+
+#[test]
 fn deleting_the_row_before_a_repair_keeps_the_coverage_the_provider_reads() {
     // The ordering rule, and the distinction that makes it survivable. The row
     // has to go *before* a repair rewrites the bytes it claims — otherwise a
@@ -1231,6 +1395,214 @@ fn a_rewrite_widens_to_whole_articles_so_the_volume_composition_stays_exact() {
     assert_eq!(
         widen_to_articles(&[(200, 264)], &sparse, 300),
         vec![(200, 264)]
+    );
+}
+
+#[test]
+fn whole_volume_rewrite_requires_actual_end_to_end_ranges() {
+    use super::super::reconstruct::{PartialArticle, VolumeReconstruction};
+    use super::super::repair::DamagedDirectVolume;
+
+    let mut volume = DamagedDirectVolume {
+        volume_index: 0,
+        par2_file_id: par2_rs::FileId::from_bytes([9; 16]),
+        len: 300,
+        path: std::path::PathBuf::new(),
+        rewrite: Vec::new(),
+        reconstruction: VolumeReconstruction {
+            volume_index: 0,
+            path: std::path::PathBuf::new(),
+            len: 300,
+            assembly_complete: false,
+            covered: ByteRanges::new(),
+            crcs: CrcRuns::default(),
+            partial_article: PartialArticle::CarryThrough,
+        },
+    };
+    for ranges in [
+        vec![(0, 300)],
+        vec![(0, 100), (100, 200), (200, 300)],
+        vec![(0, 150), (100, 300)],
+    ] {
+        volume.rewrite = ranges;
+        assert!(volume.rewrote_whole_volume(), "{:?}", volume.rewrite);
+    }
+    for ranges in [
+        vec![],
+        vec![(0, 100), (100, 200)], // Missing tail; 200 is an end, not a length.
+        vec![(0, 100), (50, 100), (140, 300)], // An overlap cannot cover a hole.
+        vec![(1, 300)],
+        vec![(0, 200), (150, 300), (100, 200)], // Unsorted.
+        vec![(0, 300), (200, 100)],             // Reversed.
+        vec![(0, 0), (0, 300)],
+        vec![(0, 301)],
+        vec![(0, u64::MAX)],
+    ] {
+        volume.rewrite = ranges;
+        assert!(!volume.rewrote_whole_volume(), "{:?}", volume.rewrite);
+    }
+    volume.len = 0;
+    volume.rewrite = vec![(0, 0)];
+    assert!(!volume.rewrote_whole_volume());
+}
+
+#[test]
+fn an_encrypted_sets_read_back_carries_the_posted_bytes_on_both_sides_of_a_span() {
+    use super::super::reconstruct::{PartialArticle, VolumeReconstruction};
+    use super::super::repair::{DamagedDirectVolume, read_repaired_spans};
+
+    // A repaired volume on disk, and one rewrite span with posted bytes on
+    // either side of it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silver.horizon.part01.rar");
+    let image: Vec<u8> = (0..400u32).map(|index| (index % 251) as u8).collect();
+    std::fs::write(&path, &image).unwrap();
+    let volume = DamagedDirectVolume {
+        volume_index: 0,
+        par2_file_id: par2_rs::FileId::from_bytes([9u8; 16]),
+        len: image.len() as u64,
+        path: path.clone(),
+        // `(start, end)`, so the span is 120 bytes at 100.
+        rewrite: vec![(100, 220)],
+        reconstruction: VolumeReconstruction {
+            volume_index: 0,
+            path,
+            len: image.len() as u64,
+            assembly_complete: true,
+            covered: ByteRanges::new(),
+            crcs: CrcRuns::default(),
+            partial_article: PartialArticle::CarryThrough,
+        },
+    };
+
+    // A plaintext set asks for neither edge: its spans decrypt nothing, so the
+    // bytes around them buy it nothing and reading them would be pure I/O.
+    let plain = read_repaired_spans(&volume, false).expect("the read-back succeeds");
+    assert_eq!(plain.len(), 1);
+    assert!(plain[0].lead_in.is_none() && plain[0].lead_out.is_none());
+
+    // An encrypted set asks for both. The span's first byte and its last both
+    // sit inside a cipher block whose other half is not in the span, and the
+    // drain can decrypt neither block without it — the low half comes from the
+    // article below, the high half from the article above, and both were routed
+    // and dropped from staging long before the repair ran.
+    let encrypted = read_repaired_spans(&volume, true).expect("the read-back succeeds");
+    let span = &encrypted[0];
+    assert_eq!(
+        span.lead_in
+            .as_ref()
+            .map(|(offset, bytes)| (*offset, bytes.to_vec())),
+        Some((68, image[68..100].to_vec())),
+        "the CBC predecessor of the span's first block, and that block's own \
+         lower half"
+    );
+    assert_eq!(
+        span.lead_out
+            .as_ref()
+            .map(|(offset, bytes)| (*offset, bytes.to_vec())),
+        Some((220, image[220..236].to_vec())),
+        "and the upper half of the block the span's last byte lands in"
+    );
+    assert_eq!(
+        span.len, 120,
+        "neither edge is part of the span: they did not change, so they must \
+         not rewrite the volume composition"
+    );
+}
+
+#[test]
+fn repaired_ranges_stream_exact_posted_bytes_and_cipher_edges() {
+    use super::super::repair::read_repaired_range;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("repaired-volume");
+    let image: Vec<u8> = (0..700_001).map(|index| (index % 251) as u8).collect();
+    std::fs::write(&path, &image).unwrap();
+    let len = image.len() as u64;
+    let mut combined = 0;
+    // Deliberately unaligned: the reader must return both halves of a CBC
+    // boundary without adding either edge to the stripe's CRC or coverage.
+    for start in (0..len).step_by(65_537) {
+        let end = (start + 65_537).min(len);
+        let span = read_repaired_range(&path, 7, len, start..end, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(span.volume_index, 7);
+        assert_eq!(span.source_offset, start);
+        assert_eq!(span.len, end - start);
+        assert_eq!(span.chunks.len(), 1);
+        assert_eq!(span.chunks[0].0, start);
+        assert_eq!(
+            span.chunks[0].1.as_ref(),
+            &image[start as usize..end as usize]
+        );
+        let mut retained = span.chunks[0].1.len();
+        if start == 0 {
+            assert!(span.lead_in.is_none());
+        } else {
+            let (offset, bytes) = span.lead_in.as_ref().unwrap();
+            assert_eq!(*offset, start.saturating_sub(32));
+            assert_eq!(bytes.as_ref(), &image[*offset as usize..start as usize]);
+            retained += bytes.len();
+        }
+        if end == len {
+            assert!(span.lead_out.is_none());
+        } else {
+            let (offset, bytes) = span.lead_out.as_ref().unwrap();
+            assert_eq!(*offset, end);
+            assert_eq!(
+                bytes.as_ref(),
+                &image[end as usize..(end + 16).min(len) as usize]
+            );
+            retained += bytes.len();
+        }
+        assert!(retained <= 65_537 + 48);
+        combined = weaver_yenc::crc32_combine(combined, span.crc32, span.len);
+    }
+    assert_eq!(combined, par2_rs::checksum::crc32(&image));
+    assert!(
+        read_repaired_range(&path, 7, len, len..len, true)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn repaired_range_refuses_invalid_geometry_and_preserves_io_errors() {
+    use super::super::repair::read_repaired_range;
+    use std::io::ErrorKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("repaired-volume");
+    let missing = read_repaired_range(&path, 0, 100, 0..100, false).unwrap_err();
+    assert_eq!(missing.kind(), ErrorKind::NotFound);
+    assert!(missing.raw_os_error().is_some());
+    for range in [
+        std::ops::Range { start: 20, end: 10 },
+        0..101,
+        100..u64::MAX,
+    ] {
+        // Refuse the geometry before touching even a missing file.
+        assert_eq!(
+            read_repaired_range(&path, 0, 100, range, true)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput,
+        );
+    }
+    std::fs::write(&path, [0; 99]).unwrap();
+    assert_eq!(
+        read_repaired_range(&path, 0, 100, 0..100, false)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::UnexpectedEof,
+    );
+    // A missing CBC edge is also a short read, never synthesized padding.
+    assert_eq!(
+        read_repaired_range(&path, 0, 100, 0..98, true)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::UnexpectedEof,
     );
 }
 

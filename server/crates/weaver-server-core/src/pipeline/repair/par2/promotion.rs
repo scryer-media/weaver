@@ -23,13 +23,24 @@ impl Pipeline {
     }
 
     pub(crate) fn is_promoted_recovery_file(&self, job_id: JobId, file_index: u32) -> bool {
-        self.par2_runtime(job_id)
-            .and_then(|runtime| runtime.files.get(&file_index))
-            .is_some_and(|file| file.promoted)
+        self.par3_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.is_promoted(job_id, file_index))
+            || self
+                .par2_runtime(job_id)
+                .and_then(|runtime| runtime.files.get(&file_index))
+                .is_some_and(|file| file.promoted)
     }
 
     pub(crate) fn segment_is_completion_critical(&self, segment_id: SegmentId) -> bool {
-        self.par2_runtime(segment_id.file_id.job_id)
+        self.par3_runtime.as_ref().is_some_and(|runtime| {
+            runtime.article_promoted(
+                segment_id.file_id.job_id,
+                segment_id.file_id.file_index,
+                segment_id.segment_number,
+            )
+        }) || self
+            .par2_runtime(segment_id.file_id.job_id)
             .and_then(|runtime| runtime.files.get(&segment_id.file_id.file_index))
             .is_some_and(|file| {
                 file.promoted
@@ -1151,17 +1162,21 @@ impl Pipeline {
             let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
                 state.assembly.optional_recovery_bytes();
             let health = health_milli(total, state.failed_bytes);
+            let native_verifying = self.show_par3_verification_wait(state.job_id);
+            let status = if native_verifying {
+                JobStatus::Verifying
+            } else {
+                state.status.clone()
+            };
             let (mut download_state, post_state, run_state) =
-                crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
+                crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
             let has_current_download_activity =
                 self.job_has_current_download_activity(state.job_id);
             if matches!(download_state, crate::jobs::model::DownloadState::Complete)
                 && has_current_download_activity
             {
                 download_state = crate::jobs::model::DownloadState::Downloading;
-            } else if matches!(state.status, JobStatus::Downloading)
-                && !has_current_download_activity
-            {
+            } else if matches!(status, JobStatus::Downloading) && !has_current_download_activity {
                 download_state = crate::jobs::model::DownloadState::Queued;
             }
             let remaining_par_files = state
@@ -1178,21 +1193,37 @@ impl Pipeline {
                 })
                 .count() as u32;
             let download_wait = self.download_wait_by_job.get(&state.job_id);
+            let propagation_retry_at = self
+                .propagation_ready_at
+                .get(&state.job_id)
+                .filter(|(deadline, _)| *deadline > Instant::now())
+                .filter(|_| matches!(state.status, JobStatus::Queued | JobStatus::Downloading))
+                .map(|(_, retry_at_epoch_ms)| *retry_at_epoch_ms as f64);
+            if propagation_retry_at.is_some() {
+                download_state = crate::jobs::model::DownloadState::Queued;
+            }
             list.push(JobInfo {
                 job_id: state.job_id,
                 job_hash: Some(state.job_hash),
                 name: state.spec.name.clone(),
                 error: if let JobStatus::Failed { error } = &state.status {
                     Some(error.clone())
+                } else if self.blocked_restores.contains_key(&state.job_id) {
+                    state.failure_error.clone()
                 } else {
                     None
                 },
-                download_wait_reason: download_wait.map(|wait| wait.reason.to_owned()),
-                download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
-                status: state.status.clone(),
+                download_wait_reason: propagation_retry_at
+                    .map(|_| crate::jobs::handle::PROPAGATION_WAIT_REASON.to_owned())
+                    .or_else(|| download_wait.map(|wait| wait.reason.to_owned())),
+                download_retry_at_epoch_ms: propagation_retry_at
+                    .or_else(|| download_wait.and_then(|wait| wait.retry_at_epoch_ms)),
+                status,
                 download_state,
-                finalizing_download: self.jobs_finalizing_download.contains(&state.job_id),
-                fetching_repair_data: jobs_fetching_repair_data.contains(&state.job_id),
+                finalizing_download: !native_verifying
+                    && self.jobs_finalizing_download.contains(&state.job_id),
+                fetching_repair_data: !native_verifying
+                    && jobs_fetching_repair_data.contains(&state.job_id),
                 post_state,
                 run_state,
                 progress: Self::effective_progress(state),
@@ -1208,13 +1239,29 @@ impl Pipeline {
                 failed_bytes: state.failed_bytes,
                 health,
                 terminal_discards: Vec::new(),
-                total_files: state.assembly.total_file_count() as u32,
-                completed_files: state.assembly.complete_file_count() as u32,
+                total_files: self.blocked_restores.get(&state.job_id).map_or_else(
+                    || state.assembly.total_file_count() as u32,
+                    |request| request.spec.files.len() as u32,
+                ),
+                completed_files: self.blocked_restores.get(&state.job_id).map_or_else(
+                    || state.assembly.complete_file_count() as u32,
+                    |request| {
+                        request
+                            .complete_files
+                            .iter()
+                            .filter(|file| {
+                                file.job_id == state.job_id
+                                    && (file.file_index as usize) < request.spec.files.len()
+                            })
+                            .count() as u32
+                    },
+                ),
                 remaining_par_files,
                 password: state.spec.password.clone(),
                 category: state.spec.category.clone(),
                 metadata: state.spec.metadata.clone(),
                 output_dir: Some(state.working_dir.display().to_string()),
+                server_attribution: state.server_attribution.contributions().to_vec(),
                 created_at_epoch_ms: state.created_at_epoch_ms,
             });
         };

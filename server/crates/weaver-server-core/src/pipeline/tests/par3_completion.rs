@@ -1,0 +1,1516 @@
+use super::*;
+
+const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
+
+#[tokio::test]
+async fn par3_repair_phases_admit_two_and_preserve_par2_exclusion() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    for number in 1..=4 {
+        let id = JobId(number);
+        insert_active_job(
+            &mut pipeline,
+            id,
+            standalone_job_spec("repair phases", &[("payload.bin".into(), 1)]),
+        )
+        .await;
+        if number < 4 {
+            pipeline
+                .par3_runtime
+                .get_or_insert_with(Box::default)
+                .admit(id)
+                .unwrap();
+        }
+    }
+    assert!(pipeline.maybe_start_par3_repair(JobId(1)).await);
+    assert!(pipeline.maybe_start_par3_repair(JobId(2)).await);
+    assert!(!pipeline.maybe_start_par3_repair(JobId(3)).await);
+    assert!(!pipeline.maybe_start_repair(JobId(4)).await);
+    assert_eq!(pipeline.active_repair_jobs(), 2);
+    pipeline.transition_postprocessing_status(
+        JobId(1),
+        JobStatus::Downloading,
+        Some("downloading"),
+    );
+    pipeline.promote_queued_repairs();
+    assert!(matches!(
+        pipeline.jobs[&JobId(3)].status,
+        JobStatus::Repairing
+    ));
+    assert!(matches!(
+        pipeline.jobs[&JobId(4)].status,
+        JobStatus::QueuedRepair
+    ));
+    for number in [2, 3] {
+        pipeline.transition_postprocessing_status(
+            JobId(number),
+            JobStatus::Downloading,
+            Some("downloading"),
+        );
+    }
+    pipeline.promote_queued_repairs();
+    assert!(matches!(
+        pipeline.jobs[&JobId(4)].status,
+        JobStatus::Repairing
+    ));
+    assert!(
+        !pipeline.maybe_start_par3_repair(JobId(1)).await,
+        "an active PAR2 repair keeps its existing exclusive admission"
+    );
+}
+
+#[test]
+fn par3_indexes_and_smaller_volumes_do_not_change_par2_promotion() {
+    for (names, promoted) in [
+        (
+            vec![
+                ("set.vol0+8.par2", 1000),
+                ("set.par3", 10),
+                ("set.vol0+1.par3", 1),
+            ],
+            Some(0),
+        ),
+        (
+            vec![
+                ("set.vol1+8.par2", 1000),
+                ("set.vol0+1.par2", 300),
+                ("set.vol0+1.par3", 1),
+            ],
+            Some(1),
+        ),
+        (vec![("set.par2", 0), ("set.vol0+1.par3", 1)], None),
+        (
+            vec![("set.vol0+4.par3", 400), ("set.vol4+1.par3", 100)],
+            Some(1),
+        ),
+        (vec![("set.par3", 1), ("set.vol0+1.par3", 100)], None),
+    ] {
+        let files: Vec<_> = names
+            .iter()
+            .map(|(name, len)| ((*name).into(), *len))
+            .collect();
+        let mut spec = standalone_job_spec("recovery promotion", &files);
+        for file in &mut spec.files {
+            file.role = FileRole::from_filename(&file.filename);
+        }
+        let (_, mut downloads, _) =
+            Pipeline::build_job_assembly(JobId(3190), &spec, &HashSet::new());
+        let mut actual = Vec::new();
+        while let Some(work) = downloads.pop() {
+            let index = work.segment_id.file_id.file_index;
+            if spec.files[index as usize].role.is_recovery() {
+                assert!(!work.is_recovery);
+                assert_eq!(work.priority, 0);
+                actual.push(index);
+            }
+        }
+        assert_eq!(
+            actual,
+            promoted.into_iter().collect::<Vec<_>>(),
+            "{names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn par3_embedded_probe_is_optional_and_absent_when_par2_is_declared() {
+    for par2 in [false, true] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job = JobId(3191);
+        let mut files = vec![("archive.zip".into(), 32)];
+        if par2 {
+            files.push(("set.par2".into(), 0));
+        }
+        let mut spec = standalone_job_spec("optional probe", &files);
+        for file in &mut spec.files {
+            file.role = FileRole::from_filename(&file.filename);
+        }
+        let working = insert_active_job(&mut pipeline, job, spec).await;
+        let id = NzbFileId {
+            job_id: job,
+            file_index: 0,
+        };
+        pipeline
+            .jobs
+            .get_mut(&job)
+            .unwrap()
+            .assembly
+            .file_mut(id)
+            .unwrap()
+            .mark_complete();
+        // A directory causes an actual read error if discovery reaches the probe.
+        std::fs::create_dir(working.join("archive.zip")).unwrap();
+        pipeline.try_load_par3_metadata(job, id).await;
+        pipeline.discover_embedded_par3_at_completion(job).await;
+        assert_eq!(pipeline.par3_inside_probes.contains(id), !par2);
+        assert!(!matches!(
+            pipeline.jobs[&job].status,
+            JobStatus::Failed { .. }
+        ));
+        assert!(pipeline.par3_runtime.is_none());
+    }
+}
+
+#[tokio::test]
+async fn par3_failed_name_move_rolls_back_live_and_restored_identity() {
+    use crate::jobs::record::FileIdentitySource;
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job = JobId(3192);
+    let working = insert_active_job(
+        &mut pipeline,
+        job,
+        standalone_job_spec("name rollback", &[("opaque.dat".into(), 4)]),
+    )
+    .await;
+    write_and_complete_file(&mut pipeline, job, 0, "opaque.dat", b"data").await;
+    std::fs::write(working.join("target.bin"), b"unrelated").unwrap();
+    let id = NzbFileId {
+        job_id: job,
+        file_index: 0,
+    };
+    let previous = pipeline.effective_file_identity(job, id).unwrap();
+    assert!(
+        pipeline
+            .install_par3_content_name(job, previous.clone(), "target.bin", &working)
+            .is_err()
+    );
+    assert_eq!(pipeline.effective_file_identity(job, id).unwrap(), previous);
+    assert_eq!(
+        pipeline.db.load_active_jobs().unwrap()[&job].file_identities[&0],
+        previous
+    );
+    let mut intent = previous.clone();
+    intent.classification_source = FileIdentitySource::Par3Pending;
+    intent.canonical_filename = Some("target.bin".into());
+    pipeline.db.save_file_identity(job, &intent).unwrap();
+    let mut identities = HashMap::from([(0, intent)]);
+    pipeline
+        .restore_pending_par3_content_names(job, &working, &mut identities)
+        .unwrap();
+    assert_eq!(identities[&0].current_filename, previous.current_filename);
+    assert_eq!(identities[&0].canonical_filename, None);
+    assert_eq!(
+        identities[&0].classification_source,
+        FileIdentitySource::Declared
+    );
+    assert_eq!(
+        pipeline.db.load_active_jobs().unwrap()[&job].file_identities[&0],
+        identities[&0]
+    );
+    pipeline
+        .restore_pending_par3_content_names(job, &working, &mut identities)
+        .unwrap();
+    assert_eq!(std::fs::read(working.join("opaque.dat")).unwrap(), b"data");
+    assert_eq!(
+        std::fs::read(working.join("target.bin")).unwrap(),
+        b"unrelated"
+    );
+}
+
+#[tokio::test]
+async fn embedded_discovery_cache_is_withdrawn_before_admission_on_writes_and_rebinding() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let first = NzbFileId {
+        job_id: JobId(3114),
+        file_index: 0,
+    };
+    let sibling = NzbFileId {
+        file_index: 1,
+        ..first
+    };
+    let other = NzbFileId {
+        job_id: JobId(3115),
+        ..first
+    };
+    for file in [first, sibling, other] {
+        pipeline.par3_inside_probes.insert(file);
+    }
+    assert!(pipeline.par3_runtime.is_none());
+    pipeline.invalidate_par3_source_write(first);
+    assert!(!pipeline.par3_inside_probes.contains(first));
+    assert!(pipeline.par3_inside_probes.contains(sibling));
+    assert!(pipeline.par3_inside_probes.contains(other));
+    pipeline.par3_inside_probes.insert(first);
+    pipeline.invalidate_par3_bindings(first.job_id);
+    assert!(!pipeline.par3_inside_probes.contains(first));
+    assert!(!pipeline.par3_inside_probes.contains(sibling));
+    assert!(pipeline.par3_inside_probes.contains(other));
+    assert!(
+        pipeline.par3_runtime.is_none(),
+        "ordinary source changes must not allocate an engine"
+    );
+}
+
+#[tokio::test]
+async fn missing_par2_metadata_requires_current_par3_evidence_for_every_payload() {
+    for unprotected in [false, true] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3113);
+        let mut files = vec![
+            ("a.bin", (0..5000u32).map(|i| (i * 7 + 3) as u8).collect()),
+            ("b.txt", b"qrstuvwxyz".to_vec()),
+            (
+                "sub/c.bin",
+                (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+            ),
+            ("set.par3", INDEX.to_vec()),
+        ];
+        if unprotected {
+            files.push(("unprotected.bin", b"not covered by the PAR3 set".to_vec()));
+        }
+        let mut descriptions: Vec<_> = files
+            .iter()
+            .map(|(name, bytes)| ((*name).into(), bytes.len() as u32))
+            .collect();
+        descriptions.push(("missing.par2".into(), 100));
+        let mut spec = standalone_job_spec("Missing PAR2 metadata", &descriptions);
+        for file in &mut spec.files {
+            file.role = FileRole::from_filename(&file.filename);
+        }
+        let working = insert_active_job(&mut pipeline, job_id, spec).await;
+        tokio::fs::create_dir(working.join("sub")).await.unwrap();
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+        }
+        assert!(!pipeline.par3_verifies_all_payloads(job_id));
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 3,
+                },
+            )
+            .await;
+        settle_par3(&mut pipeline, job_id).await;
+        let runtime = pipeline.par3_runtime.as_ref().unwrap();
+        assert!(runtime.verified(job_id));
+        let reads = runtime.source_verifications(job_id);
+        for _ in 0..3 {
+            assert_eq!(pipeline.par3_verifies_all_payloads(job_id), !unprotected);
+        }
+        assert_eq!(
+            pipeline
+                .par3_runtime
+                .as_ref()
+                .unwrap()
+                .source_verifications(job_id),
+            reads,
+            "completion policy must consume current evidence without reading sources"
+        );
+        assert!(!pipeline.par2_verified.contains(&job_id));
+        pipeline.invalidate_par3_source_write(NzbFileId {
+            job_id,
+            file_index: 0,
+        });
+        assert!(
+            !pipeline.par3_verifies_all_payloads(job_id),
+            "a source write must withdraw the alternative completion verdict"
+        );
+    }
+}
+
+#[tokio::test]
+async fn alternate_repair_requires_a_typed_native_reason_for_every_failed_set() {
+    use crate::pipeline::repair::backend::AlternateRepairReason;
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3112);
+    let mut spec = standalone_job_spec(
+        "Typed alternate repair",
+        &[("set.par3".into(), INDEX.len() as u32)],
+    );
+    spec.files[0].role = FileRole::from_filename("set.par3");
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 0, "set.par3", INDEX).await;
+    pipeline
+        .try_load_par3_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+        )
+        .await;
+    settle_par3(&mut pipeline, job_id).await;
+    let set_id = par2_rs::RecoverySetId::from_bytes([7; 16]);
+    let set = pipeline
+        .ensure_par2_runtime(job_id)
+        .sets
+        .entry(set_id)
+        .or_default();
+    set.settled = true;
+    // The message deliberately includes recovery language. Eligibility must
+    // come from the native verdict kind, never a substring in an error body.
+    set.failure = Some("I/O failure while reading insufficient recovery".into());
+    assert!(!pipeline.par3_has_work_after_par2_failure(job_id));
+    for reason in [
+        AlternateRepairReason::InsufficientRecovery,
+        AlternateRepairReason::ResourceLimited,
+    ] {
+        pipeline
+            .ensure_par2_runtime(job_id)
+            .sets
+            .get_mut(&set_id)
+            .unwrap()
+            .alternate_repair = Some(reason);
+        assert!(pipeline.par3_has_work_after_par2_failure(job_id));
+    }
+    let sibling = par2_rs::RecoverySetId::from_bytes([8; 16]);
+    let set = pipeline
+        .ensure_par2_runtime(job_id)
+        .sets
+        .entry(sibling)
+        .or_default();
+    set.settled = true;
+    set.failure = Some("cancelled".into());
+    assert!(
+        !pipeline.par3_has_work_after_par2_failure(job_id),
+        "an eligible sibling cannot turn a terminal failure into fallback work"
+    );
+}
+
+#[tokio::test]
+async fn par2_capacity_and_promotion_exclude_par3_recovery_carriers() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3110);
+    let payload = vec![3u8; 10000];
+    let index = build_test_par2_index_for_files(&[("payload.bin", &payload)], 2048);
+    let mut spec = standalone_job_spec(
+        "Mixed recovery ownership",
+        &[
+            ("payload.bin".into(), payload.len() as u32),
+            ("repair.par2".into(), index.len() as u32),
+            ("repair.vol0+16.par3".into(), 1 << 20),
+        ],
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    write_and_complete_file(&mut pipeline, job_id, 1, "repair.par2", &index).await;
+    pipeline
+        .try_load_par2_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 1,
+            },
+        )
+        .await;
+    let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+    assert_eq!(pipeline.total_recovery_block_capacity(job_id, set_id), 0);
+    assert_eq!(pipeline.promote_recovery_targeted(job_id, set_id, 1), 0);
+    assert_eq!(
+        pipeline.jobs[&job_id].recovery_queue.len(),
+        1,
+        "the PAR3 volume must remain available to its own engine"
+    );
+}
+
+#[tokio::test]
+async fn par2_installation_fences_par3_evidence_and_reverifies_only_the_rewritten_source() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3111);
+    let original: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
+    let mut files = vec![
+        ("a.bin", original.clone()),
+        ("b.txt", b"qrstuvwxyz".to_vec()),
+        (
+            "sub/c.bin",
+            (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+        ),
+        ("set.par3", INDEX.to_vec()),
+    ];
+    let par2 = build_test_par2_index_for_files(
+        &[
+            ("a.bin", &files[0].1),
+            ("b.txt", &files[1].1),
+            ("sub/c.bin", &files[2].1),
+        ],
+        2048,
+    );
+    files.push(("set.par2", par2));
+    files.push((
+        "sibling.par2",
+        build_test_par2_index_for_files(&[("a.bin", &original)], 2048),
+    ));
+    files[0].1[2300] ^= 1;
+    let mut spec = standalone_job_spec(
+        "Cross-format source fence",
+        &files
+            .iter()
+            .map(|(name, bytes)| ((*name).into(), bytes.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    let working = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::create_dir(working.join("sub")).await.unwrap();
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+    }
+    for file_index in [4, 5] {
+        pipeline
+            .try_load_par2_metadata(job_id, NzbFileId { job_id, file_index })
+            .await;
+    }
+    assert_eq!(pipeline.par2_servable_set_ids(job_id).len(), 2);
+    assert!(
+        pipeline
+            .resolve_par2_file_binding(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .is_none(),
+        "handoff must resolve the selected set when the global binding is ambiguous"
+    );
+    pipeline
+        .try_load_par3_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 3,
+            },
+        )
+        .await;
+    settle_par3(&mut pipeline, job_id).await;
+    let source = par3_rs::source::SourceId(0);
+    let clean = par3_rs::source::SourceId(1);
+    let runtime = pipeline.par3_runtime.as_ref().unwrap();
+    assert!(!runtime.verified_file(job_id, source));
+    assert!(runtime.source_verified(job_id, clean));
+    let reads = runtime.source_verifications(job_id);
+    let set_id = pipeline.par2_served_set_id(job_id).unwrap();
+    // Archive-type shortcuts can settle before an extraction failure arrives.
+    // Native PAR3 damage must reopen both overlapping claims without reading
+    // sources, then require PAR2's own authoritative pass.
+    for id in pipeline.par2_servable_set_ids(job_id) {
+        pipeline.settle_par2_set(job_id, id,
+            crate::pipeline::completion::finalize::check::Par2SetSettlementReason::Clean {
+                slice_size: 2048,
+                verification_mode: crate::pipeline::completion::finalize::check::CleanPar2VerificationMode::StrongDecode,
+            }).await;
+    }
+    assert!(pipeline.par2_verified.contains(&job_id));
+    assert!(pipeline.reopen_par2_strong_decode_claims_on_par3_damage(job_id));
+    assert!(!pipeline.par2_verified.contains(&job_id));
+    assert!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .sets
+            .values()
+            .all(|set| !set.settled)
+    );
+    assert!(pipeline.par3_requires_authoritative_par2(job_id));
+    assert!(!pipeline.reopen_par2_strong_decode_claims_on_par3_damage(job_id));
+    assert_eq!(
+        pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .source_verifications(job_id),
+        reads
+    );
+    let native = pipeline
+        .par2_set_for(job_id, set_id)
+        .unwrap()
+        .as_ref()
+        .clone();
+    let mut options = par2_rs::Par2RepairSessionOptions::new(working.clone(), Vec::new());
+    options.file_set = Some(native);
+    options.memory_limit = Some(8 << 20);
+    let outcome = tokio::task::spawn_blocking(move || {
+        par2_rs::Par2RepairSession::open(options)
+            .unwrap()
+            .analyze()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome
+            .verification
+            .files
+            .iter()
+            .filter(|file| !matches!(file.status, par2_rs::verify::FileStatus::Complete))
+            .count(),
+        1
+    );
+    pipeline
+        .fence_par3_before_par2_repair(job_id, set_id, Some(&outcome.verification))
+        .unwrap();
+    assert!(pipeline.par3_runtime.as_ref().unwrap().has_work(job_id));
+    assert!(
+        !pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .verified_file(job_id, source)
+    );
+    // Model the verified installation after the native PAR2 operation. The
+    // strong PAR3 proof must come from its fresh source read, not this write.
+    tokio::fs::write(working.join("a.bin"), &original)
+        .await
+        .unwrap();
+    let rewritten = outcome
+        .verification
+        .files
+        .iter()
+        .filter(|file| !matches!(file.status, par2_rs::verify::FileStatus::Complete))
+        .map(|file| file.file_id)
+        .collect();
+    pipeline
+        .refresh_par3_after_par2_repair(job_id, set_id, &rewritten)
+        .unwrap();
+    settle_par3(&mut pipeline, job_id).await;
+    let runtime = pipeline.par3_runtime.as_ref().unwrap();
+    assert!(runtime.verified(job_id));
+    assert_eq!(
+        runtime.source_verifications(job_id),
+        reads + 1,
+        "the repaired source owes native verification; clean siblings owe none"
+    );
+}
+
+#[tokio::test]
+async fn par3_index_avoids_speculative_recovery_and_defers_early_health_abort() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3104);
+    let mut spec = standalone_job_spec(
+        "PAR3 health",
+        &[
+            ("payload.bin".into(), 10000),
+            ("set.par3".into(), 100),
+            ("set.vol0+1.par3".into(), 3000),
+        ],
+    );
+    for file in &mut spec.files[1..] {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    assert_eq!(state.recovery_queue.len(), 1);
+    assert_eq!(state.download_queue.len(), 2);
+    state.failed_bytes = 3000;
+    pipeline.check_health(job_id);
+    assert!(!matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Failed { .. }
+    ));
+    // An unparsed hint earns time to discover metadata, not fabricated blocks
+    // or speculative verification state.
+    assert!(pipeline.par3_runtime.is_none());
+}
+
+#[tokio::test]
+async fn par3_recovery_windows_bound_47_and_81_articles_without_duplicate_admission() {
+    for count in [47, 81] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3210);
+        let mut spec = standalone_job_spec("window", &[("set.vol0+1.par3".into(), 750_000)]);
+        spec.files[0].role = FileRole::from_filename("set.vol0+1.par3");
+        spec.files[0].segments = (0..count).map(|number| segment_spec! {
+            number: number, bytes: 750_000, message_id: format!("window-{number}@example.test"),
+        }).collect();
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        // No index has arrived: exercise bounded ordinal discovery, without
+        // inventing authenticated packet positions or recovery counts.
+        let runtime = pipeline.par3_runtime.get_or_insert_with(Box::default);
+        runtime.admit(job_id).unwrap();
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        for work in state.download_queue.drain_all() {
+            state.recovery_queue.push(work);
+        }
+        let mut received = HashSet::new();
+        let mut windows = 0;
+        while received.len() < count as usize {
+            assert!(pipeline.promote_par3_recovery_window(job_id, false));
+            let size = pipeline.jobs[&job_id].download_queue.len();
+            assert_eq!(size, (count as usize - received.len()).min(32));
+            assert!(pipeline.promote_par3_recovery_window(job_id, false));
+            assert_eq!(pipeline.jobs[&job_id].download_queue.len(), size);
+            let work = pipeline
+                .jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .download_queue
+                .drain_all();
+            for item in work {
+                assert!(item.completion_critical);
+                assert_eq!(item.retry_count, 0);
+                assert!(item.exclude_servers.is_empty());
+                assert!(received.insert(item.segment_id));
+                // A parked article must not block the next window or lose its
+                // retry ownership. It is not put back in the source queue.
+                pipeline
+                    .pending_retries_by_segment
+                    .insert(item.segment_id, 1);
+            }
+            windows += 1;
+        }
+        assert_eq!(windows, (count as usize).div_ceil(32));
+        assert_eq!(pipeline.pending_retries_by_segment.len(), count as usize);
+        assert!(!pipeline.promote_par3_recovery_window(job_id, false));
+    }
+}
+
+#[tokio::test]
+async fn par3_windows_preserve_byte_limits_pause_and_unassessed_arrivals() {
+    for (article_bytes, prefetch, expected) in [
+        (18 << 20, false, 1),
+        (40 << 20, false, 1),
+        (9 << 20, true, 0),
+    ] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3211);
+        let name = "set.vol0+1.par3";
+        let mut spec = standalone_job_spec("bounded", &[(name.into(), article_bytes)]);
+        spec.files[0].role = FileRole::from_filename(name);
+        spec.files[0].segments = (0..3)
+            .map(|number| {
+                segment_spec! {
+                    number: number, bytes: article_bytes,
+                    message_id: format!("bounded-{number}@example.test"),
+                }
+            })
+            .collect();
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        pipeline
+            .par3_runtime
+            .get_or_insert_with(Box::default)
+            .admit(job_id)
+            .unwrap();
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        for work in state.download_queue.drain_all() {
+            state.recovery_queue.push(work);
+        }
+        state.status = JobStatus::Paused;
+        assert!(!pipeline.promote_par3_recovery_window(job_id, prefetch));
+        assert!(pipeline.jobs[&job_id].download_queue.is_empty());
+        pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Downloading;
+        assert_eq!(
+            pipeline.promote_par3_recovery_window(job_id, prefetch),
+            expected != 0
+        );
+        assert_eq!(pipeline.jobs[&job_id].download_queue.len(), expected);
+        if expected == 0 {
+            assert_eq!(pipeline.jobs[&job_id].recovery_queue.len(), 3);
+            continue;
+        }
+        let work = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .download_queue
+            .drain_all();
+        let file = work[0].segment_id.file_id;
+        pipeline.active_decodes_by_file.insert(file, 1);
+        assert!(pipeline.promote_par3_recovery_window(job_id, false));
+        assert!(
+            pipeline.jobs[&job_id].download_queue.is_empty(),
+            "decode must publish before another batch"
+        );
+        pipeline.active_decodes_by_file.remove(&file);
+        assert!(pipeline.promote_par3_recovery_window(job_id, false));
+        assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 1);
+    }
+}
+
+async fn settle_par3(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline.par3_runtime.as_ref().unwrap().has_work(job_id) {
+        let done =
+            tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        pipeline.handle_repair_work_done(done).await;
+    }
+}
+
+#[tokio::test]
+async fn par3_prefetch_requires_confirmed_protected_damage_and_runs_only_once() {
+    for mode in ["unprotected", "withdrawn", "absent"] {
+        let confirmed = mode != "unprotected";
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3220);
+        let files = [
+            (
+                "a.bin",
+                (0..5000u32).map(|i| (i * 7 + 3) as u8).collect::<Vec<_>>(),
+            ),
+            ("b.txt", b"qrstuvwxyz".to_vec()),
+            (
+                "sub/c.bin",
+                (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+            ),
+            ("set.par3", INDEX.to_vec()),
+            ("still-downloading.bin", Vec::new()),
+            ("set.vol0+1.par3", Vec::new()),
+        ];
+        let mut spec = standalone_job_spec(
+            "prefetch",
+            &files
+                .iter()
+                .map(|(name, bytes)| ((*name).into(), (bytes.len() as u32).max(750_000)))
+                .collect::<Vec<_>>(),
+        );
+        spec.files[3].role = FileRole::from_filename("set.par3");
+        spec.files[5].role = FileRole::from_filename("set.vol0+1.par3");
+        spec.files[5].segments = (0..16).map(|number| segment_spec! {
+            number: number, bytes: 750_000, message_id: format!("prefetch-{number}@example.test"),
+        }).collect();
+        let working = insert_active_job(&mut pipeline, job_id, spec).await;
+        tokio::fs::create_dir(working.join("sub")).await.unwrap();
+        for (index, (name, bytes)) in files[..4].iter().enumerate() {
+            if mode == "absent" && index == 0 {
+                continue;
+            }
+            tokio::fs::write(working.join(name), bytes).await.unwrap();
+            pipeline
+                .jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .assembly
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                })
+                .unwrap()
+                .mark_complete();
+        }
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .download_queue
+            .extract_matching(|work| work.segment_id.file_id.file_index < 4);
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 3,
+                },
+            )
+            .await;
+        settle_par3(&mut pipeline, job_id).await;
+        let missing = SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: if confirmed { 0 } else { 4 },
+            },
+            segment_number: 0,
+        };
+        pipeline
+            .segment_terminal_states
+            .insert(missing, SegmentTerminalState::Missing);
+        if mode == "withdrawn" {
+            // Withdraw verification while retaining the authenticated binding.
+            pipeline.invalidate_par3_source_write(missing.file_id);
+        }
+        pipeline.maybe_prefetch_par3_recovery(job_id);
+        let promoted = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .download_queue
+            .extract_matching(|work| work.segment_id.file_id.file_index == 5);
+        if confirmed {
+            assert!(!promoted.is_empty());
+            assert!(promoted.len() <= 8);
+            assert!(
+                promoted
+                    .iter()
+                    .map(|work| u64::from(work.byte_estimate))
+                    .sum::<u64>()
+                    <= 8 << 20
+            );
+        } else {
+            assert!(
+                promoted.is_empty(),
+                "an unprotected missing article cannot justify prefetch"
+            );
+        }
+        assert_eq!(
+            pipeline.jobs[&job_id].download_queue.len(),
+            1,
+            "ordinary payload remains queued"
+        );
+        pipeline.maybe_prefetch_par3_recovery(job_id);
+        assert_eq!(
+            pipeline.jobs[&job_id].download_queue.len(),
+            1,
+            "a parked or transient window cannot repeat prefetch"
+        );
+        for work in promoted {
+            assert_eq!(work.retry_count, 0);
+            assert!(work.exclude_servers.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn damaged_obfuscated_par3_payload_retires_inferred_split_topology() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job = JobId(3199);
+    let name = "51273aad56a8b904e96928935278a627.201";
+    let expected: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
+    let mut damaged = expected.clone();
+    damaged[2200..2232].fill(0);
+    let files = [
+        (name, damaged),
+        ("b.txt", b"qrstuvwxyz".to_vec()),
+        (
+            "sub/c.bin",
+            (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+        ),
+        ("set.par3", INDEX.to_vec()),
+        (
+            "set.vol0+1.par3",
+            include_bytes!("../repair/backend/fixtures/set.vol0+1.par3").to_vec(),
+        ),
+    ];
+    let mut spec = standalone_job_spec(
+        "damaged obfuscated payload",
+        &files
+            .iter()
+            .map(|(name, bytes)| ((*name).into(), bytes.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    let working = insert_active_job(&mut pipeline, job, spec).await;
+    tokio::fs::create_dir(working.join("sub")).await.unwrap();
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job, index as u32, name, bytes).await;
+        pipeline
+            .try_load_par3_metadata(
+                job,
+                NzbFileId {
+                    job_id: job,
+                    file_index: index as u32,
+                },
+            )
+            .await;
+    }
+    pipeline.jobs.get_mut(&job).unwrap().download_queue = DownloadQueue::new();
+    for _ in 0..20 {
+        settle_par3(&mut pipeline, job).await;
+        if pipeline.par3_runtime.as_ref().unwrap().verified(job) {
+            break;
+        }
+        pipeline.check_par3_completion(job).await;
+    }
+    assert!(pipeline.par3_runtime.as_ref().unwrap().verified(job));
+    assert_eq!(
+        tokio::fs::read(working.join("a.bin")).await.unwrap(),
+        expected
+    );
+    assert!(pipeline.jobs[&job].assembly.archive_topologies().is_empty());
+    assert!(!pipeline.check_par3_completion(job).await);
+    for _ in 0..12 {
+        pipeline.check_job_completion(job).await;
+        while pipeline
+            .inflight_extractions
+            .get(&job)
+            .is_some_and(|sets| !sets.is_empty())
+        {
+            let done = next_extraction_done(&mut pipeline).await;
+            pipeline.handle_extraction_done(done).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if !pipeline.jobs.contains_key(&job) {
+            break;
+        }
+    }
+    let delivered = pipeline.complete_dir.join("damaged obfuscated payload");
+    assert_eq!(
+        tokio::fs::read(delivered.join("a.bin")).await.unwrap(),
+        expected
+    );
+    assert!(
+        !delivered.join(name).exists(),
+        "do not deliver the damaged donor"
+    );
+}
+
+#[tokio::test]
+async fn par3_repairs_an_interior_article_hole_and_reconciles_completion() {
+    assert_par3_repairs_from_status(JobStatus::Downloading, false).await;
+}
+
+#[tokio::test]
+async fn par3_repair_can_follow_retired_extraction_work() {
+    for status in [JobStatus::Extracting, JobStatus::QueuedExtract] {
+        assert_par3_repairs_from_status(status, false).await;
+    }
+}
+
+#[tokio::test]
+async fn par3_demoted_materialized_ranges_repair_without_par2_placements() {
+    assert_par3_repairs_from_status(JobStatus::Downloading, true).await;
+}
+
+async fn assert_par3_repairs_from_status(status: JobStatus, materialized: bool) {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3103);
+    let expected: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
+    let recovery = include_bytes!("../repair/backend/fixtures/set.vol0+1.par3");
+    let files = [
+        ("a.bin", expected.clone()),
+        ("b.txt", b"qrstuvwxyz".to_vec()),
+        (
+            "sub/c.bin",
+            (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+        ),
+        ("set.par3", INDEX.to_vec()),
+        ("set.vol0+1.par3", recovery.to_vec()),
+    ];
+    let mut spec = standalone_job_spec(
+        "PAR3 article hole",
+        &files
+            .iter()
+            .map(|(name, bytes)| ((*name).into(), bytes.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    spec.files[0].segments = [2100, 2100, 1100]
+        .into_iter()
+        .enumerate()
+        .map(|(number, bytes)| {
+            segment_spec! {
+                number: number as u32, bytes: bytes, message_id: format!("hole-{number}@example.com"),
+            }
+        })
+        .collect();
+    for file in &mut spec.files[3..] {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    let working = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::create_dir(working.join("sub")).await.unwrap();
+    let mut damaged = expected.clone();
+    damaged[2000..4000].fill(0);
+    tokio::fs::write(working.join("a.bin"), damaged)
+        .await
+        .unwrap();
+    {
+        let file = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .assembly
+            .file_mut(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .unwrap();
+        if !materialized {
+            file.record_placement(0, 0, 2000);
+        }
+        file.commit_segment(0, 2000).unwrap();
+        if !materialized {
+            file.record_placement(2, 4000, 1000);
+        }
+        file.commit_segment(2, 1000).unwrap();
+    }
+    for (index, (name, bytes)) in files.iter().enumerate().skip(1) {
+        write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                },
+            )
+            .await;
+    }
+    if materialized {
+        pipeline
+            .par3_runtime
+            .as_mut()
+            .unwrap()
+            .note_materialized_ranges(
+                job_id,
+                par3_rs::source::SourceId(0),
+                &[(0, 2000), (4000, 1000)],
+            );
+        pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+            )
+            .await;
+    }
+    let clean_stamp = tokio::fs::metadata(working.join("sub/c.bin"))
+        .await
+        .unwrap()
+        .modified()
+        .unwrap();
+    settle_par3(&mut pipeline, job_id).await;
+    assert_eq!(
+        pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .assessments(job_id)
+            .next()
+            .unwrap()
+            .1
+            .status,
+        par3_rs::session::RepairStatus::Ready
+    );
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.status = status;
+        state.refresh_runtime_lanes_from_status();
+    }
+    assert!(pipeline.check_par3_completion(job_id).await);
+    assert!(matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Repairing
+    ));
+    settle_par3(&mut pipeline, job_id).await;
+    assert_eq!(
+        tokio::fs::read(working.join("a.bin")).await.unwrap(),
+        expected
+    );
+    assert!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: 0
+            })
+            .unwrap()
+            .is_complete()
+    );
+    assert_eq!(
+        pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .assessments(job_id)
+            .next()
+            .unwrap()
+            .1
+            .status,
+        par3_rs::session::RepairStatus::Complete
+    );
+    assert_eq!(
+        tokio::fs::metadata(working.join("sub/c.bin"))
+            .await
+            .unwrap()
+            .modified()
+            .unwrap(),
+        clean_stamp
+    );
+    let repaired = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let repaired_file = pipeline.jobs[&job_id].assembly.file(repaired).unwrap();
+    assert_eq!(
+        repaired_file.received_bytes(),
+        expected.len() as u64,
+        "PAR3 completion must preserve decoded length despite encoded declarations"
+    );
+    let verifications = pipeline
+        .par3_runtime
+        .as_ref()
+        .unwrap()
+        .source_verifications(job_id);
+    // Discovery can run again after repair invalidates an earlier negative
+    // probe. It must not republish the old article hole over the installed file.
+    for _ in 0..3 {
+        pipeline.try_load_par3_metadata(job_id, repaired).await;
+        settle_par3(&mut pipeline, job_id).await;
+        assert!(pipeline.par3_runtime.as_ref().unwrap().verified(job_id));
+        assert_eq!(
+            pipeline
+                .par3_runtime
+                .as_ref()
+                .unwrap()
+                .source_verifications(job_id),
+            verifications
+        );
+    }
+    assert!(!pipeline.check_par3_completion(job_id).await);
+    assert!(!pipeline.par2_verified.contains(&job_id));
+}
+
+#[tokio::test]
+async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
+    for damaged in [false, true] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3102);
+        let mut payload: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
+        if damaged {
+            payload[2300] ^= 1;
+        }
+        let files = [
+            ("a.bin", payload),
+            ("b.txt", b"qrstuvwxyz".to_vec()),
+            (
+                "sub/c.bin",
+                (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+            ),
+            ("set.par3", INDEX.to_vec()),
+        ];
+        let mut spec = standalone_job_spec(
+            "PAR3 assessment",
+            &files
+                .iter()
+                .map(|(name, bytes)| ((*name).to_owned(), bytes.len() as u32))
+                .collect::<Vec<_>>(),
+        );
+        spec.files[3].role = FileRole::from_filename("set.par3");
+        let working = insert_active_job(&mut pipeline, job_id, spec).await;
+        tokio::fs::create_dir(working.join("sub")).await.unwrap();
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+            pipeline
+                .try_load_par3_metadata(
+                    job_id,
+                    NzbFileId {
+                        job_id,
+                        file_index: index as u32,
+                    },
+                )
+                .await;
+        }
+        while pipeline.par3_runtime.as_ref().unwrap().has_work(job_id) {
+            let done =
+                tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            pipeline.handle_repair_work_done(done).await;
+        }
+        // No recovery candidates remain in this fixture. The scheduler can now
+        // authorize sliding discovery, including after a later source change.
+        assert!(
+            pipeline
+                .par3_runtime
+                .as_mut()
+                .unwrap()
+                .request_donor_search(job_id)
+                .unwrap()
+        );
+        settle_par3(&mut pipeline, job_id).await;
+        let views: Vec<_> = pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .assessments(job_id)
+            .collect();
+        assert_eq!(views.len(), 1);
+        let view = views[0].1;
+        assert_eq!(
+            view.status,
+            if damaged {
+                par3_rs::session::RepairStatus::Ready
+            } else {
+                par3_rs::session::RepairStatus::Complete
+            }
+        );
+        assert_eq!(
+            view.files.iter().filter(|file| file.complete).count(),
+            if damaged { 2 } else { 3 }
+        );
+        if damaged {
+            assert_eq!(view.files[0].unresolved.len(), 1);
+            assert_eq!(view.files[0].unresolved[0], 2000..4000);
+            // This official input repeats every 256 bytes. The damaged
+            // block has a strong donor elsewhere in the same file; it still
+            // needs installation, but no recovery download.
+            assert!(view.requirements.is_empty());
+        }
+        let expected_counts = if damaged { [0, 1, 0, 0] } else { [1, 0, 0, 0] };
+        let reads = pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .source_verifications(job_id);
+        for _ in 0..3 {
+            pipeline.note_par3_verification(job_id);
+            pipeline.note_job_unverifiable_if_no_par2_set(job_id);
+            assert_eq!(par3_verification_counts(&pipeline), expected_counts);
+            assert_eq!(
+                pipeline
+                    .par3_runtime
+                    .as_ref()
+                    .unwrap()
+                    .source_verifications(job_id),
+                reads
+            );
+        }
+        let source = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        pipeline.invalidate_par2_session_for_file_write(source);
+        pipeline.note_par3_verification(job_id);
+        assert_eq!(par3_verification_counts(&pipeline), expected_counts);
+        assert_eq!(
+            pipeline
+                .par3_runtime
+                .as_ref()
+                .unwrap()
+                .assessments(job_id)
+                .count(),
+            0
+        );
+        let mut replacement = files[0].1.clone();
+        replacement[2300] ^= 1;
+        tokio::fs::write(working.join("a.bin"), replacement)
+            .await
+            .unwrap();
+        pipeline.try_load_par3_metadata(job_id, source).await;
+        while pipeline.par3_runtime.as_ref().unwrap().has_work(job_id) {
+            let done =
+                tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            pipeline.handle_repair_work_done(done).await;
+        }
+        let (_, view) = pipeline
+            .par3_runtime
+            .as_ref()
+            .unwrap()
+            .assessments(job_id)
+            .next()
+            .unwrap();
+        assert_eq!(
+            view.status,
+            if damaged {
+                par3_rs::session::RepairStatus::Complete
+            } else {
+                par3_rs::session::RepairStatus::Ready
+            }
+        );
+        pipeline.note_job_unverifiable_if_no_par2_set(job_id);
+        assert_eq!(par3_verification_counts(&pipeline), [1, 1, 0, 0]);
+    }
+}
+
+fn par3_verification_counts(pipeline: &Pipeline) -> [u64; 4] {
+    let snapshot = pipeline.metrics.job_lifecycle.snapshot();
+    ["intact", "damaged", "missing", "unverifiable"].map(|outcome| {
+        snapshot
+            .verifications
+            .iter()
+            .find(|(name, _)| *name == outcome)
+            .unwrap()
+            .1
+    })
+}
+
+#[test]
+fn repair_completion_envelope_preserves_par2_queue_payload_size() {
+    assert_eq!(
+        std::mem::size_of::<RepairWorkDone>(),
+        std::mem::size_of::<Par2AnalysisWorkDone>()
+    );
+}
+
+#[tokio::test]
+async fn par2_only_publications_create_no_par3_runtime_or_worker_queue() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3100);
+    let spec = standalone_job_spec(
+        "PAR2 isolation",
+        &[("payload.bin".into(), 4), ("set.par2".into(), 8)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, name, bytes) in [
+        (0, "payload.bin", &b"data"[..]),
+        (1, "set.par2", &b"PAR2\0PKT"[..]),
+    ] {
+        write_and_complete_file(&mut pipeline, job_id, file_index, name, bytes).await;
+        let file_id = NzbFileId { job_id, file_index };
+        pipeline.file_prefix_16k.insert(file_id, bytes.to_vec());
+        pipeline.try_load_par3_metadata(job_id, file_id).await;
+        assert!(pipeline.par3_runtime.is_none());
+    }
+}
+
+#[tokio::test]
+async fn completion_waits_for_authenticated_carrier_worker_including_renamed_input() {
+    for filename in ["set.par3", "renamed.bin"] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3101);
+        let mut spec =
+            standalone_job_spec("PAR3 discovery", &[(filename.into(), INDEX.len() as u32)]);
+        spec.files[0].role = FileRole::from_filename(filename);
+        let working = insert_active_job(&mut pipeline, job_id, spec).await;
+        write_and_complete_file(&mut pipeline, job_id, 0, filename, INDEX).await;
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 0,
+        };
+        pipeline
+            .file_prefix_16k
+            .insert(file_id, INDEX[..64].to_vec());
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state.download_queue = DownloadQueue::new();
+            state.status = JobStatus::Downloading;
+            state.refresh_runtime_lanes_from_status();
+        }
+        pipeline.try_load_par3_metadata(job_id, file_id).await;
+        assert!(pipeline.par3_runtime.as_ref().unwrap().has_work(job_id));
+        pipeline.check_job_completion(job_id).await;
+        assert!(matches!(
+            pipeline.jobs[&job_id].status,
+            JobStatus::Downloading
+        ));
+        let jobs = pipeline.list_jobs();
+        let visible = jobs.iter().find(|job| job.job_id == job_id).unwrap();
+        assert!(matches!(visible.status, JobStatus::Verifying));
+        assert_eq!(visible.post_state, crate::jobs::model::PostState::Verifying);
+        assert!(!visible.finalizing_download);
+        assert!(!visible.fetching_repair_data);
+        assert!(working.join(filename).exists());
+        let done =
+            tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        pipeline.handle_repair_work_done(done).await;
+        let coordinator = pipeline.par3_runtime.as_ref().unwrap();
+        assert!(!coordinator.has_work(job_id));
+        assert_eq!(coordinator.authenticated_set_count(job_id), 1);
+        pipeline.clear_par2_runtime_state(job_id);
+        assert_eq!(
+            pipeline
+                .par3_runtime
+                .as_ref()
+                .unwrap()
+                .authenticated_set_count(job_id),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn restored_completed_images_are_reverified_without_article_placements() {
+    for changed in [false, true] {
+        let root = TempDir::new().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+        let job_id = JobId(3111);
+        let mut files = [
+            (
+                "a.bin",
+                (0..5000u32).map(|i| (i * 7 + 3) as u8).collect::<Vec<_>>(),
+            ),
+            ("b.txt", b"qrstuvwxyz".to_vec()),
+            (
+                "sub/c.bin",
+                (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+            ),
+            ("set.par3", INDEX.to_vec()),
+        ];
+        if changed {
+            files[0].1[123] ^= 1;
+        }
+        let mut spec = standalone_job_spec(
+            "PAR3 restored images",
+            &files
+                .iter()
+                .map(|(name, bytes)| ((*name).into(), bytes.len() as u32 + 333))
+                .collect::<Vec<_>>(),
+        );
+        spec.files[3].role = FileRole::from_filename("set.par3");
+        let working = insert_active_job(&mut pipeline, job_id, spec).await;
+        tokio::fs::create_dir(working.join("sub")).await.unwrap();
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            tokio::fs::write(working.join(name), bytes).await.unwrap();
+            let file = pipeline
+                .jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .assembly
+                .file_mut(NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                })
+                .unwrap();
+            file.mark_complete();
+            assert!(file.placement_of(0).is_none());
+            // Ordinary restore progress may use the NZB's encoded units.
+            // Native availability must still come from the actual disk image.
+            pipeline.persisted_file_progress.insert(
+                NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                },
+                bytes.len() as u64 + 333,
+            );
+        }
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 3,
+                },
+            )
+            .await;
+        settle_par3(&mut pipeline, job_id).await;
+        let runtime = pipeline.par3_runtime.as_ref().unwrap();
+        assert_eq!(runtime.verified(job_id), !changed);
+        if changed {
+            assert_eq!(
+                runtime.assessments(job_id).next().unwrap().1.status,
+                par3_rs::session::RepairStatus::NeedRecovery
+            );
+            assert!(
+                pipeline
+                    .par3_runtime
+                    .as_mut()
+                    .unwrap()
+                    .request_donor_search(job_id)
+                    .unwrap()
+            );
+            settle_par3(&mut pipeline, job_id).await;
+        }
+        let runtime = pipeline.par3_runtime.as_ref().unwrap();
+        let (_, view) = runtime.assessments(job_id).next().unwrap();
+        assert_eq!(
+            view.files.iter().filter(|file| file.complete).count(),
+            if changed { 2 } else { 3 }
+        );
+        if changed {
+            assert_eq!(view.status, par3_rs::session::RepairStatus::Ready);
+            assert!(
+                view.requirements.is_empty(),
+                "repeated source bytes donate the damaged block"
+            );
+        }
+    }
+}

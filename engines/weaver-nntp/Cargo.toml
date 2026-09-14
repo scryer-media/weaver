@@ -8,6 +8,7 @@ license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
+weaver-tunnel = { path = "../weaver-tunnel" }
 weaver-yenc = { path = "../weaver-yenc", default-features = false }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -33,6 +34,7 @@ s2n-tls-tokio = "0.3.43"
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
+weaver-tunnel = { path = "../weaver-tunnel", features = ["test-support"] }
 criterion = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,30 +1,12 @@
 use super::*;
 
 impl Pipeline {
-    pub(crate) fn maybe_service_deferred_lane_refills(&mut self) {
-        if self.deferred_lane_refills.is_empty() {
-            return;
-        }
-        if self.refresh_download_pressure().state == DownloadPressureState::Hard {
-            return;
-        }
-        let mut pending = std::mem::take(&mut self.deferred_lane_refills);
-        while let Some(request) = pending.pop_front() {
-            self.handle_download_lane_refill_request(request);
-            if !self.deferred_lane_refills.is_empty() {
-                // Granting re-latched hard pressure and the handler re-deferred
-                // this request; stop and keep the rest queued in arrival order.
-                break;
-            }
-        }
-        self.deferred_lane_refills.append(&mut pending);
-    }
-
     pub(crate) fn handle_download_lane_refill_request(
         &mut self,
         request: DownloadLaneRefillRequest,
     ) {
         let DownloadLaneRefillRequest {
+            lane_id,
             job_id,
             runtime_generation,
             server_idx,
@@ -36,7 +18,7 @@ impl Pipeline {
             response_tx,
         } = request;
         let batch_class = DownloadBatchClass::from(&compatibility);
-        if runtime_generation != self.pool_generation {
+        if runtime_generation != self.pool_generation || !self.download_lane_is_live(lane_id) {
             let _ = response_tx.send(DownloadLaneRefillResponse {
                 lease: None,
                 park_reason: LaneParkReason::Error,
@@ -45,15 +27,19 @@ impl Pipeline {
         }
         let now = Instant::now();
         let mut park_reason = LaneParkReason::NoWork;
+        // Set when the dispatch pass has asked non-critical lanes to give
+        // their connections back. The lane still gets its refill; what the
+        // flag decides is whether a refill that came back non-critical is
+        // handed over or rolled back into a yield.
+        let mut yield_unless_critical = false;
         let mut allow_refill = !self.global_paused && !self.rate_limiter.should_wait();
         if !allow_refill {
             self.hot_share_yield_signal.clear();
         }
-        let lane_ip_key = ServerIpKey {
-            server_idx,
-            ip: remote_ip,
-        };
-        if self.ip_replacement_retired_ips.contains(&lane_ip_key) {
+        if remote_ip.is_some_and(|ip| {
+            self.ip_replacement_retired_ips
+                .contains(&ServerIpKey { server_idx, ip })
+        }) {
             allow_refill = false;
             park_reason = LaneParkReason::IpReplacementRetired;
         }
@@ -77,26 +63,17 @@ impl Pipeline {
 
         let pressure = self.refresh_download_pressure();
         // Soft pressure shrinks the lease (see download_lane_lease_work_limit) instead of
-        // idling the lane. Hard pressure holds the request until the backlog drains: the
-        // lane blocks on its oneshot either way, and answering on the pressure transition
-        // avoids a park/redispatch round-trip per stall.
+        // idling the lane. Hard pressure parks the lane instead of holding the request:
+        // a lane blocked on its refill answer keeps its socket and its pool permit for
+        // as long as the backlog takes to drain, and nothing bounds that wait. Parking
+        // releases the permit; the dispatch wake once pressure clears redispatches.
         if allow_refill && pressure.state == DownloadPressureState::Hard {
-            self.deferred_lane_refills
-                .push_back(DownloadLaneRefillRequest {
-                    job_id,
-                    runtime_generation,
-                    server_idx,
-                    remote_ip,
-                    supports_pipelining,
-                    current_mode,
-                    spillover_loan_kind,
-                    compatibility,
-                    response_tx,
-                });
             self.metrics
                 .download_lane_refill_deferred_total
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            self.hot_share_yield_signal.clear();
+            allow_refill = false;
+            park_reason = LaneParkReason::Pressure;
         }
 
         if allow_refill {
@@ -143,8 +120,12 @@ impl Pipeline {
                     if !batch_class.completion_critical
                         && self.hot_share_yield_signal.is_requested() =>
                 {
-                    allow_refill = false;
-                    park_reason = LaneParkReason::HotShareYield;
+                    // …but only after this lane has been offered the critical
+                    // work itself. A connection that can serve it is worth
+                    // more here than the same connection redialled by the next
+                    // pass, so the refill runs and is judged on the class it
+                    // came back with.
+                    yield_unless_critical = true;
                 }
                 // A completion-critical lane has no cap and the hot job's own
                 // regular lane is never reclaimed for capacity reasons — hot
@@ -217,8 +198,24 @@ impl Pipeline {
         } else {
             None
         };
+        // The yield was asked for so that completion-critical demand could have
+        // this connection. If the refill found critical work for the lane
+        // itself, the demand is served here and there is nothing to yield; if
+        // it came back with ordinary payload, that payload goes back to the
+        // queue and the connection is returned as asked.
+        if yield_unless_critical
+            && !lease
+                .as_ref()
+                .is_some_and(|lease| lease.compatibility.completion_critical)
+        {
+            if let Some(lease) = lease.take() {
+                self.rollback_download_batch_lease(lease);
+            }
+            park_reason = LaneParkReason::HotShareYield;
+        }
         if let Some(lease) = lease.as_mut() {
             lease.spillover_loan_kind = spillover_loan_kind;
+            lease.lane_id = lane_id;
         }
 
         let Some(lease) = lease else {
@@ -258,13 +255,12 @@ impl Pipeline {
         };
 
         // Stage two of the refill may re-open the lease around another work
-        // item's compatibility, so the class booked here is the lease's, not
-        // the request's. Both agree by construction — the class and the
-        // recovery flag a lane is counted under never change while it runs —
-        // and reading it from the lease is what keeps that true if they ever
-        // diverge.
-        let batch_class = DownloadBatchClass::from(&lease.compatibility);
+        // item's compatibility, and the critical-first path deliberately
+        // does — so the class booked here is the lease's, not the request's,
+        // and the difference between the two is a class change to settle.
+        let granted_class = DownloadBatchClass::from(&lease.compatibility);
         let activation_items = Self::activation_items(&lease);
+        let progress_article = self.checkpoint_progress_article_for_lease(&lease);
         let next_mode = Self::actual_download_lane_mode(
             lease.lane_mode,
             &lease.server_modes,
@@ -272,17 +268,30 @@ impl Pipeline {
             supports_pipelining,
         );
         let work_count = lease.works.len();
+        let booked_works = lease.works.clone();
         match response_tx.send(DownloadLaneRefillResponse {
             lease: Some(lease),
             park_reason: LaneParkReason::NoWork,
         }) {
             Ok(()) => {
+                if let Some(owner) = self.download_lane_owners.get_mut(&lane_id) {
+                    owner.mode = next_mode;
+                    owner.completion_critical = granted_class.completion_critical;
+                    owner
+                        .outstanding
+                        .extend(booked_works.into_iter().map(|work| (work.segment_id, work)));
+                }
+                if let Some(segment_id) = progress_article {
+                    self.checkpoint_progress_articles
+                        .insert(job_id, (lane_id, segment_id));
+                }
                 self.metrics
                     .download_lane_refill_granted_total
                     .fetch_add(1, Ordering::Relaxed);
+                self.rebook_download_lane_class(job_id, batch_class, granted_class);
                 self.activate_download_batch(
                     job_id,
-                    batch_class,
+                    granted_class,
                     next_mode,
                     work_count,
                     &activation_items,

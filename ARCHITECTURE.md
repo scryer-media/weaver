@@ -202,6 +202,29 @@ That means:
 
 If memory growth is unbounded, the feature is not done.
 
+UU spool admission limits apply only to files identified as UU. A capped UU
+file may still fetch the article that advances its sequential assembly cursor.
+yEnc and files of unknown encoding retain normal dispatch, batching, refill,
+and spillover behavior; decode enforces the UU park limits when an article
+first identifies a file as UU. Disk-spooled UU bytes do not count toward shared
+memory pressure. Resident bytes remain subject to the shared memory budgets.
+
+Free-space gates (UU spool, direct-store scratch, extraction reserve) share
+one rule: a filesystem that cannot be measured is not evidence that it is
+full. UU and extraction use the operations capacity sampler; holds scratch
+maintains its own cached estimate. Both keep and debit the last good reading
+across probe failures. The operations sampler logs outage/recovery transitions
+and starts each probe's TTL when the attempt finishes, so a slow syscall cannot
+expire its own cache lifetime. Active storage checks probe the exact root;
+ancestor capacity is only an advisory startup estimate. A fresh reading that confirms
+the reserve is gone refuses; a stale or unknown reading never fails a job on
+its own. The only place "unknown" refuses is a write that needs a reading to be
+judged at all (a UU spill), and that refusal is a requeue, not a failure.
+After a spill is refused, known UU files dispatch cursor work until the refused
+bytes fit in memory or the spool. This prevents successful tail articles from
+being repeatedly fetched and discarded during an outage. Memory parking for
+in-flight arrivals remains available; yEnc keeps its normal batching/refill path.
+
 ### 8. Shared Mutable Runtime State Must Be Explicit
 
 Shared mutable runtime coordination must stay explicit and centrally owned.
@@ -256,6 +279,22 @@ Weaver-web should feel rich, but it should still be a projection client over bac
 ### 11. Engine Crates Are Real Boundaries, Not Product Homes
 
 NNTP, NZB, yEnc, PAR2, and RAR are real engine boundaries.
+
+The NNTP engine owns physical socket admission per durable server. A socket
+retains its slot through dialing, handshake, active use, idle caching and local
+closure, across client generations and transport backends. Dispatch bookings
+are separate from that budget. Reclaiming an idle transport targets its owner
+and socket identity; only closure refunds its slot. Explicit IP-replacement
+trials have a separate, bounded allowance.
+
+Transport quarantine has connection-scoped outcomes and recovery epochs. Old
+socket outcomes cannot settle a new episode. Recovery admits one fresh,
+demanded article; a completed BODY response or valid not-found response proves
+recovery, while handshake alone does not. The server actor returns surplus
+article reservations before issuing that probe. Transport retries start at
+30 seconds and cap at 60 seconds; authentication and provider capacity refusals
+retain their separate policies. Idle inspection processes transport state
+without article work, with bounded input and no blocking waits.
 
 Those crates should own protocol and algorithm concerns. They should not own product semantics such as:
 
@@ -324,6 +363,12 @@ Weaver should keep explicit homes for:
 
 These areas may interact, but they should not collapse into one generic config bucket or one giant `config.rs`.
 
+Propagation delay is a persisted General setting in seconds and defaults to
+zero. A saved value takes precedence over `WEAVER_PROPAGATION_DELAY_SECS`.
+Changes recalculate waiting jobs immediately. A propagation hold is projected
+as queued with a download-wait reason and deadline, so clients can distinguish
+it from active downloading without changing the persisted job lifecycle.
+
 ### History, Metrics, and Logs Are Projections, Not Alternate Truth
 
 Operator-facing history, metrics, and logs are important, but they are projections over authoritative backend state and runtime behavior.
@@ -341,7 +386,66 @@ That means:
 - extraction rules stay explicit
 - file-role and archive-topology logic should live in coherent modules, not be scattered through unrelated helpers
 
+ZIP and ZIP64 direct unpack share the completed-file ZIP decoder. During a
+download, the reader exposes only committed byte ranges, including prioritized
+central-directory articles; sparse file length is never evidence of coverage.
+ZIP64 sizes and offsets remain 64-bit through seeking and extraction. A chase's
+staged output is installed only after verification and repair settle. Repair
+that may change consumed bytes discards that output and uses the repaired archive.
+
+TAR, compressed TAR, gzip, bzip2, XZ, Zstandard, Brotli, and DEFLATE use shared
+sequential decoders during download and at completion. Sequential chases start
+without knowing the archive length: gaps wait for committed bytes and EOF comes
+from the completed final part. Compressed TAR consumes its outer trailer before
+accepting output. Plain split sets join through the same reader after their
+ordered topology is known. All use the existing cancellation, resource budgets,
+staging, and PAR2 invalidation lifecycle. A verified joined file produced by PAR2
+takes precedence over a chase of its source parts.
+
 ### Engine Boundaries Stay Explicit
+
+`pipeline/repair/backend` is the operation boundary for retained PAR2 and PAR3
+engines. It preserves native assessments, evidence, source invalidation, errors,
+and repair requests. Calls are statically dispatched above block I/O; PAR2's
+readers, checksum substitutions, and buffer limits remain native. PAR3 carrier
+roles control discovery priority; authenticated packets alone establish set
+membership and recovery availability. Carrier scans run on blocking workers and
+retain lazy payload references. Extending visibility over unchanged disk backing
+preserves the scanner and pending packet hash; replay checks the path and logical
+generation before reusing progress. Published coverage keeps holes unavailable.
+Visibility extensions over unchanged backing retain source evidence, while
+actual writes withdraw it. Completed conventional files bind through committed
+decoded placements; restored complete disk images without placements are candidates
+for fresh verification. Native
+sessions retain their evidence, while bounded actor views carry file-coordinate
+damage and matrix/cohort requirements. Pending publications hide prior views;
+the shared worker queue rotates between PAR3 jobs. Conventional writes withdraw
+coverage before disk mutation, and worker epochs reject stale handbacks. Identity
+rebindings retire the corresponding source publications for fresh binding.
+`pipeline/repair/par3/coordination` keeps cross-format handoffs above block I/O.
+PAR2 recovery estimates exclude PAR3 carriers. PAR2 gets the first repair attempt;
+its writes fence the affected PAR3 sources and republish the installed images for
+fresh verification, retaining clean sibling evidence. After PAR2 exhausts its
+recovery, admitted PAR3 work can repair the shared files; affected PAR2 sets then
+verify the new bytes themselves. Conflicting native verdicts refuse delivery.
+Temporary handoff lists use the PAR3 host budget; PAR2-only jobs allocate none.
+Conventional PAR3 completion requests individual recovery articles and dispatches native
+staged repairs. Verified installed files reconcile assembly and persistence without
+translating PAR3 fingerprints into PAR2 MD5. PAR3 reads direct volume images through
+a separately bounded reader, retaining cipher frontiers and checking backing
+generations. Direct finalization waits for verification and application of the
+native verdict to the router's deferred archive checks. A verified native session
+alone cannot demote or finalize a set with those checks still pending. Live direct sets receive
+verified replacement volumes in bounded, generation-checked readback tickets.
+Set-wide transactions defer integrity checks and checkpoints until every affected
+volume is placed. Encrypted readback captures neighbour CBC edges from the known
+part layout before shared partials change, including bytes in other repaired
+volumes that never arrived. Coverage is admitted after placement and conventional
+completed-file rows are suppressed for those virtual sources. Earlier
+archive-checksum demotions still use conventional repair.
+Shared mutation views and restart evidence remain under integration. The implementation
+record and remaining acceptance gates live in
+[the PAR3 integration plan](docs/par3-integration-plan.md).
 
 Engine crates should remain sharp and focused:
 

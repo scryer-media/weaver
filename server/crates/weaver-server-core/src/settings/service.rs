@@ -5,7 +5,7 @@ use crate::persistence::Database;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
-    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, TunerOverrides,
+    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -31,6 +31,9 @@ impl Database {
             .and_then(|v| v.parse().ok());
         let ip_replacement_trial_extra_connections = settings
             .get("ip_replacement_trial_extra_connections")
+            .and_then(|v| v.parse().ok());
+        let propagation_delay_secs = settings
+            .get("propagation_delay_secs")
             .and_then(|v| v.parse().ok());
         let cleanup_after_extract = settings
             .get("cleanup_after_extract")
@@ -125,27 +128,6 @@ impl Database {
             }
         };
 
-        let tuner = {
-            let max_dl = settings
-                .get("tuner.max_concurrent_downloads")
-                .and_then(|v| v.parse().ok());
-            let decode_threads = settings
-                .get("tuner.decode_thread_count")
-                .and_then(|v| v.parse().ok());
-            let extract_threads = settings
-                .get("tuner.extract_thread_count")
-                .and_then(|v| v.parse().ok());
-            if max_dl.is_some() || decode_threads.is_some() || extract_threads.is_some() {
-                Some(TunerOverrides {
-                    max_concurrent_downloads: max_dl,
-                    decode_thread_count: decode_threads,
-                    extract_thread_count: extract_threads,
-                })
-            } else {
-                None
-            }
-        };
-
         let retry = {
             let max_retries = settings
                 .get("retry.max_retries")
@@ -174,13 +156,25 @@ impl Database {
             let enabled = settings
                 .get("direct_store.enabled")
                 .and_then(|v| v.parse().ok());
-            let holds_scratch_ceiling_bytes = settings
-                .get("direct_store.holds_scratch_ceiling_bytes")
-                .and_then(|v| v.parse().ok());
-            if enabled.is_some() || holds_scratch_ceiling_bytes.is_some() {
+            let bytes_setting = |key: &str| settings.get(key).and_then(|v| v.parse::<u64>().ok());
+            let holds_scratch_ceiling_bytes =
+                bytes_setting("direct_store.holds_scratch_ceiling_bytes");
+            let holds_resident_limit_bytes =
+                bytes_setting("direct_store.holds_resident_limit_bytes");
+            let holds_scratch_total_bytes = bytes_setting("direct_store.holds_scratch_total_bytes");
+            let holds_disk_reserve_bytes = bytes_setting("direct_store.holds_disk_reserve_bytes");
+            if enabled.is_some()
+                || holds_scratch_ceiling_bytes.is_some()
+                || holds_resident_limit_bytes.is_some()
+                || holds_scratch_total_bytes.is_some()
+                || holds_disk_reserve_bytes.is_some()
+            {
                 Some(DirectStoreOverrides {
                     enabled,
                     holds_scratch_ceiling_bytes,
+                    holds_resident_limit_bytes,
+                    holds_scratch_total_bytes,
+                    holds_disk_reserve_bytes,
                 })
             } else {
                 None
@@ -256,7 +250,6 @@ impl Database {
             intermediate_dir,
             complete_dir,
             buffer_pool,
-            tuner,
             servers,
             categories,
             retry,
@@ -264,6 +257,7 @@ impl Database {
             cleanup_after_extract,
             isp_bandwidth_cap,
             ip_replacement_trial_extra_connections,
+            propagation_delay_secs,
             watch_folder,
             duplicate_policy,
             direct_store,
@@ -285,6 +279,9 @@ impl Database {
         }
         if let Some(speed) = config.max_download_speed {
             self.set_setting("max_download_speed", &speed.to_string())?;
+        }
+        if let Some(delay) = config.propagation_delay_secs {
+            self.set_setting("propagation_delay_secs", &delay.to_string())?;
         }
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;
@@ -373,24 +370,31 @@ impl Database {
             }
         }
 
-        if let Some(ref tuner) = config.tuner {
-            if let Some(v) = tuner.max_concurrent_downloads {
-                self.set_setting("tuner.max_concurrent_downloads", &v.to_string())?;
-            }
-            if let Some(v) = tuner.decode_thread_count {
-                self.set_setting("tuner.decode_thread_count", &v.to_string())?;
-            }
-        }
-
         if let Some(ref direct_store) = config.direct_store {
             if let Some(enabled) = direct_store.enabled {
                 self.set_setting("direct_store.enabled", &enabled.to_string())?;
             }
-            if let Some(bytes) = direct_store.holds_scratch_ceiling_bytes {
-                self.set_setting(
+            for (key, bytes) in [
+                (
                     "direct_store.holds_scratch_ceiling_bytes",
-                    &bytes.to_string(),
-                )?;
+                    direct_store.holds_scratch_ceiling_bytes,
+                ),
+                (
+                    "direct_store.holds_resident_limit_bytes",
+                    direct_store.holds_resident_limit_bytes,
+                ),
+                (
+                    "direct_store.holds_scratch_total_bytes",
+                    direct_store.holds_scratch_total_bytes,
+                ),
+                (
+                    "direct_store.holds_disk_reserve_bytes",
+                    direct_store.holds_disk_reserve_bytes,
+                ),
+            ] {
+                if let Some(bytes) = bytes {
+                    self.set_setting(key, &bytes.to_string())?;
+                }
             }
         }
 

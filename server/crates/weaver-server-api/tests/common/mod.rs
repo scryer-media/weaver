@@ -145,6 +145,7 @@ pub struct TestHarness {
     /// The same config the schema holds, so a policy mutation's live effect on
     /// the trusted-network list is observable from a test.
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
+    pub update_check: weaver_server_core::update_check::UpdateCheckService,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
@@ -200,13 +201,13 @@ impl TestHarness {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            tuner: None,
             servers: vec![],
             categories: vec![],
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
             isp_bandwidth_cap: None,
+            propagation_delay_secs: None,
             ip_replacement_trial_extra_connections: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
@@ -241,6 +242,8 @@ impl TestHarness {
 
         let scheduled_resume =
             weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
+        let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())
+            .expect("failed to create update checker");
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
             scheduled_resume: scheduled_resume.clone(),
@@ -252,6 +255,7 @@ impl TestHarness {
             security: security.clone(),
             rss,
             watch_folder,
+            update_check: update_check.clone(),
             schedules: shared_schedules,
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
@@ -301,6 +305,7 @@ impl TestHarness {
             server_transfer_policy,
             auth_cache,
             security,
+            update_check,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }
@@ -596,6 +601,9 @@ fn spawn_test_scheduler(
                         par2_bytes,
                         health_probing: false,
                         health_probe_round: 0,
+                        health_probe_failing_files: 0,
+                        health_failing_files: std::collections::HashSet::new(),
+                        early_recovery_requested_blocks: 0,
                         last_health_probe_failed_bytes: 0,
                         next_health_probe_failed_bytes: 1,
                         detected_archives: HashMap::new(),
@@ -607,6 +615,7 @@ fn spawn_test_scheduler(
                         category_bytes: None,
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
+                        server_attribution: Default::default(),
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -665,7 +674,8 @@ fn spawn_test_scheduler(
                     scheduler_state.set_paused(false);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetSpeedLimit { reply, .. } => {
+                SchedulerCommand::SetPropagationDelay { reply, .. }
+                | SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetIpReplacementTrialExtraConnections { reply, .. } => {
@@ -744,6 +754,9 @@ fn spawn_test_scheduler(
                         par2_bytes,
                         health_probing: false,
                         health_probe_round: 0,
+                        health_probe_failing_files: 0,
+                        health_failing_files: std::collections::HashSet::new(),
+                        early_recovery_requested_blocks: 0,
                         last_health_probe_failed_bytes: 0,
                         next_health_probe_failed_bytes: 1,
                         detected_archives: HashMap::new(),
@@ -755,6 +768,7 @@ fn spawn_test_scheduler(
                         category_bytes: None,
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
+                        server_attribution: Default::default(),
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));
@@ -783,7 +797,24 @@ fn spawn_test_scheduler(
                         .expect("failed to delete history events from test db");
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::DeleteAllHistory { reply, .. } => {
+                SchedulerCommand::DeleteAllHistory {
+                    delete_files,
+                    reply,
+                } => {
+                    if delete_files {
+                        for row in db
+                            .list_job_history(&weaver_server_core::HistoryFilter::default())
+                            .expect("failed to load history rows from test db")
+                        {
+                            if let Some(output_dir) = row.output_dir {
+                                let output_dir = PathBuf::from(output_dir);
+                                if output_dir.exists() {
+                                    std::fs::remove_dir_all(&output_dir)
+                                        .expect("failed to remove test history output directory");
+                                }
+                            }
+                        }
+                    }
                     jobs.retain(|_, state| {
                         !matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
                     });
@@ -872,6 +903,10 @@ fn spawn_test_scheduler(
                 SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
                     let _ = reply.send(());
                 }
+                // Dropping the reply is the answer: the diagnostics request
+                // reports a pipeline that did not respond, which is what a
+                // mock scheduler is.
+                SchedulerCommand::PipelineDiagnostics { .. } => {}
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -918,6 +953,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             metadata: state.spec.metadata.clone(),
             output_dir: None,
             created_at_epoch_ms: state.created_at_epoch_ms,
+            server_attribution: Vec::new(),
         })
         .collect()
 }

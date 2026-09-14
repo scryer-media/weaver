@@ -838,6 +838,55 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
 }
 
 #[tokio::test]
+async fn capped_uu_spool_keeps_unrelated_yenc_ordinals_eligible() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp,
+        BufferPoolConfig {
+            small_count: 1,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let uu_job = JobId(20150);
+    let yenc_job = JobId(20151);
+    let mut spec = standalone_job_spec("Spool isolation", &[("small.bin".to_string(), 16)]);
+    insert_active_job(&mut pipeline, uu_job, spec.clone()).await;
+    let mut second = spec.files[0].segments[0].clone();
+    second.ordinal = 1;
+    second.article_number = 2;
+    second.message_id = "second@example.invalid".to_string();
+    spec.files[0].segments.push(second);
+    spec.total_bytes *= 2;
+    insert_active_job(&mut pipeline, yenc_job, spec).await;
+    let first = pipeline
+        .jobs
+        .get_mut(&yenc_job)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(first.segment_id.segment_number, 0);
+    pipeline.uu_files.insert(
+        NzbFileId {
+            job_id: uu_job,
+            file_index: 0,
+        },
+        UuFileAssembly::default(),
+    );
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(0));
+    let pressure = pipeline.refresh_download_pressure();
+    assert!(pipeline.uu_spool_admission_capped(0));
+    let lease = pipeline
+        .try_lease_initial_download_batch_for_test(yenc_job, pressure)
+        .expect("yEnc beyond ordinal zero must keep progressing during UU disk pressure");
+    assert_eq!(lease.works[0].segment_id.segment_number, 1);
+    assert_eq!(lease.works[0].segment_id.file_id.job_id, yenc_job);
+}
+
+#[tokio::test]
 async fn refresh_download_pressure_reports_combined_hard_byte_pressure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -1042,6 +1091,7 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
 
     pipeline
         .process_released_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(payload)),
@@ -1846,10 +1896,11 @@ async fn hot_share_yield_signal_clears_when_refill_gates_disable_bounded_share()
     pipeline.global_paused = true;
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id,
         server_idx: 0,
-        remote_ip: "127.0.0.1".parse().unwrap(),
+        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,
@@ -2572,10 +2623,11 @@ async fn lane_refill_reclaims_spillover_when_hot_regains_queued_work() {
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: spillover_job_id,
         server_idx: 0,
-        remote_ip: "127.0.0.1".parse().unwrap(),
+        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: Some(SpilloverLoanKind::MeasuredUnderfill),
@@ -2731,10 +2783,11 @@ async fn hot_lane_refill_is_granted_when_hot_holds_all_capacity_and_peer_has_no_
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: hot_job_id,
         server_idx: 0,
-        remote_ip: "127.0.0.1".parse().unwrap(),
+        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,
@@ -2829,10 +2882,11 @@ async fn hot_lane_refill_yields_to_higher_priority_completion_critical_work_with
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: hot_job_id,
         server_idx: 0,
-        remote_ip: "127.0.0.1".parse().unwrap(),
+        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,
@@ -2924,10 +2978,11 @@ async fn lane_refill_preserves_same_band_spillover_after_underfill() {
     };
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: spillover_job_id,
         server_idx: 0,
-        remote_ip: "127.0.0.1".parse().unwrap(),
+        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: Some(SpilloverLoanKind::MeasuredUnderfill),
@@ -3034,10 +3089,11 @@ async fn lane_refill_reclaims_spillover_after_measured_speed_harm() {
 
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+        lane_id: 0,
         runtime_generation: 0,
         job_id: spillover_job_id,
         server_idx: 0,
-        remote_ip: "127.0.0.1".parse().unwrap(),
+        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: Some(SpilloverLoanKind::MeasuredUnderfill),
@@ -3068,6 +3124,7 @@ async fn lane_refill_reclaims_spillover_after_measured_speed_harm() {
     );
 
     pipeline.handle_download_lane_parked(DownloadLaneParked {
+        lane_id: 0,
         job_id: spillover_job_id,
         mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: Some(SpilloverLoanKind::MeasuredUnderfill),
@@ -3126,6 +3183,7 @@ async fn released_download_result_fences_completion_until_processed() {
 
     pipeline
         .process_released_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from_static(b"discarded"))),
@@ -3190,6 +3248,7 @@ async fn failed_job_retains_released_result_ledgers_until_terminal_processing() 
 
     pipeline
         .process_released_download_done(DownloadResult {
+            lane_id: 0,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(payload)),
@@ -3239,7 +3298,9 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
     let mut pending = VecDeque::new();
     pipeline.handle_owned_download_lane_event(
         OwnedDownloadLaneEvent::BatchComplete {
+            lane_id: 0,
             results: vec![DownloadResult {
+                lane_id: 0,
                 runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Decoded(DecodeResult {
@@ -3347,6 +3408,7 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
     let mut pending = VecDeque::new();
     pipeline.handle_owned_download_lane_event(
         OwnedDownloadLaneEvent::BatchComplete {
+            lane_id: 0,
             results: vec![],
             unrequested_works: vec![tail_work],
             stats: weaver_nntp::blocking::BlockingLaneStats::default(),

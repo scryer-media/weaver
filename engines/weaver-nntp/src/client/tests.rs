@@ -243,6 +243,70 @@ async fn spawn_probe_confirmation_server(head_response: &'static [u8]) -> u16 {
     port
 }
 
+/// A server on which STAT finds nothing, and which insists that the HEAD
+/// re-check arrive as one pipelined batch: the second HEAD has to be on the
+/// wire before the first is answered. Answers the first id as present and the
+/// second as missing.
+async fn spawn_pipelined_head_recheck_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"200 ready\r\n").await.unwrap();
+        socket.flush().await.unwrap();
+
+        while let Some(line) = try_read_command_line(&mut socket).await {
+            if line.starts_with("MODE READER") {
+                socket
+                    .write_all(b"500 MODE READER unsupported\r\n")
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                continue;
+            }
+            if line.starts_with("CAPABILITIES") {
+                socket
+                    .write_all(
+                        b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+                    )
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                continue;
+            }
+            if line.starts_with("STAT ") {
+                socket.write_all(b"430 No such article\r\n").await.unwrap();
+                socket.flush().await.unwrap();
+                continue;
+            }
+            if line.starts_with("HEAD <first@example.com>") {
+                let second = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    read_command_line(&mut socket),
+                )
+                .await
+                .expect("the HEAD re-check must send every miss before reading an answer");
+                assert!(
+                    second.starts_with("HEAD <second@example.com>"),
+                    "unexpected second command: {second:?}"
+                );
+                socket
+                    .write_all(
+                        b"221 0 <first@example.com> Headers follow\r\nSubject: still here\r\n.\r\n430 No such article\r\n",
+                    )
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                continue;
+            }
+            panic!("unexpected command line: {line:?}");
+        }
+    });
+
+    port
+}
+
 fn scripted_server(port: u16, group: usize) -> ServerPoolConfig {
     ServerPoolConfig {
         server: ServerConfig {
@@ -483,7 +547,11 @@ fn blocking_body_lane_candidate_honors_exclusions_and_capacity() {
     });
 
     assert!(client.has_blocking_body_lane_candidate(&[]));
-    assert!(!client.has_blocking_body_lane_candidate(&[0]));
+    assert!(
+        client.has_blocking_body_lane_candidate(&[0]),
+        "a plaintext server is as good an owned-lane host as a TLS one"
+    );
+    assert!(!client.has_blocking_body_lane_candidate(&[0, 1]));
 
     let saturated = NntpClient::new(NntpClientConfig {
         servers: vec![scripted_blocking_s2n_server(1, 0)],
@@ -540,11 +608,18 @@ fn blocking_body_lane_candidate_survives_the_over_limit_holdoff() {
 
 #[test]
 fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
-    // The fill server is not s2n-capable; the only s2n candidate is a
-    // backfill server, which must stay unreachable for ordinary work.
+    // The fill server negotiates STARTTLS, which an owned lane cannot do, so
+    // the only lane candidate is a backfill server — and that must stay
+    // unreachable for ordinary work.
     let client = NntpClient::new(NntpClientConfig {
         servers: vec![
-            scripted_server(1, 0),
+            ServerPoolConfig {
+                server: ServerConfig {
+                    starttls: true,
+                    ..scripted_server(1, 0).server
+                },
+                ..scripted_server(1, 0)
+            },
             ServerPoolConfig {
                 backfill: true,
                 ..scripted_blocking_s2n_server(2, 2)
@@ -566,8 +641,44 @@ fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
     assert!(!client.has_blocking_body_lane_candidate(&[0, 1]));
 }
 
+#[tokio::test]
+async fn group_requirement_discovery_retries_the_decoded_batch_item() {
+    let client = multi_server_client(1);
+    let mut attempts = Vec::new();
+    let mut last_error = None;
+    let disposition = client
+        .classify_decoded_batch_item(
+            0,
+            None,
+            None,
+            "<group-required@example.com>",
+            DecodedBatchItem {
+                elapsed: Duration::ZERO,
+                result: Err(DecodedBodyError::Nntp(NntpError::NoGroupSelected)),
+            },
+            &mut attempts,
+            &mut last_error,
+        )
+        .await;
+
+    assert!(matches!(disposition, DecodedBatchDisposition::Retry));
+    assert_eq!(
+        attempts[0].outcome,
+        FetchAttemptOutcome::GroupSelectionRequired
+    );
+    assert!(matches!(
+        last_error,
+        Some(DecodedBodyError::Nntp(NntpError::NoGroupSelected))
+    ));
+    assert_eq!(
+        client.pool().health().lock().await.server(0).failure_count,
+        0
+    );
+}
+
 #[test]
 fn transient_errors() {
+    assert!(is_transient(&NntpError::NoGroupSelected));
     assert!(is_transient(&NntpError::Timeout));
     assert!(is_transient(&NntpError::ConnectionClosed));
     assert!(is_transient(&NntpError::TruncatedMultilineBody));
@@ -715,12 +826,19 @@ async fn infrastructure_admission_failures_do_not_poison_server_health() {
         5,
     ));
 
+    let permit = client
+        .pool()
+        .try_acquire_blocking_permit(ServerId(0))
+        .unwrap();
+    let ticket = &permit.health_lease.0;
     for error in [
         NntpError::TooManyConnections,
         NntpError::PoolExhausted,
         NntpError::PoolShutdown,
     ] {
-        client.record_transient_server_failure(0, &error).await;
+        client
+            .record_connection_reply(0, ticket, Some(&error))
+            .await;
     }
     assert_eq!(
         client.pool().health().lock().await.server(0).failure_count,
@@ -728,7 +846,7 @@ async fn infrastructure_admission_failures_do_not_poison_server_health() {
     );
 
     client
-        .record_transient_server_failure(0, &NntpError::AcquireTimeout(15))
+        .record_connection_reply(0, ticket, Some(&NntpError::AcquireTimeout(15)))
         .await;
     assert_eq!(
         client.pool().health().lock().await.server(0).failure_count,
@@ -736,7 +854,7 @@ async fn infrastructure_admission_failures_do_not_poison_server_health() {
     );
 
     client
-        .record_transient_server_failure(0, &NntpError::SoftTimeout(15))
+        .record_connection_reply(0, ticket, Some(&NntpError::SoftTimeout(15)))
         .await;
     assert_eq!(
         client.pool().health().lock().await.server(0).failure_count,
@@ -909,7 +1027,14 @@ async fn blocking_tls_capacity_rejection_parks_connects_without_health_poisoning
         soft_timeout: Duration::from_secs(15),
     });
 
-    client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::TooManyConnections,
+        &crate::pool::BlockingConnectionPermit::for_tests()
+            .health_lease
+            .0,
+    );
 
     assert_eq!(client.pool().configured_connections(ServerId(0)), Some(8));
     assert!(client.pool().is_over_limit(ServerId(0)));
@@ -927,8 +1052,22 @@ async fn blocking_capacity_holdoff_never_cools_healthy_server() {
         soft_timeout: Duration::from_secs(15),
     });
 
-    client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
-    client.record_blocking_connect_failure(0, &NntpError::TooManyConnections);
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::TooManyConnections,
+        &crate::pool::BlockingConnectionPermit::for_tests()
+            .health_lease
+            .0,
+    );
+    client.record_blocking_connect_failure(
+        0,
+        crate::pool::FreshConnectAdmission::Open,
+        &NntpError::TooManyConnections,
+        &crate::pool::BlockingConnectionPermit::for_tests()
+            .health_lease
+            .0,
+    );
 
     assert_eq!(client.pool().configured_connections(ServerId(0)), Some(2));
     assert!(client.pool().is_over_limit(ServerId(0)));
@@ -1261,7 +1400,9 @@ async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_movi
     );
     assert!(client.server_quota_rejection(ServerId(0), 40).is_none());
     assert!(client.server_quota_rejection(ServerId(1), 41).is_none());
-    let blocking_large = client.blocking_body_server_selection_with_estimate(&[], 41);
+    let blocking_large = client
+        .try_blocking_body_server_selection_with_estimate(&[], 41)
+        .expect("the health state is uncontended in this test");
     assert_eq!(blocking_large.eligible, vec![ServerId(1)]);
     assert_eq!(
         blocking_large.quota_blocked.unwrap().stable_server_id,
@@ -1687,7 +1828,9 @@ async fn outage_disabled_fill_server_keeps_backfill_locked_with_peers_excluded()
         order.is_empty(),
         "a consecutive-failure disable is an outage, not a config error: {order:?}"
     );
-    let selection = client.blocking_body_server_selection(&[1], 0);
+    let selection = client
+        .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
+        .expect("the health state is uncontended in this test");
     assert!(
         selection.eligible.is_empty(),
         "owned lane must not spill an outage onto backfill: {:?}",
@@ -1724,7 +1867,9 @@ async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
 
     client.pool.health().lock().await.record_failure(0, true);
 
-    let selection = client.blocking_body_server_selection(&[1], 0);
+    let selection = client
+        .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
+        .expect("the health state is uncontended in this test");
     assert_eq!(
         selection.eligible,
         vec![ServerId(2)],
@@ -1738,7 +1883,9 @@ async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
         .lock()
         .await
         .record_cooldown(0, CooldownReason::Transport);
-    let selection = cooling.blocking_body_server_selection(&[1], 0);
+    let selection = cooling
+        .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
+        .expect("the health state is uncontended in this test");
     assert!(
         selection.eligible.is_empty(),
         "owned lane must not spill a cooldown onto backfill: {:?}",
@@ -1762,6 +1909,43 @@ fn selection_contention_is_requeued_but_is_not_capacity_admission() {
     assert!(!BlockingBodyLaneAcquireError::NoEligibleServer.should_requeue_owned_work());
     assert!(
         !BlockingBodyLaneAcquireError::Other(NntpError::PoolShutdown).should_requeue_owned_work()
+    );
+}
+
+/// The dispatcher asks this question before it decides between an owned lane
+/// and the async path, and a momentary lock collision is not an answer about
+/// servers. Collapsing it into "no candidate" sent the batch to the async
+/// path — which then dialled its own connection while the owned lane sat on a
+/// warm one.
+#[tokio::test]
+async fn candidacy_separates_contention_from_having_no_candidate() {
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_blocking_s2n_server(1, 2)],
+        max_idle_age: Duration::from_secs(30),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    });
+    assert_eq!(
+        client.blocking_body_lane_candidacy(&[]),
+        BlockingBodyLaneCandidacy::Candidate
+    );
+    assert_eq!(
+        client.blocking_body_lane_candidacy(&[0]),
+        BlockingBodyLaneCandidacy::None,
+        "the only server is excluded, so there is genuinely no candidate"
+    );
+
+    let health = client.pool.health().clone();
+    let guard = health.lock().await;
+    assert_eq!(
+        client.blocking_body_lane_candidacy(&[]),
+        BlockingBodyLaneCandidacy::Contended,
+        "a held health mutex is 'ask again', not 'no candidate'"
+    );
+    drop(guard);
+    assert_eq!(
+        client.blocking_body_lane_candidacy(&[]),
+        BlockingBodyLaneCandidacy::Candidate
     );
 }
 
@@ -2370,7 +2554,10 @@ async fn extra_body_lane_reports_remote_ip() {
         .await
         .expect("extra BODY lane should acquire");
 
-    assert_eq!(lane.remote_ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        lane.remote_ip(),
+        Some("127.0.0.1".parse::<IpAddr>().unwrap())
+    );
     lane.park();
 }
 
@@ -2975,15 +3162,30 @@ fn lane_config(tls: bool, starttls: bool, pinned_ca: bool) -> ServerConfig {
     }
 }
 
+/// Owned lanes are the one download path, so a plaintext server gets one too:
+/// its lane is what serves BODY, PAR2 recovery and the existence probe from a
+/// single warm connection. Only STARTTLS is left out, because the blocking
+/// transport has no in-band upgrade.
+#[test]
+fn a_plaintext_server_gets_an_owned_lane_and_a_starttls_one_does_not() {
+    assert!(supports_blocking_body_lane(&lane_config(
+        false, false, false
+    )));
+    assert!(!supports_blocking_body_lane(&lane_config(true, true, true)));
+    assert!(!supports_blocking_body_lane(&lane_config(
+        false, true, false
+    )));
+}
+
 #[test]
 fn blocking_tls_lane_eligibility_rejects_plain_and_starttls() {
     use crate::tls::NntpTlsBackend;
 
-    assert!(!blocking_tls_lane_eligible(
+    assert!(!blocking_lane_tls_eligible(
         &lane_config(false, false, true),
         NntpTlsBackend::ManualRustls
     ));
-    assert!(!blocking_tls_lane_eligible(
+    assert!(!blocking_lane_tls_eligible(
         &lane_config(true, true, true),
         NntpTlsBackend::ManualRustls
     ));
@@ -2993,11 +3195,11 @@ fn blocking_tls_lane_eligibility_rejects_plain_and_starttls() {
 fn blocking_tls_lane_eligibility_rustls_works_without_pinned_ca() {
     use crate::tls::NntpTlsBackend;
 
-    assert!(blocking_tls_lane_eligible(
+    assert!(blocking_lane_tls_eligible(
         &lane_config(true, false, false),
         NntpTlsBackend::ManualRustls
     ));
-    assert!(blocking_tls_lane_eligible(
+    assert!(blocking_lane_tls_eligible(
         &lane_config(true, false, true),
         NntpTlsBackend::ManualRustls
     ));
@@ -3008,7 +3210,7 @@ fn adopted_name_mismatch_certificate_forces_the_rustls_body_lane() {
     let mut config = lane_config(true, false, false);
     config.tls_name_mismatch_certificate_der = Some(vec![0x30, 0x82, 0x01, 0x0a]);
 
-    assert!(supports_blocking_tls_body_lane(&config));
+    assert!(supports_blocking_body_lane(&config));
 }
 
 #[cfg(not(windows))]
@@ -3016,12 +3218,191 @@ fn adopted_name_mismatch_certificate_forces_the_rustls_body_lane() {
 fn blocking_tls_lane_eligibility_s2n_requires_pinned_ca() {
     use crate::tls::NntpTlsBackend;
 
-    assert!(!blocking_tls_lane_eligible(
+    assert!(!blocking_lane_tls_eligible(
         &lane_config(true, false, false),
         NntpTlsBackend::S2n
     ));
-    assert!(blocking_tls_lane_eligible(
+    assert!(blocking_lane_tls_eligible(
         &lane_config(true, false, true),
         NntpTlsBackend::S2n
     ));
+}
+
+/// A 501 is a syntax error in the one request, not a server without STAT.
+///
+/// One message-id the server cannot parse must not retire STAT for the
+/// process: every later probe would then run HEAD per article, one round trip
+/// each, against a server that pipelines STAT perfectly well.
+#[tokio::test]
+async fn a_501_to_one_stat_does_not_retire_stat_for_the_server() {
+    let port = spawn_scripted_server(vec![
+        ScriptStep {
+            expect_prefix: None,
+            response: b"200 ready\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("CAPABILITIES"),
+            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n",
+        },
+        ScriptStep {
+            expect_prefix: Some("STAT "),
+            response: b"501 Syntax error\r\n",
+        },
+    ])
+    .await;
+
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_server(port, 0)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(5),
+    });
+
+    let err = client
+        .stat_many(&["<odd id@example.com>"])
+        .await
+        .expect_err("a 501 is a refusal of the request");
+    assert!(
+        !matches!(err, NntpError::CommandNotRecognized),
+        "a 501 must not be read as the command being missing: {err:?}"
+    );
+    assert!(
+        crate::server_caps::supports_stat("127.0.0.1", port),
+        "one unparseable id must not retire STAT for the server"
+    );
+}
+
+/// With every usable server excluded there is nobody left to ask, and that is
+/// an answer for the caller — not an inconclusive batch, and not a dial.
+#[tokio::test]
+async fn a_probe_with_every_server_excluded_has_nobody_to_ask() {
+    // The script would fail on any command; the point is that no connection
+    // is ever opened to it.
+    let port = spawn_scripted_server(vec![ScriptStep {
+        expect_prefix: None,
+        response: b"200 ready\r\n",
+    }])
+    .await;
+
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_server(port, 0)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(5),
+    });
+
+    let outcome = client
+        .confirm_exists_for_probe_excluding(&["<probe@silver.horizon>"], &[0])
+        .await;
+    assert!(
+        outcome.is_none(),
+        "excluding the only server leaves nothing to ask: {outcome:?}"
+    );
+    assert!(
+        client.has_available_permit(ServerId(0)),
+        "no connection may be opened on an excluded server"
+    );
+}
+
+/// The HEAD re-check of STAT's misses is one pipelined batch, not one
+/// failover fetch per article: N misses cost one round trip per server, and a
+/// missing article is exactly the case where every server has to be asked.
+#[tokio::test]
+async fn the_head_recheck_of_stat_misses_is_one_pipelined_batch() {
+    let port = spawn_pipelined_head_recheck_server().await;
+
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![scripted_server(port, 0)],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(5),
+    });
+
+    let result = client
+        .confirm_exists_for_probe(&["<first@example.com>", "<second@example.com>"])
+        .await;
+    assert_eq!(
+        result,
+        ProbeBatchResult {
+            exists: vec![true, false],
+            inconclusive: false,
+        },
+        "the batch's answers land on the ids they were asked about"
+    );
+}
+
+/// The owned-lane candidacy probe asks whether any server could take work at
+/// all. It is not a dispatch, so it must leave a server's blocked signal
+/// exactly as the last real dispatch left it — the zero-byte question it
+/// asks fits any server with a byte of headroom.
+#[test]
+fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
+    let transfers = crate::transfer::ServerTransferRegistry::new();
+    let limited_id = StableServerId(2_100);
+    let limited = transfers.configure(
+        limited_id,
+        crate::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(crate::transfer::QuotaRuntimeConfig {
+                limit_bytes: 100,
+                generation: 1,
+                retry_at: None,
+            }),
+        },
+    );
+    let mut used = limited.try_reserve(60).unwrap();
+    used.record_blocking(60);
+    used.finish();
+    assert!(!limited.snapshot().quota_blocked);
+
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![
+            ServerPoolConfig {
+                server: ServerConfig {
+                    host: "limited.example.com".into(),
+                    ..Default::default()
+                },
+                stable_id: limited_id,
+                transfer_control: Some(Arc::clone(&limited)),
+                max_connections: 1,
+                group: 0,
+                ..ServerPoolConfig::default()
+            },
+            ServerPoolConfig {
+                server: ServerConfig {
+                    host: "unlimited.example.com".into(),
+                    ..Default::default()
+                },
+                stable_id: StableServerId(2_101),
+                max_connections: 1,
+                group: 1,
+                ..ServerPoolConfig::default()
+            },
+        ],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    });
+
+    // A dispatch that skips the limited server for headroom is the server
+    // turning work away, and the signal latches.
+    let selection = client
+        .try_blocking_body_server_selection_with_estimate(&[], 41)
+        .expect("the health state is uncontended in this test");
+    assert_eq!(selection.eligible, vec![ServerId(1)]);
+    assert!(limited.snapshot().quota_blocked);
+
+    // The probe still sees the limited server as a candidate (zero bytes fit)
+    // and the latch stands.
+    let candidacy = client.blocking_body_lane_candidacy(&[]);
+    assert!(
+        !matches!(candidacy, BlockingBodyLaneCandidacy::Contended),
+        "the health state is uncontended in this test"
+    );
+    assert!(
+        limited.snapshot().quota_blocked,
+        "a candidacy question must not clear the blocked signal a dispatch latched"
+    );
+    assert!(client.server_quota_rejection(ServerId(0), 41).is_some());
+    assert!(limited.snapshot().quota_blocked);
 }

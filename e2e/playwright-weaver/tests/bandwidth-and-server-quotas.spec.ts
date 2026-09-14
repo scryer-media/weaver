@@ -523,12 +523,29 @@ async function exerciseMultiServerFallbackAndGlobalBlock(
     request,
     "nntp2",
     quota("ONE_TIME", 4 * oneArticleQuota),
-    { active: true, connections: 1, maxDownloadSpeed: 0, priority: 1 },
+    { active: false, connections: 1, maxDownloadSpeed: 0, priority: 1 },
   );
   await resetServerQuota(request, primary.id);
   await resetServerQuota(request, secondary.id);
 
-  const fallbackJobId = await runMirroredProbe(request, "fallback", articleBytes, 4);
+  // Consume the primary's headroom before dispatching the fallback workload.
+  // With both servers active from the start, spare lanes can take all remaining
+  // articles without the primary ever refusing one for quota.
+  const primingJobId = await runMirroredProbe(request, "primary-quota", articleBytes, 1);
+  await waitForCompletedJob(request, primingJobId);
+  const primedPrimary = await readServerQuota(request, primary.id);
+  expect(primedPrimary.usedBytes).toBeGreaterThan(0);
+  expect(primedPrimary.reservedBytes).toBe(0);
+  expect(primedPrimary.remainingBytes).toBeLessThan(oneArticleQuota);
+  expect((await readServerQuota(request, secondary.id)).usedBytes).toBe(0);
+
+  await configureServerQuota(
+    request,
+    "nntp2",
+    quota("ONE_TIME", 4 * oneArticleQuota),
+    { active: true, connections: 1, maxDownloadSpeed: 0, priority: 1 },
+  );
+  const fallbackJobId = await runMirroredProbe(request, "fallback", articleBytes, 3);
   await waitForCompletedJob(request, fallbackJobId);
   await expect
     .poll(async () => {
@@ -551,6 +568,7 @@ async function exerciseMultiServerFallbackAndGlobalBlock(
   ]);
   expect(primaryBlocked).toMatchObject({
     blocked: true,
+    usedBytes: primedPrimary.usedBytes,
     reservedBytes: 0,
   });
   // Conservative reservation stops admitting once the remaining headroom is

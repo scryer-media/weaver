@@ -56,7 +56,13 @@ pub(crate) async fn run(
         .await??,
     );
     let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
-    let nntp = wiring::build_nntp_client(config, &profile, &server_transfer_policy);
+    let proxy_db = db.clone();
+    let runtime_handle = tokio::runtime::Handle::current();
+    let proxies = tokio::task::spawn_blocking(move || {
+        weaver_server_core::proxies::ProxyRuntime::new(proxy_db, runtime_handle)
+    })
+    .await??;
+    let nntp = wiring::build_nntp_client(config, &profile, &server_transfer_policy, &proxies)?;
     let initial_global_paused = weaver_server_core::runtime::load_global_pause_from_db(db).await?;
 
     // Set up scheduler channels and shared control-plane state.
@@ -67,6 +73,7 @@ pub(crate) async fn run(
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
     let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
     handle.set_server_transfer_policy(std::sync::Arc::clone(&server_transfer_policy));
+    handle.set_proxy_runtime(proxies.clone());
     handle.set_nntp_pool(std::sync::Arc::clone(nntp.pool()));
 
     // Subscribe to events for progress logging.
@@ -201,7 +208,8 @@ pub(crate) async fn run(
                 }
                 Err(error) => Err(std::io::Error::other(error)),
             };
-            handle.shutdown().await.ok();
+            proxies.stop_all().await;
+    handle.shutdown().await.ok();
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed after terminal job status");
             }
@@ -218,7 +226,8 @@ pub(crate) async fn run(
         }
         _ = shutdown::wait_for_shutdown() => {
             info!("received shutdown signal, shutting down");
-            handle.shutdown().await.ok();
+            proxies.stop_all().await;
+    handle.shutdown().await.ok();
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during shutdown");
             }
@@ -233,6 +242,7 @@ pub(crate) async fn run(
             Ok(())
         }
         result = &mut pipeline_task => {
+            proxies.stop_all().await;
             let error = shutdown::pipeline_exit_error(result);
             flush_writer_queue_on_exit(db).await;
             server_transfer_maintenance.abort();

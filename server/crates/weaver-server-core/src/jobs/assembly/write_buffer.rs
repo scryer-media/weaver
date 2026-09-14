@@ -207,6 +207,17 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         self.buffered_bytes
     }
 
+    /// Sparse ranges whose writes have completed. Buffered/released chunks
+    /// and the write cursor are not evidence of committed bytes.
+    pub(crate) fn persisted_ranges(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
+        self.pending
+            .iter()
+            .filter_map(|(&offset, chunk)| match chunk {
+                PendingChunk::Persisted { len } => Some((offset, *len)),
+                PendingChunk::Buffered(_) => None,
+            })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty() && self.redundant.is_empty()
     }

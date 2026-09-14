@@ -162,7 +162,7 @@ impl HistoryDeleteManager {
     async fn process_operation(&self, operation: HistoryDeleteOperationRow) -> Result<()> {
         if operation.delete_files && !operation.file_delete_authorized {
             const RESUBMIT_MESSAGE: &str =
-                "file deletion was not authorized; resubmit with an admin-scoped caller";
+                "file deletion was not authorized; resubmit with integration (control) scope";
             let db = self.db.clone();
             tokio::task::spawn_blocking(move || {
                 db.fail_pending_history_delete_operation_targets(operation.id, RESUBMIT_MESSAGE)
@@ -319,6 +319,7 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
+            server_attribution: None,
         }
     }
 
@@ -360,7 +361,7 @@ mod tests {
         assert_eq!(state[&7].state, AsyncOperationTargetState::Failed);
         assert_eq!(
             state[&7].error_message.as_deref(),
-            Some("file deletion was not authorized; resubmit with an admin-scoped caller")
+            Some("file deletion was not authorized; resubmit with integration (control) scope")
         );
         let summaries = db.list_history_delete_operations(false).unwrap();
         assert_eq!(summaries.len(), 1);

@@ -373,6 +373,7 @@ type GeneralSettings {
 	cleanupAfterExtract: Boolean!
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
+	propagationDelaySecs: Int!
 	ipReplacementTrialExtraConnections: Int!
 	enableSrrdbLookup: Boolean!
 	ispBandwidthCap: IspBandwidthCapSettings
@@ -386,6 +387,7 @@ input GeneralSettingsInput {
 	cleanupAfterExtract: Boolean
 	maxDownloadSpeed: Int
 	maxRetries: Int
+	propagationDelaySecs: Int
 	ipReplacementTrialExtraConnections: Int
 	enableSrrdbLookup: Boolean
 	ispBandwidthCap: IspBandwidthCapSettingsInput
@@ -488,6 +490,16 @@ input HistoryPageInput {
 	pageSize: Int!
 	search: String
 	status: HistoryStatusFilter
+	"""
+	Keep only rows whose category is one of these; absent or empty keeps
+	every row.
+
+	The list unions rather than intersects, so a caller offering categories
+	as facets widens the result with each one. The empty string selects rows
+	with no category at all, which is how "uncategorised" is asked for
+	without a second field.
+	"""
+	categories: [String!]
 	sortField: HistorySortField
 	sortDirection: HistorySortDirection
 }
@@ -630,6 +642,15 @@ type JobDetailSnapshot {
 	historyItem: HistoryItem
 	jobTimeline: JobTimeline
 	jobEvents: [JobEvent!]!
+	"""
+	Which servers served this job's articles, highest count first.
+
+	Counted as articles land, so it covers only articles whose serving
+	server could be named: it understates rather than misattributes, and
+	the totals need not add up to the job's article count. Empty for jobs
+	that finished before the counters existed.
+	"""
+	serverAttribution: [JobServerContribution!]!
 }
 
 """
@@ -662,6 +683,21 @@ type JobOutputResult {
 	outputDir: String!
 	files: [JobOutputFile!]!
 	totalBytes: Int!
+}
+
+"""
+How many of a job's articles one server served.
+
+`serverId` is the configured server's own id. `serverHost` is resolved from
+the current configuration at read time rather than stored per job, so a
+server that has since been deleted keeps its counts and reports a null host;
+clients render those by id.
+"""
+type JobServerContribution {
+	serverId: Int!
+	serverHost: String
+	articles: Int!
+	wireBytes: Int!
 }
 
 """
@@ -892,6 +928,10 @@ type MetricsHistoryResult {
 }
 
 type MutationRoot {
+	saveProxyProfile(id: Int, input: ProxyProfileInput!): ProxyProfile!
+	deleteProxyProfile(id: Int!): Boolean!
+	resetProxyHostKey(id: Int!): ProxyProfile!
+	testProxyProfile(id: Int!): ProxyTestResult!
 	"""
 	Create a new API key. Returns the raw key (shown only once).
 	"""
@@ -927,160 +967,6 @@ type MutationRoot {
 	Change the login password. Requires the current password for verification.
 	"""
 	changePassword(currentPassword: String!, newPassword: String!): Boolean!
-	"""
-	Add a new category.
-	"""
-	addCategory(input: CategoryInput!): Category!
-	"""
-	Update a category by ID.
-	"""
-	updateCategory(id: Int!, input: CategoryInput!): Category!
-	"""
-	Remove a category by ID.
-	"""
-	removeCategory(id: Int!): [Category!]!
-	"""
-	Submit an NZB for download through the public integration facade.
-	"""
-	submitNzb(input: SubmitNzbInput!): SubmissionResult!
-	stageNzbUpload(input: StageNzbUploadInput!): StagedNzbUploadResult!
-	submitStagedNzbs(input: SubmitStagedNzbsInput!): SubmitStagedNzbsResult!
-	discardStagedNzbs(ids: [String!]!): Boolean!
-	"""
-	Pause a running job.
-	"""
-	pauseJob(id: Int!): Boolean!
-	"""
-	Resume a paused job.
-	"""
-	resumeJob(id: Int!): Boolean!
-	"""
-	Cancel and remove a job.
-	"""
-	cancelJob(id: Int!): Boolean!
-	"""
-	Reprocess a completed or failed job (re-run post-download stages without re-downloading).
-	"""
-	reprocessJob(id: Int!): Boolean!
-	"""
-	Re-download a completed or failed job from its persisted NZB under the same job ID.
-	"""
-	redownloadJob(id: Int!): Boolean!
-	"""
-	Delete completed/failed/cancelled jobs from history.
-	`deleteFiles: true` requires admin scope.
-	Returns the remaining history jobs after deletion.
-	"""
-	acceptHistoryDelete(input: AcceptHistoryDeleteInput!): HistoryDeleteAcceptance!
-	"""
-	Delete a completed/failed/cancelled job from history.
-	`deleteFiles: true` requires admin scope.
-	Returns the remaining history jobs after deletion.
-	"""
-	deleteHistory(id: Int!, deleteFiles: Boolean! = false): [HistoryItem!]!
-	"""
-	Explicitly forget durable duplicate identity for a job without deleting history or files.
-	"""
-	forgetDuplicateIdentity(id: Int!): Boolean!
-	markDuplicateGood(id: Int!): Boolean!
-	markDuplicateBad(id: Int!): SemanticPromotionResult!
-	promoteDuplicateCandidate(id: Int!): SemanticPromotionResult!
-	"""
-	Delete multiple completed/failed/cancelled jobs from history by ID.
-	`deleteFiles: true` requires admin scope.
-	Returns the remaining history jobs after deletion.
-	"""
-	deleteHistoryBatch(ids: [Int!]!, deleteFiles: Boolean! = false): [HistoryItem!]!
-	"""
-	Delete all completed/failed/cancelled jobs from history.
-	`deleteFiles: true` requires admin scope.
-	"""
-	deleteAllHistory(deleteFiles: Boolean! = false): [HistoryItem!]!
-	"""
-	Update category and/or priority for one or more jobs.
-	"""
-	updateJobs(ids: [Int!]!, category: String, priority: String): Boolean!
-	"""
-	Set or clear a queued job's archive/unpack password. Passing null or
-	an empty string removes the password (even one that came from the NZB
-	itself); the override is durable across restarts. The password never
-	appears in job attributes — only `hasPassword` reflects it.
-	"""
-	setJobPassword(id: Int!, password: String): Boolean!
-	"""
-	Move a queue item within the manual queue order. The move breaks ties
-	within a dispatch priority band; HIGH/NORMAL/LOW still dominates.
-	`offset` is required when `kind` is OFFSET (negative moves toward the
-	front).
-	"""
-	reorderQueueItem(id: Int!, kind: QueueMoveKind!, offset: Int): Boolean!
-	"""
-	Pause all download dispatch globally.
-	"""
-	pauseAll: Boolean!
-	"""
-	Resume all download dispatch globally.
-	"""
-	resumeAll: Boolean!
-	"""
-	Set the global download speed limit in bytes/sec. 0 means unlimited.
-	"""
-	setSpeedLimit(bytesPerSec: Int!): Boolean!
-	"""
-	Pause one queue item and return its updated facade state.
-	"""
-	pauseQueueItem(id: Int!): QueueCommandResult!
-	"""
-	Resume one queue item and return its updated facade state.
-	"""
-	resumeQueueItem(id: Int!): QueueCommandResult!
-	"""
-	Cancel one queue item.
-	"""
-	cancelQueueItem(id: Int!): QueueCommandResult!
-	"""
-	Reprocess a failed queue item.
-	"""
-	reprocessQueueItem(id: Int!): QueueCommandResult!
-	"""
-	Re-download a failed queue item under the same job ID.
-	"""
-	redownloadQueueItem(id: Int!): QueueCommandResult!
-	"""
-	Remove history items by ID. `deleteFiles: true` requires admin scope.
-	"""
-	removeHistoryItems(ids: [Int!]!, deleteFiles: Boolean! = false): HistoryCommandResult!
-	"""
-	Pause the queue globally.
-	"""
-	pauseQueue: QueueCommandResult!
-	"""
-	Resume the queue globally.
-	"""
-	resumeQueue: QueueCommandResult!
-	"""
-	Set the queue speed limit in bytes/sec. 0 means unlimited.
-	"""
-	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
-	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
-	"""
-	Select the sole live source of post-processing scripts. Changing it
-	clears name-based assignments and option values, never script files.
-	"""
-	setPostProcessingScriptDirectory(directory: String!): PostProcessingSettingsGql!
-	"""
-	Replace the global default list and every per-category override.
-	"""
-	setScriptLists(input: ScriptListsInput!): ScriptListsGql!
-	"""
-	Replace the stored option values for one script, validated against its manifest.
-	"""
-	setScriptOptions(script: String!, options: [ScriptOptionInput!]!): ScriptGql!
-	"""
-	Execute the job's script list again against its retained output directory.
-	"""
-	rerunPostProcessing(jobId: Int!): Boolean!
-	cancelJobPostProcessing(jobId: Int!): Boolean!
 	"""
 	Add a new RSS feed.
 	"""
@@ -1141,6 +1027,160 @@ type MutationRoot {
 	Test connectivity to an NNTP server without saving it.
 	"""
 	testConnection(input: ServerInput!): TestConnectionResult!
+	"""
+	Add a new category.
+	"""
+	addCategory(input: CategoryInput!): Category!
+	"""
+	Update a category by ID.
+	"""
+	updateCategory(id: Int!, input: CategoryInput!): Category!
+	"""
+	Remove a category by ID.
+	"""
+	removeCategory(id: Int!): [Category!]!
+	"""
+	Submit an NZB for download through the public integration facade.
+	"""
+	submitNzb(input: SubmitNzbInput!): SubmissionResult!
+	stageNzbUpload(input: StageNzbUploadInput!): StagedNzbUploadResult!
+	submitStagedNzbs(input: SubmitStagedNzbsInput!): SubmitStagedNzbsResult!
+	discardStagedNzbs(ids: [String!]!): Boolean!
+	"""
+	Pause a running job.
+	"""
+	pauseJob(id: Int!): Boolean!
+	"""
+	Resume a paused job.
+	"""
+	resumeJob(id: Int!): Boolean!
+	"""
+	Cancel and remove a job.
+	"""
+	cancelJob(id: Int!): Boolean!
+	"""
+	Reprocess a completed or failed job (re-run post-download stages without re-downloading).
+	"""
+	reprocessJob(id: Int!): Boolean!
+	"""
+	Re-download a completed or failed job from its persisted NZB under the same job ID.
+	"""
+	redownloadJob(id: Int!): Boolean!
+	"""
+	Delete completed/failed/cancelled jobs from history.
+	Integration (control) scope may also delete completed output with `deleteFiles: true`.
+	Returns the remaining history jobs after deletion.
+	"""
+	acceptHistoryDelete(input: AcceptHistoryDeleteInput!): HistoryDeleteAcceptance!
+	"""
+	Delete a completed/failed/cancelled job from history.
+	Integration (control) scope may also delete completed output with `deleteFiles: true`.
+	Returns the remaining history jobs after deletion.
+	"""
+	deleteHistory(id: Int!, deleteFiles: Boolean! = false): [HistoryItem!]!
+	"""
+	Explicitly forget durable duplicate identity for a job without deleting history or files.
+	"""
+	forgetDuplicateIdentity(id: Int!): Boolean!
+	markDuplicateGood(id: Int!): Boolean!
+	markDuplicateBad(id: Int!): SemanticPromotionResult!
+	promoteDuplicateCandidate(id: Int!): SemanticPromotionResult!
+	"""
+	Delete multiple completed/failed/cancelled jobs from history by ID.
+	Integration (control) scope may also delete completed output with `deleteFiles: true`.
+	Returns the remaining history jobs after deletion.
+	"""
+	deleteHistoryBatch(ids: [Int!]!, deleteFiles: Boolean! = false): [HistoryItem!]!
+	"""
+	Delete all completed/failed/cancelled jobs from history.
+	Integration (control) scope may also delete completed output with `deleteFiles: true`.
+	"""
+	deleteAllHistory(deleteFiles: Boolean! = false): [HistoryItem!]!
+	"""
+	Update category and/or priority for one or more jobs.
+	"""
+	updateJobs(ids: [Int!]!, category: String, priority: String): Boolean!
+	"""
+	Set or clear a queued job's archive/unpack password. Passing null or
+	an empty string removes the password (even one that came from the NZB
+	itself); the override is durable across restarts. The password never
+	appears in job attributes — only `hasPassword` reflects it.
+	"""
+	setJobPassword(id: Int!, password: String): Boolean!
+	"""
+	Move a queue item within the manual queue order. The move breaks ties
+	within a dispatch priority band; HIGH/NORMAL/LOW still dominates.
+	`offset` is required when `kind` is OFFSET (negative moves toward the
+	front).
+	"""
+	reorderQueueItem(id: Int!, kind: QueueMoveKind!, offset: Int): Boolean!
+	"""
+	Pause all download dispatch globally.
+	"""
+	pauseAll: Boolean!
+	"""
+	Resume all download dispatch globally.
+	"""
+	resumeAll: Boolean!
+	"""
+	Set the global download speed limit in bytes/sec. 0 means unlimited.
+	"""
+	setSpeedLimit(bytesPerSec: Int!): Boolean!
+	"""
+	Pause one queue item and return its updated facade state.
+	"""
+	pauseQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Resume one queue item and return its updated facade state.
+	"""
+	resumeQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Cancel one queue item.
+	"""
+	cancelQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Reprocess a failed queue item.
+	"""
+	reprocessQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Re-download a failed queue item under the same job ID.
+	"""
+	redownloadQueueItem(id: Int!): QueueCommandResult!
+	"""
+	Remove history items by ID. Integration (control) scope may also delete completed output with `deleteFiles: true`.
+	"""
+	removeHistoryItems(ids: [Int!]!, deleteFiles: Boolean! = false): HistoryCommandResult!
+	"""
+	Pause the queue globally.
+	"""
+	pauseQueue: QueueCommandResult!
+	"""
+	Resume the queue globally.
+	"""
+	resumeQueue: QueueCommandResult!
+	"""
+	Set the queue speed limit in bytes/sec. 0 means unlimited.
+	"""
+	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
+	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
+	"""
+	Select the sole live source of post-processing scripts. Changing it
+	clears name-based assignments and option values, never script files.
+	"""
+	setPostProcessingScriptDirectory(directory: String!): PostProcessingSettingsGql!
+	"""
+	Replace the global default list and every per-category override.
+	"""
+	setScriptLists(input: ScriptListsInput!): ScriptListsGql!
+	"""
+	Replace the stored option values for one script, validated against its manifest.
+	"""
+	setScriptOptions(script: String!, options: [ScriptOptionInput!]!): ScriptGql!
+	"""
+	Execute the job's script list again against its retained output directory.
+	"""
+	rerunPostProcessing(jobId: Int!): Boolean!
+	cancelJobPostProcessing(jobId: Int!): Boolean!
 	"""
 	Update general settings.
 	"""
@@ -1255,7 +1295,62 @@ type ProviderHoldoff {
 	untilEpochMs: Int!
 }
 
+enum ProxyKind {
+	HTTP_CONNECT
+	HTTP3_CONNECT
+	SOCKS5
+	SSH
+	WIRE_GUARD
+}
+
+type ProxyProfile {
+	id: Int!
+	name: String!
+	kind: ProxyKind!
+	enabled: Boolean!
+	host: String!
+	port: Int!
+	dnsServers: [String!]!
+	tunnelAddresses: [String!]!
+	peerPublicKey: String
+	tunnelPublicKey: String
+	mtu: Int!
+	keepaliveSeconds: Int
+	timeoutSeconds: Int!
+	hostKeyFingerprint: String
+	hasUsername: Boolean!
+	hasPassword: Boolean!
+	hasPrivateKey: Boolean!
+	hasPassphrase: Boolean!
+	hasPresharedKey: Boolean!
+}
+
+input ProxyProfileInput {
+	name: String!
+	kind: ProxyKind!
+	enabled: Boolean!
+	host: String!
+	port: Int!
+	dnsServers: [String!]! = []
+	tunnelAddresses: [String!]! = []
+	peerPublicKey: String
+	mtu: Int! = 1280
+	keepaliveSeconds: Int
+	timeoutSeconds: Int! = 30
+	username: String
+	password: String
+	privateKey: String
+	passphrase: String
+	presharedKey: String
+}
+
+type ProxyTestResult {
+	success: Boolean!
+	message: String!
+}
+
 type QueryRoot {
+	proxyProfiles: [ProxyProfile!]!
 	"""
 	Admin-facing auth status moved to query semantics.
 	"""
@@ -1417,6 +1512,10 @@ type QueryRoot {
 	The running weaver binary version.
 	"""
 	version: String!
+	"""
+	Latest stable Weaver release information observed by the background checker.
+	"""
+	updateStatus: UpdateStatus!
 	"""
 	Safe runtime and storage facts for the built-in troubleshooting UI.
 	"""
@@ -1703,6 +1802,34 @@ enum QueueWaitReason {
 	POST_PROCESSING_CAPACITY
 }
 
+type RoutingFailure {
+	proxyId: Int!
+	message: String!
+}
+
+type RoutingPolicy {
+	proxyIds: [Int!]!
+	allowDirect: Boolean!
+}
+
+input RoutingPolicyInput {
+	proxyIds: [Int!]!
+	allowDirect: Boolean!
+}
+
+enum RoutingState {
+	IDLE
+	PROXY
+	DIRECT
+	BLOCKED
+}
+
+type RoutingStatus {
+	state: RoutingState!
+	selectedProxyId: Int
+	failures: [RoutingFailure!]!
+}
+
 type RssFeed {
 	id: Int!
 	name: String!
@@ -1720,9 +1847,12 @@ type RssFeed {
 	lastError: String
 	consecutiveFailures: Int!
 	rules: [RssRule!]!
+	routing: RoutingPolicy!
+	routingStatus: RoutingStatus!
 }
 
 input RssFeedInput {
+	routing: RoutingPolicyInput
 	name: String!
 	url: String!
 	enabled: Boolean! = true
@@ -2003,6 +2133,8 @@ type Server {
 	Whether that server follows the client's cipher order (null when unknown).
 	"""
 	tlsHonorsClientCipherOrder: Boolean
+	routing: RoutingPolicy!
+	routingStatus: RoutingStatus!
 }
 
 type ServerDetails {
@@ -2030,6 +2162,8 @@ type ServerDetails {
 	Whether that server follows the client's cipher order (null when unknown).
 	"""
 	tlsHonorsClientCipherOrder: Boolean
+	routing: RoutingPolicy!
+	routingStatus: RoutingStatus!
 }
 
 type ServerDownloadQuota {
@@ -2150,6 +2284,7 @@ type ServerHealth {
 }
 
 input ServerInput {
+	routing: RoutingPolicyInput
 	host: String!
 	port: Int!
 	tls: Boolean!
@@ -2328,6 +2463,10 @@ type SubscriptionRoot {
 	"""
 	serviceLogLines: String!
 	"""
+	Subscribe to release-check state changes, including the initial snapshot.
+	"""
+	updateStatusUpdates: UpdateStatus!
+	"""
 	Subscribe to cadence-driven system metrics and global queue state.
 	"""
 	systemMetricsUpdates: SystemMetricsSnapshot!
@@ -2433,6 +2572,21 @@ enum TimelineStage {
 	EXTRACTING
 	INTERRUPTED
 	FINAL_MOVE
+}
+
+"""
+Latest stable release observed by the background release checker.
+"""
+type UpdateStatus {
+	currentVersion: String!
+	latestVersion: String
+	updateAvailable: Boolean!
+	releaseUrl: String
+	publishedAtEpochMs: Int
+	checking: Boolean!
+	lastCheckedAtEpochMs: Int
+	lastSuccessfulCheckAtEpochMs: Int
+	lastError: String
 }
 
 """

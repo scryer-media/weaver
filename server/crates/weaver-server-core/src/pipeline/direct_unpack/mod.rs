@@ -1,9 +1,19 @@
-//! Direct unpack: extracting a 7z set while it is still downloading.
+//! Direct unpack: extracting archive members while their source is downloading.
+//!
+//! RAR uses incremental physical header prefixes and separate gated volume
+//! readers, preserving the dictionary across solid members and volume changes.
+//! Mixed direct-store sets use published virtual source ranges and extract only
+//! compressed members into private staging. Repair invalidates that speculative
+//! output; final consumption either installs its verified manifest or falls
+//! back to conventional extraction. Both paths share the existing chase worker
+//! and extraction memory limits.
+//!
+//! The 7z reader design is described below.
 //!
 //! Conventional extraction waits for every part file to land and then runs the
 //! decoder over them. Direct unpack starts the same decoder early and lets it
 //! chase the download, so unpacking overlaps the transfer instead of following
-//! it. What makes that possible is not a change to the decoder but a change to
+//! it. For 7z, that needs a change to
 //! what it reads through: [`GatedSplitReader`] presents the set as one
 //! archive stream whose frontier is the download's verified watermark, parking
 //! rather than returning short or wrong bytes when the decoder gets ahead.
@@ -75,6 +85,9 @@
 
 pub mod coverage;
 pub(crate) mod decode_memory;
+pub(crate) mod rar;
+pub(crate) mod rar_reader;
+pub(crate) mod rar_virtual;
 pub mod reader;
 pub mod settings;
 pub mod start_header;
@@ -87,5 +100,7 @@ pub use start_header::{StartHeader, StartHeaderError};
 
 #[cfg(test)]
 mod gating_tests;
+#[cfg(test)]
+mod rar_install_tests;
 #[cfg(test)]
 mod read_pattern_tests;

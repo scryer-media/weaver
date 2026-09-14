@@ -3,7 +3,9 @@ pub mod archive;
 pub(crate) use archive::rar_state;
 mod capacity;
 mod completion;
+pub(crate) use completion::finalize::placement;
 mod decode;
+pub mod diagnostics;
 mod direct_store;
 pub mod direct_unpack;
 pub mod download;
@@ -59,6 +61,7 @@ use weaver_nntp::NntpClient;
 
 use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
+pub(crate) use self::extraction::safety::ProcessMemoryPermit;
 use self::extraction::{
     ExtractionLimits, ExtractionRoot, JobExtractionBudget, ProcessMemoryBudget,
 };
@@ -79,46 +82,6 @@ fn download_restart_checkpoint_bytes() -> u64 {
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|bytes| *bytes > 0)
             .unwrap_or(DOWNLOAD_RESTART_CHECKPOINT_BYTES)
-    })
-}
-
-/// How long after a post's own date its articles are left alone before weaver
-/// will fetch them.
-///
-/// # Why there is a delay at all
-///
-/// A binary post does not appear on a server the instant it is made: it
-/// propagates, article by article, and a reader that starts pulling immediately
-/// meets articles that simply have not arrived yet. Every one of those reads is
-/// a not-found that looks exactly like a missing article — it burns a retry, it
-/// spends the article's server budget, it marks servers unhealthy, and on a
-/// par2-less job it can fail a download that would have succeeded ten minutes
-/// later. Waiting costs a few minutes; not waiting costs accuracy in the one
-/// signal weaver uses to decide an article is gone.
-///
-/// # Why it is not a setting
-///
-/// Deliberately not user-facing: no settings row, no schema column, no UI, no
-/// API surface. Both major clients expose this knob and the community guidance
-/// that has grown up around it is a range — roughly five to fifteen minutes —
-/// rather than a value anyone tunes per job. A knob whose right answer is "the
-/// conservative end, always" is not a choice worth asking a user to make; it is
-/// a default worth getting right. The environment variable exists so an
-/// operator can disable the behaviour or shorten it for a test, not as a
-/// supported configuration surface.
-///
-/// `WEAVER_PROPAGATION_DELAY_SECS`: unset takes the conservative end of that
-/// range, `0` disables deferral entirely, and any other value is a delay in
-/// seconds. Read once, like every other environment gate here.
-fn propagation_delay() -> Duration {
-    const DEFAULT_PROPAGATION_DELAY_SECS: u64 = 300;
-    static DELAY: OnceLock<Duration> = OnceLock::new();
-    *DELAY.get_or_init(|| {
-        let secs = std::env::var("WEAVER_PROPAGATION_DELAY_SECS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_PROPAGATION_DELAY_SECS);
-        Duration::from_secs(secs)
     })
 }
 
@@ -304,13 +267,19 @@ impl DownloadBatchCompatibility {
     ///   effective exclude set, and each result reports the batch's excludes
     ///   back into the segment's failure ledger. Mixing them would book one
     ///   article's exclusions against another's, so these stay equal.
-    /// * `is_recovery` — recovery never rides an owned blocking lane (see
-    ///   `should_use_owned_blocking_lane`) and is accounted separately.
-    /// * `completion_critical` — the class a lane is counted under at start
-    ///   (`active_completion_critical_connections*`) and released under at
-    ///   park. A lane may not change class without changing that protocol, so
-    ///   the split is kept; the critical phase of every dispatch pass takes
-    ///   the connection instead, and item-2 wakes that pass on the park.
+    /// * `is_recovery` — the in-flight recovery count is added per batch and
+    ///   released per work item, so a batch that mixed the two would book one
+    ///   article's bytes against the other's ledger.
+    /// * `completion_critical` — the class the *batch* is sized and counted
+    ///   under.
+    ///
+    /// Neither of those makes the class of the *lane* immutable. A lane whose
+    /// job has completion-critical work queued changes class between batches
+    /// instead of parking: `try_lease_refill_download_batch` looks at the
+    /// critical heap first and re-opens the lease around that work's own
+    /// compatibility, and the refill grant rebooks the connection from the
+    /// class it held to the class it is being given. What stays fixed is one
+    /// *batch*'s class, which is all this rule decides.
     ///
     /// `priority` is deliberately **not** asked: it only orders the queue.
     /// Gating a refill on it pinned each lane inside one direct-store volume
@@ -394,7 +363,18 @@ impl<'a> DownloadBatchSelector<'a> {
     }
 }
 
+pub(super) struct DownloadLaneOwner {
+    job_id: JobId,
+    mode: DownloadLaneMode,
+    spillover_loan_kind: Option<SpilloverLoanKind>,
+    completion_critical: bool,
+    connection: bool,
+    ip_replacement: bool,
+    outstanding: HashMap<SegmentId, DownloadWork>,
+}
+
 pub(super) struct DownloadBatchLease {
+    pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) lane_mode: DownloadLaneMode,
@@ -416,10 +396,11 @@ pub(super) struct DownloadBatchLease {
 }
 
 pub(super) struct DownloadLaneRefillRequest {
+    pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
-    pub(super) remote_ip: IpAddr,
+    pub(super) remote_ip: Option<IpAddr>,
     pub(super) supports_pipelining: bool,
     /// The mode the scheduler last **booked** this lane's depth gauge under —
     /// not necessarily the one it is running. A lane started on a lease mode
@@ -928,12 +909,14 @@ pub(super) enum IpReplacementTrialEvent {
     SameIpRejected,
     CandidateRejected,
     CandidateAccepted {
+        lane_id: u64,
         old_key: ServerIpKey,
         samples: Vec<weaver_nntp::client::FetchAttemptTrace>,
     },
 }
 
 pub(super) struct DownloadLaneParked {
+    pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) mode: DownloadLaneMode,
     pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
@@ -949,6 +932,7 @@ pub(super) enum OwnedDownloadLaneEvent {
         error: weaver_nntp::client::BlockingBodyLaneAcquireError,
     },
     BatchComplete {
+        lane_id: u64,
         results: Vec<DownloadResult>,
         unrequested_works: Vec<DownloadWork>,
         stats: weaver_nntp::blocking::BlockingLaneStats,
@@ -997,6 +981,7 @@ impl DownloadResultOrigin {
 
 /// Result of a download task.
 pub(super) struct DownloadResult {
+    pub(super) lane_id: u64,
     pub(super) segment_id: SegmentId,
     pub(super) runtime_generation: u64,
     pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
@@ -1082,6 +1067,7 @@ impl DownloadFailureKind {
                 | Self::LaneUnavailable
                 | Self::Unrequested
                 | Self::ConnectionEstablishment
+                | Self::EstablishedTransport
                 | Self::Auth
         )
     }
@@ -1140,6 +1126,9 @@ impl DownloadFailure {
         use weaver_nntp::NntpError;
 
         match error {
+            // A 412 learns the GROUP prologue needed by the next connection;
+            // no article content has been received or rejected yet.
+            NntpError::NoGroupSelected => Some(DownloadFailureKind::ConnectionEstablishment),
             NntpError::PoolExhausted
             | NntpError::PoolShutdown
             | NntpError::TooManyConnections
@@ -1151,6 +1140,8 @@ impl DownloadFailure {
             | NntpError::AuthenticationRejected
             | NntpError::AuthenticationRequired
             | NntpError::AccessDenied => Some(DownloadFailureKind::Auth),
+            // Incomplete transport framing is not evidence of corrupt article
+            // content. Server health and parked retries bound repeated faults.
             NntpError::ServiceUnavailable
             | NntpError::Timeout
             | NntpError::SoftTimeout(_)
@@ -1179,7 +1170,6 @@ impl DownloadFailure {
         let kind = Self::infrastructure_kind(error, DownloadFailureKind::ConnectionEstablishment)
             .unwrap_or(match error {
                 NntpError::NoSuchGroup
-                | NntpError::NoGroupSelected
                 | NntpError::CommandNotRecognized
                 | NntpError::TlsRequired
                 | NntpError::UnexpectedResponse { .. }
@@ -1215,6 +1205,11 @@ impl DownloadFailure {
 #[derive(Debug, Clone)]
 pub(super) enum DownloadError {
     Fetch(DownloadFailure),
+    /// Local cache or resource failure; never evidence that an article is missing.
+    Local {
+        raw_size: u64,
+        error: String,
+    },
     Decode {
         raw_size: u64,
         error: String,
@@ -1223,6 +1218,10 @@ pub(super) enum DownloadError {
 }
 
 impl DownloadError {
+    pub(super) fn local(error: String) -> Self {
+        Self::Local { raw_size: 0, error }
+    }
+
     #[cfg(test)]
     pub(super) fn fetch(kind: DownloadFailureKind, message: impl Into<String>) -> Self {
         Self::Fetch(DownloadFailure::new(kind, message))
@@ -1254,7 +1253,7 @@ impl DownloadError {
                     | DownloadFailureKind::ServerQuota
                     | DownloadFailureKind::Unrequested
             ),
-            Self::Decode { .. } => false,
+            Self::Decode { .. } | Self::Local { .. } => false,
         }
     }
 }
@@ -1624,9 +1623,14 @@ pub(super) struct Par2SetRuntime {
     /// and reconciliation latch therefore live with the set rather than with
     /// the job.
     pub(super) settled: bool,
+    /// Integrity was deferred to archive extraction instead of a PAR2 hash pass.
+    pub(in crate::pipeline) settled_via_strong_decode: bool,
     /// A final answer that could not verify or repair this set.  The gate keeps
     /// processing later sets before turning these failures into the job result.
     pub(super) failure: Option<String>,
+    /// A native recoverability verdict can permit another format to try. I/O,
+    /// cancellation and other unclassified failures keep this empty.
+    pub(in crate::pipeline) alternate_repair: Option<repair::backend::AlternateRepairReason>,
     /// Damage observed while deciding this set.  The aggregate reports one
     /// job-level verification metric after every servable set has settled.
     pub(super) missing_blocks: u32,
@@ -1787,6 +1791,17 @@ pub(super) struct Par2AnalysisWorkDone {
     pub(super) outcome: completion::finalize::check::Par2AnalysisTicketOutcome,
 }
 
+/// Native outcomes share the existing repair completion queue. Dispatch occurs
+/// once per operation; block reads and native evidence stay format-specific.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keep the existing PAR2 result inline without adding a per-operation allocation"
+)]
+pub(super) enum RepairWorkDone {
+    Par2(Par2AnalysisWorkDone),
+    Par3(Box<repair::par3::work::WorkDone>),
+}
+
 /// One demoted set's reconstruction sweep, detached from the actor.
 ///
 /// The sweep reads every volume of the set out of the overlay and writes it to
@@ -1850,6 +1865,7 @@ pub(super) struct DirectPostRepairCarry {
 
 #[derive(Default)]
 pub(super) struct Par2RuntimeState {
+    pub(super) scan_budget: Option<Arc<std::sync::Mutex<repair::par2::Par2ScanBudget>>>,
     /// Every recovery set this job has met. Each parsed, described entry gets
     /// its own completion-gate pass; entries without an index remain only for
     /// attribution and an operator warning.
@@ -2423,6 +2439,7 @@ impl Default for CompletedFileChecksumState {
 pub(super) enum DecodedChunk {
     Contiguous(Box<[u8]>),
     Batches { chunks: Vec<Box<[u8]>>, len: usize },
+    Shared(Arc<download::repeated::SharedArticle>),
 }
 
 impl DecodedChunk {
@@ -2430,6 +2447,7 @@ impl DecodedChunk {
         match self {
             Self::Contiguous(bytes) => bytes.len(),
             Self::Batches { len, .. } => *len,
+            Self::Shared(body) => body.data.len_bytes(),
         }
     }
 
@@ -2439,6 +2457,7 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => f(bytes),
+            Self::Shared(body) => body.data.for_each_slice(f),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
                     f(chunk.as_ref());
@@ -2453,6 +2472,7 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => writer.write_all(bytes),
+            Self::Shared(body) => body.data.write_to(writer),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
                     writer.write_all(chunk.as_ref())?;
@@ -2467,6 +2487,7 @@ impl DecodedChunk {
     pub(super) fn push_io_slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
         match self {
             Self::Contiguous(bytes) => out.push(std::io::IoSlice::new(bytes)),
+            Self::Shared(body) => body.data.push_io_slices(out),
             Self::Batches { chunks, .. } => {
                 out.extend(chunks.iter().map(|chunk| std::io::IoSlice::new(chunk)));
             }
@@ -2771,9 +2792,6 @@ pub struct Pipeline {
     /// Runtime-only per-server BODY depth explorers. Seeded from the persisted
     /// depth on first observation; the measurements themselves never persist.
     pub(super) download_lane_runtime: DownloadLaneRuntimeState,
-    /// Lane refill requests held under hard download pressure, answered as the
-    /// backlog drains so lanes resume without a park/redispatch round-trip.
-    pub(super) deferred_lane_refills: VecDeque<DownloadLaneRefillRequest>,
     /// A lane parked and its connection slot came back; the run loop owes a
     /// dispatch pass.
     ///
@@ -2819,6 +2837,8 @@ pub struct Pipeline {
     pub(super) active_decodes_by_job: HashMap<JobId, usize>,
     /// In-flight decode task count per file.
     pub(super) active_decodes_by_file: HashMap<NzbFileId, usize>,
+    /// Raw article bytes reserved until the actor consumes each decode result.
+    pub(super) active_decode_bytes: HashMap<SegmentId, u64>,
     /// Last time a job made observable progress in the download stage.
     pub(super) job_last_download_activity: HashMap<JobId, Instant>,
     /// Delayed retry tasks that have been scheduled but not yet re-queued.
@@ -2995,6 +3015,8 @@ pub struct Pipeline {
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     /// Jobs that should re-enter completion/post-processing on the next loop pass.
     pub(super) pending_completion_checks: VecDeque<JobId>,
+    /// Presence gates every attempt to resume a partially restored job.
+    pub(crate) blocked_restores: HashMap<JobId, crate::jobs::handle::RestoreJobRequest>,
     /// Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
@@ -3121,8 +3143,8 @@ pub struct Pipeline {
             Result<par2_rs::Par2RepairOutcome, String>,
         ),
     >,
-    pub(super) par2_analysis_done_tx: mpsc::Sender<Par2AnalysisWorkDone>,
-    pub(super) par2_analysis_done_rx: mpsc::Receiver<Par2AnalysisWorkDone>,
+    pub(super) repair_work_done_tx: mpsc::Sender<RepairWorkDone>,
+    pub(super) repair_work_done_rx: mpsc::Receiver<RepairWorkDone>,
     /// Monotonic fence for demotion sweeps detached from the actor.
     pub(super) next_direct_demotion_work_id: u64,
     /// The demotion sweeps a job has outstanding, keyed by the set each one
@@ -3171,22 +3193,37 @@ pub struct Pipeline {
     pub(super) snapshot_publish_pending: bool,
     /// Per-job delay after restart-durable-lead throttling parks primary work.
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
+    /// The one over-limit article reserved until its result is processed or returned.
+    pub(super) checkpoint_progress_articles: HashMap<JobId, (u64, SegmentId)>,
+    pub(super) download_lane_owners: HashMap<u64, DownloadLaneOwner>,
     /// When each deferred job's articles become old enough to fetch.
     ///
     /// Absent means the question has not been asked yet or was answered
     /// "eligible" — see [`Pipeline::propagation_hold_until`], which is where the
-    /// answer is computed and cached. Same shape and same role as
-    /// `download_restart_durable_lead_retry_after` above: a per-job "not
-    /// before", read at the dispatch gate and surfaced to the run loop's sleep
-    /// so the wake happens at eligibility rather than by polling.
-    pub(super) propagation_ready_at: HashMap<JobId, Instant>,
-    /// Test-only override of [`propagation_delay`], mirroring
-    /// `stateful_par2_session_forced`. The env gate is read once per process,
-    /// so a test that needs a different delay cannot get one by setting the
-    /// variable.
+    /// answer is computed and cached as a monotonic deadline plus a stable
+    /// epoch-millisecond timestamp for clients. The dispatch gate and run-loop
+    /// sleep use the monotonic deadline, so eligibility wakes without polling.
+    pub(super) propagation_ready_at: HashMap<JobId, (Instant, i64)>,
+    /// Last visible holds, used to notify subscribers after publishing a snapshot.
+    pub(super) published_propagation_holds: HashMap<JobId, i64>,
+    /// Configured minimum post age, updated through the scheduler command channel.
+    pub(super) propagation_delay: Duration,
+    #[cfg(test)]
     pub(super) propagation_delay_forced: Option<Duration>,
     /// Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
+    /// Last time we warned that an owned blocking lane could not be acquired.
+    pub(super) last_owned_lane_acquire_failure_log_at: Option<Instant>,
+    /// Last time an owned blocking lane failed to be acquired at all, warned
+    /// about or not. The under-cap report below is gated on it: lanes below
+    /// their cap are only a fault when a lane actually failed to open.
+    pub(super) last_owned_lane_acquire_failure_at: Option<Instant>,
+    /// When the servers were first seen below their configured connection cap
+    /// while work was queued, and the last time that was reported. Cleared as
+    /// soon as a pass finds the lanes filled, so only a *sustained* underfill
+    /// is ever logged.
+    pub(super) download_lanes_under_cap_since: Option<Instant>,
+    pub(super) last_download_lanes_under_cap_log_at: Option<Instant>,
     /// Current in-memory decoded backlog retained for sequential write ordering.
     pub(super) write_buffered_bytes: usize,
     /// Current in-memory decoded segment count retained for sequential write ordering.
@@ -3208,12 +3245,15 @@ pub struct Pipeline {
     pub(super) uu_spool_max_segments: usize,
     /// Free space preserved on the intermediate filesystem while spilling UU.
     pub(super) uu_spool_min_free_bytes: u64,
-    /// Most recent free-space sample for the spool filesystem.
-    pub(super) uu_spool_last_free_space_check: Option<Instant>,
-    /// Cached available bytes for the spool filesystem; `None` means unknown.
-    pub(super) uu_spool_available_bytes: Option<u64>,
+    /// Rate-limited free-space readings for the spool filesystem. Admitted
+    /// spills are debited against the cached reading between probes.
+    pub(super) uu_spool_capacity: crate::operations::CapacitySampler,
+    /// Largest refused UU spill. Dispatch preserves cursor progress until
+    /// this many bytes can be parked in memory or admitted to the spool.
+    pub(super) uu_spool_blocked_spill_bytes: Option<usize>,
     #[cfg(test)]
-    /// Test-only free-space result; `Some(None)` exercises a failed probe.
+    /// Test-only free-space reading; `Some(None)` exercises a filesystem that
+    /// has never produced a reading.
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
     /// Per-file write reorder buffers for decoded segments waiting on write order.
     pub(super) write_buffers: HashMap<NzbFileId, WriteReorderBuffer<BufferedDecodedSegment>>,
@@ -3240,6 +3280,10 @@ pub struct Pipeline {
     pub(super) uu_park_requeues: HashMap<SegmentId, u32>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
+    /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.
+    par3_runtime: Option<Box<repair::par3::work::Coordinator>>,
+    /// Bounded archive framing probes, retired with each job and rebuilt on restore.
+    par3_inside_probes: repair::par3::inside::Probes,
     #[cfg(test)]
     pub(super) par2_binding_resolver_calls: std::sync::atomic::AtomicU64,
     /// Direct-store routing state: admitted archive sets, their routers and
@@ -3394,7 +3438,10 @@ pub struct Pipeline {
     pub(super) pp_pool: Arc<rayon::ThreadPool>,
     /// Environment-derived, always-on extraction ceilings.
     pub(super) extraction_limits: Arc<ExtractionLimits>,
-    /// One decoder-memory allowance shared by every extraction job.
+    /// Scheduling metadata retained by admitted jobs.
+    pub(super) job_scheduling_memory: HashMap<JobId, ProcessMemoryPermit>,
+    pub(super) repeated_articles: HashMap<JobId, Arc<download::repeated::RepeatedArticles>>,
+    /// Shared allowance for scheduling, repair metadata, and extraction decoders.
     pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,
     /// The post-processing pool again, for direct-unpack chases only.
     ///
@@ -3405,19 +3452,6 @@ pub struct Pipeline {
     /// extraction of any kind could start. Chases contend only with each other
     /// here.
     pub(super) chase_pool: Arc<rayon::ThreadPool>,
-    /// The same allowance again, for direct-unpack chases only.
-    ///
-    /// A chase takes its permit before it opens the archive and holds it until
-    /// it returns — across every park the gated reader does waiting on the
-    /// download it is chasing. Drawing that from the shared pool meant one
-    /// parked chase stopped every other 7z extraction in the process, including
-    /// the conventional extractions that were the job's actual critical path.
-    ///
-    /// Chases share this pool with each other, so at most one chase holds
-    /// decoder memory at a time no matter how many are armed. The cost is that
-    /// worst-case decoder memory is now two allowances rather than one: one
-    /// speculative chase plus one real extraction.
-    pub(super) direct_unpack_process_memory: Arc<ProcessMemoryBudget>,
     /// One shared output budget per job, retained across nested extraction layers.
     pub(super) extraction_budgets: HashMap<JobId, Arc<JobExtractionBudget>>,
     /// A job's normalized unacceptable-extension policy is fixed at its first

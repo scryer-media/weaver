@@ -144,6 +144,7 @@ fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
             category: state.spec.category.clone(),
             metadata: state.spec.metadata.clone(),
             output_dir: None,
+            server_attribution: Vec::new(),
             created_at_epoch_ms: state.created_at_epoch_ms,
         })
         .collect()
@@ -278,11 +279,15 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         downloaded_bytes: 0,
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
+                        server_attribution: Default::default(),
                         failed_bytes: 0,
                         probe_projected_failed_bytes: 0,
                         par2_bytes,
                         health_probing: false,
                         health_probe_round: 0,
+                        health_probe_failing_files: 0,
+                        health_failing_files: std::collections::HashSet::new(),
+                        early_recovery_requested_blocks: 0,
                         last_health_probe_failed_bytes: 0,
                         next_health_probe_failed_bytes: 1,
                         detected_archives: HashMap::new(),
@@ -373,7 +378,8 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     shared_state.set_paused(false);
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetSpeedLimit { reply, .. } => {
+                SchedulerCommand::SetPropagationDelay { reply, .. }
+                | SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetIpReplacementTrialExtraConnections { reply, .. } => {
@@ -431,11 +437,15 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         downloaded_bytes: 0,
                         restored_download_floor_bytes: 0,
                         downloaded_wire_bytes: 0,
+                        server_attribution: Default::default(),
                         failed_bytes: 0,
                         probe_projected_failed_bytes: 0,
                         par2_bytes,
                         health_probing: false,
                         health_probe_round: 0,
+                        health_probe_failing_files: 0,
+                        health_failing_files: std::collections::HashSet::new(),
+                        early_recovery_requested_blocks: 0,
                         last_health_probe_failed_bytes: 0,
                         next_health_probe_failed_bytes: 1,
                         detected_archives: HashMap::new(),
@@ -538,6 +548,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
                     let _ = reply.send(());
                 }
+                // This stub has no pipeline behind it, so the reply channel is
+                // dropped and the caller sees the command go unanswered.
+                SchedulerCommand::PipelineDiagnostics { .. } => {}
                 SchedulerCommand::Shutdown => break,
             }
             // Publish updated job list to shared state after every command.
@@ -1018,6 +1031,7 @@ fn job_download_rates_report_only_transferring_download_phases() {
             error: None,
             download_wait_reason: None,
             download_retry_at_epoch_ms: None,
+            server_attribution: Vec::new(),
             created_at_epoch_ms: 0.0,
         }
     }

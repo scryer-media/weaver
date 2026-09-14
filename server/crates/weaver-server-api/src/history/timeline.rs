@@ -36,7 +36,16 @@ pub(crate) fn build_job_timeline(
         .map(|event| (event.timestamp as f64).min(current_attempt_started_at))
         .unwrap_or(current_attempt_started_at);
 
-    let outcome = JobStatusGql::from(&job.status);
+    let outcome = if job.download_wait_reason.as_deref()
+        == Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON)
+        && matches!(
+            job.status,
+            weaver_server_core::JobStatus::Queued | weaver_server_core::JobStatus::Downloading
+        ) {
+        JobStatusGql::Queued
+    } else {
+        JobStatusGql::from(&job.status)
+    };
     let now = epoch_ms_now();
     let terminal_event_at =
         events
@@ -56,7 +65,7 @@ pub(crate) fn build_job_timeline(
     });
 
     let download_spans =
-        synthesize_active_download_span(collect_download_spans(events), job, started_at);
+        synthesize_active_download_span(collect_download_spans(events), job, started_at, outcome);
     let finalizing_download_spans = collect_finalizing_download_spans(events);
     let pause_spans = collect_pause_spans(events);
     let verify_spans = collect_verify_spans(events);
@@ -93,8 +102,23 @@ pub(crate) fn build_job_timeline(
         _ => Vec::new(),
     };
 
-    let (extraction_groups, extracting_spans) =
+    let (extraction_groups, member_extracting_spans) =
         build_extraction_groups(events, outcome, ended_at, now);
+    let extracting_spans = merge_extracting_spans(
+        member_extracting_spans,
+        close_open_job_spans(
+            collect_job_spans(
+                events,
+                EventKind::ExtractionReady,
+                EventKind::ExtractionComplete,
+                extraction_stage_boundary_state,
+            ),
+            ended_at,
+            outcome,
+            now,
+        ),
+        now,
+    );
 
     let mut lanes = Vec::new();
     push_lane(&mut lanes, TimelineStage::PendingDownload, pending_spans);
@@ -545,13 +569,14 @@ fn synthesize_active_download_span(
     mut spans: Vec<JobTimelineSpan>,
     job: &JobInfo,
     started_at: f64,
+    outcome: JobStatusGql,
 ) -> Vec<JobTimelineSpan> {
     if spans.iter().any(|span| span.ended_at.is_none()) {
         return spans;
     }
 
     if spans.is_empty()
-        && matches!(job.status, weaver_server_core::JobStatus::Downloading)
+        && matches!(outcome, JobStatusGql::Downloading)
         && matches!(job.run_state, weaver_server_core::RunState::Active)
     {
         spans.push(JobTimelineSpan {
@@ -745,6 +770,38 @@ fn build_extraction_groups(
 
     let extracting_spans = merge_ranges(aggregate_ranges);
     (extraction_groups, extracting_spans)
+}
+
+/// The job's own Extracting status is extraction even when no member reports
+/// it — an unpack that ran alongside the download and is only finishing now
+/// has nothing to announce per member — so the lane is the union of member
+/// activity and the time the job spent in that status.
+fn merge_extracting_spans(
+    member_spans: Vec<JobTimelineSpan>,
+    stage_spans: Vec<JobTimelineSpan>,
+    now: f64,
+) -> Vec<JobTimelineSpan> {
+    merge_ranges(
+        member_spans
+            .into_iter()
+            .chain(stage_spans)
+            .map(|span| (span.started_at, span.ended_at.unwrap_or(now), span.state))
+            .collect(),
+    )
+}
+
+fn extraction_stage_boundary_state(kind: EventKind) -> Option<TimelineSpanState> {
+    match kind {
+        EventKind::ExtractionFailed | EventKind::JobFailed | EventKind::JobCancelled => {
+            Some(TimelineSpanState::Failed)
+        }
+        EventKind::DownloadStarted
+        | EventKind::RepairStarted
+        | EventKind::MoveToCompleteStarted
+        | EventKind::JobCreated
+        | EventKind::JobCompleted => Some(TimelineSpanState::Complete),
+        _ => None,
+    }
 }
 
 fn extraction_boundary_state(kind: EventKind) -> Option<TimelineSpanState> {

@@ -7,6 +7,25 @@
     <script>
       (() => {
         const root = document.documentElement;
+        // The Next UI is a single dark palette on its own background, so it
+        // settles both questions at once and skips the theme class entirely.
+        try {
+          const variant = (() => {
+            try {
+              return window.localStorage.getItem("weaver.ui-variant");
+            } catch {
+              return null;
+            }
+          })() ?? window.sessionStorage.getItem("weaver.ui-variant");
+          if (variant === "next") {
+            root.dataset.ui = "next";
+            root.dataset.initialTheme = "dark";
+            root.style.colorScheme = "dark";
+            return;
+          }
+        } catch {
+          // Storage is unreadable; fall through to the classic interface.
+        }
         try {
           const storedTheme = window.localStorage.getItem("theme");
           const theme = storedTheme === "system"
@@ -28,17 +47,26 @@
         background-color: #f8f9fc;
         color-scheme: light;
       }
+      html[data-ui="next"], html[data-ui="next"] body {
+        background-color: #1a1b1e;
+        color-scheme: dark;
+      }
     </style>
     <meta name="theme-color" content="#d9d9d9" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#081224" media="(prefers-color-scheme: dark)" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Weaver" />
     <link rel="manifest" href="%BASE_URL%manifest.webmanifest" />
     <link rel="icon" href="%BASE_URL%favicon.ico" sizes="any" />
     <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon-adaptive.svg" />
     <link rel="icon" type="image/png" sizes="32x32" href="%BASE_URL%favicon-light-32.png" media="(prefers-color-scheme: light)" />
     <link rel="icon" type="image/png" sizes="32x32" href="%BASE_URL%favicon-dark-32.png" media="(prefers-color-scheme: dark)" />
     <link rel="apple-touch-icon" href="%BASE_URL%apple-touch-icon.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="%BASE_URL%apple-touch-icon-180.png" />
+    <link rel="apple-touch-icon" sizes="167x167" href="%BASE_URL%apple-touch-icon-167.png" />
+    <link rel="apple-touch-icon" sizes="152x152" href="%BASE_URL%apple-touch-icon-152.png" />
+    <link rel="apple-touch-icon" sizes="120x120" href="%BASE_URL%apple-touch-icon-120.png" />
     <title>Weaver</title>
   </head>
   <body>

@@ -4,6 +4,7 @@ use std::collections::{BinaryHeap, HashMap};
 use crate::jobs::ids::{MessageId, NzbFileId, SegmentId};
 
 /// A work item representing a segment to download.
+#[derive(Clone)]
 pub struct DownloadWork {
     pub segment_id: SegmentId,
     pub message_id: MessageId,
@@ -26,8 +27,7 @@ pub struct DownloadWork {
     pub exclude_servers: Vec<usize>,
     /// Transport-rotation hint: the server whose established connection just
     /// failed for this segment. Selection avoids it on the next attempt so the
-    /// retry lands elsewhere when an alternative exists — mirroring
-    /// NZBGet's per-article `failedServers` — but unlike `exclude_servers` it
+    /// retry lands elsewhere when an alternative exists. Unlike `exclude_servers`, it
     /// never counts toward article-not-found exhaustion, so one transient
     /// timeout can never help declare an article missing. Replaced (not
     /// accumulated) on each transport failure; advisory only, so an index left
@@ -35,10 +35,35 @@ pub struct DownloadWork {
     pub avoid_server: Option<usize>,
 }
 
+/// Dispatch classes, in the order the queue serves them:
+///
+/// 0. completion-critical work that is not recovery — PAR2 index bootstrap,
+///    metadata discovery, the direct-store identity probe wave;
+/// 1. promoted PAR2 recovery blocks, which share the payload's connections and
+///    lead it, because a repair cannot start until they land;
+/// 2. ordinary payload.
+///
+/// Classes 0 and 1 live in the completion-critical heap and 2 in the ordinary
+/// one, so the split is what `pop` reads; the rank orders 0 against 1 inside
+/// the critical heap ahead of the per-file priority.
+const COMPLETION_RANK_CRITICAL: u8 = 0;
+const COMPLETION_RANK_PROMOTED_RECOVERY: u8 = 1;
+const COMPLETION_RANK_ORDINARY: u8 = 2;
+
+fn completion_rank_for(work: &DownloadWork) -> u8 {
+    if !work.completion_critical {
+        COMPLETION_RANK_ORDINARY
+    } else if work.is_recovery {
+        COMPLETION_RANK_PROMOTED_RECOVERY
+    } else {
+        COMPLETION_RANK_CRITICAL
+    }
+}
+
 /// Wrapper that implements ordering for the priority queue.
 /// Lower priority number = higher scheduling priority (downloaded first).
 struct PrioritizedWork {
-    /// Completion-critical PAR2 work sorts ahead of ordinary queue priority.
+    /// Dispatch class: see [`completion_rank_for`].
     completion_rank: u8,
     priority: u32,
     /// Optional intra-priority rank for deterministic dynamic ordering.
@@ -153,7 +178,7 @@ impl DownloadQueue {
             .or_default() += 1;
         let completion_critical = work.completion_critical;
         let item = Reverse(PrioritizedWork {
-            completion_rank: u8::from(!work.completion_critical),
+            completion_rank: completion_rank_for(&work),
             priority,
             rank,
             sequence,
@@ -352,6 +377,41 @@ impl DownloadQueue {
             .and_then(|Reverse(pw)| matches(&pw.work).then_some(&pw.work))
     }
 
+    /// Read the same candidate as `pop_first_matching`, including work hidden
+    /// behind an ineligible head. Keep the ordinary eligible-head path O(1).
+    pub fn peek_first_matching(
+        &self,
+        mut matches: impl FnMut(&DownloadWork) -> bool,
+    ) -> Option<&DownloadWork> {
+        for heap in [&self.completion_critical_heap, &self.ordinary_heap] {
+            if let Some(Reverse(item)) = heap.peek()
+                && matches(&item.work)
+            {
+                return Some(&item.work);
+            }
+            if let Some(item) = heap
+                .iter()
+                .map(|Reverse(item)| item)
+                .filter(|item| matches(&item.work))
+                .min()
+            {
+                return Some(&item.work);
+            }
+        }
+        None
+    }
+
+    /// The head of one dispatch class without removing it, in O(1).
+    ///
+    /// For decisions that are about the *shape* of the work rather than the
+    /// work itself — which newsgroups a connection for this job would have to
+    /// be opened for, ahead of any lease being cut.
+    pub fn peek_in_class(&self, completion_critical: bool) -> Option<&DownloadWork> {
+        self.heap_for_class(completion_critical)
+            .peek()
+            .map(|Reverse(pw)| &pw.work)
+    }
+
     pub fn len(&self) -> usize {
         self.completion_critical_heap.len() + self.ordinary_heap.len()
     }
@@ -520,11 +580,11 @@ impl DownloadQueue {
         let mut promoted = 0;
         for Reverse(mut pw) in items {
             if let Some((priority, rank)) = priority_for(&pw.work) {
-                pw.completion_rank = 0;
                 pw.priority = priority;
                 pw.rank = rank;
                 pw.work.priority = priority;
                 pw.work.completion_critical = true;
+                pw.completion_rank = completion_rank_for(&pw.work);
                 promoted += 1;
             }
             if pw.work.completion_critical {

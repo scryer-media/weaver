@@ -27,52 +27,14 @@ impl Pipeline {
         stop_on_cap_block: bool,
     ) -> Result<Option<DownloadWork>, DispatchAttempt> {
         if !self.primary_download_within_restart_durable_lead(job_id, &work) {
-            let (projected_before_flush, limit) = self
-                .restart_durable_lead_block(job_id, &work)
-                .expect("blocked durable lead must include projected bytes");
             self.flush_file_progress_batch("download.file_progress.flush.restart_durable_lead");
-            if let Some((projected_after_flush, _)) = self.restart_durable_lead_block(job_id, &work)
-            {
-                let backlog = self.download_pipeline_backlog_for_job(job_id);
-                if !backlog.has_durable_catch_up_work() {
-                    debug!(
-                        job_id = job_id.0,
-                        segment = ?work.segment_id,
-                        projected_before_flush,
-                        projected_after_flush,
-                        limit,
-                        "dispatch continuing: restart durable lead exceeded but download pipeline is idle"
-                    );
-                } else {
-                    self.metrics
-                        .download_restart_durable_lead_blocked_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.download_restart_durable_lead_retry_after.insert(
-                        job_id,
-                        Instant::now() + DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY,
-                    );
-                    debug!(
-                        job_id = job_id.0,
-                        segment = ?work.segment_id,
-                        projected_before_flush,
-                        projected_after_flush,
-                        limit,
-                        active_downloads = backlog.active_downloads,
-                        active_connections = backlog.active_connections,
-                        active_decodes = backlog.active_decodes,
-                        delayed_retries = backlog.delayed_retries,
-                        released_results = backlog.released_results,
-                        pending_decodes = backlog.pending_decodes,
-                        buffered_write_segments = backlog.buffered_write_segments,
-                        buffered_write_bytes = backlog.buffered_write_bytes,
-                        "dispatch delayed: restart durable lead"
-                    );
-                    if let Some(state) = self.jobs.get_mut(&job_id) {
-                        state.download_queue.push(work);
-                    }
-                    self.update_queue_metrics();
-                    return Ok(None);
+            if !self.primary_download_within_restart_durable_lead(job_id, &work) {
+                self.note_checkpoint_dispatch_block(job_id);
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.download_queue.push(work);
                 }
+                self.update_queue_metrics();
+                return Ok(None);
             }
         }
         self.download_restart_durable_lead_retry_after
@@ -144,7 +106,10 @@ impl Pipeline {
     /// present in the primary queue must publish its grid first. Indexless
     /// recovery discovery stays completion-bounded instead of turning every
     /// optional volume into a pre-download barrier.
-    fn par2_metadata_bootstrap_files(&mut self, job_id: JobId) -> Option<Vec<u32>> {
+    pub(in crate::pipeline::download::worker) fn par2_metadata_bootstrap_files(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<Vec<u32>> {
         if self.par2_bypassed.contains(&job_id)
             || self
                 .jobs
@@ -220,8 +185,18 @@ impl Pipeline {
         selector: Option<DownloadBatchSelector<'_>>,
         selection: DownloadWorkSelection,
         uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
+        leased: &[DownloadWork],
     ) -> Option<DownloadWork> {
-        if bootstrap_files.is_none() {
+        // Sweep-owned files take the scanning path below, which looks past
+        // their work the way it looks past non-bootstrap work.
+        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
+        let direct_admission = self.direct_store_admission(job_id, leased);
+        let checkpoint = self.checkpoint_admission(job_id);
+        if bootstrap_files.is_none()
+            && sweep_held.is_none()
+            && direct_admission.is_empty()
+            && !checkpoint.enforced
+        {
             if let Some(uu_cursor_ordinals) = uu_cursor_ordinals {
                 return self.jobs.get_mut(&job_id).and_then(|state| {
                     let matches = |work: &DownloadWork| {
@@ -263,14 +238,26 @@ impl Pipeline {
                 }
             });
         }
-        self.jobs.get_mut(&job_id).and_then(|state| {
+        let checkpoint_blocked = std::cell::Cell::new(false);
+        let result = self.jobs.get_mut(&job_id).and_then(|state| {
             let matches = |work: &DownloadWork| {
                 bootstrap_files
                     .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
+                    && sweep_held
+                        .as_deref()
+                        .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
+                    && direct_admission.iter().all(|set| set.allows(work))
                     && selector.is_none_or(|selector| selector.matches(work))
                     && selection.matches(work)
                     && uu_cursor_ordinals
                         .is_none_or(|cursors| Self::uu_work_closes_cursor(cursors, work))
+                    && {
+                        let allowed = checkpoint.decision(work, leased).allows();
+                        if !allowed {
+                            checkpoint_blocked.set(true);
+                        }
+                        allowed
+                    }
             };
             match selection {
                 DownloadWorkSelection::Any => state.download_queue.pop_first_matching(matches),
@@ -281,7 +268,11 @@ impl Pipeline {
                     .download_queue
                     .pop_first_matching_in_class(false, matches),
             }
-        })
+        });
+        if result.is_none() && checkpoint_blocked.get() {
+            self.note_checkpoint_dispatch_block(job_id);
+        }
+        result
     }
 
     pub(in crate::pipeline::download::worker) fn try_lease_initial_download_batch(
@@ -300,6 +291,7 @@ impl Pipeline {
             None,
             selection,
             uu_cursor_ordinals.as_ref(),
+            &[],
         ) else {
             return Ok(None);
         };
@@ -406,24 +398,95 @@ impl Pipeline {
         let rule = DownloadBatchRule::Refill {
             match_groups: self.server_needs_group_prologue(server_idx),
         };
+
+        // An established connection is worth more to this job's critical class
+        // than a fresh dial would be: work is completion-critical precisely
+        // because something downstream is waiting on it. A lane carrying
+        // ordinary payload therefore looks at the critical heap first and
+        // changes class, instead of parking, dropping its socket, and leaving
+        // the critical lease to pay for a handshake.
+        if !compatibility.completion_critical
+            && self.job_has_completion_critical_work(job_id)
+            && let Some(first) = self.pop_refill_work_servable_by_lane(
+                job_id,
+                server_idx,
+                &compatibility,
+                rule,
+                par2_metadata_bootstrap_files.as_deref(),
+                DownloadWorkSelection::CompletionCritical,
+                // The critical heap holds both ranks — the index and metadata
+                // reads, and promoted recovery — and an established lane may
+                // take whichever leads it.
+                None,
+                uu_cursor_ordinals.as_ref(),
+            )
+        {
+            if par2_metadata_bootstrap_files.is_some() {
+                self.par2_metadata_bootstrap_claims_work(job_id, &first);
+            }
+            let compatibility = DownloadBatchCompatibility::from_work(&first);
+            let Some(first) = self.reserve_download_work_for_dispatch(job_id, first, false)? else {
+                return Ok(None);
+            };
+            return Ok(Some(self.finish_download_batch_lease(
+                lane_mode,
+                compatibility,
+                first,
+                pressure,
+                rule,
+                par2_metadata_bootstrap_files.as_deref(),
+            )));
+        }
+
         let first = match self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
             Some(DownloadBatchSelector::new(&compatibility, rule)),
             selection,
             uu_cursor_ordinals.as_ref(),
+            &[],
         ) {
             Some(first) => first,
             None => {
-                let Some(first) = self.pop_refill_work_servable_by_lane(
+                let mut popped = self.pop_refill_work_servable_by_lane(
                     job_id,
                     server_idx,
                     &compatibility,
                     rule,
                     par2_metadata_bootstrap_files.as_deref(),
                     selection,
+                    Some(compatibility.is_recovery),
                     uu_cursor_ordinals.as_ref(),
-                ) else {
+                );
+                // The other direction of the same rule: a lane whose critical
+                // class has drained carries ordinary payload rather than
+                // parking and leaving the next pass to dial a connection for
+                // work that is queued right now. Two exceptions. An
+                // outstanding yield means this connection is already owed to
+                // critical demand the dispatcher will place itself. And only
+                // the hot job's lanes may change down: critical work has no
+                // owner, but ordinary payload does, and a critical lane that
+                // kept carrying another job's payload would be a spillover
+                // lane the dispatch pass never lent — one that skipped every
+                // reclaim and best-mode rule an ordinary lane of that job is
+                // held to on the same refill.
+                if popped.is_none()
+                    && compatibility.completion_critical
+                    && !self.hot_share_yield_signal.is_requested()
+                    && self.hot_dispatch_job == Some(job_id)
+                {
+                    popped = self.pop_refill_work_servable_by_lane(
+                        job_id,
+                        server_idx,
+                        &compatibility,
+                        rule,
+                        par2_metadata_bootstrap_files.as_deref(),
+                        DownloadWorkSelection::NonCritical,
+                        None,
+                        uu_cursor_ordinals.as_ref(),
+                    );
+                }
+                let Some(first) = popped else {
                     return Ok(None);
                 };
                 compatibility = DownloadBatchCompatibility::from_work(&first);
@@ -456,20 +519,25 @@ impl Pipeline {
             .server_configs()
             .get(server_idx)
             .is_some_and(|config| {
-                weaver_nntp::prologue::prologue_for(&config.host, config.port).group
+                weaver_nntp::server_caps::requires_group_selection(&config.host, config.port)
             })
     }
 
-    /// Stage two of a refill: the first queued work of this lane's class that
-    /// `server_idx` is actually allowed to fetch.
+    /// Stage two of a refill: the first queued work `server_idx` is actually
+    /// allowed to fetch, within the class `selection` names.
     ///
-    /// The class and the recovery flag still hold — a lane is counted under
-    /// both for its whole life — but the exclude set is allowed to differ,
+    /// The exclude set is allowed to differ from the lane's current batch,
     /// because a differing exclude set is a statement about *other* servers.
     /// The lane's own server must be clear of the work's failure exclusions,
     /// its rotation hint, and the job's retention exclusions; otherwise this
     /// lane genuinely cannot serve it and the queue is left alone. The group
     /// question is the rule's, exactly as in stage one.
+    ///
+    /// `require_recovery` pins the recovery flag when the caller is filling
+    /// the lane's current class, where the batch must stay homogeneous; the
+    /// class-change path passes `None`, because both ranks of the critical
+    /// heap are equally welcome on an established connection and the popped
+    /// work's own compatibility becomes the new batch's.
     #[allow(clippy::too_many_arguments)]
     fn pop_refill_work_servable_by_lane(
         &mut self,
@@ -479,20 +547,26 @@ impl Pipeline {
         rule: DownloadBatchRule,
         bootstrap_files: Option<&[u32]>,
         selection: DownloadWorkSelection,
+        require_recovery: Option<bool>,
         uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
     ) -> Option<DownloadWork> {
         let retention_excludes = self.job_retention_excludes(job_id);
         if retention_excludes.contains(&server_idx) {
             return None;
         }
-        let is_recovery = compatibility.is_recovery;
-        let completion_critical = compatibility.completion_critical;
         let match_groups = matches!(rule, DownloadBatchRule::Refill { match_groups: true });
         let groups = compatibility.groups.clone();
-        self.jobs.get_mut(&job_id).and_then(|state| {
+        let direct_admission = self.direct_store_admission(job_id, &[]);
+        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
+        let checkpoint = self.checkpoint_admission(job_id);
+        let checkpoint_blocked = std::cell::Cell::new(false);
+        let result = self.jobs.get_mut(&job_id).and_then(|state| {
             let matches = |work: &DownloadWork| {
-                work.is_recovery == is_recovery
-                    && work.completion_critical == completion_critical
+                require_recovery.is_none_or(|is_recovery| work.is_recovery == is_recovery)
+                    && direct_admission.iter().all(|set| set.allows(work))
+                    && sweep_held
+                        .as_deref()
+                        .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
                     && !work.exclude_servers.contains(&server_idx)
                     && work.avoid_server != Some(server_idx)
                     && (!match_groups
@@ -503,6 +577,13 @@ impl Pipeline {
                     && selection.matches(work)
                     && uu_cursor_ordinals
                         .is_none_or(|cursors| Self::uu_work_closes_cursor(cursors, work))
+                    && {
+                        let allowed = checkpoint.decision(work, &[]).allows();
+                        if !allowed {
+                            checkpoint_blocked.set(true);
+                        }
+                        allowed
+                    }
             };
             match selection {
                 DownloadWorkSelection::Any => state.download_queue.pop_first_matching(matches),
@@ -513,7 +594,11 @@ impl Pipeline {
                     .download_queue
                     .pop_first_matching_in_class(false, matches),
             }
-        })
+        });
+        if result.is_none() && checkpoint_blocked.get() {
+            self.note_checkpoint_dispatch_block(job_id);
+        }
+        result
     }
 
     pub(in crate::pipeline::download::worker) fn try_lease_ip_replacement_trial_batch(
@@ -521,16 +606,21 @@ impl Pipeline {
         job_id: JobId,
         server_idx: usize,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
-        if self.refresh_download_pressure().uu_spool_admission_capped {
+        if self.repeated_articles.contains_key(&job_id) {
             return Ok(None);
         }
+        let uu_cursor_ordinals = self
+            .refresh_download_pressure()
+            .uu_spool_admission_capped
+            .then(|| self.uu_spool_cursor_ordinals());
         let par2_metadata_bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
         let Some(first) = self.pop_download_work_for_par2_bootstrap(
             job_id,
             par2_metadata_bootstrap_files.as_deref(),
             None,
             DownloadWorkSelection::NonCritical,
-            None,
+            uu_cursor_ordinals.as_ref(),
+            &[],
         ) else {
             return Ok(None);
         };
@@ -558,6 +648,7 @@ impl Pipeline {
             self.lease_effective_exclude_servers(job_id, &compatibility);
         if compatibility.is_recovery {
             let lease = DownloadBatchLease {
+                lane_id: Self::next_download_lane_id(),
                 job_id,
                 runtime_generation: self.pool_generation,
                 lane_mode: DownloadLaneMode::Sequential,
@@ -580,7 +671,8 @@ impl Pipeline {
                 par2_metadata_bootstrap_files.as_deref(),
                 Some(DownloadBatchSelector::initial(&compatibility)),
                 DownloadWorkSelection::NonCritical,
-                None,
+                uu_cursor_ordinals.as_ref(),
+                &works,
             ) else {
                 break;
             };
@@ -601,6 +693,7 @@ impl Pipeline {
         }
 
         let lease = DownloadBatchLease {
+            lane_id: Self::next_download_lane_id(),
             job_id,
             runtime_generation: self.pool_generation,
             lane_mode: DownloadLaneMode::Sequential,
@@ -659,12 +752,6 @@ impl Pipeline {
                     ))
                 }
             };
-        let cap_for_restart_durable_lead = self.should_cap_lease_for_restart_durable_lead(job_id);
-        let mut leased_undurable_bytes = if first.is_recovery {
-            0
-        } else {
-            first.byte_estimate as u64
-        };
         let mut works = vec![first];
         let selection = if compatibility.completion_critical {
             DownloadWorkSelection::CompletionCritical
@@ -676,35 +763,27 @@ impl Pipeline {
         // under the initial rule would stop at the first priority change, which
         // is precisely the boundary it exists to cross.
         let selector = DownloadBatchSelector::new(&compatibility, rule);
+        // Keep capped UU files at their next required ordinal throughout the
+        // batch. Other files retain the ordinary runway and can share a lease.
+        let uu_cursor_ordinals = pressure
+            .uu_spool_admission_capped
+            .then(|| self.uu_spool_cursor_ordinals());
         while works.len() < work_limit {
             let Some(next) = self.pop_download_work_for_par2_bootstrap(
                 job_id,
                 par2_metadata_bootstrap_files,
                 Some(selector),
                 selection,
-                None,
+                uu_cursor_ordinals.as_ref(),
+                &works,
             ) else {
                 break;
             };
             if par2_metadata_bootstrap_files.is_some() {
                 self.par2_metadata_bootstrap_claims_work(job_id, &next);
             }
-            if cap_for_restart_durable_lead
-                && self
-                    .restart_durable_lead_block_with_extra(job_id, &next, leased_undurable_bytes)
-                    .is_some()
-            {
-                if let Some(state) = self.jobs.get_mut(&job_id) {
-                    state.download_queue.push(next);
-                }
-                break;
-            }
             match self.reserve_download_work_for_dispatch(job_id, next, false) {
                 Ok(Some(next)) => {
-                    if !next.is_recovery {
-                        leased_undurable_bytes =
-                            leased_undurable_bytes.saturating_add(next.byte_estimate as u64);
-                    }
                     works.push(next);
                 }
                 Ok(None) | Err(DispatchAttempt::StopAll) | Err(DispatchAttempt::NoWork) => break,
@@ -725,6 +804,7 @@ impl Pipeline {
         let effective_exclude_servers =
             self.lease_effective_exclude_servers(job_id, &compatibility);
         DownloadBatchLease {
+            lane_id: Self::next_download_lane_id(),
             job_id,
             runtime_generation: self.pool_generation,
             lane_mode,
@@ -827,9 +907,6 @@ impl Pipeline {
         refill: bool,
         article_bytes: u32,
     ) -> usize {
-        if pressure.uu_spool_admission_capped {
-            return 1;
-        }
         if self.hot_dispatch_job == Some(job_id) {
             match pressure.state {
                 DownloadPressureState::Clear => {
@@ -922,6 +999,11 @@ impl Pipeline {
         activation_items: &[(SegmentId, NzbFileId, u64)],
         starts_connection: bool,
     ) {
+        if let Some(segment_id) = self.checkpoint_progress_article_for_lease(lease) {
+            self.checkpoint_progress_articles
+                .insert(lease.job_id, (lease.lane_id, segment_id));
+        }
+        self.book_download_lane_owner(lease, starts_connection);
         self.activate_download_batch(
             lease.job_id,
             DownloadBatchClass::from(&lease.compatibility),

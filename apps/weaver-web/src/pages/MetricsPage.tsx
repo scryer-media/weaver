@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useSubscription } from "urql";
-import { Loader2 } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
 import { formatBytes, formatSpeed } from "@/components/SpeedDisplay";
@@ -9,6 +8,7 @@ import { TimeSeriesChart } from "@/components/TimeSeriesChart";
 import { Progress } from "@/components/ui/progress";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { requestGraphqlClientRestart, useGraphqlConnectionState } from "@/graphql/client";
+import { LoadingMark } from "@/lib/loading-mark";
 import {
   METRICS_PAGE_QUERY,
   METRICS_PAGE_SUBSCRIPTION,
@@ -240,7 +240,8 @@ export function MetricsPage() {
       ) : null}
 
       {fetching && !metrics ? (
-        <div className="rounded-card border border-border bg-card p-5 sm:p-6 text-sm text-muted-foreground">
+        <div className="flex items-center gap-3 rounded-card border border-border bg-card p-5 sm:p-6 text-sm text-muted-foreground">
+          <LoadingMark className="h-5" />
           {t("label.loading")}
         </div>
       ) : null}
@@ -524,8 +525,8 @@ export function MetricsPage() {
 function MetricsDiagramLoader({ label }: { label: string }) {
   return (
     <div className="flex h-[240px] items-center justify-center rounded-inner border border-dashed border-border bg-background/40">
-      <div className="flex items-center gap-2 text-sm text-muted-foreground">
-        <Loader2 className="size-4 animate-spin" />
+      <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
+        <LoadingMark className="h-8" />
         <span>{label}</span>
       </div>
     </div>

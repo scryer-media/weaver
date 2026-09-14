@@ -1187,15 +1187,29 @@ async fn waiting_on_present_volumes_is_not_repair_ready_until_a_volume_is_truly_
     );
 
     // And the same missing-middle shape stops qualifying the moment any
-    // pipeline work reappears — `health_probing` here stands in for any of
-    // the pending-work arms.
-    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
-        state.health_probing = true;
-    }
+    // pipeline work reappears — a delayed retry here stands in for any of the
+    // pending-work arms. (A health probe is deliberately not one of them: it
+    // moves no byte, so it can never turn absence back into arrival.)
+    pipeline.pending_retries_by_job.insert(job_id, 1);
     assert!(
         !pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
         "absence while anything is en route is not absence"
     );
+    pipeline.pending_retries_by_job.remove(&job_id);
+    assert!(
+        pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
+        "and it qualifies again once that retry is gone"
+    );
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.health_probing = true;
+    }
+    assert!(
+        pipeline.job_has_live_rar_waiting_for_absent_volumes(job_id),
+        "a probe in flight is not pending work and must not hold repair back"
+    );
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.health_probing = false;
+    }
 
     // AwaitingRepair qualifies with an empty waiting list — the livelocked
     // small-repair family sits exactly there — and it stays unconditional:
@@ -1224,9 +1238,7 @@ async fn waiting_on_present_volumes_is_not_repair_ready_until_a_volume_is_truly_
 /// verified, byte-correct output.
 ///
 /// Once PAR2 has repaired and re-verified a protected output, that verification
-/// is authoritative and the bitmap is diagnostic history. This is exactly what
-/// NZBGet pins in `test_parchecker_repair`, which makes a segment unavailable
-/// and asserts `SUCCESS/PAR`.
+/// is authoritative and the bitmap is diagnostic history.
 #[tokio::test]
 async fn missing_article_repaired_by_par2_completes_despite_incomplete_bitmap() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1678,9 +1690,7 @@ async fn contested_par2_binding_is_refused_and_named() {
 ///
 /// Job 10000 forced this: a 1.09 GB payload that PAR2 repaired and re-verified,
 /// failed because a 738 KB `.nfo` no recovery set ever covered was missing a few
-/// articles. Health 999. Both oracles ship that job — NZBGet's `FAILURE/HEALTH`
-/// requires par to have been *skipped*, and SABnzbd never derives a failure from
-/// missing articles at all — and weaver's final move relocates the working
+/// articles. Health 999. Weaver's final move relocates the working
 /// directory wholesale, so the bytes reach the user regardless. Refusing the job
 /// destroys a good download to report damage on a text file.
 ///

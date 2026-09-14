@@ -1,7 +1,9 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { watchForSignOut } from "./lib/login-required";
 import "./fonts.css";
+import "./next/fonts.css";
 import "./globals.css";
 
 if (import.meta.env.DEV) {
@@ -18,6 +20,8 @@ if (import.meta.env.DEV) {
     performance.clearMarks();
   }, 30_000);
 }
+
+watchForSignOut();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

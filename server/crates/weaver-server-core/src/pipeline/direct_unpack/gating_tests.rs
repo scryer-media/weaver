@@ -97,6 +97,31 @@ fn settled_coverage_reads_the_whole_concatenated_stream() {
 }
 
 #[test]
+fn physical_truncation_inside_committed_coverage_is_not_archive_eof() {
+    for sequential in [false, true] {
+        let fixture = split_fixture(payload(4096, 19), &[]);
+        let coverage = settled_coverage(&fixture);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.paths[0])
+            .unwrap()
+            .set_len(1024)
+            .unwrap();
+        let mut reader: Box<dyn Read> = if sequential {
+            Box::new(GatedSplitReader::open_sequential(&fixture.paths, coverage).unwrap())
+        } else {
+            Box::new(GatedSplitReader::open(&fixture.paths, coverage).unwrap())
+        };
+        let mut output = Vec::new();
+        let error = reader
+            .read_to_end(&mut output)
+            .expect_err("truncated committed bytes");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(output, fixture.bytes[..1024]);
+    }
+}
+
+#[test]
 fn reads_park_until_the_watermark_advances() {
     let fixture = split_fixture(payload(200_000, 11), &[80_000]);
     let coverage = Arc::new(SetCoverage::new(2));

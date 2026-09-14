@@ -4,7 +4,56 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/scryer-media/weaver/e2e/internal/corpus"
 )
+
+func TestChaosStatFixtureCrossesProbeThresholdWithoutTerminalDamage(t *testing.T) {
+	root := filepath.Join("..", "..")
+	scenario, err := loadScenario(filepath.Join(root, "testdata", chaosStatProbeSlug))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, _, err := corpus.LoadLedger(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sizes := make(map[string]int64)
+	for _, file := range ledger.Files {
+		sizes[file.Path] = file.Size
+	}
+	if len(scenario.FixtureAssets) < 2 || scenario.SegmentSize <= 0 {
+		t.Fatal("STAT probe needs damage across multiple segmented payload files")
+	}
+	segments := make(map[int]bool)
+	for _, number := range scenario.DeleteSegmentNumbers {
+		if number < 1 || segments[number] {
+			t.Fatalf("invalid or repeated deleted segment %d", number)
+		}
+		segments[number] = true
+	}
+	var total, missing int64
+	for _, asset := range scenario.FixtureAssets {
+		size := sizes["testdata/"+asset]
+		if size <= 0 || filepath.Ext(asset) != ".mkv" {
+			t.Fatalf("probe asset %s must have a pinned payload size and no recovery", asset)
+		}
+		total += size
+		for number := range segments {
+			end := int64(number) * int64(scenario.SegmentSize)
+			if end > size {
+				t.Fatalf("deleted segment %d is not a full article in %s", number, asset)
+			}
+			missing += int64(scenario.SegmentSize)
+		}
+	}
+	// Leave margin for yEnc/NZB byte estimates around the 2% activation fence.
+	// Without PAR2, 15% missing is terminal damage rather than a probe fixture.
+	percent := 100 * float64(missing) / float64(total)
+	if percent <= 2.5 || percent >= 15 {
+		t.Fatalf("STAT fixture loses %.2f%% of payload; need >2.5%% and <15%%", percent)
+	}
+}
 
 func TestSeededArticleIDsAreScopedToExactFixtureNZB(t *testing.T) {
 	root := t.TempDir()

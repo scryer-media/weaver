@@ -2,6 +2,148 @@
 
 use super::*;
 
+#[test]
+fn bounded_repair_reconstructs_a_missing_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = b"complete";
+    let set = build_repairable_par2_set("payload.bin", payload, 4, 2);
+    let outcome = run_file_descriptor_bounded_par2_repair(
+        temp.path().to_path_buf(),
+        set,
+        HashMap::new(),
+        Vec::new(),
+        64 * 1024 * 1024,
+        par2_rs::CancellationToken::new(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.status, par2_rs::Par2RepairStatus::Repaired);
+    assert_eq!(
+        std::fs::read(temp.path().join("payload.bin")).unwrap(),
+        payload
+    );
+}
+
+/// Admission, authenticated metadata ingestion, the normal repair worker, and
+/// final output reconciliation must all tolerate a payload with no disk inode.
+#[tokio::test]
+async fn admitted_job_reconstructs_an_entirely_missing_payload() {
+    use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let payload = b"complete generated payload";
+    std::fs::write(source.join("payload.bin"), payload).unwrap();
+    let mut options = Par2CreatorOptions::with_output(
+        source.join("repair.par2"),
+        Some(source.clone()),
+        vec![source.join("payload.bin")],
+    );
+    options.block_sizing = BlockSizing::Bytes(16);
+    options.recovery_amount = RecoveryAmount::Count(2);
+    options.volume_count = Some(1);
+    let creator = Par2Creator::new(options);
+    let created = creator.create(&creator.plan().unwrap()).unwrap();
+    let carriers: Vec<_> = created
+        .output_paths
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_str().unwrap().to_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect();
+    let mut files = vec![("payload.bin".to_owned(), payload.len() as u32)];
+    files.extend(
+        carriers
+            .iter()
+            .map(|(name, bytes)| (name.clone(), bytes.len() as u32)),
+    );
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(11738);
+    let job_name = "Generated Missing Payload";
+    pipeline
+        .add_job(
+            job_id,
+            standalone_job_spec(job_name, &files),
+            PathBuf::from("missing.nzb"),
+            sample_nzb_zstd(),
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    let working = pipeline.jobs[&job_id].working_dir.clone();
+    assert!(!working.join("payload.bin").exists());
+    // The transport supplies completed carriers and a terminal not-found result
+    // for the payload. No repair set or source binding is injected by the test.
+    for (index, (name, bytes)) in carriers.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, index as u32 + 1, name, bytes).await;
+        pipeline
+            .try_load_par2_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: index as u32 + 1,
+                },
+            )
+            .await;
+    }
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            runtime_generation: pipeline.pool_generation,
+            data: Err(DownloadError::from_nntp(
+                weaver_nntp::NntpError::ArticleNotFound,
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: u32::MAX,
+            exclude_servers: Vec::new(),
+            release_connection_slot: false,
+        })
+        .await;
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
+    let drained = drain_job_events(&mut events, job_id);
+    assert!(
+        drained.iter().any(|event| matches!(
+            event,
+            PipelineEvent::RepairComplete {
+                slices_repaired: 2,
+                ..
+            }
+        )),
+        "{drained:?}"
+    );
+    assert_eq!(
+        std::fs::read(pipeline.complete_dir.join(job_name).join("payload.bin")).unwrap(),
+        payload
+    );
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn par2_session_io_errors_preserve_file_descriptor_exhaustion() {
@@ -2153,9 +2295,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
         Some(JobStatus::Complete)
     );
     // Two: the pre-repair authoritative pass, then the post-repair pass that
-    // re-reads what the repair installed. Every repair path runs the second
-    // one now — it is the phase SABnzbd shows as "verifying repaired files"
-    // and NZBGet as `ptVerifyingRepaired`.
+    // re-reads what the repair installed. Every repair path runs both passes.
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
         2
@@ -2545,9 +2685,7 @@ async fn restored_repairing_payload_uses_single_repairer_analyze_and_execute_pas
         Some(JobStatus::Complete)
     );
     // Two: the pre-repair authoritative pass, then the post-repair pass that
-    // re-reads what the repair installed. Every repair path runs the second
-    // one now — it is the phase SABnzbd shows as "verifying repaired files"
-    // and NZBGet as `ptVerifyingRepaired`.
+    // re-reads what the repair installed. Every repair path runs both passes.
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
         2
@@ -2813,9 +2951,7 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
         Some(JobStatus::Downloading)
     );
     // Two: the pre-repair authoritative pass, then the post-repair pass that
-    // re-reads what the repair installed. Every repair path runs the second
-    // one now — it is the phase SABnzbd shows as "verifying repaired files"
-    // and NZBGet as `ptVerifyingRepaired`.
+    // re-reads what the repair installed. Every repair path runs both passes.
     assert_eq!(
         drain_job_verification_started(&mut verify_events, job_id),
         2

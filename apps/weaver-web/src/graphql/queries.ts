@@ -10,6 +10,8 @@ const FACADE_QUEUE_ITEM_FIELDS = `
       ...ParsedReleaseFields
     }
     status: state
+    downloadWaitReason
+    downloadRetryAtEpochMs
     progressPercent
     totalBytes
     downloadedBytes
@@ -43,6 +45,8 @@ const QUEUE_TABLE_ITEM_FIELDS = `
     displayTitle
     originalTitle
     status: state
+    downloadWaitReason
+    downloadRetryAtEpochMs
     progressPercent
     totalBytes
     downloadedBytes
@@ -168,6 +172,8 @@ export const PARSED_RELEASE_FIELDS = `
 
 const SERVER_FIELDS = `
   fragment ServerFields on Server {
+    routing { proxyIds allowDirect }
+    routingStatus { state selectedProxyId failures { proxyId message } }
     id
     host
     port
@@ -202,6 +208,8 @@ const SERVER_FIELDS = `
 
 const SERVER_DETAILS_FIELDS = `
   fragment ServerDetailsFields on ServerDetails {
+    routing { proxyIds allowDirect }
+    routingStatus { state selectedProxyId failures { proxyId message } }
     id
     host
     port
@@ -248,6 +256,38 @@ const CATEGORY_FIELDS = `
 export const VERSION_QUERY = gql`
   query Version {
     version
+  }
+`;
+
+export const UPDATE_STATUS_QUERY = gql`
+  query UpdateStatus {
+    updateStatus {
+      currentVersion
+      latestVersion
+      updateAvailable
+      releaseUrl
+      publishedAtEpochMs
+      checking
+      lastCheckedAtEpochMs
+      lastSuccessfulCheckAtEpochMs
+      lastError
+    }
+  }
+`;
+
+export const UPDATE_STATUS_SUBSCRIPTION = gql`
+  subscription UpdateStatusUpdates {
+    updateStatusUpdates {
+      currentVersion
+      latestVersion
+      updateAvailable
+      releaseUrl
+      publishedAtEpochMs
+      checking
+      lastCheckedAtEpochMs
+      lastSuccessfulCheckAtEpochMs
+      lastError
+    }
   }
 `;
 
@@ -299,6 +339,7 @@ const GENERAL_SETTINGS_FIELDS = `
     cleanupAfterExtract
     maxDownloadSpeed
     maxRetries
+    propagationDelaySecs
     ipReplacementTrialExtraConnections
     enableSrrdbLookup
     duplicatePolicy {
@@ -461,6 +502,8 @@ const RSS_RULE_FIELDS = `
 
 const RSS_FEED_FIELDS = `
   fragment RssFeedFields on RssFeed {
+    routing { proxyIds allowDirect }
+    routingStatus { state selectedProxyId failures { proxyId message } }
     id
     name
     url
@@ -563,6 +606,12 @@ export const JOB_QUERY = gql`
         message
         timestamp
       }
+      serverAttribution {
+        serverId
+        serverHost
+        articles
+        wireBytes
+      }
     }
   }
   ${JOB_TIMELINE_FIELDS}
@@ -644,6 +693,12 @@ export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
         message
         timestamp
       }
+      serverAttribution {
+        serverId
+        serverHost
+        articles
+        wireBytes
+      }
     }
   }
   ${JOB_TIMELINE_FIELDS}
@@ -684,6 +739,7 @@ export const LIVE_METRICS_QUERY = gql`
     }
     globalState: globalQueueState {
       isPaused
+      speedLimitBytesPerSec
       downloadBlock {
         ...DownloadBlockFields
       }
@@ -707,6 +763,13 @@ export const SYSTEM_INFO_QUERY = gql`
         cgroupLimit
         decoderTier
         simdFeatures
+        kernels {
+          component
+          library
+          ladder
+          kernel
+          pinnedBy
+        }
       }
       memory {
         totalBytes
@@ -914,6 +977,7 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       }
       globalState {
         isPaused
+        speedLimitBytesPerSec
         downloadBlock {
           ...DownloadBlockFields
         }

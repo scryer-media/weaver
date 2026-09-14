@@ -20,11 +20,9 @@ impl Pipeline {
     /// When this job's articles become old enough to fetch, or `None` if they
     /// already are.
     ///
-    /// `Some` means dispatch holds off. The job stays exactly where it is —
-    /// `Queued`, in the ordinary queue, with no status of its own — because a
-    /// deferral is not a state the user needs a word for: it resolves by
-    /// itself, on a clock, within minutes. Pause, resume and delete all behave
-    /// as they always did, since none of them consults this.
+    /// `Some` means dispatch holds off. Queue snapshots expose the reason and
+    /// deadline so clients can distinguish propagation from active downloading.
+    /// Pause, resume and delete retain their ordinary lifecycle semantics.
     ///
     /// The answer is computed once per job and cached. It is derived from wall
     /// time (the NZB's date is an epoch second) but stored as an [`Instant`],
@@ -38,13 +36,13 @@ impl Pipeline {
     /// the anchor is the newest date the NZB does carry, because that is the
     /// article most likely still in flight.
     pub(in crate::pipeline) fn propagation_hold_until(&mut self, job_id: JobId) -> Option<Instant> {
-        let delay = self
-            .propagation_delay_forced
-            .unwrap_or_else(crate::pipeline::propagation_delay);
+        let delay = self.propagation_delay;
+        #[cfg(test)]
+        let delay = self.propagation_delay_forced.unwrap_or(delay);
         if delay.is_zero() {
             return None;
         }
-        if let Some(ready_at) = self.propagation_ready_at.get(&job_id).copied() {
+        if let Some((ready_at, _)) = self.propagation_ready_at.get(&job_id).copied() {
             if ready_at > Instant::now() {
                 return Some(ready_at);
             }
@@ -70,7 +68,10 @@ impl Pipeline {
         }
 
         let ready_at = Instant::now() + remaining;
-        self.propagation_ready_at.insert(job_id, ready_at);
+        let retry_at_epoch_ms =
+            chrono::Utc::now().timestamp_millis() + remaining.as_millis() as i64;
+        self.propagation_ready_at
+            .insert(job_id, (ready_at, retry_at_epoch_ms));
         // Once per job, because the gate is consulted on every dispatch pass.
         info!(
             job_id = job_id.0,
@@ -92,7 +93,7 @@ impl Pipeline {
         let now = Instant::now();
         self.propagation_ready_at
             .values()
-            .copied()
+            .map(|(ready_at, _)| *ready_at)
             .min()
             .map(|ready_at| ready_at.saturating_duration_since(now))
     }

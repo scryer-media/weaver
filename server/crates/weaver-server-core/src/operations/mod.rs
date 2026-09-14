@@ -19,7 +19,10 @@ pub use backup::{
     BackupStatus, CategoryRemapInput, CategoryRemapRequirement, PendingRestoreOutcome,
     RestoreOptions, RestoreReport, StableStateExport, apply_pending_restore,
 };
-pub use disk::{DiskSpace, DiskSpaceCollector, disk_space};
+pub use disk::{
+    Capacity, CapacityReading, CapacitySampler, DiskProbeError, DiskSpace, DiskSpaceCollector,
+    disk_space, is_out_of_space, probe_disk_space, probe_nearest_disk_space,
+};
 pub use health::{
     BrowseDirectoryError, CreateDirectoryError, DirectoryBrowseEntry, DirectoryBrowseListing,
     browse_directories, create_directory,

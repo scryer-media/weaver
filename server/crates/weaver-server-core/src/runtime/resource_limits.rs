@@ -1,3 +1,4 @@
+#[cfg(any(unix, test))]
 const OPEN_FILE_LIMIT_TARGETS: [u64; 4] = [65_536, 16_384, 4_096, 1_024];
 
 /// Raise the process open-file soft limit toward a practical ceiling.

@@ -505,6 +505,7 @@ async fn results_are_persisted_on_the_job_and_a_rerun_replaces_them() {
         created_at: 1,
         completed_at: 2,
         metadata: None,
+        server_attribution: None,
     })
     .unwrap();
 

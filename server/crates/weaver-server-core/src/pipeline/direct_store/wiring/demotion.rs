@@ -105,7 +105,10 @@ impl Pipeline {
         // produced are the conventional extractor's to overwrite now.
         self.direct_tolerated_in_flight.remove(&job_id);
         self.direct_tolerated_results.remove(&job_id);
-        if reason == DemotionReason::HoldsScratchCeiling {
+        if matches!(
+            reason,
+            DemotionReason::HoldsScratchCeiling | DemotionReason::HoldsScratchDiskReserve
+        ) {
             debug!(
                 job_id = job_id.0,
                 set_name = %set_name,
@@ -151,7 +154,16 @@ impl Pipeline {
         // above, and for the same reason: it describes volumes that were
         // virtual when it was reached and are about to become files the
         // conventional path writes. The next pass reads the set as it now is.
+        self.direct_unpack_abort_set(
+            job_id,
+            &set_name,
+            "direct RAR source demoted",
+            crate::pipeline::direct_unpack::wiring::AbortLatch::Permanent,
+            crate::pipeline::direct_unpack::wiring::DemotionReason::PartUnreadable,
+        );
+        self.taint_direct_unpack_set(job_id, &set_name);
         self.clear_pending_par2_repairs_for_job(job_id);
+        self.invalidate_par3_direct_set(job_id, set_index);
         self.direct_store.begin_materialization(
             job_id,
             set_index,
@@ -287,7 +299,8 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Err(ReconstructionFailure::NoLayout);
         };
-        if set.router.member_partials().is_empty() {
+        let preserve_holds = matches!(reason, DemotionReason::Par3MemoryPressure);
+        if !preserve_holds && set.router.member_partials().is_empty() {
             // Nothing was ever routed to a member, so there is nothing to
             // reconstruct *from* beyond headers. Refetching is both correct and
             // cheaper than materializing header-only volumes.
@@ -341,7 +354,13 @@ impl Pipeline {
             // struck and whose targeted requeue owns every segment the atoms do
             // not wholly back; a hold materialized here would be written twice
             // and counted against a completion gate nothing then clears.
-            let physical_coverage = set.volume_coverage(*volume_index);
+            // A PAR3 spill starts outside an article handoff. Its immutable
+            // holds can be reconstructed too, subject to the same CRC atoms.
+            let physical_coverage = if preserve_holds && handoffs.is_empty() {
+                set.volume_coverage_with_holds(*volume_index)
+            } else {
+                set.volume_coverage(*volume_index)
+            };
             let crcs = set.volume_crc_runs(*volume_index);
             // Routing can demote after durably placing only part of the current
             // article. Keep that range provisional: the decode handoff owns the
@@ -473,8 +492,13 @@ impl Pipeline {
             "submitting a direct demotion reconstruction ticket"
         );
         let done_tx = self.direct_demotion_done_tx.clone();
+        let disk_reservation = self
+            .par3_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.take_spill_disk(job_id));
         tokio::spawn(async move {
             let rebuilt = tokio::task::spawn_blocking(move || {
+                let _disk_reservation = disk_reservation;
                 crate::pipeline::direct_store::reconstruct::reconstruct_volumes(
                     &provider, &plans, sparse,
                 )
@@ -605,8 +629,9 @@ impl Pipeline {
             refetched_bytes = summary.refetched_bytes,
             "direct-store set materialized from its own routed bytes"
         );
-        self.finish_demoted_set_handback(done.job_id, volume_files)
+        self.finish_demoted_set_handback(done.job_id, volume_files.clone())
             .await;
+        self.relieve_handed_back_write_backlog(&volume_files).await;
         self.schedule_job_completion_check(done.job_id);
     }
 
@@ -938,6 +963,20 @@ impl Pipeline {
                             file_asm.record_placement(*segment_number, offset, len as u32);
                         }
                     }
+                }
+                // Native PAR3 availability is independent of PAR2's placement
+                // bookkeeping. Only an admitted coordinator retains these
+                // already-materialized extents; no buffered bytes are exposed.
+                if let Some(coordinator) = self
+                    .par3_runtime
+                    .as_mut()
+                    .filter(|coordinator| coordinator.contains_job(job_id))
+                {
+                    coordinator.note_materialized_ranges(
+                        job_id,
+                        par3_rs::source::SourceId(u64::from(*file_index)),
+                        &materialized_extents,
+                    );
                 }
                 lost_bytes =
                     lost_bytes.saturating_add(previously_received.saturating_sub(kept_bytes));

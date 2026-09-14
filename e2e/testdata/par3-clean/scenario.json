@@ -1,0 +1,14 @@
+{
+  "slug": "par3-clean",
+  "title": "E2E.Test.PAR3.Clean.Amber.Lattice.S01E03.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A loose payload with a Cauchy PAR3 set and nothing damaged. PAR3 verification passes on the payload alone, so the job completes without a repair.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "amber.lattice.s01e03.mkv": "8342d490184b545b062b867889967559b2119afa633509838d7e8f6d5308ec04"
+  },
+  "forbiddenJobEvents": [
+    "RepairComplete",
+    "RepairFailed"
+  ]
+}

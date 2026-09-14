@@ -7,20 +7,30 @@ impl Pipeline {
         output_dir
             .strip_prefix(&self.intermediate_dir)
             .ok()
-            .filter(|suffix| !suffix.as_os_str().is_empty())
+            .filter(|suffix| {
+                let mut components = suffix.components();
+                matches!(components.next(), Some(std::path::Component::Normal(_)))
+                    && components.next().is_none()
+            })
             .map(|_| output_dir.to_path_buf())
     }
 
     pub(crate) async fn history_cleanup_dirs_for_job(
         &self,
         job_id: JobId,
-    ) -> Result<BTreeSet<PathBuf>, crate::SchedulerError> {
+    ) -> Result<BTreeSet<(JobId, PathBuf)>, crate::SchedulerError> {
         let mut dirs = BTreeSet::new();
         if let Some(state) = self.jobs.get(&job_id)
             && is_terminal_status(&state.status)
             && let Some(path) = self.cleanupable_history_output_dir(&state.working_dir)
         {
-            dirs.insert(path);
+            crate::jobs::working_dir::prepare_history_working_dir(
+                &self.intermediate_dir,
+                &path,
+                job_id,
+            )
+            .await?;
+            dirs.insert((job_id, path));
         }
 
         let db = self.db.clone();
@@ -40,7 +50,13 @@ impl Pipeline {
             && let Some(path) =
                 self.cleanupable_history_output_dir(std::path::Path::new(&output_dir))
         {
-            dirs.insert(path);
+            crate::jobs::working_dir::prepare_history_working_dir(
+                &self.intermediate_dir,
+                &path,
+                job_id,
+            )
+            .await?;
+            dirs.insert((job_id, path));
         }
 
         Ok(dirs)
@@ -48,13 +64,19 @@ impl Pipeline {
 
     pub(crate) async fn all_history_cleanup_dirs(
         &self,
-    ) -> Result<BTreeSet<PathBuf>, crate::SchedulerError> {
+    ) -> Result<BTreeSet<(JobId, PathBuf)>, crate::SchedulerError> {
         let mut dirs = BTreeSet::new();
-        for state in self.jobs.values() {
+        for (job_id, state) in &self.jobs {
             if is_terminal_status(&state.status)
                 && let Some(path) = self.cleanupable_history_output_dir(&state.working_dir)
             {
-                dirs.insert(path);
+                crate::jobs::working_dir::prepare_history_working_dir(
+                    &self.intermediate_dir,
+                    &path,
+                    *job_id,
+                )
+                .await?;
+                dirs.insert((*job_id, path));
             }
         }
 
@@ -72,7 +94,13 @@ impl Pipeline {
                 && let Some(path) =
                     self.cleanupable_history_output_dir(std::path::Path::new(&output_dir))
             {
-                dirs.insert(path);
+                crate::jobs::working_dir::prepare_history_working_dir(
+                    &self.intermediate_dir,
+                    &path,
+                    JobId(row.job_id),
+                )
+                .await?;
+                dirs.insert((JobId(row.job_id), path));
             }
         }
 
@@ -81,14 +109,22 @@ impl Pipeline {
 
     pub(crate) async fn cleanup_history_intermediate_dirs(
         &self,
-        dirs: &BTreeSet<PathBuf>,
+        dirs: &BTreeSet<(JobId, PathBuf)>,
     ) -> Result<(), crate::SchedulerError> {
-        for dir in dirs {
+        for (job_id, dir) in dirs {
             // Failed jobs never pass through the finalize close, so drop any
             // cached write handles before their dirs (and paths) are freed
             // for reuse.
             crate::pipeline::close_cached_write_handles_under(dir).await;
-            match tokio::fs::remove_dir_all(dir).await {
+            let root = self.intermediate_dir.clone();
+            let target = dir.clone();
+            let expected_job = *job_id;
+            let removal = tokio::task::spawn_blocking(move || {
+                crate::jobs::working_dir::remove_job_working_dir(&root, &target, expected_job)
+            })
+            .await
+            .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?;
+            match removal {
                 Ok(()) => {
                     info!(dir = %dir.display(), "removed historical intermediate directory");
                 }
@@ -199,7 +235,16 @@ impl Pipeline {
 
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.jobs.remove(&job_id);
+        self.retire_stalled_download_lanes(job_id);
+        self.job_scheduling_memory.remove(&job_id);
+        self.repeated_articles.remove(&job_id);
         self.job_order.retain(|id| *id != job_id);
+        self.remove_pending_completion_check(job_id);
+        self.pending_retries_by_job.remove(&job_id);
+        self.pending_retries_by_segment
+            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        self.cancel_infrastructure_retries_for_job(job_id);
+        self.download_wait_by_job.remove(&job_id);
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);
         self.clear_par2_runtime_state(job_id);
@@ -320,6 +365,7 @@ impl Pipeline {
             } else {
                 serde_json::to_string(&state.spec.metadata).ok()
             },
+            server_attribution: state.server_attribution.to_storage_json(),
         };
 
         self.finished_jobs.retain(|j| j.job_id != job_id);
@@ -362,6 +408,7 @@ impl Pipeline {
                 category: state.spec.category.clone(),
                 metadata: state.spec.metadata.clone(),
                 output_dir: Some(state.working_dir.display().to_string()),
+                server_attribution: state.server_attribution.contributions().to_vec(),
                 created_at_epoch_ms: state.created_at_epoch_ms,
             },
         );

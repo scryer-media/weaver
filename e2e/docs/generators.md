@@ -130,6 +130,7 @@ payload almost every archive wraps), `clip-preview` (5 MiB exactly),
 | `rarlab-7.23` | `rarlinux-x64-723.tar.gz`, SHA-256 `759b4b6a…cab588` | every general-corpus RAR5 archive (`-ma5`) |
 | `sevenzip-26.02` | `https://www.7-zip.org/a/7z2602-linux-x64.tar.xz`, SHA-256 `41aaba7b…c28c03e` | every 7z container |
 | `par2cmdline-turbo-1.4.0` | `v1.4.0.tar.gz`, SHA-256 `6f2cb042…d1b972` | every PAR2 recovery set |
+| `par3cmdline-2971702e` | `par3cmdline` revision `2971702e`, SHA-256 `41695d42…6c8e8d` | every PAR3 recovery set and every inserted PAR3 protection, and the repair each damaged PAR3 fixture is proved against |
 | `uudeview-0.5.20` | `uudeview_0.5.20.orig.tar.gz`, SHA-256 `a2a44fa5…70a414` | every uuencoded article, and the decoder each one is proved against |
 | `ffmpeg-7.1-ubuntu2404` | image digest `sha256:292a972c…71931d` | every video clip |
 | `go-fixture-bytes` | Go 1.27.0, stdlib | payload streams and every byte edit |
@@ -147,7 +148,7 @@ was fetched. The full digests are in `test-corpus/toolchains.json`, which is
 the only place they are authoritative.
 
 The Dockerfiles the container pins name live in
-`internal/fixturegen/docker/{rarlab,par2,sevenzip}/Dockerfile`. Each takes the
+`internal/fixturegen/docker/{rarlab,par2,par3,sevenzip}/Dockerfile`. Each takes the
 URL and the digest as build arguments and runs `sha256sum -c` before it
 installs anything, so a changed upstream download fails the build rather than
 silently entering the corpus.
@@ -172,7 +173,7 @@ not belong in this corpus. Listing and verifying with `unrar` is fine; creating
 is not.
 
 The other formats are open, and are written by whichever pinned oracle is most
-convenient: PAR2 by par2cmdline-turbo, 7z by the official 7-Zip console binary
+convenient: PAR2 by par2cmdline-turbo, PAR3 by the par3cmdline reference, 7z by the official 7-Zip console binary
 (never a distribution `p7zip` fork), video by the pinned FFmpeg image, and
 zip/tar/gzip/DEFLATE/zstd/bzip2/brotli by Go.
 
@@ -189,10 +190,11 @@ zip/tar/gzip/DEFLATE/zstd/bzip2/brotli by Go.
 | 7z | `single-7z`, `single-7z-corrupted`, `7z-encrypted`, `split-7z`, `split-7z-encrypted`, `split-7z-corrupted` | LZMA2, split by byte range |
 | obfuscated | `obfuscated-rar`, `obfuscated-rar-unknown-numeric`, `obfuscated-rar-split-topology`, `obfuscated-split-7z` | hex and numeric names: `.10/.11/.12`, `.100/.101/.102` |
 | PAR2 | 22 slugs: ordinary repair, heavy damage ×4, insufficient parity, small repair ×5, multivolume, RAR4, 7z, a split 7z with one part withheld from the posting, direct payload, sidecar-only rewrite, multi-swap placement, ignorable-sidecar deficit, partial recovery volume, split parts under a joined-file set, two sets in one posting | par2cmdline-turbo |
+| PAR3 | 33 slugs, `par3-*` and `par2-par3-both-sufficient`: loose sets under Cauchy, FFT, a 16-bit field, uneven interleaved cohorts, aligned and sliding deduplication, Data packets with the payload withheld, packed tails, multi-file sets, a withheld file, insufficient recovery, heavy damage, deleted tail articles, a withheld index, an obfuscated payload name, a lone recovery volume posted under a `.bin` name, and two sets in one posting; external sets over multivolume RAR5 (repair, withheld volume, `-hp`), RAR4, 7z, a split 7z with a part withheld, and zip; protection inserted into zip (clean, repair, header repair, insufficient, one deleted article) and into an uncompressed 7z; PAR2 beside PAR3, once where only PAR3 can repair and once where either can | par3cmdline; RARLAB 7.23 / 6.24, 7-Zip and Go for the containers |
 | zip | `zip-unencrypted`, `zip-encrypted`, `zip-corrupted` | stored members; ZipCrypto for the encrypted one |
 | tar | `tar-archive`, `tar-corrupted`, `tgz-archive`, `tar-gzip-archive`, `tbz2-archive`, `tar-bzip2-archive`, `targz-archive`, `targz-corrupted` | ustar padded to GNU tar's 10 KiB blocking factor |
 | stream codec | `gzip-single`, `gzip-corrupted`, `deflate-single`, `bzip2-single`, `zstd-single`, `brotli-single` | bare streams, no container |
-| direct store | 13 slugs | stored, non-solid RAR sets the direct-store router must carry: eight clean shapes, four hole-repair sets (`-p`, `-hp`, RAR4 `-p`, plain) damaged by deleting an interior volume's tail articles, and `direct-store-par2-withheld-volume`, whose interior volume is deleted whole after posting so the NZB lists a volume every server answers 430 for — the health probe must settle without burning its soft timeout and the repair creates the volume from nothing |
+| direct store | 17 slugs | stored, non-solid RAR sets the direct-store router must carry: eight clean shapes, four hole-repair sets (`-p`, `-hp`, RAR4 `-p`, plain) damaged by deleting an interior volume's tail articles, and `direct-store-par2-withheld-volume`, whose interior volume is deleted whole after posting so the NZB lists a volume every server answers 430 for — the health probe must settle without burning its soft timeout and the repair creates the volume from nothing. Four more twin the plain, `-p` and `-hp` hole repairs and the withheld volume with PAR3 recovery in place of PAR2 |
 | mixed | `mixed-archive` | a RAR beside a loose clip and an NFO |
 | uuencode | `uu-release`, `uu-mixed-yenc`, `uu-preamble-tail`, `uu-missing-middle` | the only fixtures nyuu cannot post — it is a yEnc poster with no encoding selector — so their article bodies ship pre-encoded and the seeder posts them itself. uuenview writes the encoding and splits it at line boundaries; uudeview decodes every one back before it is published. `uu-preamble-tail` carries the corpus's one deliberate deviation from oracle output: an unpadded final group, the broken-encoder probe |
 
@@ -209,6 +211,14 @@ drop exactly 1 MiB from the tail. PAR2 damage is expressed in *blocks*: the
 recipe reads the slice size back out of the index file par2cmdline wrote and
 zeroes a whole number of blocks, so "sixteen of fifty blocks against one
 recovery block" stays true when a payload changes size.
+
+PAR3 damage is expressed in blocks of the geometry each recipe fixes, and every
+damaged PAR3 fixture carries a proof: before the output is accepted, the
+par3cmdline reference repairs a scratch copy of exactly what the posting will
+carry and must restore every damaged or withheld file byte for byte. The
+reference exits zero even when it cannot repair, so the proof judges bytes,
+never the exit status; the two insufficient fixtures must instead be refused
+outright.
 
 ## Adding a scenario
 

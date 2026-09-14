@@ -17,6 +17,7 @@ impl SettingsQuery {
                 complete_dir: cfg.complete_dir(),
                 cleanup_after_extract: cfg.cleanup_after_extract(),
                 max_download_speed: cfg.max_download_speed.unwrap_or(0),
+                propagation_delay_secs: cfg.propagation_delay_secs(),
                 max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
                 ip_replacement_trial_extra_connections: cfg
                     .ip_replacement_trial_extra_connections(),

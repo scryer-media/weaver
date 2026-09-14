@@ -23,6 +23,7 @@ enum OutOfOrderPersistReason {
     PerFileMaxPending,
     GlobalWriteBacklog,
     QuiescentFlush,
+    DirectUnpack,
 }
 
 impl OutOfOrderPersistReason {
@@ -31,6 +32,7 @@ impl OutOfOrderPersistReason {
             Self::PerFileMaxPending => "download.write_buffer.out_of_order.per_file_max_pending",
             Self::GlobalWriteBacklog => "download.write_buffer.out_of_order.global_write_backlog",
             Self::QuiescentFlush => "download.write_buffer.out_of_order.quiescent_flush",
+            Self::DirectUnpack => "download.write_buffer.out_of_order.direct_unpack",
         }
     }
 }
@@ -543,29 +545,32 @@ impl Pipeline {
         let Some(file) = state.assembly.file(file_id) else {
             return true;
         };
-        if !matches!(
+        // Past this point the job does have a recovery set. A RAR volume is
+        // adjudicated by that set's slice grid rather than by a hash over the
+        // volume, so the stream buys nothing for it.
+        !matches!(
             self.classified_role_for_file(file_id.job_id, file),
             weaver_model::files::FileRole::RarVolume { .. }
-        ) {
-            return true;
-        }
-        self.par2_set(file_id.job_id).is_none()
+        )
     }
 
+    /// Whether the completed-file MD5 has no consumer, so neither the streamed
+    /// hash nor a read-back has to produce one.
+    ///
+    /// The consumer is PAR2: committed-file evidence binds a finished file to a
+    /// recovery-set description by hash identity. A job with no recovery set
+    /// has nobody to compare a whole-file MD5 against, and that is true
+    /// whatever the file's role — the role only ever stood in for "is this
+    /// likely to end up in front of PAR2", which the recovery set itself
+    /// answers directly. Restricting it to standalone files meant every split
+    /// archive volume in a job with no recovery set was hashed in full on the
+    /// orchestrator task for a value nothing would read.
+    ///
+    /// A recovery set discovered *after* a file settled is handled where it
+    /// always was: this predicate is re-evaluated at finalize, and a set that
+    /// has appeared by then sends the file down the read-back path instead.
     fn can_defer_completed_file_md5(&self, file_id: NzbFileId) -> bool {
-        if self.par2_set(file_id.job_id).is_some() {
-            return false;
-        }
-        let Some(state) = self.jobs.get(&file_id.job_id) else {
-            return false;
-        };
-        let Some(file) = state.assembly.file(file_id) else {
-            return false;
-        };
-        matches!(
-            self.classified_role_for_file(file_id.job_id, file),
-            weaver_model::files::FileRole::Standalone | weaver_model::files::FileRole::Unknown
-        )
+        self.par2_set(file_id.job_id).is_none()
     }
 
     pub(crate) fn note_expected_file_crc(
@@ -746,12 +751,21 @@ impl Pipeline {
                     // had already proven Damaged (the yEnc aggregate CRC it was
                     // gated on is the poster's own declaration, not independent
                     // evidence). Files land in the deferral paths below instead
-                    // and are adjudicated by the dual-CRC slice verdicts, like
-                    // SABnzbd's quick-check and NZBGet's ParQuick, which only
-                    // ever compare observed values against expectations.
+                    // and are adjudicated by the dual-CRC slice verdicts, which
+                    // compare observed values against expectations.
                     let file_crc_matched = expected_file_crc
                         .is_some_and(|expected_file_crc| streamed.crc32 == expected_file_crc);
-                    if file_crc_matched && self.can_defer_completed_file_md5(file_id) {
+                    // A poster who supplied an aggregate `=yend crc32` has to
+                    // be satisfied; one who supplied none leaves the
+                    // per-article CRC32s as the alignment, and they have
+                    // already adjudicated every byte. Demanding the poster's
+                    // value here would send the many multipart posts that omit
+                    // it into a whole-file read-back to produce a hash this
+                    // job has no recovery set to compare against — strictly
+                    // worse than the streamed hash it replaced.
+                    let file_crc_agrees = expected_file_crc
+                        .is_none_or(|expected_file_crc| streamed.crc32 == expected_file_crc);
+                    if file_crc_agrees && self.can_defer_completed_file_md5(file_id) {
                         crate::runtime::perf_probe::record(
                             "download.file_hash.md5.deferred_no_par2_expected_crc",
                             std::time::Duration::from_nanos(1),
@@ -808,7 +822,8 @@ impl Pipeline {
             .map_err(|error| format!("failed to checksum completed file: {error}"))
     }
 
-    pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId) {
+    pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId, raw_bytes: u64) {
+        self.active_decode_bytes.insert(segment_id, raw_bytes);
         let job_id = segment_id.file_id.job_id;
         *self.active_decodes_by_job.entry(job_id).or_default() += 1;
         *self
@@ -819,6 +834,7 @@ impl Pipeline {
     }
 
     fn note_decode_finished(&mut self, segment_id: SegmentId) {
+        self.active_decode_bytes.remove(&segment_id);
         let job_id = segment_id.file_id.job_id;
         if let Some(active) = self.active_decodes_by_job.get_mut(&job_id) {
             *active = active.saturating_sub(1);
@@ -1003,6 +1019,7 @@ impl Pipeline {
             return;
         };
 
+        self.invalidate_par3_source_write(file_id);
         let segment = match write_segment_to_disk(&file_path, file_offset, segment).await {
             Ok(segment) => segment,
             Err(error) => {
@@ -1086,10 +1103,11 @@ impl Pipeline {
                 {
                     return None;
                 }
-                let has_buffered_segments = self
-                    .write_buffers
-                    .keys()
-                    .any(|file_id| file_id.job_id == *job_id);
+                let has_buffered_segments = self.write_buffers.iter().any(|(file_id, buffer)| {
+                    file_id.job_id == *job_id
+                        && buffer.buffered_len() > 0
+                        && !self.demotion_sweep_owns_file(*file_id)
+                });
                 has_buffered_segments.then_some(*job_id)
             })
             .collect();
@@ -1097,9 +1115,16 @@ impl Pipeline {
         for job_id in stalled_jobs {
             let file_ids: Vec<NzbFileId> = self
                 .write_buffers
-                .keys()
-                .copied()
-                .filter(|file_id| file_id.job_id == job_id)
+                .iter()
+                // Quiescence does not transfer ownership from a reconstruction
+                // ticket. Its handback must seed the volume before these bytes
+                // can be committed and the whole-file CRC can be checked.
+                .filter(|(file_id, buffer)| {
+                    file_id.job_id == job_id
+                        && buffer.buffered_len() > 0
+                        && !self.demotion_sweep_owns_file(**file_id)
+                })
+                .map(|(file_id, _)| *file_id)
                 .collect();
 
             if file_ids.is_empty() {
@@ -1214,8 +1239,8 @@ impl Pipeline {
     /// Handle a decode failure by re-queuing the segment for re-download.
     ///
     /// yEnc decode failures (CRC/size mismatch, malformed data) indicate the
-    /// article body was corrupted — either in transit or on the server. Following
-    /// NZBGet's approach, we re-download the segment (which may hit a different
+    /// article body was corrupted — either in transit or on the server. We
+    /// re-download the segment (which may hit a different
     /// server via the connection pool's failover logic). After `MAX_SEGMENT_RETRIES`
     /// decode failures for the same segment, mark it as permanently failed and
     /// update health.
@@ -2174,12 +2199,11 @@ impl Pipeline {
         let decoded_bytes = data.len_bytes();
         let projected_resident = self.write_buffered_bytes.saturating_add(decoded_bytes);
         let spills = projected_resident >= self.write_backlog_budget_bytes;
-        if self.uu_spool_admission_capped(0)
-            || (spills && self.uu_spool_admission_capped(decoded_bytes))
-        {
+        if self.uu_spool_admission_capped(0) || (spills && !self.admit_uu_spill(decoded_bytes)) {
             // The part is already decoded, but holding it would exceed the
             // aggregate cache cap or consume the intermediate filesystem's
-            // reserved free space. Requeue without retry burn, exactly like a
+            // reserved free space (or, for a spill, the filesystem cannot be
+            // measured at all). Requeue without retry burn, exactly like a
             // per-file farthest-part displacement.
             return Ok(vec![segment_number]);
         }
@@ -2477,11 +2501,20 @@ impl Pipeline {
 
     fn fail_job_for_disk_write(&mut self, error: SegmentWriteError, context: &'static str) {
         let job_id = error.file_id.job_id;
-        let message = format!("{context} for {}: {}", error.file_id, error.source);
+        let out_of_space = crate::operations::is_out_of_space(&error.source);
+        let message = if out_of_space {
+            format!(
+                "{context} for {}: filesystem out of space or over quota ({})",
+                error.file_id, error.source
+            )
+        } else {
+            format!("{context} for {}: {}", error.file_id, error.source)
+        };
         error!(
             job_id = job_id.0,
             file_id = %error.file_id,
             error = %error.source,
+            out_of_space,
             context,
             "disk write failed; failing job"
         );
@@ -2539,6 +2572,7 @@ impl Pipeline {
             "download.persist_ready_segments.batch_bytes",
             ready_bytes as u64,
         );
+        self.invalidate_par3_source_write(file_id);
         let write_result = write_segments_to_disk(&file_path, ready).await;
         self.release_write_buffered(ready_bytes, ready_count);
 
@@ -2598,12 +2632,13 @@ impl Pipeline {
         if self.demotion_sweep_owns_file(file_id) {
             return Ok(());
         }
+        let direct_unpack = self.direct_unpack_wants_committed_ranges(file_id);
         loop {
             let batch = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
                     return Ok(());
                 };
-                if !write_buf.exceeds_max_pending() {
+                if !direct_unpack && !write_buf.exceeds_max_pending() {
                     return Ok(());
                 }
                 write_buf.take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
@@ -2616,14 +2651,72 @@ impl Pipeline {
             self.persist_out_of_order_segments(
                 file_id,
                 batch,
-                OutOfOrderPersistReason::PerFileMaxPending,
+                if direct_unpack {
+                    OutOfOrderPersistReason::DirectUnpack
+                } else {
+                    OutOfOrderPersistReason::PerFileMaxPending
+                },
             )
             .await?;
         }
     }
 
     async fn relieve_global_write_backlog(&mut self) -> Result<(), SegmentWriteError> {
-        while self.write_buffered_bytes > self.write_backlog_budget_bytes {
+        self.relieve_global_write_backlog_to(self.write_backlog_budget_bytes)
+            .await
+    }
+
+    /// Spill the write backlog off the hard-pressure latch without waiting
+    /// for a decode landing.
+    ///
+    /// The landing path's relief runs only when an article lands, and under
+    /// a hard latch none does: dispatch is stopped until the backlog falls
+    /// below the soft limit, while the landing relief stops at the budget.
+    /// Bytes left between the two limits by the last landing, or parked for a
+    /// demotion sweep and handed back after it, would otherwise sit there with
+    /// nothing to move them. Runs from the tune tick and from the sweep
+    /// handback, and wakes dispatch once the latch is gone.
+    pub(crate) async fn relieve_latched_write_backlog(&mut self) {
+        if !self.download_write_hard_pressure_latched {
+            return;
+        }
+        let (_, _, write_soft, _) = self.download_pressure_limits();
+        let target = usize::try_from(write_soft.saturating_sub(1)).unwrap_or(usize::MAX);
+        if let Err(error) = self.relieve_global_write_backlog_to(target).await {
+            self.fail_job_for_disk_write(error, "failed to relieve latched write backlog");
+            return;
+        }
+        if self.refresh_download_pressure().state != DownloadPressureState::Hard {
+            self.download_dispatch_wake = true;
+        }
+    }
+
+    /// Spill the articles a demotion sweep parked, now that the files are
+    /// ordinary again.
+    ///
+    /// The handback drained what was contiguous; whatever landed out of order
+    /// while the sweep owned the files is still resident, and the per-file and
+    /// global relief both skipped these files for as long as it ran. The hold
+    /// on their queued work lifts here too, so dispatch is owed a pass.
+    pub(crate) async fn relieve_handed_back_write_backlog(&mut self, volume_files: &[NzbFileId]) {
+        for file_id in volume_files {
+            if let Err(error) = self.enforce_file_write_backlog(*file_id).await {
+                self.fail_job_for_disk_write(
+                    error,
+                    "failed to relieve a handed-back volume's write backlog",
+                );
+                return;
+            }
+        }
+        self.relieve_latched_write_backlog().await;
+        self.download_dispatch_wake = true;
+    }
+
+    async fn relieve_global_write_backlog_to(
+        &mut self,
+        target_bytes: usize,
+    ) -> Result<(), SegmentWriteError> {
+        while self.write_buffered_bytes > target_bytes {
             let candidate_file = self
                 .write_buffers
                 .iter()
@@ -2703,6 +2796,7 @@ impl Pipeline {
         };
 
         let write_start = Instant::now();
+        self.invalidate_par3_source_write(file_id);
         let write_result = write_segments_to_disk(&file_path, segments).await;
         // Hot-path safe: reuses the `write_start` this path already keeps for
         // the `disk_write_latency_us` gauge, so the histogram costs no extra
@@ -2870,6 +2964,16 @@ impl Pipeline {
                     );
                 }
 
+                if was_duplicate && self.direct_unpack_wants_committed_ranges(file_id) {
+                    self.taint_direct_unpack_for_file(job_id, filename);
+                }
+                self.direct_unpack_note_range(
+                    file_id,
+                    filename,
+                    file_offset,
+                    u64::from(decoded_size),
+                );
+
                 // The file hash is a *running* stream: every chunk must be fed
                 // once, in offset order. A duplicate's bytes were already fed
                 // by the original arrival, so re-feeding them is what trips the
@@ -2976,6 +3080,7 @@ impl Pipeline {
                             let mut leftovers = leftovers.into_iter();
                             while let Some((offset, buffered)) = leftovers.next() {
                                 let buffered_bytes = buffered.len_bytes();
+                                self.invalidate_par3_source_write(file_id);
                                 if let Err(e) =
                                     write_segment_to_disk(file_path, offset, buffered).await
                                 {
@@ -3054,15 +3159,38 @@ impl Pipeline {
                                 return;
                             }
                         }
-                        crate::pipeline::release_cached_write_handle(file_path);
-                        self.fail_job(
-                            job_id,
-                            format!(
-                                "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
-                                file_checksum.crc32
-                            ),
-                        );
-                        return;
+                        if self.par2_can_recover_file_crc(file_id, total_bytes, expected_crc) {
+                            self.taint_direct_unpack_for_file(job_id, filename);
+                            let file_index = file_id.file_index;
+                            if let Err(error) = self
+                                .db_blocking(move |db| db.mark_file_incomplete(job_id, file_index))
+                                .await
+                            {
+                                crate::pipeline::release_cached_write_handle(file_path);
+                                self.fail_job(
+                                    job_id,
+                                    format!("failed to persist CRC damage: {error}"),
+                                );
+                                return;
+                            }
+                            warn!(
+                                job_id = job_id.0,
+                                file_id = %file_id,
+                                expected_crc = format_args!("{expected_crc:08x}"),
+                                actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                "whole-file CRC mismatch; matching PAR2 metadata requires repair before acceptance"
+                            );
+                        } else {
+                            crate::pipeline::release_cached_write_handle(file_path);
+                            self.fail_job(
+                                job_id,
+                                format!(
+                                    "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
+                                    file_checksum.crc32
+                                ),
+                            );
+                            return;
+                        }
                     }
                     self.ensure_par2_runtime(job_id)
                         .completed_checksums
@@ -3123,7 +3251,9 @@ impl Pipeline {
                         total_bytes,
                     });
 
-                    {
+                    // A CRC-rejected source must not become a durable completed
+                    // file before PAR2 accepts it. A restart must revisit it.
+                    if expected_file_crc.is_none_or(|expected| expected == file_checksum.crc32) {
                         let file_index = file_id.file_index;
                         let fname = filename.to_string();
                         if let Err(e) = self
@@ -3144,7 +3274,9 @@ impl Pipeline {
                     self.pending_file_progress.remove(&file_id);
                     self.persisted_file_progress.remove(&file_id);
                     self.file_hash_states.remove(&file_id);
-                    self.expected_file_crcs.remove(&file_id);
+                    if expected_file_crc.is_none_or(|expected| expected == file_checksum.crc32) {
+                        self.expected_file_crcs.remove(&file_id);
+                    }
                     self.file_hash_reread_required.remove(&file_id);
                     self.unverified_segments.remove(&file_id);
                     self.file_crc_recoveries.remove(&file_id);
@@ -3160,6 +3292,7 @@ impl Pipeline {
                         stage_ms = stage_start.elapsed().as_millis() as u64,
                         "file-complete stage: try_load_par2_metadata"
                     );
+                    self.try_load_par3_metadata(job_id, file_id).await;
                     stage_start = Instant::now();
                     self.try_merge_par2_recovery(job_id, file_id).await;
                     crate::runtime::perf_probe::record(
