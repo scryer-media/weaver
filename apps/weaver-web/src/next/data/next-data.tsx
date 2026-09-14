@@ -25,6 +25,7 @@ import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { DownloadBlockState } from "@/lib/context/live-data-context";
 import { formatRate } from "./format";
+import { withLiveConnections, type ProviderConnections } from "./provider-connections";
 import { useHistoryLiveRefresh } from "./use-history-live-refresh";
 import { useLiveQueue, type LiveQueue } from "./use-live-queue";
 
@@ -66,6 +67,7 @@ interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
   globalState: { isPaused: boolean; speedLimitBytesPerSec: number; downloadBlock: DownloadBlockState };
   providerHoldoffs?: ProviderHoldoff[];
+  providerConnections?: ProviderConnections[];
 }
 
 /** A category as it is configured, not as the queue happens to use it. */
@@ -235,7 +237,13 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     () => reexecuteCategories({ requestPolicy: "network-only" }),
     [reexecuteCategories],
   );
-  const providers = providerData?.serverHealth ?? EMPTY_PROVIDERS;
+  // Health is re-read on a slow beat; the counts on the meters follow the
+  // metrics stream instead, so they move as the pool opens connections.
+  const liveConnections = snapshot?.providerConnections;
+  const providers = useMemo(
+    () => withLiveConnections(providerData?.serverHealth ?? EMPTY_PROVIDERS, liveConnections),
+    [providerData, liveConnections],
+  );
   const providersLoaded = providerData !== undefined;
   const holdoffs = snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS;
   const version = versionData?.version ?? "";

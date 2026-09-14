@@ -69,7 +69,7 @@ export function ProvidersBlock() {
                     : `${provider.connectionsActive} / ${provider.connectionsMax || provider.connectionsConfigured}`}
                 </span>
               </div>
-              <Bar percent={load} color={idle ? WV.inert : WV.accent} height={10} />
+              <Bar percent={load} color={idle ? WV.inert : WV.accent} height={10} live />
             </div>
           );
         })

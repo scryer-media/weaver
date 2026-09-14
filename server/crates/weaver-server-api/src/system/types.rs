@@ -411,6 +411,20 @@ pub struct SystemMetricsSnapshot {
     /// gauge the way the event-driven queue item, published at most once a
     /// second, always did.
     pub job_download_rates: Vec<JobDownloadRate>,
+    /// Connections each server has open right now, on the same cadence, so a
+    /// connection meter can follow the pool instead of waiting for the next
+    /// `serverHealth` read.
+    pub provider_connections: Vec<ProviderConnections>,
+}
+
+/// How many of a server's connections are in use at one instant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct ProviderConnections {
+    /// `host:port` label, matching `ServerHealth.label`.
+    pub label: String,
+    pub active: u32,
+    /// The server's connection limit.
+    pub max: u32,
 }
 
 /// The download-phase rate of one job, from the same estimator and the same

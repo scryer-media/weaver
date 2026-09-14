@@ -504,6 +504,7 @@ export function Bar({
   className,
   style,
   label,
+  live = false,
 }: {
   percent: number;
   color: string;
@@ -514,12 +515,18 @@ export function Bar({
   style?: CSSProperties;
   /** What the meter measures. With one, it is announced as a progress bar. */
   label?: string;
+  /**
+   * Draw each value as it arrives instead of walking up to it. For a meter fed
+   * several times a second, where the walk would only trail behind the reading.
+   */
+  live?: boolean;
 }) {
   const clamped = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
   const cell = period ?? blockPeriod(height);
   const [ref, width] = useTrackWidth();
   const cells = Math.max(1, Math.floor(width / cell));
-  const shown = useSteppedValue(clamped, 100 / (cells * BAR_LEVELS));
+  const stepped = useSteppedValue(clamped, live ? 0 : 100 / (cells * BAR_LEVELS));
+  const shown = live ? clamped : stepped;
 
   // Whole cells first, then the level the next one has reached. The epsilon
   // keeps a value sitting exactly on a boundary from also drawing an empty stub

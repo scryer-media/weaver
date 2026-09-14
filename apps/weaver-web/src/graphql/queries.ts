@@ -990,6 +990,11 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
         jobId
         rateBps
       }
+      providerConnections {
+        label
+        active
+        max
+      }
     }
   }
   ${DOWNLOAD_BLOCK_FIELDS}
