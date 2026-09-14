@@ -145,7 +145,13 @@ mod tests {
         let access = open(source, path.clone(), &options).unwrap();
         let snapshot = access.snapshot(source).unwrap();
         assert_eq!(access.snapshot(source).unwrap(), snapshot);
-        std::fs::write(&path, b"other").unwrap();
+        // The fence sees a same-length rewrite through its timestamps, which
+        // NTFS advances only at the system clock's granularity.
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        while std::fs::metadata(&path).unwrap().modified().unwrap() == written {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::fs::write(&path, b"other").unwrap();
+        }
         assert!(matches!(
             EngineError::from(access.snapshot(source).unwrap_err()),
             EngineError::SourceChanged(id) if id == source
