@@ -63,6 +63,10 @@ pub(crate) fn extract(
     let mut archive =
         unrar_rs::RarArchive::open_prefix(first, password.as_deref(), NonZeroUsize::MIN)
             .map_err(|error| error.to_string())?;
+    // Chases wait for committed download ranges. Decode inline to avoid the
+    // worker item/replay overhead while bandwidth limits progress. Completed
+    // archive extraction keeps unrar-rs's default parallel policy.
+    archive.set_decode_mode(unrar_rs::DecodeMode::Serial);
     let options = unrar_rs::ExtractOptions {
         verify: true,
         password: password.clone(),
