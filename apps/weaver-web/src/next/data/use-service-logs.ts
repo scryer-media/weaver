@@ -81,7 +81,7 @@ function parse(id: number, raw: string): LogLine {
 }
 
 export interface ServiceLogs {
-  /** Newest first, as the design renders them. */
+  /** Oldest first, so the tail grows at the bottom like a terminal. */
   lines: LogLine[];
   counts: Record<LogLevelFilter, number>;
   bufferedCount: number;
@@ -230,7 +230,7 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
     const matching = level === "all" ? searched : searched.filter((line) => line.level === level);
 
     return {
-      lines: matching.slice().reverse(),
+      lines: matching,
       counts,
       bufferedCount: buffer.length,
       matchedCount: matching.length,
