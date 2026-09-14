@@ -1138,4 +1138,8 @@ export const nextZh: LocaleDictionary = {
   "next.login.docker": "Docker",
   "next.login.bareMetal": "直接安装",
   "next.login.trustedNetworks": "也可以在 {{variable}} 中列出受信任的网络，让这些网络中的浏览器无需登录即可以管理员身份访问。",
+  "next.job.deleteSaveFiles": "删除，保留文件",
+  "next.job.deleteAllFiles": "删除，全部文件",
+  "next.job.deleteAllTitle": "连同所有文件删除",
+  "next.job.deleteAllBody": "该条目将从历史中移除，其下载的文件也会从磁盘删除。此操作在后台进行，无法撤销。",
 };

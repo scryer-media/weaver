@@ -1138,4 +1138,8 @@ export const nextPt: LocaleDictionary = {
   "next.login.docker": "Docker",
   "next.login.bareMetal": "Instalação direta",
   "next.login.trustedNetworks": "Ou liste redes confiáveis em {{variable}} para que os navegadores delas entrem como administradores sem fazer login.",
+  "next.job.deleteSaveFiles": "Excluir, manter arquivos",
+  "next.job.deleteAllFiles": "Excluir, todos os arquivos",
+  "next.job.deleteAllTitle": "Excluir com todos os arquivos",
+  "next.job.deleteAllBody": "A entrada sai do histórico e seus arquivos baixados são excluídos do disco. Isso é feito em segundo plano e não pode ser desfeito.",
 };

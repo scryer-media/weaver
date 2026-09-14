@@ -1138,4 +1138,8 @@ export const nextJa: LocaleDictionary = {
   "next.login.docker": "Docker",
   "next.login.bareMetal": "直接インストール",
   "next.login.trustedNetworks": "または {{variable}} に信頼できるネットワークを指定すると、そのネットワークのブラウザはサインインなしで管理者として利用できます。",
+  "next.job.deleteSaveFiles": "削除（ファイルは残す）",
+  "next.job.deleteAllFiles": "削除（すべてのファイル）",
+  "next.job.deleteAllTitle": "すべてのファイルごと削除",
+  "next.job.deleteAllBody": "エントリは履歴から消え、ダウンロードしたファイルもディスクから削除されます。処理はバックグラウンドで行われ、元に戻せません。",
 };

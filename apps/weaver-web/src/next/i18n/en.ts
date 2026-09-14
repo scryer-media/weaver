@@ -1144,4 +1144,8 @@ export const nextEn: LocaleDictionary = {
   "next.login.docker": "Docker",
   "next.login.bareMetal": "Bare metal",
   "next.login.trustedNetworks": "Or list trusted networks in {{variable}} to let browsers on them in as administrators without signing in.",
+  "next.job.deleteSaveFiles": "Delete, save files",
+  "next.job.deleteAllFiles": "Delete, all files",
+  "next.job.deleteAllTitle": "Delete with all files",
+  "next.job.deleteAllBody": "The entry leaves history and its downloaded files are deleted from disk. This runs in the background and cannot be undone.",
 };

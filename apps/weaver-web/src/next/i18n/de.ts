@@ -1138,4 +1138,8 @@ export const nextDe: LocaleDictionary = {
   "next.login.docker": "Docker",
   "next.login.bareMetal": "Direkt installiert",
   "next.login.trustedNetworks": "Oder trage vertrauenswürdige Netzwerke in {{variable}} ein, damit Browser aus diesen Netzen ohne Anmeldung als Administrator zugreifen.",
+  "next.job.deleteSaveFiles": "Löschen, Dateien behalten",
+  "next.job.deleteAllFiles": "Löschen, alle Dateien",
+  "next.job.deleteAllTitle": "Mit allen Dateien löschen",
+  "next.job.deleteAllBody": "Der Eintrag verlässt den Verlauf und seine heruntergeladenen Dateien werden von der Festplatte gelöscht. Das läuft im Hintergrund und lässt sich nicht rückgängig machen.",
 };

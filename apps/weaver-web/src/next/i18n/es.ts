@@ -1138,4 +1138,8 @@ export const nextEs: LocaleDictionary = {
   "next.login.docker": "Docker",
   "next.login.bareMetal": "Instalación directa",
   "next.login.trustedNetworks": "O indica redes de confianza en {{variable}} para que sus navegadores entren como administradores sin iniciar sesión.",
+  "next.job.deleteSaveFiles": "Eliminar, conservar archivos",
+  "next.job.deleteAllFiles": "Eliminar, todos los archivos",
+  "next.job.deleteAllTitle": "Eliminar con todos los archivos",
+  "next.job.deleteAllBody": "La entrada sale del historial y sus archivos descargados se eliminan del disco. Se ejecuta en segundo plano y no se puede deshacer.",
 };

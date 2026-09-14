@@ -189,7 +189,7 @@ export function JobDetailPage() {
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
 
-  const [confirm, setConfirm] = useState<"delete" | "cancel" | "forget" | null>(null);
+  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "cancel" | "forget" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -267,6 +267,10 @@ export function JobDetailPage() {
   const token = statusToken(job.status);
   const failed = token === "failed";
   const done = token === "completed";
+  // Weaver holds a finished job in its queue for a while before history takes
+  // it, so whether the job is over comes from its status, not from where the
+  // snapshot found it: pausing or cancelling a finished job means nothing.
+  const terminal = done || failed;
   const color = statusColor(progress.status);
   const percent = job.progress * 100;
   const phase = ratePhase(job.phaseProgress);
@@ -370,7 +374,7 @@ export function JobDetailPage() {
                 {t("next.inspector.stopScripts")}
               </SecondaryButton>
             ) : null}
-            {inQueue ? (
+            {inQueue && !terminal ? (
               <>
                 <SecondaryButton
                   icon={token === "paused" ? "resume" : "pause"}
@@ -438,7 +442,10 @@ export function JobDetailPage() {
                   {t("next.job.reprocess")}
                 </SecondaryButton>
                 <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
-                  {t("action.delete")}
+                  {t("next.job.deleteSaveFiles")}
+                </DangerButton>
+                <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("deleteAll")}>
+                  {t("next.job.deleteAllFiles")}
                 </DangerButton>
               </>
             )}
@@ -840,27 +847,34 @@ export function JobDetailPage() {
         </PanelGrid>
       </div>
 
-      <ConfirmDialog
-        open={confirm === "delete"}
-        title={t("next.job.deleteTitle")}
-        note={job.displayTitle || job.name}
-        busy={busy}
-        confirmLabel={t("next.job.deleteTitle")}
-        body={t("next.job.deleteBody")}
-        onDismiss={() => setConfirm(null)}
-        onConfirm={() => {
-          setConfirm(null);
-          void run(t("next.job.report.removed"), async () => {
-            const result = await acceptHistoryDelete({
-              input: { mode: "IDS", ids: [job.id], deleteFiles: false },
-            });
-            if (!result.error) {
-              navigate("/history");
-            }
-            return result;
-          });
-        }}
-      />
+      {(["delete", "deleteAll"] as const).map((kind) => {
+        const deleteFiles = kind === "deleteAll";
+        const title = deleteFiles ? t("next.job.deleteAllTitle") : t("next.job.deleteTitle");
+        return (
+          <ConfirmDialog
+            key={kind}
+            open={confirm === kind}
+            title={title}
+            note={job.displayTitle || job.name}
+            busy={busy}
+            confirmLabel={title}
+            body={deleteFiles ? t("next.job.deleteAllBody") : t("next.job.deleteBody")}
+            onDismiss={() => setConfirm(null)}
+            onConfirm={() => {
+              setConfirm(null);
+              void run(t("next.job.report.removed"), async () => {
+                const result = await acceptHistoryDelete({
+                  input: { mode: "IDS", ids: [job.id], deleteFiles },
+                });
+                if (!result.error) {
+                  navigate("/history");
+                }
+                return result;
+              });
+            }}
+          />
+        );
+      })}
 
       <ConfirmDialog
         open={confirm === "cancel"}
