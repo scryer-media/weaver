@@ -345,6 +345,9 @@ pub struct ServerInput {
 pub struct AdoptableTlsNameMismatchCertificate {
     pub der_base64: String,
     pub sha256_fingerprint: String,
+    /// Hostnames the certificate is issued for: its DNS alternative names, or
+    /// its common name when it has none.
+    pub names: Vec<String>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -379,6 +382,7 @@ impl From<weaver_server_core::servers::ServerConnectivityResult> for TestConnect
             adoptable_tls_name_mismatch_certificate: result
                 .adoptable_tls_name_mismatch_certificate_der
                 .map(|der| AdoptableTlsNameMismatchCertificate {
+                    names: weaver_nntp::tls::certificate_names(&der),
                     sha256_fingerprint: certificate_fingerprint(Some(&der))
                         .expect("certificate fingerprint exists for DER"),
                     der_base64: base64::engine::general_purpose::STANDARD.encode(der),

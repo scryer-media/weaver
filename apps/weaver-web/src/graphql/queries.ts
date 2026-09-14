@@ -1183,6 +1183,7 @@ export const TEST_CONNECTION_MUTATION = gql`
       adoptableTlsNameMismatchCertificate {
         derBase64
         sha256Fingerprint
+        names
       }
     }
   }

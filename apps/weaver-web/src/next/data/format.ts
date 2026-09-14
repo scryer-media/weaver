@@ -250,6 +250,12 @@ export function formatDayClock(epochMs: number | null | undefined): string {
   });
 }
 
+/** Hostnames for a sentence: the first few, then how many more there are. */
+export function formatHostnames(names: readonly string[], shown = 3): string {
+  const listed = names.slice(0, shown).join(", ");
+  return names.length > shown ? `${listed} +${names.length - shown}` : listed;
+}
+
 export function formatLatency(milliseconds: number | null | undefined): string {
   if (milliseconds == null || !Number.isFinite(milliseconds) || milliseconds <= 0) {
     return EM_DASH;

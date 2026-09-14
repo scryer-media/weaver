@@ -15,6 +15,7 @@ tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots = { workspace = true, default-features = false }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }

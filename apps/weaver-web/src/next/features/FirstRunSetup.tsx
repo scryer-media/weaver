@@ -25,7 +25,7 @@ import { Icon } from "../components/icons";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { WorkingOverlay } from "../components/WorkingOverlay";
 import { StorageMounts, type StorageVolume } from "../components/storage";
-import { formatLatency } from "../data/format";
+import { formatHostnames, formatLatency } from "../data/format";
 import { WV } from "../data/palette";
 import { PathField } from "./DirectoryBrowserDialog";
 
@@ -49,6 +49,7 @@ interface TestResult {
   adoptableTlsNameMismatchCertificate: {
     derBase64: string;
     sha256Fingerprint: string;
+    names: string[];
   } | null;
 }
 
@@ -69,7 +70,7 @@ interface ProviderForm {
   username: string;
   password: string;
   connections: number;
-  certificate: { derBase64: string; fingerprint: string } | null;
+  certificate: { derBase64: string; fingerprint: string; names?: string[] } | null;
 }
 
 /**
@@ -564,6 +565,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
               <TestOutcome
                 t={t}
                 result={testResult}
+                host={form.host.trim()}
                 trusted={form.certificate !== null}
                 onTrust={
                   certificate
@@ -571,6 +573,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
                         setConfirmTrust({
                           derBase64: certificate.derBase64,
                           fingerprint: certificate.sha256Fingerprint,
+                          names: certificate.names,
                         })
                     : undefined
                 }
@@ -601,8 +604,11 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
         body={
           <span className="flex flex-col gap-2.5">
             <span>{t("next.providers.trustBody")}</span>
-            <span className="font-wv-mono text-[11px] break-all text-wv-muted">
-              {t("next.providers.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}
+            <span className="flex flex-col gap-1 font-wv-mono text-[11px] break-all text-wv-muted">
+              {confirmTrust?.names?.length ? (
+                <span>{t("next.providers.certNames", { names: formatHostnames(confirmTrust.names) })}</span>
+              ) : null}
+              <span>{t("next.providers.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}</span>
             </span>
           </span>
         }
@@ -617,21 +623,36 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
 function TestOutcome({
   t,
   result,
+  host,
   trusted,
   onTrust,
 }: {
   t: Translate;
   result: TestResult;
+  host: string;
   trusted: boolean;
   onTrust?: () => void;
 }) {
-  const certificate = result.adoptableTlsNameMismatchCertificate;
+  // A certificate on offer is the whole story: say whose certificate it is
+  // instead of repeating the server's failure above the same warning.
+  const certificate = trusted ? null : result.adoptableTlsNameMismatchCertificate;
   return (
     <div role="status" className="flex flex-col gap-1.5 border border-wv-hairline bg-wv-input px-3 py-3">
-      <div className="flex items-center gap-[9px] text-[13px]">
-        <Square color={result.success ? WV.green : WV.error} />
-        <span className={result.success ? "text-wv-fg" : "text-wv-error-text"}>{result.message}</span>
-      </div>
+      {certificate ? (
+        <div className="flex items-start gap-[9px] text-[13px] leading-[1.45]">
+          <Square color={WV.warn} className="mt-[6px] flex-none" />
+          <span className="text-wv-warn">
+            {certificate.names.length
+              ? t("next.providers.certIssuedFor", { names: formatHostnames(certificate.names), host })
+              : t("next.providers.certMismatch")}
+          </span>
+        </div>
+      ) : (
+        <div className="flex items-center gap-[9px] text-[13px]">
+          <Square color={result.success ? WV.green : WV.error} />
+          <span className={result.success ? "text-wv-fg" : "text-wv-error-text"}>{result.message}</span>
+        </div>
+      )}
       {result.latencyMs === null ? null : (
         <div className="font-wv-mono text-[11.5px] text-wv-muted">
           {formatLatency(result.latencyMs)}
@@ -640,17 +661,12 @@ function TestOutcome({
       )}
       {certificate ? (
         <div className="flex flex-col gap-2 pt-1.5">
-          <span className="text-[12px] leading-[1.45] text-wv-warn">
-            {t("next.firstRun.provider.certMismatch")}
-          </span>
           <span className="font-wv-mono text-[11px] break-all text-wv-muted">
             {t("next.providers.certFingerprint", { fingerprint: certificate.sha256Fingerprint })}
           </span>
-          {trusted ? null : (
-            <SecondaryButton icon="trust" onClick={onTrust} className="self-start">
-              {t("next.providers.trustCert")}
-            </SecondaryButton>
-          )}
+          <SecondaryButton icon="trust" onClick={onTrust} className="self-start">
+            {t("next.providers.trustCert")}
+          </SecondaryButton>
         </div>
       ) : null}
     </div>

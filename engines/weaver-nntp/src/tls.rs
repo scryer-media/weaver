@@ -1406,6 +1406,84 @@ pub async fn inspect_tls_name_mismatch_certificate(
     inspect_tls_name_mismatch_certificate_via(host, port, ca_cert_path, None).await
 }
 
+/// The hostnames a certificate is issued for, for showing to a person.
+///
+/// Returns the certificate's DNS subject alternative names, or its subject
+/// common name when it has none. Empty when the certificate cannot be parsed.
+pub fn certificate_names(der: &[u8]) -> Vec<String> {
+    let der = CertificateDer::from(der);
+    let Ok(cert) = webpki::EndEntityCert::try_from(&der) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for name in cert.valid_dns_names() {
+        if !names.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    if names.is_empty()
+        && let Some(common_name) = subject_common_name(cert.subject())
+    {
+        names.push(common_name);
+    }
+    names
+}
+
+/// The first common name in a DER subject whose outer `SEQUENCE` is removed.
+fn subject_common_name(mut subject: &[u8]) -> Option<String> {
+    const COMMON_NAME_OID: &[u8] = &[0x55, 0x04, 0x03];
+    while !subject.is_empty() {
+        let (tag, mut set, rest) = der_element(subject)?;
+        subject = rest;
+        if tag != 0x31 {
+            continue;
+        }
+        while !set.is_empty() {
+            let (tag, attribute, rest) = der_element(set)?;
+            set = rest;
+            if tag != 0x30 {
+                continue;
+            }
+            let (oid_tag, oid, value) = der_element(attribute)?;
+            if oid_tag != 0x06 || oid != COMMON_NAME_OID {
+                continue;
+            }
+            let (value_tag, value, _) = der_element(value)?;
+            // UTF8String, PrintableString, T61String, IA5String.
+            if !matches!(value_tag, 0x0c | 0x13 | 0x14 | 0x16) {
+                return None;
+            }
+            let name = std::str::from_utf8(value).ok()?.trim();
+            return (!name.is_empty()).then(|| name.to_string());
+        }
+    }
+    None
+}
+
+/// Split one DER element into its tag, contents and the bytes after it.
+fn der_element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&first, mut rest) = rest.split_first()?;
+    let len = if first & 0x80 == 0 {
+        usize::from(first)
+    } else {
+        let count = usize::from(first & 0x7f);
+        if count == 0 || count > std::mem::size_of::<usize>() || rest.len() < count {
+            return None;
+        }
+        let (bytes, tail) = rest.split_at(count);
+        rest = tail;
+        bytes
+            .iter()
+            .fold(0usize, |len, &byte| (len << 8) | usize::from(byte))
+    };
+    if rest.len() < len {
+        return None;
+    }
+    let (contents, after) = rest.split_at(len);
+    Some((tag, contents, after))
+}
+
 pub async fn inspect_tls_name_mismatch_certificate_via(
     host: &str,
     port: u16,
@@ -1768,6 +1846,37 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn certificate_names_lists_the_hosts_a_certificate_is_issued_for() {
+        let certificate = rcgen::generate_simple_self_signed(vec![
+            "news.example".to_string(),
+            "*.news.example".to_string(),
+            "NEWS.example".to_string(),
+        ])
+        .expect("certificate");
+
+        assert_eq!(
+            certificate_names(certificate.cert.der()),
+            vec!["news.example".to_string(), "*.news.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn certificate_names_falls_back_to_the_common_name() {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "legacy.example");
+        let key = rcgen::KeyPair::generate().expect("key");
+        let certificate = params.self_signed(&key).expect("certificate");
+
+        assert_eq!(
+            certificate_names(certificate.der()),
+            vec!["legacy.example".to_string()]
+        );
+        assert!(certificate_names(b"not a certificate").is_empty());
     }
 
     #[test]

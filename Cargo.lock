@@ -6015,6 +6015,7 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "rustls-pki-types",
+ "rustls-webpki",
  "s2n-tls",
  "s2n-tls-sys",
  "s2n-tls-tokio",

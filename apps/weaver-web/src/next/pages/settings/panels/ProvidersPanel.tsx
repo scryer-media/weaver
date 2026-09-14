@@ -22,7 +22,7 @@ import { PrimaryButton, SecondaryButton, Toggle } from "../../../components/cont
 import { Cell } from "../../../components/rows";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
 import { WV } from "../../../data/palette";
-import { formatLatency, formatSize } from "../../../data/format";
+import { formatHostnames, formatLatency, formatSize } from "../../../data/format";
 import { PanelControls, SettingsBlocks, type FieldSpec, type SettingsBlock } from "../framework";
 
 /**
@@ -86,6 +86,7 @@ interface TestResult {
   adoptableTlsNameMismatchCertificate: {
     derBase64: string;
     sha256Fingerprint: string;
+    names: string[];
   } | null;
 }
 
@@ -294,7 +295,7 @@ export function ProvidersPanel() {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<TestResult | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<Server | null>(null);
-  const [confirmTrust, setConfirmTrust] = useState<{ derBase64: string; fingerprint: string } | null>(null);
+  const [confirmTrust, setConfirmTrust] = useState<{ derBase64: string; fingerprint: string; names: string[] } | null>(null);
 
   // Only the single-server query carries the stored username; the list does not.
   const [{ data: detailsData }] = useQuery<{ server: ServerDetails | null }>({
@@ -438,6 +439,8 @@ export function ProvidersPanel() {
     // Test again with the certificate, so the result shows whether it connects now.
     void runTest(next);
   };
+
+  const adoptable = values?.certificateDerBase64 ? null : (testResult?.adoptableTlsNameMismatchCertificate ?? null);
 
   // A trusted certificate belongs to one host and port over TLS.
   const forgetCertificate = { certificateDerBase64: null, certificateFingerprint: null };
@@ -759,12 +762,28 @@ export function ProvidersPanel() {
         ) : null}
         {testResult ? (
           <div className="flex flex-none flex-col gap-1.5 border-t border-wv-hairline px-4 sm:px-6 py-4">
-            <div className="flex items-center gap-[9px] text-[13px]">
-              <Square color={testResult.success ? WV.green : WV.error} />
-              <span className={testResult.success ? "text-wv-fg" : "text-wv-error-text"}>
-                {testResult.message}
-              </span>
-            </div>
+            {adoptable ? (
+              // A certificate on offer is the whole story: say whose certificate
+              // it is instead of repeating the server's failure above it.
+              <div className="flex items-start gap-[9px] text-[13px] leading-[1.45]">
+                <Square color={WV.warn} className="mt-[6px] flex-none" />
+                <span className="text-wv-warn">
+                  {adoptable.names.length
+                    ? t("next.providers.certIssuedFor", {
+                        names: formatHostnames(adoptable.names),
+                        host: values?.host.trim() ?? "",
+                      })
+                    : t("next.providers.certMismatch")}
+                </span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-[9px] text-[13px]">
+                <Square color={testResult.success ? WV.green : WV.error} />
+                <span className={testResult.success ? "text-wv-fg" : "text-wv-error-text"}>
+                  {testResult.message}
+                </span>
+              </div>
+            )}
             {testResult.latencyMs === null ? null : (
               <div className="font-wv-mono text-[11.5px] text-wv-muted">
                 {formatLatency(testResult.latencyMs)}
@@ -772,28 +791,21 @@ export function ProvidersPanel() {
                 {testResult.tlsCipherSuite ? ` · ${shortCipher(testResult.tlsCipherSuite)}` : ""}
               </div>
             )}
-            {testResult.adoptableTlsNameMismatchCertificate && !values?.certificateDerBase64 ? (
+            {adoptable ? (
               <div className="flex flex-col gap-2 pt-1.5">
-                <span className="text-[12px] leading-[1.45] text-wv-warn">
-                  {t("next.providers.certMismatch")}
-                </span>
                 <span className="font-wv-mono text-[11px] break-all text-wv-muted">
-                  {t("next.providers.certFingerprint", {
-                    fingerprint: testResult.adoptableTlsNameMismatchCertificate.sha256Fingerprint,
-                  })}
+                  {t("next.providers.certFingerprint", { fingerprint: adoptable.sha256Fingerprint })}
                 </span>
                 <SecondaryButton
                   icon="trust"
                   className="self-start"
-                  onClick={() => {
-                    const certificate = testResult.adoptableTlsNameMismatchCertificate;
-                    if (certificate) {
-                      setConfirmTrust({
-                        derBase64: certificate.derBase64,
-                        fingerprint: certificate.sha256Fingerprint,
-                      });
-                    }
-                  }}
+                  onClick={() =>
+                    setConfirmTrust({
+                      derBase64: adoptable.derBase64,
+                      fingerprint: adoptable.sha256Fingerprint,
+                      names: adoptable.names,
+                    })
+                  }
                 >
                   {t("next.providers.trustCert")}
                 </SecondaryButton>
@@ -831,8 +843,11 @@ export function ProvidersPanel() {
         body={
           <span className="flex flex-col gap-2.5">
             <span>{t("next.providers.trustBody")}</span>
-            <span className="font-wv-mono text-[11px] break-all text-wv-muted">
-              {t("next.providers.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}
+            <span className="flex flex-col gap-1 font-wv-mono text-[11px] break-all text-wv-muted">
+              {confirmTrust?.names.length ? (
+                <span>{t("next.providers.certNames", { names: formatHostnames(confirmTrust.names) })}</span>
+              ) : null}
+              <span>{t("next.providers.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}</span>
             </span>
           </span>
         }
