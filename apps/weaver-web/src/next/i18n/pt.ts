@@ -304,9 +304,7 @@ export const nextPt: LocaleDictionary = {
   "next.completed.archived": "{{size}} arquivados",
   "next.completed.deleting": "Excluindo",
   "next.completed.took": "levou {{span}}",
-  "next.completed.deleteBody": "Excluir só o histórico remove os itens e mantém os arquivos no disco. Excluir com arquivos remove também os arquivos baixados. Ambos rodam em segundo plano; os itens ficam aqui, bloqueados, até sumirem.",
-  "next.completed.deleteHistoryOnly": "Excluir só o histórico",
-  "next.completed.deleteWithFiles": "Excluir com arquivos",
+  "next.completed.deleteBody": "“Excluir, manter arquivos” remove os itens e mantém os arquivos no disco. “Excluir” remove também os arquivos baixados. Ambos rodam em segundo plano; os itens ficam aqui, bloqueados, até sumirem.",
   "next.job.title": "Tarefa",
   "next.job.missingTitle": "Tarefa não encontrada",
   "next.job.missingBody": "Ela foi excluída do histórico, ou o link aponta para um id que o weaver não possui.",
@@ -1140,7 +1138,6 @@ export const nextPt: LocaleDictionary = {
   "next.login.bareMetal": "Instalação direta",
   "next.login.trustedNetworks": "Ou liste redes confiáveis em {{variable}} para que os navegadores delas entrem como administradores sem fazer login.",
   "next.job.deleteSaveFiles": "Excluir, manter arquivos",
-  "next.job.deleteAllFiles": "Excluir, todos os arquivos",
   "next.job.deleteAllTitle": "Excluir com todos os arquivos",
   "next.job.deleteAllBody": "A entrada sai do histórico e seus arquivos baixados são excluídos do disco. Isso é feito em segundo plano e não pode ser desfeito.",
   // First-run setup

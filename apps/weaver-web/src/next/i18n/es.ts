@@ -304,9 +304,7 @@ export const nextEs: LocaleDictionary = {
   "next.completed.archived": "{{size}} archivados",
   "next.completed.deleting": "Eliminando",
   "next.completed.took": "tardó {{span}}",
-  "next.completed.deleteBody": "«Eliminar solo del historial» quita las entradas y deja sus archivos en el disco. «Eliminar con archivos» borra también los archivos descargados. Ambas se ejecutan en segundo plano; las entradas siguen aquí, bloqueadas, hasta que desaparecen.",
-  "next.completed.deleteHistoryOnly": "Eliminar solo del historial",
-  "next.completed.deleteWithFiles": "Eliminar con archivos",
+  "next.completed.deleteBody": "«Eliminar, conservar archivos» quita las entradas y deja sus archivos en el disco. «Eliminar» borra también los archivos descargados. Ambas se ejecutan en segundo plano; las entradas siguen aquí, bloqueadas, hasta que desaparecen.",
   "next.job.title": "Trabajo",
   "next.job.missingTitle": "No existe ese trabajo",
   "next.job.missingBody": "Se eliminó del historial, o el enlace apunta a un id que weaver no tiene.",
@@ -1140,7 +1138,6 @@ export const nextEs: LocaleDictionary = {
   "next.login.bareMetal": "Instalación directa",
   "next.login.trustedNetworks": "O indica redes de confianza en {{variable}} para que sus navegadores entren como administradores sin iniciar sesión.",
   "next.job.deleteSaveFiles": "Eliminar, conservar archivos",
-  "next.job.deleteAllFiles": "Eliminar, todos los archivos",
   "next.job.deleteAllTitle": "Eliminar con todos los archivos",
   "next.job.deleteAllBody": "La entrada sale del historial y sus archivos descargados se eliminan del disco. Se ejecuta en segundo plano y no se puede deshacer.",
   // First-run setup

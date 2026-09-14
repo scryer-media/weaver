@@ -304,9 +304,7 @@ export const nextKo: LocaleDictionary = {
   "next.completed.archived": "{{size}} 보관됨",
   "next.completed.deleting": "삭제 중",
   "next.completed.took": "{{span}} 걸림",
-  "next.completed.deleteBody": "'기록만 삭제'는 항목을 지우고 파일은 디스크에 남깁니다. '파일과 함께 삭제'는 다운로드한 파일도 지웁니다. 둘 다 백그라운드에서 실행되며, 항목은 사라질 때까지 잠긴 채 여기에 남습니다.",
-  "next.completed.deleteHistoryOnly": "기록만 삭제",
-  "next.completed.deleteWithFiles": "파일과 함께 삭제",
+  "next.completed.deleteBody": "'삭제, 파일 유지'는 항목을 지우고 파일은 디스크에 남깁니다. '삭제'는 다운로드한 파일도 지웁니다. 둘 다 백그라운드에서 실행되며, 항목은 사라질 때까지 잠긴 채 여기에 남습니다.",
   "next.job.title": "작업",
   "next.job.missingTitle": "해당 작업 없음",
   "next.job.missingBody": "기록에서 삭제되었거나, 링크가 weaver에 없는 id를 가리킵니다.",
@@ -1140,7 +1138,6 @@ export const nextKo: LocaleDictionary = {
   "next.login.bareMetal": "직접 설치",
   "next.login.trustedNetworks": "또는 {{variable}}에 신뢰할 네트워크를 지정하면 해당 네트워크의 브라우저가 로그인 없이 관리자로 접속합니다.",
   "next.job.deleteSaveFiles": "삭제, 파일 유지",
-  "next.job.deleteAllFiles": "삭제, 모든 파일",
   "next.job.deleteAllTitle": "모든 파일과 함께 삭제",
   "next.job.deleteAllBody": "항목이 기록에서 사라지고 다운로드한 파일도 디스크에서 삭제됩니다. 백그라운드에서 실행되며 되돌릴 수 없습니다.",
   // First-run setup

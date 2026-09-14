@@ -304,9 +304,7 @@ export const nextFr: LocaleDictionary = {
   "next.completed.archived": "{{size}} archivés",
   "next.completed.deleting": "Suppression",
   "next.completed.took": "a pris {{span}}",
-  "next.completed.deleteBody": "« Supprimer l’historique seulement » retire les entrées et laisse leurs fichiers sur le disque. « Supprimer avec les fichiers » efface aussi les fichiers téléchargés. Les deux s’exécutent en arrière-plan ; les entrées restent ici, verrouillées, jusqu’à leur disparition.",
-  "next.completed.deleteHistoryOnly": "Supprimer l’historique seulement",
-  "next.completed.deleteWithFiles": "Supprimer avec les fichiers",
+  "next.completed.deleteBody": "« Supprimer, garder les fichiers » retire les entrées et laisse leurs fichiers sur le disque. « Supprimer » efface aussi les fichiers téléchargés. Les deux s’exécutent en arrière-plan ; les entrées restent ici, verrouillées, jusqu’à leur disparition.",
   "next.job.title": "Tâche",
   "next.job.missingTitle": "Tâche introuvable",
   "next.job.missingBody": "Elle a été supprimée de l’historique, ou le lien pointe vers un identifiant que weaver ne connaît pas.",
@@ -1140,7 +1138,6 @@ export const nextFr: LocaleDictionary = {
   "next.login.bareMetal": "Installation directe",
   "next.login.trustedNetworks": "Vous pouvez aussi lister des réseaux de confiance dans {{variable}} pour que leurs navigateurs entrent en administrateur sans se connecter.",
   "next.job.deleteSaveFiles": "Supprimer, garder les fichiers",
-  "next.job.deleteAllFiles": "Supprimer, tous les fichiers",
   "next.job.deleteAllTitle": "Supprimer avec tous les fichiers",
   "next.job.deleteAllBody": "L'entrée quitte l'historique et ses fichiers téléchargés sont supprimés du disque. L'opération s'exécute en arrière-plan et ne peut pas être annulée.",
   // First-run setup

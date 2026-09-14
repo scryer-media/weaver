@@ -304,9 +304,7 @@ export const nextZh: LocaleDictionary = {
   "next.completed.archived": "已归档 {{size}}",
   "next.completed.deleting": "正在删除",
   "next.completed.took": "耗时 {{span}}",
-  "next.completed.deleteBody": "“仅删除历史记录”会移除条目并保留磁盘上的文件。“连同文件删除”也会删除已下载的文件。两者都在后台运行；条目会锁定并留在这里，直到删除完成。",
-  "next.completed.deleteHistoryOnly": "仅删除历史记录",
-  "next.completed.deleteWithFiles": "连同文件删除",
+  "next.completed.deleteBody": "“删除，保留文件”会移除条目并保留磁盘上的文件。“删除”也会删除已下载的文件。两者都在后台运行；条目会锁定并留在这里，直到删除完成。",
   "next.job.title": "任务",
   "next.job.missingTitle": "没有该任务",
   "next.job.missingBody": "它已从历史记录中删除，或者链接指向 weaver 中不存在的 id。",
@@ -1140,7 +1138,6 @@ export const nextZh: LocaleDictionary = {
   "next.login.bareMetal": "直接安装",
   "next.login.trustedNetworks": "也可以在 {{variable}} 中列出受信任的网络，让这些网络中的浏览器无需登录即可以管理员身份访问。",
   "next.job.deleteSaveFiles": "删除，保留文件",
-  "next.job.deleteAllFiles": "删除，全部文件",
   "next.job.deleteAllTitle": "连同所有文件删除",
   "next.job.deleteAllBody": "该条目将从历史中移除，其下载的文件也会从磁盘删除。此操作在后台进行，无法撤销。",
   // First-run setup

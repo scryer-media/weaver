@@ -304,9 +304,7 @@ export const nextJa: LocaleDictionary = {
   "next.completed.archived": "{{size}} をアーカイブ",
   "next.completed.deleting": "削除中",
   "next.completed.took": "所要 {{span}}",
-  "next.completed.deleteBody": "「履歴のみ削除」は項目を削除し、ファイルはディスクに残します。「ファイルごと削除」はダウンロードしたファイルも削除します。どちらもバックグラウンドで実行され、完了するまで項目はロックされたままここに表示されます。",
-  "next.completed.deleteHistoryOnly": "履歴のみ削除",
-  "next.completed.deleteWithFiles": "ファイルごと削除",
+  "next.completed.deleteBody": "「削除（ファイルは残す）」は項目を削除し、ファイルはディスクに残します。「削除」はダウンロードしたファイルも削除します。どちらもバックグラウンドで実行され、完了するまで項目はロックされたままここに表示されます。",
   "next.job.title": "ジョブ",
   "next.job.missingTitle": "ジョブが見つかりません",
   "next.job.missingBody": "履歴から削除されたか、リンクが weaver にない ID を指しています。",
@@ -1140,7 +1138,6 @@ export const nextJa: LocaleDictionary = {
   "next.login.bareMetal": "直接インストール",
   "next.login.trustedNetworks": "または {{variable}} に信頼できるネットワークを指定すると、そのネットワークのブラウザはサインインなしで管理者として利用できます。",
   "next.job.deleteSaveFiles": "削除（ファイルは残す）",
-  "next.job.deleteAllFiles": "削除（すべてのファイル）",
   "next.job.deleteAllTitle": "すべてのファイルごと削除",
   "next.job.deleteAllBody": "エントリは履歴から消え、ダウンロードしたファイルもディスクから削除されます。処理はバックグラウンドで行われ、元に戻せません。",
   // First-run setup

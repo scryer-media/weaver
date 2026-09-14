@@ -304,9 +304,7 @@ export const nextIt: LocaleDictionary = {
   "next.completed.archived": "{{size}} archiviati",
   "next.completed.deleting": "Eliminazione",
   "next.completed.took": "ha richiesto {{span}}",
-  "next.completed.deleteBody": "«Elimina solo la cronologia» rimuove le voci e lascia i file sul disco. «Elimina con i file» rimuove anche i file scaricati. Entrambe girano in background; le voci restano qui, bloccate, finché non spariscono.",
-  "next.completed.deleteHistoryOnly": "Elimina solo la cronologia",
-  "next.completed.deleteWithFiles": "Elimina con i file",
+  "next.completed.deleteBody": "«Elimina, mantieni i file» rimuove le voci e lascia i file sul disco. «Elimina» rimuove anche i file scaricati. Entrambe girano in background; le voci restano qui, bloccate, finché non spariscono.",
   "next.job.title": "Job",
   "next.job.missingTitle": "Job inesistente",
   "next.job.missingBody": "È stato eliminato dalla cronologia, oppure il link punta a un id che weaver non conosce.",
@@ -1140,7 +1138,6 @@ export const nextIt: LocaleDictionary = {
   "next.login.bareMetal": "Installazione diretta",
   "next.login.trustedNetworks": "In alternativa, elenca le reti attendibili in {{variable}} per far entrare i loro browser come amministratori senza accedere.",
   "next.job.deleteSaveFiles": "Elimina, mantieni i file",
-  "next.job.deleteAllFiles": "Elimina, tutti i file",
   "next.job.deleteAllTitle": "Elimina con tutti i file",
   "next.job.deleteAllBody": "La voce esce dalla cronologia e i suoi file scaricati vengono eliminati dal disco. L'operazione avviene in background e non può essere annullata.",
   // First-run setup

@@ -22,6 +22,7 @@ export function ConfirmDialog({
   onConfirm,
   onDismiss,
   alternative,
+  solid = false,
 }: {
   open: boolean;
   title: string;
@@ -35,6 +36,8 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onDismiss: () => void;
   alternative?: { label: string; onConfirm: () => void };
+  /** Fill a lone destructive confirm red, as it is when it sits beside an alternative. */
+  solid?: boolean;
 }) {
   const t = useTranslate();
   return (
@@ -56,7 +59,7 @@ export function ConfirmDialog({
             <DangerButton
               onClick={onConfirm}
               disabled={busy}
-              solid={alternative !== undefined}
+              solid={solid || alternative !== undefined}
               className="px-[14px]"
             >
               {confirmLabel ?? t("next.common.remove")}

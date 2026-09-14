@@ -443,8 +443,8 @@ export function JobDetailPage() {
                 <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
                   {t("next.job.deleteSaveFiles")}
                 </DangerButton>
-                <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("deleteAll")}>
-                  {t("next.job.deleteAllFiles")}
+                <DangerButton icon="remove" size="compact" solid disabled={busy} onClick={() => setConfirm("deleteAll")}>
+                  {t("action.delete")}
                 </DangerButton>
               </>
             )}
@@ -843,7 +843,8 @@ export function JobDetailPage() {
             title={title}
             note={job.displayTitle || job.name}
             busy={busy}
-            confirmLabel={title}
+            confirmLabel={deleteFiles ? t("action.delete") : t("next.job.deleteSaveFiles")}
+            solid={deleteFiles}
             body={deleteFiles ? t("next.job.deleteAllBody") : t("next.job.deleteBody")}
             onDismiss={() => setConfirm(null)}
             onConfirm={() => {

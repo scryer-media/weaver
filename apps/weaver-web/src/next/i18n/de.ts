@@ -304,9 +304,7 @@ export const nextDe: LocaleDictionary = {
   "next.completed.archived": "{{size}} archiviert",
   "next.completed.deleting": "Wird gelöscht",
   "next.completed.took": "dauerte {{span}}",
-  "next.completed.deleteBody": "„Nur Verlauf löschen“ entfernt die Einträge und lässt ihre Dateien auf der Festplatte. „Mit Dateien löschen“ entfernt auch die heruntergeladenen Dateien. Beides läuft im Hintergrund; die Einträge bleiben gesperrt hier, bis sie weg sind.",
-  "next.completed.deleteHistoryOnly": "Nur Verlauf löschen",
-  "next.completed.deleteWithFiles": "Mit Dateien löschen",
+  "next.completed.deleteBody": "„Löschen, Dateien behalten“ entfernt die Einträge und lässt ihre Dateien auf der Festplatte. „Löschen“ entfernt auch die heruntergeladenen Dateien. Beides läuft im Hintergrund; die Einträge bleiben gesperrt hier, bis sie weg sind.",
   "next.job.title": "Job",
   "next.job.missingTitle": "Job nicht gefunden",
   "next.job.missingBody": "Er wurde aus dem Verlauf gelöscht, oder der Link verweist auf eine ID, die weaver nicht kennt.",
@@ -1140,7 +1138,6 @@ export const nextDe: LocaleDictionary = {
   "next.login.bareMetal": "Direkt installiert",
   "next.login.trustedNetworks": "Oder trage vertrauenswürdige Netzwerke in {{variable}} ein, damit Browser aus diesen Netzen ohne Anmeldung als Administrator zugreifen.",
   "next.job.deleteSaveFiles": "Löschen, Dateien behalten",
-  "next.job.deleteAllFiles": "Löschen, alle Dateien",
   "next.job.deleteAllTitle": "Mit allen Dateien löschen",
   "next.job.deleteAllBody": "Der Eintrag verlässt den Verlauf und seine heruntergeladenen Dateien werden von der Festplatte gelöscht. Das läuft im Hintergrund und lässt sich nicht rückgängig machen.",
   // First-run setup

@@ -729,8 +729,8 @@ export function CompletedPage() {
             )}
           </>
         }
-        alternative={{ label: t("next.completed.deleteHistoryOnly"), onConfirm: () => void deletePicked(false) }}
-        confirmLabel={t("next.completed.deleteWithFiles")}
+        alternative={{ label: t("next.job.deleteSaveFiles"), onConfirm: () => void deletePicked(false) }}
+        confirmLabel={t("action.delete")}
         onConfirm={() => void deletePicked(true)}
         onDismiss={() => setConfirmDelete(false)}
       />
