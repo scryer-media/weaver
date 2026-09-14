@@ -1281,6 +1281,27 @@ export const FINISH_FIRST_RUN_SETUP_MUTATION = gql`
   }
 `;
 
+// --- Access-model notice ---
+
+export const SECURITY_UPGRADE_NOTICE_QUERY = gql`
+  query SecurityUpgradeNotice {
+    securityUpgradeNotice {
+      pending
+      deployment
+      operatingSystem
+      loginEnabled
+    }
+  }
+`;
+
+export const DISMISS_SECURITY_UPGRADE_NOTICE_MUTATION = gql`
+  mutation DismissSecurityUpgradeNotice {
+    dismissSecurityUpgradeNotice {
+      pending
+    }
+  }
+`;
+
 // --- API Keys ---
 
 export const API_KEYS_QUERY = gql`

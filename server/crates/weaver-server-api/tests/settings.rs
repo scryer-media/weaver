@@ -502,3 +502,37 @@ async fn first_run_setup_requires_admin() {
         );
     }
 }
+
+async fn security_upgrade_notice_pending(h: &TestHarness) -> bool {
+    let resp = h
+        .execute("{ securityUpgradeNotice { pending deployment operatingSystem loginEnabled } }")
+        .await;
+    assert_no_errors(&resp);
+    response_data(&resp)["securityUpgradeNotice"]["pending"]
+        .as_bool()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn security_upgrade_notice_shows_once_on_the_older_access_settings() {
+    let h = TestHarness::new().await;
+    assert!(security_upgrade_notice_pending(&h).await);
+
+    let resp = h
+        .execute("mutation { dismissSecurityUpgradeNotice { pending } }")
+        .await;
+    assert_no_errors(&resp);
+    assert!(!security_upgrade_notice_pending(&h).await);
+}
+
+#[tokio::test]
+async fn security_upgrade_notice_is_not_owed_on_the_current_access_model() {
+    let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+    security.apply_stored_access_policy_revision(
+        None,
+        Some(weaver_server_core::security::AUTHENTICATED_POLICY_REVISION),
+        true,
+    );
+    let h = TestHarness::new_with_security(security).await;
+    assert!(!security_upgrade_notice_pending(&h).await);
+}
