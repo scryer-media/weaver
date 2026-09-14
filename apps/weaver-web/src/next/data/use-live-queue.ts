@@ -9,8 +9,9 @@ import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-t
  * The live queue, as the Next UI needs it.
  *
  * The redesign shows one grouped, unpaginated list and composes category, tab
- * and search filters client-side, so this fetches the whole queue in a single
- * page and lets the screen slice it. `queuePage` computes `summary` and
+ * and search filters client-side, so this fetches the whole queue and lets the
+ * screen slice it. The first page is the live query; a queue longer than one
+ * page reads the remaining pages behind it after every refetch. `queuePage` computes `summary` and
  * `categories` from every job *before* applying the input filter, which is what
  * makes the rail counts and tab counts correct on screens that are showing a
  * filtered list — and correct on screens that never render the list at all.
@@ -173,11 +174,49 @@ export function useLiveQueue(): LiveQueue {
     refreshNow();
   }, [connection.lastConnectedAt, connection.status, refreshNow]);
 
+  // `queuePage` serves at most QUEUE_PAGE_SIZE jobs. Each time the first page
+  // lands with a larger total, the rest are read behind it; until they arrive
+  // the previous tail stands, so a refetch never truncates the list.
+  const [tail, setTail] = useState<GraphqlJobData[]>(EMPTY_ITEMS);
+  useEffect(() => {
+    if (!page || page.items.length >= page.totalCount) {
+      return;
+    }
+    let cancelled = false;
+    const pageCount = Math.ceil(page.totalCount / QUEUE_PAGE_SIZE);
+    void Promise.all(
+      Array.from({ length: pageCount - 1 }, (_, index) =>
+        client
+          .query<QueuePageResponse>(
+            QUEUE_PAGE_QUERY,
+            { input: { pageIndex: index + 1, pageSize: QUEUE_PAGE_SIZE } },
+            { requestPolicy: "network-only" },
+          )
+          .toPromise(),
+      ),
+    ).then((results) => {
+      if (cancelled || results.some((result) => !result.data)) {
+        return;
+      }
+      setTail(results.flatMap((result) => result.data?.queuePage.items ?? []));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, page]);
+
+  const firstPageItems = page?.items ?? EMPTY_ITEMS;
+  const pageItems = useMemo(() => {
+    if (!page || firstPageItems.length >= page.totalCount || tail.length === 0) {
+      return firstPageItems;
+    }
+    // Jobs can shift across a page boundary between the two reads.
+    const seen = new Set(firstPageItems.map((item) => item.id));
+    return [...firstPageItems, ...tail.filter((item) => !seen.has(item.id))];
+  }, [firstPageItems, page, tail]);
+
   const latestCursor = page?.latestCursor;
-  const visibleIds = useMemo(
-    () => new Set((page?.items ?? EMPTY_ITEMS).map((item) => item.id)),
-    [page?.items],
-  );
+  const visibleIds = useMemo(() => new Set(pageItems.map((item) => item.id)), [pageItems]);
 
   useEffect(() => {
     if (!latestCursor) {
@@ -250,7 +289,6 @@ export function useLiveQueue(): LiveQueue {
   );
 
   // Once a refetch lands without the removed rows, stop carrying the tombstones.
-  const pageItems = page?.items ?? EMPTY_ITEMS;
   useEffect(() => {
     setRemovedIds((current) => {
       if (current.size === 0) {

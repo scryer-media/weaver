@@ -87,7 +87,7 @@ export function DownloadInspector({
   });
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
-  const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
+  const [cancelState, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
   const [stopState, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
   const { categories, queue } = useNextData();
@@ -281,9 +281,17 @@ export function DownloadInspector({
         <DangerButton
           icon="cancelDownload"
           className="w-full justify-center"
+          disabled={cancelState.fetching}
           onClick={() => {
-            onRemoved(job.id);
-            void cancelJob({ id: job.id });
+            setFailure(null);
+            // The row leaves the queue only once the daemon has accepted the removal.
+            void cancelJob({ id: job.id }).then((result) => {
+              if (result.error || result.data?.cancelJob !== true) {
+                setFailure(result.error?.message ?? t("next.inspector.removeFailed"));
+                return;
+              }
+              onRemoved(job.id);
+            });
           }}
         >
           {t("next.inspector.removeDownload")}

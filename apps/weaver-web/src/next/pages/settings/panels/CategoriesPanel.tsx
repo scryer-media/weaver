@@ -13,6 +13,7 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { PrimaryButton } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
+import { useNextData } from "../../../data/next-data";
 import { categoryColor } from "../../../data/palette";
 import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
 
@@ -42,6 +43,8 @@ const NEW_CATEGORY: CategoryForm = { name: "", destDir: "", aliases: "" };
 export function CategoriesPanel() {
   const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{ categories: Category[] }>({ query: CATEGORIES_QUERY });
+  // The rails and pickers elsewhere read the shared copy, which this panel's own query does not reach.
+  const { refreshCategories } = useNextData();
   const [{ data: settingsData }] = useQuery<{ settings: { completeDir: string; dataDir: string } }>({
     query: SETTINGS_QUERY,
   });
@@ -93,6 +96,7 @@ export function CategoriesPanel() {
     }
     setEditingId(null);
     void reexecute({ requestPolicy: "network-only" });
+    refreshCategories();
   };
 
   const remove = async () => {
@@ -105,6 +109,7 @@ export function CategoriesPanel() {
     setConfirmRemove(null);
     setEditingId(null);
     void reexecute({ requestPolicy: "network-only" });
+    refreshCategories();
   };
 
   const blocks: SettingsBlock[] = [

@@ -346,13 +346,24 @@ export function ProvidersPanel() {
   };
 
   const setActive = async (server: Server, active: boolean) => {
-    const stored = await client.query<{ server: ServerDetails | null }>(SERVER_QUERY, {
-      id: server.id,
-    }).toPromise();
-    const username = stored.data?.server?.username ?? "";
+    // The update replaces the whole record, so it is built from the stored
+    // details: the list omits the username and the adopted TLS certificate,
+    // and sending the list row would clear both.
+    const stored = await client
+      .query<{ server: ServerDetails | null }>(
+        SERVER_QUERY,
+        { id: server.id },
+        { requestPolicy: "network-only" },
+      )
+      .toPromise();
+    const details = stored.data?.server;
+    if (!details) {
+      void reexecute({ requestPolicy: "network-only" });
+      return;
+    }
     await updateServer({
       id: server.id,
-      input: { ...serverInput(formToState(server, username)), active },
+      input: { ...serverInput(formToState(details, details.username ?? "")), active },
     });
     void reexecute({ requestPolicy: "network-only" });
   };

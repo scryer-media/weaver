@@ -3,8 +3,10 @@ export const proxyLabels: Record<ProxyKind, string> = { HTTP_CONNECT: "HTTP CONN
 export type RoutingPolicy = { proxyIds: number[]; allowDirect: boolean };
 export type RoutingStatus = { state: string; selectedProxyId: number | null; failures: { proxyId: number; message: string }[] };
 export const directRouting: RoutingPolicy = { proxyIds: [], allowDirect: true };
+/** The daemon accepts at most this many proxy routes in one policy. */
+export const MAX_PROXY_ROUTES = 8;
 export function appendProxy(policy: RoutingPolicy, id: number): RoutingPolicy {
-  if (policy.proxyIds.includes(id) || policy.proxyIds.length >= 8) return policy;
+  if (policy.proxyIds.includes(id) || policy.proxyIds.length >= MAX_PROXY_ROUTES) return policy;
   return { proxyIds: [...policy.proxyIds, id], allowDirect: policy.proxyIds.length === 0 ? false : policy.allowDirect };
 }
 export function moveProxy(policy: RoutingPolicy, index: number, delta: number): RoutingPolicy {

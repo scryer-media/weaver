@@ -92,17 +92,18 @@ function sortJobs(jobs: JobData[], sort: SortId, etaById: Map<number, string>): 
     case "progress":
       sorted.sort((left, right) => right.progress - left.progress);
       break;
-    case "eta":
-      // Rows without an estimate sort last rather than first.
-      sorted.sort((left, right) => {
-        const leftHas = etaById.has(left.id) ? 0 : 1;
-        const rightHas = etaById.has(right.id) ? 0 : 1;
-        if (leftHas !== rightHas) return leftHas - rightHas;
-        const leftRemaining = Math.max(left.totalBytes - left.downloadedBytes, 0);
-        const rightRemaining = Math.max(right.totalBytes - right.downloadedBytes, 0);
-        return leftRemaining - rightRemaining;
-      });
+    case "eta": {
+      // A job's time left counts everything queued ahead of it, so estimates
+      // grow in queue order and that order is the ranking; a small job behind a
+      // large one finishes after it. Rows without an estimate sort last.
+      const rank = new Map([...etaById.keys()].map((id, index) => [id, index]));
+      sorted.sort(
+        (left, right) =>
+          (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
+          (rank.get(right.id) ?? Number.MAX_SAFE_INTEGER),
+      );
       break;
+    }
   }
   return sorted;
 }

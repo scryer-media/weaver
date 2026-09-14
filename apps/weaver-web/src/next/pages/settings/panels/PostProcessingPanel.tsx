@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import {
   POST_PROCESSING_SETTINGS_QUERY,
@@ -99,6 +99,11 @@ interface ExecutionForm {
   unacceptableExtensions: string;
 }
 
+/** The daemon runs between one and eight scripts at once. */
+const CONCURRENCY_MAX = 8;
+
+const EMPTY_LISTS: ScriptLists = { global: [], categories: [] };
+
 const DEFAULTS: ExecutionForm = {
   executionEnabled: false,
   concurrency: 1,
@@ -169,6 +174,9 @@ export function PostProcessingPanel() {
   const [optionValues, setOptionValues] = useState<Record<string, string>>({});
   const [optionsError, setOptionsError] = useState<string | null>(null);
   const [optionsBusy, setOptionsBusy] = useState(false);
+  const [localLists, setLocalLists] = useState<{ base: ScriptLists | undefined; value: ScriptLists } | null>(null);
+  const [listSaves, setListSaves] = useState(0);
+  const listQueue = useRef<Promise<void>>(Promise.resolve());
 
   const settings = data?.postProcessingSettings;
   const scripts = useMemo(() => data?.scripts?.scripts ?? [], [data?.scripts?.scripts]);
@@ -215,7 +223,7 @@ export function PostProcessingPanel() {
       void saveSettings({
         input: {
           executionEnabled: values.executionEnabled,
-          concurrency: Math.max(1, Math.round(values.concurrency || 1)),
+          concurrency: Math.min(CONCURRENCY_MAX, Math.max(1, Math.round(values.concurrency || 1))),
           terminationGraceSeconds: Math.max(0, Math.round(values.terminationGraceSeconds || 0)),
           pythonInterpreter: values.pythonInterpreter.trim() || null,
           powershellInterpreter: values.powershellInterpreter.trim() || null,
@@ -235,7 +243,15 @@ export function PostProcessingPanel() {
   });
 
   const scriptDirectory = directory ?? settings?.scriptDirectory ?? "";
-  const lists = settings?.lists ?? { global: [], categories: [] };
+  // Run-list edits apply locally at once and save one after another, so a
+  // second edit made before the first lands builds on the first rather than on
+  // the list the daemon last reported. The local copy stands until a refetch
+  // replaces the list it was built on.
+  const serverLists = settings?.lists;
+  const lists =
+    localLists && (listSaves > 0 || localLists.base === serverLists)
+      ? localLists.value
+      : (serverLists ?? EMPTY_LISTS);
   const entries = listFor(lists, scope);
   const listed = new Set(entries.map((entry) => entry.script));
   const available = scripts.filter((script) => !listed.has(script.name));
@@ -247,28 +263,31 @@ export function PostProcessingPanel() {
 
   const persistLists = (next: ScriptLists) => {
     setError(null);
-    void saveLists({
-      input: {
-        global: next.global.map((entry) => ({
+    setLocalLists({ base: serverLists, value: next });
+    setListSaves((count) => count + 1);
+    const input = {
+      global: next.global.map((entry) => ({
+        script: entry.script,
+        enabled: entry.enabled,
+        timeoutSeconds: entry.timeoutSeconds ?? null,
+      })),
+      categories: next.categories.map((category) => ({
+        category: category.category,
+        entries: category.entries.map((entry) => ({
           script: entry.script,
           enabled: entry.enabled,
           timeoutSeconds: entry.timeoutSeconds ?? null,
         })),
-        categories: next.categories.map((category) => ({
-          category: category.category,
-          entries: category.entries.map((entry) => ({
-            script: entry.script,
-            enabled: entry.enabled,
-            timeoutSeconds: entry.timeoutSeconds ?? null,
-          })),
-        })),
-      },
-    }).then((result) => {
+      })),
+    };
+    listQueue.current = listQueue.current.then(async () => {
+      const result = await saveLists({ input });
       if (result.error) {
         setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
-        return;
+      } else {
+        setStatus(t("next.postProcessing.runListSaved"));
       }
-      setStatus(t("next.postProcessing.runListSaved"));
+      setListSaves((count) => count - 1);
       void reexecute({ requestPolicy: "network-only" });
     });
   };
@@ -410,7 +429,7 @@ export function PostProcessingPanel() {
             kind: "number",
             value: values.concurrency,
             min: 1,
-            max: 32,
+            max: CONCURRENCY_MAX,
             onChange: (next) => patch({ concurrency: next }),
           },
         },

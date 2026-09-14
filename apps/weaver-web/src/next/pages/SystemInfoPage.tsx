@@ -25,6 +25,40 @@ interface ConfiguredStorage {
   error: string | null;
 }
 
+type KernelComponent =
+  | "YENC_DECODE"
+  | "YENC_CRC32"
+  | "PAR2_REPAIR"
+  | "PAR2_MD5"
+  | "PAR2_CRC32"
+  | "RAR_RECOVERY"
+  | "RAR_CRC32"
+  | "RAR_SHA1"
+  | "RAR_AES";
+
+interface KernelSelection {
+  component: KernelComponent;
+  library: string;
+  /** Every kernel the library can pick on this architecture, fastest first. */
+  ladder: string[];
+  kernel: string;
+  /** The environment variable that moved the pick off what the CPU alone chose. */
+  pinnedBy: string | null;
+}
+
+/** Translation keys for the screen; the report keeps its own English names. */
+const KERNEL_LABEL: Record<KernelComponent, { key: string; report: string }> = {
+  YENC_DECODE: { key: "next.system.kernel.yencDecode", report: "yEnc decode" },
+  YENC_CRC32: { key: "next.system.kernel.yencCrc32", report: "Article CRC32" },
+  PAR2_REPAIR: { key: "next.system.kernel.par2Repair", report: "PAR2 repair" },
+  PAR2_MD5: { key: "next.system.kernel.par2Md5", report: "PAR2 MD5" },
+  PAR2_CRC32: { key: "next.system.kernel.par2Crc32", report: "PAR2 CRC32" },
+  RAR_RECOVERY: { key: "next.system.kernel.rarRecovery", report: "RAR5 recovery records" },
+  RAR_CRC32: { key: "next.system.kernel.rarCrc32", report: "RAR CRC32" },
+  RAR_SHA1: { key: "next.system.kernel.rarSha1", report: "RAR SHA-1" },
+  RAR_AES: { key: "next.system.kernel.rarAes", report: "RAR decryption" },
+};
+
 interface SystemInfo {
   version: string;
   uptimeSeconds: number;
@@ -38,6 +72,7 @@ interface SystemInfo {
     cgroupLimit: number | null;
     decoderTier: string;
     simdFeatures: string[];
+    kernels: KernelSelection[];
   };
   memory: {
     totalBytes: number;
@@ -80,11 +115,64 @@ function reportText(info: SystemInfo, cacheBytes: number, cacheLimit: number): s
     `Container memory limit: ${info.memory.cgroupLimitBytes == null ? "not limited" : formatSize(info.memory.cgroupLimitBytes)}`,
     `Article cache in use: ${cacheInUse}`,
     `Primary storage: ${info.primaryStorage.filesystem} · ${info.primaryStorage.storageClass} · ${formatCount(info.primaryStorage.startupRandomReadIops)} IOPS`,
+    ...info.compute.kernels.map((entry) => {
+      const pin = entry.pinnedBy ? `, pinned by ${entry.pinnedBy}` : "";
+      return `Kernel · ${KERNEL_LABEL[entry.component]?.report ?? entry.component}: ${entry.kernel} (${entry.library}${pin})`;
+    }),
   ];
   // Paths are deliberately omitted — the on-screen section says as much, and a
   // report pasted into a public tracker should not carry someone's library
   // layout.
   return lines.join("\n");
+}
+
+/**
+ * One library's dispatch: what it runs, and where that sits on the ladder it
+ * climbs down from. Rungs above the selected one are faster kernels this host
+ * lacks the instructions for (or that a variable switched off); rungs below are
+ * what it would fall back to.
+ */
+function KernelRow({ entry }: { entry: KernelSelection }) {
+  const t = useTranslate();
+  const label = KERNEL_LABEL[entry.component];
+  const selected = entry.ladder.indexOf(entry.kernel);
+  return (
+    <div className="grid grid-cols-[minmax(0,max-content)_minmax(0,1fr)] items-baseline gap-x-6 gap-y-1 border-b border-wv-hairline px-4 sm:px-6 py-[11px] hover:bg-wv-cell-hover">
+      <span className="text-[13px] text-wv-muted">{label ? t(label.key) : entry.component}</span>
+      <span className="justify-self-end text-right font-wv-mono text-[12.5px] text-wv-fg">{entry.kernel}</span>
+      <span className="font-wv-mono text-[11px] text-wv-faint">{entry.library}</span>
+      {entry.ladder.length > 1 ? (
+        <ol
+          aria-label={t("next.system.kernelLadder")}
+          className="flex flex-wrap justify-end gap-x-1.5 gap-y-0.5 text-right font-wv-mono text-[11px]"
+        >
+          {entry.ladder.map((rung, index) => (
+            <li
+              key={rung}
+              aria-current={index === selected ? "true" : undefined}
+              className={
+                index === selected
+                  ? "text-wv-accent"
+                  : index < selected
+                    ? "text-wv-disabled"
+                    : "text-wv-faint"
+              }
+            >
+              {index > 0 ? <span className="mr-1.5 text-wv-disabled">›</span> : null}
+              {rung}
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <span />
+      )}
+      {entry.pinnedBy ? (
+        <span className="col-start-2 justify-self-end font-wv-mono text-[11px] text-wv-warn">
+          {t("next.system.kernelPinned", { variable: entry.pinnedBy })}
+        </span>
+      ) : null}
+    </div>
+  );
 }
 
 /**
@@ -221,6 +309,15 @@ export function SystemInfoPage() {
                   : String(info.compute.cgroupLimit)
               }
             />
+
+            {info.compute.kernels.length > 0 ? (
+              <>
+                <SectionHeader label={t("next.system.kernels")} note={t("next.system.kernelsNote")} />
+                {info.compute.kernels.map((entry) => (
+                  <KernelRow key={entry.component} entry={entry} />
+                ))}
+              </>
+            ) : null}
 
             <SectionHeader label={t("next.system.memory")} note={t("next.system.memoryNote")} />
             <KeyValueRow label={t("next.system.totalMemory")} value={formatSize(info.memory.totalBytes)} />

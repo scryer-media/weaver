@@ -60,6 +60,8 @@ const ACTIONS: { value: string; label: string }[] = [
   { value: "pause", label: "next.schedules.pause" },
   { value: "resume", label: "next.schedules.resume" },
   { value: "speed_limit", label: "next.schedules.setLimit" },
+  { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },
+  { value: "resume_watch_folder_scanning", label: "next.schedules.resumeWatchFolder" },
 ];
 
 const NEW_SCHEDULE: ScheduleForm = {
@@ -78,7 +80,8 @@ function actionLabel(t: Translate, schedule: Schedule): string {
       ? t("next.schedules.limitTo", { rate: formatRate(schedule.speedLimitBytes) })
       : t("next.schedules.removeLimit");
   }
-  return schedule.actionType === "pause" ? t("next.schedules.pause") : t("next.schedules.resume");
+  const action = ACTIONS.find((option) => option.value === schedule.actionType);
+  return action ? t(action.label) : schedule.actionType;
 }
 
 function daysLabel(t: Translate, days: string[]): string {

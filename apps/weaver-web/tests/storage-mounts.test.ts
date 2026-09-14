@@ -30,6 +30,33 @@ test("paths with the same capacity are one disk", () => {
   assert.deepEqual(mounts[0].paths, ["/srv/weaver", "/srv/weaver/complete"]);
 });
 
+test("matching disks side by side stay apart", () => {
+  // Two identical drives holding the same amount report the same figures; only
+  // nesting says two paths share a filesystem.
+  const mounts = storageMounts([
+    volume("/mnt/first/complete", { totalBytes: 4_000, usedBytes: 1_000 }),
+    volume("/mnt/second/complete", { totalBytes: 4_000, usedBytes: 1_000 }),
+  ]);
+
+  assert.equal(mounts.length, 2);
+});
+
+test("a path above a disk's paths joins it", () => {
+  const mounts = storageMounts([
+    volume("/srv/weaver/complete", { totalBytes: 4_000, usedBytes: 1_000 }),
+    volume("/srv/weaver/intermediate", { totalBytes: 4_000, usedBytes: 1_000 }),
+    volume("/srv/weaver", { totalBytes: 4_000, usedBytes: 1_000 }),
+  ]);
+
+  // The siblings are listed first; their parent still brings them together.
+  assert.equal(mounts.length, 1);
+  assert.deepEqual(mounts[0].paths, [
+    "/srv/weaver",
+    "/srv/weaver/complete",
+    "/srv/weaver/intermediate",
+  ]);
+});
+
 test("a category directory that does not exist yet folds into its library", () => {
   // The daemon reports one entry per configured path, and a category's
   // directory is only created when something lands in it — so the probe fails

@@ -39,8 +39,13 @@ const MIB = 1024 * 1024;
  * payload names the mount, so the capacity figures are the fingerprint: two
  * paths on one filesystem are handed the same numbers by the same `statvfs`.
  * Used bytes are compared to the mebibyte so a sampling skew between two reads
- * of a busy disk does not split it in half; total bytes have to match exactly,
- * which is what keeps two genuinely different disks apart.
+ * of a busy disk does not split it in half; total bytes have to match exactly.
+ *
+ * A fingerprint alone cannot tell two identical, equally full disks apart, so
+ * it only merges paths that are nested: a path joins a disk when it sits under,
+ * or above, a path already on it. Two matching drives mounted side by side stay
+ * two pies; the cost is that sibling folders on one disk with no configured
+ * parent between them are drawn once each.
  *
  * A path with no capacity has no fingerprint, and the common reason is a
  * category directory the daemon has not had cause to create yet. Rather than
@@ -59,19 +64,30 @@ export function storageMounts(volumes: readonly StorageVolume[]): StorageMount[]
   const probed: { path: string; key: string }[] = [];
   const unprobed: StorageVolume[] = [];
 
-  for (const volume of volumes) {
+  // Shallowest first, so a parent is on its disk before the folders under it
+  // look for one and two siblings meet through it.
+  const byDepth = [...volumes].sort(
+    (left, right) => normalizeSeparators(left.path).length - normalizeSeparators(right.path).length,
+  );
+  for (const volume of byDepth) {
     if (!volume.capacity) {
       unprobed.push(volume);
       continue;
     }
-    const key = `fs:${volume.capacity.totalBytes}:${Math.round(volume.capacity.usedBytes / MIB)}`;
-    probed.push({ path: volume.path, key });
-    const existing = mounts.get(key);
+    const fingerprint = `fs:${volume.capacity.totalBytes}:${Math.round(volume.capacity.usedBytes / MIB)}`;
+    const existing = [...mounts.values()].find(
+      (mount) =>
+        mount.key.startsWith(`${fingerprint}#`) &&
+        mount.paths.some((path) => contains(path, volume.path) || contains(volume.path, path)),
+    );
     if (existing) {
+      probed.push({ path: volume.path, key: existing.key });
       existing.paths.push(volume.path);
       existing.label = sharedPath(existing.paths);
       continue;
     }
+    const key = `${fingerprint}#${volume.path}`;
+    probed.push({ path: volume.path, key });
     mounts.set(key, {
       key,
       label: volume.path,
@@ -102,7 +118,11 @@ export function storageMounts(volumes: readonly StorageVolume[]): StorageMount[]
       error: volume.error,
     });
   }
-  return [...mounts.values()];
+  // Back in the order the daemon listed the paths.
+  const order = new Map(volumes.map((volume, index) => [volume.path, index]));
+  const first = (mount: StorageMount) =>
+    Math.min(...mount.paths.map((path) => order.get(path) ?? Number.MAX_SAFE_INTEGER));
+  return [...mounts.values()].sort((left, right) => first(left) - first(right));
 }
 
 /** Whether `child` sits under `parent`, comparing whole path segments. */

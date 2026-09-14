@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -92,6 +93,8 @@ export interface NextData {
    * not the same statement as "you have no categories".
    */
   categories: ConfiguredCategory[];
+  /** Re-read the categories after a change made elsewhere in the interface. */
+  refreshCategories: () => void;
   historyCount: number;
   providers: ProviderHealth[];
   /**
@@ -147,7 +150,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const [{ data: historyCountData }, reexecuteHistoryCount] = useQuery<{ all: number }>({
     query: HISTORY_JOBS_COUNT_QUERY,
   });
-  const [{ data: categoryData }] = useQuery<{ categories: ConfiguredCategory[] }>({
+  const [{ data: categoryData }, reexecuteCategories] = useQuery<{ categories: ConfiguredCategory[] }>({
     query: CATEGORIES_QUERY,
   });
   const [{ data: providerData }, reexecuteProviders] = useQuery<{
@@ -213,6 +216,10 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const downloadBlock = globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK;
   const isPaused = globalState?.isPaused ?? false;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
+  const refreshCategories = useCallback(
+    () => reexecuteCategories({ requestPolicy: "network-only" }),
+    [reexecuteCategories],
+  );
   const providers = providerData?.serverHealth ?? EMPTY_PROVIDERS;
   const providersLoaded = providerData !== undefined;
   const holdoffs = snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS;
@@ -239,6 +246,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       downloadBlock,
       queue,
       categories,
+      refreshCategories,
       historyCount,
       providers,
       providersLoaded,
@@ -260,6 +268,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       providers,
       providersLoaded,
       queue,
+      refreshCategories,
       speed,
       update,
       version,

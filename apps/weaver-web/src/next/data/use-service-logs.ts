@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "urql";
-import { getGraphqlWsClient } from "@/graphql/client";
+import { getGraphqlWsClient, useGraphqlClient } from "@/graphql/client";
 import { SERVICE_LOGS_QUERY } from "@/graphql/queries";
 
 /**
@@ -149,11 +149,26 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
       nextIdRef.current += 1;
       return line;
     });
-    const merged = [...seeded, ...bufferRef.current];
+    // The snapshot holds every line up to its newest, so a buffered line at or
+    // before that one — a subscription line that landed before the query
+    // answered, or the previous snapshot on a re-seed — is already in it.
+    const newest = seed[seed.length - 1];
+    const buffered = bufferRef.current;
+    let overlap = -1;
+    for (let index = buffered.length - 1; index >= 0; index -= 1) {
+      if (buffered[index]!.raw === newest) {
+        overlap = index;
+        break;
+      }
+    }
+    const merged = [...seeded, ...buffered.slice(overlap + 1)];
     bufferRef.current = merged.slice(-BUFFER_MAX);
     setBuffer(bufferRef.current.slice());
   }, [data]);
 
+  // The app replaces its GraphQL client, socket included, when the page comes
+  // back to the foreground; the tail resubscribes on the new socket.
+  const graphqlClient = useGraphqlClient();
   useEffect(() => {
     const client = getGraphqlWsClient();
     const unsubscribe = client.subscribe(
@@ -185,7 +200,7 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
       unsubscribe();
       setConnected(false);
     };
-  }, [flush]);
+  }, [flush, graphqlClient]);
 
   useEffect(
     () => () => {

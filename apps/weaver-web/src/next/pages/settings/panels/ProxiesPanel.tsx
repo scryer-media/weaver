@@ -13,16 +13,23 @@ import { parseWireguardConfig, stripConfigAssignment } from "@/lib/wireguard-con
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { PrimaryButton, SecondaryButton, TextArea } from "../../../components/controls";
+import { PrimaryButton, SecondaryButton, TextArea, TextField } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
-import { PanelControls, SettingsBlocks, type FieldSpec, type SettingsBlock } from "../framework";
+import {
+  PanelControls,
+  SettingsBlocks,
+  type FieldControl,
+  type FieldSpec,
+  type SettingsBlock,
+} from "../framework";
 
 /**
  * Proxies: the tunnels a provider or a feed may be routed through.
  *
  * Secrets are write-only — the daemon reports only whether it holds one — so
- * every secret field is blank on open and an untouched field is never sent.
+ * every secret field is blank on open and an untouched field is never sent. A
+ * stored optional secret can be cleared, which sends `null` for it.
  * WireGuard profiles accept a pasted configuration file, which is how anyone
  * actually has these details to hand.
  */
@@ -42,7 +49,8 @@ interface ProxyForm {
   mtu: string;
   keepaliveSeconds: string;
   timeoutSeconds: number;
-  secrets: Partial<Record<SecretKey, string>>;
+  /** A string replaces the stored secret, `null` clears it, absent keeps it. */
+  secrets: Partial<Record<SecretKey, string | null>>;
 }
 
 const KINDS: { value: string; label: string }[] = (
@@ -58,6 +66,8 @@ const DEFAULT_PORTS: Record<ProxyKind, number> = {
 };
 
 const MTU_DEFAULT = 1280;
+/** The daemon accepts a connect timeout of 1–300 seconds. */
+const TIMEOUT_MAX = 300;
 const KEEPALIVE_DEFAULT = 25;
 const WIREGUARD_KEY = /^[A-Za-z0-9+/]{43}=$/;
 const CONFIG_KEYS = {
@@ -226,6 +236,58 @@ export function ProxiesPanel() {
       }
       return { ...current, secrets };
     });
+  const setCleared = (key: SecretKey, cleared: boolean) =>
+    setForm((current) => {
+      const secrets = { ...current.secrets };
+      if (cleared) {
+        secrets[key] = null;
+      } else {
+        delete secrets[key];
+      }
+      return { ...current, secrets };
+    });
+
+  /** A secret the daemon holds: blank keeps it, a value replaces it, Clear removes it. */
+  const storedSecret = (
+    key: SecretKey,
+    label: string,
+    options: { password?: boolean; multiline?: boolean } = {},
+  ): FieldControl => {
+    const cleared = form.secrets[key] === null;
+    const value = form.secrets[key] ?? "";
+    const placeholder = cleared ? t("next.proxies.clearedPlaceholder") : "••••••••";
+    return {
+      kind: "custom",
+      control: (
+        <div className="flex items-start justify-end gap-2">
+          {options.multiline ? (
+            <TextArea
+              label={label}
+              value={value}
+              rows={3}
+              placeholder={placeholder}
+              className="w-[190px]"
+              onChange={(next) => setSecret(key, next)}
+            />
+          ) : (
+            <TextField
+              label={label}
+              value={value}
+              type={options.password ? "password" : "text"}
+              placeholder={placeholder}
+              className="w-[190px] max-w-full"
+              onChange={(next) => setSecret(key, next)}
+            />
+          )}
+          <SecondaryButton onClick={() => setCleared(key, !cleared)}>
+            {cleared ? t("next.proxies.keepStored") : t("next.proxies.clearStored")}
+          </SecondaryButton>
+        </div>
+      ),
+    };
+  };
+  const storedHelp = (key: SecretKey) =>
+    form.secrets[key] === null ? t("next.proxies.storedCleared") : t("next.proxies.storedKeep");
 
   const open = (profile: ProxyProfile | null) => {
     setError(null);
@@ -341,13 +403,17 @@ export function ProxiesPanel() {
     {
       id: "kind",
       label: t("next.proxies.type"),
-      control: {
-        kind: "select",
-        value: form.kind,
-        options: KINDS,
-        onChange: (next) =>
-          patch({ kind: next as ProxyKind, port: DEFAULT_PORTS[next as ProxyKind] }),
-      },
+      // The daemon keeps a profile's type for life; another type is another profile.
+      help: editing ? t("next.proxies.typeLocked") : undefined,
+      control: editing
+        ? { kind: "static", value: proxyLabels[form.kind] }
+        : {
+            kind: "select",
+            value: form.kind,
+            options: KINDS,
+            onChange: (next) =>
+              patch({ kind: next as ProxyKind, port: DEFAULT_PORTS[next as ProxyKind] }),
+          },
     },
     {
       id: "host",
@@ -373,7 +439,7 @@ export function ProxiesPanel() {
         kind: "number",
         value: form.timeoutSeconds,
         min: 1,
-        max: 600,
+        max: TIMEOUT_MAX,
         onChange: (next) => patch({ timeoutSeconds: next }),
         suffix: t("next.general.seconds"),
       },
@@ -412,14 +478,15 @@ export function ProxiesPanel() {
         {
           id: "presharedKey",
           label: t("next.proxies.presharedKey"),
-          help: editing?.hasPresharedKey ? t("next.proxies.storedKeep") : t("next.proxies.optional"),
-          control: {
-            kind: "text",
-            type: "password",
-            value: form.secrets.presharedKey ?? "",
-            placeholder: editing?.hasPresharedKey ? "••••••••" : "",
-            onChange: (next) => setSecret("presharedKey", next),
-          },
+          help: editing?.hasPresharedKey ? storedHelp("presharedKey") : t("next.proxies.optional"),
+          control: editing?.hasPresharedKey
+            ? storedSecret("presharedKey", t("next.proxies.presharedKey"), { password: true })
+            : {
+                kind: "text",
+                type: "password",
+                value: form.secrets.presharedKey ?? "",
+                onChange: (next) => setSecret("presharedKey", next),
+              },
         },
         {
           id: "addresses",
@@ -470,50 +537,55 @@ export function ProxiesPanel() {
         {
           id: "username",
           label: t("next.proxies.username"),
-          help: editing?.hasUsername ? t("next.proxies.storedKeep") : t("next.proxies.optional"),
-          control: {
-            kind: "text",
-            value: form.secrets.username ?? "",
-            placeholder: editing?.hasUsername ? "••••••••" : "",
-            onChange: (next) => setSecret("username", next),
-          },
+          help: editing?.hasUsername ? storedHelp("username") : t("next.proxies.optional"),
+          control: editing?.hasUsername
+            ? storedSecret("username", t("next.proxies.username"))
+            : {
+                kind: "text",
+                value: form.secrets.username ?? "",
+                onChange: (next) => setSecret("username", next),
+              },
         },
         {
           id: "password",
           label: t("next.proxies.password"),
-          help: editing?.hasPassword ? t("next.proxies.storedKeep") : t("next.proxies.optional"),
-          control: {
-            kind: "text",
-            type: "password",
-            value: form.secrets.password ?? "",
-            placeholder: editing?.hasPassword ? "••••••••" : "",
-            onChange: (next) => setSecret("password", next),
-          },
+          help: editing?.hasPassword ? storedHelp("password") : t("next.proxies.optional"),
+          control: editing?.hasPassword
+            ? storedSecret("password", t("next.proxies.password"), { password: true })
+            : {
+                kind: "text",
+                type: "password",
+                value: form.secrets.password ?? "",
+                onChange: (next) => setSecret("password", next),
+              },
         },
         ...(form.kind === "SSH"
           ? [
               {
                 id: "privateKey",
                 label: t("next.proxies.privateKey"),
-                help: editing?.hasPrivateKey ? t("next.proxies.storedKeep") : t("next.proxies.sshKeyHelp"),
-                control: {
-                  kind: "textarea" as const,
-                  value: form.secrets.privateKey ?? "",
-                  rows: 3,
-                  onChange: (next: string) => setSecret("privateKey", next),
-                },
+                help: editing?.hasPrivateKey ? storedHelp("privateKey") : t("next.proxies.sshKeyHelp"),
+                control: editing?.hasPrivateKey
+                  ? storedSecret("privateKey", t("next.proxies.privateKey"), { multiline: true })
+                  : {
+                      kind: "textarea" as const,
+                      value: form.secrets.privateKey ?? "",
+                      rows: 3,
+                      onChange: (next: string) => setSecret("privateKey", next),
+                    },
               },
               {
                 id: "passphrase",
                 label: t("next.proxies.passphrase"),
-                help: editing?.hasPassphrase ? t("next.proxies.storedKeep") : t("next.proxies.optional"),
-                control: {
-                  kind: "text" as const,
-                  type: "password" as const,
-                  value: form.secrets.passphrase ?? "",
-                  placeholder: editing?.hasPassphrase ? "••••••••" : "",
-                  onChange: (next: string) => setSecret("passphrase", next),
-                },
+                help: editing?.hasPassphrase ? storedHelp("passphrase") : t("next.proxies.optional"),
+                control: editing?.hasPassphrase
+                  ? storedSecret("passphrase", t("next.proxies.passphrase"), { password: true })
+                  : {
+                      kind: "text" as const,
+                      type: "password" as const,
+                      value: form.secrets.passphrase ?? "",
+                      onChange: (next: string) => setSecret("passphrase", next),
+                    },
               },
             ]
           : []),

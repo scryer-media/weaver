@@ -16,7 +16,8 @@ import type { DownloadBlockState } from "@/lib/context/live-data-context";
  * `metricsHistory` returns cumulative counters and instantaneous gauges at a
  * fixed resolution; the charts want per-second rates for the former and the
  * raw value for the latter, so the conversion happens once here and the page
- * only picks metric names.
+ * only picks metric names. Rolled-up ranges already carry a counter's average
+ * rate per bucket, so only raw (`ACTUAL`) counter samples are differentiated.
  */
 
 interface MetricsHistoryResponse {
@@ -71,27 +72,41 @@ export function useMetricsSeries(range: MetricsHistoryRange): MetricsSeries {
     // Long ranges are served pre-rolled-up; short ones carry raw samples.
     const preferred = isRollupMetricsRange(range) ? "AVG" : "ACTUAL";
 
-    const lookup = (metric: string): number[] => {
+    const find = (metric: string) => {
       const series = history?.series ?? [];
-      const match =
+      return (
         series.find((entry) => entry.metric === metric && entry.variant === preferred)
-        ?? series.find((entry) => entry.metric === metric);
-      if (!match) {
-        return EMPTY;
-      }
-      // A series can lag the timestamp axis by a sample; pad rather than draw
-      // a line that ends early against the other series in the same plot.
-      const values = match.values ?? EMPTY;
+        ?? series.find((entry) => entry.metric === metric)
+      );
+    };
+
+    // A series can lag the timestamp axis by a sample; pad rather than draw a
+    // line that ends early against the other series in the same plot.
+    const aligned = (values: number[]): number[] => {
       if (values.length >= timestamps.length) {
         return values.slice(0, timestamps.length);
       }
       return [...values, ...Array.from({ length: timestamps.length - values.length }, () => 0)];
     };
 
+    const gauge = (metric: string): number[] => {
+      const match = find(metric);
+      return match ? aligned(match.values ?? EMPTY) : EMPTY;
+    };
+
+    const rate = (metric: string): number[] => {
+      const match = find(metric);
+      if (!match) {
+        return EMPTY;
+      }
+      const values = aligned(match.values ?? EMPTY);
+      return match.variant === "ACTUAL" ? toRates(timestamps, values) : values;
+    };
+
     return {
       timestamps,
-      rate: (metric: string) => toRates(timestamps, lookup(metric)),
-      gauge: lookup,
+      rate,
+      gauge,
       isLoading: fetching && !history,
       error: error?.message ?? null,
     };

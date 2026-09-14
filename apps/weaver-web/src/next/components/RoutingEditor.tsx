@@ -4,6 +4,7 @@ import { PROXY_PROFILES_QUERY } from "@/graphql/proxies";
 import { useTranslate } from "@/lib/context/translate-context";
 import {
   appendProxy,
+  MAX_PROXY_ROUTES,
   moveProxy,
   proxyLabels,
   type ProxyProfile,
@@ -98,26 +99,32 @@ export function RoutingEditor({
       )}
 
       <div className="flex items-center justify-between gap-3">
-        <Select
-          label={t("next.routing.addRoute")}
-          value=""
-          className="min-w-[240px]"
-          options={[
-            {
-              value: "",
-              label: available.length === 0 ? t("next.routing.noneAvailable") : t("next.routing.addProxy"),
-            },
-            ...available.map((profile) => ({
-              value: String(profile.id),
-              label: `${profile.name} · ${proxyLabels[profile.kind]}${profile.enabled ? "" : ` (${t("next.routing.disabled")})`}`,
-            })),
-          ]}
-          onChange={(next) => {
-            if (next) {
-              onChange(appendProxy(value, Number(next)));
-            }
-          }}
-        />
+        {value.proxyIds.length >= MAX_PROXY_ROUTES ? (
+          <span className="font-wv-mono text-[11.5px] text-wv-muted">
+            {t("next.routing.full", { count: MAX_PROXY_ROUTES })}
+          </span>
+        ) : (
+          <Select
+            label={t("next.routing.addRoute")}
+            value=""
+            className="min-w-[240px]"
+            options={[
+              {
+                value: "",
+                label: available.length === 0 ? t("next.routing.noneAvailable") : t("next.routing.addProxy"),
+              },
+              ...available.map((profile) => ({
+                value: String(profile.id),
+                label: `${profile.name} · ${proxyLabels[profile.kind]}${profile.enabled ? "" : ` (${t("next.routing.disabled")})`}`,
+              })),
+            ]}
+            onChange={(next) => {
+              if (next) {
+                onChange(appendProxy(value, Number(next)));
+              }
+            }}
+          />
+        )}
         <Link
           to="/settings/proxies"
           className="font-wv-mono text-[11.5px] text-wv-accent hover:underline"

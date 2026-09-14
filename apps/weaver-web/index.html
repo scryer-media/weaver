@@ -10,7 +10,14 @@
         // The Next UI is a single dark palette on its own background, so it
         // settles both questions at once and skips the theme class entirely.
         try {
-          if (window.localStorage.getItem("weaver.ui-variant") === "next") {
+          const variant = (() => {
+            try {
+              return window.localStorage.getItem("weaver.ui-variant");
+            } catch {
+              return null;
+            }
+          })() ?? window.sessionStorage.getItem("weaver.ui-variant");
+          if (variant === "next") {
             root.dataset.ui = "next";
             root.dataset.initialTheme = "dark";
             root.style.colorScheme = "dark";

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { useMutation, useQuery, useSubscription } from "urql";
 import {
@@ -172,7 +172,7 @@ export function JobDetailPage() {
     variables,
     pause: connection.isDisconnected || !Number.isFinite(jobId),
   });
-  const [{ data: filesData }] = useQuery<{
+  const [{ data: filesData }, refetchFiles] = useQuery<{
     jobOutputFiles: { outputDir: string | null; files: OutputFile[]; totalBytes: number } | null;
   }>({ query: JOB_OUTPUT_FILES_QUERY, variables: { jobId }, pause: !Number.isFinite(jobId) });
   const [{ data: duplicateData }, refetchDuplicate] = useQuery<{
@@ -198,6 +198,19 @@ export function JobDetailPage() {
   const raw = snapshot?.queueItem ?? snapshot?.historyItem ?? null;
   const job = useMemo(() => (raw ? normalizeJobData(raw) : null), [raw]);
   const progress = useJobProgress(job ?? NO_JOB);
+  // The output folder fills in as the job moves through post-processing and
+  // settles when it finishes, so the listing is re-read on each status change
+  // rather than kept from the page's first render.
+  const jobStatus = job?.status;
+  const listedStatus = useRef(jobStatus);
+  useEffect(() => {
+    const previous = listedStatus.current;
+    listedStatus.current = jobStatus;
+    // The first status is the one the initial listing was read under.
+    if (previous !== undefined && jobStatus !== undefined && previous !== jobStatus) {
+      refetchFiles({ requestPolicy: "network-only" });
+    }
+  }, [jobStatus, refetchFiles]);
   // The engine appends; the log reads newest first, like every other log here.
   const events = useMemo(() => [...(snapshot?.jobEvents ?? [])].reverse(), [snapshot?.jobEvents]);
   // Shares are of the payload that *was* attributed, not of the job's bytes:

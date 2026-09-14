@@ -24,15 +24,28 @@ function isUiVariant(value: string | null): value is UiVariant {
   return value === "classic" || value === "next";
 }
 
+/**
+ * Where the choice is kept, most durable first. A browser that blocks local
+ * storage often still allows session storage, which carries the choice through
+ * the reload that applies it and for the rest of the tab's life.
+ */
+function stores(): (() => Storage)[] {
+  return [() => window.localStorage, () => window.sessionStorage];
+}
+
 export function readUiVariant(): UiVariant {
-  try {
-    const stored = window.localStorage.getItem(UI_VARIANT_STORAGE_KEY);
-    return isUiVariant(stored) ? stored : DEFAULT_UI_VARIANT;
-  } catch {
-    // Private browsing and blocked site data both throw on access rather than
-    // returning null; the default is the right answer in either case.
-    return DEFAULT_UI_VARIANT;
+  for (const store of stores()) {
+    try {
+      const stored = store().getItem(UI_VARIANT_STORAGE_KEY);
+      if (isUiVariant(stored)) {
+        return stored;
+      }
+    } catch {
+      // Private browsing and blocked site data both throw on access rather
+      // than returning null; try the next store.
+    }
   }
+  return DEFAULT_UI_VARIANT;
 }
 
 /** Mirror the variant onto `<html>` so the scoped CSS in `next/theme.css` applies. */
@@ -46,19 +59,38 @@ export function applyUiVariant(variant: UiVariant): void {
 }
 
 /**
- * Persist the variant and reload.
+ * Persist the variant and reload. Returns false, without reloading, when the
+ * browser keeps nothing: the reload could only land on the current interface.
  *
  * A full reload rather than a re-render: the two trees own different global
  * state (theme class, body background, document title cadence, the classic
  * UI's PWA and toast providers), and unmounting one live UI to mount the other
  * leaves enough of that behind to be worth the 200ms.
  */
-export function setUiVariant(variant: UiVariant): void {
+export function setUiVariant(variant: UiVariant): boolean {
+  const [durable, session] = stores();
+  let saved = false;
   try {
-    window.localStorage.setItem(UI_VARIANT_STORAGE_KEY, variant);
+    durable().setItem(UI_VARIANT_STORAGE_KEY, variant);
+    saved = true;
+    try {
+      session().removeItem(UI_VARIANT_STORAGE_KEY);
+    } catch {
+      // Nothing was kept there if it cannot be reached.
+    }
   } catch {
-    // A browser that cannot store the choice still gets it for this session.
+    try {
+      session().setItem(UI_VARIANT_STORAGE_KEY, variant);
+      saved = true;
+    } catch {
+      // Neither store accepts it.
+    }
+  }
+  if (!saved) {
+    // A reload would come straight back to the interface already showing.
+    return false;
   }
   applyUiVariant(variant);
   window.location.reload();
+  return true;
 }

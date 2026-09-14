@@ -762,6 +762,13 @@ export const SYSTEM_INFO_QUERY = gql`
         cgroupLimit
         decoderTier
         simdFeatures
+        kernels {
+          component
+          library
+          ladder
+          kernel
+          pinnedBy
+        }
       }
       memory {
         totalBytes
