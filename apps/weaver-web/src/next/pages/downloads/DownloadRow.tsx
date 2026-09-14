@@ -1,8 +1,11 @@
 import { memo } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
+import { statusToken } from "@/lib/status-tokens";
+import { cn } from "@/lib/utils";
 import { Square } from "@/next/components/chrome";
 import { CheckBox } from "@/next/components/controls";
+import { Icon, type IconName } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { ListRow, ValueCell } from "@/next/components/rows";
 import { EM_DASH, formatSize } from "@/next/data/format";
@@ -25,6 +28,8 @@ export const DownloadRow = memo(function DownloadRow({
   wait,
   hold,
   statusTitle,
+  onPause,
+  onCancel,
 }: {
   job: JobData;
   selected: boolean;
@@ -39,10 +44,15 @@ export const DownloadRow = memo(function DownloadRow({
   hold: string | null;
   /** A longer account of the wait, shown on hover. */
   statusTitle?: string;
+  /** Pause the download, or resume it when `paused` is false. */
+  onPause: (id: number, paused: boolean) => void;
+  /** Ask to cancel the download; the page confirms first. */
+  onCancel: (id: number) => void;
 }) {
   const t = useTranslate();
   const progress = useJobProgress(job);
   const name = formatJobReleaseName(job);
+  const isPaused = statusToken(job.status) === "paused";
   // The phase the label names, or failing that the last one with a bar; a
   // phase still settling is not what the row says it is doing.
   const phase =
@@ -96,8 +106,52 @@ export const DownloadRow = memo(function DownloadRow({
           </div>
           <ValueCell>{formatSize(job.totalBytes)}</ValueCell>
           <ValueCell>{trailing}</ValueCell>
+          <div className="-mx-[6px] flex flex-none items-center gap-0.5">
+            <RowIconButton
+              icon={isPaused ? "resume" : "pause"}
+              label={isPaused ? t("action.resume") : t("action.pause")}
+              onClick={() => onPause(job.id, !isPaused)}
+            />
+            <RowIconButton
+              icon="cancelDownload"
+              label={t("next.job.cancelTitle")}
+              danger
+              onClick={() => onCancel(job.id)}
+            />
+          </div>
         </>
       }
     />
   );
 });
+
+/** A 28px icon action inside a row; its click never reaches the row. */
+function RowIconButton({
+  icon,
+  label,
+  danger = false,
+  onClick,
+}: {
+  icon: IconName;
+  label: string;
+  danger?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+      className={cn(
+        "flex size-7 flex-none cursor-pointer items-center justify-center border border-transparent text-wv-muted hover:border-wv-control hover:bg-wv-button",
+        danger ? "hover:text-wv-error" : "hover:text-wv-fg",
+      )}
+    >
+      <Icon name={icon} size={15} />
+    </button>
+  );
+}

@@ -2,8 +2,11 @@ import { useCallback, useMemo, useRef, useState, type DragEvent } from "react";
 import { useClient, useMutation, useQuery } from "urql";
 import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
 import {
+  CANCEL_JOB_MUTATION,
   PAUSE_ALL_MUTATION,
+  PAUSE_JOB_MUTATION,
   RESUME_ALL_MUTATION,
+  RESUME_JOB_MUTATION,
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
@@ -132,12 +135,17 @@ export function DownloadsPage() {
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  // The one row whose cancel button is waiting on confirmation.
+  const [confirmRowCancel, setConfirmRowCancel] = useState<number | null>(null);
   const [report, setReport] = useState<string | null>(null);
 
   const client = useClient();
 
   const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
   const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
+  const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
+  const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
+  const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
   }>({ query: SYSTEM_INFO_QUERY });
@@ -379,6 +387,36 @@ export function DownloadsPage() {
     setSelectedId((current) => (current === id ? null : current));
   }, []);
 
+  const pauseRow = useCallback(
+    (id: number, paused: boolean) => {
+      void (paused ? pauseJob({ id }) : resumeJob({ id }));
+    },
+    [pauseJob, resumeJob],
+  );
+
+  // Like the bulk cancel: the row leaves the moment the cancel is sent and
+  // comes back if the daemon refuses it.
+  const cancelRow = async () => {
+    const id = confirmRowCancel;
+    setConfirmRowCancel(null);
+    if (id === null) {
+      return;
+    }
+    handleRemoved(id);
+    const result = await cancelJob({ id });
+    if (result.error || result.data?.cancelJob !== true) {
+      setRemovedIds((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+      setReport(result.error?.message ?? t("next.inspector.removeFailed"));
+    }
+    queue.refresh();
+  };
+  const rowCancelJob =
+    confirmRowCancel === null ? null : (jobs.find((job) => job.id === confirmRowCancel) ?? null);
+
   // A cap or a provider quota stops every download that would otherwise be
   // fetching, whatever its own status says; so does pausing everything.
   const blocked = downloadBlock.kind === "ISP_CAP" || downloadBlock.kind === "SERVER_QUOTA";
@@ -604,6 +642,8 @@ export function DownloadsPage() {
                       picked={picked.has(job.id)}
                       onPick={togglePicked}
                       statusLabel={statusLabel}
+                      onPause={pauseRow}
+                      onCancel={setConfirmRowCancel}
                       wait={waitValue(job)}
                       hold={blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null}
                       statusTitle={
@@ -648,6 +688,18 @@ export function DownloadsPage() {
         dismissLabel={t("next.downloads.keepDownloading")}
         onConfirm={() => void cancelPicked()}
         onDismiss={() => setConfirmCancel(false)}
+      />
+
+      <ConfirmDialog
+        open={confirmRowCancel !== null}
+        title={t("next.job.cancelTitle")}
+        note={rowCancelJob ? formatJobReleaseName(rowCancelJob) : undefined}
+        destructive
+        body={t("next.job.cancelBody")}
+        confirmLabel={t("next.job.cancelTitle")}
+        dismissLabel={t("next.downloads.keepDownloading")}
+        onConfirm={() => void cancelRow()}
+        onDismiss={() => setConfirmRowCancel(null)}
       />
 
       <AddNzbDialog
