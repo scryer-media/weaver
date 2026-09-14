@@ -1747,7 +1747,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3872,7 +3872,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4022,7 +4022,7 @@ dependencies = [
 [[package]]
 name = "reedsolomon-rs"
 version = "0.4.5"
-source = "git+https://github.com/scryer-media/rarpar?rev=d6971403c1911b44df04ef7cf9d7d80effcfbff1#d6971403c1911b44df04ef7cf9d7d80effcfbff1"
+source = "git+https://github.com/scryer-media/rarpar?rev=6e05d8a4534d1f44a274e33157ffee1cc93355d8#6e05d8a4534d1f44a274e33157ffee1cc93355d8"
 dependencies = [
  "memmap2",
  "rayon",
@@ -4299,7 +4299,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4367,7 +4367,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5235,10 +5235,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5751,7 +5751,7 @@ dependencies = [
 [[package]]
 name = "unrar-rs"
 version = "0.10.5"
-source = "git+https://github.com/scryer-media/rarpar?rev=d6971403c1911b44df04ef7cf9d7d80effcfbff1#d6971403c1911b44df04ef7cf9d7d80effcfbff1"
+source = "git+https://github.com/scryer-media/rarpar?rev=6e05d8a4534d1f44a274e33157ffee1cc93355d8#6e05d8a4534d1f44a274e33157ffee1cc93355d8"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -5761,7 +5761,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs 0.4.5 (git+https://github.com/scryer-media/rarpar?rev=d6971403c1911b44df04ef7cf9d7d80effcfbff1)",
+ "reedsolomon-rs 0.4.5 (git+https://github.com/scryer-media/rarpar?rev=6e05d8a4534d1f44a274e33157ffee1cc93355d8)",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",
@@ -6281,7 +6281,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
