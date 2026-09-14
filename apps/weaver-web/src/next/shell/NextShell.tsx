@@ -344,7 +344,7 @@ function InterfaceBlock() {
         href="https://www.scryer.media/weaver/donate/"
         target="_blank"
         rel="noreferrer noopener"
-        className="flex items-center gap-[9px] text-[12.5px] text-wv-muted hover:text-wv-fg"
+        className="flex items-center justify-center gap-[9px] text-[12.5px] text-wv-muted hover:text-wv-fg"
       >
         <Icon name="sponsor" size={14} className="flex-none text-wv-error" />
         {t("nav.sponsor")}
