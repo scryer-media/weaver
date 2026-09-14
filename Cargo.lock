@@ -3470,7 +3470,7 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -3484,7 +3484,7 @@ dependencies = [
  "blake3",
  "crc-fast",
  "rayon",
- "reedsolomon-rs 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reedsolomon-rs",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -4014,15 +4014,6 @@ name = "reedsolomon-rs"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04bd2b18265c8b055ea65a86fe8c0e95a91ad2cbe8fb845b0ba8ffc214931084"
-dependencies = [
- "memmap2",
- "rayon",
-]
-
-[[package]]
-name = "reedsolomon-rs"
-version = "0.4.5"
-source = "git+https://github.com/scryer-media/rarpar?rev=df47ae697c19136c48800f197c6006f26d5461bb#df47ae697c19136c48800f197c6006f26d5461bb"
 dependencies = [
  "memmap2",
  "rayon",
@@ -5751,7 +5742,8 @@ dependencies = [
 [[package]]
 name = "unrar-rs"
 version = "0.10.5"
-source = "git+https://github.com/scryer-media/rarpar?rev=df47ae697c19136c48800f197c6006f26d5461bb#df47ae697c19136c48800f197c6006f26d5461bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcf5a0ba5a6c1afdac0d595af74cdb31195b7a4aaed3de0352b519b3b5dc92bb"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -5761,7 +5753,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs 0.4.5 (git+https://github.com/scryer-media/rarpar?rev=df47ae697c19136c48800f197c6006f26d5461bb)",
+ "reedsolomon-rs",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",
@@ -6119,7 +6111,7 @@ dependencies = [
  "pbkdf2",
  "quick-xml",
  "rayon",
- "reedsolomon-rs 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reedsolomon-rs",
  "regex",
  "reqwest",
  "rmp-serde",
