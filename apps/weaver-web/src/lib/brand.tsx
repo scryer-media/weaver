@@ -101,10 +101,12 @@ export function BrandLockup({ className, decorative = false }: BrandProps) {
       <defs>
         <MarkGradient id={gradient} />
       </defs>
-      <path d={MARK_PATH} fill={"url(#" + gradient + ")"} />
-      {WORDMARK_PATHS.map((path) => (
-        <path key={path} d={path} fill="currentColor" />
-      ))}
+      <path data-brand-part="mark" d={MARK_PATH} fill={"url(#" + gradient + ")"} />
+      <g data-brand-part="wordmark">
+        {WORDMARK_PATHS.map((path) => (
+          <path key={path} d={path} fill="currentColor" />
+        ))}
+      </g>
     </svg>
   );
 }

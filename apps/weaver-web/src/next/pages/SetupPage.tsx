@@ -1,5 +1,5 @@
-import type { ReactNode } from "react";
-import { BrandLockup } from "@/lib/brand";
+import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { BrandLockup, BrandMark } from "@/lib/brand";
 import { SETUP_CODE_DISPLAY_LENGTH } from "@/lib/setup-code";
 import {
   BIND_CHOICES,
@@ -167,16 +167,64 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
   );
 }
 
+/** The mark's share of the lockup's width: both viewBoxes start at x 0 and share a height. */
+const MARK_SHARE_OF_LOCKUP = 553 / 2500;
+
+function prefersReducedMotion() {
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+}
+
 function SetupFrame({ children }: { children: ReactNode }) {
+  // The welcome plays once per page load. It stays mounted across the switch
+  // to "Setup complete", so finishing setup does not play it again.
+  const [intro, setIntro] = useState(() => !prefersReducedMotion());
+  const lockupRef = useRef<HTMLDivElement>(null);
+  const flyingRef = useRef<HTMLDivElement>(null);
+  const [flight, setFlight] = useState<CSSProperties | null>(null);
+
+  // Measured before the first paint: where the mark in the lockup sits, and how
+  // far the big centred mark has to travel and shrink to land exactly on it.
+  useLayoutEffect(() => {
+    const lockupArt = lockupRef.current?.querySelector("svg");
+    if (!intro || !lockupArt || !flyingRef.current) {
+      return;
+    }
+    const lockup = lockupArt.getBoundingClientRect();
+    const flying = flyingRef.current.getBoundingClientRect();
+    const target = {
+      x: lockup.left + (lockup.width * MARK_SHARE_OF_LOCKUP) / 2,
+      y: lockup.top + lockup.height / 2,
+    };
+    setFlight({
+      "--wv-intro-x": `${target.x - (flying.left + flying.width / 2)}px`,
+      "--wv-intro-y": `${target.y - (flying.top + flying.height / 2)}px`,
+      "--wv-intro-scale": String(lockup.height / flying.height),
+    } as CSSProperties);
+  }, [intro]);
+
   return (
     // The Next interface locks page scrolling, so the page scrolls itself.
-    <div className="h-dvh overflow-y-auto bg-wv-app text-wv-fg">
+    <div className={cn("h-dvh overflow-y-auto bg-wv-app text-wv-fg", intro && "wv-setup-intro")}>
       <div className="mx-auto flex w-full max-w-[560px] flex-col gap-8 px-4 py-10 sm:px-6 sm:py-16">
-        <BrandLockup className="h-[26px] w-auto self-center text-wv-strong" />
-        <main className="flex flex-col gap-6 border !border-wv-control bg-wv-chrome px-5 py-6 shadow-wv-menu sm:px-7">
+        <div ref={lockupRef} className="h-[26px] self-center">
+          <BrandLockup className="block h-full w-auto text-wv-strong" />
+        </div>
+        <main className="wv-setup-intro-form flex flex-col gap-6 border !border-wv-control bg-wv-chrome px-5 py-6 shadow-wv-menu sm:px-7">
           {children}
         </main>
       </div>
+      {intro ? (
+        <div aria-hidden="true" className="pointer-events-none fixed inset-0 flex items-center justify-center">
+          <div
+            ref={flyingRef}
+            style={flight ?? { opacity: 0 }}
+            className={cn("aspect-[553/363] h-[min(38vmin,260px)]", flight && "wv-setup-intro-mark")}
+            onAnimationEnd={() => setIntro(false)}
+          >
+            <BrandMark decorative className="block size-full" />
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

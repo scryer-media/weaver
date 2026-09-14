@@ -271,3 +271,69 @@ html[data-ui="next"] .wv-ping:focus-visible {
     outline-offset: 3px;
   }
 }
+
+/*
+ * The setup page's welcome. A large mark grows as it fades in at the middle of
+ * the screen, then shrinks and flies onto the mark in the lockup, whose
+ * wordmark fades in beside it as the form rises into place. The page measures
+ * the flight into --wv-intro-x, --wv-intro-y and --wv-intro-scale before the
+ * first paint. The mark in the lockup stays hidden until the flying one lands
+ * on it, and with reduced motion the page skips the welcome and shows at once.
+ */
+html[data-ui="next"] .wv-setup-intro-mark {
+  animation: wv-setup-intro-mark 2s both;
+  will-change: transform, opacity;
+}
+
+html[data-ui="next"] .wv-setup-intro [data-brand-part="mark"] {
+  opacity: 0;
+}
+
+html[data-ui="next"] .wv-setup-intro [data-brand-part="wordmark"] {
+  animation: wv-setup-intro-fade 0.45s ease-out 1.55s both;
+}
+
+html[data-ui="next"] .wv-setup-intro .wv-setup-intro-form {
+  animation: wv-setup-intro-rise 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) 1.6s both;
+}
+
+@keyframes wv-setup-intro-mark {
+  0% {
+    opacity: 0;
+    transform: scale(0.6);
+    animation-timing-function: cubic-bezier(0.2, 0.7, 0.3, 1);
+  }
+  40% {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+  48% {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+    animation-timing-function: cubic-bezier(0.65, 0, 0.25, 1);
+  }
+  100% {
+    opacity: 1;
+    transform: translate(var(--wv-intro-x), var(--wv-intro-y)) scale(var(--wv-intro-scale));
+  }
+}
+
+@keyframes wv-setup-intro-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes wv-setup-intro-rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
