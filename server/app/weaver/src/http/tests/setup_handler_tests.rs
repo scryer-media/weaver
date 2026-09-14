@@ -15,6 +15,7 @@ fn setup_test_router(
         .layer(axum::extract::connect_info::MockConnectInfo(peer))
         .layer(Extension(db))
         .layer(Extension(security))
+        .layer(Extension(assets::BaseUrl(Arc::new("/".to_string()))))
         .layer(Extension(auth_cache))
         .layer(Extension(SessionToken(Arc::new(
             "browser-session-token".to_string(),

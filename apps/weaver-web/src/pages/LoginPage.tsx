@@ -31,6 +31,7 @@ export function LoginPage() {
               autoFocus
             />
           </div>
+          <label className="flex items-center gap-2 text-sm text-muted-foreground"><input type="checkbox" checked={form.remember} onChange={(event) => form.setRemember(event.target.checked)} /> Remember this browser for 30 days</label>
           <div className="space-y-2">
             <Label htmlFor="password">{t("next.login.password")}</Label>
             <Input
@@ -66,7 +67,7 @@ export function LoginPage() {
               <p>{t("next.login.resetHelp")}</p>
               <ResetCommand label={t("next.login.docker")} command={LOGIN_RESET_COMMANDS.docker} />
               <ResetCommand label={t("next.login.bareMetal")} command={LOGIN_RESET_COMMANDS.bareMetal} />
-              <p>{t("next.login.trustedNetworks", { variable: LOGIN_RESET_COMMANDS.trustedNetworks })}</p>
+              <p>Without bootstrap credentials, use the one-time code shown at startup after resetting login. Remove the reset override when setup is complete.</p>
             </div>
           ) : null}
         </div>

@@ -10,9 +10,11 @@ import {
   ENABLE_LOGIN_MUTATION,
   HTTP_BIND_ADDRESS_QUERY,
   LOGIN_STATUS_QUERY,
+  NETWORK_ACCESS_QUERY,
   SET_ACCESS_POLICY_MUTATION,
   SET_HTTP_BIND_ADDRESS_MUTATION,
 } from "@/graphql/queries";
+import { SecuritySettingsPage } from "@/pages/settings/SecuritySettingsPage";
 import { useTranslate } from "@/lib/context/translate-context";
 import { noteLoginEnabled } from "@/lib/login-required";
 import { Square } from "../../../components/chrome";
@@ -89,6 +91,23 @@ function cleanMessage(message: string): string {
 }
 
 export function SecurityPanel() {
+  const [{ data, error }] = useQuery<{ networkAccess: { authenticatedAccess: boolean } }>({
+    query: NETWORK_ACCESS_QUERY,
+    requestPolicy: "network-only",
+  });
+  if (error) {
+    return <p role="alert" className="p-6 text-wv-error-text">{cleanMessage(error.message)}</p>;
+  }
+  if (!data) return null;
+  // Share the authenticated controls so preview, reauthentication and drafts
+  // have the same behavior in both interfaces. Legacy deployments retain their panel.
+  if (data.networkAccess.authenticatedAccess) {
+    return <div className="min-h-0 flex-1 overflow-auto p-4 sm:p-6"><SecuritySettingsPage embedded /></div>;
+  }
+  return <LegacySecurityPanel />;
+}
+
+function LegacySecurityPanel() {
   const t = useTranslate();
   const [{ data: loginData, fetching: loginFetching }, refetchLogin] = useQuery<{ adminLoginStatus: LoginStatus }>({
     query: LOGIN_STATUS_QUERY,

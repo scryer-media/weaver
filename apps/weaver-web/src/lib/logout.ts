@@ -11,8 +11,9 @@ export async function signOut(
   baseURI: string,
   request: typeof fetch = fetch,
   navigate: (href: string) => void = (href) => window.location.assign(href),
+  headers?: HeadersInit,
 ): Promise<void> {
-  const response = await request(new URL("api/logout", baseURI).href, { method: "POST" });
+  const response = await request(new URL("api/logout", baseURI).href, { method: "POST", credentials: "include", headers });
   if (!response.ok) {
     throw new Error(`Sign out failed (HTTP ${response.status})`);
   }

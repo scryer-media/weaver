@@ -9,6 +9,7 @@ mod metrics;
 mod nzbget;
 mod request_metrics;
 mod routes;
+mod setup_code;
 mod system;
 
 use std::sync::Arc;

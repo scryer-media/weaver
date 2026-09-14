@@ -49,6 +49,10 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("gzip"))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Axum extracts independent request and application state"
+)]
 pub(super) async fn static_handler(
     uri: Uri,
     headers: HeaderMap,
@@ -56,6 +60,7 @@ pub(super) async fn static_handler(
     Extension(super::SessionToken(session_token)): Extension<super::SessionToken>,
     Extension(auth_cache): Extension<LoginAuthCache>,
     Extension(security): Extension<RuntimeSecurityConfig>,
+    setup_challenge: Option<Extension<super::setup_code::SetupChallenge>>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
 ) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
@@ -106,13 +111,25 @@ pub(super) async fn static_handler(
     }
 
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
-    // How this deployment is packaged decides which "you cannot finish setup
-    // from here" page an untrusted visitor gets. Detected inline rather than
-    // resolved at boot: this is the entry path — one page load, not one call
-    // per asset — and the answer must not go stale against a marker the
-    // operator adds to a running deployment's environment on the next start.
+    // How this deployment is packaged decides which recovery page applies.
     let deployment =
         weaver_server_core::runtime::environment::detect_runtime_environment().deployment;
+    if setup_challenge
+        .as_ref()
+        .is_some_and(|Extension(challenge)| challenge.is_available())
+    {
+        // A fresh authenticated install is intentionally reachable far enough
+        // to load the wizard from any browser. The one-time startup code is
+        // the admission proof for the setup write; peer address is no longer
+        // an unreliable substitute for operator intent.
+        return spa_entry_response(&base_url, false, &session_token, &security);
+    }
+    if security.authenticated_access_mode()
+        && auth_cache.snapshot().is_none()
+        && setup_challenge.is_none()
+    {
+        return SETUP_RECOVERY_REQUIRED_PAGE.response_for(&security, peer, &headers, deployment);
+    }
     entry_response(
         &headers,
         &base_url,
@@ -137,25 +154,22 @@ fn entry_response(
     peer: Option<SocketAddr>,
     deployment: DeploymentEnvironment,
 ) -> Response {
+    // Both interfaces render sign-in from auth status. Serving the public shell
+    // grants no session; HTTP and WebSocket operations still authenticate it.
+    if security.authenticated_access_mode() {
+        return spa_entry_response(base_url, false, session_token, security);
+    }
+
     let cached_auth = auth_cache.snapshot();
     // Trusted-network sessions only apply while login protection is disabled.
     let trusted_peer = cached_auth.is_none() && security.is_trusted_client(peer, headers);
 
-    // Credentials exist: every browser gets the shell, signed in or not. The
-    // shell asks `/api/auth/status` before it mounts and draws its own sign-in
-    // page, in whichever interface this browser uses, so the page is the same
-    // whether the shell came from here or from a dev server.
     if cached_auth.is_none() && !trusted_peer {
-        // No credentials and a peer outside the trust list. Loopback is
-        // admitted to the wizard FIRST, before the configured check: the
-        // machine's own browser must be able to run setup whenever no
-        // credentials exist — including after WEAVER_RESET_LOGIN cleared them
-        // on an already-configured install, which is exactly the lockout that
-        // browser has to be able to repair. (Loopback is not in the trust
-        // list on a fresh install — the list is what the wizard writes — so
-        // `trusted_peer` alone would turn the operator away. This mirrors
-        // `setup_handler`'s admission rule: the form goes to exactly the
-        // browsers that could submit it.)
+        if !super::auth::legacy_setup_available(security) {
+            return BROWSER_ACCESS_RESTRICTED_PAGE
+                .response_for(security, peer, headers, deployment);
+        }
+        // Legacy recovery requires an explicit reset on configured installs.
         if !security
             .resolve_client_ip(peer, headers)
             .is_some_and(ip_is_loopback)
@@ -188,6 +202,15 @@ fn entry_response(
         // arriving.
     }
 
+    spa_entry_response(base_url, trusted_peer, session_token, security)
+}
+
+fn spa_entry_response(
+    base_url: &str,
+    issue_legacy_session: bool,
+    session_token: &str,
+    security: &RuntimeSecurityConfig,
+) -> Response {
     if let Some(index) = FrontendAssets::get("index.html") {
         let mime = mime_guess::from_path("index.html").first_or_octet_stream();
         let body = rewrite_index_html(&index.data, base_url);
@@ -197,7 +220,7 @@ fn entry_response(
             body,
         )
             .into_response();
-        if trusted_peer {
+        if issue_legacy_session {
             let cookie = super::auth::session_cookie_value(session_token, security);
             if let Ok(value) = HeaderValue::from_str(&cookie) {
                 response.headers_mut().append(header::SET_COOKIE, value);
@@ -307,6 +330,18 @@ const BROWSER_ACCESS_RESTRICTED_PAGE: NoticePage = NoticePage {
   <p>
     To allow more browsers, adjust Browser access in Settings &rarr; Security
     from a trusted machine.
+  </p>"#,
+};
+
+const SETUP_RECOVERY_REQUIRED_PAGE: NoticePage = NoticePage {
+    title: "Weaver setup needs recovery",
+    subtitle: "Setup Code Unavailable",
+    body: r#"  <p>
+    Weaver has no administrator account, but the one-time setup code is no
+    longer available. The operator must restart Weaver with
+    <code>WEAVER_RESET_LOGIN=1</code> to arm recovery, then use the new startup
+    code or bootstrap credentials to create the account. Remove the reset
+    override after recovery.
   </p>"#,
 };
 
@@ -438,15 +473,16 @@ mod tests {
         security: RuntimeSecurityConfig,
         peer: Option<SocketAddr>,
     ) -> Response {
+        let auth_cache = LoginAuthCache::default();
+        let session_token = super::super::SessionToken(Arc::new("browser-token".to_string()));
         static_handler(
             Uri::from_static(path),
             HeaderMap::new(),
             Extension(BaseUrl(Arc::new(String::new()))),
-            Extension(super::super::SessionToken(Arc::new(
-                "browser-token".to_string(),
-            ))),
-            Extension(LoginAuthCache::default()),
+            Extension(session_token),
+            Extension(auth_cache),
             Extension(security),
+            None,
             peer.map(|peer| Extension(ConnectInfo(peer))),
         )
         .await
@@ -672,42 +708,47 @@ mod tests {
             "not-a-real-hash",
             [7; 32],
         )));
-        let security = RuntimeSecurityConfig::default();
-        security.apply_stored_trust(Some("login_required"), None);
-        security.set_trusted_cidrs(vec!["192.168.1.0/24".parse().unwrap()]);
+        for authenticated in [false, true] {
+            let security = RuntimeSecurityConfig::default();
+            if authenticated {
+                security.apply_stored_access_policy_revision(None, None, false);
+            } else {
+                security.apply_stored_trust(Some("login_required"), None);
+            }
+            security.set_trusted_cidrs(vec!["192.168.1.0/24".parse().unwrap()]);
 
-        for peer in ["192.168.1.20:49152", "203.0.113.9:49152", "127.0.0.1:49152"] {
-            let response = super::entry_response(
-                &HeaderMap::new(),
-                "",
-                "browser-token",
-                &auth_cache,
-                &security,
-                Some(peer.parse().unwrap()),
-                DeploymentEnvironment::Native,
-            );
+            for peer in ["192.168.1.20:49152", "203.0.113.9:49152", "127.0.0.1:49152"] {
+                let response = super::entry_response(
+                    &HeaderMap::new(),
+                    "",
+                    "browser-token",
+                    &auth_cache,
+                    &security,
+                    Some(peer.parse().unwrap()),
+                    DeploymentEnvironment::Native,
+                );
 
-            assert_eq!(response.status(), StatusCode::OK, "{peer}");
-            assert!(
-                response.headers().get(header::SET_COOKIE).is_none(),
-                "{peer}"
-            );
-            let body = body_text(response).await;
-            assert!(
-                !body.contains("Browser Access Restricted")
-                    && !body.contains("<title>Set up Weaver</title>"),
-                "{peer} must get the shell, not a notice page: {body}"
-            );
+                assert_eq!(response.status(), StatusCode::OK, "{peer}");
+                assert!(
+                    response.headers().get(header::SET_COOKIE).is_none(),
+                    "{peer}"
+                );
+                let body = body_text(response).await;
+                assert!(
+                    !body.contains("Browser Access Restricted")
+                        && !body.contains("<title>Set up Weaver</title>"),
+                    "{peer} must get the shell, not a notice page: {body}"
+                );
+            }
         }
     }
 
     #[tokio::test]
-    async fn a_credential_reset_reopens_the_wizard_for_the_machines_own_browser() {
-        // WEAVER_RESET_LOGIN clears the credentials but leaves the stored
-        // access mode, so the instance reads as configured while trusting
-        // nothing. The machine's own browser must still get the wizard —
-        // it is the only thing that can repair this state from the UI — so
-        // the configured check must never outrank loopback admission.
+    async fn configured_missing_credentials_stays_closed_without_explicit_reset() {
+        // A configured, credential-less installation has the same shape as a
+        // fresh one. It must still remain closed until startup explicitly
+        // arms recovery with WEAVER_RESET_LOGIN.
+
         let security = RuntimeSecurityConfig::default();
         security.apply_stored_trust(Some("login_required"), None);
         assert!(security.security_configured());
@@ -725,11 +766,8 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_text(response).await;
-        assert!(
-            !body.contains("Browser Access Restricted")
-                && !body.contains("<title>Set up Weaver</title>"),
-            "the reset operator's own browser must get the wizard SPA, not a notice page: {body}"
-        );
+        assert!(body.contains("Browser Access Restricted"), "{body}");
+        assert!(!body.contains("<title>Set up Weaver</title>"), "{body}");
     }
 
     #[tokio::test]

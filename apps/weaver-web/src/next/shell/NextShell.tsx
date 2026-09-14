@@ -3,6 +3,7 @@ import { NavLink, useLocation } from "react-router";
 import { BrandLockup } from "@/lib/brand";
 import { useTranslate } from "@/lib/context/translate-context";
 import { useLoginEnabled } from "@/lib/login-required";
+import { authHeaders } from "@/graphql/client";
 import { signOut } from "@/lib/logout";
 import { setUiVariant } from "@/lib/ui-variant";
 import { cn } from "@/lib/utils";
@@ -317,7 +318,7 @@ function SignOutControl() {
             setBusy(true);
             setFailed(false);
             // Success leaves the page for the sign-in screen; only a refusal returns here.
-            signOut(document.baseURI).catch(() => {
+            signOut(document.baseURI, fetch, undefined, authHeaders()).catch(() => {
               setBusy(false);
               setFailed(true);
             });

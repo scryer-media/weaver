@@ -132,12 +132,12 @@ export function useLoginEnabled(): boolean {
 type SignInOutcome = { ok: true } | { ok: false; status: number; message: string };
 
 /** Post the credentials; rejects only when Weaver cannot be reached at all. */
-async function signIn(username: string, password: string): Promise<SignInOutcome> {
+async function signIn(username: string, password: string, remember: boolean): Promise<SignInOutcome> {
   const response = await fetch(loginUrl(), {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, remember }),
   });
   if (response.ok) {
     return { ok: true };
@@ -157,6 +157,7 @@ async function signIn(username: string, password: string): Promise<SignInOutcome
 export function useSignInForm(t: Translate) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -167,7 +168,7 @@ export function useSignInForm(t: Translate) {
     }
     setBusy(true);
     setError(null);
-    void signIn(username, password)
+    void signIn(username, password, remember)
       .catch(() => null)
       .then((outcome) => {
         if (outcome?.ok) {
@@ -192,6 +193,8 @@ export function useSignInForm(t: Translate) {
     setUsername,
     password,
     setPassword,
+    remember,
+    setRemember,
     busy,
     error,
     canSubmit: !busy && username.length > 0 && password.length > 0,
@@ -205,5 +208,4 @@ export const LOGIN_RESET_COMMANDS = {
     "docker run -e WEAVER_RESET_LOGIN=1 -e WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin -e WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/run/secrets/weaver-login -v /host/password:/run/secrets/weaver-login:ro ...",
   bareMetal:
     "WEAVER_RESET_LOGIN=1 WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/path/to/password weaver serve",
-  trustedNetworks: "WEAVER_TRUSTED_CIDRS",
 } as const;

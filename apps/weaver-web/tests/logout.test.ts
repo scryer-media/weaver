@@ -40,3 +40,14 @@ test("stays on the page when the server does not confirm the sign-out", async ()
     assert.deepEqual(calls.visits, []);
   }
 });
+
+test("authenticated sign-out carries the browser CSRF proof", async () => {
+  let sent: RequestInit | undefined;
+  const request = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    sent = init;
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+  await signOut("https://media.example.test/weaver/", request, () => {}, { "X-Weaver-CSRF": "test-proof" });
+  assert.equal(sent?.credentials, "include");
+  assert.equal(new Headers(sent?.headers).get("X-Weaver-CSRF"), "test-proof");
+});

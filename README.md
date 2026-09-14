@@ -54,6 +54,9 @@ Instead of the traditional sequential approach (download everything, then repair
 
 See [Installation](https://www.scryer.media/weaver/docs/installation/) for supported install methods and [Getting Started](https://www.scryer.media/weaver/docs/getting-started/) for first-run setup.
 
+See [Network setup and browser access](docs/network-setup.md) for Compose defaults,
+one-time setup codes, environment overrides, trusted proxies, and legacy compatibility.
+
 ## API
 
 Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and subscription support. The same API powers the web UI, so anything you can do in the interface is available programmatically.

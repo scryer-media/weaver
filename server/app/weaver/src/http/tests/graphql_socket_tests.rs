@@ -310,3 +310,51 @@ async fn sockets_are_refused_to_pages_from_other_origins() {
         .await;
     server.admitted(&[], init).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_browser_socket_keeps_origin_binding_and_closes_after_logout() {
+    let db = Database::open_in_memory().unwrap();
+    let server = SocketServer::start(db, LoginAuthCache::default()).await;
+    server
+        .security
+        .apply_stored_access_policy_revision(None, None, false);
+    let token = "authenticated-socket-test-token";
+    let csrf = "authenticated-socket-test-csrf";
+    let hex_hash = |value: &str| {
+        jwt::hash_api_key(value)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let origin = "https://media.example.test";
+    server
+        .db
+        .create_browser_session(&weaver_server_core::auth::BrowserSession {
+            token_hash: hex_hash(token),
+            csrf_verifier: hex_hash(csrf),
+            origin: origin.into(),
+            client_ip: None,
+            remembered: false,
+            created_at: now,
+            expires_at: now + 60,
+            revoked_at: None,
+        })
+        .unwrap();
+    let headers = [
+        (header::COOKIE, format!("weaver_session={token}")),
+        (header::ORIGIN, origin.into()),
+    ];
+    // A proxy may rewrite Host; the persisted Origin plus CSRF proof governs this mode.
+    let mut client = server
+        .admitted(&headers, serde_json::json!({"csrf": csrf}))
+        .await;
+    server
+        .db
+        .revoke_browser_session(&hex_hash(token), now)
+        .unwrap();
+    assert_closed_forbidden(&mut client).await;
+}

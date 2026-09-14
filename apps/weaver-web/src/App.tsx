@@ -227,15 +227,23 @@ function SetupGate({ children }: { children: React.ReactNode }) {
     const statusUrl = new URL("api/auth/status", document.baseURI).href;
     fetch(statusUrl, { credentials: "include" })
       .then((response) => (response.ok ? response.json() : { setupRequired: false }))
-      .then((payload: AuthStatus & { setup?: SetupEnvironment }) => {
+      .then((payload: AuthStatus & { authenticatedAccess?: boolean; setup?: SetupEnvironment }) => {
         if (!cancelled) {
           // Before the tree mounts, so a signed-out browser goes straight to
           // the sign-in page instead of firing queries that are refused.
           noteAuthStatus(payload);
           setSetupRequired(Boolean(payload.setupRequired));
-          setSetupEnvironment(payload.setup ?? null);
+          setSetupEnvironment(
+            payload.setup
+              ? {
+                  ...payload.setup,
+                  authenticatedAccess: payload.authenticatedAccess === true,
+                }
+              : null,
+          );
         }
-      })
+        }
+      )
       .catch(() => {
         // Unreachable status endpoint: let the app render and surface its own
         // errors rather than trapping the user on a blank gate.

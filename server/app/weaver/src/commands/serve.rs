@@ -49,17 +49,63 @@ pub(crate) async fn run(
         db.get_setting(weaver_server_core::security::SETTING_HTTP_BIND_ADDRESS)?
             .as_deref(),
     );
+    let stored_mode = db.get_setting(weaver_server_core::security::SETTING_ACCESS_MODE)?;
+    let stored_revision =
+        db.get_setting(weaver_server_core::security::SETTING_SECURITY_POLICY_REVISION)?;
+    let unconfigured_new_install = db.pre_migration_schema_version().is_none()
+        || (db
+            .get_setting(crate::bootstrap::INSTALL_GENERATION_SETTING)?
+            .as_deref()
+            == Some("authenticated-v1")
+            && stored_revision.is_none()
+            && stored_mode.is_none());
+    security.apply_stored_access_policy_revision(
+        stored_mode.as_deref(),
+        stored_revision.as_deref(),
+        !unconfigured_new_install || security.trust_env_pinned,
+    );
     security.apply_stored_trust(
         db.get_setting(weaver_server_core::security::SETTING_ACCESS_MODE)?
             .as_deref(),
         db.get_setting(weaver_server_core::security::SETTING_TRUSTED_NETWORKS)?
             .as_deref(),
     );
+    security.apply_stored_proxies(
+        db.get_setting(weaver_server_core::security::SETTING_TRUSTED_PROXIES)?
+            .as_deref(),
+    );
     if let Some(reason) = security.bind_fallback.as_deref() {
         warn!(reason, "stored bind address could not be honored");
     }
     crate::bootstrap::bootstrap_login_if_needed(&db).await?;
-    if security.has_trusted_cidrs() {
+    if security.authenticated_access_mode() {
+        let has_credentials = db.get_auth_credentials()?.is_some();
+        let explicit_recovery =
+            std::env::var("WEAVER_RESET_LOGIN").is_ok_and(|value| value == "1" || value == "true");
+        if !has_credentials && (unconfigured_new_install || explicit_recovery) {
+            db.mark_initial_setup_pending()?;
+        } else if has_credentials {
+            // Bootstrap can complete a previously pending wizard. Clear its
+            // eligibility before serving so later credential damage cannot
+            // accidentally reopen first-run setup.
+            db.delete_setting(weaver_server_core::auth::repository::SETUP_PENDING_SETTING_KEY)?;
+            db.set_setting(
+                weaver_server_core::auth::repository::SETUP_COMPLETED_SETTING_KEY,
+                "configured",
+            )?;
+            db.set_setting(
+                weaver_server_core::security::SETTING_SECURITY_POLICY_REVISION,
+                weaver_server_core::security::AUTHENTICATED_POLICY_REVISION,
+            )?;
+        }
+    } else {
+        db.set_setting(
+            weaver_server_core::security::SETTING_SECURITY_POLICY_REVISION,
+            "legacy-v1",
+        )?;
+        security.mark_security_configured();
+    }
+    if security.has_trusted_cidrs() && !security.authenticated_access_mode() {
         warn!(
             trusted_cidrs = ?security.trusted_cidrs(),
             "trusted-network clients receive loginless full administrative browser access"

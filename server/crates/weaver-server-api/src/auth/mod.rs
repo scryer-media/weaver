@@ -3,7 +3,9 @@ pub mod types;
 
 pub use crate::schema::auth_mutation as mutation;
 pub use crate::schema::auth_query as query;
-pub use guards::{AdminGuard, ControlGuard, ReadGuard, graphql_error, internal_error};
+pub use guards::{
+    AdminGuard, ControlGuard, FreshAdminGuard, ReadGuard, graphql_error, internal_error,
+};
 pub use types::CallerIdentity;
 pub use weaver_server_core::auth::{
     CachedLoginAuth, CallerScope, LoginAuthCache, check_password_length, generate_api_key,
