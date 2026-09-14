@@ -990,6 +990,7 @@ export const nextJa: LocaleDictionary = {
   "next.providers.remove": "プロバイダーを削除",
   "next.providers.resetUsage": "使用量をリセット",
   "next.providers.testing": "テスト中…",
+  "next.providers.saving": "テストして保存中…",
   "next.providers.test": "接続をテスト",
   "next.providers.loading": "プロバイダーを読み込み中…",
   "next.providers.pipelining": "パイプライン",

@@ -990,6 +990,7 @@ export const nextPt: LocaleDictionary = {
   "next.providers.remove": "Remover provedor",
   "next.providers.resetUsage": "Zerar consumo",
   "next.providers.testing": "Testando…",
+  "next.providers.saving": "Testando e salvando…",
   "next.providers.test": "Testar conexão",
   "next.providers.loading": "Carregando provedor…",
   "next.providers.pipelining": "pipelining",

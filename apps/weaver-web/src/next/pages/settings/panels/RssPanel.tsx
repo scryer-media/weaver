@@ -687,6 +687,7 @@ export function RssPanel() {
           label: t("next.rss.username"),
           control: {
             kind: "text",
+            secret: true,
             value: feedForm.username,
             onChange: (next) => patchFeed({ username: next }),
           },

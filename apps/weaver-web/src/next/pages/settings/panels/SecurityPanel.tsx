@@ -503,6 +503,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   mono: false,
+                  autoComplete: "username",
                   value: enableForm.username,
                   onChange: (next) =>
                     setEnableForm((current) => ({ ...current, username: next })),
@@ -514,6 +515,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
+                  autoComplete: "new-password",
                   value: enableForm.password,
                   onChange: (next) =>
                     setEnableForm((current) => ({ ...current, password: next })),
@@ -525,6 +527,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
+                  autoComplete: "new-password",
                   value: enableForm.confirm,
                   onChange: (next) => setEnableForm((current) => ({ ...current, confirm: next })),
                 },
@@ -553,6 +556,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
+                  autoComplete: "current-password",
                   value: passwordForm.current,
                   onChange: (next) =>
                     setPasswordForm((current) => ({ ...current, current: next })),
@@ -564,6 +568,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
+                  autoComplete: "new-password",
                   value: passwordForm.next,
                   onChange: (next) => setPasswordForm((current) => ({ ...current, next })),
                 },
@@ -574,6 +579,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
+                  autoComplete: "new-password",
                   value: passwordForm.confirm,
                   onChange: (next) =>
                     setPasswordForm((current) => ({ ...current, confirm: next })),
@@ -654,6 +660,7 @@ function LegacySecurityPanel() {
             label={t("next.security.apiKey")}
             value={createdKey?.rawKey ?? ""}
             onChange={() => undefined}
+            secret
             className="w-full"
           />
         </div>

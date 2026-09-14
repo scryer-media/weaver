@@ -893,6 +893,7 @@ export function ApiKeysSection() {
               <Input
                 ref={keyFieldRef}
                 data-testid="raw-api-key"
+                secret
                 readOnly
                 value={createdKey?.rawKey ?? ""}
                 onFocus={handleKeyFieldFocus}

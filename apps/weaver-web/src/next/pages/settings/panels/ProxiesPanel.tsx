@@ -266,6 +266,7 @@ export function ProxiesPanel() {
               value={value}
               rows={3}
               placeholder={placeholder}
+              secret
               className="w-[190px]"
               onChange={(next) => setSecret(key, next)}
             />
@@ -274,6 +275,7 @@ export function ProxiesPanel() {
               label={label}
               value={value}
               type={options.password ? "password" : "text"}
+              secret
               placeholder={placeholder}
               className="w-[190px] max-w-full"
               onChange={(next) => setSecret(key, next)}
@@ -542,6 +544,7 @@ export function ProxiesPanel() {
             ? storedSecret("username", t("next.proxies.username"))
             : {
                 kind: "text",
+                secret: true,
                 value: form.secrets.username ?? "",
                 onChange: (next) => setSecret("username", next),
               },
@@ -569,6 +572,7 @@ export function ProxiesPanel() {
                   ? storedSecret("privateKey", t("next.proxies.privateKey"), { multiline: true })
                   : {
                       kind: "textarea" as const,
+                      secret: true,
                       value: form.secrets.privateKey ?? "",
                       rows: 3,
                       onChange: (next: string) => setSecret("privateKey", next),
@@ -696,6 +700,7 @@ export function ProxiesPanel() {
               label={t("next.proxies.configLabel")}
               value={configText}
               rows={4}
+              secret
               className="w-full"
               placeholder={"[Interface]\nPrivateKey = …\nAddress = 10.6.0.2/32\n\n[Peer]\nPublicKey = …\nEndpoint = vpn.example.com:51820"}
               onChange={setConfigText}

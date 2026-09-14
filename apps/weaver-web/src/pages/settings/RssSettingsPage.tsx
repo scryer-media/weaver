@@ -801,6 +801,7 @@ function FeedFormCard({
 
           <Field label={t("rss.username")}>
             <Input
+              secret
               value={values.username}
               onChange={(event) =>
                 setValues((current) => ({ ...current, username: event.target.value }))

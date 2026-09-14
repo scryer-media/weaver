@@ -515,6 +515,7 @@ export function ProvidersPanel() {
               label: t("next.providers.username"),
               control: {
                 kind: "text",
+                secret: true,
                 value: values.username,
                 onChange: (next) => patch({ username: next }),
               },
@@ -676,7 +677,14 @@ export function ProvidersPanel() {
             : t("next.providers.priorityNote", { priority: values?.priority ?? 0 })
         }
         width={620}
-        overlay={testing ? <WorkingOverlay label={t("next.providers.testing")} /> : undefined}
+        overlay={
+          testing ? (
+            <WorkingOverlay label={t("next.providers.testing")} />
+          ) : busy && confirmRemove === null ? (
+            // Saving tests the connection too, so it is as slow as a test.
+            <WorkingOverlay label={t("next.providers.saving")} />
+          ) : undefined
+        }
         sections={sections}
         error={error}
         busy={busy}

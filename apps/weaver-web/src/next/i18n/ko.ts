@@ -990,6 +990,7 @@ export const nextKo: LocaleDictionary = {
   "next.providers.remove": "공급자 제거",
   "next.providers.resetUsage": "사용량 초기화",
   "next.providers.testing": "테스트 중…",
+  "next.providers.saving": "테스트 후 저장 중…",
   "next.providers.test": "연결 테스트",
   "next.providers.loading": "공급자를 불러오는 중…",
   "next.providers.pipelining": "파이프라이닝",

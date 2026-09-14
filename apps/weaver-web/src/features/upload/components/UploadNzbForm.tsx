@@ -312,12 +312,6 @@ export function UploadNzbForm({
               <Input
                 id={`upload-password-${layout}`}
                 type="password"
-                autoComplete="off"
-                data-1p-ignore="true"
-                data-bwignore="true"
-                data-lpignore="true"
-                data-protonpass-ignore="true"
-                data-form-type="other"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
                 placeholder={t("upload.passwordPlaceholder")}

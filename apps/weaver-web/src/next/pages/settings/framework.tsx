@@ -73,6 +73,9 @@ export type FieldControl =
       mono?: boolean;
       type?: "text" | "password" | "url";
       className?: string;
+      autoComplete?: string;
+      /** Keep password managers out. Defaults to on for a password that is not the Weaver login. */
+      secret?: boolean;
     }
   /** A folder on the daemon's filesystem: typed, or picked with Browse. */
   | {
@@ -96,6 +99,8 @@ export type FieldControl =
       onChange: (next: string) => void;
       rows?: number;
       placeholder?: string;
+      /** Keep password managers out, for key material. */
+      secret?: boolean;
     }
   | { kind: "time"; value: string; onChange: (next: string) => void }
   | {
@@ -166,6 +171,8 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           placeholder={control.placeholder}
           mono={control.mono ?? true}
           type={control.type}
+          autoComplete={control.autoComplete}
+          secret={control.secret}
           className={control.className ?? "w-[268px] max-w-full"}
         />
       );
@@ -198,6 +205,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           label={spec.label}
           rows={control.rows}
           placeholder={control.placeholder}
+          secret={control.secret}
         />
       );
     case "time":

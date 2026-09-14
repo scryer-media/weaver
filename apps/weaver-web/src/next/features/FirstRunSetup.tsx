@@ -384,7 +384,12 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
 
   return (
     <>
-      {testing ? <WorkingOverlay label={t("next.providers.testing")} /> : null}
+      {testing ? (
+        <WorkingOverlay label={t("next.providers.testing")} />
+      ) : saving ? (
+        // Saving tests the connection too, so it is as slow as a test.
+        <WorkingOverlay label={t("next.providers.saving")} />
+      ) : null}
       <StepBody
         title={t("next.firstRun.provider.title")}
         body={t("next.firstRun.provider.body")}
@@ -502,7 +507,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
                   label={t("next.providers.username")}
                   value={form.username}
                   onChange={(username) => patch({ username })}
-                  autoComplete="off"
+                  secret
                   className="w-full"
                 />
               </FormField>
@@ -512,7 +517,6 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
                   label={t("next.providers.password")}
                   value={form.password}
                   onChange={(password) => patch({ password })}
-                  autoComplete="new-password"
                   className="w-full"
                 />
               </FormField>

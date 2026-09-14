@@ -990,6 +990,7 @@ export const nextZh: LocaleDictionary = {
   "next.providers.remove": "移除服务商",
   "next.providers.resetUsage": "重置用量",
   "next.providers.testing": "正在测试…",
+  "next.providers.saving": "正在测试并保存…",
   "next.providers.test": "测试连接",
   "next.providers.loading": "正在加载服务商…",
   "next.providers.pipelining": "流水线",

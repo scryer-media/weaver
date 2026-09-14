@@ -9,6 +9,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { DELETE_PROXY_MUTATION, PROXY_PROFILES_QUERY, RESET_PROXY_TRUST_MUTATION, SAVE_PROXY_MUTATION, TEST_PROXY_MUTATION } from "@/graphql/proxies";
+import { PASSWORD_MANAGER_MARKERS } from "@/lib/password-manager";
 import { proxyLabels, type ProxyKind, type ProxyProfile } from "@/lib/proxies";
 import { parseWireguardConfig, stripConfigAssignment } from "@/lib/wireguard-config";
 
@@ -21,7 +22,7 @@ const MTU_MIN = 1280, MTU_MAX = 3800, MTU_DEFAULT = 1280, KEEPALIVE_DEFAULT = 25
 const CONFIG_KEYS = { privateKey: ["privatekey"], presharedKey: ["presharedkey"], peerPublicKey: ["publickey", "peerpublickey"], endpoint: ["endpoint"], mtu: ["mtu"], keepalive: ["persistentkeepalive", "keepalive"], list: ["address", "addresses", "dns"] } as const;
 const CONFIG_SAMPLE = "[Interface]\nPrivateKey = …\nAddress = 10.6.0.2/32\n\n[Peer]\nPublicKey = …\nEndpoint = vpn.example.com:51820";
 const WIREGUARD_KEY = /^[A-Za-z0-9+/]{43}=$/;
-const noPasswordManager = { "data-1p-ignore": "true", "data-lpignore": "true", "data-bwignore": "true", "data-form-type": "other", "data-protonpass-ignore": "true" };
+const noPasswordManager = PASSWORD_MANAGER_MARKERS;
 const monoArea = "block min-h-20 w-full rounded-md border border-input bg-background p-3 font-mono text-xs";
 const hint = "block text-xs text-muted-foreground";
 // One entry per line or comma; a pasted `Address = …` or `DNS = …` line counts as its value.
@@ -127,7 +128,7 @@ export function ProxiesSettingsPage() {
     const change = (text: string) => setSecret(key, text);
     const props = { value: value ?? "", disabled: !!present && value === null, placeholder: present ? "Stored securely · leave blank to keep" : "", autoComplete: "off" };
     return <div className="space-y-2" key={key}>
-      <label className="block space-y-2 text-sm"><span>{label}</span>{multiline ? <textarea {...props} className="min-h-28 w-full rounded-md border border-input bg-background p-3 font-mono text-xs" onChange={e => change(e.target.value)} /> : <Input {...props} type={key === "username" ? "text" : "password"} onChange={e => change(e.target.value)} />}</label>
+      <label className="block space-y-2 text-sm"><span>{label}</span>{multiline ? <textarea {...props} {...noPasswordManager} className="min-h-28 w-full rounded-md border border-input bg-background p-3 font-mono text-xs" onChange={e => change(e.target.value)} /> : <Input {...props} secret type={key === "username" ? "text" : "password"} onChange={e => change(e.target.value)} />}</label>
       {present && <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={value === null} onChange={e => setSecret(key, e.target.checked ? null : "")} />Clear stored {label.toLowerCase()}</label>}
     </div>;
   };

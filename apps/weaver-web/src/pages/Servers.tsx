@@ -847,6 +847,7 @@ function ServerFormCard({
           <Field label={t("servers.username")} htmlFor="server-username">
             <Input
               id="server-username"
+              secret
               value={values.username}
               onChange={(event) => setValues((current) => ({ ...current, username: event.target.value }))}
             />

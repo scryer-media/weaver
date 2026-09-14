@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type Ref } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
+import { ignoredByPasswordManagers, PASSWORD_MANAGER_IGNORE } from "@/lib/password-manager";
 import { cn } from "@/lib/utils";
 import { Icon, type IconName } from "./icons";
 import { Menu, MenuItem } from "./Menu";
@@ -464,6 +465,7 @@ export function TextField({
   id,
   autoComplete,
   autoFocus,
+  secret,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -472,6 +474,8 @@ export function TextField({
   className?: string;
   mono?: boolean;
   type?: "text" | "password" | "url";
+  /** Keep password managers out. Defaults to on for a password that is not the Weaver login. */
+  secret?: boolean;
   onBlur?: () => void;
   onFocus?: () => void;
   onKeyDown?: (event: React.KeyboardEvent<HTMLInputElement>) => void;
@@ -485,6 +489,7 @@ export function TextField({
       ref={ref}
       id={id}
       autoComplete={autoComplete}
+      {...(ignoredByPasswordManagers({ secret, type, autoComplete }) ? PASSWORD_MANAGER_IGNORE : null)}
       autoFocus={autoFocus}
       type={type}
       aria-label={label}
@@ -636,6 +641,7 @@ export function TextArea({
   placeholder,
   rows = 3,
   className,
+  secret = false,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -643,9 +649,12 @@ export function TextArea({
   placeholder?: string;
   rows?: number;
   className?: string;
+  /** Keep password managers out, for key material. */
+  secret?: boolean;
 }) {
   return (
     <textarea
+      {...(secret ? PASSWORD_MANAGER_IGNORE : null)}
       aria-label={label}
       placeholder={placeholder}
       rows={rows}
