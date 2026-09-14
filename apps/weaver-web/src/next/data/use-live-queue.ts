@@ -20,10 +20,16 @@ import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-t
  * per-item payload from `queueEvents` immediately so a row's progress moves at
  * event rate, and refetch the page on a throttle so membership and ordering
  * settle. Both are needed — the event stream never says where a new row sorts.
+ *
+ * A job someone just added is the exception to the throttle. Its row is drawn
+ * from the creation event the moment it arrives, at the end of the list, and
+ * the page is read again straight away to put it in its place and count it.
  */
 
 const QUEUE_PAGE_SIZE = 500;
 const QUEUE_EVENT_REFRESH_INTERVAL_MS = 2_000;
+/** Jobs added together (a multi-file drop) are one refetch, not one each. */
+const ARRIVAL_REFRESH_DELAY_MS = 100;
 
 const EMPTY_ITEMS: GraphqlJobData[] = [];
 const EMPTY_CATEGORIES: string[] = [];
@@ -123,8 +129,14 @@ export function useLiveQueue(): LiveQueue {
   const [overlays, setOverlays] = useState<Record<number, { item: GraphqlJobData; cursor: bigint }>>(
     {},
   );
+  // Jobs created since the page was read, held until a page read after their
+  // creation either carries them or shows they have already left.
+  const [arrivals, setArrivals] = useState<Record<number, { item: GraphqlJobData; cursor: bigint }>>(
+    {},
+  );
   const [removedIds, setRemovedIds] = useState<ReadonlySet<number>>(() => new Set());
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshDueAtRef = useRef<number | null>(null);
   const lastRefreshAtRef = useRef(0);
   const lastEventSequenceRef = useRef<bigint | null>(null);
   const lastConnectedAtRef = useRef<number | null | undefined>(undefined);
@@ -134,23 +146,30 @@ export function useLiveQueue(): LiveQueue {
       clearTimeout(refreshTimerRef.current);
       refreshTimerRef.current = null;
     }
+    refreshDueAtRef.current = null;
     lastRefreshAtRef.current = Date.now();
     void reexecuteQuery({ requestPolicy: "network-only" });
   }, [reexecuteQuery]);
 
-  const scheduleRefresh = useCallback(() => {
+  /** `soon` brings a pending throttled refetch forward rather than waiting it out. */
+  const scheduleRefresh = useCallback((soon = false) => {
+    const now = Date.now();
+    const dueAt = soon
+      ? now + ARRIVAL_REFRESH_DELAY_MS
+      : Math.max(now, lastRefreshAtRef.current + QUEUE_EVENT_REFRESH_INTERVAL_MS);
     if (refreshTimerRef.current) {
-      return;
+      if (refreshDueAtRef.current !== null && refreshDueAtRef.current <= dueAt) {
+        return;
+      }
+      clearTimeout(refreshTimerRef.current);
     }
-    const elapsed = Date.now() - lastRefreshAtRef.current;
-    refreshTimerRef.current = setTimeout(
-      () => {
-        refreshTimerRef.current = null;
-        lastRefreshAtRef.current = Date.now();
-        void reexecuteQuery({ requestPolicy: "network-only" });
-      },
-      Math.max(0, QUEUE_EVENT_REFRESH_INTERVAL_MS - elapsed),
-    );
+    refreshDueAtRef.current = dueAt;
+    refreshTimerRef.current = setTimeout(() => {
+      refreshTimerRef.current = null;
+      refreshDueAtRef.current = null;
+      lastRefreshAtRef.current = Date.now();
+      void reexecuteQuery({ requestPolicy: "network-only" });
+    }, dueAt - now);
   }, [reexecuteQuery]);
 
   // A reconnect means the event sequence restarted somewhere unknowable; drop
@@ -169,6 +188,7 @@ export function useLiveQueue(): LiveQueue {
     lastConnectedAtRef.current = connection.lastConnectedAt;
     lastEventSequenceRef.current = null;
     setOverlays({});
+    setArrivals({});
     setRemovedIds(new Set());
     setPolledPage(undefined);
     refreshNow();
@@ -254,11 +274,33 @@ export function useLiveQueue(): LiveQueue {
             next.add(removedId);
             return next;
           });
+          setArrivals((current) => {
+            if (!(removedId in current)) {
+              return current;
+            }
+            const next = { ...current };
+            delete next[removedId];
+            return next;
+          });
           scheduleRefresh();
           return;
         }
 
-        if (event.item && visibleIds.has(event.item.id)) {
+        if (event.item && !visibleIds.has(event.item.id)) {
+          const item = event.item;
+          const created = event.kind === "ITEM_CREATED";
+          setArrivals((current) => {
+            const existing = current[item.id];
+            if ((!created && !existing) || (existing && existing.cursor >= sequence)) {
+              return current;
+            }
+            return { ...current, [item.id]: { item, cursor: sequence } };
+          });
+          scheduleRefresh(created);
+          return;
+        }
+
+        if (event.item) {
           const item = event.item;
           setOverlays((current) => {
             const existing = current[item.id];
@@ -304,13 +346,29 @@ export function useLiveQueue(): LiveQueue {
     });
   }, [pageItems]);
 
-  const jobs = useMemo(
-    () =>
-      pageItems
-        .filter((item) => !removedIds.has(item.id))
-        .map((item) => normalizeJobData(overlays[item.id]?.item ?? item)),
-    [overlays, pageItems, removedIds],
-  );
+  // A page read after a job's creation is the authority on it: either the job
+  // is on it, or it has already finished or gone.
+  useEffect(() => {
+    const pageSequence = latestCursor ? decodeQueueEventCursor(latestCursor) : null;
+    setArrivals((current) => {
+      const entries = Object.entries(current);
+      const kept = entries.filter(
+        ([id, arrival]) =>
+          !visibleIds.has(Number(id)) && (pageSequence === null || arrival.cursor > pageSequence),
+      );
+      return kept.length === entries.length ? current : Object.fromEntries(kept);
+    });
+  }, [latestCursor, visibleIds]);
+
+  const jobs = useMemo(() => {
+    const arrived = Object.values(arrivals)
+      .filter((arrival) => !visibleIds.has(arrival.item.id))
+      .sort((left, right) => (left.cursor < right.cursor ? -1 : left.cursor > right.cursor ? 1 : 0))
+      .map((arrival) => arrival.item);
+    return [...pageItems, ...arrived]
+      .filter((item) => !removedIds.has(item.id))
+      .map((item) => normalizeJobData(overlays[item.id]?.item ?? item));
+  }, [arrivals, overlays, pageItems, removedIds, visibleIds]);
 
   return {
     jobs,

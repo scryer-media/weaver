@@ -205,6 +205,44 @@ export interface JobProgressState {
   nextChangeAt: number | null;
 }
 
+/** The job's own download figures, which stand in for a download phase weaver no longer reports. */
+export interface JobDownloadTotals {
+  completedBytes: number;
+  totalBytes: number;
+  progressPercent: number;
+}
+
+/**
+ * The download bar a stack is drawn beneath.
+ *
+ * Weaver stops reporting the download phase once no article is in flight, but a
+ * job keeps extracting, repairing or moving after that. Those bars stack under
+ * the download's rather than replacing it, so a row does not swap its one bar
+ * for another colour; with the phase gone, the job's own totals fill it in.
+ */
+function withDownloadBar(
+  bars: JobPhaseProgressData[],
+  download: JobDownloadTotals | null,
+): JobPhaseProgressData[] {
+  if (download === null || bars.length === 0 || bars.some((bar) => bar.phase === "DOWNLOADING")) {
+    return bars;
+  }
+  const at = bars[0].updatedAtEpochMs;
+  return [
+    {
+      phase: "DOWNLOADING",
+      completedBytes: download.completedBytes,
+      totalBytes: download.totalBytes,
+      progressPercent: download.progressPercent,
+      rateBps: null,
+      estimatedRemainingMs: null,
+      startedAtEpochMs: at,
+      updatedAtEpochMs: at,
+    },
+    ...bars,
+  ];
+}
+
 export const NO_PROGRESS_STATE: JobProgressState = {
   phases: new Map(),
   status: null,
@@ -225,6 +263,7 @@ export function advanceJobProgress(
   status: string,
   phases: readonly JobPhaseProgressData[],
   now: number,
+  download: JobDownloadTotals | null = null,
 ): JobProgressState {
   const first = previous.status === null;
   let clocks = previous.phases;
@@ -252,7 +291,17 @@ export function advanceJobProgress(
     (phase) =>
       phase.phase === "DOWNLOADING" && phase.totalBytes > 0 && phase.completedBytes < phase.totalBytes,
   );
-  const presented = status === "EXTRACTING" && !extractionShown && downloading ? "DOWNLOADING" : status;
+  // The other way round, weaver keeps a job DOWNLOADING for as long as any
+  // download-side work lingers, which can outlast the last article while an
+  // archive is still being unpacked. Once the download's own bar has gone, the
+  // label names the phase the job is visibly in.
+  const later = settled.bars.filter((bar) => bar.phase !== "DOWNLOADING").at(-1);
+  const presented =
+    status === "EXTRACTING" && !extractionShown && downloading
+      ? "DOWNLOADING"
+      : status === "DOWNLOADING" && later && !settled.clocks.has("DOWNLOADING")
+        ? later.phase
+        : status;
   const label = settleStatus(
     first ? null : previous.status,
     presented,
@@ -264,7 +313,7 @@ export function advanceJobProgress(
   return {
     phases: settled.clocks,
     status: label.clock,
-    bars: settled.bars,
+    bars: withDownloadBar(settled.bars, download),
     nextChangeAt: due.length === 0 ? null : Math.min(...due),
   };
 }

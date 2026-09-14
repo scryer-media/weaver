@@ -186,3 +186,39 @@ test("once the download is done, the rate is quoted from the phase still working
   assert.equal(ratePhase([download, extraction]), extraction);
   assert.equal(ratePhase([]), null);
 });
+
+test("an extraction still running after the last article stacks under the download bar", () => {
+  const download = { completedBytes: 1_000, totalBytes: 1_000, progressPercent: 100 };
+  const extraction = { ...phase("EXTRACTING", 30), startedAtEpochMs: 1_000, updatedAtEpochMs: 9_000 };
+  // Weaver keeps the job DOWNLOADING while download-side work lingers, and
+  // no longer reports the download phase at all.
+  const state = advanceJobProgress(NO_PROGRESS_STATE, "DOWNLOADING", [extraction], 5, download);
+
+  assert.deepEqual(kinds(state.bars), ["DOWNLOADING", "EXTRACTING"]);
+  assert.equal(state.bars[0].progressPercent, 100);
+  assert.equal(state.status?.shown, "EXTRACTING");
+});
+
+test("a download that has just gone quiet keeps the label until its bar has gone", () => {
+  const download = { completedBytes: 600, totalBytes: 1_000, progressPercent: 60 };
+  let state = advanceJobProgress(NO_PROGRESS_STATE, "DOWNLOADING", [phase("DOWNLOADING", 50)], 0, download);
+  state = advanceJobProgress(state, "DOWNLOADING", [phase("DOWNLOADING", 55), phase("EXTRACTING", 10)], 2_000, download);
+  state = advanceJobProgress(state, "DOWNLOADING", [phase("DOWNLOADING", 60), phase("EXTRACTING", 20)], 4_000, download);
+  assert.deepEqual(kinds(state.bars), ["DOWNLOADING", "EXTRACTING"]);
+
+  // The download phase drops out for a moment; its bar is held, so the label waits.
+  const quiet = advanceJobProgress(state, "DOWNLOADING", [phase("EXTRACTING", 30)], 4_500, download);
+  assert.deepEqual(kinds(quiet.bars), ["DOWNLOADING", "EXTRACTING"]);
+  assert.equal(quiet.status?.shown, "DOWNLOADING");
+
+  const gone = advanceJobProgress(quiet, "DOWNLOADING", [phase("EXTRACTING", 40)], 6_500, download);
+  assert.deepEqual(kinds(gone.bars), ["DOWNLOADING", "EXTRACTING"]);
+  assert.equal(gone.bars[0].progressPercent, 60);
+  assert.equal(gone.status?.shown, "EXTRACTING");
+});
+
+test("with no later phase running there is no stack to hold the download bar up", () => {
+  const download = { completedBytes: 1_000, totalBytes: 1_000, progressPercent: 100 };
+  const state = advanceJobProgress(NO_PROGRESS_STATE, "VERIFYING", [], 5, download);
+  assert.deepEqual(kinds(state.bars), []);
+});

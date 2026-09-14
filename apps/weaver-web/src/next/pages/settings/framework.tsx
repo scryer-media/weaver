@@ -23,6 +23,7 @@ import {
   Toggle,
 } from "@/next/components/controls";
 import { FormRow } from "@/next/components/rows";
+import { cn } from "@/lib/utils";
 
 /**
  * The settings screen's shared machinery.
@@ -117,6 +118,11 @@ export interface FieldSpec {
   /** Extra text the search box should match — a path, a host, a unit. */
   keywords?: string;
   control: FieldControl;
+  /**
+   * For a row that only means something behind another row's toggle: `true`
+   * slides it shut, `false` slides it open. Rows without it are always shown.
+   */
+  collapsed?: boolean;
 }
 
 /** Draw one field's control. Shared by the panels and by the record editor. */
@@ -229,11 +235,31 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
 export function FieldRows({ fields }: { fields: readonly FieldSpec[] }) {
   return (
     <>
-      {fields.map((field) => (
-        <FormRow key={field.id} label={field.label} help={field.help}>
-          <FieldControlView spec={field} />
-        </FormRow>
-      ))}
+      {fields.map((field) => {
+        const row = (
+          <FormRow key={field.id} label={field.label} help={field.help}>
+            <FieldControlView spec={field} />
+          </FormRow>
+        );
+        if (field.collapsed === undefined) {
+          return row;
+        }
+        // Animating the grid track from 0fr to 1fr slides the row to its real
+        // height without measuring it; `inert` keeps a shut row out of the tab
+        // order and away from assistive technology.
+        return (
+          <div
+            key={field.id}
+            inert={field.collapsed}
+            className={cn(
+              "grid transition-[grid-template-rows,opacity] duration-200 ease-out motion-reduce:transition-none",
+              field.collapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100",
+            )}
+          >
+            <div className="min-h-0 overflow-hidden">{row}</div>
+          </div>
+        );
+      })}
     </>
   );
 }
@@ -324,11 +350,11 @@ export function SettingsBlocks({
         return block;
       }
       if (block.kind === "section") {
-        const fields = block.fields.filter((field) =>
-          matches(
-            `${field.label} ${field.help ?? ""} ${field.keywords ?? ""}`,
-            search,
-          ),
+        // A shut row stays shut while searching: its toggle is the way in.
+        const fields = block.fields.filter(
+          (field) =>
+            field.collapsed !== true &&
+            matches(`${field.label} ${field.help ?? ""} ${field.keywords ?? ""}`, search),
         );
         return fields.length > 0 ? { ...block, fields } : null;
       }

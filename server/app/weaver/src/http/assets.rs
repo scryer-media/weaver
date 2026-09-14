@@ -6,7 +6,6 @@ use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 use std::net::SocketAddr;
 
-use weaver_server_core::auth as jwt;
 use weaver_server_core::auth::LoginAuthCache;
 use weaver_server_core::runtime::environment::DeploymentEnvironment;
 use weaver_server_core::security::{RuntimeSecurityConfig, ip_is_loopback};
@@ -140,21 +139,13 @@ fn entry_response(
 ) -> Response {
     let cached_auth = auth_cache.snapshot();
     // Trusted-network sessions only apply while login protection is disabled.
-    // When login is enabled, returning the SPA shell would make it repeatedly
-    // receive GraphQL 401s instead of serving the sign-in page.
     let trusted_peer = cached_auth.is_none() && security.is_trusted_client(peer, headers);
-    let has_valid_jwt = cached_auth.as_ref().is_some_and(|auth| {
-        super::auth::extract_jwt_cookie(headers)
-            .is_some_and(|token| jwt::verify_jwt(&token, &auth.jwt_secret).is_ok())
-    });
 
-    if cached_auth.is_some() {
-        // Credentials exist: an unauthenticated browser gets the login page,
-        // exactly as before.
-        if !has_valid_jwt {
-            return login_page_response();
-        }
-    } else if !trusted_peer {
+    // Credentials exist: every browser gets the shell, signed in or not. The
+    // shell asks `/api/auth/status` before it mounts and draws its own sign-in
+    // page, in whichever interface this browser uses, so the page is the same
+    // whether the shell came from here or from a dev server.
+    if cached_auth.is_none() && !trusted_peer {
         // No credentials and a peer outside the trust list. Loopback is
         // admitted to the wizard FIRST, before the configured check: the
         // machine's own browser must be able to run setup whenever no
@@ -218,112 +209,9 @@ fn entry_response(
     }
 }
 
-const LOGIN_PAGE_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Weaver - Login</title>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-    background:#0a0e1a;color:#e2e8f0;display:flex;align-items:center;
-    justify-content:center;min-height:100vh}
-  .card{background:#111827;border:1px solid rgba(255,255,255,.08);
-    border-radius:20px;padding:40px;width:100%;max-width:380px;
-    box-shadow:0 20px 60px rgba(0,0,0,.4)}
-  h1{font-size:1.5rem;font-weight:600;margin-bottom:8px;letter-spacing:-.02em}
-  .subtitle{font-size:.8rem;color:#64748b;text-transform:uppercase;
-    letter-spacing:.2em;margin-bottom:32px}
-  label{display:block;font-size:.85rem;color:#94a3b8;margin-bottom:6px}
-  input{width:100%;padding:10px 14px;border:1px solid rgba(255,255,255,.1);
-    border-radius:10px;background:#0f172a;color:#e2e8f0;font-size:.95rem;
-    margin-bottom:16px;outline:none;transition:border .2s}
-  input:focus{border-color:#6366f1}
-  button{width:100%;padding:11px;border:none;border-radius:10px;
-    background:#6366f1;color:#fff;font-size:.95rem;font-weight:500;
-    cursor:pointer;transition:background .2s}
-  button:hover{background:#4f46e5}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  .error{color:#f87171;font-size:.85rem;margin-bottom:12px;display:none}
-  .forgot{margin-top:16px;text-align:center}
-  .forgot a{color:#6366f1;font-size:.85rem;text-decoration:none;cursor:pointer}
-  .forgot a:hover{text-decoration:underline}
-  .reset-help{display:none;margin-top:12px;padding:12px;border-radius:10px;
-    background:#0f172a;border:1px solid rgba(255,255,255,.08);font-size:.8rem;
-    color:#94a3b8;line-height:1.5}
-  .reset-help code{background:#1e293b;padding:2px 6px;border-radius:4px;
-    color:#e2e8f0;font-size:.8rem}
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>Weaver</h1>
-  <div class="subtitle">Sign In</div>
-  <form id="form">
-    <label for="username">Username</label>
-    <input id="username" name="username" type="text" autocomplete="username" required autofocus/>
-    <label for="password">Password</label>
-    <input id="password" name="password" type="password" autocomplete="current-password" required/>
-    <div class="error" id="error"></div>
-    <button type="submit" id="btn">Sign In</button>
-  </form>
-  <div class="forgot">
-    <a id="forgot-link">Forgot password?</a>
-    <div class="reset-help" id="reset-help">
-      Stop Weaver, then restart with reset plus bootstrap credentials. Prefer a password file.<br/><br/>
-      <strong>Docker:</strong><br/>
-      <code>docker run -e WEAVER_RESET_LOGIN=1 -e WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin -e WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/run/secrets/weaver-login -v /host/password:/run/secrets/weaver-login:ro ...</code><br/><br/>
-      <strong>Bare metal:</strong><br/>
-      <code>WEAVER_RESET_LOGIN=1 WEAVER_BOOTSTRAP_LOGIN_USERNAME=admin WEAVER_BOOTSTRAP_LOGIN_PASSWORD_FILE=/path/to/password weaver serve</code><br/><br/>
-      Alternatively, configure explicit <code>WEAVER_TRUSTED_CIDRS</code> for loginless full-administrator browser access.
-    </div>
-  </div>
-</div>
-<script>
-const form=document.getElementById("form"),
-  err=document.getElementById("error"),
-  btn=document.getElementById("btn");
-form.addEventListener("submit",async e=>{
-  e.preventDefault();
-  err.style.display="none";
-  btn.disabled=true;
-  btn.textContent="Signing in\u2026";
-  try{
-    const r=await fetch("/api/login",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({
-        username:form.username.value,
-        password:form.password.value
-      })
-    });
-    if(r.ok){window.location.href="/";return}
-    const d=await r.json().catch(()=>({}));
-    err.textContent=d.error||"Login failed";
-    err.style.display="block";
-  }catch{
-    err.textContent="Connection error";
-    err.style.display="block";
-  }
-  btn.disabled=false;
-  btn.textContent="Sign In";
-});
-document.getElementById("forgot-link").addEventListener("click",()=>{
-  const el=document.getElementById("reset-help");
-  el.style.display=el.style.display==="block"?"none":"block";
-});
-</script>
-</body>
-</html>"#;
-
-fn login_page_response() -> Response {
-    html_page_response(LOGIN_PAGE_HTML)
-}
-
 /// Shared styling for the three static pages an untrusted, credential-less
 /// browser can land on. Kept as one constant rather than repeated per page so
-/// they cannot drift apart from each other or from the login page's look.
+/// they cannot drift apart from each other.
 const NOTICE_PAGE_STYLE: &str = r#"<style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
@@ -770,6 +658,43 @@ mod tests {
             // Turned away, but told from where — the address to add to the
             // trusted list, or to recognise as a proxy's or gateway's.
             assert!(body.contains("192.168.1.20"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_browser_gets_the_shell_once_a_login_exists() {
+        // The shell draws the sign-in page itself, so a browser without a
+        // valid login cookie gets it from anywhere — never a notice page and
+        // never a trusted-network session cookie, which a login outranks.
+        let auth_cache = LoginAuthCache::default();
+        auth_cache.replace(Some(weaver_server_core::auth::CachedLoginAuth::new(
+            "operator",
+            "not-a-real-hash",
+            [7; 32],
+        )));
+        let security = RuntimeSecurityConfig::default();
+        security.apply_stored_trust(Some("login_required"), None);
+        security.set_trusted_cidrs(vec!["192.168.1.0/24".parse().unwrap()]);
+
+        for peer in ["192.168.1.20:49152", "203.0.113.9:49152", "127.0.0.1:49152"] {
+            let response = super::entry_response(
+                &HeaderMap::new(),
+                "",
+                "browser-token",
+                &auth_cache,
+                &security,
+                Some(peer.parse().unwrap()),
+                DeploymentEnvironment::Native,
+            );
+
+            assert_eq!(response.status(), StatusCode::OK, "{peer}");
+            assert!(response.headers().get(header::SET_COOKIE).is_none(), "{peer}");
+            let body = body_text(response).await;
+            assert!(
+                !body.contains("Browser Access Restricted")
+                    && !body.contains("<title>Set up Weaver</title>"),
+                "{peer} must get the shell, not a notice page: {body}"
+            );
         }
     }
 

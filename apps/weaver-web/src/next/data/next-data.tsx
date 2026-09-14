@@ -25,6 +25,7 @@ import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { DownloadBlockState } from "@/lib/context/live-data-context";
 import { formatRate } from "./format";
+import { useHistoryLiveRefresh } from "./use-history-live-refresh";
 import { useLiveQueue, type LiveQueue } from "./use-live-queue";
 
 /**
@@ -98,6 +99,8 @@ export interface NextData {
   /** Re-read the categories after a change made elsewhere in the interface. */
   refreshCategories: () => void;
   historyCount: number;
+  /** Re-read the history count after a change made elsewhere in the interface. */
+  refreshHistoryCount: () => void;
   providers: ProviderHealth[];
   /**
    * Whether `providers` is an answer. It is also empty before server health
@@ -179,6 +182,15 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     }
   }, [connectionState.status, metricsSubscriptionData]);
 
+  // The history count follows history itself: a job reaching an outcome or a
+  // row leaving it is a reason to count again, whichever screen is open.
+  // Removals are counted even while a delete runs, so the rail falls with it.
+  const refreshHistoryCount = useCallback(
+    () => reexecuteHistoryCount({ requestPolicy: "network-only" }),
+    [reexecuteHistoryCount],
+  );
+  useHistoryLiveRefresh({ refresh: refreshHistoryCount, deletesActive: false });
+
   // Server health has no subscription; the queue's own refresh cadence is the
   // right beat for it, so re-read it whenever the queue's shape changes.
   const queueShape = `${queue.summary.totalItems}:${queue.summary.activeItems}`;
@@ -252,6 +264,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       categories,
       refreshCategories,
       historyCount,
+      refreshHistoryCount,
       providers,
       providersLoaded,
       holdoffs,
@@ -273,6 +286,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       providersLoaded,
       queue,
       refreshCategories,
+      refreshHistoryCount,
       speed,
       speedLimit,
       update,

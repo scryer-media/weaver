@@ -5,7 +5,7 @@ import type { DownloadBlockState } from "@/lib/context/live-data-context";
 import { useTranslate } from "@/lib/context/translate-context";
 import { Bar, KeyValueRow } from "../../../components/chrome";
 import { WV } from "../../../data/palette";
-import { formatDate, formatRate, formatSize } from "../../../data/format";
+import { formatDate, formatSize } from "../../../data/format";
 import {
   SettingsBlocks,
   useDraft,
@@ -22,8 +22,7 @@ import {
  * and what the daemon is enforcing can never disagree.
  */
 
-const MAX_SPEED = 10 * 1024 * 1024 * 1024;
-const SPEED_STEP = 1024 * 1024;
+const MIB = 1024 ** 2;
 const GIB = 1024 ** 3;
 const TIB = 1024 ** 4;
 
@@ -184,15 +183,14 @@ export function BandwidthPanel() {
           label: t("next.bandwidth.ceiling"),
           help: t("next.bandwidth.ceilingHelp"),
           keywords: "speed limit throttle rate",
+          // The same field as the speed-limit dialog, so the ceiling reads and
+          // edits identically wherever it is set.
           control: {
-            kind: "slider",
-            value: Math.min(values.maxDownloadSpeed, MAX_SPEED),
+            kind: "number",
+            value: Math.round((values.maxDownloadSpeed / MIB) * 10) / 10,
             min: 0,
-            max: MAX_SPEED,
-            step: SPEED_STEP,
-            onChange: (next) => draft.set({ maxDownloadSpeed: next }),
-            display:
-              values.maxDownloadSpeed === 0 ? t("settings.unlimited") : formatRate(values.maxDownloadSpeed),
+            onChange: (next) => draft.set({ maxDownloadSpeed: Math.round(Math.max(0, next) * MIB) }),
+            suffix: "MB/s",
           },
         },
         {
@@ -208,6 +206,7 @@ export function BandwidthPanel() {
         },
         {
           id: "capPeriod",
+          collapsed: !values.cap.enabled,
           label: t("next.bandwidth.capWindow"),
           help: t("next.bandwidth.capWindowHelp"),
           keywords: "daily weekly monthly period",
@@ -220,6 +219,7 @@ export function BandwidthPanel() {
         },
         {
           id: "capLimit",
+          collapsed: !values.cap.enabled,
           label: t("next.bandwidth.allowance"),
           help: t("next.bandwidth.allowanceHelp"),
           keywords: "cap size gb tb limit",
@@ -261,6 +261,7 @@ export function BandwidthPanel() {
         },
         {
           id: "resetTime",
+          collapsed: !values.cap.enabled,
           label: t("next.bandwidth.resetAt"),
           help: t("next.bandwidth.resetAtHelp"),
           keywords: "clock hour",
@@ -274,6 +275,7 @@ export function BandwidthPanel() {
           ? [
               {
                 id: "weeklyResetWeekday",
+                collapsed: !values.cap.enabled,
                 label: t("next.bandwidth.resetDay"),
                 help: t("next.bandwidth.resetDayHelp"),
                 control: {
@@ -290,6 +292,7 @@ export function BandwidthPanel() {
           ? [
               {
                 id: "monthlyResetDay",
+                collapsed: !values.cap.enabled,
                 label: t("next.bandwidth.resetDayOfMonth"),
                 help: t("next.bandwidth.resetDayOfMonthHelp"),
                 control: {

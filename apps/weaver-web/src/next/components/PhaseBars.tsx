@@ -8,6 +8,7 @@ import { useStatusLabel } from "../data/status";
 import {
   advanceJobProgress,
   NO_PROGRESS_STATE,
+  type JobDownloadTotals,
   type JobProgressState,
 } from "../data/phase-bars";
 
@@ -30,39 +31,60 @@ interface HeldState extends JobProgressState {
   jobId: number;
 }
 
-function start(job: Pick<JobData, "id" | "status" | "phaseProgress">): HeldState {
+type ProgressJob = Pick<JobData, "id" | "status" | "phaseProgress"> &
+  Partial<Pick<JobData, "downloadedBytes" | "totalBytes" | "progress">>;
+
+function downloadTotals(job: ProgressJob): JobDownloadTotals | null {
+  return job.totalBytes === undefined
+    ? null
+    : {
+        completedBytes: job.downloadedBytes ?? 0,
+        totalBytes: job.totalBytes,
+        progressPercent: (job.progress ?? 0) * 100,
+      };
+}
+
+function start(job: ProgressJob): HeldState {
   return {
-    ...advanceJobProgress(NO_PROGRESS_STATE, job.status, job.phaseProgress, Date.now()),
+    ...advanceJobProgress(NO_PROGRESS_STATE, job.status, job.phaseProgress, Date.now(), downloadTotals(job)),
     jobId: job.id,
   };
 }
 
-export function useJobProgress(job: Pick<JobData, "id" | "status" | "phaseProgress">): JobProgressView {
-  const { id, status, phaseProgress } = job;
+export function useJobProgress(job: ProgressJob): JobProgressView {
+  const { id, status, phaseProgress, downloadedBytes, totalBytes, progress } = job;
   const [state, setState] = useState<HeldState>(() => start(job));
 
   useEffect(() => {
+    const current = { id, status, phaseProgress, downloadedBytes, totalBytes, progress };
     setState((previous) =>
       previous.jobId === id
-        ? { ...advanceJobProgress(previous, status, phaseProgress, Date.now()), jobId: id }
-        : start({ id, status, phaseProgress }),
+        ? {
+            ...advanceJobProgress(previous, status, phaseProgress, Date.now(), downloadTotals(current)),
+            jobId: id,
+          }
+        : start(current),
     );
-  }, [id, status, phaseProgress]);
+  }, [id, status, phaseProgress, downloadedBytes, totalBytes, progress]);
 
   const { nextChangeAt } = state;
   useEffect(() => {
     if (nextChangeAt === null) {
       return;
     }
+    const current = { id, status, phaseProgress, downloadedBytes, totalBytes, progress };
     const timer = window.setTimeout(() => {
       setState((previous) =>
         previous.jobId === id
-          ? { ...advanceJobProgress(previous, status, phaseProgress, Date.now()), jobId: id }
+          ? {
+              ...advanceJobProgress(previous, status, phaseProgress, Date.now(), downloadTotals(current)),
+              jobId: id,
+            }
           : previous,
       );
     }, Math.max(0, nextChangeAt - Date.now()));
     return () => window.clearTimeout(timer);
-  }, [id, nextChangeAt, status, phaseProgress]);
+  }, [id, nextChangeAt, status, phaseProgress, downloadedBytes, totalBytes, progress]);
 
   // The render that switches to another job has not been through the effect
   // yet; it shows that job as reported rather than the last one's bars.

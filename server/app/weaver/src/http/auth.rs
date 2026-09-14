@@ -838,7 +838,11 @@ pub(super) async fn auth_status_handler(
         false
     };
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
-    let trusted_peer = security.is_trusted_client(peer, &headers);
+    // The same rule as `resolve_caller`: a trusted network stands in for a
+    // login only while no login exists. Counting it here too would tell a
+    // trusted browser it is signed in while every query it sends is refused,
+    // and the interface would never show it the sign-in page.
+    let trusted_peer = creds.is_none() && security.is_trusted_client(peer, &headers);
     // Setup is offered to exactly the browsers that could complete it:
     // `setup_handler` admits loopback-or-trusted, and a trusted peer skips
     // the wizard entirely (it is already admitted), which leaves loopback.

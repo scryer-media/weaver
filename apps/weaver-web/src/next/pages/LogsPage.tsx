@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { EmptyState } from "../components/chrome";
@@ -17,6 +17,9 @@ import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../shell/rail-blocks";
 
 const CHIP_OFF = "#3a414f";
+
+/** How close to the bottom still counts as following the tail. */
+const TAIL_SLACK_PX = 24;
 
 const FILTERS: LogLevelFilter[] = ["all", ...LOG_LEVELS];
 
@@ -42,6 +45,29 @@ export function LogsPage() {
   const [level, setLevel] = useState<LogLevelFilter>("all");
   const [query, setQuery] = useState("");
   const logs = useServiceLogs(level, query);
+
+  // The freshest line is at the bottom, so the page opens there and stays
+  // there as lines arrive — unless someone has scrolled up to read, in which
+  // case new lines must not pull the text out from under them. A new filter is
+  // a new view, and starts at its own tail.
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const followingRef = useRef(true);
+  useLayoutEffect(() => {
+    followingRef.current = true;
+  }, [level, query]);
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current;
+    if (scroller && followingRef.current) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  }, [logs.lines]);
+  const onScroll = () => {
+    const scroller = scrollerRef.current;
+    if (scroller) {
+      followingRef.current =
+        scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= TAIL_SLACK_PX;
+    }
+  };
 
   return (
     <NextShell
@@ -107,7 +133,11 @@ export function LogsPage() {
         total: formatCount(logs.bufferedCount),
       })}
     >
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
+      <div
+        ref={scrollerRef}
+        onScroll={onScroll}
+        className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list"
+      >
         {logs.lines.length === 0 && logs.loading ? (
           <EmptyState loading title={t("next.common.loading")} body={t("next.logs.loadingBody")} />
         ) : logs.lines.length === 0 ? (

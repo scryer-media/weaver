@@ -16,12 +16,15 @@ import { PwaProvider } from "@/lib/context/pwa-context";
 import { Toaster } from "@/components/ui/sonner";
 import { applyUiVariant, readUiVariant } from "@/lib/ui-variant";
 import { LoadingMark } from "@/lib/loading-mark";
+import { noteAuthStatus, useLoginRequired, type AuthStatus } from "@/lib/login-required";
+import { LoginPage } from "@/pages/LoginPage";
 
 /// The Next interface is a second, self-contained UI tree (`src/next`).
 /// Loading it lazily keeps its chunk out of a classic browser's bundle; the
 /// variant only changes on a full reload (see `setUiVariant`), so reading it
 /// once per mount is enough and no component below ever re-renders on a switch.
 const NextApp = lazy(() => import("./next/NextApp"));
+const NextLoginPage = lazy(() => import("./next/pages/LoginPage"));
 
 const uiVariant = readUiVariant();
 
@@ -50,6 +53,7 @@ function GatePlaceholder() {
 function AppProviders() {
   const { isReady, t, uiLanguage, setLanguagePreference, selectedLanguage } = useLanguage();
   const client = useGraphqlClient();
+  const loginRequired = useLoginRequired();
   const wasBackgroundedRef = useRef(false);
 
   useEffect(() => {
@@ -97,6 +101,22 @@ function AppProviders() {
     return <GatePlaceholder />;
   }
 
+  // Nothing below can load for a browser that has to sign in first, so the
+  // sign-in page replaces the whole tree rather than sitting inside it.
+  if (loginRequired) {
+    return (
+      <TranslateContext.Provider value={contextValue}>
+        {uiVariant === "next" ? (
+          <Suspense fallback={<GatePlaceholder />}>
+            <NextLoginPage />
+          </Suspense>
+        ) : (
+          <LoginPage />
+        )}
+      </TranslateContext.Provider>
+    );
+  }
+
   return (
     <TranslateContext.Provider value={contextValue}>
       <Provider value={client}>
@@ -142,8 +162,8 @@ interface SecuritySetupState {
 /// The decision is latched after the first resolution. The urql client is
 /// recreated on tab refocus, which re-runs this query; without the latch the
 /// app would blank mid-session every time. Nothing re-latches after a login
-/// either: the sign-in page is server-rendered and navigates to `/`, so the
-/// gate is re-evaluated by the fresh document load.
+/// either: signing in reloads the page, so the gate is re-evaluated by the
+/// fresh document load.
 function SecurityUpgradeGate({ children }: { children: React.ReactNode }) {
   const [decision, setDecision] = useState<"pending" | "wizard" | "app">("pending");
   const [{ data, error, fetching }] = useQuery<SecuritySetupState>({
@@ -207,8 +227,11 @@ function SetupGate({ children }: { children: React.ReactNode }) {
     const statusUrl = new URL("api/auth/status", document.baseURI).href;
     fetch(statusUrl, { credentials: "include" })
       .then((response) => (response.ok ? response.json() : { setupRequired: false }))
-      .then((payload: { setupRequired?: boolean; setup?: SetupEnvironment }) => {
+      .then((payload: AuthStatus & { setup?: SetupEnvironment }) => {
         if (!cancelled) {
+          // Before the tree mounts, so a signed-out browser goes straight to
+          // the sign-in page instead of firing queries that are refused.
+          noteAuthStatus(payload);
           setSetupRequired(Boolean(payload.setupRequired));
           setSetupEnvironment(payload.setup ?? null);
         }

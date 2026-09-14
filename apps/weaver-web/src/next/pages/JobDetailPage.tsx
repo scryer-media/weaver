@@ -54,7 +54,6 @@ import { buildTimelineView, type JobTimelineData } from "../data/timeline";
 import { useNextData } from "../data/next-data";
 import { countLabel } from "../i18n/labels";
 import { NextShell, RailBlock } from "../shell/NextShell";
-import { JumpListBlock } from "../shell/rail-blocks";
 
 /**
  * One job, end to end.
@@ -189,7 +188,7 @@ export function JobDetailPage() {
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
 
-  const [confirm, setConfirm] = useState<"delete" | "cancel" | "forget" | null>(null);
+  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "cancel" | "forget" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -267,6 +266,10 @@ export function JobDetailPage() {
   const token = statusToken(job.status);
   const failed = token === "failed";
   const done = token === "completed";
+  // Weaver holds a finished job in its queue for a while before history takes
+  // it, so whether the job is over comes from its status, not from where the
+  // snapshot found it: pausing or cancelling a finished job means nothing.
+  const terminal = done || failed;
   const color = statusColor(progress.status);
   const percent = job.progress * 100;
   const phase = ratePhase(job.phaseProgress);
@@ -370,7 +373,7 @@ export function JobDetailPage() {
                 {t("next.inspector.stopScripts")}
               </SecondaryButton>
             ) : null}
-            {inQueue ? (
+            {inQueue && !terminal ? (
               <>
                 <SecondaryButton
                   icon={token === "paused" ? "resume" : "pause"}
@@ -438,25 +441,15 @@ export function JobDetailPage() {
                   {t("next.job.reprocess")}
                 </SecondaryButton>
                 <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
-                  {t("action.delete")}
+                  {t("next.job.deleteSaveFiles")}
+                </DangerButton>
+                <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("deleteAll")}>
+                  {t("next.job.deleteAllFiles")}
                 </DangerButton>
               </>
             )}
           </div>
         </header>
-      }
-      railMiddle={
-        <JumpListBlock
-          eyebrow={t("next.job.thisJob")}
-          items={[
-            { id: "pipeline", label: t("next.job.pipeline"), meta: timeline?.stages.length ?? 0 },
-            { id: "files", label: t("next.job.outputFiles"), meta: files.length },
-            { id: "log", label: t("next.job.eventLog"), meta: events.length },
-            { id: "release", label: t("next.job.releaseDetails") },
-            { id: "metadata", label: t("next.job.metadata") },
-            { id: "providers", label: t("next.rail.providers"), meta: providers.length },
-          ]}
-        />
       }
       railFooter={
         <RailBlock eyebrow={t("next.job.savedBandwidth")}>
@@ -840,27 +833,34 @@ export function JobDetailPage() {
         </PanelGrid>
       </div>
 
-      <ConfirmDialog
-        open={confirm === "delete"}
-        title={t("next.job.deleteTitle")}
-        note={job.displayTitle || job.name}
-        busy={busy}
-        confirmLabel={t("next.job.deleteTitle")}
-        body={t("next.job.deleteBody")}
-        onDismiss={() => setConfirm(null)}
-        onConfirm={() => {
-          setConfirm(null);
-          void run(t("next.job.report.removed"), async () => {
-            const result = await acceptHistoryDelete({
-              input: { mode: "IDS", ids: [job.id], deleteFiles: false },
-            });
-            if (!result.error) {
-              navigate("/history");
-            }
-            return result;
-          });
-        }}
-      />
+      {(["delete", "deleteAll"] as const).map((kind) => {
+        const deleteFiles = kind === "deleteAll";
+        const title = deleteFiles ? t("next.job.deleteAllTitle") : t("next.job.deleteTitle");
+        return (
+          <ConfirmDialog
+            key={kind}
+            open={confirm === kind}
+            title={title}
+            note={job.displayTitle || job.name}
+            busy={busy}
+            confirmLabel={title}
+            body={deleteFiles ? t("next.job.deleteAllBody") : t("next.job.deleteBody")}
+            onDismiss={() => setConfirm(null)}
+            onConfirm={() => {
+              setConfirm(null);
+              void run(t("next.job.report.removed"), async () => {
+                const result = await acceptHistoryDelete({
+                  input: { mode: "IDS", ids: [job.id], deleteFiles },
+                });
+                if (!result.error) {
+                  navigate("/history");
+                }
+                return result;
+              });
+            }}
+          />
+        );
+      })}
 
       <ConfirmDialog
         open={confirm === "cancel"}
