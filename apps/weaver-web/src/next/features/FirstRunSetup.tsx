@@ -23,6 +23,7 @@ import { Eyebrow, Square } from "../components/chrome";
 import { NumberField, PrimaryButton, SecondaryButton, TextField, Toggle } from "../components/controls";
 import { Icon } from "../components/icons";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { LanguagePicker } from "../components/LanguagePicker";
 import { WorkingOverlay } from "../components/WorkingOverlay";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { formatHostnames, formatLatency } from "../data/format";
@@ -185,8 +186,12 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
 
   return (
     // The Next interface locks page scrolling, so the walk scrolls itself.
-    <div className="h-dvh overflow-y-auto bg-wv-app text-wv-fg">
+    <div className="relative h-dvh overflow-y-auto bg-wv-app text-wv-fg">
       <div className="mx-auto flex w-full max-w-[600px] flex-col gap-8 px-4 py-10 sm:px-6 sm:py-16">
+        {/* Above the lockup on a phone; in the page's corner once there is room. */}
+        <div className="-mt-6 -mb-4 self-end sm:absolute sm:top-4 sm:right-6 sm:m-0">
+          <LanguagePicker />
+        </div>
         <BrandLockup className="h-[26px] w-auto self-center text-wv-strong" />
 
         <main className="relative flex flex-col border border-wv-control bg-wv-chrome shadow-wv-menu">

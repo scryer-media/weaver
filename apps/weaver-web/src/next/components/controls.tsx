@@ -330,6 +330,7 @@ export function Select<T extends string>({
   options,
   onChange,
   label,
+  icon,
   className,
   menuClassName,
 }: {
@@ -337,6 +338,8 @@ export function Select<T extends string>({
   options: readonly { value: T; label: string }[];
   onChange: (next: T) => void;
   label: string;
+  /** Shown before the current choice, for a control without a visible label. */
+  icon?: IconName;
   className?: string;
   menuClassName?: string;
 }) {
@@ -382,7 +385,8 @@ export function Select<T extends string>({
           className,
         )}
       >
-        <span className="truncate">{current?.label ?? value}</span>
+        {icon ? <Icon name={icon} size={13} className="-mr-1 flex-none text-wv-muted" /> : null}
+        <span className="min-w-0 flex-1 truncate text-left">{current?.label ?? value}</span>
         <Icon name="dropdown" size={13} className="flex-none text-wv-muted" />
       </button>
       <Menu
