@@ -40,6 +40,14 @@ fn reclaimable(error: &io::Error) -> bool {
 }
 
 impl ReaderCache {
+    /// Cumulative reader reuses and evictions, read once per work handback.
+    pub(super) fn counters(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.evictions.load(Ordering::Relaxed),
+        )
+    }
+
     pub(super) fn clear(&self) -> EngineResult<()> {
         let mut cache = self
             .inner

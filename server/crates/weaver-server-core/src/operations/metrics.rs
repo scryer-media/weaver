@@ -8,6 +8,13 @@ use crate::operations::instrumentation::{
     JobLifecycleMetrics, PipelineHistograms, ServerMetricsRegistry,
 };
 
+mod par3;
+
+pub use par3::{
+    PAR3_SLOTS, PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3Metrics, Par3MetricsSnapshot,
+    Par3OutcomeClass, Par3Phase, Par3Slot, Par3SlotSnapshot, Par3Stage,
+};
+
 const SPEED_WINDOW_SAMPLES: usize = 50; // ~5 seconds at 100ms snapshot rate
 const SPEED_EMA_HALF_LIFE_SECS: f64 = 1.0;
 
@@ -530,6 +537,10 @@ pub struct PipelineMetrics {
     /// Pipeline stage duration histograms, read on demand through
     /// [`crate::SchedulerHandle::pipeline_histograms_snapshot`].
     pub pipeline_histograms: PipelineHistograms,
+    /// PAR3 recovery counters, phases and stalls. Unlike the three registries
+    /// above these *are* folded into [`MetricsSnapshot`]: every field is a
+    /// relaxed atomic over fixed storage, so the tick stays a struct copy.
+    pub par3: Par3Metrics,
 
     // Timing (not atomic — set once at creation)
     pub start_time: Instant,
@@ -665,8 +676,19 @@ impl PipelineMetrics {
             server_metrics: ServerMetricsRegistry::new(),
             job_lifecycle: JobLifecycleMetrics::new(),
             pipeline_histograms: PipelineHistograms::new(),
+            par3: Par3Metrics::default(),
             start_time: Instant::now(),
         })
+    }
+
+    /// Monotonic milliseconds since this metrics object was created. Every
+    /// PAR3 timestamp shares this origin so a snapshot can subtract two of
+    /// them without needing a clock of its own.
+    pub fn now_ms(&self) -> u64 {
+        self.start_time
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
     }
 
     fn saturating_sub_u64(counter: &AtomicU64, amount: u64) {
@@ -1054,6 +1076,7 @@ impl PipelineMetrics {
             recovery_queue_depth: self.recovery_queue_depth.load(Ordering::Relaxed),
             articles_per_sec: rates.articles,
             decode_rate_mbps: rates.decode_mib,
+            par3: self.par3.snapshot(self.now_ms()),
         }
     }
 
@@ -1219,6 +1242,9 @@ pub struct MetricsSnapshot {
     pub recovery_queue_depth: usize,
     pub articles_per_sec: f64,
     pub decode_rate_mbps: f64,
+    /// PAR3 recovery counters and the two work slots' phase/stall state.
+    #[serde(default)]
+    pub par3: Par3MetricsSnapshot,
 }
 
 #[cfg(test)]
