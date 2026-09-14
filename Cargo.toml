@@ -134,7 +134,8 @@ par3-rs = { version = "0.3.1", default-features = false }
 # without re-zeroing the RS scratch tables per byte, which cut .rev restores
 # from 3-4x the CPU of unrar to parity, and reopens the reconstructed last
 # volume for its padding trim instead of failing with EBADF.
-unrar-rs = { version = "0.10.4", default-features = false, features = ["crypto-aws-lc"] }
+# Temporary benchmark pin for rarpar PR #72; reproducible without a local checkout.
+unrar-rs = { git = "https://github.com/scryer-media/rarpar", rev = "d6971403c1911b44df04ef7cf9d7d80effcfbff1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
@@ -154,8 +155,8 @@ debug = 0
 split-debuginfo = "off"
 incremental = false
 
-# `par2-rs`, `unrar-rs` and `reedsolomon-rs` are ordinary crates.io
-# dependencies. Do not add a `[patch.crates-io]` block that points outside this
+# Apart from the explicit benchmark Git pin above, rarpar crates use crates.io.
+# Do not add a `[patch.crates-io]` block that points outside this
 # repository: the e2e harness's Weaver image build refuses such a manifest, and
 # any build without that exact checkout cannot compile the workspace. When a
 # rarpar change is needed, publish it and bump the requirement here instead.

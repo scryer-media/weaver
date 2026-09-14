@@ -688,7 +688,10 @@ mod tests {
             );
 
             assert_eq!(response.status(), StatusCode::OK, "{peer}");
-            assert!(response.headers().get(header::SET_COOKIE).is_none(), "{peer}");
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "{peer}"
+            );
             let body = body_text(response).await;
             assert!(
                 !body.contains("Browser Access Restricted")
