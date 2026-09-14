@@ -277,6 +277,7 @@ impl AuthMutation {
                 "username and password must not be empty",
             ));
         }
+        crate::auth::check_password_length(&password).map_err(async_graphql::Error::new)?;
         let hash = tokio::task::spawn_blocking(move || crate::auth::hash_password(&password))
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
@@ -323,9 +324,7 @@ impl AuthMutation {
         current_password: String,
         new_password: String,
     ) -> Result<bool> {
-        if new_password.is_empty() {
-            return Err(async_graphql::Error::new("new password must not be empty"));
-        }
+        crate::auth::check_password_length(&new_password).map_err(async_graphql::Error::new)?;
         let db = ctx.data::<Database>()?.clone();
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
         let db2 = db.clone();

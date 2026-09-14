@@ -6,6 +6,7 @@ import { SectionCard } from "@/components/SectionCard";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { signOut } from "@/lib/logout";
 import {
   ACCESS_POLICY_QUERY,
   CHANGE_PASSWORD_MUTATION,
@@ -127,8 +128,10 @@ function LoginProtectionSection() {
   };
 
   const handleLogout = () => {
-    fetch("/api/logout", { method: "POST" }).then(() => {
-      window.location.href = "/";
+    setError(null);
+    setSuccess(null);
+    signOut(document.baseURI).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : "Sign out failed");
     });
   };
 

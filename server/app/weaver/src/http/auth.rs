@@ -471,6 +471,9 @@ pub(super) async fn setup_handler(
                     "username and password are required for this access mode",
                 );
             }
+            if let Err(error) = jwt::check_password_length(&password) {
+                return super::error_response(StatusCode::BAD_REQUEST, &error);
+            }
             Some((username, password))
         }
         AccessMode::NoLogin => {

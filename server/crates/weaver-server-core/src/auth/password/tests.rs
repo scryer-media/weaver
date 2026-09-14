@@ -8,6 +8,16 @@ fn password_hash_verification() {
 }
 
 #[test]
+fn login_passwords_have_a_minimum_length() {
+    assert!(check_password_length("").is_err());
+    assert!(check_password_length("seven77").is_err());
+    // Characters, not bytes: seven accented letters are still seven.
+    assert!(check_password_length("ééééééé").is_err());
+    assert!(check_password_length("eight888").is_ok());
+    assert!(check_password_length("ééééééééé").is_ok());
+}
+
+#[test]
 fn reject_unknown_hash_format() {
     assert!(!verify_password("hunter2", "not-a-phc-hash"));
     assert!(!verify_password(

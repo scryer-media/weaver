@@ -346,6 +346,9 @@ pub struct RuntimeSecurityConfig {
     /// wizard that picks "no login" must be able to admit the very next
     /// request, not the next restart.
     trusted_cidrs: Arc<RwLock<Vec<IpNet>>>,
+    /// Wakes open browser sockets admitted through the trust list, so a
+    /// narrowed policy reaches them as well as the next request.
+    trust_changes: Arc<tokio::sync::watch::Sender<()>>,
     /// True once the operator's browser-access policy is settled, shared across
     /// clones for the same reason the trust list is: the answer decides whether
     /// a credential-less visitor is shown the first-run wizard, and a wizard
@@ -412,6 +415,7 @@ impl RuntimeSecurityConfig {
             rss_allow_private_network: parse_bool_env(ENV_RSS_ALLOW_PRIVATE_NETWORK, true)?,
             strict_security,
             trusted_cidrs: Arc::new(RwLock::new(trusted_cidrs)),
+            trust_changes: Arc::new(tokio::sync::watch::Sender::new(())),
             trusted_proxies: parse_trusted_proxies_env()?,
             // An env-pinned deployment has already declared its policy, so it
             // is configured before the database is even open. Everything else
@@ -511,6 +515,12 @@ impl RuntimeSecurityConfig {
             .trusted_cidrs
             .write()
             .expect("trusted-network lock poisoned") = networks;
+        self.trust_changes.send_replace(());
+    }
+
+    /// Resolves after every replacement of the trusted-network list.
+    pub fn subscribe_trust_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.trust_changes.subscribe()
     }
 
     pub fn trusted_cidrs(&self) -> Vec<IpNet> {
@@ -630,6 +640,39 @@ impl RuntimeSecurityConfig {
             .expect("trusted-network lock poisoned")
             .iter()
             .any(|network| network.contains(&ip))
+    }
+
+    /// Whether a browser page at `origin` may open this server's GraphQL socket.
+    ///
+    /// Cookies ride along on a socket upgrade from any page on the same site,
+    /// so the initiating page has to be this application, which only ever
+    /// serves its own bundled UI: the host the request was addressed to, the
+    /// host a configured proxy says it was addressed to, or a host the operator
+    /// named for this server.
+    pub fn is_websocket_origin_allowed(
+        &self,
+        origin: &str,
+        request_host: Option<&HttpAuthority>,
+        peer: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> bool {
+        let Some(page) = PageOrigin::parse(origin) else {
+            return false;
+        };
+        if request_host.is_some_and(|host| page.is_served_at(host)) {
+            return true;
+        }
+        if peer.is_some_and(|peer| self.is_trusted_proxy(peer.ip()))
+            && forwarded_host(headers).is_some_and(|host| page.is_served_at(&host))
+        {
+            return true;
+        }
+        self.http_allowed_hosts.iter().any(|allowed| {
+            allowed.host == page.authority.host
+                && allowed
+                    .port
+                    .is_none_or(|port| page.authority.port == Some(port))
+        })
     }
 
     /// Returns whether this address is a proxy the operator named in
@@ -754,6 +797,49 @@ fn single_forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
         })
 }
 
+/// A browser `Origin`, reduced to the authority it was served from.
+struct PageOrigin {
+    /// Always carries a port: the explicit one, or the scheme's default.
+    authority: HttpAuthority,
+    default_port: u16,
+}
+
+impl PageOrigin {
+    fn parse(origin: &str) -> Option<Self> {
+        let url = Url::parse(origin).ok()?;
+        let default_port = match url.scheme() {
+            "http" => 80,
+            "https" => 443,
+            _ => return None,
+        };
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        let port = url.port().unwrap_or(default_port);
+        let authority = HttpAuthority::parse(&format!("{}:{port}", url.host_str()?)).ok()?;
+        Some(Self {
+            authority,
+            default_port,
+        })
+    }
+
+    /// Whether a request addressed to `host` reached the server this page came
+    /// from. Browsers leave the scheme's default port out of `Host`.
+    fn is_served_at(&self, host: &HttpAuthority) -> bool {
+        self.authority.host == host.host
+            && self.authority.port == Some(host.port.unwrap_or(self.default_port))
+    }
+}
+
+/// The host the client addressed, as the nearest proxy reported it: the first
+/// entry of the first `X-Forwarded-Host`.
+fn forwarded_host(headers: &HeaderMap) -> Option<HttpAuthority> {
+    let mut values = headers.get_all("x-forwarded-host").iter();
+    let value = values.next()?.to_str().ok()?;
+    let first = value.split(',').next()?;
+    HttpAuthority::parse(first).ok()
+}
+
 /// Whether anything in this request looks like it came through a proxy.
 ///
 /// Wider than the headers resolution actually reads, because this only decides
@@ -803,6 +889,7 @@ impl Default for RuntimeSecurityConfig {
             rss_allow_private_network: true,
             strict_security: false,
             trusted_cidrs: Arc::new(RwLock::new(Vec::new())),
+            trust_changes: Arc::new(tokio::sync::watch::Sender::new(())),
             trusted_proxies: Vec::new(),
             security_configured: Arc::new(AtomicBool::new(false)),
             trust_env_pinned: false,
@@ -1873,5 +1960,75 @@ mod tests {
         clear_env();
         let config = RuntimeSecurityConfig::from_env().unwrap();
         assert!(config.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn websocket_origin_must_be_the_application_the_request_addressed() {
+        let config = RuntimeSecurityConfig::default();
+        let host = HttpAuthority::parse("weaver.example.test").unwrap();
+        let none = HeaderMap::new();
+        let allowed =
+            |origin: &str| config.is_websocket_origin_allowed(origin, Some(&host), None, &none);
+
+        // A browser leaves the scheme's default port out of Host.
+        assert!(allowed("https://weaver.example.test"));
+        assert!(allowed("http://WEAVER.example.test"));
+        assert!(!allowed("https://weaver.example.test:8443"));
+        // A hostile sibling on the same site still sends its own cookies' site.
+        assert!(!allowed("https://sibling.example.test"));
+        assert!(!allowed("null"));
+        assert!(!allowed("file:///weaver.example.test"));
+
+        let direct = HttpAuthority::parse("192.168.1.20:9090").unwrap();
+        assert!(config.is_websocket_origin_allowed(
+            "http://192.168.1.20:9090",
+            Some(&direct),
+            None,
+            &none
+        ));
+        assert!(!config.is_websocket_origin_allowed(
+            "http://192.168.1.20:9091",
+            Some(&direct),
+            None,
+            &none
+        ));
+    }
+
+    #[test]
+    fn websocket_origin_accepts_configured_names_and_trusted_forwarded_hosts() {
+        let rewritten = HttpAuthority::parse("127.0.0.1:9090").unwrap();
+        let forwarded = headers_with(&[("x-forwarded-host", "weaver.example.test")]);
+
+        // A proxy that rewrites Host is believed about the original host only
+        // when the operator named it.
+        let config = proxied(&[], &["10.0.0.2"]);
+        assert!(config.is_websocket_origin_allowed(
+            "https://weaver.example.test",
+            Some(&rewritten),
+            peer("10.0.0.2:40000"),
+            &forwarded
+        ));
+        assert!(!config.is_websocket_origin_allowed(
+            "https://weaver.example.test",
+            Some(&rewritten),
+            peer("10.0.0.3:40000"),
+            &forwarded
+        ));
+
+        let mut config = RuntimeSecurityConfig::default();
+        config.http_allowed_hosts = vec![HttpAuthority::parse("weaver.example.test").unwrap()];
+        let none = HeaderMap::new();
+        assert!(config.is_websocket_origin_allowed(
+            "https://weaver.example.test",
+            Some(&rewritten),
+            None,
+            &none
+        ));
+        assert!(!config.is_websocket_origin_allowed(
+            "https://sibling.example.test",
+            Some(&rewritten),
+            None,
+            &none
+        ));
     }
 }

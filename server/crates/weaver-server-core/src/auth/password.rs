@@ -15,6 +15,20 @@ fn pinned_argon2() -> argon2::Argon2<'static> {
     argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
 }
 
+/// The fewest characters a login password may have.
+pub const MIN_PASSWORD_CHARS: usize = 8;
+
+/// Refuse a password too short to become the login password. The login rate
+/// limiter slows guessing, but it cannot make a two-letter password safe.
+pub fn check_password_length(password: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(format!(
+            "password must be at least {MIN_PASSWORD_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
 pub fn hash_password(password: &str) -> Result<String, String> {
     use argon2::password_hash::PasswordHasher;
     // Salt bytes come straight from `getrandom` (already a direct dependency)

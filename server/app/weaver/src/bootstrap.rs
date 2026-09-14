@@ -106,6 +106,8 @@ pub(crate) async fn bootstrap_login_if_needed(
         BootstrapPasswordSource::Environment(password) => password,
         BootstrapPasswordSource::File(path) => read_bootstrap_password_file(&path)?,
     };
+    weaver_server_core::auth::check_password_length(&password)
+        .map_err(|error| BootstrapLoginError::new(format!("bootstrap login {error}")))?;
     let password_hash =
         tokio::task::spawn_blocking(move || weaver_server_core::auth::hash_password(&password))
             .await
@@ -452,5 +454,16 @@ mod tests {
             std::env::set_var(ENV_BOOTSTRAP_LOGIN_PASSWORD_FILE, "/does/not/exist");
         }
         assert!(bootstrap_login_if_needed(&db).await.is_err());
+
+        unsafe {
+            std::env::remove_var(ENV_BOOTSTRAP_LOGIN_PASSWORD_FILE);
+            std::env::set_var(ENV_BOOTSTRAP_LOGIN_PASSWORD, "short");
+        }
+        let error = bootstrap_login_if_needed(&db).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "bootstrap login password must be at least 8 characters"
+        );
+        assert!(db.get_auth_credentials().unwrap().is_none());
     }
 }
