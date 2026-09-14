@@ -16,8 +16,8 @@ services:
     restart: unless-stopped
 ```
 
-New installations require an administrator login. Weaver prints a one-time
-setup code once at startup; enter it in the browser wizard. The code is valid
+New installations require an administrator login. Weaver prints a six-character
+one-time setup code once at startup; enter it in the browser wizard. The code is valid
 until setup succeeds or Weaver restarts and is never exposed by unauthenticated
 HTTP. Native launchers show the same code. For unattended setup, use bootstrap
 credentials:

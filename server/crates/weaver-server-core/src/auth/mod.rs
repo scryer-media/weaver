@@ -9,7 +9,8 @@ pub use model::{ApiKeyCache, CachedLoginAuth, CallerScope, LoginAuthCache};
 pub use password::{MIN_PASSWORD_CHARS, check_password_length, hash_password, verify_password};
 pub use repository::{AuthCredentials, BrowserSession};
 pub use service::{
-    Claims, JWT_TTL_SECS, JwtError, JwtSecretError, create_jwt, decode_jwt_secret,
-    derive_browser_csrf_token, encode_jwt_secret, generate_api_key,
-    generate_browser_session_secret, generate_jwt_secret, hash_api_key, verify_jwt,
+    Claims, JWT_TTL_SECS, JwtError, JwtSecretError, SETUP_CODE_ALPHABET, SETUP_CODE_LENGTH,
+    create_jwt, decode_jwt_secret, derive_browser_csrf_token, encode_jwt_secret, generate_api_key,
+    generate_browser_session_secret, generate_jwt_secret, generate_setup_code, hash_api_key,
+    is_setup_code, verify_jwt,
 };

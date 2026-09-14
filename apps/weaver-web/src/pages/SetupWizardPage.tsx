@@ -426,10 +426,13 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
             <Label htmlFor="setup-code">One-time setup code</Label>
             <Input
               id="setup-code"
-              type="password"
               value={setupCode}
-              onChange={(event) => setSetupCode(event.target.value)}
+              onChange={(event) => setSetupCode(event.target.value.toUpperCase())}
               autoComplete="off"
+              autoCapitalize="characters"
+              spellCheck={false}
+              maxLength={6}
+              className="font-mono tracking-[0.3em]"
             />
             <p className="text-sm text-muted-foreground">
               Enter the code shown when Weaver started. It is accepted only while setup is pending.

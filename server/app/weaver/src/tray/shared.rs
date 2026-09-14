@@ -670,8 +670,7 @@ fn forward_server_stderr(stderr: impl Read, setup_code: Arc<Mutex<Option<String>
 
 fn parse_setup_code_line(line: &str) -> Option<String> {
     let code = line.strip_prefix(SETUP_CODE_PREFIX)?;
-    (code.len() == 64 && code.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| code.to_string())
+    weaver_server_core::auth::is_setup_code(code).then(|| code.to_string())
 }
 
 impl ServerSupervisor {
@@ -1090,10 +1089,10 @@ mod tests {
 
     #[test]
     fn setup_code_parser_accepts_only_the_exact_marker() {
-        let code = "a".repeat(64);
+        let code = "K7PM2X";
         assert_eq!(
             parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}{code}")),
-            Some(code)
+            Some(code.to_string())
         );
         assert_eq!(
             parse_setup_code_line("Weaver one-time setup code: short"),

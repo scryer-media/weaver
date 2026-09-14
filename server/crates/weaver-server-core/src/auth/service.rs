@@ -56,6 +56,41 @@ pub fn generate_browser_session_secret() -> String {
     hex::encode(bytes)
 }
 
+/// Characters a first-run setup code is drawn from: capitals and digits, less
+/// the ones that read alike (0/O, 1/I/L), so the code survives being copied
+/// by eye from a terminal.
+pub const SETUP_CODE_ALPHABET: &[u8; 31] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+/// Length of a first-run setup code. Six characters is about 30 bits, and the
+/// setup endpoint allows five wrong guesses a minute for the life of one
+/// process, which puts a guessed code centuries away.
+pub const SETUP_CODE_LENGTH: usize = 6;
+
+/// A short first-run setup code, uniform over `SETUP_CODE_ALPHABET`.
+pub fn generate_setup_code() -> String {
+    // Rejection sampling: 248 is the largest multiple of 31 in a byte, so
+    // every accepted byte maps to a character with equal probability.
+    let limit = (256 / SETUP_CODE_ALPHABET.len() * SETUP_CODE_ALPHABET.len()) as u8;
+    let mut code = String::with_capacity(SETUP_CODE_LENGTH);
+    let mut bytes = [0u8; 16];
+    while code.len() < SETUP_CODE_LENGTH {
+        getrandom::fill(&mut bytes).expect("getrandom failed");
+        for byte in bytes {
+            if byte < limit && code.len() < SETUP_CODE_LENGTH {
+                code.push(char::from(
+                    SETUP_CODE_ALPHABET[usize::from(byte) % SETUP_CODE_ALPHABET.len()],
+                ));
+            }
+        }
+    }
+    code
+}
+
+/// Whether `code` has the shape `generate_setup_code` produces.
+pub fn is_setup_code(code: &str) -> bool {
+    code.len() == SETUP_CODE_LENGTH && code.bytes().all(|byte| SETUP_CODE_ALPHABET.contains(&byte))
+}
+
 /// Stable per-session CSRF value. Only a verifier is persisted; this value is
 /// regenerated from the server secret after a browser reload or process restart.
 pub fn derive_browser_csrf_token(session_token: &str, server_secret: &[u8; 32]) -> String {

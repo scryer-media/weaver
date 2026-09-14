@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use weaver_server_core::auth::service::verify_browser_csrf_token;
-use weaver_server_core::auth::{generate_browser_session_secret, hash_api_key};
+use weaver_server_core::auth::{generate_setup_code, hash_api_key};
 
 const MAX_FAILURES: usize = 5;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
@@ -26,10 +26,10 @@ pub(super) enum SetupCodeError {
 }
 
 impl SetupChallenge {
-    /// Generates 256 bits of random material and returns it once. Only its
-    /// verifier remains in the cloneable challenge state.
+    /// Generates a short setup code and returns it once. Only its verifier
+    /// remains in the cloneable challenge state.
     pub(super) fn generate() -> (Self, String) {
-        let code = generate_browser_session_secret();
+        let code = generate_setup_code();
         let verifier = hex_hash(hash_api_key(&code));
         (
             Self(Arc::new(Mutex::new(State {
@@ -68,11 +68,15 @@ impl SetupChallenge {
         if state.failures.len() >= MAX_FAILURES {
             return Err(SetupCodeError::RateLimited);
         }
-        let Some(code) = code.filter(|code| !code.is_empty()) else {
+        // Codes are capitals; accept them however they were typed.
+        let Some(code) = code
+            .map(|code| code.trim().to_ascii_uppercase())
+            .filter(|code| !code.is_empty())
+        else {
             state.failures.push_back(now);
             return Err(SetupCodeError::Missing);
         };
-        if !verify_browser_csrf_token(code, &state.verifier) {
+        if !verify_browser_csrf_token(&code, &state.verifier) {
             state.failures.push_back(now);
             return Err(SetupCodeError::Invalid);
         }
@@ -112,6 +116,16 @@ mod tests {
         challenge.consume();
         assert!(!challenge.is_available());
         assert_eq!(challenge.verify(Some(&code)), Err(SetupCodeError::Consumed));
+    }
+
+    #[test]
+    fn codes_are_short_and_accepted_in_any_case() {
+        let (challenge, code) = SetupChallenge::generate();
+        assert!(weaver_server_core::auth::is_setup_code(&code), "{code}");
+        assert_eq!(
+            challenge.verify(Some(&format!(" {} ", code.to_ascii_lowercase()))),
+            Ok(())
+        );
     }
 
     #[test]

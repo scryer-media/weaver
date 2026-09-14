@@ -620,8 +620,8 @@ fn release_hygiene_allows_repo_local_paths() {
 
 #[test]
 fn setup_code_is_read_only_from_the_current_run() {
-    let stale = "a".repeat(64);
-    let current = "0123456789abcdef".repeat(4);
+    let stale = "AAAAAA";
+    let current = "K7PM2X";
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("backend.log");
     let bootstrap = format!("{SETUP_CODE_PREFIX}{stale}\n");
@@ -633,7 +633,7 @@ fn setup_code_is_read_only_from_the_current_run() {
 
     assert_eq!(
         read_setup_code(&log, bootstrap.len() as u64).unwrap(),
-        Some(current)
+        Some(current.to_string())
     );
     assert_eq!(
         read_setup_code(&log, fs::metadata(&log).unwrap().len()).unwrap(),
@@ -643,17 +643,16 @@ fn setup_code_is_read_only_from_the_current_run() {
 
 #[test]
 fn setup_code_line_must_carry_a_whole_code() {
-    let code = "f".repeat(64);
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}{code}\r")),
-        Some(code.as_str())
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM2X\r")),
+        Some("K7PM2X")
     );
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}abc")),
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P")),
         None
     );
     assert_eq!(
-        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}{}", "g".repeat(64))),
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7-M2X")),
         None
     );
     assert_eq!(parse_setup_code_line("INFO listening"), None);

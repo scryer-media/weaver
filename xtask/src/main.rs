@@ -2499,7 +2499,7 @@ const SETUP_CODE_PREFIX: &str = "Weaver one-time setup code: ";
 fn parse_setup_code_line(line: &str) -> Option<&str> {
     let (_, code) = line.split_once(SETUP_CODE_PREFIX)?;
     let code = code.trim_end();
-    (code.len() == 64 && code.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(code)
+    (code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_alphanumeric())).then_some(code)
 }
 
 /// The setup code a backend wrote to its log after `offset`. Skipping what
