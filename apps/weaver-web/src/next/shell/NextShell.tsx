@@ -327,39 +327,42 @@ function ThroughputBlock() {
   const limit = splitSpeed(inForce);
   const title = bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle");
   return (
-    <RailBlock>
-      <div className="flex items-center justify-between gap-2">
-        <Eyebrow tone="rail">{t("next.shell.throughput")}</Eyebrow>
+    <RailBlock eyebrow={t("next.shell.throughput")}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 flex-col gap-[7px]">
+          <RailMetric
+            value={now.value}
+            unit={now.unit}
+            note={
+              peakSpeed > 0
+                ? t("next.shell.peak", { value: peak.value, unit: peak.unit })
+                : t("next.shell.noTraffic")
+            }
+          />
+          {inForce > 0 ? (
+            <div className="-mt-[4px] font-wv-mono text-[11px] text-wv-warn">
+              {t(bySchedule ? "next.shell.scheduledLimit" : "next.shell.limit", {
+                value: limit.value,
+                unit: limit.unit,
+              })}
+            </div>
+          ) : null}
+        </div>
         <button
           type="button"
           onClick={openDialog}
           title={title}
           aria-label={title}
           className={cn(
-            "-my-[6px] -mr-[6px] flex size-7 flex-none cursor-pointer items-center justify-center",
-            inForce > 0 ? "text-wv-warn" : "text-wv-muted hover:text-wv-fg",
+            "flex size-9 flex-none cursor-pointer items-center justify-center border bg-wv-button hover:bg-wv-button-hover",
+            inForce > 0
+              ? "border-wv-warn/60 text-wv-warn hover:border-wv-warn"
+              : "border-wv-control text-wv-fg hover:border-wv-control-hover",
           )}
         >
-          <Icon name="bandwidth" size={15} />
+          <Icon name="bandwidth" size={16} />
         </button>
       </div>
-      <RailMetric
-        value={now.value}
-        unit={now.unit}
-        note={
-          peakSpeed > 0
-            ? t("next.shell.peak", { value: peak.value, unit: peak.unit })
-            : t("next.shell.noTraffic")
-        }
-      />
-      {inForce > 0 ? (
-        <div className="-mt-[4px] font-wv-mono text-[11px] text-wv-warn">
-          {t(bySchedule ? "next.shell.scheduledLimit" : "next.shell.limit", {
-            value: limit.value,
-            unit: limit.unit,
-          })}
-        </div>
-      ) : null}
       {dialog}
     </RailBlock>
   );
