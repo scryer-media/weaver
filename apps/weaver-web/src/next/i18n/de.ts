@@ -293,7 +293,6 @@ export const nextDe: LocaleDictionary = {
   "next.completed.release": "Release",
   "next.completed.outcome": "Ergebnis",
   "next.completed.done": "Fertig",
-  "next.completed.statusNote": "{{shown}} von {{total}} Einträgen passen · der Verlauf bleibt, bis ein Eintrag gelöscht wird",
   "next.completed.freeOn": "{{size}} frei auf {{volume}}",
   "next.completed.freeAcross": "{{size}} frei auf {{count}} Volumes",
   "next.completed.loadingBody": "Die Verlaufsseite wird geladen.",

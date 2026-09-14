@@ -293,7 +293,6 @@ export const nextPt: LocaleDictionary = {
   "next.completed.release": "Lançamento",
   "next.completed.outcome": "Resultado",
   "next.completed.done": "Concluído",
-  "next.completed.statusNote": "{{shown}} de {{total}} itens correspondem · o histórico é mantido até que um item seja excluído",
   "next.completed.freeOn": "{{size}} livres em {{volume}}",
   "next.completed.freeAcross": "{{size}} livres em {{count}} volumes",
   "next.completed.loadingBody": "Buscando a página do histórico.",

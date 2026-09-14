@@ -293,7 +293,6 @@ export const nextKo: LocaleDictionary = {
   "next.completed.release": "릴리스",
   "next.completed.outcome": "결과",
   "next.completed.done": "완료",
-  "next.completed.statusNote": "항목 {{total}}개 중 {{shown}}개 일치 · 기록은 항목을 삭제할 때까지 보관됩니다",
   "next.completed.freeOn": "{{volume}}에 {{size}} 남음",
   "next.completed.freeAcross": "볼륨 {{count}}개에 {{size}} 남음",
   "next.completed.loadingBody": "기록 페이지를 불러오는 중입니다.",

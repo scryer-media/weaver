@@ -293,7 +293,6 @@ export const nextEs: LocaleDictionary = {
   "next.completed.release": "Release",
   "next.completed.outcome": "Resultado",
   "next.completed.done": "Hecho",
-  "next.completed.statusNote": "{{shown}} de {{total}} entradas coinciden · el historial se conserva hasta que se elimina una entrada",
   "next.completed.freeOn": "{{size}} libres en {{volume}}",
   "next.completed.freeAcross": "{{size}} libres en {{count}} volúmenes",
   "next.completed.loadingBody": "Cargando la página del historial.",

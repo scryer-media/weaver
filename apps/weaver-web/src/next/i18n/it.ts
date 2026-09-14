@@ -293,7 +293,6 @@ export const nextIt: LocaleDictionary = {
   "next.completed.release": "Release",
   "next.completed.outcome": "Esito",
   "next.completed.done": "Finito",
-  "next.completed.statusNote": "{{shown}} di {{total}} voci corrispondono · la cronologia resta finché una voce non viene eliminata",
   "next.completed.freeOn": "{{size}} liberi su {{volume}}",
   "next.completed.freeAcross": "{{size}} liberi su {{count}} volumi",
   "next.completed.loadingBody": "Caricamento della pagina della cronologia.",

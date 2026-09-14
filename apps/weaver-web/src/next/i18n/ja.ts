@@ -293,7 +293,6 @@ export const nextJa: LocaleDictionary = {
   "next.completed.release": "リリース",
   "next.completed.outcome": "結果",
   "next.completed.done": "完了時刻",
-  "next.completed.statusNote": "{{total}} 件中 {{shown}} 件が一致 · 履歴は項目を削除するまで保持されます",
   "next.completed.freeOn": "{{volume}} の空き {{size}}",
   "next.completed.freeAcross": "{{count}} ボリュームの空き {{size}}",
   "next.completed.loadingBody": "履歴ページを取得しています。",

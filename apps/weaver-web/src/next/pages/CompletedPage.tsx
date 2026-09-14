@@ -620,10 +620,7 @@ export function CompletedPage() {
         />
       }
       statusNote={
-        deletes.active
-          ? describeDeleteProgress(t, deletes.progress)
-          : report
-          ?? t("next.completed.statusNote", { shown: formatCount(totalCount), total: formatCount(counts.all) })
+        deletes.active ? describeDeleteProgress(t, deletes.progress) : (report ?? undefined)
       }
       statusRight={
         mounts.length === 0

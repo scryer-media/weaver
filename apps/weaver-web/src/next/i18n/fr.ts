@@ -293,7 +293,6 @@ export const nextFr: LocaleDictionary = {
   "next.completed.release": "Release",
   "next.completed.outcome": "Résultat",
   "next.completed.done": "Fini",
-  "next.completed.statusNote": "{{shown}} entrées sur {{total}} correspondent · l’historique est conservé jusqu’à la suppression d’une entrée",
   "next.completed.freeOn": "{{size}} libres sur {{volume}}",
   "next.completed.freeAcross": "{{size}} libres sur {{count}} volumes",
   "next.completed.loadingBody": "Chargement de la page d’historique.",

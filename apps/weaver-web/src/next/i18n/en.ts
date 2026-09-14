@@ -299,7 +299,6 @@ export const nextEn: LocaleDictionary = {
   "next.completed.release": "Release",
   "next.completed.outcome": "Outcome",
   "next.completed.done": "Done",
-  "next.completed.statusNote": "{{shown}} of {{total}} entries match · history is kept until an entry is deleted",
   "next.completed.freeOn": "{{size}} free on {{volume}}",
   "next.completed.freeAcross": "{{size}} free across {{count}} volumes",
   "next.completed.loadingBody": "Fetching the history page.",

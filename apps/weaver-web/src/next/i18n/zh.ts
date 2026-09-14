@@ -293,7 +293,6 @@ export const nextZh: LocaleDictionary = {
   "next.completed.release": "发布",
   "next.completed.outcome": "结果",
   "next.completed.done": "完成时间",
-  "next.completed.statusNote": "{{total}} 项中 {{shown}} 项匹配 · 历史记录会保留到被删除为止",
   "next.completed.freeOn": "{{volume}} 可用 {{size}}",
   "next.completed.freeAcross": "{{count}} 个卷共可用 {{size}}",
   "next.completed.loadingBody": "正在获取历史记录页面。",
