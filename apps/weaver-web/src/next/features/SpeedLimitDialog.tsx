@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation } from "urql";
 import { UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
-import { NumberField, PrimaryButton, SecondaryButton, Toggle } from "@/next/components/controls";
+import { NumberField, PrimaryButton, SecondaryButton } from "@/next/components/controls";
 import { Dialog } from "@/next/components/Dialog";
 import { FormRow } from "@/next/components/rows";
 import { formatRate } from "@/next/data/format";
@@ -24,21 +24,19 @@ export function useSpeedLimitDialog() {
   const { speedLimit: ceiling, downloadBlock } = useNextData();
   const [saveState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
   const [open, setOpen] = useState(false);
-  const [limited, setLimited] = useState(false);
-  const [megabytes, setMegabytes] = useState(10);
+  const [megabytes, setMegabytes] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const scheduled = downloadBlock.scheduledSpeedLimit;
 
   const openDialog = () => {
-    setLimited(ceiling > 0);
-    setMegabytes(ceiling > 0 ? Math.round((ceiling / MIB) * 10) / 10 : 10);
+    setMegabytes(Math.round((ceiling / MIB) * 10) / 10);
     setError(null);
     setOpen(true);
   };
 
   const save = () => {
-    const bytes = limited ? Math.round(Math.max(0, megabytes) * MIB) : 0;
+    const bytes = Math.round(Math.max(0, megabytes) * MIB);
     setError(null);
     void updateSettings({ input: { maxDownloadSpeed: bytes } }).then((result) => {
       if (result.error || !result.data?.updateSettings) {
@@ -59,27 +57,19 @@ export function useSpeedLimitDialog() {
       footer={
         <>
           <SecondaryButton onClick={() => setOpen(false)}>{t("action.cancel")}</SecondaryButton>
-          <PrimaryButton
-            disabled={saveState.fetching || (limited && megabytes <= 0)}
-            onClick={save}
-          >
+          <PrimaryButton disabled={saveState.fetching} onClick={save}>
             {saveState.fetching ? t("settings.saving") : t("action.apply")}
           </PrimaryButton>
         </>
       }
     >
-      <FormRow label={t("next.speedLimit.limit")} help={t("next.speedLimit.limitHelp")}>
-        <Toggle checked={limited} onChange={setLimited} label={t("next.speedLimit.limit")} />
-      </FormRow>
       <FormRow label={t("next.speedLimit.ceiling")} help={t("next.speedLimit.ceilingHelp")}>
         <NumberField
           label={t("next.speedLimit.ceilingAria")}
           value={megabytes}
           onChange={setMegabytes}
-          min={0.1}
-          step={0.1}
+          min={0}
           suffix="MB/s"
-          disabled={!limited}
         />
       </FormRow>
       {scheduled > 0 ? (

@@ -327,9 +327,10 @@ function ThroughputBlock() {
   const limit = splitSpeed(inForce);
   const title = bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle");
   return (
-    <RailBlock eyebrow={t("next.shell.throughput")}>
+    <RailBlock>
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 flex-col gap-[7px]">
+          <Eyebrow tone="rail">{t("next.shell.throughput")}</Eyebrow>
           <RailMetric
             value={now.value}
             unit={now.unit}
