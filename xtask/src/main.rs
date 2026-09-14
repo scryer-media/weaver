@@ -2358,8 +2358,13 @@ fn wait_for_backend(pid: u32, port: u16, log_path: &Path) -> Result<()> {
                 log_path.display()
             );
         }
+        // Only the exit status matters: the page body and the refused
+        // connections of a backend still starting are noise, and a real
+        // failure is reported with the log tail below.
         let status = Command::new("curl")
-            .args(["-fsS", &format!("http://127.0.0.1:{port}/")])
+            .args(["-fs", &format!("http://127.0.0.1:{port}/")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()?;
         if status.success() {
             return Ok(());
