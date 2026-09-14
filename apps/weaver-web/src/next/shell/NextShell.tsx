@@ -324,10 +324,10 @@ function SignOutControl() {
             });
           }}
           className={cn(
-            "flex h-8 items-center justify-center gap-[7px] border border-wv-control bg-wv-button px-[9px] text-[12.5px] font-medium whitespace-nowrap sm:px-3",
+            "flex h-8 items-center justify-center gap-[7px] border !border-wv-error bg-wv-danger-bg px-[9px] text-[12.5px] font-medium whitespace-nowrap sm:px-3",
             busy
               ? "cursor-default text-wv-disabled"
-              : "cursor-pointer text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover",
+              : "cursor-pointer text-wv-error-text hover:!border-wv-error-text hover:bg-wv-danger-bg-hover",
           )}
         >
           <Icon name="signOut" size={13} className="flex-none" />
