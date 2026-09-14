@@ -195,11 +195,11 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
       <div className="w-full max-w-2xl space-y-6 rounded-lg border border-border bg-card p-8">
         <div className="space-y-1">
           <h1 className="text-2xl font-semibold">Set up Weaver</h1>
-          <p className="text-sm text-muted-foreground">
-            {form.authenticatedAccess
-              ? "Create the administrator account for this protected Weaver."
-              : "Two decisions, changeable later in Settings → Security."}
-          </p>
+          {form.authenticatedAccess ? null : (
+            <p className="text-sm text-muted-foreground">
+              Two decisions, changeable later in Settings → Security.
+            </p>
+          )}
         </div>
 
         {!form.authenticatedAccess ? (

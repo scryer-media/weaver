@@ -47,11 +47,7 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
     <SetupFrame>
       <SetupHeading
         title="Set up Weaver"
-        body={
-          form.authenticatedAccess
-            ? "Create the administrator account for this protected Weaver."
-            : "Two decisions, changeable later in Settings → Security."
-        }
+        body={form.authenticatedAccess ? undefined : "Two decisions, changeable later in Settings → Security."}
       />
 
       {!form.authenticatedAccess ? (
@@ -185,11 +181,11 @@ function SetupFrame({ children }: { children: ReactNode }) {
   );
 }
 
-function SetupHeading({ title, body }: { title: string; body: string }) {
+function SetupHeading({ title, body }: { title: string; body?: string }) {
   return (
     <div className="flex flex-col gap-1.5">
       <h1 className="font-wv-title text-[19px] font-semibold text-wv-strong">{title}</h1>
-      <p className="text-[13px] leading-[1.55] text-wv-muted">{body}</p>
+      {body ? <p className="text-[13px] leading-[1.55] text-wv-muted">{body}</p> : null}
     </div>
   );
 }

@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,11 +9,28 @@ use weaver_server_core::auth::{generate_setup_code, hash_api_key, normalize_setu
 const MAX_FAILURES: usize = 5;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
+/// Asks for a setup code even on loopback, to try the flow a container gets.
+const ENV_REQUIRE_SETUP_CODE: &str = "WEAVER_REQUIRE_SETUP_CODE";
+
+/// Whether first-time setup has to be proven with the code from the console.
+///
+/// A Weaver listening on loopback alone can only be opened from this machine,
+/// so reaching the wizard is proof enough. Anything wider needs the code: a
+/// container's `0.0.0.0`, a LAN address, or a reverse proxy relaying browsers
+/// from elsewhere to a loopback listener.
+pub(super) fn setup_code_required(bind_address: IpAddr, behind_trusted_proxy: bool) -> bool {
+    let forced = std::env::var(ENV_REQUIRE_SETUP_CODE)
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    forced || behind_trusted_proxy || !weaver_server_core::security::ip_is_loopback(bind_address)
+}
+
 #[derive(Clone)]
 pub(super) struct SetupChallenge(Arc<Mutex<State>>);
 
 struct State {
-    verifier: String,
+    /// `None` for a Weaver only this machine can reach, whose setup needs no
+    /// code: being able to open it at all already proves the operator is here.
+    verifier: Option<String>,
     failures: VecDeque<Instant>,
     consumed: bool,
 }
@@ -33,12 +51,29 @@ impl SetupChallenge {
         let verifier = hex_hash(hash_api_key(&normalize_setup_code(&code)));
         (
             Self(Arc::new(Mutex::new(State {
-                verifier,
+                verifier: Some(verifier),
                 failures: VecDeque::new(),
                 consumed: false,
             }))),
             code,
         )
+    }
+
+    /// Setup without a code, for a Weaver that listens on loopback only.
+    pub(super) fn open() -> Self {
+        Self(Arc::new(Mutex::new(State {
+            verifier: None,
+            failures: VecDeque::new(),
+            consumed: false,
+        })))
+    }
+
+    pub(super) fn code_required(&self) -> bool {
+        self.0
+            .lock()
+            .expect("setup challenge lock poisoned")
+            .verifier
+            .is_some()
     }
 
     pub(super) fn verify(&self, code: Option<&str>) -> Result<(), SetupCodeError> {
@@ -58,6 +93,9 @@ impl SetupChallenge {
         if state.consumed {
             return Err(SetupCodeError::Consumed);
         }
+        let Some(verifier) = state.verifier.clone() else {
+            return Ok(());
+        };
         while state
             .failures
             .front()
@@ -77,7 +115,7 @@ impl SetupChallenge {
             state.failures.push_back(now);
             return Err(SetupCodeError::Missing);
         };
-        if !verify_browser_csrf_token(&code, &state.verifier) {
+        if !verify_browser_csrf_token(&code, &verifier) {
             state.failures.push_back(now);
             return Err(SetupCodeError::Invalid);
         }
@@ -117,6 +155,26 @@ mod tests {
         challenge.consume();
         assert!(!challenge.is_available());
         assert_eq!(challenge.verify(Some(&code)), Err(SetupCodeError::Consumed));
+    }
+
+    #[test]
+    fn only_a_loopback_listener_without_a_proxy_skips_the_code() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(!setup_code_required(loopback, false));
+        assert!(!setup_code_required("::1".parse().unwrap(), false));
+        assert!(setup_code_required(loopback, true));
+        assert!(setup_code_required("0.0.0.0".parse().unwrap(), false));
+        assert!(setup_code_required("192.168.1.20".parse().unwrap(), false));
+    }
+
+    #[test]
+    fn an_open_challenge_takes_no_code_and_is_still_single_use() {
+        let challenge = SetupChallenge::open();
+        assert!(!challenge.code_required());
+        assert_eq!(challenge.verify(None), Ok(()));
+        assert_eq!(challenge.verify(Some("anything")), Ok(()));
+        challenge.consume();
+        assert_eq!(challenge.verify(None), Err(SetupCodeError::Consumed));
     }
 
     #[test]

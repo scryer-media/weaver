@@ -16,13 +16,17 @@ services:
     restart: unless-stopped
 ```
 
-New installations require an administrator login. Weaver prints a one-time setup
-code such as `K7P-M2X` once at startup, in a banner headed "FIRST-TIME SETUP:
-ACTION REQUIRED" (with JSON logging, a `WARN` record with a `setup_code` field).
-Enter it in the browser wizard; the hyphen is optional. The code is valid
-until setup succeeds or Weaver restarts and is never exposed by unauthenticated
-HTTP. Native launchers show the same code. For unattended setup, use bootstrap
-credentials:
+New installations require an administrator login. When Weaver listens on more
+than loopback (the container's `0.0.0.0`, a LAN address) or behind
+`WEAVER_TRUSTED_PROXIES`, the wizard also asks for a one-time setup code, which
+Weaver prints once at startup such as `K7P-M2X`, in a banner headed
+"FIRST-TIME SETUP: ACTION REQUIRED" (with JSON logging, a `WARN` record with a
+`setup_code` field). Enter it in the browser wizard; the hyphen is optional.
+The code is valid until setup succeeds or Weaver restarts and is never exposed
+by unauthenticated HTTP. A Weaver on the default `127.0.0.1` can only be opened
+from its own machine, so its wizard needs no code; set
+`WEAVER_REQUIRE_SETUP_CODE=1` to ask for one anyway. For unattended setup, use
+bootstrap credentials:
 
 ```yaml
       - WEAVER_ACCESS_MODE=authenticated
@@ -38,7 +42,8 @@ accepts only `authenticated`; blank means unset and other nonempty values are
 errors. It is optional for new installations and explicitly migrates an existing
 installation to authenticated browser access.
 For a legacy installation with no stored login, setting only
-`WEAVER_ACCESS_MODE=authenticated` opens setup with a one-time startup code;
+`WEAVER_ACCESS_MODE=authenticated` opens setup (with a one-time startup code
+when Weaver listens beyond loopback);
 bootstrap credentials and reset recovery are not required. Pending setup survives
 restarts and removing the migration override. An installation that has already
 completed authenticated setup never reopens setup merely because its credentials

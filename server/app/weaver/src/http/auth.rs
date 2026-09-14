@@ -719,6 +719,18 @@ pub(super) async fn setup_handler(
                 ),
             };
         }
+        // Without a code, a loopback listener is the only proof. A proxy on
+        // this machine could still be relaying someone else's browser, and
+        // its headers are the tell.
+        if !challenge.code_required()
+            && security.forwarding_headers_ignored(Some(peer_addr), &headers)
+        {
+            return failure(
+                StatusCode::FORBIDDEN,
+                "SETUP_LOCAL_ONLY",
+                "Finish setup in a browser on the machine Weaver runs on.",
+            );
+        }
         let origin = match canonical_browser_origin(&headers) {
             Ok(origin) => origin,
             Err(status) => {
@@ -1894,7 +1906,9 @@ pub(super) async fn auth_status_handler(
     // already-configured install.
     let setup_required = creds.is_none()
         && if security.authenticated_access_mode() {
-            challenge.is_some_and(|Extension(challenge)| challenge.is_available())
+            challenge
+                .as_ref()
+                .is_some_and(|Extension(challenge)| challenge.is_available())
         } else {
             legacy_setup_available(&security)
                 && !trusted_peer
@@ -1916,7 +1930,10 @@ pub(super) async fn auth_status_handler(
         let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
         status["setup"] = serde_json::json!({
             "bindEditable": security.bind_address_source.is_editable(),
-            "codeRequired": security.authenticated_access_mode(),
+            "codeRequired": security.authenticated_access_mode()
+                && challenge
+                    .as_ref()
+                    .is_some_and(|Extension(challenge)| challenge.code_required()),
             "deployment": environment.deployment.as_str(),
         });
     }

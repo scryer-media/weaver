@@ -179,6 +179,12 @@ struct ServeArgs {
         help = "Build and run the backend with the full production release profile"
     )]
     production_build: bool,
+    #[arg(
+        long = "OTP",
+        help = "Ask for the one-time setup code on first-time setup, as a container does; \
+                a loopback dev backend otherwise sets up without one"
+    )]
+    otp: bool,
     target: Option<String>,
 }
 
@@ -2966,6 +2972,9 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     backend.env("WEAVER_ENCRYPTION_KEY", &encryption_key);
+    if args.otp {
+        backend.env("WEAVER_REQUIRE_SETUP_CODE", "1");
+    }
     let mut backend = backend.spawn()?;
     let backend_pid = backend.id();
     let backend_signal_forwarder = install_backend_signal_forwarder(backend_pid)?;

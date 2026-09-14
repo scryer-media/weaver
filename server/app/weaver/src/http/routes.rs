@@ -95,12 +95,20 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             .as_deref()
             == Some("pending")
     {
-        let (challenge, code) = super::setup_code::SetupChallenge::generate();
-        crate::logging::announce_setup_code(&code);
-        tracing::warn!(
-            "first-time setup is waiting for the one-time setup code printed on the console (stderr)"
-        );
-        Some(challenge)
+        if super::setup_code::setup_code_required(
+            security.http_bind_address,
+            !security.trusted_proxies.is_empty(),
+        ) {
+            let (challenge, code) = super::setup_code::SetupChallenge::generate();
+            crate::logging::announce_setup_code(&code);
+            tracing::warn!(
+                "first-time setup is waiting for the one-time setup code printed on the console (stderr)"
+            );
+            Some(challenge)
+        } else {
+            tracing::info!("first-time setup is open to a browser on this machine");
+            Some(super::setup_code::SetupChallenge::open())
+        }
     } else {
         None
     };
