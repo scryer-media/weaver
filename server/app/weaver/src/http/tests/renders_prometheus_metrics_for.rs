@@ -336,6 +336,7 @@ fn renders_prometheus_download_observed_limiter_states() {
         recovery_queue_depth: 0,
         articles_per_sec: 0.0,
         decode_rate_mbps: 0.0,
+        par3: Par3MetricsSnapshot::default(),
     };
     let unblocked = DownloadBlockState {
         kind: DownloadBlockKind::None,

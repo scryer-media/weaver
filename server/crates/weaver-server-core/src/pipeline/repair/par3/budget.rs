@@ -32,6 +32,11 @@ pub(super) struct Budget {
 }
 
 impl Budget {
+    /// Bytes currently held by live reservations against this budget.
+    fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
     fn new(limit: usize, label: &'static str) -> Arc<Self> {
         Arc::new(Self {
             limit,
@@ -66,6 +71,12 @@ impl Budget {
 pub(super) struct Reservation {
     budget: Arc<Budget>,
     bytes: usize,
+}
+
+impl Reservation {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 impl Drop for Reservation {
@@ -110,6 +121,12 @@ impl Budgets {
             payload: Budget::new(limits.payload, "PAR3 retained payload"),
             allocations: Arc::default(),
         }
+    }
+
+    /// Host-side bytes currently reserved across both weaver-owned budgets.
+    /// The engine's own reservations are reported separately by its budget.
+    pub fn host_used(&self) -> u64 {
+        (self.metadata.used() as u64).saturating_add(self.payload.used() as u64)
     }
 
     pub fn retain(&self, bytes: &Arc<[u8]>) -> EngineResult<Arc<PayloadLease>> {

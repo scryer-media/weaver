@@ -22,8 +22,8 @@ use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::operations::metrics::PipelineMetrics;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::{
-    JobInfo, JobSpec, JobStatus, MetricsSnapshot, SchedulerCommand, SchedulerError,
-    SharedPipelineState,
+    JobInfo, JobSpec, JobStatus, MetricsSnapshot, Par3MetricsSnapshot, SchedulerCommand,
+    SchedulerError, SharedPipelineState,
 };
 
 use weaver_server_core::operations::instrumentation as instr;
@@ -1061,6 +1061,7 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         recovery_queue_depth: 21,
         articles_per_sec: 22.5,
         decode_rate_mbps: 23.5,
+        par3: Par3MetricsSnapshot::default(),
     }
 }
 
