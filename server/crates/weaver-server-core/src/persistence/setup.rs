@@ -46,6 +46,47 @@ pub fn open_database(config_path: &Path) -> Result<Database, Box<dyn std::error:
     Ok(Database::open_target(target)?)
 }
 
+/// Read one stored setting without opening the database for use: no
+/// migrations, no pool, nothing created. For code that needs a value before
+/// [`open_database`] has finished, while a schema upgrade may be holding the
+/// database. Any failure — no database yet, a schema without the table, a
+/// locked file — reads as unset.
+pub async fn peek_setting(config_path: &Path, key: &str) -> Option<String> {
+    use sqlx::Connection;
+
+    const SQLITE_QUERY: &str = "SELECT value FROM settings WHERE key = ?1";
+    const POSTGRES_QUERY: &str = "SELECT value FROM settings WHERE key = $1";
+    match DatabaseTarget::resolve(config_path).ok()? {
+        DatabaseTarget::PostgresUrl(url) => {
+            let mut connection = sqlx::PgConnection::connect(&url).await.ok()?;
+            let value = sqlx::query_scalar::<_, String>(POSTGRES_QUERY)
+                .bind(key)
+                .fetch_optional(&mut connection)
+                .await
+                .ok()
+                .flatten();
+            let _ = connection.close().await;
+            value
+        }
+        target => {
+            let path = target.sqlite_path().ok()??;
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(path)
+                .read_only(true)
+                .busy_timeout(std::time::Duration::from_millis(500));
+            let mut connection = sqlx::SqliteConnection::connect_with(&options).await.ok()?;
+            let value = sqlx::query_scalar::<_, String>(SQLITE_QUERY)
+                .bind(key)
+                .fetch_optional(&mut connection)
+                .await
+                .ok()
+                .flatten();
+            let _ = connection.close().await;
+            value
+        }
+    }
+}
+
 pub fn finish_open_db_and_config(
     config_path: &Path,
     mut db: Database,
@@ -169,6 +210,24 @@ active = true
             data_dir.display().to_string().replace('\\', "\\\\")
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peek_setting_reads_a_stored_value_without_creating_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(peek_setting(dir.path(), "http_bind_address").await, None);
+        assert!(!dir.path().join("weaver.db").exists());
+
+        let db = open_database(dir.path()).unwrap();
+        db.set_setting("http_bind_address", "0.0.0.0").unwrap();
+        assert_eq!(
+            peek_setting(dir.path(), "http_bind_address")
+                .await
+                .as_deref(),
+            Some("0.0.0.0")
+        );
+        assert_eq!(peek_setting(dir.path(), "absent").await, None);
+        drop(db);
     }
 
     #[test]

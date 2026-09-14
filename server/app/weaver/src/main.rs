@@ -195,6 +195,17 @@ async fn async_main() {
 
     let restore_locator_dir =
         weaver_server_core::persistence::setup::default_data_dir_for_config_path(&config_path);
+    // A schema upgrade can take long enough that a browser would give up on a
+    // Weaver that is not answering, so the address answers with a holding page
+    // for as long as one runs.
+    let upgrade_splash = match &command {
+        Command::Serve { port, base_url } => Some(http::UpgradeSplash::watch(
+            config_path.clone(),
+            *port,
+            base_url,
+        )),
+        _ => None,
+    };
     let db = match bootstrap::open_database(&config_path) {
         Ok(db) => db,
         Err(error) => {
@@ -210,6 +221,11 @@ async fn async_main() {
                 std::process::exit(1);
             }
         };
+    // Restoring can upgrade the restored database too, so the page stays up
+    // through it. It must be down before the real server binds the port.
+    if let Some(splash) = upgrade_splash {
+        splash.stop().await;
+    }
     let (mut db, mut config) = if let Some(outcome) = restore_outcome {
         tracing::info!(
             restore_id = %outcome.restore_id,

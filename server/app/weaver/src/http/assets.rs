@@ -17,6 +17,28 @@ struct FrontendAssets;
 #[derive(Clone)]
 pub(super) struct BaseUrl(pub(super) Arc<String>);
 
+/// A built asset found by its source name, for a page that is not the web
+/// app and so cannot learn the content hash the build put in the file name.
+///
+/// Vite names a file `<stem>-<hash>.<extension>` with an eight-character
+/// hash; matching on the hash's length keeps `weaver-loading` from finding
+/// `weaver-loading-still`.
+pub(super) fn built_asset(stem: &str, extension: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+    FrontendAssets::iter()
+        .find(|path| is_built_asset(path, stem, extension))
+        .and_then(|path| FrontendAssets::get(&path))
+        .map(|file| file.data)
+}
+
+fn is_built_asset(path: &str, stem: &str, extension: &str) -> bool {
+    path.strip_prefix("assets/")
+        .and_then(|name| name.strip_prefix(stem))
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|rest| rest.strip_suffix(extension))
+        .and_then(|rest| rest.strip_suffix('.'))
+        .is_some_and(|hash| hash.len() == 8)
+}
+
 /// Rewrite `index.html` to inject the optional base URL.
 ///
 /// When `base_url` is non-empty (e.g. "/weaver"):
@@ -865,5 +887,19 @@ mod tests {
         assert!(body.contains("Browser Access Restricted"), "{body}");
         assert!(body.contains("every browser you try"), "{body}");
         assert!(body.contains("userland-proxy"), "{body}");
+    }
+
+    #[test]
+    fn built_assets_are_found_past_their_content_hash() {
+        let animated = "assets/weaver-loading-tWAxluo1.webp";
+        let still = "assets/weaver-loading-still-SFHdK-fZ.webp";
+        assert!(is_built_asset(animated, "weaver-loading", "webp"));
+        assert!(!is_built_asset(still, "weaver-loading", "webp"));
+        assert!(is_built_asset(still, "weaver-loading-still", "webp"));
+        assert!(!is_built_asset(
+            "assets/weaver-loading-tWAxluo1.webp.gz",
+            "weaver-loading",
+            "webp"
+        ));
     }
 }
