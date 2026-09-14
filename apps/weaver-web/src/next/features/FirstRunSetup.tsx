@@ -21,6 +21,7 @@ import { cn } from "@/lib/utils";
 import { Eyebrow, Square } from "../components/chrome";
 import { NumberField, PrimaryButton, SecondaryButton, TextField, Toggle } from "../components/controls";
 import { Icon } from "../components/icons";
+import { WorkingOverlay } from "../components/WorkingOverlay";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { formatLatency } from "../data/format";
 import { WV } from "../data/palette";
@@ -177,7 +178,7 @@ function FirstRunWizard({ onDone }: { onDone: () => void }) {
       <div className="mx-auto flex w-full max-w-[600px] flex-col gap-8 px-4 py-10 sm:px-6 sm:py-16">
         <BrandLockup className="h-[26px] w-auto self-center text-wv-strong" />
 
-        <main className="flex flex-col border border-wv-control bg-wv-chrome shadow-wv-menu">
+        <main className="relative flex flex-col border border-wv-control bg-wv-chrome shadow-wv-menu">
           <div className="flex flex-col gap-4 border-b border-wv-hairline px-5 pt-5 pb-4 sm:px-7">
             <div className="flex items-center gap-3">
               <Eyebrow className="min-w-0 truncate">{t("next.firstRun.title")}</Eyebrow>
@@ -382,178 +383,181 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
   const certificate = testResult?.adoptableTlsNameMismatchCertificate ?? null;
 
   return (
-    <StepBody
-      title={t("next.firstRun.provider.title")}
-      body={t("next.firstRun.provider.body")}
-      footer={
-        editing ? (
-          <>
-            <SecondaryButton icon="test" onClick={() => void runTest()} disabled={testing || saving}>
-              {testing ? t("next.providers.testing") : t("next.providers.test")}
-            </SecondaryButton>
-            {servers.length > 0 ? (
-              <SecondaryButton
-                onClick={() => {
-                  setAddingAnother(false);
-                  setForm(NEW_PROVIDER);
-                  setTestResult(null);
-                  setError(null);
-                }}
-              >
-                {t("action.cancel")}
+    <>
+      {testing ? <WorkingOverlay label={t("next.providers.testing")} /> : null}
+      <StepBody
+        title={t("next.firstRun.provider.title")}
+        body={t("next.firstRun.provider.body")}
+        footer={
+          editing ? (
+            <>
+              <SecondaryButton icon="test" onClick={() => void runTest()} disabled={testing || saving}>
+                {testing ? t("next.providers.testing") : t("next.providers.test")}
               </SecondaryButton>
-            ) : (
-              <SecondaryButton onClick={onContinue}>{t("next.firstRun.provider.skip")}</SecondaryButton>
-            )}
-            <PrimaryButton
-              icon="add"
-              onClick={() => void save()}
-              disabled={saving || !normalizeHost(form.host)}
-              className="ml-auto"
-            >
-              {saving ? t("next.firstRun.saving") : t("next.firstRun.provider.save")}
-            </PrimaryButton>
-          </>
-        ) : (
-          <>
-            <SecondaryButton icon="add" onClick={() => setAddingAnother(true)} disabled={!loaded}>
-              {t("next.firstRun.provider.addAnother")}
-            </SecondaryButton>
-            <PrimaryButton onClick={onContinue} disabled={!loaded} className="ml-auto">
-              {t("next.firstRun.continue")}
-            </PrimaryButton>
-          </>
-        )
-      }
-    >
-      {!loaded ? (
-        <div role="status" className="flex items-center gap-3 font-wv-mono text-[12px] text-wv-muted">
-          <LoadingMark className="h-5" />
-        </div>
-      ) : null}
-
-      {servers.length > 0 ? (
-        <div className="flex flex-col gap-2">
-          <Eyebrow tone="rail">{t("next.firstRun.provider.saved")}</Eyebrow>
-          <ul className="flex flex-col border border-wv-hairline">
-            {servers.map((server) => (
-              <li
-                key={server.id}
-                className="flex items-center gap-3 border-b border-wv-hairline px-3 py-2.5 last:border-b-0"
+              {servers.length > 0 ? (
+                <SecondaryButton
+                  onClick={() => {
+                    setAddingAnother(false);
+                    setForm(NEW_PROVIDER);
+                    setTestResult(null);
+                    setError(null);
+                  }}
+                >
+                  {t("action.cancel")}
+                </SecondaryButton>
+              ) : (
+                <SecondaryButton onClick={onContinue}>{t("next.firstRun.provider.skip")}</SecondaryButton>
+              )}
+              <PrimaryButton
+                icon="add"
+                onClick={() => void save()}
+                disabled={saving || !normalizeHost(form.host)}
+                className="ml-auto"
               >
-                <Square color={WV.green} />
-                <span className="min-w-0 flex-1 truncate font-wv-mono text-[12px] text-wv-fg">
-                  {server.host}:{server.port}
-                </span>
-                <span className="font-wv-mono text-[11px] text-wv-muted">
-                  {server.tls ? "TLS · " : ""}
-                  {t("next.providers.threads")} {server.connections}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+                {saving ? t("next.firstRun.saving") : t("next.firstRun.provider.save")}
+              </PrimaryButton>
+            </>
+          ) : (
+            <>
+              <SecondaryButton icon="add" onClick={() => setAddingAnother(true)} disabled={!loaded}>
+                {t("next.firstRun.provider.addAnother")}
+              </SecondaryButton>
+              <PrimaryButton onClick={onContinue} disabled={!loaded} className="ml-auto">
+                {t("next.firstRun.continue")}
+              </PrimaryButton>
+            </>
+          )
+        }
+      >
+        {!loaded ? (
+          <div role="status" className="flex items-center gap-3 font-wv-mono text-[12px] text-wv-muted">
+            <LoadingMark className="h-5" />
+          </div>
+        ) : null}
 
-      {editing ? (
-        <div className="flex flex-col gap-4">
-          <div className="grid grid-cols-[minmax(0,1fr)_110px] gap-3">
-            <FormField label={t("next.providers.host")} help={t("next.providers.hostHelp")}>
-              <TextField
-                label={t("next.providers.host")}
-                value={form.host}
-                placeholder="news.example.com"
-                onChange={(host) => patch({ host, certificate: null })}
-                autoComplete="off"
-                autoFocus
-                className="w-full"
+        {servers.length > 0 ? (
+          <div className="flex flex-col gap-2">
+            <Eyebrow tone="rail">{t("next.firstRun.provider.saved")}</Eyebrow>
+            <ul className="flex flex-col border border-wv-hairline">
+              {servers.map((server) => (
+                <li
+                  key={server.id}
+                  className="flex items-center gap-3 border-b border-wv-hairline px-3 py-2.5 last:border-b-0"
+                >
+                  <Square color={WV.green} />
+                  <span className="min-w-0 flex-1 truncate font-wv-mono text-[12px] text-wv-fg">
+                    {server.host}:{server.port}
+                  </span>
+                  <span className="font-wv-mono text-[11px] text-wv-muted">
+                    {server.tls ? "TLS · " : ""}
+                    {t("next.providers.threads")} {server.connections}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        {editing ? (
+          <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-[minmax(0,1fr)_110px] gap-3">
+              <FormField label={t("next.providers.host")} help={t("next.providers.hostHelp")}>
+                <TextField
+                  label={t("next.providers.host")}
+                  value={form.host}
+                  placeholder="news.example.com"
+                  onChange={(host) => patch({ host, certificate: null })}
+                  autoComplete="off"
+                  autoFocus
+                  className="w-full"
+                />
+              </FormField>
+              <FormField label={t("next.providers.port")}>
+                <NumberField
+                  label={t("next.providers.port")}
+                  value={form.port}
+                  min={1}
+                  max={65535}
+                  onChange={(port) => patch({ port })}
+                  className="w-full"
+                />
+              </FormField>
+            </div>
+
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex min-w-0 flex-col gap-[7px]">
+                <span className="text-[12px] font-medium text-wv-secondary">{t("next.firstRun.provider.tls")}</span>
+                <span className="text-[11.5px] leading-[1.45] text-wv-muted">{t("next.firstRun.provider.tlsHint")}</span>
+              </div>
+              <Toggle
+                label={t("next.firstRun.provider.tls")}
+                checked={form.tls}
+                onChange={(tls) => patch({ tls, port: tls ? 563 : 119 })}
               />
-            </FormField>
-            <FormField label={t("next.providers.port")}>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <FormField label={`${t("next.providers.username")} (${t("next.common.optional")})`}>
+                <TextField
+                  label={t("next.providers.username")}
+                  value={form.username}
+                  onChange={(username) => patch({ username })}
+                  autoComplete="off"
+                  className="w-full"
+                />
+              </FormField>
+              <FormField label={`${t("next.providers.password")} (${t("next.common.optional")})`}>
+                <TextField
+                  type="password"
+                  label={t("next.providers.password")}
+                  value={form.password}
+                  onChange={(password) => patch({ password })}
+                  autoComplete="new-password"
+                  className="w-full"
+                />
+              </FormField>
+            </div>
+
+            <FormField label={t("next.providers.threads")} help={t("next.providers.threadsHelp")}>
               <NumberField
-                label={t("next.providers.port")}
-                value={form.port}
+                label={t("next.providers.threads")}
+                value={form.connections}
                 min={1}
-                max={65535}
-                onChange={(port) => patch({ port })}
-                className="w-full"
+                max={200}
+                onChange={(connections) => patch({ connections })}
               />
             </FormField>
-          </div>
 
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex min-w-0 flex-col gap-[7px]">
-              <span className="text-[12px] font-medium text-wv-secondary">{t("next.firstRun.provider.tls")}</span>
-              <span className="text-[11.5px] leading-[1.45] text-wv-muted">{t("next.firstRun.provider.tlsHint")}</span>
-            </div>
-            <Toggle
-              label={t("next.firstRun.provider.tls")}
-              checked={form.tls}
-              onChange={(tls) => patch({ tls, port: tls ? 563 : 119 })}
-            />
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <FormField label={`${t("next.providers.username")} (${t("next.common.optional")})`}>
-              <TextField
-                label={t("next.providers.username")}
-                value={form.username}
-                onChange={(username) => patch({ username })}
-                autoComplete="off"
-                className="w-full"
+            {testResult ? (
+              <TestOutcome
+                t={t}
+                result={testResult}
+                trusted={form.certificate !== null}
+                onTrust={
+                  certificate
+                    ? () =>
+                        setForm((current) => ({
+                          ...current,
+                          certificate: {
+                            derBase64: certificate.derBase64,
+                            fingerprint: certificate.sha256Fingerprint,
+                          },
+                        }))
+                    : undefined
+                }
               />
-            </FormField>
-            <FormField label={`${t("next.providers.password")} (${t("next.common.optional")})`}>
-              <TextField
-                type="password"
-                label={t("next.providers.password")}
-                value={form.password}
-                onChange={(password) => patch({ password })}
-                autoComplete="new-password"
-                className="w-full"
-              />
-            </FormField>
+            ) : null}
+            {form.certificate && !testResult ? (
+              <div className="flex items-center gap-2 text-[12px] text-wv-muted">
+                <Icon name="trust" size={13} className="flex-none" />
+                {t("next.firstRun.provider.certificateTrusted")}
+              </div>
+            ) : null}
+            {error ? <ErrorLine>{error}</ErrorLine> : null}
           </div>
-
-          <FormField label={t("next.providers.threads")} help={t("next.providers.threadsHelp")}>
-            <NumberField
-              label={t("next.providers.threads")}
-              value={form.connections}
-              min={1}
-              max={200}
-              onChange={(connections) => patch({ connections })}
-            />
-          </FormField>
-
-          {testResult ? (
-            <TestOutcome
-              t={t}
-              result={testResult}
-              trusted={form.certificate !== null}
-              onTrust={
-                certificate
-                  ? () =>
-                      setForm((current) => ({
-                        ...current,
-                        certificate: {
-                          derBase64: certificate.derBase64,
-                          fingerprint: certificate.sha256Fingerprint,
-                        },
-                      }))
-                  : undefined
-              }
-            />
-          ) : null}
-          {form.certificate && !testResult ? (
-            <div className="flex items-center gap-2 text-[12px] text-wv-muted">
-              <Icon name="trust" size={13} className="flex-none" />
-              {t("next.firstRun.provider.certificateTrusted")}
-            </div>
-          ) : null}
-          {error ? <ErrorLine>{error}</ErrorLine> : null}
-        </div>
-      ) : null}
-    </StepBody>
+        ) : null}
+      </StepBody>
+    </>
   );
 }
 

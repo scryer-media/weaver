@@ -38,6 +38,7 @@ export function RecordEditor({
   deleteLabel,
   extraActions,
   width = 560,
+  overlay,
   children,
 }: {
   open: boolean;
@@ -55,6 +56,8 @@ export function RecordEditor({
   /** Buttons that belong beside Delete — "Test connection", "Sync now". */
   extraActions?: ReactNode;
   width?: number;
+  /** Laid over the whole editor while something slow runs. */
+  overlay?: ReactNode;
   /** Anything that is not a field: a test result, a warning, a sub-table. */
   children?: ReactNode;
 }) {
@@ -65,6 +68,7 @@ export function RecordEditor({
       title={title}
       note={note}
       width={width}
+      overlay={overlay}
       onDismiss={onDismiss}
       footer={
         <>

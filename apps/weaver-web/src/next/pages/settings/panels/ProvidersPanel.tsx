@@ -19,6 +19,7 @@ import { RecordEditor, type EditorSection } from "../../../components/RecordEdit
 import { RoutingEditor } from "../../../components/RoutingEditor";
 import { PrimaryButton, SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
+import { WorkingOverlay } from "../../../components/WorkingOverlay";
 import { WV } from "../../../data/palette";
 import { formatLatency, formatSize } from "../../../data/format";
 import { PanelControls, SettingsBlocks, type FieldSpec, type SettingsBlock } from "../framework";
@@ -675,6 +676,7 @@ export function ProvidersPanel() {
             : t("next.providers.priorityNote", { priority: values?.priority ?? 0 })
         }
         width={620}
+        overlay={testing ? <WorkingOverlay label={t("next.providers.testing")} /> : undefined}
         sections={sections}
         error={error}
         busy={busy}

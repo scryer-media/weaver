@@ -23,6 +23,7 @@ export function Dialog({
   onDismiss,
   footer,
   width = 520,
+  overlay,
   children,
 }: {
   open: boolean;
@@ -31,6 +32,8 @@ export function Dialog({
   onDismiss: () => void;
   footer?: ReactNode;
   width?: number;
+  /** Laid over the whole panel, header and footer included: a `WorkingOverlay`. */
+  overlay?: ReactNode;
   children: ReactNode;
 }) {
   // Read through a ref so a re-render with a fresh callback keeps this
@@ -74,7 +77,7 @@ export function Dialog({
         aria-label={title}
         style={{ width }}
         className={cn(
-          "flex max-h-full max-w-full flex-col border border-wv-control bg-wv-chrome text-wv-fg shadow-wv-menu",
+          "relative flex max-h-full max-w-full flex-col border border-wv-control bg-wv-chrome text-wv-fg shadow-wv-menu",
         )}
       >
         {/* Centred in the bar as a group; the title and note share a baseline inside it. */}
@@ -94,6 +97,7 @@ export function Dialog({
             {footer}
           </div>
         )}
+        {overlay}
       </div>
     </div>,
     document.body,
