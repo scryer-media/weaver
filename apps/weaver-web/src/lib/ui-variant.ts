@@ -1,9 +1,9 @@
 /**
  * Which interface the browser renders.
  *
- * Weaver ships two complete, independent UIs: `classic`, the card-based app
- * that has always been here, and `next`, the hairline three-region redesign
- * under `src/next`. They share the GraphQL layer and nothing else — no
+ * Weaver ships two complete, independent UIs: `next`, the hairline
+ * three-region interface under `src/next` and the default, and `classic`, the
+ * card-based app that came before it. They share the GraphQL layer and nothing else — no
  * layout, no tokens, no typefaces — so the choice is made once, above the
  * router, and the losing tree never mounts.
  *
@@ -18,7 +18,8 @@ export type UiVariant = "classic" | "next";
 
 export const UI_VARIANT_STORAGE_KEY = "weaver.ui-variant";
 
-export const DEFAULT_UI_VARIANT: UiVariant = "classic";
+/** A browser that never chose gets the new interface. */
+export const DEFAULT_UI_VARIANT: UiVariant = "next";
 
 function isUiVariant(value: string | null): value is UiVariant {
   return value === "classic" || value === "next";

@@ -9,22 +9,22 @@
         const root = document.documentElement;
         // The Next UI is a single dark palette on its own background, so it
         // settles both questions at once and skips the theme class entirely.
-        try {
-          const variant = (() => {
+        // Next is the default: only a browser that chose classic skips it.
+        // Mirrors `readUiVariant`, which takes the first store holding a choice.
+        const variant = [() => window.localStorage, () => window.sessionStorage]
+          .map((store) => {
             try {
-              return window.localStorage.getItem("weaver.ui-variant");
+              return store().getItem("weaver.ui-variant");
             } catch {
               return null;
             }
-          })() ?? window.sessionStorage.getItem("weaver.ui-variant");
-          if (variant === "next") {
-            root.dataset.ui = "next";
-            root.dataset.initialTheme = "dark";
-            root.style.colorScheme = "dark";
-            return;
-          }
-        } catch {
-          // Storage is unreadable; fall through to the classic interface.
+          })
+          .find((value) => value === "classic" || value === "next");
+        if (variant !== "classic") {
+          root.dataset.ui = "next";
+          root.dataset.initialTheme = "dark";
+          root.style.colorScheme = "dark";
+          return;
         }
         try {
           const storedTheme = window.localStorage.getItem("theme");

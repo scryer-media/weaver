@@ -1,9 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
-import {
-  SecurityUpgradeWizard,
-  SetupWizardPage,
-  type SetupEnvironment,
-} from "@/pages/SetupWizardPage";
+import { SecurityUpgradeWizard, SetupWizardPage } from "@/pages/SetupWizardPage";
+import type { SetupEnvironment } from "@/lib/setup-flow";
 import { Provider, useQuery } from "urql";
 import { RouterProvider } from "react-router/dom";
 import { ThemeProvider } from "next-themes";
@@ -25,6 +22,7 @@ import { LoginPage } from "@/pages/LoginPage";
 /// once per mount is enough and no component below ever re-renders on a switch.
 const NextApp = lazy(() => import("./next/NextApp"));
 const NextLoginPage = lazy(() => import("./next/pages/LoginPage"));
+const NextSetupPage = lazy(() => import("./next/pages/SetupPage"));
 
 const uiVariant = readUiVariant();
 
@@ -260,7 +258,13 @@ function SetupGate({ children }: { children: React.ReactNode }) {
     return <GatePlaceholder />;
   }
   if (setupRequired) {
-    return <SetupWizardPage environment={setupEnvironment} />;
+    return uiVariant === "next" ? (
+      <Suspense fallback={<GatePlaceholder />}>
+        <NextSetupPage environment={setupEnvironment} />
+      </Suspense>
+    ) : (
+      <SetupWizardPage environment={setupEnvironment} />
+    );
   }
   return <>{children}</>;
 }
