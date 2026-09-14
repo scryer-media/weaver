@@ -3,8 +3,8 @@ use crate::observability::with_timed_config_read;
 use crate::system::metrics_history::{build_metrics_history, tier_for_range};
 use crate::system::types::{
     ConfiguredStorage, DatabaseEngineGql, DecoderTierGql, DeploymentEnvironmentGql, DiskCapacity,
-    MetricsHistoryRangeGql, OperatingSystemGql, ServerRestartCapability, SystemComputeInfo,
-    SystemInfo, SystemMemoryInfo, SystemStorageProfile,
+    KernelComponentGql, KernelSelectionInfo, MetricsHistoryRangeGql, OperatingSystemGql,
+    ServerRestartCapability, SystemComputeInfo, SystemInfo, SystemMemoryInfo, SystemStorageProfile,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,6 +88,10 @@ impl SystemQuery {
                 cgroup_limit: profile.cpu.cgroup_limit,
                 decoder_tier: decoder_tier_gql(weaver_yenc::simd::selected_decoder_tier()),
                 simd_features,
+                kernels: weaver_server_core::runtime::kernels::selected_kernels()
+                    .into_iter()
+                    .map(kernel_selection_info)
+                    .collect(),
             },
             memory: SystemMemoryInfo {
                 total_bytes: profile.memory.total_bytes,
@@ -439,6 +443,29 @@ fn operating_system_gql(
         OperatingSystem::Macos => OperatingSystemGql::Macos,
         OperatingSystem::Windows => OperatingSystemGql::Windows,
         OperatingSystem::Unknown => OperatingSystemGql::Unknown,
+    }
+}
+
+fn kernel_selection_info(
+    value: weaver_server_core::runtime::kernels::KernelSelection,
+) -> KernelSelectionInfo {
+    use weaver_server_core::runtime::kernels::KernelComponent;
+    KernelSelectionInfo {
+        component: match value.component {
+            KernelComponent::YencDecode => KernelComponentGql::YencDecode,
+            KernelComponent::YencCrc32 => KernelComponentGql::YencCrc32,
+            KernelComponent::Par2Repair => KernelComponentGql::Par2Repair,
+            KernelComponent::Par2Md5 => KernelComponentGql::Par2Md5,
+            KernelComponent::Par2Crc32 => KernelComponentGql::Par2Crc32,
+            KernelComponent::RarRecovery => KernelComponentGql::RarRecovery,
+            KernelComponent::RarCrc32 => KernelComponentGql::RarCrc32,
+            KernelComponent::RarSha1 => KernelComponentGql::RarSha1,
+            KernelComponent::RarAes => KernelComponentGql::RarAes,
+        },
+        library: value.library.to_string(),
+        ladder: value.ladder.into_iter().map(str::to_string).collect(),
+        kernel: value.kernel.to_string(),
+        pinned_by: value.pinned_by.map(str::to_string),
     }
 }
 

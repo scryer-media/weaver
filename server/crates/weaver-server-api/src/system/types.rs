@@ -942,6 +942,45 @@ pub struct SystemComputeInfo {
     pub cgroup_limit: Option<f64>,
     pub decoder_tier: DecoderTierGql,
     pub simd_features: Vec<String>,
+    /// The kernel each hot-path library dispatches to on this host.
+    pub kernels: Vec<KernelSelectionInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum KernelComponentGql {
+    #[graphql(name = "YENC_DECODE")]
+    YencDecode,
+    #[graphql(name = "YENC_CRC32")]
+    YencCrc32,
+    #[graphql(name = "PAR2_REPAIR")]
+    Par2Repair,
+    #[graphql(name = "PAR2_MD5")]
+    Par2Md5,
+    #[graphql(name = "PAR2_CRC32")]
+    Par2Crc32,
+    #[graphql(name = "RAR_RECOVERY")]
+    RarRecovery,
+    #[graphql(name = "RAR_CRC32")]
+    RarCrc32,
+    #[graphql(name = "RAR_SHA1")]
+    RarSha1,
+    #[graphql(name = "RAR_AES")]
+    RarAes,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct KernelSelectionInfo {
+    pub component: KernelComponentGql,
+    /// The crate that owns the dispatch.
+    pub library: String,
+    /// Every kernel this build can select on this architecture, in the order
+    /// the dispatcher tries them.
+    pub ladder: Vec<String>,
+    /// The rung the dispatcher selected; always an entry of `ladder`.
+    pub kernel: String,
+    /// The environment variable that moved the selection off the rung the CPU
+    /// alone would have picked, when one did.
+    pub pinned_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, SimpleObject)]

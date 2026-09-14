@@ -20,6 +20,10 @@ par2-rs = { workspace = true, features = [
     "native-crypto",
 ] }
 par3-rs = { workspace = true }
+# Already in the graph through par2-rs; named directly so System info can read
+# the XOR-JIT gate, which par2-rs does not re-export. The RAR3 recovery-volume
+# tests also author their `.rev` fixture with its RS coder.
+reedsolomon-rs = { version = "0.4.5", default-features = false }
 unrar-rs = { workspace = true, features = [
     "crypto-aws-lc",
 ] }
@@ -95,10 +99,6 @@ sevenz-rust2 = { workspace = true, features = ["compress"] }
 axum = { workspace = true }
 criterion = "0.8"
 lzma-rust2 = { workspace = true, features = ["encoder"] }
-# The RAR3 recovery-volume tests author their `.rev` fixture in-process with
-# the same RS coder the restorer decodes with. Test-only: the shipped binary
-# only ever restores from recovery volumes, it never writes one.
-reedsolomon-rs = { version = "0.4.4", default-features = false }
 
 [[bench]]
 name = "infrastructure_retry"
