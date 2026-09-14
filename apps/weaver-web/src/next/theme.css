@@ -281,7 +281,7 @@ html[data-ui="next"] .wv-ping:focus-visible {
  * on it, and with reduced motion the page skips the welcome and shows at once.
  */
 html[data-ui="next"] .wv-setup-intro-mark {
-  animation: wv-setup-intro-mark 2s both;
+  animation: wv-setup-intro-mark 1.2s both;
   will-change: transform, opacity;
 }
 
@@ -290,11 +290,11 @@ html[data-ui="next"] .wv-setup-intro [data-brand-part="mark"] {
 }
 
 html[data-ui="next"] .wv-setup-intro [data-brand-part="wordmark"] {
-  animation: wv-setup-intro-fade 0.45s ease-out 1.55s both;
+  animation: wv-setup-intro-fade 0.27s ease-out 0.93s both;
 }
 
 html[data-ui="next"] .wv-setup-intro .wv-setup-intro-form {
-  animation: wv-setup-intro-rise 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) 1.6s both;
+  animation: wv-setup-intro-rise 0.33s cubic-bezier(0.2, 0.7, 0.2, 1) 0.96s both;
 }
 
 @keyframes wv-setup-intro-mark {
