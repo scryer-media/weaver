@@ -22,6 +22,7 @@ import { cn } from "@/lib/utils";
 import { Eyebrow, Square } from "../components/chrome";
 import { NumberField, PrimaryButton, SecondaryButton, TextField, Toggle } from "../components/controls";
 import { Icon } from "../components/icons";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { WorkingOverlay } from "../components/WorkingOverlay";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { formatLatency } from "../data/format";
@@ -70,6 +71,14 @@ interface ProviderForm {
   connections: number;
   certificate: { derBase64: string; fingerprint: string } | null;
 }
+
+/**
+ * What a save says when the provider's certificate names another host. Saving
+ * probes the connection, and the probe's message is fixed English text, so the
+ * step recognises it and runs a test, whose result carries the certificate to
+ * trust.
+ */
+const CERTIFICATE_NAME_MISMATCH = "certificate belongs to a different hostname";
 
 const NEW_PROVIDER: ProviderForm = {
   host: "",
@@ -314,6 +323,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
   const [testResult, setTestResult] = useState<TestResult | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmTrust, setConfirmTrust] = useState<ProviderForm["certificate"]>(null);
 
   const servers = data?.servers ?? [];
   const loaded = data !== undefined || !fetching;
@@ -325,29 +335,29 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
     setError(null);
   };
 
-  const input = () => ({
-    host: normalizeHost(form.host),
-    port: form.port,
-    tls: form.tls,
-    username: form.username.trim() || null,
-    password: form.password.trim() || null,
-    connections: form.connections,
+  const input = (provider: ProviderForm = form) => ({
+    host: normalizeHost(provider.host),
+    port: provider.port,
+    tls: provider.tls,
+    username: provider.username.trim() || null,
+    password: provider.password.trim() || null,
+    connections: provider.connections,
     active: true,
     priority: 0,
     backfill: false,
     retentionDays: 0,
-    tlsNameMismatchCertificateDerBase64: form.certificate?.derBase64 ?? null,
+    tlsNameMismatchCertificateDerBase64: provider.certificate?.derBase64 ?? null,
   });
 
-  const runTest = async () => {
-    if (!normalizeHost(form.host)) {
+  const runTest = async (provider: ProviderForm = form) => {
+    if (!normalizeHost(provider.host)) {
       setError(t("next.providers.hostRequired"));
       return;
     }
     setTesting(true);
     setTestResult(null);
     setError(null);
-    const result = await testConnection({ input: input() });
+    const result = await testConnection({ input: input(provider) });
     setTesting(false);
     setTestResult(
       (result.data?.testConnection as TestResult | undefined) ??
@@ -372,7 +382,13 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
     const result = await addServer({ input: input() });
     setSaving(false);
     if (result.error) {
-      setError(t("next.firstRun.provider.saveFailed", { message: errorMessage(result.error) }));
+      const message = errorMessage(result.error);
+      if (form.tls && !form.certificate && message.includes(CERTIFICATE_NAME_MISMATCH)) {
+        // Show the certificate the way a test does, so it can be trusted here.
+        await runTest();
+        return;
+      }
+      setError(t("next.firstRun.provider.saveFailed", { message }));
       return;
     }
     setForm(NEW_PROVIDER);
@@ -382,6 +398,17 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
   };
 
   const certificate = testResult?.adoptableTlsNameMismatchCertificate ?? null;
+
+  const trust = () => {
+    if (!confirmTrust) {
+      return;
+    }
+    const next = { ...form, certificate: confirmTrust };
+    setConfirmTrust(null);
+    setForm(next);
+    // Test again with the certificate, so the result shows whether it connects now.
+    void runTest(next);
+  };
 
   return (
     <>
@@ -484,7 +511,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
                   value={form.port}
                   min={1}
                   max={65535}
-                  onChange={(port) => patch({ port })}
+                  onChange={(port) => patch({ port, certificate: null })}
                   className="w-full"
                 />
               </FormField>
@@ -498,7 +525,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
               <Toggle
                 label={t("next.firstRun.provider.tls")}
                 checked={form.tls}
-                onChange={(tls) => patch({ tls, port: tls ? 563 : 119 })}
+                onChange={(tls) => patch({ tls, port: tls ? 563 : 119, certificate: null })}
               />
             </div>
 
@@ -541,27 +568,48 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
                 onTrust={
                   certificate
                     ? () =>
-                        setForm((current) => ({
-                          ...current,
-                          certificate: {
-                            derBase64: certificate.derBase64,
-                            fingerprint: certificate.sha256Fingerprint,
-                          },
-                        }))
+                        setConfirmTrust({
+                          derBase64: certificate.derBase64,
+                          fingerprint: certificate.sha256Fingerprint,
+                        })
                     : undefined
                 }
               />
             ) : null}
-            {form.certificate && !testResult ? (
-              <div className="flex items-center gap-2 text-[12px] text-wv-muted">
-                <Icon name="trust" size={13} className="flex-none" />
-                {t("next.firstRun.provider.certificateTrusted")}
+            {form.certificate ? (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-wv-muted">
+                <span className="flex items-center gap-2">
+                  <Icon name="trust" size={13} className="flex-none" />
+                  {t("next.firstRun.provider.certificateTrusted")}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => patch({ certificate: null })}
+                  className="cursor-pointer text-wv-secondary underline underline-offset-2 hover:text-wv-fg"
+                >
+                  {t("next.firstRun.provider.forgetCertificate")}
+                </button>
               </div>
             ) : null}
             {error ? <ErrorLine>{error}</ErrorLine> : null}
           </div>
         ) : null}
       </StepBody>
+      <ConfirmDialog
+        open={confirmTrust !== null}
+        title={t("next.firstRun.provider.trustTitle")}
+        body={
+          <span className="flex flex-col gap-2.5">
+            <span>{t("next.firstRun.provider.trustBody")}</span>
+            <span className="font-wv-mono text-[11px] break-all text-wv-muted">
+              {t("next.firstRun.provider.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}
+            </span>
+          </span>
+        }
+        confirmLabel={t("next.firstRun.provider.trustConfirm")}
+        onConfirm={trust}
+        onDismiss={() => setConfirmTrust(null)}
+      />
     </>
   );
 }
@@ -598,12 +646,7 @@ function TestOutcome({
           <span className="font-wv-mono text-[11px] break-all text-wv-muted">
             {t("next.firstRun.provider.certFingerprint", { fingerprint: certificate.sha256Fingerprint })}
           </span>
-          {trusted ? (
-            <span className="flex items-center gap-2 text-[12px] text-wv-fg">
-              <Icon name="trust" size={13} className="flex-none" />
-              {t("next.firstRun.provider.certificateTrusted")}
-            </span>
-          ) : (
+          {trusted ? null : (
             <SecondaryButton icon="trust" onClick={onTrust} className="self-start">
               {t("next.providers.trustCert")}
             </SecondaryButton>
