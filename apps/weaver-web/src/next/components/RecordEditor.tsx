@@ -17,6 +17,8 @@ import { FieldRows, type FieldSpec } from "@/next/pages/settings/framework";
 export interface EditorSection {
   id: string;
   title: string;
+  /** A chip beside the title, such as the beta marker. */
+  tag?: ReactNode;
   note?: ReactNode;
   fields: FieldSpec[];
 }
@@ -81,7 +83,7 @@ export function RecordEditor({
     >
       {sections.map((section) => (
         <div key={section.id} className="flex flex-none flex-col">
-          <SectionHeader label={section.title} note={section.note} sticky={false} />
+          <SectionHeader label={section.title} tag={section.tag} note={section.note} sticky={false} />
           <FieldRows fields={section.fields} />
         </div>
       ))}

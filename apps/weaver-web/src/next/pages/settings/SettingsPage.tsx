@@ -6,7 +6,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { NextShell } from "../../shell/NextShell";
 import { PanelListBlock, PathBlock } from "../../shell/rail-blocks";
 import { useNextData } from "../../data/next-data";
-import { EmptyState } from "../../components/chrome";
+import { BetaTag, EmptyState } from "../../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
 import { SettingsShellProvider, type PanelFlags } from "./framework";
 import { SETTINGS_PANELS, findPanel } from "./panels";
@@ -82,6 +82,7 @@ export function SettingsPage() {
   return (
     <NextShell
       title={panel ? t(panel.label) : t("nav.settings")}
+      titleTag={panel?.tag === "beta" ? <BetaTag /> : undefined}
       note={panel ? t(panel.note) : undefined}
       railMiddle={<PanelListBlock eyebrow={t("nav.settings")} items={railItems} />}
       railFooter={

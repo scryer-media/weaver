@@ -1,5 +1,6 @@
 import { useQuery } from "urql";
 import { Link } from "react-router";
+import { BetaBadge } from "@/components/BetaBadge";
 import { Button } from "@/components/ui/button";
 import { PROXY_PROFILES_QUERY } from "@/graphql/proxies";
 import { appendProxy, moveProxy, proxyLabels, type ProxyProfile, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
@@ -8,7 +9,8 @@ export function ProxyRoutingEditor({ value, onChange }: { value: RoutingPolicy; 
   const [{ data, error }] = useQuery<{ proxyProfiles: ProxyProfile[] }>({ query: PROXY_PROFILES_QUERY });
   const profiles = data?.proxyProfiles ?? [];
   return <fieldset className="space-y-3 rounded-inner border border-border p-5">
-    <legend className="px-2 text-sm font-semibold">Proxy route</legend>
+    <legend className="flex items-center gap-2 px-2 text-sm font-semibold">Proxy route<BetaBadge /></legend>
+    <p className="text-sm text-amber-800 dark:text-amber-200">Proxy routing is in beta. Test the proxies on this route before relying on it.</p>
     <p className="text-sm text-muted-foreground">Try each route in order. New connections return to the primary when it recovers.</p>
     {error && <p role="alert">Unable to load proxy profiles. Existing assignments are preserved.</p>}
     <ol className="space-y-2">

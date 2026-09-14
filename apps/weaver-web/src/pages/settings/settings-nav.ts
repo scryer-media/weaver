@@ -57,6 +57,7 @@ export const settingsNav: readonly SettingsNavEntry[] = [
     labelKey: "settings.proxies",
     descriptionKey: "settings.proxiesDesc",
     icon: Waypoints,
+    beta: true,
   },
   {
     to: "/settings/bandwidth",

@@ -38,6 +38,7 @@ interface NavEntry {
 
 export function NextShell({
   title,
+  titleTag,
   note,
   controls,
   header,
@@ -52,6 +53,8 @@ export function NextShell({
 }: {
   /** Required unless `header` replaces the whole title bar. */
   title?: string;
+  /** A chip right after the title — the beta marker on a settings panel. */
+  titleTag?: ReactNode;
   note?: ReactNode;
   controls?: ReactNode;
   /**
@@ -215,6 +218,7 @@ export function NextShell({
               <h1 className="flex-none font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
                 {title}
               </h1>
+              {titleTag}
               {note === undefined ? null : (
                 <span className="hidden truncate font-wv-mono text-[11.5px] text-wv-muted sm:inline">
                   {note}

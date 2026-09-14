@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { Copy, Upload } from "lucide-react";
 import { useMutation, useQuery } from "urql";
+import { BetaBadge } from "@/components/BetaBadge";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -134,9 +135,10 @@ export function ProxiesSettingsPage() {
   const p = editor?.profile;
   const showDetails = !!d && (d.kind !== "WIRE_GUARD" || wgDetailsOpen);
   return <div className="space-y-6">
-    <PageHeader title="Proxies" description="Create reusable profiles, then assign an ordered route in each server or RSS feed editor." actions={<Button onClick={() => open(null)}>Add proxy</Button>} />
+    <PageHeader title="Proxies" titleAdornment={<BetaBadge />} description="Create reusable profiles, then assign an ordered route in each server or RSS feed editor." actions={<Button onClick={() => open(null)}>Add proxy</Button>} />
+    <div role="note" className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-800 dark:text-amber-200"><BetaBadge />Proxies are in beta. Test each profile before routing a server or RSS feed through it.</div>
     {(message || error) && <p role="status" className="rounded-md border border-border p-4 text-sm">{message ?? error?.message}</p>}
-    {d && <SectionCard title={p ? `Edit ${p.name}` : "New proxy"} actions={<label className="flex items-center gap-2 text-sm font-medium"><input type="checkbox" className="size-4" checked={d.enabled} onChange={e => update({ enabled: e.target.checked })} />Enabled</label>}>
+    {d && <SectionCard title={<span className="flex flex-wrap items-center gap-2">{p ? `Edit ${p.name}` : "New proxy"}<BetaBadge /></span>} actions={<label className="flex items-center gap-2 text-sm font-medium"><input type="checkbox" className="size-4" checked={d.enabled} onChange={e => update({ enabled: e.target.checked })} />Enabled</label>}>
       <form className="space-y-5" onSubmit={e => { e.preventDefault(); if (showDetails) void saveEditor(); }}>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-[12rem_minmax(0,1fr)_minmax(0,1.4fr)_7rem_9rem]">
           <label className="space-y-2 text-sm">Type<select className="h-10 w-full rounded-md border border-input bg-background px-3" value={d.kind} disabled={!!p} onChange={e => { const kind = e.target.value as ProxyKind; update({ ...initial, name: d.name, enabled: d.enabled, timeoutSeconds: d.timeoutSeconds, kind, port: defaultPorts[kind], secrets: {} }); setWgDetailsOpen(kind !== "WIRE_GUARD"); }}>

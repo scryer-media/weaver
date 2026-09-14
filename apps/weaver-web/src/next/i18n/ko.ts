@@ -1126,4 +1126,6 @@ export const nextKo: LocaleDictionary = {
   "next.system.kernel.rarCrc32": "RAR CRC32",
   "next.system.kernel.rarSha1": "RAR SHA-1",
   "next.system.kernel.rarAes": "RAR 복호화",
+  "next.proxies.betaNotice": "프록시는 베타 기능입니다. 공급자나 피드를 연결하기 전에 각 프로필을 테스트하세요.",
+  "next.routing.betaNotice": "프록시 라우팅은 베타 기능입니다. 이 경로에 의존하기 전에 경로의 프록시를 테스트하세요.",
 };

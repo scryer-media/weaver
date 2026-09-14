@@ -1,5 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useTranslate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { cn } from "@/lib/utils";
 import { WV } from "../data/palette";
@@ -38,11 +39,14 @@ export function SectionHeader({
   count,
   note,
   lead,
+  tag,
   sticky = true,
 }: {
   label: ReactNode;
   count?: ReactNode;
   note?: ReactNode;
+  /** A chip right after the label — the beta marker on a section still settling. */
+  tag?: ReactNode;
   /** A control ahead of the label — the checkbox that ticks every row in the section. */
   lead?: ReactNode;
   sticky?: boolean;
@@ -56,6 +60,7 @@ export function SectionHeader({
     >
       {lead}
       <Eyebrow>{label}</Eyebrow>
+      {tag}
       {count === undefined ? null : (
         <span className="font-wv-mono text-[11px] text-wv-note">{count}</span>
       )}
@@ -299,6 +304,31 @@ export function Field({
       <span title={title} className="truncate text-[13px] font-medium text-wv-fg">
         {value}
       </span>
+    </div>
+  );
+}
+
+/** The warn-toned chip on every surface whose feature is still in beta. */
+export function BetaTag({ className }: { className?: string }) {
+  const t = useTranslate();
+  return (
+    <span
+      className={cn(
+        "inline-flex h-[18px] flex-none items-center self-center border border-wv-warn/60 px-[6px] font-wv-mono text-[10px] leading-none font-medium tracking-[0.1em] whitespace-nowrap text-wv-warn uppercase",
+        className,
+      )}
+    >
+      {t("next.settings.beta")}
+    </span>
+  );
+}
+
+/** A full-width beta band: the chip, then what the reader should know about it. */
+export function BetaNotice({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex flex-none items-center gap-[10px] border-b border-wv-hairline bg-wv-cell-hover px-4 py-3 text-[12.5px] text-wv-warn sm:px-6">
+      <BetaTag />
+      <span className="min-w-0">{children}</span>
     </div>
   );
 }

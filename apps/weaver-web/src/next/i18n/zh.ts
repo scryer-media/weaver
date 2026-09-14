@@ -1126,4 +1126,6 @@ export const nextZh: LocaleDictionary = {
   "next.system.kernel.rarCrc32": "RAR CRC32",
   "next.system.kernel.rarSha1": "RAR SHA-1",
   "next.system.kernel.rarAes": "RAR 解密",
+  "next.proxies.betaNotice": "代理功能处于测试阶段。在让服务商或订阅源通过代理之前，请先测试每个配置。",
+  "next.routing.betaNotice": "代理路由处于测试阶段。在依赖此路由之前，请先测试其中的代理。",
 };

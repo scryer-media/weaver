@@ -13,7 +13,7 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
-import { Square } from "../../../components/chrome";
+import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { RoutingEditor } from "../../../components/RoutingEditor";
@@ -635,6 +635,7 @@ export function ProvidersPanel() {
         {
           id: "routing",
           title: t("next.providers.networkRoute"),
+          tag: <BetaTag />,
           fields: [
             {
               id: "routing",

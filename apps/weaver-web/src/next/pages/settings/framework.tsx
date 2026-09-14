@@ -244,6 +244,8 @@ export interface SettingsSectionModel {
   kind: "section";
   id: string;
   title: string;
+  /** A chip beside the title, such as the beta marker. */
+  tag?: ReactNode;
   note?: ReactNode;
   fields: FieldSpec[];
 }
@@ -259,6 +261,8 @@ export interface SettingsTableModel {
   kind: "table";
   id: string;
   title: string;
+  /** A chip beside the title, such as the beta marker. */
+  tag?: ReactNode;
   note?: ReactNode;
   /** Raw `grid-template-columns`, so panels keep the handoff's exact tracks. */
   columns: string;
@@ -285,6 +289,8 @@ export interface SettingsCustomModel {
   kind: "custom";
   id: string;
   title: string;
+  /** A chip beside the title, such as the beta marker. */
+  tag?: ReactNode;
   note?: ReactNode;
   searchText: string;
   body: ReactNode;
@@ -361,7 +367,7 @@ export function SettingsBlocks({
     <>
       {visible.map((block) => (
         <section key={block.id} className="flex flex-none flex-col">
-          <SectionHeader label={block.title} note={block.note} />
+          <SectionHeader label={block.title} tag={block.tag} note={block.note} />
           {block.kind === "section" ? (
             <FieldRows fields={block.fields} />
           ) : null}

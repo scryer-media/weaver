@@ -1126,4 +1126,6 @@ export const nextIt: LocaleDictionary = {
   "next.system.kernel.rarCrc32": "CRC32 RAR",
   "next.system.kernel.rarSha1": "SHA-1 RAR",
   "next.system.kernel.rarAes": "Decrittazione RAR",
+  "next.proxies.betaNotice": "I proxy sono in beta. Prova ogni profilo prima di instradarvi un provider o un feed.",
+  "next.routing.betaNotice": "L’instradamento tramite proxy è in beta. Prova i proxy di questo percorso prima di farci affidamento.",
 };

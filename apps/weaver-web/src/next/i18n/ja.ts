@@ -1126,4 +1126,6 @@ export const nextJa: LocaleDictionary = {
   "next.system.kernel.rarCrc32": "RAR CRC32",
   "next.system.kernel.rarSha1": "RAR SHA-1",
   "next.system.kernel.rarAes": "RAR 復号",
+  "next.proxies.betaNotice": "プロキシはベータ版です。プロバイダーやフィードを経由させる前に、各プロファイルをテストしてください。",
+  "next.routing.betaNotice": "プロキシルーティングはベータ版です。このルートに頼る前に、ルート上のプロキシをテストしてください。",
 };

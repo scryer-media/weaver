@@ -11,7 +11,7 @@ import {
   type RoutingPolicy,
   type RoutingStatus,
 } from "@/lib/proxies";
-import { Square } from "./chrome";
+import { BetaTag, Square } from "./chrome";
 import { SecondaryButton, Select, Toggle } from "./controls";
 import { Icon } from "./icons";
 import { WV } from "../data/palette";
@@ -39,6 +39,11 @@ export function RoutingEditor({
 
   return (
     <div className="flex w-full flex-col gap-3">
+      <div className="flex items-center gap-2 text-[12px] text-wv-warn">
+        <BetaTag />
+        <span className="max-w-[300px] min-w-0">{t("next.routing.betaNotice")}</span>
+      </div>
+
       {error ? (
         <div className="font-wv-mono text-[11.5px] text-wv-error-text">
           {t("next.routing.profilesUnreadable")}

@@ -75,6 +75,7 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "proxies",
     label: "next.settings.panel.proxies",
     note: "next.settings.panel.proxiesNote",
+    tag: "beta",
     icon: "proxies",
     Component: ProxiesPanel,
   },
