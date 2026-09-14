@@ -3032,6 +3032,40 @@ async fn auth_status_handler_uses_cached_auth_state() {
 }
 
 #[tokio::test]
+async fn a_trusted_network_is_not_signed_in_once_a_login_exists() {
+    let security = weaver_server_core::security::RuntimeSecurityConfig::default();
+    security.apply_stored_trust(Some("login_required"), None);
+    security.set_trusted_cidrs(vec!["192.168.1.0/24".parse().unwrap()]);
+    let lan_browser = "192.168.1.20:49152";
+
+    let before_login = auth_status_payload(auth_status_test_router_from_peer(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+        security.clone(),
+        lan_browser,
+    ))
+    .await;
+    assert_eq!(before_login["enabled"], false);
+    assert_eq!(before_login["authenticated"], true);
+
+    let auth_cache = LoginAuthCache::default();
+    auth_cache.replace(Some(CachedLoginAuth::new(
+        "admin",
+        "not-a-phc-hash",
+        jwt::generate_jwt_secret(),
+    )));
+    let after_login = auth_status_payload(auth_status_test_router_from_peer(
+        Database::open_in_memory().unwrap(),
+        auth_cache,
+        security,
+        lan_browser,
+    ))
+    .await;
+    assert_eq!(after_login["enabled"], true);
+    assert_eq!(after_login["authenticated"], false);
+}
+
+#[tokio::test]
 async fn auth_status_describes_the_deployment_only_while_setup_is_pending() {
     let payload = auth_status_payload(auth_status_test_router(
         Database::open_in_memory().unwrap(),
