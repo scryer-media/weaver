@@ -15,6 +15,7 @@ import { LoadingMark } from "@/lib/loading-mark";
 import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { BetaTag, Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
+import { Icon } from "../../../components/icons";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { RoutingEditor } from "../../../components/RoutingEditor";
 import { PrimaryButton, SecondaryButton, Toggle } from "../../../components/controls";
@@ -107,7 +108,16 @@ interface ServerForm {
   quotaResetTime: string;
   routing: RoutingPolicy;
   certificateDerBase64: string | null;
+  certificateFingerprint: string | null;
 }
+
+/**
+ * What a save says when the provider's certificate names another host. Saving
+ * probes the connection, and the probe's message is fixed English text, so the
+ * editor recognises it and runs a test, whose result carries the certificate
+ * to trust.
+ */
+const CERTIFICATE_NAME_MISMATCH = "certificate belongs to a different hostname";
 
 const EMPTY_QUOTA: ServerQuota = {
   enabled: false,
@@ -140,6 +150,7 @@ const NEW_SERVER: ServerForm = {
   quotaResetTime: "00:00",
   routing: directRouting,
   certificateDerBase64: null,
+  certificateFingerprint: null,
 };
 
 /** Labels are translation keys, resolved when the panel renders. */
@@ -235,6 +246,7 @@ function formToState(server: ServerDetails | Server, username: string): ServerFo
       "tlsNameMismatchCertificateDerBase64" in server
         ? server.tlsNameMismatchCertificateDerBase64
         : null,
+    certificateFingerprint: server.tlsNameMismatchCertificateFingerprint ?? null,
   };
 }
 
@@ -282,6 +294,7 @@ export function ProvidersPanel() {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<TestResult | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<Server | null>(null);
+  const [confirmTrust, setConfirmTrust] = useState<{ derBase64: string; fingerprint: string } | null>(null);
 
   // Only the single-server query carries the stored username; the list does not.
   const [{ data: detailsData }] = useQuery<{ server: ServerDetails | null }>({
@@ -386,23 +399,48 @@ export function ProvidersPanel() {
         : await updateServer({ id: editingId, input });
     setBusy(false);
     if (result.error) {
-      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      const message = result.error.graphQLErrors[0]?.message ?? result.error.message;
+      if (values.tls && !values.certificateDerBase64 && message.includes(CERTIFICATE_NAME_MISMATCH)) {
+        // Show the certificate the way a test does, so it can be trusted here.
+        await runTest();
+        return;
+      }
+      setError(message);
       return;
     }
     void reexecute({ requestPolicy: "network-only" });
     closeEditor();
   };
 
-  const runTest = async () => {
-    if (!values) {
+  const runTest = async (provider: ServerForm | null = values) => {
+    if (!provider) {
       return;
     }
     setTesting(true);
     setTestResult(null);
-    const result = await testConnection({ input: serverInput(values) });
+    setError(null);
+    const result = await testConnection({ input: serverInput(provider) });
     setTesting(false);
     setTestResult((result.data?.testConnection as TestResult) ?? null);
   };
+
+  const trust = () => {
+    if (!values || !confirmTrust) {
+      return;
+    }
+    const next = {
+      ...values,
+      certificateDerBase64: confirmTrust.derBase64,
+      certificateFingerprint: confirmTrust.fingerprint,
+    };
+    setConfirmTrust(null);
+    setForm(next);
+    // Test again with the certificate, so the result shows whether it connects now.
+    void runTest(next);
+  };
+
+  // A trusted certificate belongs to one host and port over TLS.
+  const forgetCertificate = { certificateDerBase64: null, certificateFingerprint: null };
 
   const remove = async () => {
     if (!confirmRemove) {
@@ -486,7 +524,7 @@ export function ProvidersPanel() {
                 kind: "text",
                 value: values.host,
                 placeholder: "news.example.com",
-                onChange: (next) => patch({ host: next }),
+                onChange: (next) => patch({ host: next, ...forgetCertificate }),
               },
             },
             {
@@ -497,7 +535,7 @@ export function ProvidersPanel() {
                 value: values.port,
                 min: 1,
                 max: 65535,
-                onChange: (next) => patch({ port: next }),
+                onChange: (next) => patch({ port: next, ...forgetCertificate }),
               },
             },
             {
@@ -507,7 +545,7 @@ export function ProvidersPanel() {
               control: {
                 kind: "toggle",
                 value: values.tls,
-                onChange: (next) => patch({ tls: next, port: next ? 563 : 119 }),
+                onChange: (next) => patch({ tls: next, port: next ? 563 : 119, ...forgetCertificate }),
               },
             },
             {
@@ -727,24 +765,35 @@ export function ProvidersPanel() {
                 {testResult.message}
               </span>
             </div>
-            <div className="font-wv-mono text-[11.5px] text-wv-muted">
-              {formatLatency(testResult.latencyMs)}
-              {testResult.supportsPipelining ? ` · ${t("next.providers.pipelining")}` : ""}
-              {testResult.tlsCipherSuite ? ` · ${shortCipher(testResult.tlsCipherSuite)}` : ""}
-            </div>
-            {testResult.adoptableTlsNameMismatchCertificate ? (
-              <div className="flex flex-wrap items-center gap-3 pt-1">
-                <span className="text-[12px] text-wv-warn">
+            {testResult.latencyMs === null ? null : (
+              <div className="font-wv-mono text-[11.5px] text-wv-muted">
+                {formatLatency(testResult.latencyMs)}
+                {testResult.supportsPipelining ? ` · ${t("next.providers.pipelining")}` : ""}
+                {testResult.tlsCipherSuite ? ` · ${shortCipher(testResult.tlsCipherSuite)}` : ""}
+              </div>
+            )}
+            {testResult.adoptableTlsNameMismatchCertificate && !values?.certificateDerBase64 ? (
+              <div className="flex flex-col gap-2 pt-1.5">
+                <span className="text-[12px] leading-[1.45] text-wv-warn">
                   {t("next.providers.certMismatch")}
+                </span>
+                <span className="font-wv-mono text-[11px] break-all text-wv-muted">
+                  {t("next.providers.certFingerprint", {
+                    fingerprint: testResult.adoptableTlsNameMismatchCertificate.sha256Fingerprint,
+                  })}
                 </span>
                 <SecondaryButton
                   icon="trust"
-                  onClick={() =>
-                    patch({
-                      certificateDerBase64:
-                        testResult.adoptableTlsNameMismatchCertificate?.derBase64 ?? null,
-                    })
-                  }
+                  className="self-start"
+                  onClick={() => {
+                    const certificate = testResult.adoptableTlsNameMismatchCertificate;
+                    if (certificate) {
+                      setConfirmTrust({
+                        derBase64: certificate.derBase64,
+                        fingerprint: certificate.sha256Fingerprint,
+                      });
+                    }
+                  }}
                 >
                   {t("next.providers.trustCert")}
                 </SecondaryButton>
@@ -752,7 +801,45 @@ export function ProvidersPanel() {
             ) : null}
           </div>
         ) : null}
+        {values?.certificateDerBase64 ? (
+          <div className="flex flex-none flex-col gap-1.5 border-t border-wv-hairline px-4 py-4 text-[12px] text-wv-muted sm:px-6">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span className="flex items-center gap-2">
+                <Icon name="trust" size={13} className="flex-none" />
+                {t("next.providers.certificateTrusted")}
+              </span>
+              <button
+                type="button"
+                onClick={() => patch(forgetCertificate)}
+                className="cursor-pointer text-wv-secondary underline underline-offset-2 hover:text-wv-fg"
+              >
+                {t("next.providers.forgetCertificate")}
+              </button>
+            </div>
+            {values.certificateFingerprint ? (
+              <span className="font-wv-mono text-[11px] break-all">
+                {t("next.providers.certFingerprint", { fingerprint: values.certificateFingerprint })}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
       </RecordEditor>
+
+      <ConfirmDialog
+        open={confirmTrust !== null}
+        title={t("next.providers.trustTitle")}
+        body={
+          <span className="flex flex-col gap-2.5">
+            <span>{t("next.providers.trustBody")}</span>
+            <span className="font-wv-mono text-[11px] break-all text-wv-muted">
+              {t("next.providers.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}
+            </span>
+          </span>
+        }
+        confirmLabel={t("next.providers.trustConfirm")}
+        onConfirm={trust}
+        onDismiss={() => setConfirmTrust(null)}
+      />
 
       <ConfirmDialog
         open={confirmRemove !== null}

@@ -580,14 +580,14 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-wv-muted">
                 <span className="flex items-center gap-2">
                   <Icon name="trust" size={13} className="flex-none" />
-                  {t("next.firstRun.provider.certificateTrusted")}
+                  {t("next.providers.certificateTrusted")}
                 </span>
                 <button
                   type="button"
                   onClick={() => patch({ certificate: null })}
                   className="cursor-pointer text-wv-secondary underline underline-offset-2 hover:text-wv-fg"
                 >
-                  {t("next.firstRun.provider.forgetCertificate")}
+                  {t("next.providers.forgetCertificate")}
                 </button>
               </div>
             ) : null}
@@ -597,16 +597,16 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
       </StepBody>
       <ConfirmDialog
         open={confirmTrust !== null}
-        title={t("next.firstRun.provider.trustTitle")}
+        title={t("next.providers.trustTitle")}
         body={
           <span className="flex flex-col gap-2.5">
-            <span>{t("next.firstRun.provider.trustBody")}</span>
+            <span>{t("next.providers.trustBody")}</span>
             <span className="font-wv-mono text-[11px] break-all text-wv-muted">
-              {t("next.firstRun.provider.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}
+              {t("next.providers.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}
             </span>
           </span>
         }
-        confirmLabel={t("next.firstRun.provider.trustConfirm")}
+        confirmLabel={t("next.providers.trustConfirm")}
         onConfirm={trust}
         onDismiss={() => setConfirmTrust(null)}
       />
@@ -644,7 +644,7 @@ function TestOutcome({
             {t("next.firstRun.provider.certMismatch")}
           </span>
           <span className="font-wv-mono text-[11px] break-all text-wv-muted">
-            {t("next.firstRun.provider.certFingerprint", { fingerprint: certificate.sha256Fingerprint })}
+            {t("next.providers.certFingerprint", { fingerprint: certificate.sha256Fingerprint })}
           </span>
           {trusted ? null : (
             <SecondaryButton icon="trust" onClick={onTrust} className="self-start">
