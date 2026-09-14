@@ -503,7 +503,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   mono: false,
-                  autoComplete: "username",
+                  secret: true,
                   value: enableForm.username,
                   onChange: (next) =>
                     setEnableForm((current) => ({ ...current, username: next })),
@@ -515,7 +515,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
-                  autoComplete: "new-password",
+                  secret: true,
                   value: enableForm.password,
                   onChange: (next) =>
                     setEnableForm((current) => ({ ...current, password: next })),
@@ -527,7 +527,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
-                  autoComplete: "new-password",
+                  secret: true,
                   value: enableForm.confirm,
                   onChange: (next) => setEnableForm((current) => ({ ...current, confirm: next })),
                 },
@@ -556,7 +556,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
-                  autoComplete: "current-password",
+                  secret: true,
                   value: passwordForm.current,
                   onChange: (next) =>
                     setPasswordForm((current) => ({ ...current, current: next })),
@@ -568,7 +568,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
-                  autoComplete: "new-password",
+                  secret: true,
                   value: passwordForm.next,
                   onChange: (next) => setPasswordForm((current) => ({ ...current, next })),
                 },
@@ -579,7 +579,7 @@ function LegacySecurityPanel() {
                 control: {
                   kind: "text",
                   type: "password",
-                  autoComplete: "new-password",
+                  secret: true,
                   value: passwordForm.confirm,
                   onChange: (next) =>
                     setPasswordForm((current) => ({ ...current, confirm: next })),

@@ -261,7 +261,7 @@ function LoginProtectionSection() {
                 value={newUsername}
                 onChange={(e) => setNewUsername(e.target.value)}
                 placeholder="admin"
-                autoComplete="username"
+                secret
               />
             </div>
             <div className="space-y-1.5">
@@ -271,7 +271,7 @@ function LoginProtectionSection() {
                 type="password"
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
-                autoComplete="new-password"
+                secret
               />
             </div>
             <div className="space-y-1.5">
@@ -281,7 +281,7 @@ function LoginProtectionSection() {
                 type="password"
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
-                autoComplete="new-password"
+                secret
               />
             </div>
             <Button onClick={handleEnable}>
@@ -300,7 +300,7 @@ function LoginProtectionSection() {
                   type="password"
                   value={currentPassword}
                   onChange={(e) => setCurrentPassword(e.target.value)}
-                  autoComplete="current-password"
+                  secret
                 />
               </div>
               <div className="space-y-1.5">
@@ -310,7 +310,7 @@ function LoginProtectionSection() {
                   type="password"
                   value={changeNewPassword}
                   onChange={(e) => setChangeNewPassword(e.target.value)}
-                  autoComplete="new-password"
+                  secret
                 />
               </div>
               <div className="space-y-1.5">
@@ -320,7 +320,7 @@ function LoginProtectionSection() {
                   type="password"
                   value={changeConfirmPassword}
                   onChange={(e) => setChangeConfirmPassword(e.target.value)}
-                  autoComplete="new-password"
+                  secret
                 />
               </div>
               <Button onClick={handleChangePassword} variant="secondary">
@@ -341,7 +341,7 @@ function LoginProtectionSection() {
                     type="password"
                     value={verificationPassword}
                     onChange={(event) => setVerificationPassword(event.target.value)}
-                    autoComplete="current-password"
+                    secret
                   />
                 </div>
                 <Button onClick={() => void verifyPassword()} disabled={verifying} variant="secondary">

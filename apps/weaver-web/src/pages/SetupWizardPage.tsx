@@ -225,7 +225,7 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
                 id="setup-username"
                 value={form.username}
                 onChange={(event) => form.setUsername(event.target.value)}
-                autoComplete="username"
+                secret
               />
             </div>
             <div className="space-y-2">
@@ -235,7 +235,7 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
                 type="password"
                 value={form.password}
                 onChange={(event) => form.setPassword(event.target.value)}
-                autoComplete="new-password"
+                secret
               />
             </div>
             <div className="space-y-2">
@@ -245,7 +245,7 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
                 type="password"
                 value={form.confirm}
                 onChange={(event) => form.setConfirm(event.target.value)}
-                autoComplete="new-password"
+                secret
               />
             </div>
             {form.passwordsDiffer ? (
@@ -261,7 +261,7 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
               id="setup-code"
               value={form.setupCode}
               onChange={(event) => form.setSetupCode(event.target.value)}
-              autoComplete="off"
+              secret
               autoCapitalize="characters"
               spellCheck={false}
               maxLength={SETUP_CODE_DISPLAY_LENGTH}

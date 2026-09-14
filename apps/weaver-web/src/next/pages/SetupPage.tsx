@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { BrandLockup, BrandMark } from "@/lib/brand";
+import { PASSWORD_MANAGER_IGNORE } from "@/lib/password-manager";
 import { SETUP_CODE_DISPLAY_LENGTH } from "@/lib/setup-code";
 import {
   BIND_CHOICES,
@@ -77,7 +78,7 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
               label="Username"
               value={form.username}
               onChange={form.setUsername}
-              autoComplete="username"
+              secret
               className="w-full"
             />
           </FormField>
@@ -89,7 +90,7 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
                 label="Password"
                 value={form.password}
                 onChange={form.setPassword}
-                autoComplete="new-password"
+                secret
                 className="w-full"
               />
             </FormField>
@@ -100,7 +101,7 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
                 label="Confirm password"
                 value={form.confirm}
                 onChange={form.setConfirm}
-                autoComplete="new-password"
+                secret
                 className="w-full"
               />
             </FormField>
@@ -119,7 +120,7 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
             id="setup-code"
             value={form.setupCode}
             onChange={(event) => form.setSetupCode(event.target.value)}
-            autoComplete="off"
+            {...PASSWORD_MANAGER_IGNORE}
             autoCapitalize="characters"
             spellCheck={false}
             maxLength={SETUP_CODE_DISPLAY_LENGTH}
