@@ -575,7 +575,6 @@ export const nextZh: LocaleDictionary = {
   "next.general.language": "语言",
   "next.general.languageHelp": "Weaver 界面的显示语言。仅对此浏览器生效。",
   "next.general.newInterface": "新界面",
-  "next.general.newInterfaceHelp": "关闭后此浏览器将回到经典界面并重新加载页面。",
   "next.general.interface": "界面",
   "next.general.downloads": "下载",
   "next.general.retries": "文章重试次数",

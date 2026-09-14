@@ -2,10 +2,12 @@ import { useEffect, useState, type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router";
 import { BrandLockup } from "@/lib/brand";
 import { useTranslate } from "@/lib/context/translate-context";
+import { setUiVariant } from "@/lib/ui-variant";
 import { cn } from "@/lib/utils";
 import { useNextData } from "../data/next-data";
 import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
+import { Toggle } from "../components/controls";
 import { Icon, type IconName } from "../components/icons";
 
 /**
@@ -170,6 +172,7 @@ export function NextShell({
       </div>
       {update === undefined ? null : <UpdateBlock version={update.version} url={update.url} />}
       <ThroughputBlock />
+      <InterfaceBlock />
     </>
   );
 
@@ -325,6 +328,41 @@ function ThroughputBlock() {
         }
       />
     </RailBlock>
+  );
+}
+
+/**
+ * The rail's last block: the sponsor link, then the switch back to the classic
+ * interface. Switching reloads the page, so the toggle only ever reads ON here.
+ */
+function InterfaceBlock() {
+  const t = useTranslate();
+  const label = t("next.general.newInterface");
+  return (
+    <div className="flex flex-none flex-col gap-[10px] border-t border-wv-line-strong px-5 py-[12px]">
+      <a
+        href="https://www.scryer.media/weaver/donate/"
+        target="_blank"
+        rel="noreferrer noopener"
+        className="flex items-center gap-[9px] text-[12.5px] text-wv-muted hover:text-wv-fg"
+      >
+        <Icon name="sponsor" size={14} className="flex-none text-wv-error" />
+        {t("nav.sponsor")}
+      </a>
+      <div className="flex items-center justify-between gap-3">
+        <span className="truncate text-[12.5px] text-wv-muted">{label}</span>
+        <Toggle
+          size="table"
+          checked
+          label={label}
+          onChange={(next) => {
+            if (!next) {
+              setUiVariant("classic");
+            }
+          }}
+        />
+      </div>
+    </div>
   );
 }
 

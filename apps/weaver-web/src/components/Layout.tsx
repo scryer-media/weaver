@@ -42,6 +42,8 @@ import { usePwa } from "@/lib/context/pwa-context";
 import { settingsNav } from "@/pages/settings/settings-nav";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import { setUiVariant } from "@/lib/ui-variant";
 import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
 import { UpdateNotificationLink } from "@/features/updates/update-notification-link";
 import {
@@ -165,6 +167,24 @@ function SponsorLink({ label }: { label: string }) {
       <Heart className="size-3.5 text-status-failed/70" aria-hidden="true" />
       <span>{label}</span>
     </a>
+  );
+}
+
+/** The switch to the new interface. Switching reloads the page, so it only ever reads off here. */
+function InterfaceSwitch({ label }: { label: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-[9px] px-2 py-1 text-[11.5px] font-medium text-muted-foreground/80">
+      <span className="truncate">{label}</span>
+      <Switch
+        checked={false}
+        onCheckedChange={(enabled) => {
+          if (enabled) {
+            setUiVariant("next");
+          }
+        }}
+        aria-label={label}
+      />
+    </div>
   );
 }
 
@@ -535,6 +555,7 @@ export function Layout() {
                   v{versionData.version}
                 </div>
               ) : null}
+              <InterfaceSwitch label={t("next.general.newInterface")} />
             </div>
           </div>
         </aside>
@@ -673,7 +694,10 @@ export function Layout() {
                 <FolderUp className="size-4" />
                 {t("nav.upload")}
               </Button>
-              <SponsorLink label={t("nav.sponsor")} />
+              <div className="flex flex-col gap-1">
+                <SponsorLink label={t("nav.sponsor")} />
+                <InterfaceSwitch label={t("next.general.newInterface")} />
+              </div>
             </div>
           </div>
         </SheetContent>

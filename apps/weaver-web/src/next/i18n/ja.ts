@@ -575,7 +575,6 @@ export const nextJa: LocaleDictionary = {
   "next.general.language": "言語",
   "next.general.languageHelp": "Weaver インターフェースの表示言語。このブラウザーにのみ適用されます。",
   "next.general.newInterface": "新しいインターフェース",
-  "next.general.newInterfaceHelp": "オフにすると、このブラウザーはクラシックインターフェースに戻り、ページを再読み込みします。",
   "next.general.interface": "インターフェース",
   "next.general.downloads": "ダウンロード",
   "next.general.retries": "記事の再試行",

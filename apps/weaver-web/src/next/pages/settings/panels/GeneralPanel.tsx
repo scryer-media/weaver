@@ -3,7 +3,6 @@ import { useMutation, useQuery } from "urql";
 import { SETTINGS_QUERY, UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
 import { useLanguageSettings, useTranslate } from "@/lib/context/translate-context";
 import { AVAILABLE_LANGUAGES } from "@/lib/i18n";
-import { setUiVariant } from "@/lib/ui-variant";
 import {
   DUPLICATE_ACTIONS,
   normalizeDuplicatePolicy,
@@ -19,11 +18,11 @@ import {
 } from "../framework";
 
 /**
- * General: everything the daemon keeps in `GeneralSettings`, plus the two
- * browser-local preferences (language and which interface this browser uses).
+ * General: everything the daemon keeps in `GeneralSettings`, plus the
+ * browser-local language preference.
  *
- * The daemon's fields are one draft saved by the top bar's Save; the two local
- * preferences apply the moment they change, so they never enter the draft.
+ * The daemon's fields are one draft saved by the top bar's Save; the language
+ * applies the moment it changes, so it never enters the draft.
  */
 
 interface GeneralSettings {
@@ -151,21 +150,6 @@ export function GeneralPanel() {
           label: language.label,
         })),
         onChange: setLanguagePreference,
-      },
-    },
-    {
-      id: "ui-variant",
-      label: t("next.general.newInterface"),
-      help: t("next.general.newInterfaceHelp"),
-      keywords: "classic theme appearance layout",
-      control: {
-        kind: "toggle",
-        value: true,
-        onChange: (next) => {
-          if (!next) {
-            setUiVariant("classic");
-          }
-        },
       },
     },
   ];

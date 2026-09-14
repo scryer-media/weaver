@@ -581,7 +581,6 @@ export const nextEn: LocaleDictionary = {
   "next.general.language": "Language",
   "next.general.languageHelp": "Display language for the Weaver interface. Applies to this browser only.",
   "next.general.newInterface": "New interface",
-  "next.general.newInterfaceHelp": "Turning this off returns this browser to the classic interface and reloads the page.",
   "next.general.interface": "Interface",
   "next.general.downloads": "Downloads",
   "next.general.retries": "Article retries",

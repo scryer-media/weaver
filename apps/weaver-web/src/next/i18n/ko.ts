@@ -575,7 +575,6 @@ export const nextKo: LocaleDictionary = {
   "next.general.language": "언어",
   "next.general.languageHelp": "Weaver 인터페이스의 표시 언어입니다. 이 브라우저에만 적용됩니다.",
   "next.general.newInterface": "새 인터페이스",
-  "next.general.newInterfaceHelp": "끄면 이 브라우저가 클래식 인터페이스로 돌아가고 페이지를 새로 고칩니다.",
   "next.general.interface": "인터페이스",
   "next.general.downloads": "다운로드",
   "next.general.retries": "기사 재시도",

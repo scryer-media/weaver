@@ -29,6 +29,7 @@ import {
   FolderPlus,
   FolderTree,
   Gauge,
+  Heart,
   History,
   KeyRound,
   ListRestart,
@@ -147,6 +148,7 @@ export const ICONS = {
   menu: Menu,
   update: CircleArrowUp,
   external: ExternalLink,
+  sponsor: Heart,
 
   // Affordances: what a control does when it is not a named action.
   dropdown: ChevronDown,
