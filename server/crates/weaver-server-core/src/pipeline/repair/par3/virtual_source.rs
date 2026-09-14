@@ -28,6 +28,17 @@ struct IdleReaders {
 
 const MAX_IDLE_READERS: usize = 16;
 
+/// Whether an idle reader's budget could satisfy the request that failed.
+fn reclaimable(error: &io::Error) -> bool {
+    budget::pressure_source(error).is_some()
+        || error.get_ref().is_some_and(|inner| {
+            inner.downcast_ref::<EngineError>().is_some_and(|error| {
+                matches!(error, EngineError::ResourceLimit(_))
+                    || budget::error_pressure_source(error).is_some()
+            })
+        })
+}
+
 impl ReaderCache {
     pub(super) fn clear(&self) -> EngineResult<()> {
         let mut cache = self
@@ -175,7 +186,19 @@ impl VirtualSource {
         self.options.cancel.check().map_err(io::Error::other)?;
         self.snapshot_checks.fetch_add(1, Ordering::Relaxed);
         for backing in &self.backing {
-            if backing.access.snapshot(self.source)? != backing.snapshot {
+            // A Windows snapshot opens the file to read its fence, so a spent
+            // handle budget reclaims idle readers here just as a new reader does.
+            let snapshot = loop {
+                match backing.access.snapshot(self.source) {
+                    Err(error) if reclaimable(&error) => {
+                        if !self.cache.evict()? {
+                            return Err(error);
+                        }
+                    }
+                    result => break result?,
+                }
+            };
+            if snapshot != backing.snapshot {
                 return Err(io::Error::other(EngineError::SourceChanged(self.source)));
             }
         }
@@ -204,15 +227,7 @@ impl VirtualSource {
         loop {
             match self.new_reader() {
                 Ok(reader) => return Ok((reader, epoch)),
-                Err(error)
-                    if budget::pressure_source(&error).is_some()
-                        || error.get_ref().is_some_and(|inner| {
-                            inner.downcast_ref::<EngineError>().is_some_and(|error| {
-                                matches!(error, EngineError::ResourceLimit(_))
-                                    || budget::error_pressure_source(error).is_some()
-                            })
-                        }) =>
-                {
+                Err(error) if reclaimable(&error) => {
                     if !self.cache.evict()? {
                         return Err(error);
                     }
@@ -329,8 +344,12 @@ impl SourceAccess for VirtualSource {
         let (mut reader, epoch) = self.reader()?;
         reader.inner.seek(SeekFrom::Start(offset))?;
         let count = reader.read(out)?;
-        self.check()?;
+        // Idle before the closing check: that check may need a handle, and
+        // under a spent budget this reader's may be the only ones to reclaim.
+        // A source found changed fails every later check before any read, so
+        // the reader it leaves behind never serves another byte.
         self.return_reader(reader, epoch)?;
+        self.check()?;
         Ok(count)
     }
 

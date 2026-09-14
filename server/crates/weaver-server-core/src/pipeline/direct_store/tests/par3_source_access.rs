@@ -6,6 +6,11 @@ use std::io::Read;
 
 const SOURCE: SourceId = SourceId(7);
 
+/// Handles a freshness check holds while it runs. On Windows it opens the
+/// backing file to read its fence, so an idle reader can keep only what leaves
+/// the check room.
+const SNAPSHOT_CHECK_HANDLES: usize = if cfg!(windows) { 1 } else { 0 };
+
 fn access(
     volume: super::super::provider::VirtualVolume,
     options: &ExecutionOptions,
@@ -208,6 +213,10 @@ fn par3_idle_cache_is_bounded_and_evicts_before_handle_fallback() {
         let fixture = provider_fixture(coverage);
         let mut options = ExecutionOptions::default();
         options.handles = HandleBudget::new(limit);
+        // Production pairs the ceiling with the per-open cap. Windows hashes a
+        // backing file through that cap as each source is built, and the
+        // default cap would already be spent by a full idle cache.
+        options.open_handles = limit;
         let cache = Arc::new(ReaderCache::default());
         let mut sources = Vec::new();
         for number in 0..20 {
@@ -225,7 +234,7 @@ fn par3_idle_cache_is_bounded_and_evicts_before_handle_fallback() {
             sources.push(source);
             assert_eq!(
                 options.handles.used(),
-                (sources.len().min(16) * 2).min(limit)
+                (sources.len().min(16) * 2).min((limit - SNAPSHOT_CHECK_HANDLES) / 2 * 2)
             );
         }
         // The oldest evicted publication can still reopen safely.
