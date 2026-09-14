@@ -16,6 +16,8 @@ export const nextEn: LocaleDictionary = {
   "next.nav.logs": "Logs",
   "next.shell.closeNavigation": "Close navigation",
   "next.shell.openNavigation": "Open navigation",
+  "next.shell.signOut": "Sign out",
+  "next.shell.signOutFailed": "Sign out failed",
   "next.shell.reconnectingPolling": "Reconnecting — polling",
   "next.shell.reconnecting": "Reconnecting",
   "next.shell.connected": "Connected",

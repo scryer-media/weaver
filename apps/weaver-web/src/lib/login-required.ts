@@ -30,6 +30,9 @@ function loginUrl(): string {
 
 /** Record a status answer; only a login this browser lacks changes anything. */
 export function noteAuthStatus(status: AuthStatus) {
+  if (typeof status.enabled === "boolean") {
+    noteLoginEnabled(status.enabled);
+  }
   if (required || !status.enabled || status.authenticated) {
     return;
   }
@@ -89,6 +92,40 @@ export function useLoginRequired(): boolean {
     subscribe,
     () => required,
     () => required,
+  );
+}
+
+/**
+ * Whether this server has a login at all, which is when there is something to
+ * sign out of. Known before the interface mounts, from the same status answer
+ * as `required`, and kept current by the security settings, which turn the
+ * login on and off from inside the running page.
+ */
+let loginEnabled = false;
+const loginEnabledListeners = new Set<() => void>();
+
+export function noteLoginEnabled(enabled: boolean) {
+  if (loginEnabled === enabled) {
+    return;
+  }
+  loginEnabled = enabled;
+  for (const listener of loginEnabledListeners) {
+    listener();
+  }
+}
+
+function subscribeLoginEnabled(listener: () => void) {
+  loginEnabledListeners.add(listener);
+  return () => {
+    loginEnabledListeners.delete(listener);
+  };
+}
+
+export function useLoginEnabled(): boolean {
+  return useSyncExternalStore(
+    subscribeLoginEnabled,
+    () => loginEnabled,
+    () => loginEnabled,
   );
 }
 

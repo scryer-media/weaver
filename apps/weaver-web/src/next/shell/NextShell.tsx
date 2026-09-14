@@ -2,6 +2,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router";
 import { BrandLockup } from "@/lib/brand";
 import { useTranslate } from "@/lib/context/translate-context";
+import { useLoginEnabled } from "@/lib/login-required";
+import { signOut } from "@/lib/logout";
 import { setUiVariant } from "@/lib/ui-variant";
 import { cn } from "@/lib/utils";
 import { useNextData } from "../data/next-data";
@@ -28,6 +30,9 @@ import { useSpeedLimitDialog, useSpeedLimitInForce } from "../features/SpeedLimi
  * Throughput is the one rail block that is not the screen's to choose: it is
  * pinned to the foot of the rail, outside the part that scrolls, so the download
  * speed is in the same place on every screen however long the rail above it is.
+ *
+ * Sign out is the top bar's counterpart: while a login exists it closes the
+ * right end of the bar on every screen, beside whatever header the screen drew.
  */
 
 interface NavEntry {
@@ -81,6 +86,7 @@ export function NextShell({
   const { version, update, queue, historyCount, connection } = useNextData();
   const [navOpen, setNavOpen] = useState(false);
   const { pathname } = useLocation();
+  const loginEnabled = useLoginEnabled();
 
   // Following a link out of the drawer should leave the drawer behind.
   useEffect(() => {
@@ -210,30 +216,35 @@ export function NextShell({
           )}
         </button>
 
-        {header ?? (
-          /*
-           * The vertical padding stays at every width. `min-h-14` already
-           * fixes the resting height, so on a single row the padding changes
-           * nothing — it only earns its keep once the controls wrap, where
-           * dropping it left the first row flush against the top edge.
-           */
-          <header className="flex min-h-14 flex-none flex-wrap items-center gap-x-4 gap-y-2 border-b border-wv-line-strong bg-wv-chrome py-2 pr-4 pl-12 sm:pr-6 lg:pl-6">
-            <div className="flex min-w-0 items-baseline gap-[10px]">
-              <h1 className="flex-none font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
-                {title}
-              </h1>
-              {titleTag}
-              {note === undefined ? null : (
-                <span className="hidden truncate font-wv-mono text-[11.5px] text-wv-muted sm:inline">
-                  {note}
-                </span>
-              )}
-            </div>
-            {controls === undefined ? null : (
-              <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-[10px] gap-y-2">{controls}</div>
+        <div className="flex flex-none">
+          <div className="min-w-0 flex-1">
+            {header ?? (
+              /*
+               * The vertical padding stays at every width. `min-h-14` already
+               * fixes the resting height, so on a single row the padding changes
+               * nothing — it only earns its keep once the controls wrap, where
+               * dropping it left the first row flush against the top edge.
+               */
+              <header className="flex min-h-14 flex-none flex-wrap items-center gap-x-4 gap-y-2 border-b border-wv-line-strong bg-wv-chrome py-2 pr-4 pl-12 sm:pr-6 lg:pl-6">
+                <div className="flex min-w-0 items-baseline gap-[10px]">
+                  <h1 className="flex-none font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
+                    {title}
+                  </h1>
+                  {titleTag}
+                  {note === undefined ? null : (
+                    <span className="hidden truncate font-wv-mono text-[11.5px] text-wv-muted sm:inline">
+                      {note}
+                    </span>
+                  )}
+                </div>
+                {controls === undefined ? null : (
+                  <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-[10px] gap-y-2">{controls}</div>
+                )}
+              </header>
             )}
-          </header>
-        )}
+          </div>
+          {loginEnabled ? <SignOutControl /> : null}
+        </div>
 
         {beforeContent}
 
@@ -272,6 +283,55 @@ export function NextShell({
             <span className="ml-auto truncate whitespace-nowrap text-right">{statusRight}</span>
           )}
         </footer>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Sign out, beside the title bar rather than inside it, so a screen that draws
+ * its own header keeps it too. It stretches to the header's height to carry the
+ * same bottom rule, and centres on the header's first row once the header's
+ * controls wrap onto a second.
+ */
+function SignOutControl() {
+  const t = useTranslate();
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const label = t("next.shell.signOut");
+  return (
+    <div className="flex flex-none flex-col border-b border-wv-line-strong bg-wv-chrome pr-4 sm:pr-6">
+      <div className="flex max-h-14 flex-1 items-center gap-3">
+        <span aria-hidden="true" className="hidden h-5 w-px bg-wv-line-strong sm:block" />
+        {failed ? (
+          <span role="alert" className="font-wv-mono text-[11px] whitespace-nowrap text-wv-error">
+            {t("next.shell.signOutFailed")}
+          </span>
+        ) : null}
+        <button
+          type="button"
+          title={label}
+          aria-label={label}
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            setFailed(false);
+            // Success leaves the page for the sign-in screen; only a refusal returns here.
+            signOut(document.baseURI).catch(() => {
+              setBusy(false);
+              setFailed(true);
+            });
+          }}
+          className={cn(
+            "flex h-8 items-center justify-center gap-[7px] border border-wv-control bg-wv-button px-[9px] text-[12.5px] font-medium whitespace-nowrap sm:px-3",
+            busy
+              ? "cursor-default text-wv-disabled"
+              : "cursor-pointer text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover",
+          )}
+        >
+          <Icon name="signOut" size={13} className="flex-none" />
+          <span className="hidden sm:inline">{label}</span>
+        </button>
       </div>
     </div>
   );

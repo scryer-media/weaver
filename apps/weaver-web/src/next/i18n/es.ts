@@ -10,6 +10,8 @@ export const nextEs: LocaleDictionary = {
   "next.nav.logs": "Registros",
   "next.shell.closeNavigation": "Cerrar navegación",
   "next.shell.openNavigation": "Abrir navegación",
+  "next.shell.signOut": "Cerrar sesión",
+  "next.shell.signOutFailed": "No se pudo cerrar sesión",
   "next.shell.reconnectingPolling": "Reconectando — sondeando",
   "next.shell.reconnecting": "Reconectando",
   "next.shell.connected": "Conectado",

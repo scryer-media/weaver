@@ -10,6 +10,8 @@ export const nextZh: LocaleDictionary = {
   "next.nav.logs": "日志",
   "next.shell.closeNavigation": "关闭导航",
   "next.shell.openNavigation": "打开导航",
+  "next.shell.signOut": "退出登录",
+  "next.shell.signOutFailed": "退出登录失败",
   "next.shell.reconnectingPolling": "正在重新连接 — 轮询中",
   "next.shell.reconnecting": "正在重新连接",
   "next.shell.connected": "已连接",

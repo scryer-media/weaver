@@ -10,6 +10,8 @@ export const nextFr: LocaleDictionary = {
   "next.nav.logs": "Journaux",
   "next.shell.closeNavigation": "Fermer la navigation",
   "next.shell.openNavigation": "Ouvrir la navigation",
+  "next.shell.signOut": "Se déconnecter",
+  "next.shell.signOutFailed": "Échec de la déconnexion",
   "next.shell.reconnectingPolling": "Reconnexion — interrogation périodique",
   "next.shell.reconnecting": "Reconnexion",
   "next.shell.connected": "Connecté",

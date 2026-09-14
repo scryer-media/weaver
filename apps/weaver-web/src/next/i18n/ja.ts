@@ -10,6 +10,8 @@ export const nextJa: LocaleDictionary = {
   "next.nav.logs": "ログ",
   "next.shell.closeNavigation": "ナビゲーションを閉じる",
   "next.shell.openNavigation": "ナビゲーションを開く",
+  "next.shell.signOut": "ログアウト",
+  "next.shell.signOutFailed": "ログアウトに失敗しました",
   "next.shell.reconnectingPolling": "再接続中 — ポーリング中",
   "next.shell.reconnecting": "再接続中",
   "next.shell.connected": "接続済み",

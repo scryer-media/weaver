@@ -14,6 +14,7 @@ import {
   SET_HTTP_BIND_ADDRESS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { noteLoginEnabled } from "@/lib/login-required";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Dialog } from "../../../components/Dialog";
@@ -114,6 +115,14 @@ export function SecurityPanel() {
   const [, deleteApiKey] = useMutation(DELETE_API_KEY_MUTATION);
 
   const login = loginData?.adminLoginStatus;
+  const loginEnabled = login?.enabled;
+
+  // The shell's sign-out button follows the login this panel turns on and off.
+  useEffect(() => {
+    if (loginEnabled !== undefined) {
+      noteLoginEnabled(loginEnabled);
+    }
+  }, [loginEnabled]);
   const bind = bindData?.httpBindAddress;
   const policy = policyData?.accessPolicy;
   const keys = keysData?.apiKeys ?? [];

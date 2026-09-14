@@ -10,6 +10,8 @@ export const nextPt: LocaleDictionary = {
   "next.nav.logs": "Logs",
   "next.shell.closeNavigation": "Fechar navegação",
   "next.shell.openNavigation": "Abrir navegação",
+  "next.shell.signOut": "Sair",
+  "next.shell.signOutFailed": "Não foi possível sair",
   "next.shell.reconnectingPolling": "Reconectando — consultando periodicamente",
   "next.shell.reconnecting": "Reconectando",
   "next.shell.connected": "Conectado",

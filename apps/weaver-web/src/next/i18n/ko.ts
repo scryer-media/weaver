@@ -10,6 +10,8 @@ export const nextKo: LocaleDictionary = {
   "next.nav.logs": "로그",
   "next.shell.closeNavigation": "탐색 닫기",
   "next.shell.openNavigation": "탐색 열기",
+  "next.shell.signOut": "로그아웃",
+  "next.shell.signOutFailed": "로그아웃하지 못했습니다",
   "next.shell.reconnectingPolling": "재연결 중 — 폴링 중",
   "next.shell.reconnecting": "재연결 중",
   "next.shell.connected": "연결됨",
