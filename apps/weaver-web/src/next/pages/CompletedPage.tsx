@@ -172,7 +172,7 @@ export function CompletedPage() {
   const t = useTranslate();
   const navigate = useNavigate();
   const statusLabel = useStatusLabel();
-  const { categories: configured } = useNextData();
+  const { categories: configured, refreshHistoryCount } = useNextData();
 
   const [tab, setTab] = useState<TabId>("all");
   const [sort, setSort] = useState<SortId>("newest");
@@ -242,10 +242,13 @@ export function CompletedPage() {
     setPageIndex(clampedPage);
   }
 
+  // The rail counts the same history, so whatever made this page read again
+  // (a drained delete, a bulk action) has changed its count too.
   const refresh = useCallback(() => {
     void reexecute({ requestPolicy: "network-only" });
     void reexecuteSample({ requestPolicy: "network-only" });
-  }, [reexecute, reexecuteSample]);
+    refreshHistoryCount();
+  }, [reexecute, reexecuteSample, refreshHistoryCount]);
 
   // Deletes run as background operations: rows handed to one stay on the page,
   // locked, until the last operation drains and the page is fetched again.
