@@ -653,7 +653,7 @@ export const nextZh: LocaleDictionary = {
   "next.schedules.newNote": "新计划",
   "next.schedules.remove": "删除计划",
   "next.schedules.when": "时间设定",
-  "next.schedules.timeHelp": "本地时间,24 小时制。",
+  "next.schedules.timeHelp": "本地时间。",
   "next.schedules.daysHelp": "不选任何一天即每天运行。",
   "next.schedules.whatHappens": "执行内容",
   "next.schedules.removeLimitInstead": "改为取消限速",

@@ -653,7 +653,7 @@ export const nextDe: LocaleDictionary = {
   "next.schedules.newNote": "neuer Zeitplan",
   "next.schedules.remove": "Zeitplan entfernen",
   "next.schedules.when": "Wann",
-  "next.schedules.timeHelp": "Ortszeit, 24 Stunden.",
+  "next.schedules.timeHelp": "Ortszeit.",
   "next.schedules.daysHelp": "Keinen Tag auswählen, um an allen Tagen auszuführen.",
   "next.schedules.whatHappens": "Was passiert",
   "next.schedules.removeLimitInstead": "Stattdessen Limit aufheben",

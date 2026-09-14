@@ -653,7 +653,7 @@ export const nextKo: LocaleDictionary = {
   "next.schedules.newNote": "새 일정",
   "next.schedules.remove": "일정 삭제",
   "next.schedules.when": "언제",
-  "next.schedules.timeHelp": "현지 시각, 24시간제.",
+  "next.schedules.timeHelp": "현지 시각.",
   "next.schedules.daysHelp": "요일을 하나도 선택하지 않으면 매일 실행합니다.",
   "next.schedules.whatHappens": "동작 내용",
   "next.schedules.removeLimitInstead": "대신 제한 해제",

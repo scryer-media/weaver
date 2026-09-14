@@ -649,7 +649,10 @@ export function TextArea({
 
 /* --------------------------------------------------------------------- time */
 
-/** A 24-hour clock field — cap windows, quota resets, schedule edges. */
+/**
+ * A clock field — cap windows, quota resets, schedule edges. The browser draws it
+ * in the reader's own 12- or 24-hour style; the value is always `HH:MM`.
+ */
 export function TimeField({
   value,
   onChange,

@@ -653,7 +653,7 @@ export const nextEs: LocaleDictionary = {
   "next.schedules.newNote": "nueva programación",
   "next.schedules.remove": "Eliminar programación",
   "next.schedules.when": "Cuándo",
-  "next.schedules.timeHelp": "Hora local, formato de 24 horas.",
+  "next.schedules.timeHelp": "Hora local.",
   "next.schedules.daysHelp": "No marques ningún día para ejecutarla todos los días.",
   "next.schedules.whatHappens": "Qué ocurre",
   "next.schedules.removeLimitInstead": "Quitar el límite en su lugar",

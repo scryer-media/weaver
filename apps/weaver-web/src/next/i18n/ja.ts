@@ -653,7 +653,7 @@ export const nextJa: LocaleDictionary = {
   "next.schedules.newNote": "新しいスケジュール",
   "next.schedules.remove": "スケジュールを削除",
   "next.schedules.when": "いつ",
-  "next.schedules.timeHelp": "現地時刻、24 時間表記。",
+  "next.schedules.timeHelp": "現地時刻。",
   "next.schedules.daysHelp": "どの曜日も選ばなければ毎日実行します。",
   "next.schedules.whatHappens": "実行内容",
   "next.schedules.removeLimitInstead": "代わりに制限を解除",
