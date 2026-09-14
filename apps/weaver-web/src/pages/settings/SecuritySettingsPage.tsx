@@ -799,7 +799,14 @@ function AuthenticatedNetworkAccessSection({
             Listening now: <code>{status.bindAddress.address}</code>
           </div>
           <div className="mt-1 text-muted-foreground">
-            Saved for the next restart: <code>{storedListener}</code>
+            {status.bindAddress.source === "ENVIRONMENT" ? (
+              <>
+                Managed by <code>WEAVER_HTTP_BIND_ADDRESS</code>. The environment
+                override applies on restart; the saved address is ignored.
+              </>
+            ) : (
+              <>Saved for the next restart: <code>{storedListener}</code></>
+            )}
           </div>
         </div>
         <div className="space-y-2">

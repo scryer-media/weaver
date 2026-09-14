@@ -670,6 +670,11 @@ impl RuntimeSecurityConfig {
         self.authenticated_access_mode.load(Ordering::Relaxed)
     }
 
+    /// Whether the operator explicitly requested authenticated access at startup.
+    pub fn access_mode_env_pinned(&self) -> bool {
+        self.access_mode_env_pinned
+    }
+
     /// Resolve the authenticated policy after the settings table is readable.
     /// Environment has precedence; otherwise a missing legacy access setting
     /// is a fresh authenticated install and an explicit revision preserves a

@@ -50,7 +50,8 @@ pub struct BrowserSession {
 
 impl Database {
     /// Persist the explicit pending state before exposing first-run setup.
-    /// Callers must have independently established that this datastore is new.
+    /// Callers must independently establish a new datastore, an explicitly
+    /// requested credentialless legacy migration, or operator-authorized recovery.
     pub fn mark_initial_setup_pending(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {

@@ -84,7 +84,9 @@ pub(crate) async fn run(
             std::env::var("WEAVER_RESET_LOGIN").is_ok_and(|value| value == "1" || value == "true");
         if !has_credentials && (unconfigured_new_install || explicit_recovery) {
             db.mark_initial_setup_pending()?;
-        } else if has_credentials {
+        } else if !has_credentials {
+            prepare_credentialless_legacy_migration(&db, security.access_mode_env_pinned())?;
+        } else {
             // Bootstrap can complete a previously pending wizard. Clear its
             // eligibility before serving so later credential damage cannot
             // accidentally reopen first-run setup.
@@ -553,6 +555,112 @@ pub(crate) async fn run(
         ServeStop::Signal => Ok(()),
         // Unix re-execs in place, so on success this never returns.
         ServeStop::Restart => restart::restart_now().map_err(Into::into),
+    }
+}
+
+/// An explicit legacy migration may establish its first login with the startup
+/// code. Never infer that permission from missing credentials alone: a completed
+/// or unrecognized authenticated policy must continue to require recovery.
+fn prepare_credentialless_legacy_migration(
+    db: &Database,
+    explicit_migration: bool,
+) -> Result<(), weaver_server_core::StateError> {
+    use weaver_server_core::auth::repository::SETUP_COMPLETED_SETTING_KEY;
+    use weaver_server_core::security::SETTING_SECURITY_POLICY_REVISION;
+
+    if explicit_migration
+        && matches!(
+            db.get_setting(SETTING_SECURITY_POLICY_REVISION)?.as_deref(),
+            None | Some("legacy-v1")
+        )
+        && db.get_setting(SETUP_COMPLETED_SETTING_KEY)?.is_none()
+        && db.get_auth_credentials()?.is_none()
+    {
+        // This persists the authenticated revision and pending claim together,
+        // so a restart resumes setup even after the migration override is removed.
+        db.mark_initial_setup_pending()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::prepare_credentialless_legacy_migration;
+    use weaver_server_core::Database;
+    use weaver_server_core::auth::repository::{
+        SETUP_COMPLETED_SETTING_KEY, SETUP_PENDING_SETTING_KEY,
+    };
+    use weaver_server_core::security::{
+        AUTHENTICATED_POLICY_REVISION, SETTING_SECURITY_POLICY_REVISION,
+    };
+
+    #[test]
+    fn credentialless_legacy_migration_resumes_after_restart_without_override() {
+        for revision in [None, Some("legacy-v1")] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("migration.db");
+            {
+                let db = Database::open(&path).unwrap();
+                if let Some(revision) = revision {
+                    db.set_setting(SETTING_SECURITY_POLICY_REVISION, revision)
+                        .unwrap();
+                }
+                prepare_credentialless_legacy_migration(&db, true).unwrap();
+                assert!(db.get_setting(SETUP_PENDING_SETTING_KEY).unwrap().is_some());
+                assert!(db.get_auth_credentials().unwrap().is_none());
+            }
+            let db = Database::open(&path).unwrap();
+            prepare_credentialless_legacy_migration(&db, false).unwrap();
+            assert!(db.get_setting(SETUP_PENDING_SETTING_KEY).unwrap().is_some());
+            assert_eq!(
+                db.get_setting(SETTING_SECURITY_POLICY_REVISION)
+                    .unwrap()
+                    .as_deref(),
+                Some(AUTHENTICATED_POLICY_REVISION),
+            );
+        }
+    }
+
+    #[test]
+    fn missing_credentials_do_not_reopen_established_or_unknown_policy() {
+        for revision in [
+            None,
+            Some("legacy-v1"),
+            Some(AUTHENTICATED_POLICY_REVISION),
+            Some("unknown"),
+        ] {
+            for completed in [false, true] {
+                for explicit in [false, true] {
+                    let db = Database::open_in_memory().unwrap();
+                    if let Some(revision) = revision {
+                        db.set_setting(SETTING_SECURITY_POLICY_REVISION, revision)
+                            .unwrap();
+                    }
+                    if completed {
+                        db.set_setting(SETUP_COMPLETED_SETTING_KEY, "configured")
+                            .unwrap();
+                    }
+                    prepare_credentialless_legacy_migration(&db, explicit).unwrap();
+                    assert_eq!(
+                        db.get_setting(SETUP_PENDING_SETTING_KEY).unwrap().is_some(),
+                        explicit && !completed && matches!(revision, None | Some("legacy-v1")),
+                        "revision={revision:?}, completed={completed}, explicit={explicit}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn migration_retains_existing_credentials_without_opening_setup() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_auth_credentials("admin", "existing-hash").unwrap();
+        prepare_credentialless_legacy_migration(&db, true).unwrap();
+        assert!(db.get_setting(SETUP_PENDING_SETTING_KEY).unwrap().is_none());
+        assert_eq!(
+            db.get_auth_credentials().unwrap().unwrap().password_hash,
+            "existing-hash"
+        );
     }
 }
 

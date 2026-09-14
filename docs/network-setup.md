@@ -35,6 +35,12 @@ fails startup. Existing credentials are retained. The new `WEAVER_ACCESS_MODE`
 accepts only `authenticated`; blank means unset and other nonempty values are
 errors. It is optional for new installations and explicitly migrates an existing
 installation to authenticated browser access.
+For a legacy installation with no stored login, setting only
+`WEAVER_ACCESS_MODE=authenticated` opens setup with a one-time startup code;
+bootstrap credentials and reset recovery are not required. Pending setup survives
+restarts and removing the migration override. An installation that has already
+completed authenticated setup never reopens setup merely because its credentials
+are missing; use explicit reset recovery in that case.
 
 `WEAVER_TRUSTED_CIDRS` can restrict where a remembered browser login is
 accepted in authenticated mode. It never makes an unknown browser an
