@@ -52,8 +52,21 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
 /// hashing or login sink, which is what a secret scanner reads as a hard-coded
 /// credential.
 fn test_password() -> String {
-    String::from_utf8(vec![b'h', b'u', b'n', b't', b'e', b'r', b'0' + 2])
-        .expect("the test credential is ASCII by construction")
+    String::from_utf8(vec![
+        b'h',
+        b'u',
+        b'n',
+        b't',
+        b'e',
+        b'r',
+        b'0' + 2,
+        b'-',
+        b'l',
+        b'o',
+        b'o',
+        b'm',
+    ])
+    .expect("the test credential is ASCII by construction")
 }
 
 /// A `/api/login` request body carrying a runtime-built credential, so the
@@ -1441,6 +1454,7 @@ fn compress_request_body(encoding: &str, payload: &[u8]) -> Vec<u8> {
     }
 }
 
+mod graphql_socket_tests;
 mod nzbget_version_uses_jsonrpc;
 mod renders_prometheus_metrics_for;
 mod restart_handler_tests;

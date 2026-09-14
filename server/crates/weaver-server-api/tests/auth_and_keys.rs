@@ -157,7 +157,7 @@ async fn delete_nonexistent_api_key() {
 async fn enable_login() {
     let h = TestHarness::new().await;
     let resp = h
-        .execute(r#"mutation { enableLogin(username: "admin", password: "pass") }"#)
+        .execute(r#"mutation { enableLogin(username: "admin", password: "long-enough-pass") }"#)
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
@@ -194,7 +194,7 @@ async fn login_status_when_enabled() {
 
     // Enable login first.
     let resp = h
-        .execute(r#"mutation { enableLogin(username: "admin", password: "pass") }"#)
+        .execute(r#"mutation { enableLogin(username: "admin", password: "long-enough-pass") }"#)
         .await;
     assert_no_errors(&resp);
 
@@ -227,7 +227,7 @@ async fn disable_login() {
 
     // Enable first.
     let resp = h
-        .execute(r#"mutation { enableLogin(username: "admin", password: "pass") }"#)
+        .execute(r#"mutation { enableLogin(username: "admin", password: "long-enough-pass") }"#)
         .await;
     assert_no_errors(&resp);
 
@@ -250,7 +250,7 @@ async fn change_password_correct() {
 
     // Enable login.
     let resp = h
-        .execute(r#"mutation { enableLogin(username: "admin", password: "pass") }"#)
+        .execute(r#"mutation { enableLogin(username: "admin", password: "long-enough-pass") }"#)
         .await;
     assert_no_errors(&resp);
     let old_hash = h.db.get_auth_credentials().unwrap().unwrap().password_hash;
@@ -258,7 +258,7 @@ async fn change_password_correct() {
 
     // Change password.
     let resp = h
-        .execute(r#"mutation { changePassword(currentPassword: "pass", newPassword: "new") }"#)
+        .execute(r#"mutation { changePassword(currentPassword: "long-enough-pass", newPassword: "another-long-pass") }"#)
         .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
@@ -277,13 +277,13 @@ async fn change_password_wrong_current() {
 
     // Enable login.
     let resp = h
-        .execute(r#"mutation { enableLogin(username: "admin", password: "pass") }"#)
+        .execute(r#"mutation { enableLogin(username: "admin", password: "long-enough-pass") }"#)
         .await;
     assert_no_errors(&resp);
 
     // Try with wrong current password.
     let resp = h
-        .execute(r#"mutation { changePassword(currentPassword: "wrong", newPassword: "new") }"#)
+        .execute(r#"mutation { changePassword(currentPassword: "wrong", newPassword: "another-long-pass") }"#)
         .await;
     assert_has_errors(&resp);
     let err_msg = resp.errors[0].message.to_lowercase();
@@ -294,24 +294,57 @@ async fn change_password_wrong_current() {
 }
 
 #[tokio::test]
+async fn enable_login_short_password() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(r#"mutation { enableLogin(username: "admin", password: "seven77") }"#)
+        .await;
+    assert_has_errors(&resp);
+    assert_eq!(
+        resp.errors[0].message,
+        "password must be at least 8 characters"
+    );
+    assert!(h.db.get_auth_credentials().unwrap().is_none());
+    assert!(h.auth_cache.snapshot().is_none());
+}
+
+#[tokio::test]
 async fn change_password_empty_new() {
     let h = TestHarness::new().await;
 
     // Enable login.
     let resp = h
-        .execute(r#"mutation { enableLogin(username: "admin", password: "pass") }"#)
+        .execute(r#"mutation { enableLogin(username: "admin", password: "long-enough-pass") }"#)
         .await;
     assert_no_errors(&resp);
 
     // Try with empty new password.
     let resp = h
-        .execute(r#"mutation { changePassword(currentPassword: "pass", newPassword: "") }"#)
+        .execute(
+            r#"mutation { changePassword(currentPassword: "long-enough-pass", newPassword: "") }"#,
+        )
         .await;
     assert_has_errors(&resp);
     let err_msg = resp.errors[0].message.to_lowercase();
     assert!(
-        err_msg.contains("must not be empty"),
-        "expected 'must not be empty' in error: {err_msg}"
+        err_msg.contains("at least 8 characters"),
+        "expected 'at least 8 characters' in error: {err_msg}"
+    );
+
+    let old_hash = h.db.get_auth_credentials().unwrap().unwrap().password_hash;
+    let resp = h
+        .execute(
+            r#"mutation { changePassword(currentPassword: "long-enough-pass", newPassword: "seven77") }"#,
+        )
+        .await;
+    assert_has_errors(&resp);
+    assert_eq!(
+        resp.errors[0].message,
+        "password must be at least 8 characters"
+    );
+    assert_eq!(
+        h.db.get_auth_credentials().unwrap().unwrap().password_hash,
+        old_hash
     );
 }
 
@@ -321,7 +354,7 @@ async fn change_password_when_not_enabled() {
 
     // Try changing password without enabling login.
     let resp = h
-        .execute(r#"mutation { changePassword(currentPassword: "pass", newPassword: "new") }"#)
+        .execute(r#"mutation { changePassword(currentPassword: "long-enough-pass", newPassword: "another-long-pass") }"#)
         .await;
     assert_has_errors(&resp);
     let err_msg = resp.errors[0].message.to_lowercase();

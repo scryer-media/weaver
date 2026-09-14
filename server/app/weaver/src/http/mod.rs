@@ -177,6 +177,7 @@ pub async fn run_server(
         )
         .layer(cors);
     let app = routes::with_http_host_validation(app, host_security);
+    let app = routes::with_response_hardening(app);
 
     let addr = listener.local_addr()?;
     info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");

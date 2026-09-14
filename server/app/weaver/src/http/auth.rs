@@ -753,6 +753,9 @@ pub(super) async fn setup_handler(
                 "Administrator username and password are required.",
             );
         }
+        if let Err(error) = jwt::check_password_length(&password) {
+            return failure(StatusCode::BAD_REQUEST, "INVALID_PASSWORD", &error);
+        }
         let bind_pinned = !security.bind_address_source.is_editable();
         let bind_address = body
             .bind_address
@@ -947,6 +950,9 @@ pub(super) async fn setup_handler(
                     StatusCode::BAD_REQUEST,
                     "username and password are required for this access mode",
                 );
+            }
+            if let Err(error) = jwt::check_password_length(&password) {
+                return super::error_response(StatusCode::BAD_REQUEST, &error);
             }
             Some((username, password))
         }

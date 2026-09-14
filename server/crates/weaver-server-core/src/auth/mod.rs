@@ -6,7 +6,7 @@ pub mod service;
 
 pub use api_keys::{ApiKeyAuthRow, ApiKeyRow};
 pub use model::{ApiKeyCache, CachedLoginAuth, CallerScope, LoginAuthCache};
-pub use password::{hash_password, verify_password};
+pub use password::{MIN_PASSWORD_CHARS, check_password_length, hash_password, verify_password};
 pub use repository::{AuthCredentials, BrowserSession};
 pub use service::{
     Claims, JWT_TTL_SECS, JwtError, JwtSecretError, create_jwt, decode_jwt_secret,

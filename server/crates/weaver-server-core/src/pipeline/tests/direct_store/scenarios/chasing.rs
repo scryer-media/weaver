@@ -107,6 +107,78 @@ async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
     }
 }
 
+#[tokio::test]
+async fn rar_chase_settle_ignores_partial_topology_but_fences_reordered_parts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Disabled);
+    pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+        gate: DirectUnpackGate::Enabled,
+    });
+    // Only the first article is published. The worker remains behind coverage;
+    // the test exercises roster identity, not the contents of the second part.
+    let bytes = rar5_fixture_bytes("rar5_multifile_lz.rar");
+    let volumes = vec![
+        ("fixture.part1.rar".into(), bytes.clone()),
+        ("fixture.part2.rar".into(), bytes),
+    ];
+    let job_id = JobId(41954);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        direct_store_job_spec("Roster", &volumes),
+    )
+    .await;
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, "fixture")
+        .unwrap();
+    assert_eq!(coverage.part_count(), 2);
+    let armed = pipeline.direct_unpack.counters().armed;
+    let topology = crate::jobs::assembly::ArchiveTopology {
+        archive_type: crate::jobs::assembly::ArchiveType::Rar,
+        volume_map: std::collections::HashMap::from([("fixture.part1.rar".into(), 0)]),
+        complete_volumes: Default::default(),
+        expected_volume_count: Some(2),
+        members: Vec::new(),
+        unresolved_spans: Vec::new(),
+    };
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .set_archive_topology("fixture".into(), topology);
+    pipeline.settle_direct_unpack_after_download(job_id);
+    let survived = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, "fixture")
+        .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &coverage));
+    assert_eq!(pipeline.direct_unpack.counters().armed, armed);
+
+    // A true rebind changes ordered identities even when the count is equal.
+    pipeline
+        .rar_sets
+        .entry((job_id, "fixture".into()))
+        .or_default()
+        .volume_files = std::collections::BTreeMap::from([
+        (0, "fixture.part2.rar".into()),
+        (1, "fixture.part1.rar".into()),
+    ]);
+    pipeline.settle_direct_unpack_after_download(job_id);
+    let fenced = coverage.abort_reason().is_some();
+    pipeline.direct_unpack_shutdown("test teardown").await;
+    assert!(
+        survived,
+        "an incomplete topology must preserve the original chase"
+    );
+    assert!(
+        fenced,
+        "same-count reordering must invalidate the original mapping"
+    );
+}
+
 async fn drop_partial_chase(transfer_to_consumer: bool) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

@@ -8,6 +8,6 @@ pub use guards::{
 };
 pub use types::CallerIdentity;
 pub use weaver_server_core::auth::{
-    CachedLoginAuth, CallerScope, LoginAuthCache, generate_api_key, hash_api_key, hash_password,
-    verify_password,
+    CachedLoginAuth, CallerScope, LoginAuthCache, check_password_length, generate_api_key,
+    hash_api_key, hash_password, verify_password,
 };

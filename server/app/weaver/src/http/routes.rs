@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Extension, Request};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -140,7 +140,10 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .route("/readyz", get(super::health::readyz_handler))
         .merge(nzbget_rpc_routes)
         .route("/graphql", post(super::graphql::graphql_handler))
-        .route("/graphql/ws", get(super::graphql::ws_handler))
+        .route(
+            "/graphql/ws",
+            get(super::graphql::ws_handler::<weaver_server_api::WeaverSchema>),
+        )
         .route(
             "/api/jobs/{job_id}/nzb",
             get(super::jobs::job_nzb_download_handler),
@@ -234,6 +237,27 @@ pub(super) fn with_http_host_validation(router: Router, security: RuntimeSecurit
     router.layer(middleware::from_fn(move |req, next| {
         let security = Arc::clone(&host_security);
         async move { enforce_http_host(&security, req, next).await }
+    }))
+}
+
+/// Browser protections every response carries, including refusals: the UI is
+/// never framed, content types are never sniffed, and paths under a base URL
+/// never leak to other sites through `Referer`.
+pub(super) fn with_response_hardening(router: Router) -> Router {
+    router.layer(middleware::from_fn(|req: Request, next: Next| async move {
+        let mut response = next.run(req).await;
+        let headers = response.headers_mut();
+        for (name, value) in [
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "same-origin"),
+        ] {
+            headers
+                .entry(name)
+                .or_insert(HeaderValue::from_static(value));
+        }
+        response
     }))
 }
 
@@ -339,6 +363,39 @@ mod tests {
         }
 
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_browser_hardening_headers() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = with_response_hardening(guarded_router(
+            RuntimeSecurityConfig::default(),
+            Arc::clone(&hits),
+        ));
+
+        for host in ["localhost:9090", "attacker.example.test"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(header::HOST, host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let headers = response.headers();
+            assert_eq!(
+                headers[header::CONTENT_SECURITY_POLICY],
+                "frame-ancestors 'none'",
+                "{host}"
+            );
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY", "{host}");
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{host}");
+            assert_eq!(headers[header::REFERRER_POLICY], "same-origin", "{host}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

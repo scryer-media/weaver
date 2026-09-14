@@ -1,4 +1,4 @@
-use async_graphql::{Data, futures_util::StreamExt};
+use async_graphql::{Data, Executor, futures_util::StreamExt};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::{
     ConnectInfo, Extension, WebSocketUpgrade,
@@ -7,6 +7,8 @@ use axum::extract::{
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use std::{net::SocketAddr, str::FromStr, time::Duration};
+use tokio::sync::watch;
+use weaver_server_core::security::HttpAuthority;
 
 use weaver_server_api::WeaverSchema;
 use weaver_server_core::auth::CallerScope;
@@ -194,8 +196,71 @@ pub(super) async fn graphql_handler(
     Ok(schema.execute(request).await.into())
 }
 
-pub(super) async fn ws_handler(
-    Extension(schema): Extension<WeaverSchema>,
+/// Whether the page that opened this socket is this application.
+///
+/// Browsers always send `Origin` on a socket upgrade and page scripts cannot
+/// forge it; a request without one is a machine client, which carries its own
+/// credential rather than riding on a browser's cookies.
+fn upgrade_origin_allowed(
+    auth: &super::RequestAuthContext,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> bool {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let Some(origin) = origins.next() else {
+        return true;
+    };
+    if origins.next().is_some() {
+        return false;
+    }
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let request_host = headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .and_then(|host| HttpAuthority::parse(host).ok());
+    let allowed =
+        auth.security
+            .is_websocket_origin_allowed(origin, request_host.as_ref(), peer, headers);
+    if !allowed {
+        tracing::warn!(
+            origin,
+            "refused a GraphQL socket opened from another origin; name this \
+             server's public host in WEAVER_HTTP_ALLOWED_HOSTS if a proxy rewrites Host"
+        );
+    }
+    allowed
+}
+
+/// Everything that can take a credential away, subscribed before the upgrade
+/// is authenticated so no change can slip between the check and the watch.
+struct RevocationWatch {
+    login: watch::Receiver<()>,
+    api_keys: watch::Receiver<()>,
+    trust: watch::Receiver<()>,
+}
+
+impl RevocationWatch {
+    fn subscribe(auth: &super::RequestAuthContext) -> Self {
+        Self {
+            login: auth.auth_cache.subscribe(),
+            api_keys: auth.api_key_cache.subscribe(),
+            trust: auth.security.subscribe_trust_changes(),
+        }
+    }
+
+    async fn changed(&mut self) {
+        tokio::select! {
+            _ = self.login.changed() => {}
+            _ = self.api_keys.changed() => {}
+            _ = self.trust.changed() => {}
+        }
+    }
+}
+
+pub(super) async fn ws_handler<E: Executor>(
+    Extension(schema): Extension<E>,
     Extension(request_auth): Extension<super::RequestAuthContext>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
@@ -203,13 +268,29 @@ pub(super) async fn ws_handler(
 ) -> Result<axum::response::Response, StatusCode> {
     let protocol = websocket_protocol(&headers)?;
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
+    // Authenticated sessions bind an exact Origin and CSRF token at init.
+    // Legacy browser sessions still need the upgrade Host/origin defense.
+    if !request_auth.security.authenticated_access_mode()
+        && !upgrade_origin_allowed(&request_auth, peer, &headers)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let changes = RevocationWatch::subscribe(&request_auth);
     Ok(ws
         .max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
         .protocols(async_graphql::http::ALL_WEBSOCKET_PROTOCOLS)
         .on_upgrade(move |socket| async move {
-            serve_authenticated_websocket(socket, schema, request_auth, peer, headers, protocol)
-                .await;
+            serve_authenticated_websocket(
+                socket,
+                schema,
+                request_auth,
+                peer,
+                headers,
+                protocol,
+                changes,
+            )
+            .await;
         })
         .into_response())
 }
@@ -228,13 +309,14 @@ fn websocket_protocol(
         .ok_or(StatusCode::BAD_REQUEST)
 }
 
-async fn serve_authenticated_websocket(
+async fn serve_authenticated_websocket<E: Executor>(
     mut socket: WebSocket,
-    schema: WeaverSchema,
+    schema: E,
     request_auth: super::RequestAuthContext,
     peer: Option<SocketAddr>,
     headers: HeaderMap,
     protocol: async_graphql::http::WebSocketProtocols,
+    mut changes: RevocationWatch,
 ) {
     let initial = match tokio::time::timeout(
         Duration::from_secs(10),
@@ -274,7 +356,17 @@ async fn serve_authenticated_websocket(
     {
         Ok(authorization) => authorization,
         Err(_) => {
-            close_unauthorized(&mut socket).await;
+            if request_auth.security.authenticated_access_mode() {
+                close_unauthorized(&mut socket).await;
+            } else {
+                // Preserve the legacy protocol's connection-init rejection.
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: 1002,
+                        reason: "Invalid authorization".into(),
+                    })))
+                    .await;
+            }
             return;
         }
     };
@@ -298,6 +390,12 @@ async fn serve_authenticated_websocket(
 
     loop {
         tokio::select! {
+            _ = changes.changed() => {
+                if !authorization.remains_active(&request_auth, peer).await {
+                    close_unauthorized(&mut socket).await;
+                    return;
+                }
+            }
             _ = recheck.tick() => {
                 if !authorization.remains_active(&request_auth, peer).await {
                     close_unauthorized(&mut socket).await;
@@ -370,7 +468,7 @@ async fn close_unauthorized(socket: &mut WebSocket) {
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
             code: 4403,
-            reason: "Unauthorized".into(),
+            reason: "Forbidden".into(),
         })))
         .await;
 }

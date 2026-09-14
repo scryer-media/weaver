@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { authHeaders } from "@/graphql/client";
+import { signOut } from "@/lib/logout";
 import {
   ACCESS_POLICY_QUERY,
   CHANGE_PASSWORD_MUTATION,
@@ -146,19 +147,11 @@ function LoginProtectionSection() {
 
   const handleLogout = async () => {
     setError(null);
+    setSuccess(null);
     try {
-      const response = await fetch(new URL("api/logout", document.baseURI), {
-        method: "POST",
-        headers: authHeaders(),
-        credentials: "include",
-      });
-      if (!response.ok) {
-        setError("Could not sign out. Try again.");
-        return;
-      }
-      window.location.assign(new URL(".", document.baseURI));
-    } catch {
-      setError("Could not reach Weaver to sign out. Try again.");
+      await signOut(document.baseURI, fetch, undefined, authHeaders());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Sign out failed");
     }
   };
 

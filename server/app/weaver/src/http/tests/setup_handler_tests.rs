@@ -223,6 +223,25 @@ async fn credentials_are_required_by_login_modes_and_refused_by_no_login() {
         let outcome = post_setup(app, serde_json::json!({ "mode": mode })).await;
         assert_eq!(outcome.status, StatusCode::BAD_REQUEST, "{mode}");
         assert_nothing_written(&db);
+
+        let db = Database::open_in_memory().unwrap();
+        let app = setup_test_router(
+            db.clone(),
+            LoginAuthCache::default(),
+            RuntimeSecurityConfig::default(),
+            loopback_peer(),
+        );
+        let outcome = post_setup(
+            app,
+            serde_json::json!({ "mode": mode, "username": "admin", "password": "short" }),
+        )
+        .await;
+        assert_eq!(outcome.status, StatusCode::BAD_REQUEST, "{mode}");
+        assert_eq!(
+            outcome.payload["error"], "password must be at least 8 characters",
+            "{mode}"
+        );
+        assert_nothing_written(&db);
     }
 
     // A password must never be silently collected and then ignored.
