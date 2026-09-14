@@ -334,7 +334,6 @@ export const nextZh: LocaleDictionary = {
   "next.job.report.cancelled": "下载已取消",
   "next.job.report.forgotten": "已忘记身份信息",
   "next.job.reprocess": "重新处理",
-  "next.job.thisJob": "该任务",
   "next.job.pipeline": "流水线",
   "next.job.outputFiles": "输出文件",
   "next.job.eventLog": "事件日志",

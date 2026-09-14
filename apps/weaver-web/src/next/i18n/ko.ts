@@ -334,7 +334,6 @@ export const nextKo: LocaleDictionary = {
   "next.job.report.cancelled": "다운로드 취소됨",
   "next.job.report.forgotten": "식별 정보를 지움",
   "next.job.reprocess": "다시 처리",
-  "next.job.thisJob": "이 작업",
   "next.job.pipeline": "파이프라인",
   "next.job.outputFiles": "출력 파일",
   "next.job.eventLog": "이벤트 로그",

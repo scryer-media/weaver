@@ -54,7 +54,6 @@ import { buildTimelineView, type JobTimelineData } from "../data/timeline";
 import { useNextData } from "../data/next-data";
 import { countLabel } from "../i18n/labels";
 import { NextShell, RailBlock } from "../shell/NextShell";
-import { JumpListBlock } from "../shell/rail-blocks";
 
 /**
  * One job, end to end.
@@ -451,19 +450,6 @@ export function JobDetailPage() {
             )}
           </div>
         </header>
-      }
-      railMiddle={
-        <JumpListBlock
-          eyebrow={t("next.job.thisJob")}
-          items={[
-            { id: "pipeline", label: t("next.job.pipeline"), meta: timeline?.stages.length ?? 0 },
-            { id: "files", label: t("next.job.outputFiles"), meta: files.length },
-            { id: "log", label: t("next.job.eventLog"), meta: events.length },
-            { id: "release", label: t("next.job.releaseDetails") },
-            { id: "metadata", label: t("next.job.metadata") },
-            { id: "providers", label: t("next.rail.providers"), meta: providers.length },
-          ]}
-        />
       }
       railFooter={
         <RailBlock eyebrow={t("next.job.savedBandwidth")}>

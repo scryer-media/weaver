@@ -334,7 +334,6 @@ export const nextDe: LocaleDictionary = {
   "next.job.report.cancelled": "Download abgebrochen",
   "next.job.report.forgotten": "Identität vergessen",
   "next.job.reprocess": "Neu verarbeiten",
-  "next.job.thisJob": "Dieser Job",
   "next.job.pipeline": "Pipeline",
   "next.job.outputFiles": "Ausgabedateien",
   "next.job.eventLog": "Ereignisprotokoll",

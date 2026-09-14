@@ -334,7 +334,6 @@ export const nextJa: LocaleDictionary = {
   "next.job.report.cancelled": "ダウンロードをキャンセルしました",
   "next.job.report.forgotten": "識別情報を削除しました",
   "next.job.reprocess": "再処理",
-  "next.job.thisJob": "このジョブ",
   "next.job.pipeline": "パイプライン",
   "next.job.outputFiles": "出力ファイル",
   "next.job.eventLog": "イベントログ",
