@@ -412,3 +412,93 @@ async fn settings_query_stays_responsive_during_update_settings_persist() {
         "/tmp/blocked"
     );
 }
+
+async fn first_run_pending(h: &TestHarness) -> bool {
+    let resp = h.execute("{ firstRunSetup { pending } }").await;
+    assert_no_errors(&resp);
+    response_data(&resp)["firstRunSetup"]["pending"]
+        .as_bool()
+        .unwrap()
+}
+
+async fn add_inactive_server(h: &TestHarness) -> u64 {
+    let resp = h
+        .execute(
+            r#"mutation { addServer(input: { host: "news.example.com", port: 119, tls: false, connections: 5, active: false }) { id } }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    response_data(&resp)["addServer"]["id"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn first_run_setup_stays_open_until_finished() {
+    let h = TestHarness::new().await;
+    assert!(first_run_pending(&h).await);
+
+    let resp = h
+        .execute("mutation { beginFirstRunSetup { pending } }")
+        .await;
+    assert_no_errors(&resp);
+    assert!(
+        response_data(&resp)["beginFirstRunSetup"]["pending"]
+            .as_bool()
+            .unwrap()
+    );
+
+    // The wizard's own first step adds a provider; a reload must not lose it.
+    let server_id = add_inactive_server(&h).await;
+    assert!(first_run_pending(&h).await);
+
+    let resp = h
+        .execute("mutation { finishFirstRunSetup { pending } }")
+        .await;
+    assert_no_errors(&resp);
+    assert!(!first_run_pending(&h).await);
+
+    // Nothing reopens a finished wizard, not even with every provider gone.
+    let resp = h
+        .execute(&format!(
+            "mutation {{ removeServer(id: {server_id}) {{ id }} }}"
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let resp = h
+        .execute("mutation { beginFirstRunSetup { pending } }")
+        .await;
+    assert_no_errors(&resp);
+    assert!(!first_run_pending(&h).await);
+}
+
+#[tokio::test]
+async fn first_run_setup_is_not_owed_by_an_install_with_a_provider() {
+    let h = TestHarness::new().await;
+    add_inactive_server(&h).await;
+    assert!(!first_run_pending(&h).await);
+
+    let resp = h
+        .execute("mutation { beginFirstRunSetup { pending } }")
+        .await;
+    assert_no_errors(&resp);
+    assert!(
+        !response_data(&resp)["beginFirstRunSetup"]["pending"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(h.db.get_setting("first_run_setup").unwrap(), None);
+}
+
+#[tokio::test]
+async fn first_run_setup_requires_admin() {
+    let h = TestHarness::new().await;
+    for query in [
+        "{ firstRunSetup { pending } }",
+        "mutation { finishFirstRunSetup { pending } }",
+    ] {
+        let resp = h.execute_as(query, CallerScope::Read).await;
+        assert!(
+            !resp.errors.is_empty(),
+            "{query} must refuse a read-scoped caller"
+        );
+    }
+}

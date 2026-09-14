@@ -29,6 +29,17 @@ impl SettingsQuery {
             .await,
         )
     }
+    /// Whether first-run setup is still owed to this install.
+    #[graphql(guard = "AdminGuard")]
+    async fn first_run_setup(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::first_run::FirstRunSetup> {
+        let db = ctx.data::<Database>()?;
+        let config = ctx.data::<SharedConfig>()?;
+        crate::settings::first_run::status(db, config).await
+    }
+
     #[graphql(guard = "AdminGuard")]
     async fn schedules(&self, ctx: &Context<'_>) -> Result<Vec<crate::settings::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();

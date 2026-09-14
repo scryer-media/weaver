@@ -1234,6 +1234,32 @@ export const UPDATE_SETTINGS_MUTATION = gql`
   ${ISP_BANDWIDTH_CAP_FIELDS}
 `;
 
+// --- First-run setup ---
+
+export const FIRST_RUN_SETUP_QUERY = gql`
+  query FirstRunSetup {
+    firstRunSetup {
+      pending
+    }
+  }
+`;
+
+export const BEGIN_FIRST_RUN_SETUP_MUTATION = gql`
+  mutation BeginFirstRunSetup {
+    beginFirstRunSetup {
+      pending
+    }
+  }
+`;
+
+export const FINISH_FIRST_RUN_SETUP_MUTATION = gql`
+  mutation FinishFirstRunSetup {
+    finishFirstRunSetup {
+      pending
+    }
+  }
+`;
+
 // --- API Keys ---
 
 export const API_KEYS_QUERY = gql`
