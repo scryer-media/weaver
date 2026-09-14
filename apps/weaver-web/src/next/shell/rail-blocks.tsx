@@ -202,28 +202,6 @@ export function UptimeBlock() {
   );
 }
 
-/** A rail footer block whose whole content is a path — Settings uses it. */
-export function PathBlock({
-  eyebrow,
-  path,
-  note,
-}: {
-  eyebrow: string;
-  path: string | null | undefined;
-  note?: string;
-}) {
-  return (
-    <RailBlock eyebrow={eyebrow}>
-      <div className="font-wv-mono text-[11px] leading-[1.5] break-all text-wv-tertiary">
-        {path || "—"}
-      </div>
-      {note === undefined ? null : (
-        <div className="font-wv-mono text-[10.5px] text-wv-faint">{note}</div>
-      )}
-    </RailBlock>
-  );
-}
-
 /**
  * The rail's contextual middle block on the list screens: the configured
  * categories, as facets.

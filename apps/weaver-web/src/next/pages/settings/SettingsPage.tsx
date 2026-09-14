@@ -1,10 +1,8 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router";
-import { useQuery } from "urql";
-import { SETTINGS_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { NextShell } from "../../shell/NextShell";
-import { PanelListBlock, PathBlock } from "../../shell/rail-blocks";
+import { PanelListBlock } from "../../shell/rail-blocks";
 import { useNextData } from "../../data/next-data";
 import { BetaTag, EmptyState } from "../../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
@@ -47,10 +45,6 @@ export function SettingsPage() {
     );
   }, []);
 
-  const [{ data: settingsData }] = useQuery<{ settings: { dataDir: string } }>({
-    query: SETTINGS_QUERY,
-  });
-
   const railItems = useMemo(
     () =>
       SETTINGS_PANELS.map((entry) => ({
@@ -85,9 +79,6 @@ export function SettingsPage() {
       titleTag={panel?.tag === "beta" ? <BetaTag /> : undefined}
       note={panel ? t(panel.note) : undefined}
       railMiddle={<PanelListBlock eyebrow={t("nav.settings")} items={railItems} />}
-      railFooter={
-        <PathBlock eyebrow={t("next.settings.dataDirectory")} path={settingsData?.settings?.dataDir} />
-      }
       statusRight={<span className={statusTone}>{statusRight}</span>}
       controls={
         <>
