@@ -12,6 +12,11 @@
 #[path = "tray_ipc.rs"]
 mod tray_ipc;
 
+// Only the desktop platforms link the shared wrapper. It reaches into
+// weaver-server-core, and on Linux that drags in C libraries built as GCC LTO
+// objects that the no-op binary below never calls; a static link whose LTO
+// inputs are all discarded fails outright. Tests still compile it everywhere.
+#[cfg(any(windows, target_os = "macos", test))]
 #[path = "tray/shared.rs"]
 mod shared;
 
