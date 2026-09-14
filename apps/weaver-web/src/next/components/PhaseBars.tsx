@@ -134,7 +134,10 @@ export function PhaseBars({
       ? [
           {
             key: "job",
-            percent: job.progress * 100,
+            // A finished job is whole even when it never needed every posted
+            // byte (repair blocks it had no use for), so it reads full rather
+            // than as a download that stopped short.
+            percent: view.status === "COMPLETE" ? 100 : job.progress * 100,
             color: statusColor(view.status),
             name: statusLabel(view.status),
             labelled: false,
