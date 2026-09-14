@@ -29,7 +29,6 @@ export const nextKo: LocaleDictionary = {
   "next.rail.addProvider": "공급자 추가",
   "next.rail.sinceRestart": "마지막 재시작 이후",
   "next.attention.title": "주의",
-  "next.attention.nothing": "주의가 필요한 항목 없음",
   "next.attention.overLimit": "{{server}}: 연결 한도 초과",
   "next.attention.backingOff": "{{time}}까지 대기",
   "next.attention.providerState": "{{host}}: {{state}}",

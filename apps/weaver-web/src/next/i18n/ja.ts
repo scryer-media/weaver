@@ -29,7 +29,6 @@ export const nextJa: LocaleDictionary = {
   "next.rail.addProvider": "プロバイダーを追加",
   "next.rail.sinceRestart": "前回の再起動から",
   "next.attention.title": "要確認",
-  "next.attention.nothing": "確認が必要な項目はありません",
   "next.attention.overLimit": "{{server}} が接続数の上限を超えています",
   "next.attention.backingOff": "{{time}} まで待機",
   "next.attention.providerState": "{{host}}: {{state}}",

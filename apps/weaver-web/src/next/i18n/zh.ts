@@ -29,7 +29,6 @@ export const nextZh: LocaleDictionary = {
   "next.rail.addProvider": "添加服务商",
   "next.rail.sinceRestart": "自上次重启以来",
   "next.attention.title": "需要关注",
-  "next.attention.nothing": "没有需要关注的事项",
   "next.attention.overLimit": "{{server}} 已超出连接数上限",
   "next.attention.backingOff": "退避至 {{time}}",
   "next.attention.providerState": "{{host}}：{{state}}",

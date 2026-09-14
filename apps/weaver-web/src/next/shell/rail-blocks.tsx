@@ -166,26 +166,24 @@ export function AttentionBlock() {
   const t = useTranslate();
   const items = useAttentionItems();
 
+  // An empty block is noise: the rail only speaks up when something is wrong.
+  if (items.length === 0) {
+    return null;
+  }
+
   return (
     <RailBlock eyebrow={t("next.attention.title")} position="middle" className="gap-3">
-      {items.length === 0 ? (
-        <div className="flex items-center gap-[9px] text-[12.5px] text-wv-muted">
-          <Square color={WV.accent} />
-          <span>{t("next.attention.nothing")}</span>
-        </div>
-      ) : (
-        items.map((item) => (
-          <div key={item.id} className="flex gap-[9px]">
-            <Square color={item.color} className="mt-[5px]" />
-            <div className="flex min-w-0 flex-col gap-1">
-              <div className="text-[12.5px] leading-[1.35] text-wv-secondary">{item.text}</div>
-              <div className="font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
-                {item.meta}
-              </div>
+      {items.map((item) => (
+        <div key={item.id} className="flex gap-[9px]">
+          <Square color={item.color} className="mt-[5px]" />
+          <div className="flex min-w-0 flex-col gap-1">
+            <div className="text-[12.5px] leading-[1.35] text-wv-secondary">{item.text}</div>
+            <div className="font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
+              {item.meta}
             </div>
           </div>
-        ))
-      )}
+        </div>
+      ))}
     </RailBlock>
   );
 }

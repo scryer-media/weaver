@@ -29,7 +29,6 @@ export const nextDe: LocaleDictionary = {
   "next.rail.addProvider": "Anbieter hinzufügen",
   "next.rail.sinceRestart": "seit dem letzten Neustart",
   "next.attention.title": "Hinweise",
-  "next.attention.nothing": "Keine offenen Hinweise",
   "next.attention.overLimit": "{{server}} hat sein Verbindungslimit überschritten",
   "next.attention.backingOff": "wartet bis {{time}}",
   "next.attention.providerState": "{{host}} ist {{state}}",

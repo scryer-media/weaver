@@ -35,7 +35,6 @@ export const nextEn: LocaleDictionary = {
   "next.rail.addProvider": "Add provider",
   "next.rail.sinceRestart": "since the last restart",
   "next.attention.title": "Attention",
-  "next.attention.nothing": "Nothing needs attention",
   "next.attention.overLimit": "{{server}} is over its connection limit",
   "next.attention.backingOff": "backing off until {{time}}",
   "next.attention.providerState": "{{host}} is {{state}}",
