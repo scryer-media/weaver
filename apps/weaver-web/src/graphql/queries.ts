@@ -739,6 +739,7 @@ export const LIVE_METRICS_QUERY = gql`
     }
     globalState: globalQueueState {
       isPaused
+      speedLimitBytesPerSec
       downloadBlock {
         ...DownloadBlockFields
       }
@@ -976,6 +977,7 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       }
       globalState {
         isPaused
+        speedLimitBytesPerSec
         downloadBlock {
           ...DownloadBlockFields
         }

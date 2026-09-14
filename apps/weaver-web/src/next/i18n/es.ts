@@ -18,6 +18,8 @@ export const nextEs: LocaleDictionary = {
   "next.shell.throughput": "Rendimiento",
   "next.shell.peak": "pico {{value}} {{unit}}",
   "next.shell.noTraffic": "aún sin tráfico",
+  "next.shell.limit": "límite {{value}} {{unit}}",
+  "next.shell.scheduledLimit": "límite programado {{value}} {{unit}}",
   "next.title.paused": "En pausa - Weaver",
   "next.title.speed": "{{speed}} - Weaver",
 

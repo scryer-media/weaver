@@ -9,6 +9,7 @@ import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
 import { Toggle } from "../components/controls";
 import { Icon, type IconName } from "../components/icons";
+import { useSpeedLimitDialog, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
 
 /**
  * The chrome every Next screen shares: a 236px rail, a 56px top bar, the
@@ -311,13 +312,37 @@ function UpdateBlock({ version, url }: { version: string; url: string }) {
   );
 }
 
+/**
+ * The download speed, with the speed limit a click away. A limit in force turns
+ * the button amber and adds a line under the peak, so a slow queue that is only
+ * doing as it was told says so.
+ */
 function ThroughputBlock() {
   const t = useTranslate();
   const { speed, peakSpeed } = useNextData();
+  const { inForce, bySchedule } = useSpeedLimitInForce();
+  const { openDialog, dialog } = useSpeedLimitDialog();
   const now = splitSpeed(speed);
   const peak = splitSpeed(peakSpeed);
+  const limit = splitSpeed(inForce);
+  const title = bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle");
   return (
-    <RailBlock eyebrow={t("next.shell.throughput")}>
+    <RailBlock>
+      <div className="flex items-center justify-between gap-2">
+        <Eyebrow tone="rail">{t("next.shell.throughput")}</Eyebrow>
+        <button
+          type="button"
+          onClick={openDialog}
+          title={title}
+          aria-label={title}
+          className={cn(
+            "-my-[6px] -mr-[6px] flex size-7 flex-none cursor-pointer items-center justify-center",
+            inForce > 0 ? "text-wv-warn" : "text-wv-muted hover:text-wv-fg",
+          )}
+        >
+          <Icon name="bandwidth" size={15} />
+        </button>
+      </div>
       <RailMetric
         value={now.value}
         unit={now.unit}
@@ -327,6 +352,15 @@ function ThroughputBlock() {
             : t("next.shell.noTraffic")
         }
       />
+      {inForce > 0 ? (
+        <div className="-mt-[4px] font-wv-mono text-[11px] text-wv-warn">
+          {t(bySchedule ? "next.shell.scheduledLimit" : "next.shell.limit", {
+            value: limit.value,
+            unit: limit.unit,
+          })}
+        </div>
+      ) : null}
+      {dialog}
     </RailBlock>
   );
 }

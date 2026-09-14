@@ -18,6 +18,8 @@ export const nextJa: LocaleDictionary = {
   "next.shell.throughput": "スループット",
   "next.shell.peak": "ピーク {{value}} {{unit}}",
   "next.shell.noTraffic": "まだ通信はありません",
+  "next.shell.limit": "制限 {{value}} {{unit}}",
+  "next.shell.scheduledLimit": "スケジュール制限 {{value}} {{unit}}",
   "next.title.paused": "一時停止 - Weaver",
   "next.title.speed": "{{speed}} - Weaver",
 

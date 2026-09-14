@@ -63,7 +63,7 @@ interface ProviderHoldoff {
 
 interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
-  globalState: { isPaused: boolean; downloadBlock: DownloadBlockState };
+  globalState: { isPaused: boolean; speedLimitBytesPerSec: number; downloadBlock: DownloadBlockState };
   providerHoldoffs?: ProviderHoldoff[];
 }
 
@@ -82,6 +82,8 @@ export interface NextData {
   /** Highest speed seen since the tab opened; the rail and stat strip both note it. */
   peakSpeed: number;
   isPaused: boolean;
+  /** The configured download ceiling in bytes per second; 0 is unlimited. */
+  speedLimit: number;
   downloadBlock: DownloadBlockState;
   queue: LiveQueue;
   /**
@@ -215,6 +217,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const globalState = snapshot?.globalState;
   const downloadBlock = globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK;
   const isPaused = globalState?.isPaused ?? false;
+  const speedLimit = globalState?.speedLimitBytesPerSec ?? 0;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
   const refreshCategories = useCallback(
     () => reexecuteCategories({ requestPolicy: "network-only" }),
@@ -243,6 +246,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       speed,
       peakSpeed: peakSpeedRef.current,
       isPaused,
+      speedLimit,
       downloadBlock,
       queue,
       categories,
@@ -270,6 +274,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       queue,
       refreshCategories,
       speed,
+      speedLimit,
       update,
       version,
     ],

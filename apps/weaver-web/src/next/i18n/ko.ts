@@ -18,6 +18,8 @@ export const nextKo: LocaleDictionary = {
   "next.shell.throughput": "처리량",
   "next.shell.peak": "최고 {{value}} {{unit}}",
   "next.shell.noTraffic": "아직 트래픽 없음",
+  "next.shell.limit": "제한 {{value}} {{unit}}",
+  "next.shell.scheduledLimit": "일정 제한 {{value}} {{unit}}",
   "next.title.paused": "일시정지 - Weaver",
   "next.title.speed": "{{speed}} - Weaver",
 

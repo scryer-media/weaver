@@ -18,6 +18,8 @@ export const nextZh: LocaleDictionary = {
   "next.shell.throughput": "吞吐量",
   "next.shell.peak": "峰值 {{value}} {{unit}}",
   "next.shell.noTraffic": "暂无流量",
+  "next.shell.limit": "限速 {{value}} {{unit}}",
+  "next.shell.scheduledLimit": "计划限速 {{value}} {{unit}}",
   "next.title.paused": "已暂停 - Weaver",
   "next.title.speed": "{{speed}} - Weaver",
 

@@ -18,6 +18,8 @@ export const nextIt: LocaleDictionary = {
   "next.shell.throughput": "Velocità",
   "next.shell.peak": "picco {{value}} {{unit}}",
   "next.shell.noTraffic": "ancora nessun traffico",
+  "next.shell.limit": "limite {{value}} {{unit}}",
+  "next.shell.scheduledLimit": "limite pianificato {{value}} {{unit}}",
   "next.title.paused": "In pausa - Weaver",
   "next.title.speed": "{{speed}} - Weaver",
 
