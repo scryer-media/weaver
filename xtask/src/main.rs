@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::{
@@ -2492,6 +2492,31 @@ fn forward_backend_sigaction() -> libc::sigaction {
     action
 }
 
+/// How the backend announces the code its first-run setup page asks for. It
+/// writes the line to stderr only, never to tracing.
+const SETUP_CODE_PREFIX: &str = "Weaver one-time setup code: ";
+
+fn parse_setup_code_line(line: &str) -> Option<&str> {
+    let (_, code) = line.split_once(SETUP_CODE_PREFIX)?;
+    let code = code.trim_end();
+    (code.len() == 64 && code.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(code)
+}
+
+/// The setup code a backend wrote to its log after `offset`. Skipping what
+/// came before keeps the bootstrap run's code, which died with it, out.
+fn read_setup_code(log_path: &Path, offset: u64) -> Result<Option<String>> {
+    let mut log = fs::File::open(log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    log.seek(SeekFrom::Start(offset))?;
+    let mut content = String::new();
+    log.read_to_string(&mut content)?;
+    Ok(content
+        .lines()
+        .rev()
+        .find_map(parse_setup_code_line)
+        .map(str::to_string))
+}
+
 fn tail_file(path: &Path, lines: usize) -> Result<String> {
     let content = fs::read_to_string(path).unwrap_or_default();
     let collected = content.lines().rev().take(lines).collect::<Vec<_>>();
@@ -2907,6 +2932,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         .create(true)
         .append(true)
         .open(&backend_log)?;
+    let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
     let mut backend = ctx.command(&backend_binary);
     configure_backend_process_group(&mut backend);
@@ -2934,12 +2960,19 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         return Err(error);
     }
 
+    // The backend prints the code while it builds its routes, so it is in the
+    // log by the time the backend answers.
+    let setup_code = read_setup_code(&backend_log, log_offset)?;
+
     println!("==> Weaver backend ready");
     println!("    Backend:  {backend_url}");
     println!("    Frontend: {frontend_url}");
     println!("    State:    {}", state_dir.display());
     println!("    Data:     {}", data_dir.display());
     println!("    Log:      tail -f {}", backend_log.display());
+    if let Some(code) = &setup_code {
+        println!("    Setup code: {code}");
+    }
     println!(
         "    Local agent API key (Admin): {}",
         local_agent_key_file.display()

@@ -617,3 +617,44 @@ fn release_hygiene_allows_repo_local_paths() {
 
     assert!(violations.is_empty());
 }
+
+#[test]
+fn setup_code_is_read_only_from_the_current_run() {
+    let stale = "a".repeat(64);
+    let current = "0123456789abcdef".repeat(4);
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("backend.log");
+    let bootstrap = format!("{SETUP_CODE_PREFIX}{stale}\n");
+    fs::write(
+        &log,
+        format!("{bootstrap}2026-09-14T00:00:00Z INFO starting\n{SETUP_CODE_PREFIX}{current}\n"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_setup_code(&log, bootstrap.len() as u64).unwrap(),
+        Some(current)
+    );
+    assert_eq!(
+        read_setup_code(&log, fs::metadata(&log).unwrap().len()).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn setup_code_line_must_carry_a_whole_code() {
+    let code = "f".repeat(64);
+    assert_eq!(
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}{code}\r")),
+        Some(code.as_str())
+    );
+    assert_eq!(
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}abc")),
+        None
+    );
+    assert_eq!(
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}{}", "g".repeat(64))),
+        None
+    );
+    assert_eq!(parse_setup_code_line("INFO listening"), None);
+}
