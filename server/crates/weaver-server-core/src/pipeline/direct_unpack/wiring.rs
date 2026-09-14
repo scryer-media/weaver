@@ -283,6 +283,8 @@ impl DirectUnpackCounters {
 /// One set currently being chased.
 struct ArmedSet {
     coverage: Arc<SetCoverage>,
+    paths: Vec<PathBuf>,
+    physical_rar: bool,
     virtual_source: Option<(usize, super::rar_virtual::VirtualRarInput)>,
     budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
     staging_dir: PathBuf,
@@ -751,7 +753,29 @@ impl Pipeline {
         ) {
             return;
         }
-        let mut parts = std::collections::BTreeMap::new();
+        let Ok(paths) = self.rar_chase_part_paths(job_id, set_name) else {
+            return;
+        };
+        if self
+            .direct_unpack_progress_floor(job_id, &paths[0])
+            .unwrap_or(0)
+            < SIGNATURE_HEADER_LEN
+        {
+            return;
+        }
+        self.arm_prepared_direct_unpack(job_id, set_name, paths, None, ChaseFormat::Rar);
+    }
+
+    /// Use the same complete roster when arming and settling. A RAR topology
+    /// refresh only describes volumes registered so far, not all declared input.
+    fn rar_chase_part_paths(&self, job_id: JobId, set_name: &str) -> Result<Vec<PathBuf>, String> {
+        let state = self.jobs.get(&job_id).ok_or("RAR job disappeared")?;
+        let mut filenames = std::collections::HashMap::new();
+        if let Some(set) = self.rar_sets.get(&(job_id, set_name.to_string())) {
+            for (volume, filename) in &set.volume_files {
+                filenames.insert(filename.clone(), *volume);
+            }
+        }
         for file in state.assembly.files() {
             let weaver_model::files::FileRole::RarVolume { volume_number } =
                 self.classified_role_for_file(job_id, file)
@@ -766,25 +790,21 @@ impl Pipeline {
                 continue;
             }
             let filename = self.current_filename_for_file(job_id, file);
-            let Some(path) = self.resolve_job_input_path(job_id, &filename) else {
-                return;
-            };
+            filenames.entry(filename).or_insert(volume_number);
+        }
+        let mut parts = std::collections::BTreeMap::new();
+        for (filename, volume_number) in filenames {
+            let path = self
+                .resolve_job_input_path(job_id, &filename)
+                .ok_or("RAR input path disappeared")?;
             if parts.insert(volume_number, path).is_some() {
-                return;
+                return Err("RAR volumes have conflicting indices".into());
             }
         }
         if parts.is_empty() || parts.keys().copied().ne(0..parts.len() as u32) {
-            return;
+            return Err("RAR volume roster is empty or noncontiguous".into());
         }
-        let paths: Vec<_> = parts.into_values().collect();
-        if self
-            .direct_unpack_progress_floor(job_id, &paths[0])
-            .unwrap_or(0)
-            < SIGNATURE_HEADER_LEN
-        {
-            return;
-        }
-        self.arm_prepared_direct_unpack(job_id, set_name, paths, None, ChaseFormat::Rar);
+        Ok(parts.into_values().collect())
     }
 
     /// Arm a set over an explicit ordered part list.
@@ -1068,6 +1088,8 @@ impl Pipeline {
             (job_id, set_name.to_string()),
             ArmedSet {
                 aborted_at: None,
+                paths: boost_paths.clone(),
+                physical_rar: matches!(format, ChaseFormat::Rar),
                 zombie_announced: false,
                 virtual_source,
                 coverage,
@@ -2138,7 +2160,17 @@ impl Pipeline {
             {
                 continue;
             }
-            let paths = match self.archive_set_part_paths(job_id, &set_name) {
+            let physical_rar = self
+                .direct_unpack
+                .armed
+                .get(&(job_id, set_name.clone()))
+                .is_some_and(|armed| armed.physical_rar);
+            let resolved = if physical_rar {
+                self.rar_chase_part_paths(job_id, &set_name)
+            } else {
+                self.archive_set_part_paths(job_id, &set_name)
+            };
+            let paths = match resolved {
                 Ok(paths) => paths,
                 Err(error) => {
                     // A chase whose set cannot be resolved is settling nothing
@@ -2152,6 +2184,15 @@ impl Pipeline {
                         pass = if pass == SettlePass::Strict { "strict" } else { "lenient" },
                         "direct unpack cannot resolve this set's parts to settle them"
                     );
+                    if physical_rar {
+                        self.direct_unpack_abort_set(
+                            job_id,
+                            &set_name,
+                            &error,
+                            AbortLatch::Retryable,
+                            DemotionReason::PartUnreadable,
+                        );
+                    }
                     continue;
                 }
             };
@@ -2161,14 +2202,13 @@ impl Pipeline {
             // with it, and every index past the old count would address a part
             // the chase never mapped. The chase describes a different set now,
             // so it stops and extraction reads the set as it actually is.
-            let armed_parts = self
+            let changed_parts = self
                 .direct_unpack
                 .armed
                 .get(&(job_id, set_name.clone()))
+                .filter(|armed| armed.paths != paths || armed.coverage.part_count() != paths.len())
                 .map(|armed| armed.coverage.part_count());
-            if let Some(armed_parts) = armed_parts
-                && armed_parts != paths.len()
-            {
+            if let Some(armed_parts) = changed_parts {
                 warn!(
                     job_id = job_id.0,
                     set_name,

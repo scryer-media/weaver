@@ -4022,7 +4022,7 @@ dependencies = [
 [[package]]
 name = "reedsolomon-rs"
 version = "0.4.5"
-source = "git+https://github.com/scryer-media/rarpar?rev=6e05d8a4534d1f44a274e33157ffee1cc93355d8#6e05d8a4534d1f44a274e33157ffee1cc93355d8"
+source = "git+https://github.com/scryer-media/rarpar?rev=df47ae697c19136c48800f197c6006f26d5461bb#df47ae697c19136c48800f197c6006f26d5461bb"
 dependencies = [
  "memmap2",
  "rayon",
@@ -5751,7 +5751,7 @@ dependencies = [
 [[package]]
 name = "unrar-rs"
 version = "0.10.5"
-source = "git+https://github.com/scryer-media/rarpar?rev=6e05d8a4534d1f44a274e33157ffee1cc93355d8#6e05d8a4534d1f44a274e33157ffee1cc93355d8"
+source = "git+https://github.com/scryer-media/rarpar?rev=df47ae697c19136c48800f197c6006f26d5461bb#df47ae697c19136c48800f197c6006f26d5461bb"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -5761,7 +5761,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs 0.4.5 (git+https://github.com/scryer-media/rarpar?rev=6e05d8a4534d1f44a274e33157ffee1cc93355d8)",
+ "reedsolomon-rs 0.4.5 (git+https://github.com/scryer-media/rarpar?rev=df47ae697c19136c48800f197c6006f26d5461bb)",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",

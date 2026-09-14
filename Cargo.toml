@@ -135,7 +135,7 @@ par3-rs = { version = "0.3.1", default-features = false }
 # from 3-4x the CPU of unrar to parity, and reopens the reconstructed last
 # volume for its padding trim instead of failing with EBADF.
 # Temporary benchmark pin for rarpar PR #72; reproducible without a local checkout.
-unrar-rs = { git = "https://github.com/scryer-media/rarpar", rev = "6e05d8a4534d1f44a274e33157ffee1cc93355d8", default-features = false, features = ["crypto-aws-lc"] }
+unrar-rs = { git = "https://github.com/scryer-media/rarpar", rev = "df47ae697c19136c48800f197c6006f26d5461bb", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
