@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { refreshSessionCookie } from "@/graphql/client";
+import { formatSetupCode } from "@/lib/setup-code";
 
 /**
  * First-run setup, shared by both interfaces' setup pages: the same choices,
@@ -264,8 +265,8 @@ export function useSetupForm(environment?: SetupEnvironment | null) {
     confirm,
     setConfirm,
     setupCode,
-    // Codes are capitals; show them that way however they are typed.
-    setSetupCode: (next: string) => setSetupCode(next.toUpperCase()),
+    // Show the code the way Weaver prints it, however it is typed.
+    setSetupCode: (next: string) => setSetupCode(formatSetupCode(next)),
     bindWide,
     setBindWide,
     error,

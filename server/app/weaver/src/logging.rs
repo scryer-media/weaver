@@ -6,6 +6,8 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::io::Write;
+use std::sync::OnceLock;
 
 use chrono::{DateTime, Local, SecondsFormat, TimeZone};
 use tracing_subscriber::fmt::format::Writer;
@@ -75,6 +77,91 @@ impl LogFormat {
             .and_then(Self::parse)
             .unwrap_or_default()
     }
+}
+
+static CONSOLE_FORMAT: OnceLock<LogFormat> = OnceLock::new();
+
+/// Records the format the console layers were built with, so output written
+/// outside tracing can match it.
+pub(crate) fn set_console_format(format: LogFormat) {
+    let _ = CONSOLE_FORMAT.set(format);
+}
+
+/// What to tell the operator next to a setup code.
+const SETUP_CODE_INSTRUCTIONS: &str = "Open Weaver in your browser and enter this code to create the administrator account. It works until setup finishes or Weaver restarts.";
+
+/// Prints the first-run setup code to stderr, in the console's log format.
+///
+/// The code goes around tracing on purpose: tracing also feeds the in-app log
+/// viewer and the log file, and neither should hold a live credential.
+pub(crate) fn announce_setup_code(code: &str) {
+    let format = CONSOLE_FORMAT.get().copied().unwrap_or_default();
+    let timestamp = render_timestamp(Local::now(), SecondsFormat::Micros);
+    let announcement = setup_code_announcement(code, format, &timestamp);
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(announcement.as_bytes());
+    let _ = stderr.flush();
+}
+
+/// The setup code announcement: a banner a person can't scroll past in text
+/// mode, one record shaped like the rest of the log in JSON mode. Both carry
+/// `SETUP_CODE_MARKER` directly before the code, which launchers look for.
+fn setup_code_announcement(code: &str, format: LogFormat, timestamp: &str) -> String {
+    use weaver_server_core::auth::SETUP_CODE_MARKER;
+
+    match format {
+        LogFormat::Json => {
+            let record = serde_json::json!({
+                "timestamp": timestamp,
+                "level": "WARN",
+                "fields": {
+                    "message": format!(
+                        "ACTION REQUIRED: {SETUP_CODE_MARKER}{code}. {SETUP_CODE_INSTRUCTIONS}"
+                    ),
+                    "setup_code": code,
+                },
+                "target": "weaver::setup",
+            });
+            format!("{record}\n")
+        }
+        LogFormat::Text => {
+            let mut rows = vec![
+                String::new(),
+                "FIRST-TIME SETUP: ACTION REQUIRED".to_string(),
+                String::new(),
+                format!("{SETUP_CODE_MARKER}{code}"),
+                String::new(),
+            ];
+            rows.extend(wrap_words(SETUP_CODE_INSTRUCTIONS, 56));
+            rows.push(String::new());
+            let width = rows.iter().map(String::len).max().unwrap_or(0) + 6;
+            let rule = "#".repeat(width + 2);
+            let mut banner = format!("\n{rule}\n");
+            for row in rows {
+                banner.push_str(&format!("#   {row:<inner$}#\n", inner = width - 3));
+            }
+            banner.push_str(&format!("{rule}\n\n"));
+            banner
+        }
+    }
+}
+
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.len() + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Colour policy for the stdout layer.
@@ -161,6 +248,44 @@ mod tests {
             LogFormat::Text
         );
         assert_eq!(LogFormat::parse("yaml"), None);
+    }
+
+    #[test]
+    fn setup_code_banner_is_boxed_and_launchers_can_find_the_code() {
+        use weaver_server_core::auth::find_setup_code;
+
+        let banner = setup_code_announcement("K7P-M2X", LogFormat::Text, "unused");
+        let rows: Vec<&str> = banner.lines().filter(|row| !row.is_empty()).collect();
+        let width = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == width), "{banner}");
+        assert!(rows[0].chars().all(|c| c == '#'));
+        assert!(banner.contains("FIRST-TIME SETUP: ACTION REQUIRED"));
+        assert_eq!(
+            banner
+                .lines()
+                .filter_map(find_setup_code)
+                .collect::<Vec<_>>(),
+            ["K7P-M2X"]
+        );
+    }
+
+    #[test]
+    fn setup_code_json_record_is_one_parseable_line() {
+        use weaver_server_core::auth::find_setup_code;
+
+        let record = setup_code_announcement("K7P-M2X", LogFormat::Json, "2026-09-14T12:00:00Z");
+        assert_eq!(record.lines().count(), 1);
+        let value: serde_json::Value = serde_json::from_str(record.trim_end()).expect("json");
+        assert_eq!(value["timestamp"], "2026-09-14T12:00:00Z");
+        assert_eq!(value["level"], "WARN");
+        assert_eq!(value["fields"]["setup_code"], "K7P-M2X");
+        assert!(
+            value["fields"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("ACTION REQUIRED: Weaver one-time setup code: K7P-M2X. ")
+        );
+        assert_eq!(find_setup_code(&record), Some("K7P-M2X"));
     }
 
     #[test]

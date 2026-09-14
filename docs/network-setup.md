@@ -16,8 +16,10 @@ services:
     restart: unless-stopped
 ```
 
-New installations require an administrator login. Weaver prints a six-character
-one-time setup code once at startup; enter it in the browser wizard. The code is valid
+New installations require an administrator login. Weaver prints a one-time setup
+code such as `K7P-M2X` once at startup, in a banner headed "FIRST-TIME SETUP:
+ACTION REQUIRED" (with JSON logging, a `WARN` record with a `setup_code` field).
+Enter it in the browser wizard; the hyphen is optional. The code is valid
 until setup succeeds or Weaver restarts and is never exposed by unauthenticated
 HTTP. Native launchers show the same code. For unattended setup, use bootstrap
 credentials:

@@ -651,8 +651,6 @@ pub(crate) struct ServerSupervisor {
     log_offset: u64,
 }
 
-const SETUP_CODE_PREFIX: &str = "Weaver one-time setup code: ";
-
 fn forward_server_stderr(stderr: impl Read, setup_code: Arc<Mutex<Option<String>>>) {
     let mut captured = false;
     for line in BufReader::new(stderr).lines() {
@@ -669,8 +667,7 @@ fn forward_server_stderr(stderr: impl Read, setup_code: Arc<Mutex<Option<String>
 }
 
 fn parse_setup_code_line(line: &str) -> Option<String> {
-    let code = line.strip_prefix(SETUP_CODE_PREFIX)?;
-    weaver_server_core::auth::is_setup_code(code).then(|| code.to_string())
+    weaver_server_core::auth::find_setup_code(line).map(str::to_string)
 }
 
 impl ServerSupervisor {
@@ -1080,22 +1077,23 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        HttpResponse, PopoverContent, QueueRow, SETUP_CODE_PREFIX, SMOKE_BODY, SMOKE_RESPONSE,
-        app_origin, app_url, decode_chunked, desktop_profile_dir_from, format_bytes, format_speed,
-        http_origin, is_weaver_document, last_logged_error, logged_error_message,
-        opens_in_external_browser, parse_http_response, parse_setup_code_line,
-        popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
+        HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
+        decode_chunked, desktop_profile_dir_from, format_bytes, format_speed, http_origin,
+        is_weaver_document, last_logged_error, logged_error_message, opens_in_external_browser,
+        parse_http_response, parse_setup_code_line, popover_content_from_graphql,
+        remove_desktop_profile, row_detail, set_cookie_value,
     };
 
     #[test]
     fn setup_code_parser_accepts_only_the_exact_marker() {
-        let code = "K7PM2X";
+        use weaver_server_core::auth::SETUP_CODE_MARKER;
+        let code = "K7P-M2X";
         assert_eq!(
-            parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}{code}")),
+            parse_setup_code_line(&format!("#   {SETUP_CODE_MARKER}{code}   #")),
             Some(code.to_string())
         );
         assert_eq!(
-            parse_setup_code_line("Weaver one-time setup code: short"),
+            parse_setup_code_line(&format!("{SETUP_CODE_MARKER}short")),
             None
         );
         assert_eq!(parse_setup_code_line("unrelated setup code"), None);

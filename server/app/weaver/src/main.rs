@@ -85,6 +85,7 @@ async fn async_main() {
         log_format_override.as_deref(),
         std::env::var_os(logging::LOG_FORMAT_ENV).as_ref(),
     );
+    logging::set_console_format(log_format);
     let log_color = LogColor::resolve(std::env::var_os(logging::LOG_COLOR_ENV).as_ref());
     let stdout_ansi = log_color.should_colour(
         std::io::stdout().is_terminal(),

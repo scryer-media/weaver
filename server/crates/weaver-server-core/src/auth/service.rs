@@ -61,34 +61,79 @@ pub fn generate_browser_session_secret() -> String {
 /// by eye from a terminal.
 pub const SETUP_CODE_ALPHABET: &[u8; 31] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
-/// Length of a first-run setup code. Six characters is about 30 bits, and the
-/// setup endpoint allows five wrong guesses a minute for the life of one
-/// process, which puts a guessed code centuries away.
+/// Characters a first-run setup code carries, not counting its hyphen. Six
+/// characters is about 30 bits, and the setup endpoint allows five wrong
+/// guesses a minute for the life of one process, which puts a guessed code
+/// centuries away.
 pub const SETUP_CODE_LENGTH: usize = 6;
 
-/// A short first-run setup code, uniform over `SETUP_CODE_ALPHABET`.
+/// The code is shown as two groups of three joined by a hyphen (`K7P-M2X`),
+/// so it is easy to read back and easy to spot in a log.
+const SETUP_CODE_GROUP: usize = SETUP_CODE_LENGTH / 2;
+
+/// The text that introduces a setup code wherever Weaver prints one. Launchers
+/// find the code by looking for it, so it must stay stable.
+pub const SETUP_CODE_MARKER: &str = "Weaver one-time setup code: ";
+
+/// A short first-run setup code, uniform over `SETUP_CODE_ALPHABET`, in its
+/// hyphenated display form.
 pub fn generate_setup_code() -> String {
     // Rejection sampling: 248 is the largest multiple of 31 in a byte, so
     // every accepted byte maps to a character with equal probability.
     let limit = (256 / SETUP_CODE_ALPHABET.len() * SETUP_CODE_ALPHABET.len()) as u8;
-    let mut code = String::with_capacity(SETUP_CODE_LENGTH);
+    let mut characters = Vec::with_capacity(SETUP_CODE_LENGTH);
     let mut bytes = [0u8; 16];
-    while code.len() < SETUP_CODE_LENGTH {
+    while characters.len() < SETUP_CODE_LENGTH {
         getrandom::fill(&mut bytes).expect("getrandom failed");
         for byte in bytes {
-            if byte < limit && code.len() < SETUP_CODE_LENGTH {
-                code.push(char::from(
-                    SETUP_CODE_ALPHABET[usize::from(byte) % SETUP_CODE_ALPHABET.len()],
-                ));
+            if byte < limit && characters.len() < SETUP_CODE_LENGTH {
+                characters.push(SETUP_CODE_ALPHABET[usize::from(byte) % SETUP_CODE_ALPHABET.len()]);
             }
         }
+    }
+    let mut code = String::with_capacity(SETUP_CODE_LENGTH + 1);
+    for (index, character) in characters.into_iter().enumerate() {
+        if index == SETUP_CODE_GROUP {
+            code.push('-');
+        }
+        code.push(char::from(character));
     }
     code
 }
 
-/// Whether `code` has the shape `generate_setup_code` produces.
+/// Whether `code` has the hyphenated shape `generate_setup_code` produces.
 pub fn is_setup_code(code: &str) -> bool {
-    code.len() == SETUP_CODE_LENGTH && code.bytes().all(|byte| SETUP_CODE_ALPHABET.contains(&byte))
+    let bytes = code.as_bytes();
+    bytes.len() == SETUP_CODE_LENGTH + 1
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if index == SETUP_CODE_GROUP {
+                *byte == b'-'
+            } else {
+                SETUP_CODE_ALPHABET.contains(byte)
+            }
+        })
+}
+
+/// The form a setup code is compared in: capitals, with the hyphen and any
+/// spacing dropped, so `k7p-m2x`, `K7PM2X` and `K7P M2X` are the same code.
+pub fn normalize_setup_code(input: &str) -> String {
+    input
+        .chars()
+        .filter(|character| *character != '-' && !character.is_whitespace())
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
+}
+
+/// The setup code a line announces, wherever in the line the announcement
+/// sits: a console banner row, or the message of a JSON record.
+pub fn find_setup_code(line: &str) -> Option<&str> {
+    let (_, rest) = line.split_once(SETUP_CODE_MARKER)?;
+    let code = rest.get(..SETUP_CODE_LENGTH + 1)?;
+    let whole = !rest[code.len()..]
+        .chars()
+        .next()
+        .is_some_and(|next| next.is_ascii_alphanumeric() || next == '-');
+    (is_setup_code(code) && whole).then_some(code)
 }
 
 /// Stable per-session CSRF value. Only a verifier is persisted; this value is

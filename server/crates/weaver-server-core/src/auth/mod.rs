@@ -10,7 +10,7 @@ pub use password::{MIN_PASSWORD_CHARS, check_password_length, hash_password, ver
 pub use repository::{AuthCredentials, BrowserSession};
 pub use service::{
     Claims, JWT_TTL_SECS, JwtError, JwtSecretError, SETUP_CODE_ALPHABET, SETUP_CODE_LENGTH,
-    create_jwt, decode_jwt_secret, derive_browser_csrf_token, encode_jwt_secret, generate_api_key,
-    generate_browser_session_secret, generate_jwt_secret, generate_setup_code, hash_api_key,
-    is_setup_code, verify_jwt,
+    SETUP_CODE_MARKER, create_jwt, decode_jwt_secret, derive_browser_csrf_token, encode_jwt_secret,
+    find_setup_code, generate_api_key, generate_browser_session_secret, generate_jwt_secret,
+    generate_setup_code, hash_api_key, is_setup_code, normalize_setup_code, verify_jwt,
 };

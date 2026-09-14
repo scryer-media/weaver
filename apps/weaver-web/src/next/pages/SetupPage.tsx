@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { BrandLockup } from "@/lib/brand";
+import { SETUP_CODE_DISPLAY_LENGTH } from "@/lib/setup-code";
 import {
   BIND_CHOICES,
   CONTAINER_BIND_NOTE,
@@ -125,8 +126,8 @@ export default function SetupPage({ environment }: { environment?: SetupEnvironm
             autoComplete="off"
             autoCapitalize="characters"
             spellCheck={false}
-            maxLength={6}
-            placeholder="······"
+            maxLength={SETUP_CODE_DISPLAY_LENGTH}
+            placeholder="···-···"
             className="h-[42px] w-[180px] border !border-wv-control bg-wv-input px-3 font-wv-mono text-[18px] tracking-[0.35em] text-wv-strong uppercase outline-none placeholder:text-wv-faint focus:!border-wv-control-focus"
           />
         </FormField>

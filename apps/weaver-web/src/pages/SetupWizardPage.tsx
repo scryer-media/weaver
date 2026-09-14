@@ -3,6 +3,7 @@ import { useMutation } from "urql";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SETUP_CODE_DISPLAY_LENGTH } from "@/lib/setup-code";
 import {
   SET_ACCESS_POLICY_MUTATION,
   SET_HTTP_BIND_ADDRESS_MUTATION,
@@ -263,7 +264,8 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
               autoComplete="off"
               autoCapitalize="characters"
               spellCheck={false}
-              maxLength={6}
+              maxLength={SETUP_CODE_DISPLAY_LENGTH}
+              placeholder="···-···"
               className="font-mono tracking-[0.3em]"
             />
             <p className="text-sm text-muted-foreground">

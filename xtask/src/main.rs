@@ -2493,13 +2493,26 @@ fn forward_backend_sigaction() -> libc::sigaction {
 }
 
 /// How the backend announces the code its first-run setup page asks for. It
-/// writes the line to stderr only, never to tracing.
+/// writes it to stderr only, never to tracing: a banner row in text logs, the
+/// message of one record in JSON logs. The code follows the marker as
+/// `K7P-M2X`.
 const SETUP_CODE_PREFIX: &str = "Weaver one-time setup code: ";
 
 fn parse_setup_code_line(line: &str) -> Option<&str> {
-    let (_, code) = line.split_once(SETUP_CODE_PREFIX)?;
-    let code = code.trim_end();
-    (code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_alphanumeric())).then_some(code)
+    let (_, rest) = line.split_once(SETUP_CODE_PREFIX)?;
+    let code = rest.get(..7)?;
+    let shaped = code.bytes().enumerate().all(|(index, byte)| {
+        if index == 3 {
+            byte == b'-'
+        } else {
+            byte.is_ascii_alphanumeric()
+        }
+    });
+    let whole = !rest[7..]
+        .bytes()
+        .next()
+        .is_some_and(|next| next.is_ascii_alphanumeric() || next == b'-');
+    (shaped && whole).then_some(code)
 }
 
 /// The setup code a backend wrote to its log after `offset`. Skipping what

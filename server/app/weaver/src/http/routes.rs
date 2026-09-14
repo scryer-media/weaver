@@ -96,8 +96,10 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             == Some("pending")
     {
         let (challenge, code) = super::setup_code::SetupChallenge::generate();
-        // Keep the code outside tracing and its browser-accessible log buffer.
-        eprintln!("Weaver one-time setup code: {code}");
+        crate::logging::announce_setup_code(&code);
+        tracing::warn!(
+            "first-time setup is waiting for the one-time setup code printed on the console (stderr)"
+        );
         Some(challenge)
     } else {
         None
