@@ -203,6 +203,19 @@ impl Pipeline {
         }
     }
 
+    /// Whether recovery acquisition for this job is still moving: a window's
+    /// articles are in the download pipeline, or the engine holds work for
+    /// the job — including the reassessment a drained window queues when it
+    /// retracts its in-flight declaration. While either is true, a window
+    /// that could not be admitted says nothing about whether recovery
+    /// remains; the retained view predates the retraction.
+    pub(in crate::pipeline) fn par3_recovery_in_progress(&self, job_id: JobId) -> bool {
+        self.par3_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.has_work(job_id))
+            || self.par3_batch_has_activity(job_id)
+    }
+
     pub(in crate::pipeline) fn promote_par3_recovery_window(
         &mut self,
         job_id: JobId,
@@ -379,18 +392,26 @@ impl Pipeline {
         // reassessment then subtracts it, so nothing already being fetched is
         // requested a second time. A refusal here costs deduplication, not
         // correctness, so it is recorded and the window still runs.
-        let spans: Vec<std::ops::Range<u64>> = {
-            let files: std::collections::BTreeSet<u32> =
-                selected.iter().map(|id| id.file_id.file_index).collect();
+        // Each carrier declares at most as many indices as articles this
+        // window took from it. Its advertised span bounds which indices those
+        // can be; it never stands in for the articles that were not admitted.
+        let carriers: Vec<(std::ops::Range<u64>, usize)> = {
+            let mut admitted: std::collections::BTreeMap<u32, usize> =
+                std::collections::BTreeMap::new();
+            for id in &selected {
+                *admitted.entry(id.file_id.file_index).or_default() += 1;
+            }
             let state = self.jobs.get(&job_id).expect("live job");
-            files
+            admitted
                 .into_iter()
-                .filter_map(|index| state.spec.files.get(index as usize))
-                .filter_map(|file| super::cohorts::volume_span(&file.filename))
+                .filter_map(|(index, count)| {
+                    let file = state.spec.files.get(index as usize)?;
+                    super::cohorts::volume_span(&file.filename).map(|span| (span, count))
+                })
                 .collect()
         };
         let runtime = self.par3_runtime.as_mut().expect("admitted job");
-        if let Err(error) = runtime.declare_recovery_in_flight(job_id, &spans) {
+        if let Err(error) = runtime.declare_recovery_in_flight(job_id, &carriers) {
             self.metrics
                 .par3
                 .note_admission_refused(super::outcome::admission_reason(&error));

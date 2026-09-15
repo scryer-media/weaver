@@ -704,29 +704,25 @@ impl Coordinator {
     /// deliver, so a reassessment taken while it is in flight does not ask for
     /// them again.
     ///
-    /// `spans` are the advertised index spans of the carriers this window
-    /// selected. Only indices the engine itself named as still wanted are
-    /// declared, and only where a selected carrier advertises them: a carrier
-    /// whose name says nothing declares nothing, which merely means those
-    /// indices stay askable.
+    /// `carriers` pairs each selected carrier's advertised index span with
+    /// how many of its articles this window admitted. Only indices the engine
+    /// itself named as still wanted are declared, only where a selected
+    /// carrier advertises them, and never more of one carrier's span than the
+    /// window will actually fetch from it: a carrier whose name says nothing
+    /// declares nothing, which merely means those indices stay askable.
     pub(in crate::pipeline) fn declare_recovery_in_flight(
         &mut self,
         job_id: JobId,
-        spans: &[std::ops::Range<u64>],
+        carriers: &[(std::ops::Range<u64>, usize)],
     ) -> EngineResult<()> {
-        if spans.is_empty() {
+        if carriers.is_empty() {
             return Ok(());
         }
         let declared: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)> = self
             .assessments(job_id)
             .flat_map(|(set, view)| {
                 view.requirements.iter().filter_map(move |need| {
-                    let indices: Vec<u64> = need
-                        .next_indices
-                        .iter()
-                        .copied()
-                        .filter(|index| spans.iter().any(|span| span.contains(index)))
-                        .collect();
+                    let indices = super::cohorts::declarable_indices(&need.next_indices, carriers);
                     (!indices.is_empty()).then_some((set, need.matrix, indices))
                 })
             })

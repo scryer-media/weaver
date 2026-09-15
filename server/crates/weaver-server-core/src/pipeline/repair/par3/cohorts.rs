@@ -153,6 +153,36 @@ impl CohortPlan {
     }
 }
 
+/// The indices a window may declare in flight: for each selected carrier,
+/// the lowest `admitted` still-wanted indices inside its advertised span,
+/// where `admitted` is how many of that carrier's articles the window took.
+///
+/// A carrier's span is an upper bound on what it holds, never a promise of
+/// what one window fetches from it. Declaring the whole span for a 32-article
+/// window would tell the engine every remaining index is on its way, its
+/// `outstanding` would drop to zero, and the next reassessment would find
+/// nothing left to ask for while most of the span was never requested. The
+/// count may still overshoot by the carrier's non-recovery packets; the
+/// window retracts everything it declared when it drains, so an overshoot
+/// costs one reassessment, never a block.
+pub(in crate::pipeline) fn declarable_indices(
+    next: &[u64],
+    carriers: &[(Range<u64>, usize)],
+) -> Vec<u64> {
+    let mut declared: Vec<u64> = Vec::new();
+    for (span, admitted) in carriers {
+        let fresh: Vec<u64> = next
+            .iter()
+            .copied()
+            .filter(|index| span.contains(index) && !declared.contains(index))
+            .take(*admitted)
+            .collect();
+        declared.extend(fresh);
+    }
+    declared.sort_unstable();
+    declared
+}
+
 fn intersect(left: &Range<u64>, right: &Range<u64>) -> Range<u64> {
     let start = left.start.max(right.start);
     let end = left.end.min(right.end);
@@ -414,6 +444,26 @@ mod tests {
         assert!(message.contains("cohort 1/2"), "{message}");
         assert!(!message.contains("cohort 0/2"), "{message}");
         assert!(message.contains("short 1"), "{message}");
+    }
+
+    #[test]
+    fn a_window_declares_only_as_many_indices_as_it_admitted_per_carrier() {
+        // 271 still wanted, all inside one 512-index carrier: a 32-article
+        // window declares 32, not the whole span.
+        let next: Vec<u64> = (511..782).collect();
+        let declared = declarable_indices(&next, &[(511..1023, 32)]);
+        assert_eq!(declared, (511..543).collect::<Vec<_>>());
+
+        // Two carriers in one window each contribute their own admitted
+        // count, indices outside every span are never declared, and a carrier
+        // with more articles than wanted indices declares only what exists.
+        let next: Vec<u64> = vec![1, 3, 5, 7, 9, 11, 40, 41];
+        let declared = declarable_indices(&next, &[(0..8, 2), (8..12, 5), (20..30, 3)]);
+        assert_eq!(declared, vec![1, 3, 9, 11]);
+
+        // No carrier, or no admitted articles, declares nothing.
+        assert!(declarable_indices(&next, &[]).is_empty());
+        assert!(declarable_indices(&next, &[(0..100, 0)]).is_empty());
     }
 
     #[test]

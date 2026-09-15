@@ -379,6 +379,16 @@ impl Pipeline {
             }
             RepairStatus::IncompleteMetadata | RepairStatus::NeedRecovery => {
                 if !self.promote_par3_recovery(job_id) {
+                    // No window could be admitted from the retained view. If
+                    // that view is about to be replaced — a drained window has
+                    // just retracted its in-flight indices and queued the
+                    // reassessment, or articles are still landing — the
+                    // verdict belongs to the next pass, not this one. Calling
+                    // it exhausted here would fail a job whose remaining
+                    // recovery simply has not been asked for yet.
+                    if self.par3_recovery_in_progress(job_id) {
+                        return true;
+                    }
                     // Donor search finds *source* blocks, which lower a
                     // cohort's `lost`; it never manufactures a recovery index.
                     // Running it is only worth a worker while some cohort that
