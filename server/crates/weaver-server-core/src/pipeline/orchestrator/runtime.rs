@@ -1419,15 +1419,32 @@ impl Pipeline {
         self.requeue_retry_work(work);
     }
 
+    /// Re-enters a retry that `note_retry_scheduled` booked, draining its
+    /// pending-retry counters before the work goes back on the queue.
     pub(crate) fn requeue_retry_work(&mut self, work: DownloadWork) {
+        self.note_retry_requeued(work.segment_id);
+        self.enqueue_download_work(work);
+    }
+
+    /// Queues download work that no scheduled retry stands behind.
+    ///
+    /// Leaves the pending-retry counters alone: those count retries still in
+    /// flight, and the pass-end gates read the job-wide one. Draining it here
+    /// for fresh work would cancel some other segment's real pending retry and
+    /// let the download pass end before that retry fires.
+    pub(crate) fn enqueue_download_work(&mut self, work: DownloadWork) {
         let job_id = work.segment_id.file_id.job_id;
         let segment_id = work.segment_id;
-        self.note_retry_requeued(segment_id);
         if self
             .jobs
             .get(&job_id)
             .is_none_or(|state| is_terminal_status(&state.status))
         {
+            debug!(
+                job_id = job_id.0,
+                segment = %segment_id,
+                "dropping download work for a job that is gone or terminal"
+            );
             return;
         }
         let completion_critical =

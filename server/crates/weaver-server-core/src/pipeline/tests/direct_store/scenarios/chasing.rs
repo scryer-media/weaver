@@ -446,3 +446,81 @@ async fn a_demotion_on_the_first_volume_leaves_the_rest_of_the_set_queued() {
         );
     }
 }
+
+/// A demotion's refetch must not drain a retry that is still in flight for
+/// another article of the job.
+///
+/// The refetch requeues the articles the deleted routed storage owned. Those
+/// are fresh work, not re-entering retries, so they must leave the pending-retry
+/// counters alone. Draining the job-wide counter for them cancels the real
+/// retry sleeping for a different article, the pass-end gate reads the job as
+/// having nothing left, and the job fails before that retry ever fires.
+#[tokio::test]
+async fn a_demotion_refetch_keeps_another_articles_scheduled_retry_pending() {
+    let volumes = demotion_fixture_volumes("Copper.Lantern.S02E03.mkv");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41972);
+    // Volume 2 never arrived: one of its articles was dispatched, failed, and
+    // is sleeping on its retry delay, out of the queue and booked as pending.
+    let retrying = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 2,
+        },
+        segment_number: 0,
+    };
+    let mut retry_work = None;
+
+    let (mut pipeline, _, _) =
+        demote_mid_download(&temp_dir, job_id, &volumes, |pipeline, working_dir| {
+            // No envelopes, so reconstruction has nothing to rebuild and the
+            // routed volumes' committed articles go back on the wire.
+            for volume_index in 0..2 {
+                std::fs::remove_file(
+                    working_dir.join(format!("silver.horizon.f0.vol{volume_index:05}.envelope")),
+                )
+                .unwrap();
+            }
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            let (mut taken, kept): (Vec<_>, Vec<_>) = state
+                .download_queue
+                .drain_all()
+                .into_iter()
+                .partition(|work| work.segment_id == retrying);
+            for work in kept {
+                state.download_queue.push(work);
+            }
+            retry_work = taken.pop();
+            pipeline.note_retry_scheduled(retrying);
+        })
+        .await;
+    let retry_work = retry_work.expect("the retrying article was queued");
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    for expected in [(0, 0), (0, 1), (1, 0)] {
+        assert!(
+            queued.contains(&expected),
+            "the refetch must requeue committed article {expected:?}, queue holds {queued:?}"
+        );
+    }
+    assert!(
+        !queued.contains(&(2, 0)),
+        "the retrying article is not the refetch's to requeue, queue holds {queued:?}"
+    );
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1),
+        "the refetch's fresh work must not drain the job's pending retry"
+    );
+    assert_eq!(
+        pipeline.pending_retries_by_segment.get(&retrying).copied(),
+        Some(1),
+        "the retrying article must still be booked as a pending retry"
+    );
+
+    // When the retry fires it drains its own booking and re-enters the queue.
+    pipeline.requeue_retry_work(retry_work);
+    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
+    assert!(!pipeline.pending_retries_by_segment.contains_key(&retrying));
+    assert!(peek_queued_segments(&mut pipeline, job_id).contains(&(2, 0)));
+}

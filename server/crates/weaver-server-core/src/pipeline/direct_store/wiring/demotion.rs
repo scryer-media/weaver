@@ -1081,7 +1081,7 @@ impl Pipeline {
             }
         }
         for item in work {
-            self.requeue_retry_work(item);
+            self.enqueue_download_work(item);
         }
     }
 
@@ -1176,7 +1176,7 @@ impl Pipeline {
             }
         }
         for item in work {
-            self.requeue_retry_work(item);
+            self.enqueue_download_work(item);
         }
     }
 }

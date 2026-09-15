@@ -989,7 +989,7 @@ impl Pipeline {
                 exclude_servers = ?work.exclude_servers,
                 "queued unverified segment for whole-file CRC recovery"
             );
-            self.requeue_retry_work(work);
+            self.enqueue_download_work(work);
         }
         self.update_queue_metrics();
         warn!(
