@@ -125,7 +125,7 @@ export function DangerButton({
         solid
           ? "!border-wv-error bg-wv-error text-wv-on-accent"
           : "!border-wv-danger-border bg-wv-button text-wv-error-text",
-        size === "compact" ? "h-8 px-3 text-[12.5px]" : "h-[34px] text-[13px]",
+        size === "compact" ? "h-8 px-3 text-[12.5px]" : "h-[34px] px-[14px] text-[13px]",
         disabled
           ? "cursor-default opacity-50"
           : solid
