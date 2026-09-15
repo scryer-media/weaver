@@ -195,6 +195,3 @@ processes. Never point this variable at an application database. The harness
 neither starts nor removes a container and reuses the repository's existing Go
 PostgreSQL driver. Run the same commands to select PostgreSQL; omit the variable
 to select SQLite.
-
-The current validation record, unavailable platform environments and outstanding
-optimized performance acceptance are in `docs/par3-integration-plan.md`.

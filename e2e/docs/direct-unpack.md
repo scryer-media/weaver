@@ -59,6 +59,3 @@ never discovered or changed.
 This small-payload matrix proves overlap and repair behavior. It does not
 replace the large ZIP64 (>4 GiB), archive parser, resource-limit, restart,
 multi-set PAR2 or full corpus suites.
-
-See the [2026-09-08 audit](direct-unpack-audit.md) for reproduced defects,
-fixes and validation limits.
