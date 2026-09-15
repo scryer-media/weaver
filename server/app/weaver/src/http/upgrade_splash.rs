@@ -7,6 +7,11 @@
 //! and how far the upgrade has got. The page polls, and reloads into Weaver
 //! when something other than this page answers.
 //!
+//! If Weaver stops answering instead -- an upgrade that failed ends the
+//! process -- the page turns into Weaver's error page, which waits for Weaver
+//! to answer again and offers a retry. It is carried inside the upgrade page
+//! because by then there is no server left to fetch it from.
+//!
 //! Nothing here is authenticated because nothing here is private: the page
 //! shows a count of migrations. Every non-page request is refused with 503, so
 //! an integration retries rather than mistaking the holding page for Weaver.
@@ -21,6 +26,8 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -40,6 +47,9 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 /// A stored address that cannot be read quickly is not worth delaying the
 /// page for; it falls back the same way an unreadable one does.
 const PEEK_TIMEOUT: Duration = Duration::from_secs(2);
+/// The colour mark and wordmark for a dark ground. Compiled in rather than
+/// served, because the error page shows it after the server has gone.
+const LOCKUP_SVG: &str = include_str!("../../../../../docs/img/weaver-lockup-on-dark.svg");
 
 /// The watcher, and the page once it is up. Stop it before the real server
 /// binds.
@@ -267,12 +277,20 @@ fn render_page(base_url: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     // `</` cannot end the script early once the slash is escaped.
-    let script_root = serde_json::to_string(&root)
-        .unwrap_or_else(|_| "\"\"".to_string())
-        .replace("</", "<\\/");
+    let script_string = |value: &str| {
+        serde_json::to_string(value)
+            .unwrap_or_else(|_| "\"\"".to_string())
+            .replace("</", "<\\/")
+    };
+    let lockup = format!(
+        "data:image/svg+xml;base64,{}",
+        BASE64_STANDARD.encode(LOCKUP_SVG)
+    );
     PAGE_TEMPLATE
+        .replace("{{lockup}}", &lockup)
         .replace("{{root}}", &attribute_root)
-        .replace("{{script_root}}", &script_root)
+        .replace("{{script_root}}", &script_string(&root))
+        .replace("{{script_base}}", &script_string(base_url))
 }
 
 const PAGE_TEMPLATE: &str = r##"<!doctype html>
@@ -293,16 +311,27 @@ body {
   font: 13px/1.6 "Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
 }
 main { display: flex; width: 100%; max-width: 420px; flex-direction: column; align-items: center; text-align: center; }
+main.error { max-width: 460px; }
 img { display: block; width: auto; height: 56px; user-select: none; }
+img.lockup { height: 28px; }
 h1 { margin: 28px 0 0; font: 600 22px/1.3 "Sora Variable", ui-sans-serif, system-ui, sans-serif; letter-spacing: -0.01em; }
+.error h1 { margin-top: 36px; }
 p { margin: 8px 0 0; color: #a09d96; }
 .meter { width: 100%; height: 2px; margin-top: 24px; background: #33343a; }
 .meter span { display: block; width: 0; height: 100%; background: #3fb39c; transition: width 400ms ease; }
 .note { margin-top: 20px; font-size: 12px; color: #84817a; }
+button {
+  height: 34px; margin-top: 24px; padding: 0 16px; border: 0; border-radius: 0; cursor: pointer;
+  background: #3fb39c; color: #10201c; font-family: inherit; font-size: 13px; font-weight: 500; line-height: 1;
+}
+button:hover { background: #52c4ad; }
+button:disabled { cursor: default; background: #2f8a78; }
+button:focus-visible { outline: 2px solid #3fb39c; outline-offset: 2px; }
+.error .note { min-height: 1.6em; margin-top: 12px; }
 </style>
 </head>
 <body>
-<main>
+<main id="page">
   <picture>
     <source media="(prefers-reduced-motion: reduce)" srcset="{{root}}/mark-still.webp">
     <img src="{{root}}/mark.webp" width="304" height="209" alt="" aria-hidden="true" draggable="false">
@@ -312,21 +341,65 @@ p { margin: 8px 0 0; color: #a09d96; }
   <div class="meter" aria-hidden="true"><span id="meter"></span></div>
   <p class="note">Leave Weaver running. This page opens it when the upgrade is done.</p>
 </main>
+<template id="error-page">
+  <main class="error">
+    <img class="lockup" src="{{lockup}}" alt="Weaver" draggable="false">
+    <h1>Weaver isn't responding</h1>
+    <p>Weaver stopped answering while it was starting up. It may still be on its way, or it may have stopped; its log says which.</p>
+    <button type="button" id="retry">Retry</button>
+    <p class="note" id="retry-status" role="status" aria-live="polite">This page opens Weaver as soon as it answers.</p>
+  </main>
+</template>
 <script>
 (function () {
   var root = {{script_root}};
+  var base = {{script_base}};
+  // How long Weaver may go unanswered before the page stops saying it is
+  // starting. The rest of startup runs after this page closes, and on a large
+  // install that takes a while.
+  var LOST_AFTER_MS = 60000;
   var progress = document.getElementById("progress");
   var meter = document.getElementById("meter");
+  var unanswered = null;
+
+  function request(url) {
+    var options = { cache: "no-store", credentials: "same-origin" };
+    if (window.AbortSignal && AbortSignal.timeout) {
+      options.signal = AbortSignal.timeout(5000);
+    }
+    return fetch(url, options);
+  }
   function starting() {
     progress.textContent = "Starting Weaver";
     meter.style.width = "100%";
   }
+  function silent() {
+    var now = Date.now();
+    if (unanswered === null) {
+      unanswered = now;
+    }
+    if (now - unanswered >= LOST_AFTER_MS) {
+      lost();
+      return;
+    }
+    starting();
+    window.setTimeout(poll, 1000);
+  }
   function poll() {
-    fetch(root + "/status", { cache: "no-store", credentials: "same-origin" })
+    request(root + "/status")
       .then(function (response) {
+        // A proxy in front answers for a Weaver that is not there.
+        if (response.status === 502 || response.status === 503 || response.status === 504) {
+          return { state: "unanswered" };
+        }
         return response.ok ? response.json().catch(function () { return null; }) : null;
       })
       .then(function (body) {
+        if (body && body.state === "unanswered") {
+          silent();
+          return;
+        }
+        unanswered = null;
         if (body && body.state === "upgrading") {
           progress.textContent = "Applying change " + Math.min(body.applied + 1, body.total) + " of " + body.total;
           meter.style.width = (body.total ? (body.applied / body.total) * 100 : 0) + "%";
@@ -338,12 +411,50 @@ p { margin: 8px 0 0; color: #a09d96; }
           return;
         }
         window.setTimeout(poll, 1000);
-      }, function () {
-        // Nothing is listening between this page and Weaver taking over.
-        starting();
-        window.setTimeout(poll, 1000);
-      });
+      }, silent);
   }
+
+  function lost() {
+    var page = document.getElementById("page");
+    page.replaceWith(document.getElementById("error-page").content.cloneNode(true));
+    document.title = "Weaver isn't responding";
+    var retry = document.getElementById("retry");
+    var status = document.getElementById("retry-status");
+    var timer = null;
+    // Only the latest check may schedule the next, so pressing Retry during a
+    // check does not start a second round of them.
+    var latest = 0;
+    function check(pressed) {
+      var mine = ++latest;
+      window.clearTimeout(timer);
+      if (pressed) {
+        retry.disabled = true;
+        retry.textContent = "Checking…";
+      }
+      request(base + "/healthz").then(function (response) {
+        return response.ok;
+      }, function () {
+        return false;
+      }).then(function (answered) {
+        if (mine !== latest) {
+          return;
+        }
+        if (answered) {
+          window.location.reload();
+          return;
+        }
+        if (pressed) {
+          retry.disabled = false;
+          retry.textContent = "Retry";
+          status.textContent = "Weaver still isn't answering. This page opens it as soon as it does.";
+        }
+        timer = window.setTimeout(function () { check(false); }, 3000);
+      });
+    }
+    retry.addEventListener("click", function () { check(true); });
+    check(false);
+  }
+
   poll();
 })();
 </script>
@@ -449,6 +560,16 @@ mod tests {
             get(&app, "/weaver/readyz", "*/*").await.0,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn the_page_carries_the_error_page_for_when_weaver_stops_answering() {
+        let page = render_page("/weaver");
+        assert!(page.contains(r#"<template id="error-page">"#));
+        assert!(page.contains("Weaver isn't responding"));
+        assert!(page.contains(r#"src="data:image/svg+xml;base64,"#));
+        assert!(page.contains(r#"var base = "/weaver";"#));
+        assert!(!page.contains("{{"), "every placeholder is filled");
     }
 
     #[test]

@@ -50,13 +50,17 @@ export const nextJa: LocaleDictionary = {
   "next.categories.all": "すべてのカテゴリ",
   "next.categories.uncategorised": "カテゴリなし",
 
-  // Route errors
-  "next.routeError.notFound": "ページが見つかりません",
-  "next.routeError.requestFailed": "リクエストに失敗しました ({{status}})",
-  "next.routeError.routingBody": "ページの読み込みが完了する前にルーティングエラーが発生しました。",
-  "next.routeError.title": "問題が発生しました",
-  "next.routeError.renderBody": "この画面の表示中に予期しないエラーが発生しました。",
-  "next.routeError.goBack": "戻る",
+  // Error page
+  "next.errorPage.notFound": "ページが見つかりません",
+  "next.errorPage.requestFailed": "リクエストに失敗しました ({{status}})",
+  "next.errorPage.routingBody": "ページの読み込みが完了する前にルーティングエラーが発生しました。",
+  "next.errorPage.title": "問題が発生しました",
+  "next.errorPage.renderBody": "この画面の表示中に予期しないエラーが発生しました。",
+  "next.errorPage.goBack": "戻る",
+  "next.errorPage.retry": "再試行",
+  "next.errorPage.checking": "確認中…",
+  "next.errorPage.unreachable": "Weaver が応答していません。応答があり次第、このページが Weaver を開きます。",
+  "next.errorPage.details": "技術的な詳細",
 
   // Shared components
   "next.common.clear": "クリア",

@@ -50,13 +50,17 @@ export const nextIt: LocaleDictionary = {
   "next.categories.all": "Tutte le categorie",
   "next.categories.uncategorised": "Nessuna categoria",
 
-  // Route errors
-  "next.routeError.notFound": "Pagina non trovata",
-  "next.routeError.requestFailed": "Richiesta non riuscita ({{status}})",
-  "next.routeError.routingBody": "Weaver ha riscontrato un errore di instradamento prima che la pagina finisse di caricarsi.",
-  "next.routeError.title": "Qualcosa è andato storto",
-  "next.routeError.renderBody": "Weaver ha riscontrato un errore imprevisto durante la visualizzazione di questa schermata.",
-  "next.routeError.goBack": "Indietro",
+  // Error page
+  "next.errorPage.notFound": "Pagina non trovata",
+  "next.errorPage.requestFailed": "Richiesta non riuscita ({{status}})",
+  "next.errorPage.routingBody": "Weaver ha riscontrato un errore di instradamento prima che la pagina finisse di caricarsi.",
+  "next.errorPage.title": "Qualcosa è andato storto",
+  "next.errorPage.renderBody": "Weaver ha riscontrato un errore imprevisto durante la visualizzazione di questa schermata.",
+  "next.errorPage.goBack": "Indietro",
+  "next.errorPage.retry": "Riprova",
+  "next.errorPage.checking": "Verifica in corso…",
+  "next.errorPage.unreachable": "Weaver non risponde. Questa pagina lo aprirà non appena risponde.",
+  "next.errorPage.details": "Dettagli tecnici",
 
   // Shared components
   "next.common.clear": "Cancella",

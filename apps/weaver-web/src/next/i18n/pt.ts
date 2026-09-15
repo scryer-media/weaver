@@ -50,13 +50,17 @@ export const nextPt: LocaleDictionary = {
   "next.categories.all": "Todas as categorias",
   "next.categories.uncategorised": "Sem categoria",
 
-  // Route errors
-  "next.routeError.notFound": "Página não encontrada",
-  "next.routeError.requestFailed": "Falha na solicitação ({{status}})",
-  "next.routeError.routingBody": "O Weaver encontrou um erro de roteamento antes de a página terminar de carregar.",
-  "next.routeError.title": "Algo deu errado",
-  "next.routeError.renderBody": "O Weaver encontrou um erro inesperado ao exibir esta tela.",
-  "next.routeError.goBack": "Voltar",
+  // Error page
+  "next.errorPage.notFound": "Página não encontrada",
+  "next.errorPage.requestFailed": "Falha na solicitação ({{status}})",
+  "next.errorPage.routingBody": "O Weaver encontrou um erro de roteamento antes de a página terminar de carregar.",
+  "next.errorPage.title": "Algo deu errado",
+  "next.errorPage.renderBody": "O Weaver encontrou um erro inesperado ao exibir esta tela.",
+  "next.errorPage.goBack": "Voltar",
+  "next.errorPage.retry": "Tentar novamente",
+  "next.errorPage.checking": "Verificando…",
+  "next.errorPage.unreachable": "O Weaver não está respondendo. Esta página o abrirá assim que ele responder.",
+  "next.errorPage.details": "Detalhes técnicos",
 
   // Shared components
   "next.common.clear": "Limpar",

@@ -56,13 +56,17 @@ export const nextEn: LocaleDictionary = {
   "next.categories.all": "All categories",
   "next.categories.uncategorised": "Uncategorised",
 
-  // Route errors
-  "next.routeError.notFound": "Page not found",
-  "next.routeError.requestFailed": "Request failed ({{status}})",
-  "next.routeError.routingBody": "Weaver hit a routing error before the page could finish loading.",
-  "next.routeError.title": "Something went wrong",
-  "next.routeError.renderBody": "Weaver hit an unexpected error while rendering this screen.",
-  "next.routeError.goBack": "Go back",
+  // Error page
+  "next.errorPage.notFound": "Page not found",
+  "next.errorPage.requestFailed": "Request failed ({{status}})",
+  "next.errorPage.routingBody": "Weaver hit a routing error before the page could finish loading.",
+  "next.errorPage.title": "Something went wrong",
+  "next.errorPage.renderBody": "Weaver hit an unexpected error while rendering this screen.",
+  "next.errorPage.goBack": "Go back",
+  "next.errorPage.retry": "Retry",
+  "next.errorPage.checking": "Checking…",
+  "next.errorPage.unreachable": "Weaver isn't responding. This page opens it as soon as it answers.",
+  "next.errorPage.details": "Technical details",
 
   // Shared components
   "next.common.clear": "Clear",

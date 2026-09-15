@@ -50,13 +50,17 @@ export const nextZh: LocaleDictionary = {
   "next.categories.all": "全部分类",
   "next.categories.uncategorised": "无分类",
 
-  // Route errors
-  "next.routeError.notFound": "页面未找到",
-  "next.routeError.requestFailed": "请求失败 ({{status}})",
-  "next.routeError.routingBody": "页面加载完成前，Weaver 遇到了路由错误。",
-  "next.routeError.title": "出现问题",
-  "next.routeError.renderBody": "Weaver 在显示此页面时遇到了意外错误。",
-  "next.routeError.goBack": "返回",
+  // Error page
+  "next.errorPage.notFound": "页面未找到",
+  "next.errorPage.requestFailed": "请求失败 ({{status}})",
+  "next.errorPage.routingBody": "页面加载完成前，Weaver 遇到了路由错误。",
+  "next.errorPage.title": "出现问题",
+  "next.errorPage.renderBody": "Weaver 在显示此页面时遇到了意外错误。",
+  "next.errorPage.goBack": "返回",
+  "next.errorPage.retry": "重试",
+  "next.errorPage.checking": "正在检查…",
+  "next.errorPage.unreachable": "Weaver 没有响应。一旦它恢复响应，此页面会自动打开它。",
+  "next.errorPage.details": "技术详情",
 
   // Shared components
   "next.common.clear": "清除",

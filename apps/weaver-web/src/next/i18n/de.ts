@@ -50,13 +50,17 @@ export const nextDe: LocaleDictionary = {
   "next.categories.all": "Alle Kategorien",
   "next.categories.uncategorised": "Keine Kategorie",
 
-  // Route errors
-  "next.routeError.notFound": "Seite nicht gefunden",
-  "next.routeError.requestFailed": "Anfrage fehlgeschlagen ({{status}})",
-  "next.routeError.routingBody": "Weaver ist auf einen Routing-Fehler gestoßen, bevor die Seite fertig geladen war.",
-  "next.routeError.title": "Etwas ist schiefgelaufen",
-  "next.routeError.renderBody": "Weaver ist beim Anzeigen dieser Seite auf einen unerwarteten Fehler gestoßen.",
-  "next.routeError.goBack": "Zurück",
+  // Error page
+  "next.errorPage.notFound": "Seite nicht gefunden",
+  "next.errorPage.requestFailed": "Anfrage fehlgeschlagen ({{status}})",
+  "next.errorPage.routingBody": "Weaver ist auf einen Routing-Fehler gestoßen, bevor die Seite fertig geladen war.",
+  "next.errorPage.title": "Etwas ist schiefgelaufen",
+  "next.errorPage.renderBody": "Weaver ist beim Anzeigen dieser Seite auf einen unerwarteten Fehler gestoßen.",
+  "next.errorPage.goBack": "Zurück",
+  "next.errorPage.retry": "Erneut versuchen",
+  "next.errorPage.checking": "Wird geprüft…",
+  "next.errorPage.unreachable": "Weaver antwortet nicht. Diese Seite öffnet Weaver, sobald es wieder antwortet.",
+  "next.errorPage.details": "Technische Details",
 
   // Shared components
   "next.common.clear": "Aufheben",
