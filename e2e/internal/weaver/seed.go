@@ -497,7 +497,10 @@ func runNyuuPost(
 		"-h", host, "-P", port, "--ssl=false",
 		"-u", nntpUsername(),
 		"-p", nntpPassword(),
-		"-n", "1",
+		// Eight posting connections: message ids are fixed per segment by
+		// --message-id below and Nyuu writes the NZB in argv order, so the
+		// corpus is identical to a serial post and only seeding time changes.
+		"-n", "8",
 		"-g", "alt.binaries.test",
 		"-f", "e2e-test@example.invalid",
 		"--keep-message-id",
