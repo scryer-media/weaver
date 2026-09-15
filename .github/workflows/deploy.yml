@@ -100,6 +100,12 @@ jobs:
           git verify-tag "$RELEASE_TAG"
           git fetch --no-tags origin "refs/heads/${release_branch}:refs/remotes/origin/${release_branch}"
           git merge-base --is-ancestor "${RELEASE_TAG}^{commit}" "origin/${release_branch}"
+      # The GitHub Release body is this file, so a tag without its notes stops
+      # here instead of after every package has been built.
+      - name: Verify release notes
+        env:
+          RELEASE_TAG: ${{ steps.release_identity.outputs.release_tag }}
+        run: test -s "release-notes/${RELEASE_TAG}.md"
 
   workflow-contract:
     name: workflow-contract
@@ -2355,7 +2361,7 @@ jobs:
           set -euo pipefail
           gh release create "$RELEASE_TAG" \
             --title "$RELEASE_TAG" \
-            --generate-notes \
+            --notes-file "release-notes/${RELEASE_TAG}.md" \
             artifacts/weaver-*.tar.gz \
             artifacts/weaver-*.zip \
             artifacts/weaver-*.msi \
