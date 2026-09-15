@@ -48,6 +48,11 @@ type AccessPolicyStatus {
 type AdoptableTlsNameMismatchCertificate {
 	derBase64: String!
 	sha256Fingerprint: String!
+	"""
+	Hostnames the certificate is issued for: its DNS alternative names, or
+	its common name when it has none.
+	"""
+	names: [String!]!
 }
 
 type ApiKey {
@@ -364,6 +369,13 @@ type ExtractionMemberTimelineSpan {
 type ExtractionTimelineGroup {
 	setName: String!
 	members: [ExtractionMemberTimeline!]!
+}
+
+type FirstRunSetup {
+	"""
+	Whether the browser should walk the operator through first-run setup.
+	"""
+	pending: Boolean!
 }
 
 type GeneralSettings {
@@ -749,6 +761,40 @@ type JobsSnapshot {
 	downloadBlock: DownloadBlock!
 }
 
+enum KernelComponentGql {
+	YENC_DECODE
+	YENC_CRC32
+	PAR2_REPAIR
+	PAR2_MD5
+	PAR2_CRC32
+	RAR_RECOVERY
+	RAR_CRC32
+	RAR_SHA1
+	RAR_AES
+}
+
+type KernelSelectionInfo {
+	component: KernelComponentGql!
+	"""
+	The crate that owns the dispatch.
+	"""
+	library: String!
+	"""
+	Every kernel this build can select on this architecture, in the order
+	the dispatcher tries them.
+	"""
+	ladder: [String!]!
+	"""
+	The rung the dispatcher selected; always an entry of `ladder`.
+	"""
+	kernel: String!
+	"""
+	The environment variable that moved the selection off the rung the CPU
+	alone would have picked, when one did.
+	"""
+	pinnedBy: String
+}
+
 type LoginStatusResult {
 	enabled: Boolean!
 	username: String
@@ -951,6 +997,12 @@ type MutationRoot {
 	"""
 	setHttpBindAddress(address: String!): Boolean!
 	"""
+	Atomically update the authenticated browser policy and optional next
+	listener address. Legacy access-policy mutations remain available for
+	installations that have not migrated to authenticated browser access.
+	"""
+	updateNetworkAccess(input: NetworkAccessInput!): NetworkAccessStatus!
+	"""
 	Change the browser-admission policy: mode plus trusted networks.
 	Applies immediately — trust is live state, unlike the bind address.
 	"""
@@ -967,6 +1019,10 @@ type MutationRoot {
 	Change the login password. Requires the current password for verification.
 	"""
 	changePassword(currentPassword: String!, newPassword: String!): Boolean!
+	"""
+	Revoke every durable browser session after a recent password check.
+	"""
+	signOutAll: Boolean!
 	"""
 	Add a new RSS feed.
 	"""
@@ -1185,12 +1241,109 @@ type MutationRoot {
 	Update general settings.
 	"""
 	updateSettings(input: GeneralSettingsInput!): GeneralSettings!
+	"""
+	Hold first-run setup open until the wizard finishes it.
+	"""
+	beginFirstRunSetup: FirstRunSetup!
+	"""
+	End first-run setup, finished or skipped, so it never shows again.
+	"""
+	finishFirstRunSetup: FirstRunSetup!
+	"""
+	Record that the access-model notice was read, so it never shows again.
+	"""
+	dismissSecurityUpgradeNotice: SecurityUpgradeNotice!
 	scanWatchFolder: WatchFolderScanReport!
 	createSchedule(input: ScheduleInput!): [Schedule!]!
 	updateSchedule(id: String!, input: ScheduleInput!): [Schedule!]!
 	deleteSchedule(id: String!): [Schedule!]!
 	toggleSchedule(id: String!, enabled: Boolean!): [Schedule!]!
 	createDirectory(path: String!, name: String!): DirectoryBrowseResult!
+}
+
+"""
+A draft for validating the two network settings before a later mutation
+persists either one. An empty trusted-network list permits remembered
+sessions from any resolvable client in authenticated access mode.
+"""
+input NetworkAccessInput {
+	"""
+	Omitted preserves the current proxy list; an empty list trusts no proxy.
+	"""
+	trustedProxies: [String!]
+	trustedNetworks: [String!]!
+	bindAddress: String
+}
+
+"""
+Normalized, non-persistent result of [`NetworkAccessInput`] validation.
+"""
+type NetworkAccessPreview {
+	trustedProxies: [String!]!
+	trustedNetworks: [String!]!
+	"""
+	`None` means the stored bind setting would be cleared to its loopback
+	default on restart.
+	"""
+	bindAddress: String
+	"""
+	Whether the submitted bind setting differs from the running listener.
+	"""
+	restartRequired: Boolean!
+	"""
+	How the current observed client would fare under the submitted list.
+	`None` means this GraphQL request had no transport evidence attached.
+	"""
+	currentClientAllowed: Boolean
+}
+
+"""
+The source controlling the trusted-network list.
+"""
+enum NetworkAccessSource {
+	ENVIRONMENT
+	STORED
+}
+
+"""
+Complete, effective browser network policy with the running and stored
+listener state nested in one admin-only query.
+"""
+type NetworkAccessStatus {
+	proxiesEditable: Boolean!
+	proxiesEnvPinned: Boolean!
+	proxiesSource: NetworkAccessSource!
+	authenticatedAccess: Boolean!
+	legacyCompatibility: Boolean!
+	trustedNetworks: [String!]!
+	"""
+	Explicit `WEAVER_TRUSTED_PROXIES` entries only; the service never
+	discovers or infers proxies from a private network.
+	"""
+	trustedProxies: [String!]!
+	trustedNetworksSource: NetworkAccessSource!
+	editable: Boolean!
+	envPinned: Boolean!
+	rememberedPolicyValid: Boolean!
+	currentClient: NetworkClientDiagnostics!
+	bindAddress: HttpBindAddressStatus!
+}
+
+"""
+The observed request identity used for remembered-browser admission.
+"""
+type NetworkClientDiagnostics {
+	"""
+	False when the transport did not attach request evidence to GraphQL.
+	"""
+	available: Boolean!
+	peer: String
+	resolvedClient: String
+	forwardingHeadersIgnored: Boolean!
+	"""
+	`None` when no request evidence was available.
+	"""
+	rememberedClientAllowed: Boolean
 }
 
 enum OperatingSystemGql {
@@ -1278,6 +1431,21 @@ input PostProcessingSettingsInput {
 	it. `null` is deliberately distinguishable and refused by the mutation.
 	"""
 	unacceptableExtensions: [String!]
+}
+
+"""
+How many of a server's connections are in use at one instant.
+"""
+type ProviderConnections {
+	"""
+	`host:port` label, matching `ServerHealth.label`.
+	"""
+	label: String!
+	active: Int!
+	"""
+	The server's connection limit.
+	"""
+	max: Int!
 }
 
 """
@@ -1369,6 +1537,16 @@ type QueryRoot {
 	The browser-admission policy: who gets in without a login.
 	"""
 	accessPolicy: AccessPolicyStatus!
+	"""
+	The effective browser network policy and a non-persistent draft
+	validator for the accompanying network-access mutation.
+	"""
+	networkAccess: NetworkAccessStatus!
+	"""
+	Validate and canonicalize a network draft without changing live policy
+	or stored settings. The update mutation consumes this same input shape.
+	"""
+	previewNetworkAccess(input: NetworkAccessInput!): NetworkAccessPreview!
 	"""
 	List all API keys (without raw key values).
 	"""
@@ -1507,6 +1685,15 @@ type QueryRoot {
 	Get general settings.
 	"""
 	settings: GeneralSettings!
+	"""
+	Whether first-run setup is still owed to this install.
+	"""
+	firstRunSetup: FirstRunSetup!
+	"""
+	Whether this install is owed the notice about moving to the 0.12.0
+	access model, and what it needs to say where.
+	"""
+	securityUpgradeNotice: SecurityUpgradeNotice!
 	schedules: [Schedule!]!
 	"""
 	The running weaver binary version.
@@ -1542,6 +1729,14 @@ type QueryRoot {
 	"""
 	metricsHistory(range: MetricsHistoryRangeGql!): MetricsHistoryResult!
 	browseDirectories(path: String): DirectoryBrowseResult!
+	"""
+	How full the disk under a folder is, for a folder that is not saved yet.
+
+	A folder that does not exist yet reports the disk it would be created
+	on. The answer is best effort: a network mount that does not answer
+	within a few seconds reports an error instead of holding the request.
+	"""
+	pathStorage(path: String!): ConfiguredStorage!
 	"""
 	Return recent log lines from the in-memory ring buffer.
 	"""
@@ -2060,6 +2255,25 @@ enum ScriptStatusGql {
 	CANCELLED
 }
 
+type SecurityUpgradeNotice {
+	"""
+	Whether the browser should show the notice.
+	"""
+	pending: Boolean!
+	"""
+	`native`, `docker` or `container`: where the variable has to be set.
+	"""
+	deployment: String!
+	"""
+	`linux`, `macos`, `windows` or `unknown`.
+	"""
+	operatingSystem: String!
+	"""
+	Whether a login exists. Without one, moving opens setup to create it.
+	"""
+	loginEnabled: Boolean!
+}
+
 type SemanticCandidateSnapshotInfo {
 	groupId: Int!
 	normalizedKey: String!
@@ -2478,6 +2692,10 @@ type SystemComputeInfo {
 	cgroupLimit: Float
 	decoderTier: DecoderTierGql!
 	simdFeatures: [String!]!
+	"""
+	The kernel each hot-path library dispatches to on this host.
+	"""
+	kernels: [KernelSelectionInfo!]!
 }
 
 type SystemInfo {
@@ -2515,6 +2733,12 @@ type SystemMetricsSnapshot {
 	second, always did.
 	"""
 	jobDownloadRates: [JobDownloadRate!]!
+	"""
+	Connections each server has open right now, on the same cadence, so a
+	connection meter can follow the pool instead of waiting for the next
+	`serverHealth` read.
+	"""
+	providerConnections: [ProviderConnections!]!
 }
 
 type SystemStatus {
