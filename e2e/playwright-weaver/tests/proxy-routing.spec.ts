@@ -200,9 +200,13 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
       await expect.poll(async () => (await evidence()).active.direct).toBe(0);
       const revoked = await mark();
       expect(await probe()).toMatchObject({ success: false });
-      expect(await status()).toMatchObject({ state: "BLOCKED" });
-      // Observe retries, not just the instant at which the mutation returns.
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      // A connection test dials a throwaway route of its own so that trying a
+      // server never disturbs the downloads already running through it, which
+      // also means it never moves the live route this status reads. The live
+      // route is walked to exhaustion by the revoked download's own retry, so
+      // poll for the verdict instead of reading it the instant the probe
+      // returns — and let that same window prove no retry reached the host.
+      await expect.poll(async () => (await status()).state, { timeout: 30_000 }).toBe("BLOCKED");
       await noDirect(revoked);
       await configure(initial);
     });

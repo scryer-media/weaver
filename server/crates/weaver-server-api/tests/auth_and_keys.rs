@@ -125,7 +125,9 @@ async fn listed_api_key_reports_the_creation_time_in_epoch_ms() {
 
     let resp = h.execute(r#"{ apiKeys { createdAt } }"#).await;
     assert_no_errors(&resp);
-    let listed = response_data(&resp)["apiKeys"][0]["createdAt"].as_f64().unwrap();
+    let listed = response_data(&resp)["apiKeys"][0]["createdAt"]
+        .as_f64()
+        .unwrap();
 
     // The key is stored in epoch milliseconds; the list must not scale it again.
     assert!(
