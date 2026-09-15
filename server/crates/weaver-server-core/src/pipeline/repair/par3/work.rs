@@ -716,8 +716,17 @@ impl Coordinator {
         carriers: &[(std::ops::Range<u64>, usize)],
     ) -> EngineResult<()> {
         if carriers.is_empty() {
+            tracing::info!(
+                job_id = job_id.0,
+                "PAR3 recovery in-flight declaration skipped: no carrier span"
+            );
             return Ok(());
         }
+        let views = self.assessments(job_id).count();
+        let wanted: usize = self
+            .assessments(job_id)
+            .flat_map(|(_, view)| view.requirements.iter().map(|need| need.next_indices.len()))
+            .sum();
         let declared: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)> = self
             .assessments(job_id)
             .flat_map(|(set, view)| {
@@ -727,6 +736,20 @@ impl Coordinator {
                 })
             })
             .collect();
+        let count: usize = declared.iter().map(|(_, _, indices)| indices.len()).sum();
+        let first = declared
+            .iter()
+            .flat_map(|(_, _, indices)| indices.first().copied())
+            .min();
+        tracing::info!(
+            job_id = job_id.0,
+            views,
+            wanted,
+            declared = count,
+            first_index = first,
+            carriers = ?carriers,
+            "PAR3 recovery in-flight declared"
+        );
         if declared.is_empty() {
             return Ok(());
         }
@@ -761,8 +784,20 @@ impl Coordinator {
         };
         let declared = match job.acquisition.batch.as_mut() {
             Some(batch) => std::mem::take(&mut batch.declared),
-            None => return,
+            None => {
+                tracing::info!(
+                    job_id = job_id.0,
+                    "PAR3 recovery in-flight release: no window"
+                );
+                return;
+            }
         };
+        let count: usize = declared.iter().map(|(_, _, indices)| indices.len()).sum();
+        tracing::info!(
+            job_id = job_id.0,
+            released = count,
+            "PAR3 recovery in-flight released"
+        );
         // A window that declared nothing releases nothing, and must not cost
         // the job an assessment it did not need.
         if declared.is_empty() {
@@ -777,8 +812,16 @@ impl Coordinator {
             }
         }
         // What was released has to become askable again, which only a fresh
-        // assessment can say.
-        let _ = self.queue_reassessment(job_id);
+        // assessment can say. A refusal here leaves the retained view stale
+        // with the released indices still counted in flight, so it is never
+        // silent.
+        if let Err(error) = self.queue_reassessment(job_id) {
+            tracing::warn!(
+                job_id = job_id.0,
+                %error,
+                "PAR3 reassessment after an in-flight release could not be queued"
+            );
+        }
     }
 
     pub(in crate::pipeline) fn new(
