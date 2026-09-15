@@ -636,6 +636,7 @@ async fn par3_recovery_windows_bound_47_and_81_articles_without_duplicate_admiss
         let mut windows = 0;
         while received.len() < count as usize {
             assert!(pipeline.promote_par3_recovery_window(job_id, false));
+            assert!(pipeline.par3_recovery_in_progress(job_id));
             let size = pipeline.jobs[&job_id].download_queue.len();
             assert_eq!(size, (count as usize - received.len()).min(32));
             assert!(pipeline.promote_par3_recovery_window(job_id, false));
@@ -662,6 +663,9 @@ async fn par3_recovery_windows_bound_47_and_81_articles_without_duplicate_admiss
         assert_eq!(windows, (count as usize).div_ceil(32));
         assert_eq!(pipeline.pending_retries_by_segment.len(), count as usize);
         assert!(!pipeline.promote_par3_recovery_window(job_id, false));
+        // Parked retries keep no window active and the engine holds no work,
+        // so a completion pass may now judge the deficit on this view.
+        assert!(!pipeline.par3_recovery_in_progress(job_id));
     }
 }
 
