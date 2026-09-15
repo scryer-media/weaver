@@ -116,7 +116,7 @@ windows-sys = { version = "0.61", default-features = false }
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 par2-rs = { version = "0.10", default-features = false, features = ["native-crypto"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
-par3-rs = { version = "0.3.1", default-features = false }
+par3-rs = { version = "0.4", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x
@@ -160,13 +160,3 @@ incremental = false
 # repository: the e2e harness's Weaver image build refuses such a manifest, and
 # any build without that exact checkout cannot compile the workspace. When a
 # rarpar change is needed, publish it and bump the requirement here instead.
-#
-# TEMPORARY, AND THE ONE EXCEPTION TO THE RULE ABOVE. This branch integrates an
-# unpublished par3-rs 0.3.2 from a local checkout so the consumer-side work can
-# be written and tested before the crate ships. The rule holds: this manifest
-# does not build anywhere but this machine, and the e2e image build will refuse
-# it. Delete this block — and nothing else — the moment par3-rs 0.3.2 is on
-# crates.io; the `par3-rs = { version = "0.3.1", ... }` line above is
-# deliberately left alone so that deletion is the whole revert.
-[patch.crates-io]
-par3-rs = { path = "../../../rarpar/.worktrees/par3-rs-snapshot-c1s1-staged/crates/par3-rs" }
