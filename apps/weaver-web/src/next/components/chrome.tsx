@@ -214,6 +214,7 @@ export function DetailBlock({
   return (
     <section
       id={id}
+      aria-label={title}
       className={cn(
         "flex min-w-0 flex-col gap-3 px-4 sm:px-[22px] pt-[18px]",
         tone === "panel"

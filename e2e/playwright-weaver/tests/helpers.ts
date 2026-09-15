@@ -64,7 +64,13 @@ export const test = base.extend<WeaverFixtures>({
     page.on("response", (response) => {
       responseInspections.push((async () => {
         const request = response.request();
-        if (response.status() >= 400) {
+        // The browser client asks for a session CSRF value on load; a server
+        // on the loginless access model answers 404 by contract, and the client
+        // falls back to its entry-page cookie.
+        const legacyCsrfProbe = response.status() === 404
+          && request.method() === "GET"
+          && new URL(response.url()).pathname.endsWith("/api/auth/csrf");
+        if (response.status() >= 400 && !legacyCsrfProbe) {
           httpErrors.push({
             method: request.method().toUpperCase(),
             pathname: new URL(response.url()).pathname,
@@ -142,7 +148,12 @@ export function weaverRoute(path: string): string {
 }
 
 export async function openNavigation(page: Page) {
-  const navigation = page.getByRole("navigation");
+  // The primary navigation is the one that reaches Downloads; a settings page
+  // also shows its own panel list as a navigation landmark, and below the
+  // rail breakpoint the drawer renders a second copy of the rail.
+  const navigation = page
+    .getByRole("navigation")
+    .filter({ has: page.getByRole("link", { name: "Downloads" }), visible: true });
   if (await navigation.isVisible()) return navigation;
 
   const trigger = page.getByRole("button", { name: "Open navigation" });
