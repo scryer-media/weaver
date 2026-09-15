@@ -443,9 +443,7 @@ part layout before shared partials change, including bytes in other repaired
 volumes that never arrived. Coverage is admitted after placement and conventional
 completed-file rows are suppressed for those virtual sources. Earlier
 archive-checksum demotions still use conventional repair.
-Shared mutation views and restart evidence remain under integration. The implementation
-record and remaining acceptance gates live in
-[the PAR3 integration plan](docs/par3-integration-plan.md).
+Shared mutation views and restart evidence remain under integration.
 
 Engine crates should remain sharp and focused:
 
