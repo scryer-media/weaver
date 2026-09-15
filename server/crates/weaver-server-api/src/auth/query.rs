@@ -127,8 +127,8 @@ impl AuthQuery {
                     "admin" => ApiKeyScope::Admin,
                     _ => ApiKeyScope::Control,
                 },
-                created_at: r.created_at as f64 * 1000.0,
-                last_used_at: r.last_used_at.map(|t| t as f64 * 1000.0),
+                created_at: r.created_at as f64,
+                last_used_at: r.last_used_at.map(|t| t as f64),
             })
             .collect())
     }
