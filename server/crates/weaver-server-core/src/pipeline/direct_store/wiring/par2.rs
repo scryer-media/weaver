@@ -508,7 +508,7 @@ impl Pipeline {
                     }
                 }
                 for work in rescued {
-                    self.requeue_retry_work(work);
+                    self.enqueue_download_work(work);
                     ready = false;
                 }
                 if missing_ids
