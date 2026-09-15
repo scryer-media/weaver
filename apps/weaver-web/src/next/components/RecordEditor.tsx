@@ -73,7 +73,7 @@ export function RecordEditor({
       footer={
         <>
           {onDelete === undefined ? null : (
-            <DangerButton onClick={onDelete} disabled={busy} className="mr-auto px-[14px]">
+            <DangerButton onClick={onDelete} disabled={busy} className="mr-auto">
               {deleteLabel ?? t("action.delete")}
             </DangerButton>
           )}

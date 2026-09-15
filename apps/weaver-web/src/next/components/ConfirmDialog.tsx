@@ -51,7 +51,7 @@ export function ConfirmDialog({
         <>
           <SecondaryButton onClick={onDismiss}>{dismissLabel ?? t("action.cancel")}</SecondaryButton>
           {alternative === undefined ? null : (
-            <DangerButton onClick={alternative.onConfirm} disabled={busy} className="px-[14px]">
+            <DangerButton onClick={alternative.onConfirm} disabled={busy}>
               {alternative.label}
             </DangerButton>
           )}
@@ -60,7 +60,6 @@ export function ConfirmDialog({
               onClick={onConfirm}
               disabled={busy}
               solid={solid || alternative !== undefined}
-              className="px-[14px]"
             >
               {confirmLabel ?? t("next.common.remove")}
             </DangerButton>

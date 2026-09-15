@@ -387,7 +387,6 @@ export function BackupPanel() {
         control: (
           <DangerButton
             icon="restore"
-            className="px-[14px]"
             disabled={restoreBlocked}
             onClick={() => setConfirmRestore(true)}
           >
