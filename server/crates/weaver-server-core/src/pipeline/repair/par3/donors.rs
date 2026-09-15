@@ -446,8 +446,7 @@ mod tests {
 
     #[test]
     fn cauchy_and_fft_defer_exhaustive_search_and_keep_exhaustion_nonfatal() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../e2e/internal/weaver/testdata/par3-shared");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/par3-shared");
         for name in ["cauchy.par3", "fft.par3"] {
             let mut job = Par3Job::default();
             publish(
