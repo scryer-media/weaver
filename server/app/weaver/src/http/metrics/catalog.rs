@@ -578,6 +578,8 @@ metric_families! {
         "PAR3 packets the carrier scanner authenticated or rejected.");
     PAR3_CARRIER_RANGES_UNAVAILABLE = ("weaver_par3_carrier_ranges_unavailable_total", Counter, [],
         "Holes the PAR3 carrier scanner had to seek past.");
+    PAR3_CARRIER_DAMAGED_BYTES = ("weaver_par3_carrier_damaged_bytes_total", Counter, [],
+        "Readable PAR3 carrier bytes that produced no authenticated packet.");
 
     PAR3_SLOT_PHASE = ("weaver_par3_slot_phase", Gauge, ["slot", "phase"],
         "Current phase of each PAR3 work slot; exactly one phase is 1 per slot.");

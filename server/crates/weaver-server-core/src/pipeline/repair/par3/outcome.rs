@@ -70,6 +70,11 @@ pub(in crate::pipeline) struct MissingMetadata {
     pub carriers_awaiting_bytes: u64,
     /// Referenced files with no authenticated layout entry yet.
     pub unresolved_files: u64,
+    /// A packet family no carrier produced a single authenticated copy of.
+    /// This is a different statement from `sets`: the set is not merely
+    /// incomplete, it is short one of the packets nothing can proceed without,
+    /// and no further carrier byte of the ones already scanned will supply it.
+    pub missing_vital: Option<super::carriers::Par3PacketKind>,
 }
 
 impl std::fmt::Display for MissingMetadata {
@@ -78,7 +83,11 @@ impl std::fmt::Display for MissingMetadata {
             f,
             "{} set(s), {} carrier(s) awaiting bytes, {} unresolved file(s)",
             self.sets, self.carriers_awaiting_bytes, self.unresolved_files
-        )
+        )?;
+        if let Some(kind) = self.missing_vital {
+            write!(f, ", no authenticated {} packet", kind.label())?;
+        }
+        Ok(())
     }
 }
 
@@ -104,10 +113,25 @@ pub(in crate::pipeline) enum Par3Outcome {
     WaitingForMemory { need: u64, have: u64 },
     /// Cannot fit even alone under the configured budget.
     DoesNotFit { need: u64, limit: u64 },
-    /// Informational: what the carrier scanner refused or could not read.
+    /// Informational: what the carrier scanner refused or could not read,
+    /// with the carriers it happened on.
     CarrierDamage {
+        carriers: Vec<super::carriers::CarrierDamage>,
         rejected_packets: u64,
         unavailable_ranges: u64,
+        damaged_bytes: u64,
+    },
+    /// A set names a file weaver will not create under that name.
+    UnsafePath {
+        path: String,
+        reason: super::paths::UnsafePath,
+    },
+    /// The working directory cannot hold the set's outputs and the staging
+    /// copy the installation writes beside them.
+    NoOutputSpace {
+        need: u64,
+        available: u64,
+        shortfall: u64,
     },
 }
 
@@ -122,6 +146,8 @@ impl Par3Outcome {
             Self::WaitingForMemory { .. } => Par3OutcomeClass::WaitingForMemory,
             Self::DoesNotFit { .. } => Par3OutcomeClass::DoesNotFit,
             Self::CarrierDamage { .. } => Par3OutcomeClass::CarrierDamage,
+            Self::UnsafePath { .. } => Par3OutcomeClass::UnsafePath,
+            Self::NoOutputSpace { .. } => Par3OutcomeClass::NoOutputSpace,
         }
     }
 
@@ -134,6 +160,37 @@ impl Par3Outcome {
             self,
             Self::NeedsRecovery { .. } | Self::CarrierDamage { .. } | Self::WaitingForMemory { .. }
         )
+    }
+
+    /// A bounded rendering of a damage summary, on the same rule as the
+    /// cohort list: a few entries and a count of the rest, never one line per
+    /// carrier in a set that has hundreds.
+    fn render_carriers(carriers: &[super::carriers::CarrierDamage]) -> String {
+        const SHOWN: usize = 3;
+        let mut rendered = carriers
+            .iter()
+            .take(SHOWN)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if carriers.len() > SHOWN {
+            rendered.push_str(&format!("; and {} more", carriers.len() - SHOWN));
+        }
+        rendered
+    }
+
+    /// A refused path, shortened so a hostile name cannot flood a message or
+    /// a log line with its own length.
+    fn render_path(path: &str) -> String {
+        const SHOWN: usize = 120;
+        if path.len() <= SHOWN {
+            return path.to_string();
+        }
+        let mut cut = SHOWN;
+        while cut > 0 && !path.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}...", &path[..cut])
     }
 
     fn render_cohorts(cohorts: &[CohortDeficit]) -> String {
@@ -190,12 +247,35 @@ impl std::fmt::Display for Par3Outcome {
                 "PAR3 memory admission failed: needs {need} bytes against a {limit} byte budget"
             ),
             Self::CarrierDamage {
+                carriers,
                 rejected_packets,
                 unavailable_ranges,
+                damaged_bytes,
+            } => {
+                write!(
+                    f,
+                    "PAR3 carriers rejected {rejected_packets} packet(s), left \
+                     {unavailable_ranges} range(s) unreadable and could not \
+                     authenticate {damaged_bytes} byte(s)"
+                )?;
+                if carriers.is_empty() {
+                    return Ok(());
+                }
+                write!(f, ": {}", Self::render_carriers(carriers))
+            }
+            Self::UnsafePath { path, reason } => write!(
+                f,
+                "PAR3 set names a file weaver will not create: {reason} in {:?}",
+                Self::render_path(path)
+            ),
+            Self::NoOutputSpace {
+                need,
+                available,
+                shortfall,
             } => write!(
                 f,
-                "PAR3 carriers rejected {rejected_packets} packet(s) and left \
-                 {unavailable_ranges} range(s) unreadable"
+                "PAR3 output planning is {shortfall} bytes short: installing this set needs \
+                 {need} bytes and the working directory can grant {available}"
             ),
         }
     }
@@ -224,6 +304,25 @@ pub(in crate::pipeline) fn classify_memory_refusal(
         }
     } else {
         Par3Outcome::DoesNotFit { need, limit }
+    }
+}
+
+/// The engine ceiling an error names, when it names one.
+///
+/// Hostile or merely enormous metadata — thousands of File packets, a
+/// directory tree that nests without end, a chunk list longer than the data it
+/// describes — reaches weaver as a named `ResourceLimit` rather than as host
+/// exhaustion. Naming that ceiling turns it into a typed verdict instead of an
+/// opaque engine string.
+pub(in crate::pipeline) fn execution_limit(error: &EngineError) -> Option<&'static str> {
+    match error {
+        EngineError::ResourceLimit(limit) => Some(limit),
+        EngineError::Io(error) => error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<EngineError>())
+            .and_then(execution_limit),
+        EngineError::RepairInterrupted { cause, .. } => execution_limit(cause),
+        _ => None,
     }
 }
 
@@ -341,6 +440,7 @@ impl Pipeline {
         };
         let mut missing = MissingMetadata {
             carriers_awaiting_bytes: runtime.carriers_awaiting_bytes(job_id),
+            missing_vital: runtime.missing_vital_packet(job_id),
             ..MissingMetadata::default()
         };
         for (_, view) in runtime.assessments(job_id) {
@@ -388,6 +488,7 @@ mod tests {
                     sets: 1,
                     carriers_awaiting_bytes: 2,
                     unresolved_files: 3,
+                    missing_vital: Some(super::super::carriers::Par3PacketKind::Root),
                 },
             },
             Par3Outcome::Unsupported { detail: "matrix" },
@@ -395,8 +496,25 @@ mod tests {
             Par3Outcome::WaitingForMemory { need: 10, have: 4 },
             Par3Outcome::DoesNotFit { need: 10, limit: 4 },
             Par3Outcome::CarrierDamage {
+                carriers: vec![super::super::carriers::CarrierDamage {
+                    source: SourceId(3),
+                    first_damage_offset: 672,
+                    damaged_bytes: 109,
+                    rejected: 2,
+                    unavailable_ranges: 1,
+                }],
                 rejected_packets: 2,
                 unavailable_ranges: 1,
+                damaged_bytes: 109,
+            },
+            Par3Outcome::UnsafePath {
+                path: "sub/CON".into(),
+                reason: super::super::paths::UnsafePath::ReservedDeviceName,
+            },
+            Par3Outcome::NoOutputSpace {
+                need: 4096,
+                available: 1024,
+                shortfall: 3072,
             },
         ];
         let mut seen = std::collections::BTreeSet::new();

@@ -584,6 +584,11 @@ fn render_par3(out: &mut Encoder, par3: &Par3MetricsSnapshot) {
         &[],
         par3.carrier_ranges_unavailable_total,
     );
+    out.sample(
+        &f::PAR3_CARRIER_DAMAGED_BYTES,
+        &[],
+        par3.carrier_damaged_bytes_total,
+    );
 
     for (index, slot) in par3.slots.iter().enumerate() {
         // The slot label is the array position, which is stable for the life
