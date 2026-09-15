@@ -940,15 +940,13 @@ function NetworkSettingsSection() {
   );
 }
 
-export function SecuritySettingsPage({ embedded = false }: { embedded?: boolean }) {
+export function SecuritySettingsPage() {
   return (
     <div className="max-w-[1180px]">
-      {!embedded && (
-        <SettingsPageHeader
-          title="Security"
-          description="Manage network access, login protection, and API keys"
-        />
-      )}
+      <SettingsPageHeader
+        title="Security"
+        description="Manage network access, login protection, and API keys"
+      />
       <div className="space-y-6">
         <NetworkSettingsSection />
         <LoginProtectionSection />
