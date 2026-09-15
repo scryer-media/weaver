@@ -175,10 +175,14 @@ function prefersReducedMotion() {
   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
 }
 
-function SetupFrame({ children }: { children: ReactNode }) {
+/**
+ * The page around a setup form: the lockup over one panel. `welcome` plays
+ * the mark flying into the lockup, for a new install's first page.
+ */
+export function SetupFrame({ children, welcome = true }: { children: ReactNode; welcome?: boolean }) {
   // The welcome plays once per page load. It stays mounted across the switch
   // to "Setup complete", so finishing setup does not play it again.
-  const [intro, setIntro] = useState(() => !prefersReducedMotion());
+  const [intro, setIntro] = useState(() => welcome && !prefersReducedMotion());
   const lockupRef = useRef<HTMLDivElement>(null);
   const flyingRef = useRef<HTMLDivElement>(null);
   const [flight, setFlight] = useState<CSSProperties | null>(null);
@@ -230,7 +234,7 @@ function SetupFrame({ children }: { children: ReactNode }) {
   );
 }
 
-function SetupHeading({ title, body }: { title: string; body?: string }) {
+export function SetupHeading({ title, body }: { title: string; body?: string }) {
   return (
     <div className="flex flex-col gap-1.5">
       <h1 className="font-wv-title text-[19px] font-semibold text-wv-strong">{title}</h1>
@@ -261,7 +265,7 @@ function FormField({
   );
 }
 
-function ErrorLine({ children }: { children: ReactNode }) {
+export function ErrorLine({ children }: { children: ReactNode }) {
   return (
     <div role="alert" className="text-[12.5px] leading-[1.45] text-wv-error-text">
       {children}
@@ -271,32 +275,44 @@ function ErrorLine({ children }: { children: ReactNode }) {
 
 /**
  * One option of a choice. The native radio stays for keyboard and screen
- * readers; the square beside the title is what shows. Borders use `!` because
- * the global unlayered `* { border-color }` rule otherwise wins.
+ * readers; the square beside the title is what shows. An option this
+ * deployment refuses still shows, dimmed, with the reason under it.
  */
-function Choice({
+export function Choice({
   name,
   title,
   body,
   checked,
+  disabledReason,
   onSelect,
 }: {
   name: string;
   title: string;
   body: string;
   checked: boolean;
+  disabledReason?: string | null;
   onSelect: () => void;
 }) {
+  const disabled = Boolean(disabledReason);
   return (
     <label
       className={cn(
-        "flex cursor-pointer items-start gap-3 border px-3.5 py-3 has-[:focus-visible]:!border-wv-control-focus",
-        checked
-          ? "!border-wv-accent bg-[rgb(63_179_156_/_0.07)]"
-          : "!border-wv-control hover:!border-wv-control-focus",
+        "flex items-start gap-3 border px-3.5 py-3 has-[:focus-visible]:!border-wv-control-focus",
+        disabled
+          ? "cursor-not-allowed !border-wv-control opacity-60"
+          : checked
+            ? "cursor-pointer !border-wv-accent bg-[rgb(63_179_156_/_0.07)]"
+            : "cursor-pointer !border-wv-control hover:!border-wv-control-focus",
       )}
     >
-      <input type="radio" name={name} checked={checked} onChange={onSelect} className="sr-only" />
+      <input
+        type="radio"
+        name={name}
+        checked={checked}
+        disabled={disabled}
+        onChange={onSelect}
+        className="sr-only"
+      />
       <span
         aria-hidden="true"
         className={cn(
@@ -309,21 +325,25 @@ function Choice({
       <span className="flex min-w-0 flex-col gap-1">
         <span className="text-[13px] font-medium text-wv-fg">{title}</span>
         <span className="text-[12px] leading-[1.5] text-wv-muted">{body}</span>
+        {disabledReason ? (
+          <span className="text-[12px] leading-[1.5] text-wv-warn">{disabledReason}</span>
+        ) : null}
       </span>
     </label>
   );
 }
 
 /// Restart where that is safe; otherwise the manual instruction and a way on.
-function RestartActions({
+export function RestartActions({
   supported,
   unsupportedReason,
+  onContinue = () => window.location.reload(),
 }: {
   supported: boolean;
   unsupportedReason: string | null;
+  onContinue?: () => void;
 }) {
   const { phase, error, restart } = useRestartAction();
-  const onContinue = () => window.location.reload();
 
   if (!supported) {
     return (

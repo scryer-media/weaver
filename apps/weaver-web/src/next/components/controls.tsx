@@ -210,8 +210,7 @@ export function Toggle({
 
 /**
  * The 14px selection square. Its empty border is the faint text colour, about
- * 4:1 against the list ground, and important: the global unlayered
- * `* { border-color }` rule otherwise wins and the box fades into the rows.
+ * 4:1 against the list ground, so the box does not fade into the rows.
  *
  * Rows own the click that opens them, so the box stops propagation itself —
  * every caller would otherwise have to remember to, and one that forgot would

@@ -1,13 +1,8 @@
-import { useState } from "react";
-import { useMutation } from "urql";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SETUP_CODE_DISPLAY_LENGTH } from "@/lib/setup-code";
-import {
-  SET_ACCESS_POLICY_MUTATION,
-  SET_HTTP_BIND_ADDRESS_MUTATION,
-} from "@/graphql/queries";
+import { useSecurityUpgradeForm, type SecurityUpgradeState } from "@/lib/security-upgrade";
 import {
   BIND_CHOICES,
   CONTAINER_BIND_NOTE,
@@ -15,10 +10,8 @@ import {
   MODES,
   NO_LOGIN_NETWORK_WARNING,
   RESTART_UNREACHABLE_NOTE,
-  isContainerDeployment,
   useRestartAction,
   useSetupForm,
-  type AccessMode,
   type SetupEnvironment,
 } from "@/lib/setup-flow";
 
@@ -297,27 +290,6 @@ export function SetupWizardPage({ environment }: { environment?: SetupEnvironmen
   );
 }
 
-export interface SecurityUpgradeState {
-  loginEnabled: boolean;
-  strictSecurity: boolean;
-  bindEditable: boolean;
-  /** The address the next restart uses: the stored setting, or what is running. */
-  bindEffective: string;
-  /** Whether this deployment can restart Weaver from the browser. */
-  restartSupported: boolean;
-  /** The server's refusal when it cannot, for the manual instruction. */
-  restartUnsupportedReason: string | null;
-  /** `native`, `docker`, or `container` — who decides network exposure. */
-  deployment: string;
-}
-
-/// Loopback judged on the spelling the server reports, including the
-/// IPv4-mapped form a dual-stack listener produces.
-function isLoopbackAddress(value: string): boolean {
-  const normalized = value.trim().toLowerCase().replace(/^::ffff:/, "");
-  return normalized === "::1" || normalized.startsWith("127.");
-}
-
 /// The same three choices, asked of an install that already has a login.
 ///
 /// An upgrade adds settings the operator never saw, so the wizard runs once
@@ -331,86 +303,9 @@ export function SecurityUpgradeWizard({
   state: SecurityUpgradeState;
   onDone: () => void;
 }) {
-  const [mode, setMode] = useState<AccessMode | null>(null);
-  const wideNow = !isLoopbackAddress(state.bindEffective);
-  const [bindWide, setBindWide] = useState(wideNow);
-  const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [restartNote, setRestartNote] = useState(false);
-  // Which mode is already stored. A policy write that succeeded must not be
-  // replayed when the bind step is retried after failing — but a mode the
-  // operator changed in between must still be sent.
-  const [savedMode, setSavedMode] = useState<AccessMode | null>(null);
-  const [, setPolicy] = useMutation(SET_ACCESS_POLICY_MUTATION);
-  const [, setBindAddress] = useMutation(SET_HTTP_BIND_ADDRESS_MUTATION);
+  const form = useSecurityUpgradeForm(state, onDone);
 
-  const disabledReason = (candidate: AccessMode): string | null => {
-    if (state.strictSecurity && candidate !== "login_required") {
-      return "WEAVER_STRICT_SECURITY is set in this deployment's environment, which refuses trusting access modes.";
-    }
-    if (candidate === "no_login" && state.loginEnabled) {
-      return "Your login stays. To remove it, disable login in Settings → Security first.";
-    }
-    return null;
-  };
-
-  // A container's exposure is its published ports, so the question is never
-  // asked there — not even when nothing pins the address.
-  const containerized = isContainerDeployment(state.deployment);
-  // Only when the answer differs from what the next restart already does —
-  // an unchanged choice must not produce a write or a restart notice.
-  const bindChanges = state.bindEditable && !containerized && bindWide !== wideNow;
-
-  const applyPolicy = async (chosen: AccessMode): Promise<boolean> => {
-    const result = await setPolicy({ mode: chosen });
-    if (result.error) {
-      setError(result.error.message.replace(/^\[GraphQL\]\s*/, ""));
-      return false;
-    }
-    return true;
-  };
-
-  const finish = async () => {
-    if (mode === null) {
-      return;
-    }
-    setError(null);
-    setSubmitting(true);
-    // Policy first: it takes effect immediately, so it is the half worth
-    // landing even if the bind change then fails.
-    if (savedMode !== mode) {
-      if (!(await applyPolicy(mode))) {
-        setSubmitting(false);
-        return;
-      }
-      setSavedMode(mode);
-    }
-    if (bindChanges) {
-      const result = await setBindAddress({ address: bindWide ? "0.0.0.0" : "" });
-      if (result.error) {
-        setError(result.error.message.replace(/^\[GraphQL\]\s*/, ""));
-        setSubmitting(false);
-        return;
-      }
-      setRestartNote(true);
-      return;
-    }
-    onDone();
-  };
-
-  const keepCurrent = async () => {
-    setError(null);
-    setSubmitting(true);
-    // The upgrader's status quo: every browser signs in, exactly as before.
-    // Storing it is what stops this wizard coming back.
-    if (!(await applyPolicy("login_required"))) {
-      setSubmitting(false);
-      return;
-    }
-    onDone();
-  };
-
-  if (restartNote) {
+  if (form.restartNote) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background p-6">
         <div className="w-full max-w-lg space-y-4 rounded-lg border border-border bg-card p-8">
@@ -448,34 +343,38 @@ export function SecurityUpgradeWizard({
               key={candidate.id}
               candidate={candidate}
               groupName="upgrade-access-mode"
-              checked={mode === candidate.id}
-              disabledReason={disabledReason(candidate.id)}
-              onSelect={() => setMode(candidate.id)}
+              checked={form.mode === candidate.id}
+              disabledReason={form.disabledReason(candidate.id)}
+              onSelect={() => form.setMode(candidate.id)}
             />
           ))}
         </fieldset>
 
-        {containerized ? (
+        {form.containerized ? (
           <p className="text-sm text-muted-foreground">{CONTAINER_BIND_NOTE}</p>
         ) : state.bindEditable ? (
           <BindChoices
             groupName="upgrade-bind"
-            bindWide={bindWide}
-            onChange={setBindWide}
-            warnNoLogin={mode === "no_login"}
+            bindWide={form.bindWide}
+            onChange={form.setBindWide}
+            warnNoLogin={form.mode === "no_login"}
           />
         ) : null}
 
-        {error ? <p className="text-sm text-destructive">{error}</p> : null}
+        {form.error ? <p className="text-sm text-destructive">{form.error}</p> : null}
 
         <div className="space-y-3">
-          <Button onClick={finish} disabled={mode === null || submitting} className="w-full">
-            {submitting ? "Saving…" : "Save"}
+          <Button
+            onClick={() => void form.finish()}
+            disabled={form.mode === null || form.submitting}
+            className="w-full"
+          >
+            {form.submitting ? "Saving…" : "Save"}
           </Button>
           <Button
             variant="ghost"
-            onClick={keepCurrent}
-            disabled={submitting}
+            onClick={() => void form.keepCurrent()}
+            disabled={form.submitting}
             className="w-full"
           >
             Keep my current setup
