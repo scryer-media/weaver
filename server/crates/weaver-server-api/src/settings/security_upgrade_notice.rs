@@ -7,12 +7,19 @@
 //! once. Whether it has been seen is kept here rather than in the browser, so
 //! a second browser is not told again; moving the install to the new model
 //! ends it too, because the notice has nothing left to say.
+//!
+//! An install created since then can be on the older settings too, when its
+//! deployment asked for them (`WEAVER_TRUSTED_CIDRS` without
+//! `WEAVER_ACCESS_MODE`). It chose them knowingly and never had anything to
+//! upgrade from, so it is not told.
 
 use async_graphql::SimpleObject;
 use weaver_server_core::Database;
 use weaver_server_core::auth::LoginAuthCache;
 use weaver_server_core::runtime::environment::detect_runtime_environment;
-use weaver_server_core::security::RuntimeSecurityConfig;
+use weaver_server_core::security::{
+    AUTHENTICATED_INSTALL_GENERATION, RuntimeSecurityConfig, SETTING_INSTALL_GENERATION,
+};
 
 use crate::observability::spawn_blocking_db;
 
@@ -31,8 +38,10 @@ pub struct SecurityUpgradeNotice {
     pub login_enabled: bool,
 }
 
-fn pending(legacy_access: bool, stored: Option<&str>) -> bool {
-    legacy_access && stored != Some(NOTICE_DISMISSED)
+fn pending(legacy_access: bool, generation: Option<&str>, stored: Option<&str>) -> bool {
+    legacy_access
+        && generation != Some(AUTHENTICATED_INSTALL_GENERATION)
+        && stored != Some(NOTICE_DISMISSED)
 }
 
 fn notice(pending: bool, auth_cache: &LoginAuthCache) -> SecurityUpgradeNotice {
@@ -51,17 +60,20 @@ pub(crate) async fn status(
     auth_cache: &LoginAuthCache,
 ) -> async_graphql::Result<SecurityUpgradeNotice> {
     let legacy_access = !security.authenticated_access_mode();
-    let stored = if legacy_access {
+    let (generation, stored) = if legacy_access {
         let db = db.clone();
         spawn_blocking_db("settings.security_upgrade_notice.read", move || {
-            db.get_setting(SETTING_SECURITY_UPGRADE_NOTICE)
+            Ok::<_, weaver_server_core::StateError>((
+                db.get_setting(SETTING_INSTALL_GENERATION)?,
+                db.get_setting(SETTING_SECURITY_UPGRADE_NOTICE)?,
+            ))
         })
         .await?
     } else {
-        None
+        (None, None)
     };
     Ok(notice(
-        pending(legacy_access, stored.as_deref()),
+        pending(legacy_access, generation.as_deref(), stored.as_deref()),
         auth_cache,
     ))
 }
@@ -84,12 +96,17 @@ mod tests {
 
     #[test]
     fn only_an_install_on_the_older_settings_is_told() {
-        assert!(pending(true, None));
-        assert!(!pending(false, None));
+        assert!(pending(true, None, None));
+        assert!(!pending(false, None, None));
+    }
+
+    #[test]
+    fn an_install_created_on_the_older_settings_is_not_told() {
+        assert!(!pending(true, Some(AUTHENTICATED_INSTALL_GENERATION), None));
     }
 
     #[test]
     fn a_dismissed_notice_never_returns() {
-        assert!(!pending(true, Some(NOTICE_DISMISSED)));
+        assert!(!pending(true, None, Some(NOTICE_DISMISSED)));
     }
 }
