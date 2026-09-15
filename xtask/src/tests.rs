@@ -257,6 +257,8 @@ fn sample_release_dry_run_cache() -> ReleaseDryRunCache {
             "release_prep_validation".to_string(),
             "rust_validation".to_string(),
         ],
+        release_notes_path: Some("release-notes/weaver-v0.2.8.md".to_string()),
+        release_notes_sha256: Some("sha256:release-notes".to_string()),
         failure_message: None,
     }
 }
@@ -268,6 +270,8 @@ fn sample_release_dry_run_expectations<'a>() -> ReleaseDryRunExpectations<'a> {
         latest_tag_seen: Some("weaver-v0.2.7"),
         next_version: "0.2.8",
         tag_name: "weaver-v0.2.8",
+        release_notes_path: "release-notes/weaver-v0.2.8.md",
+        release_notes_sha256: "sha256:release-notes",
     }
 }
 
@@ -383,6 +387,193 @@ fn release_dry_run_cache_accepts_matching_inputs() {
     let reason =
         release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations());
     assert!(reason.is_none());
+}
+
+#[test]
+fn release_dry_run_cache_rejects_release_notes_path_mismatch() {
+    let mut cache = sample_release_dry_run_cache();
+    cache.release_notes_path = Some("release-notes/weaver-v0.2.7.md".to_string());
+    assert_eq!(
+        release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations())
+            .as_deref(),
+        Some("release notes path changed since dry run")
+    );
+}
+
+#[test]
+fn release_dry_run_cache_rejects_changed_release_notes() {
+    let mut cache = sample_release_dry_run_cache();
+    cache.release_notes_sha256 = Some("sha256:older-notes".to_string());
+    assert_eq!(
+        release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations())
+            .as_deref(),
+        Some("release notes changed since dry run")
+    );
+}
+
+#[test]
+fn release_dry_run_cache_without_release_notes_is_not_reused() {
+    let mut cache = sample_release_dry_run_cache();
+    cache.release_notes_path = None;
+    cache.release_notes_sha256 = None;
+    assert!(
+        release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations())
+            .is_some()
+    );
+}
+
+#[test]
+fn release_notes_only_dirty_tree_skips_the_operator_prompt() {
+    let notes = "release-notes/weaver-v1.2.3.md";
+
+    assert!(dirty_paths_are_release_notes_only(
+        "?? release-notes/weaver-v1.2.3.md\n",
+        notes
+    ));
+    assert!(dirty_paths_are_release_notes_only(
+        " M release-notes/weaver-v1.2.3.md\n",
+        notes
+    ));
+    assert!(!dirty_paths_are_release_notes_only(
+        "?? release-notes/weaver-v1.2.3.md\n M xtask/src/main.rs\n",
+        notes
+    ));
+    assert!(!dirty_paths_are_release_notes_only(
+        "?? release-notes/weaver-v1.2.2.md\n",
+        notes
+    ));
+    assert!(!dirty_paths_are_release_notes_only("", notes));
+}
+
+#[test]
+fn porcelain_status_paths_follow_renames_and_unquote() {
+    assert_eq!(
+        porcelain_status_paths("R  release-notes/old.md -> release-notes/new.md\n"),
+        vec!["release-notes/new.md".to_string()]
+    );
+    assert_eq!(
+        porcelain_status_paths("?? \"release-notes/weaver v1.2.3.md\"\n"),
+        vec!["release-notes/weaver v1.2.3.md".to_string()]
+    );
+}
+
+#[test]
+fn release_notes_validation_requires_the_release_heading() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("notes.md");
+    let version = Version::parse("1.2.3").unwrap();
+
+    fs::write(
+        &path,
+        "# Weaver 1.2.3 release notes\n\n## Highlights\n\n- Faster imports.\n",
+    )
+    .unwrap();
+    validate_release_notes_document(&path, "weaver-v1.2.3", &version).unwrap();
+
+    fs::write(&path, "# weaver-v1.2.3\n\n- Faster imports.\n").unwrap();
+    validate_release_notes_document(&path, "weaver-v1.2.3", &version).unwrap();
+
+    fs::write(&path, "# Weaver 1.2.2 release notes\n\n- Faster imports.\n").unwrap();
+    let error = validate_release_notes_document(&path, "weaver-v1.2.3", &version).unwrap_err();
+    assert!(format!("{error:#}").contains("must start with"));
+
+    fs::write(&path, " \n").unwrap();
+    let error = validate_release_notes_document(&path, "weaver-v1.2.3", &version).unwrap_err();
+    assert!(format!("{error:#}").contains("empty"));
+}
+
+#[test]
+fn release_notes_validation_rejects_placeholders_and_local_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("notes.md");
+    let version = Version::parse("1.2.3").unwrap();
+
+    fs::write(&path, "# Weaver 1.2.3 release notes\n\n- TBD\n").unwrap();
+    let error = validate_release_notes_document(&path, "weaver-v1.2.3", &version).unwrap_err();
+    assert!(format!("{error:#}").contains("placeholder text"));
+
+    let local_path = concat!("/", "Users/someone/weaver");
+    fs::write(
+        &path,
+        format!("# Weaver 1.2.3 release notes\n\n- Built from {local_path}.\n"),
+    )
+    .unwrap();
+    let error = validate_release_notes_document(&path, "weaver-v1.2.3", &version).unwrap_err();
+    assert!(format!("{error:#}").contains("release hygiene"));
+}
+
+#[test]
+fn missing_release_notes_fail_with_agent_authoring_instructions() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = TaskContext {
+        repo_root: temp.path().to_path_buf(),
+    };
+    let version = Version::parse("1.2.3").unwrap();
+
+    let error = require_release_notes(&ctx, Some("weaver-v1.2.2"), "weaver-v1.2.3", &version, true)
+        .unwrap_err();
+    let message = format!("{error:#}");
+
+    assert!(message.contains("release notes are missing"));
+    assert!(message.contains("If you are an agent running this command"));
+    assert!(message.contains("Write release-notes/weaver-v1.2.3.md yourself"));
+    assert!(message.contains("# Weaver 1.2.3 release notes"));
+    assert!(message.contains("tmp/xtask-release-notes/weaver-v1.2.3-context.md"));
+    assert!(message.contains("Re-run the same `cargo xtask release --dry-run` command"));
+
+    let context = fs::read_to_string(release_notes_context_path(&ctx, "weaver-v1.2.3")).unwrap();
+    assert!(context.contains("# Release Notes Authoring Context"));
+    assert!(context.contains("Write the notes to: release-notes/weaver-v1.2.3.md"));
+}
+
+#[test]
+fn invalid_release_notes_fail_a_real_release_with_authoring_instructions() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = TaskContext {
+        repo_root: temp.path().to_path_buf(),
+    };
+    let version = Version::parse("1.2.3").unwrap();
+    let notes_path = release_notes_path(&ctx, "weaver-v1.2.3");
+    fs::create_dir_all(notes_path.parent().unwrap()).unwrap();
+    fs::write(&notes_path, "# Wrong heading\n\n- Something changed.\n").unwrap();
+
+    let error = require_release_notes(
+        &ctx,
+        Some("weaver-v1.2.2"),
+        "weaver-v1.2.3",
+        &version,
+        false,
+    )
+    .unwrap_err();
+    let message = format!("{error:#}");
+
+    assert!(message.contains("release-notes/weaver-v1.2.3.md are not usable"));
+    assert!(message.contains("must start with"));
+    assert!(message.contains("If you are an agent running this command"));
+    assert!(message.contains("then retry this release"));
+}
+
+#[test]
+fn valid_release_notes_pass_without_writing_authoring_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = TaskContext {
+        repo_root: temp.path().to_path_buf(),
+    };
+    let version = Version::parse("1.2.3").unwrap();
+    let notes_path = release_notes_path(&ctx, "weaver-v1.2.3");
+    fs::create_dir_all(notes_path.parent().unwrap()).unwrap();
+    fs::write(
+        &notes_path,
+        "# Weaver 1.2.3 release notes\n\n## Highlights\n\n- Imports are faster.\n",
+    )
+    .unwrap();
+
+    let resolved =
+        require_release_notes(&ctx, Some("weaver-v1.2.2"), "weaver-v1.2.3", &version, true)
+            .unwrap();
+
+    assert_eq!(resolved, notes_path);
+    assert!(!release_notes_context_path(&ctx, "weaver-v1.2.3").exists());
 }
 
 #[test]
