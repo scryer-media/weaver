@@ -386,3 +386,63 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
             .exists()
     );
 }
+
+/// A set demoted on its first volume's header must not take its siblings'
+/// outstanding downloads with it.
+///
+/// The whole-set refetch fallback runs when nothing was ever routed, and it is
+/// the only demotion arm that touches every volume of the set at once. The
+/// volumes behind the one that demoted have been dispatched for nothing yet:
+/// their articles are still queued, uncommitted and nobody else's, and the
+/// refetch's own rule — requeue what the deleted routed storage owned, leave
+/// everything else to its owner — must read a queued article as owned by the
+/// queue rather than as work to drop. If it does not, the pass ends with an
+/// empty queue and files nothing ever attempted, and the completion verdict
+/// blames retries that never ran.
+#[tokio::test]
+async fn a_demotion_on_the_first_volume_leaves_the_rest_of_the_set_queued() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let bytes = rar5_fixture_bytes("rar5_solid.rar");
+    let volumes = vec![
+        ("archive.part1.rar".to_string(), bytes.clone()),
+        ("archive.part2.rar".to_string(), bytes.clone()),
+        ("archive.part3.rar".to_string(), bytes),
+    ];
+    let job_id = JobId(41971);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        direct_store_job_spec("Ineligible member demotion", &volumes),
+    )
+    .await;
+    assert_eq!(
+        peek_queued_segments(&mut pipeline, job_id),
+        vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+        "every article is queued before the pass dispatches anything"
+    );
+
+    // Only the first volume is dispatched. Its header names a member the
+    // router cannot route, and nothing was routed before it, so the set takes
+    // the whole-set refetch fallback rather than a reconstruction sweep.
+    for segment in 0..2 {
+        dispatch_and_submit(&mut pipeline, job_id, &volumes, 0, segment, 2).await;
+    }
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .expect("candidate set was admitted")
+            .is_demoted(),
+        "the ineligible member must demote the set"
+    );
+
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    for expected in [(1, 0), (1, 1), (2, 0), (2, 1)] {
+        assert!(
+            queued.contains(&expected),
+            "volume article {expected:?} was never attempted and must still be queued, \
+             queue holds {queued:?}"
+        );
+    }
+}

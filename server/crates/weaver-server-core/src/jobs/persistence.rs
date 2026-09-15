@@ -96,7 +96,7 @@ fn db_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
 }
 
-fn metadata_json(metadata: &[(String, String)]) -> Result<Option<String>, StateError> {
+pub(crate) fn metadata_json(metadata: &[(String, String)]) -> Result<Option<String>, StateError> {
     if metadata.is_empty() {
         Ok(None)
     } else {

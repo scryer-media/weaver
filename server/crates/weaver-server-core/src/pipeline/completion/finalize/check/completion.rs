@@ -2424,6 +2424,39 @@ impl Pipeline {
                     return;
                 }
                 if has_incomplete_data_files {
+                    // Retries are only exhausted for articles something
+                    // actually asked for. A file whose every segment is still
+                    // missing, in a job that booked no failed bytes at all,
+                    // was never attempted: its work left the queue without
+                    // reaching a terminal result, and the verdict below blames
+                    // a retry budget nothing ever spent. Name those files —
+                    // the counters are all zero, so this line is the only
+                    // trace the loss leaves.
+                    if failed_bytes == 0 {
+                        let unattempted: Vec<String> = self
+                            .jobs
+                            .get(&job_id)
+                            .map(|state| {
+                                state
+                                    .assembly
+                                    .files()
+                                    .filter(|file| {
+                                        !file.is_complete()
+                                            && file.total_segments() > 0
+                                            && file.missing_count() == file.total_segments()
+                                    })
+                                    .map(|file| format!("{} ({})", file.file_id(), file.filename()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !unattempted.is_empty() {
+                            warn!(
+                                job_id = job_id.0,
+                                files = ?unattempted,
+                                "downloads ended with files no article was ever booked against and no failed bytes: this work left the queue without a terminal result"
+                            );
+                        }
+                    }
                     let msg = format!(
                         "download incomplete after exhausting retries: {complete_data_files}/{total_data_files} data files complete and no PAR2 metadata is available for repair"
                     );

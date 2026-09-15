@@ -29,6 +29,13 @@ const (
 const (
 	restartExtractDelayEnv = "WEAVER_E2E_DELAY=extract.member_start=20000"
 	restartPar2AliasSet    = "a31f592e0b874d3ea8c44161b77f3049"
+	// restartClassicExtractEnv keeps the classic RAR extraction path in play for
+	// the cases whose restart points are seams inside it: the member-start delay
+	// hook, the per-volume checkpoint and the finalize-after-rename trip point.
+	// Direct unpack installs members straight out of the chase and never enters
+	// those seams, so with the gate at its default a case written against them
+	// simply watches the job complete and never reaches its restart point.
+	restartClassicExtractEnv = "WEAVER_DIRECT_UNPACK=0"
 )
 
 type restartClassification string
@@ -613,7 +620,14 @@ func ensureRestartWeaverBinary() (string, error) {
 }
 
 func (ctx *restartCaseContext) restartWeaver() error {
-	return ctx.startWeaverWithConnections("", ctx.connections)
+	return ctx.startWeaverWithOptions("", ctx.connections)
+}
+
+// restartWeaverWithEnv restarts without a failpoint but keeps the environment a
+// case needs on both sides of the crash, so the path it exercised before the
+// kill is the same path it resumes on.
+func (ctx *restartCaseContext) restartWeaverWithEnv(extraEnv ...string) error {
+	return ctx.startWeaverWithOptions("", ctx.connections, extraEnv...)
 }
 
 func (ctx *restartCaseContext) killWeaverForRestart() error {
@@ -624,11 +638,59 @@ func (ctx *restartCaseContext) killWeaverForRestart() error {
 	return waitForGraphQLDown(graphqlURL(ctx.weaverURL), 20*time.Second)
 }
 
-func (ctx *restartCaseContext) waitForCrash(timeout time.Duration) error {
+// waitForCrash waits for the failpoint to take the process down, and gives up
+// the moment that can no longer happen.
+//
+// A case arms a failpoint on a seam and then waits for the process to die on
+// it. If the job runs to a terminal status without ever touching that seam the
+// process will never exit, so waiting out the full timeout only converts a
+// certain failure into a slow one. Once every submitted job is terminal in the
+// case database the verdict is already decided, so report it immediately and
+// say which seam was never reached.
+func (ctx *restartCaseContext) waitForCrash(timeout time.Duration, jobIDs ...int) error {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	return waitForGraphQLDown(graphqlURL(ctx.weaverURL), timeout)
+	url := graphqlURL(ctx.weaverURL)
+	if len(jobIDs) == 0 {
+		return waitForGraphQLDown(url, timeout)
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	body := []byte(`{"query":"{ version }"}`)
+	dbPath := filepath.Join(ctx.CaseDir, "weaver.db")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if graphQLDown(client, url, body) {
+			return nil
+		}
+		snapshot, err := captureRestartDBSnapshot(dbPath)
+		if err == nil && allJobsTerminalInSnapshot(snapshot, jobIDs) {
+			// The status flip and the process exit race each other; only call
+			// it a miss once the process is still answering after the flip.
+			time.Sleep(250 * time.Millisecond)
+			if graphQLDown(client, url, body) {
+				return nil
+			}
+			return fmt.Errorf(
+				"submitted jobs %v reached terminal status without tripping the armed failpoint at %s",
+				jobIDs,
+				url,
+			)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for GraphQL shutdown at %s", url)
+}
+
+func graphQLDown(client *http.Client, url string, body []byte) bool {
+	resp, err := postGraphQLWithClient(client, url, body)
+	if err != nil {
+		return true
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return false
 }
 
 func (ctx *restartCaseContext) cleanup() {
@@ -770,12 +832,9 @@ func waitForGraphQLDown(url string, timeout time.Duration) error {
 	body := []byte(`{"query":"{ version }"}`)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := postGraphQLWithClient(client, url, body)
-		if err != nil {
+		if graphQLDown(client, url, body) {
 			return nil
 		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
 		time.Sleep(250 * time.Millisecond)
 	}
 	return fmt.Errorf("timeout waiting for GraphQL shutdown at %s", url)
@@ -2032,7 +2091,7 @@ func classifyRestartResult(profile restartProfile, pass bool, passSummary string
 }
 
 func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv, restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
@@ -2040,26 +2099,28 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 		return restartCaseResult{}, err
 	}
 
-	preDB, _, preMetrics, err := func() (restartDBSnapshot, restartFilesystemSnapshot, restartNntpMetrics, error) {
-		_, err := ctx.waitForDB(3*time.Minute, func(snapshot restartDBSnapshot) bool {
-			status := jobStatusFromDB(snapshot, jobID)
-			metrics := snapshot.JobMetrics[jobID]
-			return metrics.Files > 0 && status != "" && !dbStatusTerminal(status)
-		})
-		if err != nil {
-			return restartDBSnapshot{}, restartFilesystemSnapshot{}, restartNntpMetrics{}, err
-		}
-		return ctx.captureEvidence("pre_crash", "e2e-rar5-multi-member-")
-	}()
+	// The restart point is the member-extraction delay hook, not "the database
+	// has a row and the job is not terminal yet". The case asserts that nothing
+	// is refetched after the restart, which only holds once every article is
+	// already durable; and a bare "not terminal yet" predicate matches the
+	// instant the job is queued, so on a fixture this small the job can reach a
+	// terminal status while the pre-crash evidence is still being captured, and
+	// the case silently turns into a check of what survives in history. Parking
+	// the process inside the extraction delay pins both ends: downloads are
+	// complete and the job provably cannot terminalize before the kill.
+	if _, err := waitForDelayHookRestartPoint(ctx, []int{jobID}, "extract.member_start", 3*time.Minute); err != nil {
+		return restartCaseResult{}, fmt.Errorf("wait for completed-download restart point: %w", err)
+	}
+	if err := ctx.killWeaverForRestart(); err != nil {
+		return restartCaseResult{}, err
+	}
+	preDB, _, preMetrics, err := ctx.captureEvidence("pre_crash", "e2e-rar5-multi-member-")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
 	preCompletedFiles := preDB.JobMetrics[jobID].Files
 
-	if err := ctx.killWeaverForRestart(); err != nil {
-		return restartCaseResult{}, err
-	}
-	if err := ctx.restartWeaver(); err != nil {
+	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	postFacade, err := ctx.waitForFacade(jobID, 2*time.Minute, func(snapshot facadeItemSnapshot) bool {
@@ -2273,7 +2334,7 @@ func runQueuedRepairSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseR
 }
 
 func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv, restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobIDs, err := ctx.submitSlugNTimes("rar5-multi-member", 2)
@@ -2292,7 +2353,7 @@ func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCase
 		return restartCaseResult{}, err
 	}
 
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv, restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	postDB, err := ctx.waitForDB(2*time.Minute, func(snapshot restartDBSnapshot) bool {
@@ -2424,7 +2485,7 @@ func runVerifyingRestartsCleanly(ctx *restartCaseContext) (restartCaseResult, er
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.waitForCrash(5 * time.Minute); err != nil {
+	if err := ctx.waitForCrash(5*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
 	_, _, _, _ = ctx.captureEvidence("pre_crash", "")
@@ -2455,7 +2516,7 @@ func runRepairingRestartsCleanly(ctx *restartCaseContext) (restartCaseResult, er
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.waitForCrash(8 * time.Minute); err != nil {
+	if err := ctx.waitForCrash(8*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
 	_, _, _, _ = ctx.captureEvidence("pre_crash", "")
@@ -2479,14 +2540,14 @@ func runRepairingRestartsCleanly(ctx *restartCaseContext) (restartCaseResult, er
 }
 
 func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaver("extract.after_volume_checkpoint"); err != nil {
+	if err := ctx.startWeaverWithOptions("extract.after_volume_checkpoint", 8, restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.waitForCrash(10 * time.Minute); err != nil {
+	if err := ctx.waitForCrash(10*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
 	_, preFS, preMetrics, err := ctx.captureEvidence("pre_crash", "")
@@ -2501,7 +2562,7 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 		return restartCaseResult{}, fmt.Errorf("staged partial member %s was empty before restart", partialPath)
 	}
 
-	if err := ctx.restartWeaver(); err != nil {
+	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
@@ -2526,14 +2587,14 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 }
 
 func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaver("extract.after_finalize_rename_before_record"); err != nil {
+	if err := ctx.startWeaverWithOptions("extract.after_finalize_rename_before_record", 8, restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.waitForCrash(12 * time.Minute); err != nil {
+	if err := ctx.waitForCrash(12*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
 	_, preFS, preMetrics, err := ctx.captureEvidence("pre_crash", "")
@@ -2548,7 +2609,7 @@ func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseRe
 		return restartCaseResult{}, fmt.Errorf("staged finalized member %s was empty before restart", stagedPath)
 	}
 
-	if err := ctx.restartWeaver(); err != nil {
+	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
@@ -2573,14 +2634,14 @@ func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseRe
 }
 
 func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaver("extract.after_volume_checkpoint"); err != nil {
+	if err := ctx.startWeaverWithOptions("extract.after_volume_checkpoint", 8, restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.waitForCrash(10 * time.Minute); err != nil {
+	if err := ctx.waitForCrash(10*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
 
@@ -2633,7 +2694,7 @@ func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (rest
 		return restartCaseResult{}, err
 	}
 
-	if err := ctx.restartWeaver(); err != nil {
+	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 
@@ -2713,7 +2774,7 @@ func runVerificationReconcilesStaleExtractingRuntime(ctx *restartCaseContext) (r
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.waitForCrash(5 * time.Minute); err != nil {
+	if err := ctx.waitForCrash(5*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
 
@@ -2795,7 +2856,7 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.waitForCrash(5 * time.Minute); err != nil {
+	if err := ctx.waitForCrash(5*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
 	if !logContains(ctx.caseLogPath, "status.enter_verifying") {
