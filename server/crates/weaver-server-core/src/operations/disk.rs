@@ -57,14 +57,38 @@ impl fmt::Display for DiskProbeError {
 impl std::error::Error for DiskProbeError {}
 
 /// Query total/available capacity for the filesystem backing `path`
-/// (`statvfs` on unix, `GetDiskFreeSpaceExW` on Windows).
+/// (`statfs` on Apple platforms, `statvfs` on other unix,
+/// `GetDiskFreeSpaceExW` on Windows).
+///
+/// Apple's `statvfs` keeps block counts in 32 bits, so a volume with more
+/// than 2^32 blocks — a 22 TB share counted in 1 KiB blocks — reads as a
+/// small disk with more free space than total. Its `statfs` counts in 64 bits.
 ///
 /// Fails when the path cannot be stat'd (e.g. it does not exist yet), when the
 /// filesystem returns an unusable reading, or on unsupported platforms. The
 /// error carries the operating-system reason so callers can log it and decide
 /// between failing open, holding a stale reading, and refusing.
 pub fn probe_disk_space(path: &Path) -> Result<DiskSpace, DiskProbeError> {
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| DiskProbeError::InvalidPath)?;
+        // SAFETY: `statfs` fills a zeroed `libc::statfs` for a valid C string path;
+        // we check the return code before reading any fields.
+        unsafe {
+            let mut stat: libc::statfs = std::mem::zeroed();
+            if libc::statfs(path_cstr.as_ptr(), &mut stat) != 0 {
+                return Err(DiskProbeError::Io(io::Error::last_os_error()));
+            }
+            // `f_bsize` is the unit `f_blocks` and `f_bavail` are counted in.
+            let unit = u64::from(stat.f_bsize);
+            reading_from_blocks(stat.f_blocks, stat.f_bavail, unit, unit)
+        }
+    }
+
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     {
         use std::os::unix::ffi::OsStrExt;
 

@@ -54,9 +54,9 @@ pub(crate) async fn run(
         db.get_setting(weaver_server_core::security::SETTING_SECURITY_POLICY_REVISION)?;
     let unconfigured_new_install = db.pre_migration_schema_version().is_none()
         || (db
-            .get_setting(crate::bootstrap::INSTALL_GENERATION_SETTING)?
+            .get_setting(weaver_server_core::security::SETTING_INSTALL_GENERATION)?
             .as_deref()
-            == Some("authenticated-v1")
+            == Some(weaver_server_core::security::AUTHENTICATED_INSTALL_GENERATION)
             && stored_revision.is_none()
             && stored_mode.is_none());
     security.apply_stored_access_policy_revision(

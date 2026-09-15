@@ -8,7 +8,7 @@ interface UpdateNotificationLinkProps {
   /**
    * `"desktop"` renders inline in the sidebar footer, in place of the plain
    * version line. `"mobile"` renders a floating pill for viewports where that
-   * sidebar is hidden.
+   * sidebar is hidden, so its breakpoint must stay the sidebar's.
    */
   placement: "desktop" | "mobile";
   label: string;
@@ -45,7 +45,7 @@ export function UpdateNotificationLink({
         "flex items-center justify-center gap-1.5 font-medium text-primary transition-colors",
         placement === "desktop"
           ? "rounded-[9px] px-2 py-1 text-[11.5px] hover:bg-accent/40 hover:text-primary"
-          : "fixed bottom-4 left-4 z-40 rounded-full border border-primary/30 bg-background/95 px-3 py-1.5 text-xs shadow-[0_18px_60px_rgba(8,18,36,0.28)] backdrop-blur-md md:hidden",
+          : "fixed bottom-4 left-4 z-40 rounded-full border border-primary/30 bg-background/95 px-3 py-1.5 text-xs shadow-[0_18px_60px_rgba(8,18,36,0.28)] backdrop-blur-md min-[1600px]:hidden",
       )}
     >
       <CircleArrowUp className="size-3.5" aria-hidden="true" />

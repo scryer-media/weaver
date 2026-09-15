@@ -66,6 +66,10 @@ pub const SETTING_ACCESS_MODE: &str = "access_mode";
 /// migration. Absence means the stored access mode retains legacy semantics.
 pub const SETTING_SECURITY_POLICY_REVISION: &str = "security_policy_revision";
 pub const AUTHENTICATED_POLICY_REVISION: &str = "authenticated-v1";
+/// Settings-table key stamped when a database is created, naming the access
+/// model that release introduced. Absent on an install that predates it.
+pub const SETTING_INSTALL_GENERATION: &str = "auth.installation_generation";
+pub const AUTHENTICATED_INSTALL_GENERATION: &str = "authenticated-v1";
 /// Settings-table key holding the trusted-network list (JSON array of CIDRs)
 /// backing [`AccessMode::LoginExceptLocal`].
 pub const SETTING_TRUSTED_NETWORKS: &str = "trusted_networks";

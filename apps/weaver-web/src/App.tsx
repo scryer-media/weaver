@@ -1,6 +1,7 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { SecurityUpgradeWizard, SetupWizardPage } from "@/pages/SetupWizardPage";
 import type { SetupEnvironment } from "@/lib/setup-flow";
+import type { SecurityUpgradeState } from "@/lib/security-upgrade";
 import { Provider, useQuery } from "urql";
 import { RouterProvider } from "react-router/dom";
 import { ThemeProvider } from "next-themes";
@@ -23,6 +24,7 @@ import { LoginPage } from "@/pages/LoginPage";
 const NextApp = lazy(() => import("./next/NextApp"));
 const NextLoginPage = lazy(() => import("./next/pages/LoginPage"));
 const NextSetupPage = lazy(() => import("./next/pages/SetupPage"));
+const NextSecurityUpgradePage = lazy(() => import("./next/pages/SecurityUpgradePage"));
 
 const uiVariant = readUiVariant();
 
@@ -189,21 +191,24 @@ function SecurityUpgradeGate({ children }: { children: React.ReactNode }) {
     return <GatePlaceholder />;
   }
   if (decision === "wizard" && data) {
-    return (
-      <SecurityUpgradeWizard
-        state={{
-          loginEnabled: data.adminLoginStatus.enabled,
-          strictSecurity: data.accessPolicy.strictSecurity,
-          bindEditable: data.httpBindAddress.editable,
-          bindEffective: data.httpBindAddress.storedAddress ?? data.httpBindAddress.address,
-          restartSupported: Boolean(data.serverRestart?.supported),
-          restartUnsupportedReason: data.serverRestart?.reason ?? null,
-          // The GraphQL enum arrives upper-cased; the wizard compares against
-          // the same lower-case spellings the REST status surface uses.
-          deployment: (data.serverRestart?.deployment ?? "").toLowerCase(),
-        }}
-        onDone={() => setDecision("app")}
-      />
+    const state: SecurityUpgradeState = {
+      loginEnabled: data.adminLoginStatus.enabled,
+      strictSecurity: data.accessPolicy.strictSecurity,
+      bindEditable: data.httpBindAddress.editable,
+      bindEffective: data.httpBindAddress.storedAddress ?? data.httpBindAddress.address,
+      restartSupported: Boolean(data.serverRestart?.supported),
+      restartUnsupportedReason: data.serverRestart?.reason ?? null,
+      // The GraphQL enum arrives upper-cased; the wizard compares against
+      // the same lower-case spellings the REST status surface uses.
+      deployment: (data.serverRestart?.deployment ?? "").toLowerCase(),
+    };
+    const onDone = () => setDecision("app");
+    return uiVariant === "next" ? (
+      <Suspense fallback={<GatePlaceholder />}>
+        <NextSecurityUpgradePage state={state} onDone={onDone} />
+      </Suspense>
+    ) : (
+      <SecurityUpgradeWizard state={state} onDone={onDone} />
     );
   }
   return <>{children}</>;
