@@ -12,8 +12,7 @@
 # The runner is amd64, which is what every image pins, so nothing is emulated:
 # the RARLAB 3.93/4.20/5.00 releases are 32-bit x86 binaries and the kernel's
 # IA-32 support runs them directly. A developer regenerating on an arm64 host
-# needs QEMU binfmt handlers for amd64 and 386 instead — see
-# e2e/docs/generators.md.
+# needs QEMU binfmt handlers for amd64 and 386 instead.
 set -euo pipefail
 
 if [ -z "${ONLY:-}" ]; then

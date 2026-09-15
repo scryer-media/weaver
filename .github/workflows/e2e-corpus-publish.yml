@@ -32,8 +32,6 @@ name: e2e-corpus-publish
 # stack, the generator already runs its oracle checks on every fixture it
 # writes, and `assemble` holds the whole tree to the ledger in both
 # directions.
-#
-# See e2e/docs/test-corpus.md.
 
 on:
   workflow_dispatch:

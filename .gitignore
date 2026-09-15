@@ -53,3 +53,7 @@ apps/weaver-web/.vite
 # Benchmark snapshots are local artifacts. Keep scripts and harnesses tracked,
 # but do not commit generated measurements.
 ci/bench/results/**
+
+# Agent working notes never ship
+*-REPORT.md
+*-PLAN.md
