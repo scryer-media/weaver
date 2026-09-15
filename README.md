@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.scryer.media/weaver/"><img src="docs/img/weaver-overview.webp" alt="Weaver web interface" width="800" /></a>
+  <a href="https://www.scryer.media/weaver/"><img src="docs/img/weaver-overview-0-12.webp" alt="Weaver web interface" width="800" /></a>
 </p>
 
 ## What is Weaver?
