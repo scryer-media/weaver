@@ -2672,6 +2672,7 @@ impl Pipeline {
                             matches!(
                                 self.classified_role_for_file(job_id, f),
                                 weaver_model::files::FileRole::Par2 { .. }
+                                    | weaver_model::files::FileRole::Par3 { .. }
                                     | weaver_model::files::FileRole::RarVolume { .. }
                                     | weaver_model::files::FileRole::SevenZipArchive
                                     | weaver_model::files::FileRole::SevenZipSplit { .. }

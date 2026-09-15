@@ -473,6 +473,11 @@ impl Drop for WorkTiming {
 pub(super) struct Acquisition {
     pub batch: Option<RecoveryBatch>,
     pub prefetched: bool,
+    /// Indices a drained window retracted while a worker held the engine
+    /// session. The retraction lands on the session at its handback, followed
+    /// by the reassessment that makes those indices askable again; dropping
+    /// it would leave them counted in flight for the rest of the job.
+    deferred_release: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)>,
 }
 
 pub(super) struct RecoveryBatch {
@@ -804,6 +809,14 @@ impl Coordinator {
             return;
         }
         let Some(runtime) = job.runtime.as_mut() else {
+            // A worker holds the session: the retraction waits for its
+            // handback rather than being lost with the session absent.
+            tracing::info!(
+                job_id = job_id.0,
+                released = count,
+                "PAR3 recovery in-flight release deferred to the worker handback"
+            );
+            job.acquisition.deferred_release.extend(declared);
             return;
         };
         for (set, matrix, indices) in &declared {
@@ -2358,8 +2371,33 @@ impl Coordinator {
                 }
             }
         }
+        let deferred_release = std::mem::take(&mut job.acquisition.deferred_release);
+        for (set, matrix, indices) in &deferred_release {
+            if let Some(session) = runtime.sets.get_mut(set) {
+                session.native.forget_recovery_in_flight(*matrix, indices);
+            }
+        }
         job.sources = runtime.sources.clone();
         job.runtime = Some(runtime);
+        if !deferred_release.is_empty() {
+            // The window drained while this worker was out; only a fresh
+            // assessment can put what it released back on offer.
+            match assessment::ViewReservation::acquire(1024) {
+                Ok(reservation) => {
+                    job.pending.insert(
+                        WorkKey::Assess,
+                        QueuedInput::new(PendingInput::Assess, reservation),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = done.job_id.0,
+                        %error,
+                        "PAR3 reassessment after a deferred in-flight release could not be queued"
+                    );
+                }
+            }
+        }
         if done.epoch != job.epoch {
             if matches!(done.key, WorkKey::Repair(_)) {
                 // Installation may have finished before the racing write. The
