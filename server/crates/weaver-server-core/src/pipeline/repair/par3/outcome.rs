@@ -72,6 +72,11 @@ pub(in crate::pipeline) struct MissingMetadata {
     pub carriers_awaiting_bytes: u64,
     /// Referenced files with no authenticated layout entry yet.
     pub unresolved_files: u64,
+    /// A packet family no carrier produced a single authenticated copy of.
+    /// This is a different statement from `sets`: the set is not merely
+    /// incomplete, it is short one of the packets nothing can proceed without,
+    /// and no further carrier byte of the ones already scanned will supply it.
+    pub missing_vital: Option<super::carriers::Par3PacketKind>,
 }
 
 impl std::fmt::Display for MissingMetadata {
@@ -80,7 +85,11 @@ impl std::fmt::Display for MissingMetadata {
             f,
             "{} set(s), {} carrier(s) awaiting bytes, {} unresolved file(s)",
             self.sets, self.carriers_awaiting_bytes, self.unresolved_files
-        )
+        )?;
+        if let Some(kind) = self.missing_vital {
+            write!(f, ", no authenticated {} packet", kind.label())?;
+        }
+        Ok(())
     }
 }
 
@@ -109,10 +118,25 @@ pub(in crate::pipeline) enum Par3Outcome {
     WaitingForMemory { need: u64, have: u64 },
     /// Cannot fit even alone under the configured budget.
     DoesNotFit { need: u64, limit: u64 },
-    /// Informational: what the carrier scanner refused or could not read.
+    /// Informational: what the carrier scanner refused or could not read,
+    /// with the carriers it happened on.
     CarrierDamage {
+        carriers: Vec<super::carriers::CarrierDamage>,
         rejected_packets: u64,
         unavailable_ranges: u64,
+        damaged_bytes: u64,
+    },
+    /// A set names a file weaver will not create under that name.
+    UnsafePath {
+        path: String,
+        reason: super::paths::UnsafePath,
+    },
+    /// The working directory cannot hold the set's outputs and the staging
+    /// copy the installation writes beside them.
+    NoOutputSpace {
+        need: u64,
+        available: u64,
+        shortfall: u64,
     },
 }
 
@@ -127,6 +151,8 @@ impl Par3Outcome {
             Self::WaitingForMemory { .. } => Par3OutcomeClass::WaitingForMemory,
             Self::DoesNotFit { .. } => Par3OutcomeClass::DoesNotFit,
             Self::CarrierDamage { .. } => Par3OutcomeClass::CarrierDamage,
+            Self::UnsafePath { .. } => Par3OutcomeClass::UnsafePath,
+            Self::NoOutputSpace { .. } => Par3OutcomeClass::NoOutputSpace,
         }
     }
 
@@ -139,6 +165,37 @@ impl Par3Outcome {
             self,
             Self::NeedsRecovery { .. } | Self::CarrierDamage { .. } | Self::WaitingForMemory { .. }
         )
+    }
+
+    /// A bounded rendering of a damage summary, on the same rule as the
+    /// cohort list: a few entries and a count of the rest, never one line per
+    /// carrier in a set that has hundreds.
+    fn render_carriers(carriers: &[super::carriers::CarrierDamage]) -> String {
+        const SHOWN: usize = 3;
+        let mut rendered = carriers
+            .iter()
+            .take(SHOWN)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if carriers.len() > SHOWN {
+            rendered.push_str(&format!("; and {} more", carriers.len() - SHOWN));
+        }
+        rendered
+    }
+
+    /// A refused path, shortened so a hostile name cannot flood a message or
+    /// a log line with its own length.
+    fn render_path(path: &str) -> String {
+        const SHOWN: usize = 120;
+        if path.len() <= SHOWN {
+            return path.to_string();
+        }
+        let mut cut = SHOWN;
+        while cut > 0 && !path.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}...", &path[..cut])
     }
 
     fn render_cohorts(cohorts: &[CohortDeficit]) -> String {
@@ -198,12 +255,35 @@ impl std::fmt::Display for Par3Outcome {
                 "PAR3 memory admission failed: needs {need} bytes against a {limit} byte budget"
             ),
             Self::CarrierDamage {
+                carriers,
                 rejected_packets,
                 unavailable_ranges,
+                damaged_bytes,
+            } => {
+                write!(
+                    f,
+                    "PAR3 carriers rejected {rejected_packets} packet(s), left \
+                     {unavailable_ranges} range(s) unreadable and could not \
+                     authenticate {damaged_bytes} byte(s)"
+                )?;
+                if carriers.is_empty() {
+                    return Ok(());
+                }
+                write!(f, ": {}", Self::render_carriers(carriers))
+            }
+            Self::UnsafePath { path, reason } => write!(
+                f,
+                "PAR3 set names a file weaver will not create: {reason} in {:?}",
+                Self::render_path(path)
+            ),
+            Self::NoOutputSpace {
+                need,
+                available,
+                shortfall,
             } => write!(
                 f,
-                "PAR3 carriers rejected {rejected_packets} packet(s) and left \
-                 {unavailable_ranges} range(s) unreadable"
+                "PAR3 output planning is {shortfall} bytes short: installing this set needs \
+                 {need} bytes and the working directory can grant {available}"
             ),
         }
     }
@@ -249,6 +329,19 @@ pub(in crate::pipeline) fn classify_memory_refusal(
     }
 }
 
+/// The ceiling an error names, when it names one.
+///
+/// Hostile or merely enormous metadata — thousands of File packets, a
+/// directory tree that nests without end, a chunk list longer than the data it
+/// describes — stops at a ceiling somebody set rather than at exhaustion.
+/// Naming that ceiling turns it into a typed verdict instead of an opaque
+/// engine string. Which side set it does not change the verdict: a plan that
+/// cannot be executed under a stated bound is unexecutable whether the bound
+/// was the engine's or weaver's, and the label says which one it was.
+pub(in crate::pipeline) fn execution_limit(error: &EngineError) -> Option<&'static str> {
+    super::budget::limit_label(error)
+}
+
 /// The path violation behind an engine error, however it was wrapped.
 ///
 /// A refused name can be reached after earlier files of the same repair have
@@ -269,16 +362,16 @@ pub(in crate::pipeline) fn unsafe_path(error: &EngineError) -> Option<&par3_rs::
 
 /// The verdict on a set that names a file the engine refuses to write.
 ///
-/// A set carries the relative paths of the files it protects, and those bytes
-/// come from whoever built it. The engine checks them against one rule table
-/// before it creates a directory or opens an output, and nothing weaver can do
-/// changes the answer: no retry, no further recovery blocks and no larger
-/// budget makes the name admissible. The refusal is therefore terminal, and it
-/// carries the engine's own text so the rule and the offending component reach
-/// the job's failure message.
+/// Weaver checks the same names before it plans anything, so this is the
+/// engine's own refusal reaching the same class from the other end: the last
+/// line rather than the first. Nothing weaver can do changes the answer — no
+/// retry, no further recovery blocks and no larger budget makes the name
+/// admissible — so the verdict is terminal, and it keeps the engine's words
+/// for the rule when weaver's table states nothing equivalent.
 pub(in crate::pipeline) fn refuse_unsafe_path(violation: &par3_rs::PathViolation) -> Par3Outcome {
-    Par3Outcome::NotExecutable {
-        limit: format!("the engine refuses a path this set names: {violation}").into(),
+    Par3Outcome::UnsafePath {
+        path: violation.path.clone(),
+        reason: super::paths::UnsafePath::from_engine(violation),
     }
 }
 
@@ -423,6 +516,7 @@ impl Pipeline {
         };
         let mut missing = MissingMetadata {
             carriers_awaiting_bytes: runtime.carriers_awaiting_bytes(job_id),
+            missing_vital: runtime.missing_vital_packet(job_id),
             ..MissingMetadata::default()
         };
         for (_, view) in runtime.assessments(job_id) {
@@ -457,16 +551,53 @@ mod tests {
 
     #[test]
     fn an_unsafe_path_is_a_terminal_refusal_that_names_the_rule() {
+        use super::super::paths::UnsafePath;
+
+        // An engine refusal reaches the class weaver's own pre-write check
+        // uses, with the path it refused and weaver's word for the rule.
         let violation = par3_rs::paths::validate_relative_path("payload/../../etc/passwd")
             .expect_err("a parent-directory component is not a writable name");
         let refused = refuse_unsafe_path(&violation);
-        assert_eq!(refused.class(), Par3OutcomeClass::NotExecutable);
+        assert_eq!(refused.class(), Par3OutcomeClass::UnsafePath);
         assert!(refused.is_terminal());
-        // The engine's own text reaches the failure message, so the rule and
-        // the component that broke it are readable without the engine.
+        assert_eq!(
+            refused,
+            Par3Outcome::UnsafePath {
+                path: "payload/../../etc/passwd".into(),
+                reason: UnsafePath::ParentDirectory,
+            }
+        );
         let message = refused.to_string();
-        assert!(message.contains(&violation.to_string()), "{message}");
-        assert!(message.contains(".."), "{message}");
+        assert!(message.contains("a `..` component"), "{message}");
+        assert!(message.contains("payload/../../etc/passwd"), "{message}");
+
+        // Every rule the two tables state the same way maps to weaver's own
+        // word for it; the rules only the engine states keep the engine's.
+        for (path, expected) in [
+            ("/etc/passwd", UnsafePath::Absolute),
+            ("sub//a.bin", UnsafePath::EmptyComponent),
+            ("./a.bin", UnsafePath::CurrentDirectory),
+            ("sub\\a.bin", UnsafePath::SeparatorInComponent),
+            ("stream:name", UnsafePath::SeparatorInComponent),
+            ("sub/CON.txt", UnsafePath::ReservedDeviceName),
+            ("a\0.bin", UnsafePath::Nul),
+            (
+                "trailing. ",
+                UnsafePath::EngineRule(par3_rs::PathRule::TrailingSpaceOrDot),
+            ),
+            (
+                &"x".repeat(par3_rs::MAX_COMPONENT_BYTES + 1),
+                UnsafePath::EngineRule(par3_rs::PathRule::ComponentTooLong),
+            ),
+        ] {
+            let violation = par3_rs::paths::validate_relative_path(path)
+                .expect_err("the engine refuses this name");
+            assert_eq!(UnsafePath::from_engine(&violation), expected, "{path:?}");
+            // Whichever table the word comes from, it is in the message.
+            let message = refuse_unsafe_path(&violation).to_string();
+            assert!(message.contains(expected.reason()), "{message}");
+        }
+
         // The same verdict has to survive the wrapper the engine uses when
         // earlier files of the repair had already staged.
         let interrupted = EngineError::RepairInterrupted {
@@ -493,6 +624,7 @@ mod tests {
                     sets: 1,
                     carriers_awaiting_bytes: 2,
                     unresolved_files: 3,
+                    missing_vital: Some(super::super::carriers::Par3PacketKind::Root),
                 },
             },
             Par3Outcome::Unsupported { detail: "matrix" },
@@ -502,8 +634,25 @@ mod tests {
             Par3Outcome::WaitingForMemory { need: 10, have: 4 },
             Par3Outcome::DoesNotFit { need: 10, limit: 4 },
             Par3Outcome::CarrierDamage {
+                carriers: vec![super::super::carriers::CarrierDamage {
+                    source: SourceId(3),
+                    first_damage_offset: 672,
+                    damaged_bytes: 109,
+                    rejected: 2,
+                    unavailable_ranges: 1,
+                }],
                 rejected_packets: 2,
                 unavailable_ranges: 1,
+                damaged_bytes: 109,
+            },
+            Par3Outcome::UnsafePath {
+                path: "sub/CON".into(),
+                reason: super::super::paths::UnsafePath::ReservedDeviceName,
+            },
+            Par3Outcome::NoOutputSpace {
+                need: 4096,
+                available: 1024,
+                shortfall: 3072,
             },
         ];
         let mut seen = std::collections::BTreeSet::new();

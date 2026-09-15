@@ -204,6 +204,20 @@ impl Pipeline {
             return false;
         }
         if let Some(error) = runtime.error(job_id) {
+            // A set whose metadata outgrows a stated ceiling stops at that
+            // ceiling by name, whether the engine set it or weaver did. Report
+            // the limit as a typed verdict rather than as an error string, so
+            // the class is countable and the check always terminates on the
+            // same answer.
+            if let Some(limit) = outcome::execution_limit(error) {
+                self.settle_par3_outcome(
+                    job_id,
+                    outcome::Par3Outcome::NotExecutable {
+                        limit: format!("it is over a ceiling on {limit}").into(),
+                    },
+                );
+                return true;
+            }
             self.fail_job(job_id, format!("PAR3 assessment failed: {error}"));
             return true;
         }
@@ -291,6 +305,35 @@ impl Pipeline {
         match status {
             RepairStatus::Complete => false,
             RepairStatus::Ready => {
+                // Everything below writes: the direct-unpack preparation, the
+                // output reservations and then the repair itself. Both set
+                // defects that make a plan unexecutable are decided here,
+                // before the first output byte exists.
+                if let Some((path, reason)) = self.par3_unsafe_output_path(job_id, set) {
+                    self.settle_par3_outcome(
+                        job_id,
+                        outcome::Par3Outcome::UnsafePath { path, reason },
+                    );
+                    return true;
+                }
+                if let Some(shortfall) = self.par3_output_space_shortfall(job_id, set).await {
+                    self.settle_par3_outcome(job_id, shortfall);
+                    return true;
+                }
+                if let Some(options) = self
+                    .par3_runtime
+                    .as_mut()
+                    .expect("admitted job")
+                    .take_option_packet_report(job_id)
+                {
+                    // Links and permissions are metadata weaver does not
+                    // install. Say so once, and install the file bytes.
+                    tracing::warn!(
+                        job_id = job_id.0,
+                        options = %options,
+                        "PAR3 set carries option packets weaver does not apply"
+                    );
+                }
                 self.prepare_direct_unpack_for_par3_repair(job_id);
                 if self.job_has_active_extraction_tasks(job_id) {
                     return true;
@@ -573,10 +616,12 @@ impl Pipeline {
                 self.settle_par3_outcome(job_id, outcome::Par3Outcome::Unsupported { detail });
             }
             // A set names the files it protects, and those names are attacker
-            // controlled. The engine refuses to write one before it creates a
-            // directory or opens a file, and no retry, no extra recovery and no
-            // amount of memory changes that name: the verdict is terminal and
-            // says which rule and which component earned it.
+            // controlled. Weaver refuses such a name before it plans anything
+            // for it; this is the same refusal arriving from the other end,
+            // because the engine checks again before it creates a directory or
+            // opens an output. No retry, no further recovery and no larger
+            // budget changes a name, so the verdict is terminal and lands in
+            // the class the plan-time refusal uses.
             Err(error) if outcome::unsafe_path(&error).is_some() => {
                 // The engine returns the temporaries it had already staged when
                 // a later name is refused. Nothing resumes this repair, so drop
@@ -587,10 +632,13 @@ impl Pipeline {
                     self.fail_job(job_id, cleanup);
                     return;
                 }
-                let refused = outcome::refuse_unsafe_path(
-                    outcome::unsafe_path(&error).expect("matched by the guard"),
-                );
-                self.fail_direct_unpack_after_repair(job_id, &refused.to_string());
+                let violation = outcome::unsafe_path(&error).expect("matched by the guard");
+                // The engine's own sentence names the offending component as
+                // well as the rule, so the unpack record keeps it verbatim
+                // while the job's verdict speaks weaver's class.
+                let detail = violation.to_string();
+                let refused = outcome::refuse_unsafe_path(violation);
+                self.fail_direct_unpack_after_repair(job_id, &detail);
                 self.settle_par3_outcome(job_id, refused);
             }
             Err(error) => {

@@ -32,9 +32,17 @@ fn damaged_payload(damage: &[usize]) -> Vec<(&'static str, Vec<u8>)> {
 /// the carriers — and so the packet bytes the engine ingests — are reordered.
 /// What a run reached: the job's own failure text, which is the verdict's
 /// `Display`, and the counter of verdict classes it passed through.
+#[derive(Debug)]
 struct Verdict {
     failure: Option<String>,
     classes: [u64; crate::operations::metrics::Par3OutcomeClass::COUNT],
+    /// What the carriers' own scans reported, captured as soon as every
+    /// carrier had been scanned and before completion could retire the job.
+    damage: Vec<String>,
+    /// Where the job's outputs would have been written.
+    working: PathBuf,
+    /// Whether the completion check stopped claiming another step on its own.
+    terminated: bool,
 }
 
 async fn verdict_for_carrier_order(
@@ -44,14 +52,28 @@ async fn verdict_for_carrier_order(
     damage: &[usize],
 ) -> Verdict {
     let (mut pipeline, _, _) = new_direct_pipeline(root).await;
-    let mut files: Vec<(String, Vec<u8>)> = damaged_payload(damage)
+    let payload: Vec<(String, Vec<u8>)> = damaged_payload(damage)
         .into_iter()
         .map(|(name, bytes)| (name.to_string(), bytes))
         .collect();
+    let carriers: Vec<(String, Vec<u8>)> = carrier_order
+        .iter()
+        .map(|(name, bytes)| ((*name).to_string(), bytes.to_vec()))
+        .collect();
+    run_par3_job(&mut pipeline, job_id, &payload, &carriers).await
+}
+
+/// Publish a job whose protected files are `payload` and whose PAR3 carriers
+/// are `carriers`, and drive it to whatever verdict PAR3 reaches.
+async fn run_par3_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    payload: &[(String, Vec<u8>)],
+    carriers: &[(String, Vec<u8>)],
+) -> Verdict {
+    let mut files: Vec<(String, Vec<u8>)> = payload.to_vec();
     let first_carrier = files.len() as u32;
-    for (name, bytes) in carrier_order {
-        files.push(((*name).to_string(), bytes.to_vec()));
-    }
+    files.extend(carriers.iter().cloned());
     let mut spec = standalone_job_spec(
         "deterministic verdict",
         &files
@@ -62,12 +84,20 @@ async fn verdict_for_carrier_order(
     for file in &mut spec.files {
         file.role = FileRole::from_filename(&file.filename);
     }
-    let working = insert_active_job(&mut pipeline, job_id, spec).await;
-    tokio::fs::create_dir(working.join("sub")).await.unwrap();
-    for (index, (name, bytes)) in files.iter().enumerate() {
-        write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+    let working = insert_active_job(pipeline, job_id, spec).await;
+    for (name, _) in &files {
+        if let Some(parent) = std::path::Path::new(name).parent()
+            && parent != std::path::Path::new("")
+        {
+            tokio::fs::create_dir_all(working.join(parent))
+                .await
+                .unwrap();
+        }
     }
-    for offset in 0..carrier_order.len() as u32 {
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(pipeline, job_id, index as u32, name, bytes).await;
+    }
+    for offset in 0..carriers.len() as u32 {
         pipeline
             .try_load_par3_metadata(
                 job_id,
@@ -77,8 +107,19 @@ async fn verdict_for_carrier_order(
                 },
             )
             .await;
-        settle_par3_recovery(&mut pipeline, job_id).await;
+        settle_par3_recovery(pipeline, job_id).await;
     }
+    let damage = pipeline
+        .par3_runtime
+        .as_ref()
+        .map(|runtime| {
+            runtime
+                .carrier_damage(job_id)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     // Drive completion until PAR3 stops claiming the next step, settling every
     // blocking work unit it asks for along the way.
     // Every announced file has already been written, so the segments still
@@ -90,18 +131,25 @@ async fn verdict_for_carrier_order(
         .unwrap()
         .download_queue
         .extract_matching(|_| true);
-    for _ in 0..16 {
+    // A completion check that keeps claiming another step forever is itself a
+    // defect, so the bound is generous and whether it was reached is reported.
+    let mut terminated = false;
+    for _ in 0..64 {
         if !pipeline.check_par3_completion(job_id).await {
+            terminated = true;
             break;
         }
-        settle_par3_recovery(&mut pipeline, job_id).await;
+        settle_par3_recovery(pipeline, job_id).await;
     }
     Verdict {
-        failure: match job_status_for_assert(&pipeline, job_id) {
+        terminated,
+        failure: match job_status_for_assert(pipeline, job_id) {
             Some(JobStatus::Failed { error }) => Some(error),
             _ => None,
         },
         classes: pipeline.metrics.par3.outcomes(),
+        damage,
+        working,
     }
 }
 
@@ -533,6 +581,723 @@ async fn a_peer_handback_wakes_every_job_parked_on_par3_memory() {
             slot.job_id
         );
     }
+}
+
+/// The fixture index's Root packet, the one vital packet a test damages.
+const ROOT_PACKET: std::ops::Range<usize> = 672..781;
+
+/// Damage a packet in place: past its 48-byte header, so the scanner still
+/// finds the packet and still reads its declared length, and only the hash it
+/// carries stops describing the body behind it.
+fn with_damaged_packet(carrier: &[u8], packet: std::ops::Range<usize>) -> Vec<u8> {
+    let mut bytes = carrier.to_vec();
+    for byte in &mut bytes[packet.start + 48..packet.end] {
+        *byte ^= 0xff;
+    }
+    bytes
+}
+
+/// Deliverable: every vital packet can be taken from the volume carriers, so a
+/// set whose index file never arrives still repairs.
+#[tokio::test]
+async fn a_set_whose_index_never_arrives_still_repairs_from_its_volumes() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52201);
+    // One damaged block against the one recovery block the volume ships.
+    let verdict =
+        verdict_for_carrier_order(&root, job_id, &[("set.vol0+1.par3", VOLUME)], &[300]).await;
+    assert_eq!(
+        verdict.failure, None,
+        "the volumes carry every vital packet: {verdict:?}",
+    );
+    assert_eq!(
+        verdict.classes[Par3OutcomeClass::MetadataIncomplete.index()],
+        0,
+        "a missing index file is not incomplete metadata"
+    );
+    let repaired = tokio::fs::read(verdict.working.join("a.bin"))
+        .await
+        .unwrap();
+    assert_eq!(
+        repaired,
+        damaged_payload(&[]).into_iter().next().unwrap().1,
+        "the protected file was reconstructed"
+    );
+}
+
+/// Deliverable: a damaged copy of a vital packet in one carrier is summarised
+/// with its offset, and the surviving copy in another carrier still repairs.
+#[tokio::test]
+async fn a_damaged_root_copy_is_summarised_and_the_surviving_copy_repairs() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52202);
+    let damaged_index = with_damaged_packet(INDEX, ROOT_PACKET);
+    let verdict = verdict_for_carrier_order(
+        &root,
+        job_id,
+        &[("set.par3", &damaged_index), ("set.vol0+1.par3", VOLUME)],
+        &[300],
+    )
+    .await;
+    assert_eq!(verdict.failure, None, "{verdict:?}");
+    assert_eq!(
+        verdict.damage.len(),
+        1,
+        "exactly one carrier was damaged: {verdict:?}"
+    );
+    assert!(
+        verdict.damage[0].contains(&format!("from offset {}", ROOT_PACKET.start)),
+        "the summary names the damaged range's own offset: {verdict:?}"
+    );
+    assert!(
+        verdict.damage[0].contains(&format!("damaged {} byte", ROOT_PACKET.len())),
+        "the summary names the damaged range's length: {verdict:?}"
+    );
+    assert_ne!(
+        verdict.classes[Par3OutcomeClass::CarrierDamage.index()],
+        0,
+        "the damage was counted as its own class"
+    );
+    let repaired = tokio::fs::read(verdict.working.join("a.bin"))
+        .await
+        .unwrap();
+    assert_eq!(
+        repaired,
+        damaged_payload(&[]).into_iter().next().unwrap().1,
+        "the surviving Root copy planned the repair"
+    );
+}
+
+/// Deliverable: with no authenticated Root copy in any carrier the job fails as
+/// incomplete metadata, and says which packet family it never saw.
+#[tokio::test]
+async fn no_authenticated_root_anywhere_names_the_root_packet() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52203);
+    let damaged_index = with_damaged_packet(INDEX, ROOT_PACKET);
+    let damaged_volume = with_damaged_packet(VOLUME, ROOT_PACKET);
+    let verdict = verdict_for_carrier_order(
+        &root,
+        job_id,
+        &[
+            ("set.par3", &damaged_index),
+            ("set.vol0+1.par3", &damaged_volume),
+        ],
+        &[300],
+    )
+    .await;
+    let failure = verdict
+        .failure
+        .clone()
+        .unwrap_or_else(|| panic!("a set with no Root must fail: {verdict:#?}"));
+    assert!(
+        failure.contains("authenticated metadata remains incomplete"),
+        "{failure}"
+    );
+    assert!(
+        failure.contains("no authenticated root packet"),
+        "the verdict names the family it never saw: {failure}"
+    );
+    assert_ne!(
+        verdict.classes[Par3OutcomeClass::MetadataIncomplete.index()],
+        0
+    );
+    assert!(
+        verdict.terminated,
+        "the completion check reached its verdict and stopped"
+    );
+}
+
+/// Deliverable: a carrier whose own file is already whole never takes a slot
+/// or a byte of a recovery window's budget. Production leaves such a carrier's
+/// spent queue entries behind, and before this they were promoted again on
+/// every pass — which both wasted the window and kept it permanently active.
+#[tokio::test]
+async fn a_complete_carrier_never_spends_a_recovery_window_budget() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52204);
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let payload = damaged_payload(&[300, 2300, 4300]);
+    let mut files: Vec<(String, Vec<u8>)> = payload
+        .iter()
+        .map(|(name, bytes)| ((*name).to_string(), bytes.clone()))
+        .collect();
+    let complete_carrier = files.len() as u32;
+    files.push(("set.par3".into(), INDEX.to_vec()));
+    let incomplete_carrier = files.len() as u32;
+    files.push(("set.vol0+1.par3".into(), VOLUME.to_vec()));
+    let mut spec = standalone_job_spec(
+        "complete carrier budget",
+        &files
+            .iter()
+            .map(|(name, bytes)| (name.clone(), bytes.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    let working = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::create_dir_all(working.join("sub"))
+        .await
+        .unwrap();
+    // Everything but the volume carrier lands. The volume's article is still
+    // owed, so a window has real work to do; the index carrier's article is
+    // spent, and only its queue entry survives.
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        if index as u32 == incomplete_carrier {
+            continue;
+        }
+        write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+    }
+    pipeline
+        .try_load_par3_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: complete_carrier,
+            },
+        )
+        .await;
+    settle_par3_recovery(&mut pipeline, job_id).await;
+    let queued = |pipeline: &Pipeline, file_index: u32| {
+        pipeline.jobs[&job_id]
+            .download_queue
+            .count_matching(|work| work.segment_id.file_id.file_index == file_index)
+    };
+    assert_ne!(
+        queued(&pipeline, complete_carrier),
+        0,
+        "production does leave a complete carrier's segment queued"
+    );
+    assert!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(NzbFileId {
+                job_id,
+                file_index: complete_carrier
+            })
+            .is_some_and(|file| file.is_complete()),
+        "that carrier's own file is whole"
+    );
+
+    assert!(
+        pipeline.promote_par3_recovery_window(job_id, false),
+        "a window is admitted for the carrier that is still owed"
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .par3
+            .recovery_articles_requested_total
+            .load(Relaxed),
+        1,
+        "only the owed carrier's article was requested"
+    );
+    let promoted = pipeline.jobs[&job_id]
+        .download_queue
+        .count_matching(|work| {
+            work.priority == crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY
+                && work.segment_id.file_id.file_index == complete_carrier
+        });
+    assert_eq!(
+        promoted, 0,
+        "the complete carrier's spent segment took no part of the window"
+    );
+    let owed = pipeline.jobs[&job_id]
+        .download_queue
+        .count_matching(|work| {
+            work.priority == crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY
+                && work.segment_id.file_id.file_index == incomplete_carrier
+        });
+    assert_eq!(
+        owed, 1,
+        "the window went to the carrier that still owes bytes"
+    );
+}
+
+/// The fixture payload with only its smallest protected file damaged, so a
+/// repair rebuilds ten bytes while the five-thousand-byte file beside it is
+/// verified and never touched.
+fn payload_with_only_the_small_file_damaged() -> Vec<(String, Vec<u8>)> {
+    let mut payload: Vec<(String, Vec<u8>)> = damaged_payload(&[])
+        .into_iter()
+        .map(|(name, bytes)| (name.to_string(), bytes))
+        .collect();
+    payload[1].1[0] ^= 0xff;
+    payload
+}
+
+/// What the fixture set's carriers are, in the order a job announces them.
+fn fixture_carriers() -> Vec<(String, Vec<u8>)> {
+    vec![
+        ("set.par3".to_string(), INDEX.to_vec()),
+        ("set.vol0+1.par3".to_string(), VOLUME.to_vec()),
+    ]
+}
+
+/// Deliverable: output planning refuses before the first output byte when the
+/// working directory cannot hold what the repair will write, and the verdict
+/// names the shortfall in bytes.
+///
+/// Only the ten-byte file is damaged, so the shortfall proves what was
+/// counted: twenty bytes, the one rebuilt output and its staging copy, with
+/// the nine thousand intact bytes beside it excluded.
+#[tokio::test]
+async fn output_planning_names_its_byte_shortfall_before_any_output_byte() {
+    use crate::pipeline::direct_store::wiring::DirectStoreRuntime;
+    use crate::pipeline::direct_store::{DirectStoreGate, DirectStoreSettings};
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52205);
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    // Every byte on the volume is reserved, so the probe reports room for
+    // nothing at all and planning has to say so.
+    pipeline.direct_store = DirectStoreRuntime::with_settings(DirectStoreSettings {
+        gate: DirectStoreGate::Enabled,
+        holds_disk_reserve_bytes: u64::MAX,
+        ..Default::default()
+    });
+    let payload = payload_with_only_the_small_file_damaged();
+    let damaged = payload[1].1.clone();
+    let verdict = run_par3_job(&mut pipeline, job_id, &payload, &fixture_carriers()).await;
+    let failure = verdict
+        .failure
+        .clone()
+        .unwrap_or_else(|| panic!("planning must refuse: {verdict:#?}"));
+    assert!(
+        failure.contains("PAR3 output planning is 20 bytes short"),
+        "only the rebuilt output and its staging copy are counted: {failure}"
+    );
+    assert!(
+        failure.contains("needs 20 bytes"),
+        "the verdict names what installing this set needs: {failure}"
+    );
+    assert_ne!(
+        verdict.classes[Par3OutcomeClass::NoOutputSpace.index()],
+        0,
+        "the refusal was counted under its own class"
+    );
+    assert_eq!(
+        tokio::fs::read(verdict.working.join("b.txt"))
+            .await
+            .unwrap(),
+        damaged,
+        "no output byte was written"
+    );
+}
+
+/// Deliverable: a file the repair will not rewrite never counts against the
+/// free space. An intact file larger than everything the disk will grant must
+/// not turn a ten-byte repair into a refusal.
+///
+/// The intact file is deliberately tens of megabytes: the window between "the
+/// bytes that will be written" and "every byte the set protects" has to be
+/// wide enough that the free space other work on the same volume consumes
+/// while this test runs cannot close it.
+#[tokio::test]
+async fn an_intact_file_larger_than_the_free_space_does_not_refuse_the_plan() {
+    use crate::pipeline::direct_store::wiring::DirectStoreRuntime;
+    use crate::pipeline::direct_store::{DirectStoreGate, DirectStoreSettings};
+
+    const INTACT_BYTES: usize = 32 << 20;
+    /// Comfortably under the intact file, comfortably over the ten-byte
+    /// repair, and far wider than any plausible disk movement beside it.
+    const GRANTED: u64 = 20 << 20;
+
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52210);
+    let source_dir = root.path().join("protected");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let intact: Vec<u8> = (0..INTACT_BYTES)
+        .map(|i| (i as u32 * 7 + 3) as u8)
+        .collect();
+    let small = b"kestrel".to_vec();
+    std::fs::write(source_dir.join("alpha.bin"), &intact).unwrap();
+    std::fs::write(source_dir.join("small.bin"), &small).unwrap();
+    let report = par3_rs::create(
+        &par3_rs::InputSpec::new(
+            &source_dir,
+            &[
+                std::path::PathBuf::from("alpha.bin"),
+                std::path::PathBuf::from("small.bin"),
+            ],
+        ),
+        &root.path().join("kestrel"),
+        &par3_rs::CreateOptions::default()
+            .with_block_size(1 << 20)
+            .with_recovery(par3_rs::RecoveryAmount::Blocks(2)),
+    )
+    .expect("a set over one large file and one small one");
+    let carriers: Vec<(String, Vec<u8>)> = report
+        .files_written
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect();
+    let mut damaged = small.clone();
+    damaged[0] ^= 0xff;
+    let payload = vec![
+        ("alpha.bin".to_string(), intact.clone()),
+        ("small.bin".to_string(), damaged),
+    ];
+
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    // Set the job up and scan its carriers first: the database, the payload
+    // and the carriers are all on disk by then, so the reserve below is taken
+    // against the free space planning will actually see.
+    scan_carriers_only(&mut pipeline, job_id, &payload, &carriers).await;
+    let working = pipeline.jobs[&job_id].working_dir.clone();
+    let available = crate::operations::disk::probe_disk_space(&working)
+        .expect("a probe of the job's own directory")
+        .available_bytes;
+    pipeline.direct_store = DirectStoreRuntime::with_settings(DirectStoreSettings {
+        gate: DirectStoreGate::Enabled,
+        holds_disk_reserve_bytes: available.saturating_sub(GRANTED),
+        ..Default::default()
+    });
+
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .extract_matching(|_| true);
+    for _ in 0..64 {
+        if !pipeline.check_par3_completion(job_id).await {
+            break;
+        }
+        settle_par3_recovery(&mut pipeline, job_id).await;
+    }
+    assert_eq!(
+        pipeline.metrics.par3.outcomes()[Par3OutcomeClass::NoOutputSpace.index()],
+        0,
+        "an intact file is not a claim on the disk"
+    );
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "the plan was not refused: {:?}",
+        job_status_for_assert(&pipeline, job_id)
+    );
+    assert_eq!(
+        std::fs::read(working.join("small.bin")).unwrap(),
+        small,
+        "the damaged file was reconstructed"
+    );
+}
+
+/// Deliverable: a set that names a file weaver will not create fails the job
+/// before any output byte, and says which rule refused the name.
+///
+/// Unix only: the refused name is a Windows reserved device name, and the
+/// protected file has to exist on disk for a genuine set to be built over it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_set_naming_a_reserved_device_fails_before_any_output_byte() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52206);
+    let source_dir = root.path().join("protected");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let alpha: Vec<u8> = (0..5000u32).map(|i| (i * 11 + 5) as u8).collect();
+    let device = b"kestrel".to_vec();
+    std::fs::write(source_dir.join("alpha.bin"), &alpha).unwrap();
+    std::fs::write(source_dir.join("CON"), &device).unwrap();
+    // The engine's own creation API builds the set. It stores the name as
+    // given, so this is a genuine PAR3 set over a genuinely named file — not a
+    // hand-edited packet.
+    let report = par3_rs::create(
+        &par3_rs::InputSpec::new(
+            &source_dir,
+            &[
+                std::path::PathBuf::from("alpha.bin"),
+                std::path::PathBuf::from("CON"),
+            ],
+        ),
+        &root.path().join("kestrel"),
+        &par3_rs::CreateOptions::default()
+            .with_block_size(2000)
+            .with_recovery(par3_rs::RecoveryAmount::Blocks(4)),
+    )
+    .expect("the engine builds a set over the reserved name");
+    let carriers: Vec<(String, Vec<u8>)> = report
+        .files_written
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect();
+    let mut damaged = alpha.clone();
+    damaged[300] ^= 0xff;
+    let payload = vec![
+        ("alpha.bin".to_string(), damaged.clone()),
+        ("CON".to_string(), device),
+    ];
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let verdict = run_par3_job(&mut pipeline, job_id, &payload, &carriers).await;
+    let failure = verdict
+        .failure
+        .clone()
+        .unwrap_or_else(|| panic!("the set names a file weaver will not create: {verdict:#?}"));
+    assert!(
+        failure.contains("weaver will not create"),
+        "the verdict refuses the name: {failure}"
+    );
+    assert!(
+        failure.contains("reserved device name"),
+        "the verdict names the rule that refused it: {failure}"
+    );
+    assert!(
+        failure.contains("CON"),
+        "the verdict names the path: {failure}"
+    );
+    assert_ne!(
+        verdict.classes[Par3OutcomeClass::UnsafePath.index()],
+        0,
+        "the refusal was counted under its own class"
+    );
+    assert_eq!(
+        std::fs::read(verdict.working.join("alpha.bin")).unwrap(),
+        damaged,
+        "no output byte was written"
+    );
+}
+
+/// Append a packet of the test's choosing to a carrier, built and hashed by the
+/// engine's own builder so it authenticates like every other packet in the set.
+fn carrier_with(carrier: &[u8], body: par3_rs::packet::PacketBody) -> Vec<u8> {
+    let set_id = par3_rs::InputSetId(carrier[32..40].try_into().expect("packet header"));
+    let mut bytes = carrier.to_vec();
+    bytes.extend_from_slice(&par3_rs::packet::Packet::new(set_id, body).to_bytes());
+    bytes
+}
+
+/// Drive a job to the point where every carrier has been scanned, without
+/// running the completion check that would consume the option-packet report.
+async fn scan_carriers_only(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    payload: &[(String, Vec<u8>)],
+    carriers: &[(String, Vec<u8>)],
+) {
+    let mut files: Vec<(String, Vec<u8>)> = payload.to_vec();
+    let first_carrier = files.len() as u32;
+    files.extend(carriers.iter().cloned());
+    let mut spec = standalone_job_spec(
+        "par3 carriers",
+        &files
+            .iter()
+            .map(|(name, bytes)| (name.clone(), bytes.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    let working = insert_active_job(pipeline, job_id, spec).await;
+    tokio::fs::create_dir_all(working.join("sub"))
+        .await
+        .unwrap();
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(pipeline, job_id, index as u32, name, bytes).await;
+    }
+    for offset in 0..carriers.len() as u32 {
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: first_carrier + offset,
+                },
+            )
+            .await;
+        settle_par3_recovery(pipeline, job_id).await;
+    }
+}
+
+/// Deliverable: a permission option packet is reported exactly once per job and
+/// never applied, and the set it rides along with still repairs.
+#[tokio::test]
+async fn an_option_packet_is_reported_once_and_never_installed() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52207);
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let damage = [300usize];
+    let payload: Vec<(String, Vec<u8>)> = damaged_payload(&damage)
+        .into_iter()
+        .map(|(name, bytes)| (name.to_string(), bytes))
+        .collect();
+    let carriers = vec![(
+        "set.vol0+1.par3".to_string(),
+        carrier_with(
+            VOLUME,
+            par3_rs::packet::PacketBody::Opaque {
+                packet_type: par3_rs::packet::PacketType::UnixPermissions,
+                body: vec![0xa4, 0x01, 0, 0],
+            },
+        ),
+    )];
+    scan_carriers_only(&mut pipeline, job_id, &payload, &carriers).await;
+    let runtime = pipeline.par3_runtime.as_mut().expect("admitted job");
+    let report = runtime
+        .take_option_packet_report(job_id)
+        .expect("the option packet is worth one line");
+    assert_eq!(report.present, 1, "{report}");
+    assert!(
+        runtime.take_option_packet_report(job_id).is_none(),
+        "the line is owed once per job, not once per completion check"
+    );
+
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .extract_matching(|_| true);
+    for _ in 0..64 {
+        if !pipeline.check_par3_completion(job_id).await {
+            break;
+        }
+        settle_par3_recovery(&mut pipeline, job_id).await;
+    }
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "an option packet never fails a job"
+    );
+    let working = pipeline.jobs[&job_id].working_dir.clone();
+    assert_eq!(
+        tokio::fs::read(working.join("a.bin")).await.unwrap(),
+        damaged_payload(&[]).into_iter().next().unwrap().1,
+        "the protected bytes were still reconstructed"
+    );
+}
+
+/// Deliverable: an option packet a File packet points at but that nothing
+/// authenticated is counted as unresolved and does not block recovery.
+#[tokio::test]
+async fn an_unresolved_option_reference_does_not_block_recovery() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52208);
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let damage = [300usize];
+    let payload: Vec<(String, Vec<u8>)> = damaged_payload(&damage)
+        .into_iter()
+        .map(|(name, bytes)| (name.to_string(), bytes))
+        .collect();
+    let carriers = vec![(
+        "set.vol0+1.par3".to_string(),
+        carrier_with(
+            VOLUME,
+            par3_rs::packet::PacketBody::File(par3_rs::packet::file::FilePacket {
+                name: "kestrel.bin".into(),
+                quick_rolling_hash: 0,
+                fingerprint: [0; 16],
+                option_hashes: vec![[0x5a; 16]],
+                chunks: Vec::new(),
+            }),
+        ),
+    )];
+    scan_carriers_only(&mut pipeline, job_id, &payload, &carriers).await;
+    let report = pipeline
+        .par3_runtime
+        .as_mut()
+        .expect("admitted job")
+        .take_option_packet_report(job_id)
+        .expect("a dangling option reference is worth one line");
+    assert_eq!(report.referenced, 1, "{report}");
+    assert_eq!(report.unresolved, 1, "{report}");
+
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .extract_matching(|_| true);
+    for _ in 0..64 {
+        if !pipeline.check_par3_completion(job_id).await {
+            break;
+        }
+        settle_par3_recovery(&mut pipeline, job_id).await;
+    }
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "an unresolved option reference never fails a job"
+    );
+    let working = pipeline.jobs[&job_id].working_dir.clone();
+    assert_eq!(
+        tokio::fs::read(working.join("a.bin")).await.unwrap(),
+        damaged_payload(&[]).into_iter().next().unwrap().1,
+        "recovery ran to completion"
+    );
+}
+
+/// Deliverable: metadata built to exhaust the host stops at a named ceiling
+/// instead, the verdict names that ceiling, and the completion check still
+/// reaches an answer and stops.
+#[tokio::test]
+async fn hostile_metadata_fails_with_the_ceiling_it_reached() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(52209);
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    // One authenticated Creator packet per fabricated input set, each built by
+    // the engine's own builder. Nothing is malformed: the hostility is that
+    // the carrier claims more input sets than one job will ever hold open.
+    let mut hostile = Vec::new();
+    for index in 0..400u64 {
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&index.to_le_bytes());
+        hostile.extend_from_slice(
+            &par3_rs::packet::Packet::new(
+                par3_rs::InputSetId(id),
+                par3_rs::packet::PacketBody::Creator(par3_rs::packet::creator::CreatorPacket::new(
+                    "kestrel",
+                )),
+            )
+            .to_bytes(),
+        );
+    }
+    let payload: Vec<(String, Vec<u8>)> = damaged_payload(&[300])
+        .into_iter()
+        .map(|(name, bytes)| (name.to_string(), bytes))
+        .collect();
+    let carriers = vec![("set.par3".to_string(), hostile)];
+    let verdict = run_par3_job(&mut pipeline, job_id, &payload, &carriers).await;
+    let failure = verdict
+        .failure
+        .clone()
+        .unwrap_or_else(|| panic!("a set past a stated ceiling fails: {verdict:#?}"));
+    assert!(
+        failure.contains("PAR3 repair is not executable"),
+        "{failure}"
+    );
+    assert!(
+        failure.contains("job PAR3 set count"),
+        "the verdict names the ceiling it reached: {failure}"
+    );
+    assert_ne!(
+        verdict.classes[Par3OutcomeClass::NotExecutable.index()],
+        0,
+        "the refusal was counted under its own class"
+    );
+    assert!(
+        verdict.terminated,
+        "the completion check reached its verdict and stopped"
+    );
 }
 
 /// Build a job over `root` whose payload is damaged at `damage`, publish its

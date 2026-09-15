@@ -608,6 +608,7 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_par3_readback_mismatch_total` | counter | — | PAR3 readbacks whose placement was refused after installation. |
 | `weaver_par3_packets_total` | counter | `outcome` | PAR3 packets the carrier scanner authenticated or rejected. |
 | `weaver_par3_carrier_ranges_unavailable_total` | counter | — | Holes the PAR3 carrier scanner had to seek past. |
+| `weaver_par3_carrier_damaged_bytes_total` | counter | — | Readable PAR3 carrier bytes that produced no authenticated packet. |
 | `weaver_par3_slot_phase` | gauge | `slot`, `phase` | Current phase of each PAR3 work slot; exactly one phase is 1 per slot. |
 | `weaver_par3_slot_job_id` | gauge | `slot` | Job id owning each PAR3 work slot; zero when the slot is free. |
 | `weaver_par3_slot_phase_seconds` | gauge | `slot` | Time each PAR3 work slot has been in its current phase. |

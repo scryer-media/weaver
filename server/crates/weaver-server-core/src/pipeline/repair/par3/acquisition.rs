@@ -321,6 +321,13 @@ impl Pipeline {
             if !candidates.contains(&id.file_id.file_index)
                 || selected.contains(&id)
                 || runtime.article_promoted(job_id, id.file_id.file_index, id.segment_number)
+                // A carrier whose own file is already whole has nothing left to
+                // fetch. Its leftover queue entries must not take a slot or a
+                // byte of this window's budget from a carrier that does.
+                || state
+                    .assembly
+                    .file(id.file_id)
+                    .is_some_and(|file| file.is_complete())
             {
                 continue;
             }
