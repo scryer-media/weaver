@@ -249,7 +249,7 @@ export function NextShell({
 
         {beforeContent}
 
-        <div className={cn("flex min-h-0 flex-1", contentClassName)}>{children}</div>
+        <main className={cn("flex min-h-0 flex-1", contentClassName)}>{children}</main>
 
         {afterContent}
 

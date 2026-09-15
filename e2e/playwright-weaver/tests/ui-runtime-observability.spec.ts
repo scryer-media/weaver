@@ -81,33 +81,42 @@ test("visible navigation routes are assigned to the Weaver coverage ledger", asy
 
 test("monitoring metrics and live logs expose real product state and controls", async ({ cleanPage: page }) => {
   await page.goto(weaverRoute("/monitoring"));
-  await expect(page.getByRole("heading", { name: "Monitoring" })).toBeVisible();
-  await expect(page.getByText("Pipeline State", { exact: true })).toBeVisible();
-  await expect(page.getByText("News Servers", { exact: true })).toBeVisible();
-  await expect(page.getByRole("group", { name: "Download Speed" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Monitoring", exact: true })).toBeVisible();
+  await expect(page.getByText("Pipeline", { exact: true })).toBeVisible();
+  await expect(page.getByText("Connections", { exact: true })).toBeVisible();
+  const main = page.getByRole("main");
+  await expect(main.getByText("Queue depths", { exact: true })).toBeVisible();
+  // The provider list reads live server health, so the configured provider
+  // shows up by host.
+  await expect(main.getByText("nntp", { exact: true })).toBeVisible();
 
   await page.goto(weaverRoute("/logs"));
-  await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
-  const logStatus = page.getByRole("status", { name: "Log stream status" });
-  await expect(logStatus).toHaveText("Live");
-  await page.getByRole("button", { name: "Pause" }).click();
-  await expect(logStatus).toHaveText("Paused");
-  await page.getByRole("button", { name: "Resume" }).click();
-  await expect(logStatus).toHaveText("Live");
+  await expect(page.getByRole("heading", { name: "Logs", exact: true })).toBeVisible();
+  const following = page.getByText("following new lines", { exact: true });
+  await expect(following).toBeVisible();
+  await page.getByRole("banner").getByRole("button", { name: "Pause tail", exact: true }).click();
+  await expect(page.getByText("paused — scroll freely", { exact: true })).toBeVisible();
+  await page.getByRole("banner").getByRole("button", { name: "Resume tail", exact: true }).click();
+  await expect(following).toBeVisible();
 });
 
 test("history pagination renders metadata-only seeded records", async ({ cleanPage: page, request }) => {
   const suffix = configuredBasePath.replaceAll("/", "-") || "root";
   const markers = await seedRuntimeHistory(request, `e2e-runtime-history-${suffix}`);
   await page.goto(weaverRoute("/history"));
-  await expect(page.getByRole("row").filter({ hasText: markers.newest })).toBeVisible();
-  const rowsPerPage = page.getByRole("combobox", { name: "Rows per page" });
-  await rowsPerPage.click();
-  await page.getByRole("option", { name: "25", exact: true }).click();
-  const next = page.getByRole("button", { name: "Next" });
+  const main = page.getByRole("main");
+  const historyRow = (name: string) =>
+    main.getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
+  await expect(historyRow(markers.newest)).toBeVisible();
+  await page
+    .getByRole("radiogroup", { name: "Rows per page", exact: true })
+    .getByRole("radio", { name: "25", exact: true })
+    .click();
+  await expect(historyRow(markers.oldest)).toHaveCount(0);
+  const next = page.getByRole("button", { name: "Next", exact: true });
   await expect(next).toBeEnabled();
   await next.click();
-  await expect(page.getByRole("row").filter({ hasText: markers.oldest })).toBeVisible();
+  await expect(historyRow(markers.oldest)).toBeVisible();
 });
 
 test("subscription loss polls and reconnects without losing the visible application", async ({ cleanPage: page }) => {
@@ -124,7 +133,7 @@ test("subscription loss polls and reconnects without losing the visible applicat
       disconnected
       && request.method() === "POST"
       && request.url().includes("/graphql")
-      && /QueuePage|LiveMetrics/.test(request.postData() ?? "")
+      && /LiveMetrics/.test(request.postData() ?? "")
     ) {
       pollingRequests += 1;
     }
@@ -142,6 +151,8 @@ test("subscription loss polls and reconnects without losing the visible applicat
 
   await page.goto(weaverRoute("/"));
   await expect(page.getByRole("main")).toBeVisible();
+  const status = page.getByRole("contentinfo");
+  await expect(status.getByText("Connected", { exact: true })).toBeVisible();
   await expect.poll(() => liveBrowserSocket).toBeTruthy();
   await expect.poll(() => liveServerSocket).toBeTruthy();
   expect(socketConnections).toBe(1);
@@ -151,9 +162,9 @@ test("subscription loss polls and reconnects without losing the visible applicat
   try {
     await liveServerSocket!.close({ code: 1012, reason: "Weaver e2e subscription interruption" });
     await liveBrowserSocket!.close({ code: 1012, reason: "Weaver e2e subscription interruption" });
-    const disconnectTitle = page.getByText("Disconnected from server", { exact: true });
-    await expect(disconnectTitle).toBeVisible();
+    await expect(status.getByText(/^Reconnecting/)).toBeVisible();
     await expect.poll(() => pollingRequests, { timeout: 20_000 }).toBeGreaterThan(0);
+    await expect(status.getByText("Reconnecting — polling", { exact: true })).toBeVisible();
     await expect(page.getByRole("main")).toBeVisible();
   } finally {
     blockReconnects = false;
@@ -163,9 +174,7 @@ test("subscription loss polls and reconnects without losing the visible applicat
     });
   }
   await expect.poll(() => socketConnections, { timeout: 20_000 }).toBeGreaterThan(1);
-  await expect(
-    page.getByText("Disconnected from server", { exact: true }),
-  ).toBeHidden({ timeout: 30_000 });
+  await expect(status.getByText("Connected", { exact: true })).toBeVisible({ timeout: 30_000 });
   await expect(page.getByRole("main")).toBeVisible();
 });
 

@@ -400,7 +400,7 @@ export function SettingsBlocks({
   return (
     <>
       {visible.map((block) => (
-        <section key={block.id} className="flex flex-none flex-col">
+        <section key={block.id} aria-label={block.title} className="flex flex-none flex-col">
           <SectionHeader label={block.title} tag={block.tag} note={block.note} />
           {block.kind === "section" ? (
             <FieldRows fields={block.fields} />

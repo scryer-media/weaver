@@ -18,22 +18,48 @@ import {
   scriptResults,
 } from "./support/setup/post-processing-job";
 
-async function waitForScriptListSave(page: Page, action: () => Promise<void>): Promise<void> {
-  const response = page.waitForResponse(
+function operationResponse(page: Page, operation: string) {
+  return page.waitForResponse(
     (candidate) =>
-      candidate.url().includes("/graphql") &&
-      candidate.request().method() === "POST" &&
-      candidate.request().postData()?.includes("mutation SetScriptLists") === true,
+      new URL(candidate.url()).pathname.endsWith("/graphql")
+      && candidate.request().method() === "POST"
+      && candidate.request().postData()?.includes(`mutation ${operation}`) === true,
   );
-  await action();
-  expect((await response).ok()).toBeTruthy();
-  await expect(page.getByText("Script list saved.")).toBeVisible();
 }
 
-async function addScriptToGlobalList(page: Page, displayName: string): Promise<void> {
+async function waitForScriptListSave(page: Page, action: () => Promise<void>): Promise<void> {
+  const response = operationResponse(page, "SetScriptLists");
+  await action();
+  expect((await response).ok()).toBeTruthy();
+  await expect(page.getByRole("contentinfo")).toContainText("Run list saved");
+}
+
+async function addScriptToRunList(page: Page, displayName: string): Promise<void> {
+  const label = "Add a script to the run list";
+  await page.getByRole("region", { name: "Run list", exact: true }).getByRole("button", { name: label, exact: true }).click();
   await waitForScriptListSave(page, () =>
-    page.getByRole("button", { name: `Add ${displayName}`, exact: true }).click(),
+    page
+      .getByRole("menu", { name: label, exact: true })
+      .getByRole("menuitemradio", { name: displayName, exact: true })
+      .click(),
   );
+}
+
+/** A discovered script's row, which opens its options. */
+function discoveredScript(page: Page, displayName: string) {
+  return page
+    .getByRole("region", { name: "Discovered scripts", exact: true })
+    .getByRole("button")
+    .filter({ has: page.getByText(displayName, { exact: true }) });
+}
+
+async function saveSettings(page: Page) {
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 test("post-processing settings, the live script list, and real script execution are browser-owned", async ({
@@ -46,67 +72,70 @@ test("post-processing settings, the live script list, and real script execution 
   await page.goto("/settings/post-processing");
 
   // 1. The master switch is off until an operator turns it on.
-  const executionToggle = page.getByRole("switch", { name: "Run post-processing scripts" });
+  const executionToggle = page.getByRole("switch", { name: "Run scripts", exact: true });
   await expect(executionToggle).toBeVisible();
   if (!(await executionToggle.isChecked())) {
     await executionToggle.click();
-    await expect(page.getByText("Post-processing settings saved.")).toBeVisible();
-    // Enabling execution saves independently and refreshes the settings query.
-    // Start editing only from the settled, persisted page state.
-    await page.reload();
-    await expect(executionToggle).toBeChecked();
   }
-  await page.locator("#pp-concurrency").fill("2");
-  await page.locator("#pp-grace").fill("5");
-  await page.getByRole("button", { name: "Save settings" }).click();
-  await expect(page.getByText("Post-processing settings saved.")).toBeVisible();
-  await page.getByLabel("Unacceptable extension patterns").fill("EXE, r??");
-  await page.getByRole("button", { name: "Save extension policy" }).click();
-  await expect(page.getByText("Post-processing settings saved.")).toBeVisible();
+  const concurrency = page.getByRole("spinbutton", { name: "Concurrent scripts", exact: true });
+  await concurrency.fill("2");
+  await concurrency.press("Tab");
+  const grace = page.getByRole("spinbutton", { name: "Termination grace", exact: true });
+  await grace.fill("5");
+  await grace.press("Tab");
+  const extensions = page.getByRole("textbox", { name: "Unacceptable extensions", exact: true });
+  await extensions.fill("EXE, r??");
+  await saveSettings(page);
 
   // 2. Scripts are listed live from the directory, with unreadable ones surfaced.
-  const problems = page.getByRole("region", { name: "Script problems" });
+  const problems = page.getByRole("region", { name: "Scripts that could not be read", exact: true });
   await expect(problems).toContainText(POST_PROCESSING_BROKEN_PACKAGE);
-
-  // 3. Build the global list, in the order the scripts must run.
-  await addScriptToGlobalList(page, POST_PROCESSING_NOTIFY_SCRIPT);
-  await addScriptToGlobalList(page, POST_PROCESSING_FAILING_SCRIPT);
-  await addScriptToGlobalList(page, POST_PROCESSING_NZBGET_DISPLAY_NAME);
-  const list = page.getByRole("list", { name: "Script list" });
-  await expect(list.getByRole("listitem")).toContainText([
-    POST_PROCESSING_NOTIFY_SCRIPT,
-    POST_PROCESSING_FAILING_SCRIPT,
-    POST_PROCESSING_NZBGET_PACKAGE,
-  ]);
   await expect(
-    list.getByRole("listitem", { name: `Script ${POST_PROCESSING_NZBGET_PACKAGE}` }),
-  ).toContainText("NZBGET");
+    discoveredScript(page, POST_PROCESSING_NZBGET_DISPLAY_NAME).getByText("NZBGet", { exact: true }),
+  ).toBeVisible();
   await expect(
-    list.getByRole("listitem", { name: `Script ${POST_PROCESSING_NOTIFY_SCRIPT}` }),
-  ).toContainText("SABNZBD");
-
-  // 4. Manifest options, including a secret that must never come back in cleartext.
-  await page.getByLabel("Script options").click();
-  await page.getByRole("option", { name: POST_PROCESSING_NZBGET_DISPLAY_NAME }).click();
-  const optionsGroup = page.getByRole("group", {
-    name: `Options for ${POST_PROCESSING_NZBGET_DISPLAY_NAME}`,
-  });
-  await expect(optionsGroup.getByLabel("Label")).toHaveValue("default-label");
-  await optionsGroup.getByLabel("Label").fill("e2e-label");
-  await optionsGroup.getByLabel("Token").fill(POST_PROCESSING_SECRET);
-  await page.getByRole("button", { name: "Save options" }).click();
-  await expect(
-    page.getByText(`Options for ${POST_PROCESSING_NZBGET_DISPLAY_NAME} saved.`),
+    discoveredScript(page, POST_PROCESSING_NOTIFY_SCRIPT).getByText("SABnzbd", { exact: true }),
   ).toBeVisible();
 
+  // 3. Build the global list, in the order the scripts must run.
+  await addScriptToRunList(page, POST_PROCESSING_NOTIFY_SCRIPT);
+  await addScriptToRunList(page, POST_PROCESSING_FAILING_SCRIPT);
+  await addScriptToRunList(page, POST_PROCESSING_NZBGET_DISPLAY_NAME);
+  const runList = page.getByRole("region", { name: "Run list", exact: true });
+  await expect(runList).toContainText(
+    new RegExp(
+      [POST_PROCESSING_NOTIFY_SCRIPT, POST_PROCESSING_FAILING_SCRIPT, POST_PROCESSING_NZBGET_DISPLAY_NAME]
+        .map(escapeRegExp)
+        .join("[\\s\\S]*"),
+    ),
+  );
+  for (const script of [POST_PROCESSING_NOTIFY_SCRIPT, POST_PROCESSING_FAILING_SCRIPT, POST_PROCESSING_NZBGET_PACKAGE]) {
+    await expect(runList.getByRole("switch", { name: `Run ${script}`, exact: true })).toBeChecked();
+  }
+
+  // 4. Manifest options, including a secret that must never come back in cleartext.
+  const options = page.getByRole("dialog", { name: POST_PROCESSING_NZBGET_DISPLAY_NAME, exact: true });
+  await discoveredScript(page, POST_PROCESSING_NZBGET_DISPLAY_NAME).click();
+  await expect(options.getByRole("textbox", { name: "Label", exact: true })).toHaveValue("default-label");
+  await options.getByRole("textbox", { name: "Label", exact: true }).fill("e2e-label");
+  await options.getByLabel("Token", { exact: true }).fill(POST_PROCESSING_SECRET);
+  await options.getByRole("button", { name: "Save options", exact: true }).click();
+  await expect(options).toBeHidden();
+  await expect(page.getByRole("contentinfo")).toContainText(
+    `Options for ${POST_PROCESSING_NZBGET_DISPLAY_NAME} saved`,
+  );
+
   await page.reload();
-  await expect(page.locator("#pp-concurrency")).toHaveValue("2");
-  await expect(page.locator("#pp-grace")).toHaveValue("5");
-  await expect(page.getByLabel("Unacceptable extension patterns")).toHaveValue("exe, r??");
-  await page.getByLabel("Script options").click();
-  await page.getByRole("option", { name: POST_PROCESSING_NZBGET_DISPLAY_NAME }).click();
-  await expect(optionsGroup.getByLabel("Label")).toHaveValue("e2e-label");
-  await expect(optionsGroup.getByLabel("Token")).toHaveValue("[REDACTED]");
+  await expect(executionToggle).toBeChecked();
+  await expect(concurrency).toHaveValue("2");
+  await expect(grace).toHaveValue("5");
+  await expect(extensions).toHaveValue("exe, r??");
+  await discoveredScript(page, POST_PROCESSING_NZBGET_DISPLAY_NAME).click();
+  await expect(options.getByRole("textbox", { name: "Label", exact: true })).toHaveValue("e2e-label");
+  await expect(options.getByLabel("Token", { exact: true })).toHaveValue("[REDACTED]");
+  await expect(page.getByRole("main")).not.toContainText(POST_PROCESSING_SECRET);
+  await options.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(options).toBeHidden();
 
   // 5. A real job runs the list in order and records one result per script.
   const job = await runJobThroughPostProcessing(request, "weaver-e2e-post-processing");
@@ -135,19 +164,19 @@ test("post-processing settings, the live script list, and real script execution 
 
   // 6. The job's event log shows what each script did, and never the secret.
   await page.goto(`/jobs/${job.id}`);
-  await page.getByRole("button", { name: "Event Log" }).click();
+  const eventLog = page.getByRole("region", { name: "Event log", exact: true });
   // Counted rather than picked positionally: the log legitimately mentions a
   // script more than once, and which occurrence renders first is not something
   // this test should assert. Presence is the claim — the secret's absence
   // below is asserted the same way.
-  await expect(page.getByText(POST_PROCESSING_NOTIFY_SCRIPT)).not.toHaveCount(0, {
+  await expect(eventLog.getByText(POST_PROCESSING_NOTIFY_SCRIPT)).not.toHaveCount(0, {
     timeout: 30_000,
   });
   await expect(page.getByText(POST_PROCESSING_SECRET)).toHaveCount(0);
-  await expect(page.getByText("[REDACTED]")).not.toHaveCount(0);
+  await expect(eventLog.getByText("[REDACTED]")).not.toHaveCount(0);
 
   // 7. Re-running executes the list again against the retained output.
-  await page.getByRole("button", { name: "Re-run scripts" }).click();
+  await page.getByRole("button", { name: "Re-run scripts", exact: true }).click();
   await expect
     .poll(() => postProcessingMarker(job.outputDir!).trim().split("\n").length, {
       timeout: 60_000,
@@ -165,36 +194,33 @@ test("a disabled entry stays in the list without running", async ({
   seedPostProcessingScripts();
 
   await page.goto("/settings/post-processing");
-  const executionToggle = page.getByRole("switch", { name: "Run post-processing scripts" });
+  const executionToggle = page.getByRole("switch", { name: "Run scripts", exact: true });
   await expect(executionToggle).toBeVisible();
   if (!(await executionToggle.isChecked())) {
     await executionToggle.click();
-    await expect(page.getByText("Post-processing settings saved.")).toBeVisible();
+    await saveSettings(page);
   }
 
-  const list = page.getByRole("list", { name: "Script list" });
-  const scriptEntryLabels = await list.getByRole("listitem").evaluateAll((items) =>
-    items
-      .map((item) => item.getAttribute("aria-label"))
-      .filter((label): label is string => label?.startsWith("Script ") === true),
-  );
-  for (const label of scriptEntryLabels) {
-    const entry = list.getByRole("listitem", { name: label, exact: true });
-    const remove = entry.getByRole("button", { name: "Remove", exact: true });
-    await waitForScriptListSave(page, () => remove.click());
+  const runList = page.getByRole("region", { name: "Run list", exact: true });
+  const notifyEntry = runList.getByRole("switch", { name: `Run ${POST_PROCESSING_NOTIFY_SCRIPT}`, exact: true });
+  if ((await notifyEntry.count()) === 0) {
+    await addScriptToRunList(page, POST_PROCESSING_NOTIFY_SCRIPT);
   }
-  await addScriptToGlobalList(page, POST_PROCESSING_NOTIFY_SCRIPT);
-  await waitForScriptListSave(page, () =>
-    page.getByRole("switch", { name: `Enable ${POST_PROCESSING_NOTIFY_SCRIPT}` }).click(),
-  );
+  // Every entry is switched off, so the job has nothing enabled to run.
+  for (const script of [POST_PROCESSING_NOTIFY_SCRIPT, POST_PROCESSING_FAILING_SCRIPT, POST_PROCESSING_NZBGET_PACKAGE]) {
+    const entry = runList.getByRole("switch", { name: `Run ${script}`, exact: true });
+    if ((await entry.count()) > 0 && (await entry.isChecked())) {
+      await waitForScriptListSave(page, () => entry.click());
+      await expect(entry).not.toBeChecked();
+    }
+  }
 
   const job = await runJobThroughPostProcessing(request, "weaver-e2e-post-processing-disabled");
   expect(await scriptResults(request, job.id)).toHaveLength(0);
   expect(postProcessingMarker(job.outputDir!)).toBe("");
   // The entry is still configured, just not enabled.
   await page.reload();
-  await expect(
-    list.getByRole("listitem", { name: `Script ${POST_PROCESSING_NOTIFY_SCRIPT}` }),
-  ).toBeVisible();
+  await expect(notifyEntry).toBeVisible();
+  await expect(notifyEntry).not.toBeChecked();
   expect(POST_PROCESSING_MARKER).toBeTruthy();
 });

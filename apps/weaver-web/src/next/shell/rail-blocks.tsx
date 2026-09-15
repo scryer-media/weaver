@@ -285,40 +285,42 @@ export function PanelListBlock({
 }) {
   return (
     <RailBlock eyebrow={eyebrow} position="middle" className="gap-0">
-      {items.map((item) => (
-        <NavLink
-          key={item.to}
-          to={item.to}
-          className={({ isActive }) =>
-            cn(
-              "-mx-[10px] flex h-[30px] items-center gap-[10px] px-[10px] text-[12.5px] hover:bg-wv-nav-hover",
-              isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
-            )
-          }
-        >
-          {({ isActive }) => (
-            <>
-              <span
-                aria-hidden="true"
-                className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
-              />
-              {item.icon === undefined ? null : (
-                <Icon
-                  name={item.icon}
-                  size={15}
-                  className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
+      <nav aria-label={eyebrow} className="flex flex-col">
+        {items.map((item) => (
+          <NavLink
+            key={item.to}
+            to={item.to}
+            className={({ isActive }) =>
+              cn(
+                "-mx-[10px] flex h-[30px] items-center gap-[10px] px-[10px] text-[12.5px] hover:bg-wv-nav-hover",
+                isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
+              )
+            }
+          >
+            {({ isActive }) => (
+              <>
+                <span
+                  aria-hidden="true"
+                  className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
                 />
-              )}
-              <span className="min-w-0 truncate">{item.label}</span>
-              {item.tag === undefined ? null : (
-                <span className="ml-auto flex-none font-wv-mono text-[10.5px] tracking-[0.1em] text-wv-faint uppercase">
-                  {item.tag}
-                </span>
-              )}
-            </>
-          )}
-        </NavLink>
-      ))}
+                {item.icon === undefined ? null : (
+                  <Icon
+                    name={item.icon}
+                    size={15}
+                    className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
+                  />
+                )}
+                <span className="min-w-0 truncate">{item.label}</span>
+                {item.tag === undefined ? null : (
+                  <span className="ml-auto flex-none font-wv-mono text-[10.5px] tracking-[0.1em] text-wv-faint uppercase">
+                    {item.tag}
+                  </span>
+                )}
+              </>
+            )}
+          </NavLink>
+        ))}
+      </nav>
     </RailBlock>
   );
 }

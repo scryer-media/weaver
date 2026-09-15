@@ -1099,13 +1099,20 @@ impl Database {
     }
 
     /// Check if the database has no settings (i.e. fresh / needs migration).
+    ///
+    /// The install-generation stamp is written the moment a new database is
+    /// created, before any configuration is imported into it, so it does not
+    /// make the database hold settings of its own.
     pub fn is_empty(&self) -> Result<bool, StateError> {
+        use crate::persistence::sql_runtime::SqlArg;
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let count = crate::persistence::sql_runtime::SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT COUNT(*) AS count FROM settings",
-                &[],
+                "SELECT COUNT(*) AS count FROM settings WHERE key <> {}",
+                &[SqlArg::Text(
+                    crate::security::SETTING_INSTALL_GENERATION.to_string(),
+                )],
             )
             .await?
             .map(|row| row.i64("count"))

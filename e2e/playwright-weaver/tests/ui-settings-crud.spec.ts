@@ -1,171 +1,229 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { expect, openNavigation, test } from "./helpers";
+import type { Locator, Page } from "@playwright/test";
+import { expect, test } from "./helpers";
 
 const afterRestart = process.env.E2E_WEAVER_UI_STAGE === "after-restart";
 const persistedCategory = "e2e-product-category-persisted";
 const persistedSchedule = "e2e-off-peak-persisted";
 
-test("general speed, SRRDB lookup, and bandwidth-cap settings persist through browser controls", async ({ cleanPage: page }) => {
+/** A settings table row, found by the exact text of one of its cells. */
+function tableRow(page: Page, table: string, cellText: string): Locator {
+  return page
+    .getByRole("region", { name: table, exact: true })
+    .getByRole("button")
+    .filter({ has: page.getByText(cellText, { exact: true }) });
+}
+
+/** Commit a panel's draft through the settings top bar and wait for it to land. */
+async function saveSettings(page: Page) {
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
+}
+
+async function confirmRemoval(page: Page, label: string) {
+  const confirm = page.getByRole("dialog", { name: label, exact: true });
+  await confirm.getByRole("button", { name: label, exact: true }).click();
+  await expect(confirm).toBeHidden();
+}
+
+test("general SRRDB lookup and bandwidth ceiling and cap persist through the settings top bar", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
-  const speed = page.getByRole("slider", { name: "Speed Limit" });
-  const srrdbLookup = page.getByRole("switch", { name: "Use SRRDB release lookup" });
-  await expect(speed).toBeVisible();
+  const srrdbLookup = page.getByRole("switch", { name: "SRRDB release lookup", exact: true });
   await expect(srrdbLookup).toBeVisible();
   if (afterRestart) {
-    await expect(speed).toHaveValue(String(8 * 1024 * 1024));
     await expect(srrdbLookup).toBeChecked();
     await page.goto("/settings/bandwidth");
-    await expect(page.getByRole("spinbutton", { name: "Billing Day" })).toHaveValue("17");
+    await expect(page.getByRole("spinbutton", { name: "Download ceiling", exact: true })).toHaveValue("8");
+    await expect(page.getByRole("switch", { name: "Enforce a data cap", exact: true })).toBeChecked();
+    await expect(page.getByRole("spinbutton", { name: "Reset day of month", exact: true })).toHaveValue("17");
     return;
   }
-  await speed.press("Home");
-  for (let step = 0; step < 8; step += 1) {
-    await speed.press("ArrowRight");
-  }
-  await expect(speed).toHaveValue(String(8 * 1024 * 1024));
-  await page.getByRole("button", { name: "Apply Now" }).click();
-  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
-  await page.reload();
-  await expect(speed).toHaveValue(String(8 * 1024 * 1024));
+
   await expect(srrdbLookup).not.toBeChecked();
   await srrdbLookup.click();
-  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await expect(page.getByText("Unsaved changes", { exact: true })).toBeVisible();
+  await saveSettings(page);
   await page.reload();
   await expect(srrdbLookup).toBeChecked();
 
   await page.goto("/settings/bandwidth");
-  const monthlyDay = page.getByRole("spinbutton", { name: "Billing Day" });
+  const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
+  await ceiling.fill("8");
+  await ceiling.press("Tab");
+  await page.getByRole("switch", { name: "Enforce a data cap", exact: true }).click();
+  await page
+    .getByRole("radiogroup", { name: "Cap window", exact: true })
+    .getByRole("radio", { name: "Monthly", exact: true })
+    .click();
+  await page.getByRole("textbox", { name: "Allowance", exact: true }).fill("500");
+  const monthlyDay = page.getByRole("spinbutton", { name: "Reset day of month", exact: true });
+  // The day of month clamps to the calendar instead of refusing the draft.
   await monthlyDay.fill("32");
-  await expect(page.getByRole("button", { name: "Save" })).toBeDisabled();
+  await monthlyDay.press("Tab");
+  await expect(monthlyDay).toHaveValue("31");
   await monthlyDay.fill("17");
-  await page.getByRole("button", { name: "Save" }).click();
-  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await monthlyDay.press("Tab");
+  await saveSettings(page);
   await page.reload();
+  await expect(ceiling).toHaveValue("8");
   await expect(monthlyDay).toHaveValue("17");
 });
 
-test("server edits preserve masked secrets and survive refresh", async ({ cleanPage: page }) => {
+test("provider edits keep the stored password masked and a disabled provider can be added and removed", async ({ cleanPage: page }) => {
   await page.goto("/settings/servers");
-  const serverRow = page.getByRole("row").filter({ hasText: "nntp:119" });
-  const connectionsCell = serverRow.getByTestId("server-connections");
+  const serverRow = tableRow(page, "Servers", "nntp");
+  const editor = page.getByRole("dialog", { name: "nntp", exact: true });
+  const expectMaskedPassword = async () => {
+    const password = editor.getByLabel("Password", { exact: true });
+    await expect(password).toHaveValue("");
+    await expect(password).toHaveAttribute("placeholder", "••••••••");
+    await expect(editor.getByText("Leave blank to keep the stored password.", { exact: true })).toBeVisible();
+  };
   if (afterRestart) {
-    await expect(connectionsCell).toHaveText("5");
-    await serverRow.getByRole("button", { name: "Edit" }).click();
-    const persistedForm = page.getByRole("region", { name: "Edit Server" });
-    await expect(persistedForm.getByLabel("Password")).toHaveValue("");
-    await expect(persistedForm.getByLabel("Password")).toHaveAttribute(
-      "placeholder",
-      "Leave blank to keep",
-    );
+    await expect(serverRow.getByText("5", { exact: true })).toBeVisible();
+    await serverRow.click();
+    await expectMaskedPassword();
+    await expect(editor.getByRole("spinbutton", { name: "Connections", exact: true })).toHaveValue("5");
+    await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(editor).toBeHidden();
     return;
   }
-  await serverRow.getByRole("button", { name: "Edit" }).click();
-  const form = page.getByRole("region", { name: "Edit Server" });
-  const password = form.getByLabel("Password");
-  await expect(password).toHaveAttribute("placeholder", "Leave blank to keep");
-  await expect(password).toHaveValue("");
-  await form.getByLabel("Connections").fill("5");
-  await form.getByRole("button", { name: "Save" }).click();
-  await expect(connectionsCell).toHaveText("5");
-  await page.reload();
-  await expect(connectionsCell).toHaveText("5");
 
-  await page.getByTestId("add-server-button").click();
-  const addForm = page.getByRole("region", { name: "Add Server" });
-  await addForm.getByLabel("Host").fill("e2e-ui.invalid");
-  await addForm.getByLabel("Port").fill("119");
-  await addForm.getByLabel("Connections").fill("1");
-  const active = addForm.getByRole("checkbox", { name: "Active" });
-  if (await active.isChecked()) await active.click();
-  await addForm.getByRole("button", { name: "Add Server" }).click();
-  const temporaryRow = page.getByRole("row").filter({ hasText: "e2e-ui.invalid:119" });
-  await expect(temporaryRow).toContainText("Disabled");
-  await temporaryRow.getByRole("button", { name: "Delete" }).click();
-  await page.getByRole("dialog").getByRole("button", { name: "Delete Server" }).click();
-  await expect(page.getByText("e2e-ui.invalid:119", { exact: true })).toHaveCount(0);
+  await serverRow.click();
+  await expectMaskedPassword();
+  const connections = editor.getByRole("spinbutton", { name: "Connections", exact: true });
+  await connections.fill("5");
+  await connections.press("Tab");
+  await editor.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(editor).toBeHidden();
+  await expect(serverRow.getByText("5", { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(serverRow.getByText("5", { exact: true })).toBeVisible();
+
+  await page.getByRole("banner").getByRole("button", { name: "Add provider", exact: true }).click();
+  const addForm = page.getByRole("dialog", { name: "Add provider", exact: true });
+  await addForm.getByRole("textbox", { name: "Host", exact: true }).fill("e2e-ui.invalid");
+  await addForm.getByRole("switch", { name: "TLS", exact: true }).click();
+  await expect(addForm.getByRole("spinbutton", { name: "Port", exact: true })).toHaveValue("119");
+  const addConnections = addForm.getByRole("spinbutton", { name: "Connections", exact: true });
+  await addConnections.fill("1");
+  await addConnections.press("Tab");
+  const enabled = addForm.getByRole("switch", { name: "Enabled", exact: true });
+  await expect(enabled).toBeChecked();
+  await enabled.click();
+  await addForm.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(addForm).toBeHidden();
+
+  const temporaryRow = tableRow(page, "Servers", "e2e-ui.invalid");
+  await expect(temporaryRow.getByRole("switch", { name: "e2e-ui.invalid enabled", exact: true })).not.toBeChecked();
+  await expect(temporaryRow.getByText("Plain", { exact: true })).toBeVisible();
+  await temporaryRow.click();
+  await page
+    .getByRole("dialog", { name: "e2e-ui.invalid", exact: true })
+    .getByRole("button", { name: "Remove provider", exact: true })
+    .click();
+  await confirmRemoval(page, "Remove provider");
+  await expect(temporaryRow).toHaveCount(0);
 });
 
 test("category create, edit, persistence, and delete are browser-owned", async ({ cleanPage: page }) => {
   await page.goto("/settings/categories");
+  const removeCategory = async (name: string) => {
+    await tableRow(page, "Categories", name).click();
+    await page
+      .getByRole("dialog", { name, exact: true })
+      .getByRole("button", { name: "Remove category", exact: true })
+      .click();
+    await confirmRemoval(page, "Remove category");
+    await expect(tableRow(page, "Categories", name)).toHaveCount(0);
+  };
   if (afterRestart) {
-    const persistedRow = page.getByRole("row").filter({ hasText: persistedCategory });
-    await expect(persistedRow).toContainText("persisted-*");
-    await persistedRow.getByRole("button", { name: "Delete" }).click();
-    await page.getByRole("dialog").getByRole("button", { name: "Delete Category" }).click();
-    await expect(page.getByText(persistedCategory, { exact: true })).toHaveCount(0);
+    await expect(tableRow(page, "Categories", persistedCategory).getByText("persisted-*", { exact: true })).toBeVisible();
+    await removeCategory(persistedCategory);
     return;
   }
-  await page.getByTestId("add-category-button").click();
-  let form = page.getByRole("region", { name: "Add Category" });
-  await form.getByLabel("Name").fill("e2e-product-category");
-  await form.getByLabel("Aliases").fill("e2e-product-*");
-  await form.getByRole("button", { name: "Add Category" }).click();
 
-  let row = page.getByRole("row").filter({ hasText: "e2e-product-category" });
-  await expect(row).toContainText("e2e-product-*");
+  const addCategory = async (name: string, aliases: string) => {
+    await page.getByRole("banner").getByRole("button", { name: "Add category", exact: true }).click();
+    const form = page.getByRole("dialog", { name: "Add category", exact: true });
+    await form.getByRole("textbox", { name: "Name", exact: true }).fill(name);
+    await form.getByRole("textbox", { name: "Also known as", exact: true }).fill(aliases);
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(form).toBeHidden();
+    await expect(tableRow(page, "Categories", name).getByText(aliases, { exact: true })).toBeVisible();
+  };
+
+  await addCategory("e2e-product-category", "e2e-product-*");
   await page.reload();
-  await expect(row).toBeVisible();
-  await row.getByRole("button", { name: "Edit" }).click();
-  form = page.getByRole("region", { name: "Edit Category" });
-  await form.getByLabel("Name").fill("e2e-product-category-edited");
-  await form.getByRole("button", { name: "Save" }).click();
-  row = page.getByRole("row").filter({ hasText: "e2e-product-category-edited" });
-  await expect(row).toBeVisible();
+  await expect(tableRow(page, "Categories", "e2e-product-category")).toBeVisible();
+  await tableRow(page, "Categories", "e2e-product-category").click();
+  const form = page.getByRole("dialog", { name: "e2e-product-category", exact: true });
+  await form.getByRole("textbox", { name: "Name", exact: true }).fill("e2e-product-category-edited");
+  await form.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(form).toBeHidden();
+  await expect(tableRow(page, "Categories", "e2e-product-category-edited")).toBeVisible();
+  await expect(tableRow(page, "Categories", "e2e-product-category")).toHaveCount(0);
 
-  await row.getByRole("button", { name: "Delete" }).click();
-  await page.getByRole("dialog").getByRole("button", { name: "Delete Category" }).click();
-  await expect(page.getByText("e2e-product-category-edited", { exact: true })).toHaveCount(0);
-
-  await page.getByTestId("add-category-button").click();
-  form = page.getByRole("region", { name: "Add Category" });
-  await form.getByLabel("Name").fill(persistedCategory);
-  await form.getByLabel("Aliases").fill("persisted-*");
-  await form.getByRole("button", { name: "Add Category" }).click();
-  await expect(page.getByRole("row").filter({ hasText: persistedCategory })).toBeVisible();
+  await removeCategory("e2e-product-category-edited");
+  await addCategory(persistedCategory, "persisted-*");
 });
 
 test("schedule rules support create, toggle, edit, and delete", async ({ cleanPage: page }) => {
   await page.goto("/settings/schedules");
+  const removeSchedule = async (label: string) => {
+    await tableRow(page, "Schedules", label).click();
+    await page
+      .getByRole("dialog", { name: label, exact: true })
+      .getByRole("button", { name: "Remove schedule", exact: true })
+      .click();
+    await confirmRemoval(page, "Remove schedule");
+    await expect(tableRow(page, "Schedules", label)).toHaveCount(0);
+  };
   if (afterRestart) {
-    const persistedRule = page.getByRole("group", { name: persistedSchedule, exact: true });
-    await expect(persistedRule).toContainText("Disabled");
-    await persistedRule.getByRole("button", { name: "Delete" }).click();
-    await expect(page.getByRole("group", { name: persistedSchedule, exact: true })).toHaveCount(0);
+    const persistedRule = tableRow(page, "Schedules", persistedSchedule);
+    await expect(persistedRule.getByRole("switch", { name: "04:30 schedule enabled", exact: true })).not.toBeChecked();
+    await removeSchedule(persistedSchedule);
     return;
   }
-  await page.getByRole("button", { name: "Add Rule" }).click();
-  await page.getByLabel("Time").fill("03:15");
-  await page.getByLabel("Label").fill("e2e-off-peak");
-  await page.getByRole("button", { name: "Create" }).click();
 
-  let rule = page.getByRole("group", { name: "e2e-off-peak", exact: true });
-  await expect(rule).toContainText("Enabled");
-  await rule.getByRole("switch").click();
-  await expect(rule).toContainText("Disabled");
+  const addSchedule = async (time: string, label: string) => {
+    await page.getByRole("banner").getByRole("button", { name: "Add schedule", exact: true }).click();
+    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    await form.getByLabel("Time", { exact: true }).fill(time);
+    await form.getByRole("textbox", { name: "Label", exact: true }).fill(label);
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(form).toBeHidden();
+    return tableRow(page, "Schedules", label);
+  };
+
+  let rule = await addSchedule("03:15", "e2e-off-peak");
+  const enabled = rule.getByRole("switch", { name: "03:15 schedule enabled", exact: true });
+  await expect(enabled).toBeChecked();
+  await enabled.click();
+  await expect(enabled).not.toBeChecked();
   await page.reload();
-  await expect(rule).toContainText("Disabled");
+  await expect(enabled).not.toBeChecked();
 
-  await rule.getByRole("button", { name: "Edit" }).click();
-  await page.getByLabel("Label").fill("e2e-off-peak-edited");
-  await page.getByRole("button", { name: "Save" }).click();
-  rule = page.getByRole("group", { name: "e2e-off-peak-edited", exact: true });
+  await rule.click();
+  const form = page.getByRole("dialog", { name: "e2e-off-peak", exact: true });
+  await form.getByRole("textbox", { name: "Label", exact: true }).fill("e2e-off-peak-edited");
+  await form.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(form).toBeHidden();
+  rule = tableRow(page, "Schedules", "e2e-off-peak-edited");
   await expect(rule).toBeVisible();
-  await rule.getByRole("button", { name: "Delete" }).click();
-  await expect(page.getByRole("group", { name: "e2e-off-peak-edited", exact: true })).toHaveCount(0);
+  await removeSchedule("e2e-off-peak-edited");
 
-  await page.getByRole("button", { name: "Add Rule" }).click();
-  await page.getByLabel("Time").fill("04:30");
-  await page.getByLabel("Label").fill(persistedSchedule);
-  await page.getByRole("button", { name: "Create" }).click();
-  rule = page.getByRole("group", { name: persistedSchedule, exact: true });
-  await rule.getByRole("switch").click();
-  await expect(rule).toContainText("Disabled");
+  rule = await addSchedule("04:30", persistedSchedule);
+  const persistedEnabled = rule.getByRole("switch", { name: "04:30 schedule enabled", exact: true });
+  await persistedEnabled.click();
+  await expect(persistedEnabled).not.toBeChecked();
 });
 
 test("settings navigation owns every coverage-ledger route", async ({ cleanPage: page }) => {
-  await page.goto("/settings/general");
-  const navigation = await openNavigation(page);
+  await page.goto("/settings");
+  await expect(page).toHaveURL(/\/settings\/general$/);
+  const navigation = page.getByRole("navigation", { name: "Settings", exact: true });
   const ledger = JSON.parse(
     readFileSync(resolve(process.cwd(), "coverage-ledger.v1.json"), "utf8"),
   ) as { routes: Array<{ path: string }> };
@@ -186,8 +244,7 @@ test("settings navigation owns every coverage-ledger route", async ({ cleanPage:
       ),
     ).sort();
   };
-  // The whole shell is client-rendered, so keep polling after opening whichever
-  // responsive navigation variant the current viewport exposes. The same deep
-  // equality keeps missing and extra routes exact.
+  // The rail is client-rendered, so keep polling; the deep equality keeps
+  // missing and extra routes exact.
   await expect.poll(settingsRoutes).toEqual(expected);
 });

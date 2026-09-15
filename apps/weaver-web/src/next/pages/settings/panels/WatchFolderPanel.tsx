@@ -45,8 +45,8 @@ interface PathProblem {
 }
 
 interface ScanReport {
-  discoveredFiles: number;
-  queuedNzbs: number;
+  discoveredFiles: string[];
+  queuedNzbs: string[];
   skippedInputs: PathProblem[];
   permanentErrors: PathProblem[];
   transientErrors: PathProblem[];
@@ -232,14 +232,14 @@ export function WatchFolderPanel() {
           id: "report",
           title: t("next.watchFolder.lastScan"),
           note: t("next.watchFolder.lastScanNote", {
-            queued: report.queuedNzbs,
-            found: report.discoveredFiles,
+            queued: report.queuedNzbs.length,
+            found: report.discoveredFiles.length,
           }),
           searchText: "scan report queued discovered errors skipped",
           body: (
             <>
-              <KeyValueRow label={t("next.watchFolder.filesFound")} value={report.discoveredFiles} />
-              <KeyValueRow label={t("next.watchFolder.queued")} value={report.queuedNzbs} />
+              <KeyValueRow label={t("next.watchFolder.filesFound")} value={report.discoveredFiles.length} />
+              <KeyValueRow label={t("next.watchFolder.queued")} value={report.queuedNzbs.length} />
               {problems.length === 0 ? (
                 <KeyValueRow label={t("next.watchFolder.problems")} value={t("next.job.none")} />
               ) : (

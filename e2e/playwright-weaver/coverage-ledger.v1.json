@@ -12,11 +12,6 @@
       "oracle": "browser"
     },
     {
-      "path": "/upload",
-      "owner": "ui-runtime-observability",
-      "oracle": "browser"
-    },
-    {
       "path": "/monitoring",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
@@ -34,16 +29,6 @@
     {
       "path": "/system-info",
       "owner": "ui-runtime-observability",
-      "oracle": "browser"
-    },
-    {
-      "path": "/servers",
-      "owner": "ui-settings-crud",
-      "oracle": "browser"
-    },
-    {
-      "path": "/categories",
-      "owner": "ui-settings-crud",
       "oracle": "browser"
     },
     {
@@ -439,6 +424,36 @@
       "owner": "ui-security",
       "oracle": "unit-only",
       "rationale": "Changing the listen address only takes effect at the next restart, so a browser flow cannot observe its result within a test; the refusal paths (environment-pinned, strict-security without login) and the pending/restart reporting are covered by weaver-server-api security_policy tests and weaver-server-core security unit tests."
+    },
+    {
+      "name": "beginFirstRunSetup",
+      "owner": "ui-security",
+      "oracle": "unit-only",
+      "rationale": "Release-gate stacks start from imported provider configuration, so the first-run wizard never opens; its setup-code and completion contract is covered by the server's first-run tests."
+    },
+    {
+      "name": "dismissSecurityUpgradeNotice",
+      "owner": "ui-security",
+      "oracle": "unit-only",
+      "rationale": "The one-time access-model notice appears only for installs created before 0.12.0; release-gate stacks are created fresh."
+    },
+    {
+      "name": "finishFirstRunSetup",
+      "owner": "ui-security",
+      "oracle": "unit-only",
+      "rationale": "Release-gate stacks start from imported provider configuration, so the first-run wizard never opens; its setup-code and completion contract is covered by the server's first-run tests."
+    },
+    {
+      "name": "signOutAll",
+      "owner": "ui-security",
+      "oracle": "unit-only",
+      "rationale": "The security flow proves per-session sign-out and credential changes; revoking every other session is covered by the server's session tests."
+    },
+    {
+      "name": "updateNetworkAccess",
+      "owner": "ui-security",
+      "oracle": "unit-only",
+      "rationale": "Release-gate stacks reach Weaver through a trusted network range that the flow must keep; narrowing it mid-run would cut the harness off, so the access-rule contract is covered by the server's access tests."
     },
     {
       "name": "addCategory",
