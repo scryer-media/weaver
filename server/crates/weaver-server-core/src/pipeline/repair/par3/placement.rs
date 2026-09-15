@@ -282,16 +282,18 @@ fn matches_single_damaged_extent(
         || file.len > READ_LIMIT.saturating_sub(*read_bytes)
         || file
             .extents
-            .first()
-            .is_none_or(|extent| extent.range.start != 0)
+            .range(0)
+            .is_none_or(|range| range.start != 0)
         || file
             .extents
-            .last()
-            .is_none_or(|extent| extent.range.end != file.len)
-        || file
-            .extents
-            .windows(2)
-            .any(|pair| pair[0].range.end != pair[1].range.start)
+            .range(file.extents.len() - 1)
+            .is_none_or(|range| range.end != file.len)
+        // Extents materialise by value now, so contiguity is checked by
+        // walking adjacent ranges rather than over a window of a slice.
+        || (1..file.extents.len()).any(|index| {
+            file.extents.range(index - 1).map(|range| range.end)
+                != file.extents.range(index).map(|range| range.start)
+        })
         || file.extents.iter().any(|extent| {
             !matches!(
                 extent.kind,
@@ -584,13 +586,43 @@ mod tests {
             (1 << 30) - file.len,
             "budget exhaustion cannot pick an untested alias"
         );
-        if let ExtentKind::Block { fingerprint, .. } = &mut alias.extents[0].kind {
-            *fingerprint = None;
-        }
+        // Extents materialise by value from shared checksum storage, so an
+        // unauthenticated extent can no longer be produced by mutating one.
+        // Scan the same set with its External Data packets removed instead:
+        // the blocks then carry no fingerprints at all, which is the condition
+        // under test.
+        let bare = root.path().join("bare.par3");
+        std::fs::write(&bare, without_external_data(INDEX)).unwrap();
+        let mut unchecked = Par3Job::default();
+        unchecked.scan_file(SourceId(97), bare, None).unwrap();
+        let bare_layout = unchecked
+            .sets
+            .values_mut()
+            .next()
+            .unwrap()
+            .native
+            .layout()
+            .unwrap()
+            .unwrap();
+        let unauthenticated = bare_layout
+            .files()
+            .iter()
+            .find(|file| file.path == "a.bin")
+            .unwrap();
+        assert!(
+            unauthenticated.extents.iter().any(|extent| matches!(
+                extent.kind,
+                ExtentKind::Block {
+                    fingerprint: None,
+                    ..
+                }
+            )),
+            "a set without External Data packets authenticates no block"
+        );
         read = 0;
         assert!(
             unique_damaged_name(
-                [file, &alias].into_iter(),
+                [file, unauthenticated].into_iter(),
                 &access,
                 source,
                 snapshot,
@@ -601,6 +633,24 @@ mod tests {
             .is_none()
         );
         assert_eq!(read, 0);
+    }
+
+    /// The same packet stream with every External Data packet dropped, so the
+    /// set describes its files without authenticating any of their blocks.
+    fn without_external_data(index: &[u8]) -> Vec<u8> {
+        use par3_rs::packet::{HEADER_SIZE, PacketHeader, PacketType};
+        let mut kept = Vec::with_capacity(index.len());
+        let mut at = 0usize;
+        while at + HEADER_SIZE <= index.len() {
+            let header = PacketHeader::parse(&index[at..], at as u64).expect("a framed packet");
+            let end = at + header.length as usize;
+            if header.packet_type != PacketType::ExternalData {
+                kept.extend_from_slice(&index[at..end]);
+            }
+            at = end;
+        }
+        assert_eq!(at, index.len(), "the fixture is a whole packet stream");
+        kept
     }
 
     #[test]

@@ -11,8 +11,9 @@ use crate::operations::instrumentation::{
 mod par3;
 
 pub use par3::{
-    PAR3_SLOTS, PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3Metrics, Par3MetricsSnapshot,
-    Par3OutcomeClass, Par3Phase, Par3Slot, Par3SlotSnapshot, Par3Stage,
+    PAR3_MEMORY_CATEGORIES, PAR3_SLOTS, PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason,
+    Par3EngineNarrowing, Par3EngineRefusal, Par3Metrics, Par3MetricsSnapshot, Par3OutcomeClass,
+    Par3Phase, Par3Slot, Par3SlotSnapshot, Par3Stage, par3_memory_category_names,
 };
 
 const SPEED_WINDOW_SAMPLES: usize = 50; // ~5 seconds at 100ms snapshot rate

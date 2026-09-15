@@ -731,6 +731,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "rayon-core",
 ]
 
 [[package]]
@@ -3470,21 +3471,19 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.20",
  "tracing",
 ]
 
 [[package]]
 name = "par3-rs"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "149eee4bf758f8c50555b9867bb3d91acdb665143922bb9f3e6be4baba3adb44"
+version = "0.3.2"
 dependencies = [
  "blake3",
  "crc-fast",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.5",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -4007,6 +4006,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.13.1",
+]
+
+[[package]]
+name = "reedsolomon-rs"
+version = "0.4.5"
+dependencies = [
+ "memmap2",
+ "rayon",
 ]
 
 [[package]]
@@ -5753,7 +5760,7 @@ dependencies = [
  "libc",
  "memchr",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "rmp-serde",
  "serde",
  "sha2 0.11.0",
@@ -6111,7 +6118,7 @@ dependencies = [
  "pbkdf2",
  "quick-xml",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "regex",
  "reqwest",
  "rmp-serde",

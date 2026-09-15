@@ -57,14 +57,14 @@ impl Par3Job {
             if let Some(layout) = set.native.layout()? {
                 count = count
                     .checked_add(layout.files().len())
-                    .ok_or(EngineError::ResourceLimit("PAR3 shared descriptions"))?;
+                    .ok_or(budget::host_limit("PAR3 shared descriptions"))?;
                 layouts.push(layout);
             }
         }
         let _files = assessment::ViewReservation::acquire(
             count
                 .checked_mul(64)
-                .ok_or(EngineError::ResourceLimit("PAR3 shared descriptions"))?,
+                .ok_or(budget::host_limit("PAR3 shared descriptions"))?,
         )?;
         let mut files: Vec<&FileLayout> = Vec::with_capacity(count);
         for layout in &layouts {
@@ -137,8 +137,9 @@ fn contradict(left: &FileLayout, right: &FileLayout) -> bool {
     false
 }
 
-fn unprotected(file: &FileLayout) -> impl Iterator<Item = &std::ops::Range<u64>> {
-    file.extents.iter().filter_map(|extent| {
-        matches!(extent.kind, ExtentKind::Unprotected).then_some(&extent.range)
-    })
+fn unprotected(file: &FileLayout) -> impl Iterator<Item = std::ops::Range<u64>> + '_ {
+    file.extents
+        .iter()
+        .filter(|extent| matches!(extent.kind, ExtentKind::Unprotected))
+        .map(|extent| extent.range)
 }

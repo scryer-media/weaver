@@ -19,6 +19,15 @@ fn execution_options() -> ExecutionOptions {
     static HANDLES: OnceLock<HandleBudget> = OnceLock::new();
     let mut options = ExecutionOptions::default();
     options.memory = budget::budgets().native.clone();
+    // What a session retains follows its set's block count, not its byte size
+    // and not the host's RAM: measured against the engine's own ledger, the
+    // same block count retained identical bytes at 512 B and at 64 KiB blocks.
+    // The measured line is about 48 bytes per block plus roughly 90 KB fixed —
+    // 0.29 MB at 4 096 blocks, 0.88 MB at 16 384, 3.25 MB at 65 531, and a few
+    // hundred KB for small sets. Half the native budget therefore admits sets
+    // of order ten million blocks, far above anything measured here, and this
+    // is a ceiling rather than a reservation: a session that never approaches
+    // it costs nothing, while a lower one would refuse large sets outright.
     options.retained_bytes = options.memory.limit() / 2;
     options.handles = HANDLES.get_or_init(|| HandleBudget::new(128)).clone();
     options.open_handles = 128;
@@ -114,7 +123,7 @@ impl Par3Job {
         if !self.disk_publications.contains_key(&source)
             && self.disk_publications.len() >= MAX_CARRIERS
         {
-            return Err(EngineError::ResourceLimit("PAR3 disk publications"));
+            return Err(budget::host_limit("PAR3 disk publications"));
         }
         let access = disk_source(source, path.clone(), &self.options)?;
         let backing = access.snapshot(source)?.ok_or(EngineError::Unavailable {
@@ -166,7 +175,7 @@ impl Par3Job {
     ) -> EngineResult<SourceSnapshot> {
         bindings::check_source(source)?;
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
-            return Err(EngineError::ResourceLimit("PAR3 source bindings"));
+            return Err(budget::host_limit("PAR3 source bindings"));
         }
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
@@ -321,7 +330,7 @@ impl Par3Job {
     ) -> EngineResult<()> {
         bindings::check_source(source)?;
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
-            return Err(EngineError::ResourceLimit("PAR3 source bindings"));
+            return Err(budget::host_limit("PAR3 source bindings"));
         }
         self.retire_name_bindings(source, &name)?;
         self.bindings.retain(|_, bound| *bound != source);
@@ -424,7 +433,7 @@ impl Par3Job {
     ) -> EngineResult<()> {
         bindings::check_source(source)?;
         if !self.carriers.contains_key(&source) && self.carriers.len() >= MAX_CARRIERS {
-            return Err(EngineError::ResourceLimit("job carrier count"));
+            return Err(budget::host_limit("job carrier count"));
         }
         let backing = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
@@ -488,7 +497,7 @@ impl Par3Job {
                     let id = packet.input_set_id();
                     if !self.sets.contains_key(&id) {
                         if self.sets.len() >= MAX_SETS {
-                            return Err(EngineError::ResourceLimit("job PAR3 set count"));
+                            return Err(budget::host_limit("job PAR3 set count"));
                         }
                         self.sets.insert(
                             id,
@@ -758,14 +767,14 @@ impl Pipeline {
             }
             let end = offset
                 .checked_add(u64::from(len))
-                .ok_or(EngineError::ResourceLimit("PAR3 source offsets"))?;
+                .ok_or(budget::host_limit("PAR3 source offsets"))?;
             if let Some(last) = ranges.last_mut()
                 && last.end == offset
             {
                 last.end = end;
             } else {
                 if ranges.len() >= 262_144 {
-                    return Err(EngineError::ResourceLimit("PAR3 source ranges"));
+                    return Err(budget::host_limit("PAR3 source ranges"));
                 }
                 ranges.push(offset..end);
             }
@@ -808,7 +817,7 @@ impl Pipeline {
                 .chain(persisted.map(|(offset, len)| offset..offset.saturating_add(len as u64)))
             {
                 if ranges.len() >= 262_144 {
-                    return Err(EngineError::ResourceLimit("PAR3 source ranges"));
+                    return Err(budget::host_limit("PAR3 source ranges"));
                 }
                 ranges.push(range);
             }
@@ -1011,7 +1020,7 @@ impl Pipeline {
                         || (0..file.total_segments()).any(|part| file.has_segment(part)))
                 {
                     if dirty.len() >= MAX_CARRIERS {
-                        return Err(EngineError::ResourceLimit("PAR3 source count"));
+                        return Err(budget::host_limit("PAR3 source count"));
                     }
                     dirty.push(source);
                 }
@@ -1122,7 +1131,7 @@ impl Pipeline {
 mod acquisition;
 mod assessment;
 mod bindings;
-mod budget;
+pub(in crate::pipeline) mod budget;
 pub(in crate::pipeline) mod cohorts;
 mod completion;
 mod coordination;

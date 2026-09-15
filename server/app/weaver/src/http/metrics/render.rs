@@ -19,8 +19,9 @@ use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot
 use weaver_server_core::settings::PerJobSeries;
 use weaver_server_core::{
     DispatchShareMode, DownloadPressureReason, DownloadPressureState, JobInfo, JobStatus,
-    MetricsSnapshot, PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3MetricsSnapshot,
-    Par3OutcomeClass, Par3Phase, Par3Stage, SpilloverDecision,
+    MetricsSnapshot, PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3EngineNarrowing,
+    Par3EngineRefusal, Par3MetricsSnapshot, Par3OutcomeClass, Par3Phase, Par3Stage,
+    SpilloverDecision, par3_memory_category_names,
 };
 
 use super::catalog as f;
@@ -444,6 +445,105 @@ fn render_par3(out: &mut Encoder, par3: &Par3MetricsSnapshot) {
     out.sample(&f::PAR3_RETAINED_BYTES, &[], par3.retained_bytes);
     out.sample(&f::PAR3_STRIPE_BYTES, &[], par3.effective_stripe_bytes);
 
+    // The category label values are the engine's own stable names, taken in
+    // ledger order, so the two arrays and the names cannot drift apart.
+    // Each family's samples are emitted together, because the exposition
+    // format requires one contiguous group per family.
+    for (family, values) in [
+        (&f::PAR3_LEDGER_BYTES, &par3.ledger_bytes),
+        (&f::PAR3_LEDGER_PEAK_BYTES, &par3.ledger_peak_bytes),
+    ] {
+        for (index, category) in par3_memory_category_names().into_iter().enumerate() {
+            out.sample(family, &[("category", category)], values[index]);
+        }
+    }
+    for (family, value) in [
+        (
+            &f::PAR3_ENGINE_ADMITTED_STRIPE_BYTES,
+            par3.engine_admitted_stripe_bytes,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_STRIPE_BUFFERS,
+            par3.engine_admitted_stripe_buffers,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_OUTPUT_TILE,
+            par3.engine_admitted_output_tile,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_VERIFY_BATCH,
+            par3.engine_admitted_verify_batch,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_WORKERS,
+            par3.engine_admitted_workers,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_WINDOW_BYTES,
+            par3.engine_admitted_window_bytes,
+        ),
+    ] {
+        out.sample(family, &[], value);
+    }
+    for cause in Par3EngineRefusal::ALL {
+        out.sample(
+            &f::PAR3_ENGINE_REFUSALS,
+            &[("cause", cause.as_str())],
+            par3.engine_refusals[cause.index()],
+        );
+    }
+    for width in Par3EngineNarrowing::ALL {
+        out.sample(
+            &f::PAR3_ENGINE_NARROWED,
+            &[("width", width.as_str())],
+            par3.engine_narrowed[width.index()],
+        );
+    }
+    out.sample(
+        &f::PAR3_ENGINE_REREAD_BYTES,
+        &[],
+        par3.engine_reread_bytes_total,
+    );
+    out.sample(
+        &f::PAR3_ENGINE_RECONSTRUCTED_BYTES,
+        &[],
+        par3.engine_reconstructed_bytes_total,
+    );
+    out.sample(
+        &f::PAR3_ENGINE_CACHE_ENTRIES,
+        &[],
+        par3.engine_cache_entries,
+    );
+    out.sample(&f::PAR3_ENGINE_CACHE_BYTES, &[], par3.engine_cache_bytes);
+    for (family, value) in [
+        (
+            &f::PAR3_ENGINE_CODEC_TRANSFORM_CALLS,
+            par3.engine_codec_transform_calls_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_BUTTERFLIES,
+            par3.engine_codec_butterflies_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_BUTTERFLIES_SKIPPED,
+            par3.engine_codec_butterflies_skipped_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_MULTIPLY_ACCUMULATES,
+            par3.engine_codec_multiply_accumulates_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_FACTORS_COMPUTED,
+            par3.engine_codec_factors_computed_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_FACTORS_REUSED,
+            par3.engine_codec_factors_reused_total,
+        ),
+    ] {
+        out.sample(family, &[], value);
+    }
+
     out.sample(&f::PAR3_PENDING_WORK, &[], par3.pending_work_depth as u64);
     out.sample(&f::PAR3_PENDING_BYTES, &[], par3.pending_work_bytes);
     for (reason, value) in [
@@ -533,6 +633,8 @@ fn render_par3(out: &mut Encoder, par3: &Par3MetricsSnapshot) {
             &[("stage", stage.as_str())],
             par3.stage_calls[stage.index()],
         );
+    }
+    for stage in Par3Stage::ALL {
         out.sample_f64(
             &f::PAR3_STAGE_SECONDS,
             &[("stage", stage.as_str())],
@@ -585,30 +687,42 @@ fn render_par3(out: &mut Encoder, par3: &Par3MetricsSnapshot) {
         par3.carrier_ranges_unavailable_total,
     );
 
+    // The slot label is the array position, which is stable for the life of the
+    // process; the job id says who currently owns that position. Each family
+    // gets its own pass over the slots, because the exposition format wants a
+    // family's samples together rather than a slot's.
+    let slot_label = |index: usize| SLOT_LABELS[index.min(SLOT_LABELS.len() - 1)];
     for (index, slot) in par3.slots.iter().enumerate() {
-        // The slot label is the array position, which is stable for the life
-        // of the process; the job id says who currently owns that position.
-        let position = SLOT_LABELS[index.min(SLOT_LABELS.len() - 1)];
         for phase in Par3Phase::ALL {
             out.sample(
                 &f::PAR3_SLOT_PHASE,
-                &[("slot", position), ("phase", phase.as_str())],
+                &[("slot", slot_label(index)), ("phase", phase.as_str())],
                 u8::from(slot.phase == phase),
             );
         }
-        out.sample(&f::PAR3_SLOT_JOB, &[("slot", position)], slot.job_id);
+    }
+    for (index, slot) in par3.slots.iter().enumerate() {
+        out.sample(
+            &f::PAR3_SLOT_JOB,
+            &[("slot", slot_label(index))],
+            slot.job_id,
+        );
+    }
+    for (index, slot) in par3.slots.iter().enumerate() {
         out.sample_f64(
             &f::PAR3_SLOT_PHASE_SECONDS,
-            &[("slot", position)],
+            &[("slot", slot_label(index))],
             seconds(
                 slot.last_progress_ms
                     .max(slot.phase_entered_ms)
                     .saturating_sub(slot.phase_entered_ms),
             ),
         );
+    }
+    for (index, slot) in par3.slots.iter().enumerate() {
         out.sample_f64(
             &f::PAR3_SLOT_STALL_SECONDS,
-            &[("slot", position)],
+            &[("slot", slot_label(index))],
             seconds(slot.current_stall_ms),
         );
     }
@@ -690,12 +804,16 @@ fn render_hot_dispatch(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         snapshot.hot_dispatch_lent_connections,
     );
 
+    // One pass per family: the exposition format wants every sample of a
+    // family together, so the two decision families cannot share a loop.
     for decision in SpilloverDecision::ALL {
         out.sample(
             &f::HOT_LAST_SPILLOVER_DECISION,
             &[("decision", decision.as_str())],
             u8::from(snapshot.hot_dispatch_last_spillover_decision == decision),
         );
+    }
+    for decision in SpilloverDecision::ALL {
         if let Some(value) = spillover_decision_total(snapshot, decision) {
             out.sample(
                 &f::HOT_SPILLOVER_DECISIONS,

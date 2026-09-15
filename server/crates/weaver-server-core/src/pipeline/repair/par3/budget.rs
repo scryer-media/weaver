@@ -1,9 +1,116 @@
 //! Process-wide PAR3 admission, resolved once outside the download loop.
 
 use super::*;
-use par3_rs::runtime::MemoryBudget;
+use par3_rs::runtime::{MemoryBudget, ResourceLimit};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Weak};
+
+/// A ceiling weaver's own admission enforced, in the vocabulary the engine
+/// refuses in.
+///
+/// The engine's `ResourceLimit` is `#[non_exhaustive]` and both its
+/// constructors are crate-private, so only par3-rs can build one. Weaver's own
+/// budgets — carrier counts, retained payload, assessment views, disk fallback
+/// — still have to refuse in the same terms, so they carry the same four fields
+/// and travel inside the engine's error type the way [`SourcePressure`] below
+/// already does. Everything that reads a refusal goes through [`limit_label`]
+/// and sees both kinds alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pipeline) struct HostLimit {
+    /// Name of the budget that refused, in the same style as the engine's.
+    pub what: &'static str,
+    /// Bytes the refused request needed, when the refusal was measured.
+    pub need: u64,
+    /// Configured ceiling for `what`, when the refusal was measured.
+    pub limit: u64,
+    /// Bytes still available under that ceiling when the request was refused.
+    pub available: u64,
+}
+
+impl std::fmt::Display for HostLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.limit == 0 {
+            f.write_str(self.what)
+        } else if self.need > self.limit {
+            write!(
+                f,
+                "{} does not fit alone (needs {} bytes, ceiling {})",
+                self.what, self.need, self.limit
+            )
+        } else {
+            write!(
+                f,
+                "{} does not fit beside the memory already reserved (needs {} bytes, {} of {} \
+                 available)",
+                self.what, self.need, self.available, self.limit
+            )
+        }
+    }
+}
+
+impl std::error::Error for HostLimit {}
+
+/// A weaver-side refusal whose ceiling is a count or a structural bound rather
+/// than a byte budget.
+pub(in crate::pipeline) fn host_limit(what: &'static str) -> EngineError {
+    EngineError::Io(std::io::Error::other(HostLimit {
+        what,
+        need: 0,
+        limit: 0,
+        available: 0,
+    }))
+}
+
+/// A weaver-side refusal measured against a byte ceiling.
+pub(in crate::pipeline) fn host_budget_limit(
+    what: &'static str,
+    need: u64,
+    limit: u64,
+    available: u64,
+) -> EngineError {
+    EngineError::Io(std::io::Error::other(HostLimit {
+        what,
+        need,
+        limit,
+        available,
+    }))
+}
+
+/// The budget a refusal names, whether the engine or weaver refused. Anything
+/// that is not a refusal answers `None`.
+pub(in crate::pipeline) fn limit_label(error: &EngineError) -> Option<&'static str> {
+    match error {
+        EngineError::ResourceLimit(limit) => Some(limit.what),
+        EngineError::Io(error) => error.get_ref().and_then(|inner| {
+            inner
+                .downcast_ref::<HostLimit>()
+                .map(|limit| limit.what)
+                .or_else(|| inner.downcast_ref::<EngineError>().and_then(limit_label))
+        }),
+        EngineError::RepairInterrupted { cause, .. } => limit_label(cause),
+        _ => None,
+    }
+}
+
+/// Whether this error is a refused reservation at all.
+pub(in crate::pipeline) fn is_limit(error: &EngineError) -> bool {
+    limit_label(error).is_some()
+}
+
+/// The engine's own measured refusal, when the engine is the one that refused.
+/// A weaver-side [`HostLimit`] is deliberately not reported here: the outcome
+/// that depends on `LimitCause` is about the engine's native budget.
+pub(in crate::pipeline) fn engine_limit(error: &EngineError) -> Option<ResourceLimit> {
+    match error {
+        EngineError::ResourceLimit(limit) => Some(*limit),
+        EngineError::Io(error) => error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<EngineError>())
+            .and_then(engine_limit),
+        EngineError::RepairInterrupted { cause, .. } => engine_limit(cause),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Limits {
@@ -59,7 +166,12 @@ impl Budget {
                     limit_bytes = self.limit,
                     "PAR3 memory admission refused"
                 );
-                EngineError::ResourceLimit(self.label)
+                host_budget_limit(
+                    self.label,
+                    bytes as u64,
+                    self.limit as u64,
+                    self.limit.saturating_sub(used) as u64,
+                )
             })?;
         Ok(Reservation {
             budget: Arc::clone(self),
@@ -166,28 +278,28 @@ pub(super) fn budgets() -> &'static Budgets {
     })
 }
 
+/// Whether the engine's own native budget is what refused.
+///
+/// A charge against that budget now names the memory category it pays for, so
+/// the label is one of the engine's category names rather than the single
+/// `memory budget` string every charge used to report. `Uncategorized` still
+/// carries that string, so nothing that refused before stops being recognised;
+/// the two labels beside the categories are refusals the budget raises without
+/// charging a category.
 pub(super) fn is_native_pressure(error: &EngineError) -> bool {
-    match error {
-        EngineError::ResourceLimit("memory budget" | "minimum repair stripe" | "open handles") => {
-            true
-        }
-        EngineError::RepairInterrupted { cause, .. } => is_native_pressure(cause),
-        _ => false,
-    }
+    limit_label(error).is_some_and(|label| {
+        matches!(label, "minimum repair stripe" | "open handles")
+            || par3_rs::runtime::MemoryCategory::ALL
+                .iter()
+                .any(|category| category.name() == label)
+    })
 }
 
 pub(super) fn is_host_pressure(error: &EngineError) -> bool {
-    match error {
-        EngineError::ResourceLimit("PAR3 host state" | "PAR3 retained payload") => true,
-        EngineError::Io(error) => {
-            error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<EngineError>())
-                .is_some_and(is_host_pressure)
-                || pressure_source(error).is_some()
-        }
-        _ => false,
-    }
+    matches!(
+        limit_label(error),
+        Some("PAR3 host state" | "PAR3 retained payload")
+    ) || matches!(error, EngineError::Io(error) if pressure_source(error).is_some())
 }
 
 #[derive(Debug)]
@@ -224,6 +336,57 @@ pub(super) fn error_pressure_source(error: &EngineError) -> Option<SourceId> {
     }
 }
 
+/// A real engine refusal of the requested cause, for tests that have to hand a
+/// `ResourceLimit` to code that classifies one.
+///
+/// par3-rs is the only crate that can build one: the struct is
+/// `#[non_exhaustive]` and both its constructors are crate-private. Rather than
+/// model what a refusal would look like, this provokes the engine into
+/// producing one through its published APIs, so the numbers and the `cause()`
+/// are the engine's own.
+#[cfg(test)]
+pub(in crate::pipeline) fn engine_refusal(cause: par3_rs::runtime::LimitCause) -> ResourceLimit {
+    use par3_rs::runtime::{ExecutionOptions, HandleBudget, LimitCause};
+
+    let limit_of = |error: EngineError| {
+        engine_limit(&error).unwrap_or_else(|| panic!("the engine refused with {error}"))
+    };
+    if cause == LimitCause::Unmeasured {
+        // A handle ceiling is a count, so its refusal is never measured.
+        let handles = HandleBudget::new(1);
+        let _held = handles.acquire().expect("the first handle fits");
+        return limit_of(handles.acquire().expect_err("the second handle does not"));
+    }
+    // A carrier scanner reserves two stripes before it reads anything, so a
+    // budget sized against that reservation refuses on demand.
+    let scanner = |options: &ExecutionOptions| {
+        let mut access = par3_rs::source::MemorySourceAccess::default();
+        access.insert(SourceId(1), 1, std::sync::Arc::from(&b"unscanned"[..]));
+        par3_rs::ingest::PacketScanner::new(
+            std::sync::Arc::new(access),
+            SourceId(1),
+            options.clone(),
+            par3_rs::ScanLimits::default(),
+        )
+    };
+    let stripe = 16 << 10;
+    let mut options = ExecutionOptions::default();
+    options.stripe_bytes = stripe;
+    options.memory = MemoryBudget::new(if cause == LimitCause::ExceedsLimit {
+        // Less than one scanner's two stripes: nothing frees enough.
+        stripe
+    } else {
+        // Room for one scanner, not two: the second waits on the first.
+        3 * stripe
+    });
+    let held =
+        (cause == LimitCause::PeerContention).then(|| scanner(&options).expect("first fits"));
+    let refusal = limit_of(scanner(&options).err().expect("the budget refuses"));
+    drop(held);
+    assert_eq!(refusal.cause(), cause, "{refusal}");
+    refusal
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -249,7 +412,12 @@ impl DiskReservation {
                     reserve_bytes = reserve,
                     "PAR3 disk fallback admission refused"
                 );
-                EngineError::ResourceLimit("PAR3 disk fallback space")
+                host_budget_limit(
+                    "PAR3 disk fallback space",
+                    bytes.saturating_add(reserve),
+                    available,
+                    available.saturating_sub(used).saturating_sub(reserve),
+                )
             })?;
         Ok(Self(bytes))
     }

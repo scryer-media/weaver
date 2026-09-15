@@ -256,7 +256,7 @@ impl Pipeline {
         let count = state.assembly.files().count();
         let cost = count
             .checked_mul(std::mem::size_of::<NzbFileId>())
-            .ok_or(EngineError::ResourceLimit("PAR3 handoff files"))?;
+            .ok_or(budget::host_limit("PAR3 handoff files"))?;
         let reservation = assessment::ViewReservation::acquire(cost)?;
         let mut files = Vec::with_capacity(count);
         for file in state.assembly.files() {

@@ -159,6 +159,11 @@ impl Pipeline {
 
     /// Tally a drained acquisition window: each article it admitted either
     /// reached the assembly or did not. Counted once per window.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn settle_par3_recovery_batch_for_test(&mut self, job_id: JobId) {
+        self.settle_par3_recovery_batch(job_id);
+    }
+
     fn settle_par3_recovery_batch(&mut self, job_id: JobId) {
         let articles = match self.par3_runtime.as_mut() {
             Some(runtime) => runtime.take_unsettled_articles(job_id),
@@ -189,6 +194,12 @@ impl Pipeline {
         if failed != 0 {
             par3.recovery_articles_failed_total
                 .fetch_add(failed, Relaxed);
+        }
+        // The window is over either way: an index that arrived is the engine's
+        // own `available` now, and one whose article failed has to become
+        // askable again instead of sitting in flight forever.
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            runtime.forget_recovery_in_flight(job_id);
         }
     }
 
@@ -357,6 +368,32 @@ impl Pipeline {
             self.fail_job(job_id, format!("PAR3 acquisition failed: {error}"));
             return true;
         }
+        // Tell the engine what this window is expected to deliver. The next
+        // reassessment then subtracts it, so nothing already being fetched is
+        // requested a second time. A refusal here costs deduplication, not
+        // correctness, so it is recorded and the window still runs.
+        let spans: Vec<std::ops::Range<u64>> = {
+            let files: std::collections::BTreeSet<u32> =
+                selected.iter().map(|id| id.file_id.file_index).collect();
+            let state = self.jobs.get(&job_id).expect("live job");
+            files
+                .into_iter()
+                .filter_map(|index| state.spec.files.get(index as usize))
+                .filter_map(|file| super::cohorts::volume_span(&file.filename))
+                .collect()
+        };
+        let runtime = self.par3_runtime.as_mut().expect("admitted job");
+        if let Err(error) = runtime.declare_recovery_in_flight(job_id, &spans) {
+            self.metrics
+                .par3
+                .note_admission_refused(super::outcome::admission_reason(&error));
+            tracing::debug!(
+                job_id = job_id.0,
+                %error,
+                "PAR3 recovery in-flight declaration refused"
+            );
+        }
+        let state = self.jobs.get_mut(&job_id).expect("live job");
         let mut remaining: std::collections::HashSet<_> = selected.iter().copied().collect();
         for mut work in pool {
             if remaining.remove(&work.segment_id) {

@@ -21,6 +21,13 @@ impl Pipeline {
         else {
             return false;
         };
+        // The engine's measurement of the refusal travels with the spill, so
+        // the verdict below is classified from what actually refused rather
+        // than from a byte count reconstructed after the fact.
+        let spill_limit = self
+            .par3_runtime
+            .as_mut()
+            .and_then(|runtime| runtime.take_spill_limit(job_id));
         let index = u32::try_from(source.0).ok().and_then(|file| {
             self.direct_store.sets_for(job_id).iter().position(|set| {
                 !set.is_demoted()
@@ -34,7 +41,7 @@ impl Pipeline {
             self.settle_par3_outcome(
                 job_id,
                 outcome::Par3Outcome::NotExecutable {
-                    limit: "the refused source has no disk fallback",
+                    limit: "the refused source has no disk fallback".into(),
                 },
             );
             return true;
@@ -81,19 +88,13 @@ impl Pipeline {
             // this image was refused for, so that refusal is a wait. Nothing
             // frees disk in the meantime: with no peer in flight the verdict
             // is terminal and names the budget that actually refused it.
-            let peer = self
-                .par3_runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.peer_holds_par3_memory(job_id));
-            if peer {
-                self.refuse_par3_memory(job_id, source, required.or(refused_bytes).unwrap_or(0));
-            } else {
-                self.settle_par3_outcome(
+            match spill_limit {
+                Some(limit) => self.refuse_par3_memory(job_id, source, limit),
+                None => self.refuse_par3_host_memory(
                     job_id,
-                    outcome::Par3Outcome::NotExecutable {
-                        limit: "the disk fallback has no room for the refused source",
-                    },
-                );
+                    source,
+                    required.or(refused_bytes).unwrap_or(0),
+                ),
             }
             return true;
         }
@@ -526,7 +527,7 @@ impl Pipeline {
                         .as_mut()
                         .is_some_and(|runtime| runtime.take_repair_retry(job_id)) =>
             {
-                if let Err(error) = self.clear_par3_pressure_temporaries(job_id, &error).await {
+                if let Err(error) = self.clear_par3_repair_temporaries(job_id, &error).await {
                     self.fail_job(job_id, error);
                     return;
                 }
@@ -550,7 +551,7 @@ impl Pipeline {
                 self.schedule_job_completion_check(job_id);
             }
             Err(error) if budget::error_pressure_source(&error).is_some() => {
-                if let Err(cleanup) = self.clear_par3_pressure_temporaries(job_id, &error).await {
+                if let Err(cleanup) = self.clear_par3_repair_temporaries(job_id, &error).await {
                     self.fail_direct_unpack_after_repair(job_id, &cleanup);
                     self.fail_job(job_id, cleanup);
                     return;
@@ -571,6 +572,27 @@ impl Pipeline {
                 self.fail_direct_unpack_after_repair(job_id, detail);
                 self.settle_par3_outcome(job_id, outcome::Par3Outcome::Unsupported { detail });
             }
+            // A set names the files it protects, and those names are attacker
+            // controlled. The engine refuses to write one before it creates a
+            // directory or opens a file, and no retry, no extra recovery and no
+            // amount of memory changes that name: the verdict is terminal and
+            // says which rule and which component earned it.
+            Err(error) if outcome::unsafe_path(&error).is_some() => {
+                // The engine returns the temporaries it had already staged when
+                // a later name is refused. Nothing resumes this repair, so drop
+                // them before the verdict rather than leave them in the job's
+                // working directory.
+                if let Err(cleanup) = self.clear_par3_repair_temporaries(job_id, &error).await {
+                    self.fail_direct_unpack_after_repair(job_id, &cleanup);
+                    self.fail_job(job_id, cleanup);
+                    return;
+                }
+                let refused = outcome::refuse_unsafe_path(
+                    outcome::unsafe_path(&error).expect("matched by the guard"),
+                );
+                self.fail_direct_unpack_after_repair(job_id, &refused.to_string());
+                self.settle_par3_outcome(job_id, refused);
+            }
             Err(error) => {
                 self.fail_direct_unpack_after_repair(job_id, &error.to_string());
                 self.fail_job(job_id, format!("PAR3 repair failed: {error}"));
@@ -579,7 +601,7 @@ impl Pipeline {
         self.promote_queued_repairs();
     }
 
-    async fn clear_par3_pressure_temporaries(
+    async fn clear_par3_repair_temporaries(
         &self,
         job_id: JobId,
         error: &EngineError,
