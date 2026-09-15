@@ -53,6 +53,8 @@ struct Carrier {
     revision: u64,
     needed: Option<u64>,
     resume: Option<u64>,
+    /// What this carrier's own scan has found so far.
+    scan: carriers::CarrierScan,
 }
 
 struct DiskPublication {
@@ -79,6 +81,147 @@ pub(in crate::pipeline) struct Par3Job {
     packets_authenticated: u64,
     packets_rejected: u64,
     ranges_unavailable: u64,
+    /// Option packets (links, permissions) authenticated from any carrier.
+    /// Weaver retains their identity so it can say they were ignored; it
+    /// never applies one.
+    option_packets: std::collections::BTreeSet<par3_rs::Fingerprint>,
+    /// Option packets that File, Directory and Root packets point at.
+    referenced_options: std::collections::BTreeSet<par3_rs::Fingerprint>,
+    /// Whether any authenticated Root declares the set's paths absolute.
+    absolute_paths: bool,
+    /// Each admitted set's input block size, from its own Start packet. A File
+    /// packet cannot be read without it. Bounded by the set ceiling, because
+    /// an entry is only made for a set that was admitted.
+    set_block_sizes: std::collections::BTreeMap<par3_rs::InputSetId, u64>,
+}
+
+/// What one authenticated metadata packet says about option packets, captured
+/// before the packet is handed to its set.
+enum PacketNote {
+    Nothing,
+    /// This packet is itself an option packet weaver does not apply.
+    Option(par3_rs::Fingerprint),
+    /// This packet points at option packets, and may declare absolute paths.
+    References {
+        hashes: Vec<par3_rs::Fingerprint>,
+        absolute: bool,
+    },
+}
+
+/// What one job's carriers said about option packets. Weaver applies no
+/// option packet, so this exists to be reported, never to change a plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::pipeline) struct OptionPacketTally {
+    /// Distinct link and permission packets that authenticated.
+    pub present: u64,
+    /// Distinct option packets File, Directory and Root packets point at.
+    pub referenced: u64,
+    /// Pointers naming an option packet nothing authenticated.
+    pub unresolved: u64,
+    /// Whether a Root declared the set's paths absolute.
+    pub absolute_paths: bool,
+}
+
+impl OptionPacketTally {
+    /// Whether there is anything worth saying about this job's options.
+    pub fn is_silent(&self) -> bool {
+        self.present == 0 && self.referenced == 0 && !self.absolute_paths
+    }
+}
+
+impl std::fmt::Display for OptionPacketTally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} option packet(s) ignored, {} referenced, {} reference(s) unresolved",
+            self.present, self.referenced, self.unresolved
+        )?;
+        if self.absolute_paths {
+            f.write_str(", set declares absolute paths")?;
+        }
+        Ok(())
+    }
+}
+
+/// The most option-packet identities one job retains. Past this the counts
+/// still rise; only the identities stop being remembered, so a set with a
+/// hostile number of options cannot grow this map without bound.
+const MAX_OPTION_HASHES: usize = 4096;
+
+impl PacketNote {
+    /// Read what one authenticated packet says about option packets.
+    ///
+    /// A File packet's body cannot be parsed without its set's block size, so
+    /// the scanner retains it verbatim. `block_size` is what this job has
+    /// learned from that set's Start packet, and is `None` until the Start
+    /// packet authenticates: a File packet that arrives ahead of its own Start
+    /// contributes no reference, which under-reports option pointers and never
+    /// over-reports them.
+    fn of(packet: &par3_rs::packet::Packet, block_size: Option<u64>) -> Self {
+        use par3_rs::packet::{PacketBody, PacketType, file::FilePacket};
+        match packet.body() {
+            PacketBody::Opaque {
+                packet_type:
+                    PacketType::Link | PacketType::UnixPermissions | PacketType::FatPermissions,
+                ..
+            } => Self::Option(packet.hash()),
+            PacketBody::Opaque {
+                packet_type: PacketType::File,
+                body,
+            } => block_size
+                .and_then(|block_size| FilePacket::parse(body, block_size).ok())
+                .filter(|file| !file.option_hashes.is_empty())
+                .map_or(Self::Nothing, |file| Self::References {
+                    hashes: file.option_hashes,
+                    absolute: false,
+                }),
+            PacketBody::File(file) if !file.option_hashes.is_empty() => Self::References {
+                hashes: file.option_hashes.clone(),
+                absolute: false,
+            },
+            PacketBody::Directory(directory) if !directory.option_hashes.is_empty() => {
+                Self::References {
+                    hashes: directory.option_hashes.clone(),
+                    absolute: false,
+                }
+            }
+            PacketBody::Root(root) if !root.option_hashes.is_empty() || root.is_absolute_path() => {
+                Self::References {
+                    hashes: root.option_hashes.clone(),
+                    absolute: root.is_absolute_path(),
+                }
+            }
+            _ => Self::Nothing,
+        }
+    }
+
+    fn apply(
+        self,
+        options: &mut std::collections::BTreeSet<par3_rs::Fingerprint>,
+        referenced: &mut std::collections::BTreeSet<par3_rs::Fingerprint>,
+        absolute: &mut bool,
+    ) {
+        match self {
+            Self::Nothing => {}
+            Self::Option(hash) => {
+                if options.len() < MAX_OPTION_HASHES {
+                    options.insert(hash);
+                }
+            }
+            Self::References {
+                hashes,
+                absolute: declared,
+            } => {
+                *absolute |= declared;
+                for hash in hashes {
+                    if referenced.len() >= MAX_OPTION_HASHES {
+                        break;
+                    }
+                    referenced.insert(hash);
+                }
+            }
+        }
+    }
 }
 
 impl Default for Par3Job {
@@ -98,6 +241,10 @@ impl Default for Par3Job {
             packets_authenticated: 0,
             packets_rejected: 0,
             ranges_unavailable: 0,
+            option_packets: std::collections::BTreeSet::new(),
+            referenced_options: std::collections::BTreeSet::new(),
+            absolute_paths: false,
+            set_block_sizes: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -460,6 +607,7 @@ impl Par3Job {
                     revision: 0,
                     needed: None,
                     resume: None,
+                    scan: carriers::CarrierScan::default(),
                 },
             );
         }
@@ -486,6 +634,9 @@ impl Par3Job {
             match carrier.scanner.poll()? {
                 ScanEvent::Packet(packet) => {
                     let id = packet.input_set_id();
+                    let kind = carriers::Par3PacketKind::of(&packet);
+                    let origin = packet.origin();
+
                     if !self.sets.contains_key(&id) {
                         if self.sets.len() >= MAX_SETS {
                             return Err(EngineError::ResourceLimit("job PAR3 set count"));
@@ -499,11 +650,43 @@ impl Par3Job {
                             )?,
                         );
                     }
+                    // A Start packet is what makes every File packet of its
+                    // own set readable, so remember its block size before the
+                    // packet moves into the set.
+                    if let Some(metadata) = packet.metadata()
+                        && let par3_rs::packet::PacketBody::Start(start) = metadata.body()
+                    {
+                        self.set_block_sizes.insert(id, start.block_size);
+                    }
+                    let note = packet.metadata().map_or(PacketNote::Nothing, |metadata| {
+                        PacketNote::of(metadata, self.set_block_sizes.get(&id).copied())
+                    });
+                    // A set that will not admit an authenticated packet has
+                    // said something about that packet, not about the rest of
+                    // the carrier. Record the refusal and keep scanning, so
+                    // one refused copy cannot cost every packet behind it. An
+                    // exhausted budget is different: it is about the job, and
+                    // scanning further would only deepen it.
                     match self.sets.get_mut(&id).expect("inserted set").merge(packet) {
-                        Ok(()) => self.packets_authenticated += 1,
+                        Ok(()) => {
+                            carrier.scan.note_packet(kind, origin.offset, origin.length);
+                            note.apply(
+                                &mut self.option_packets,
+                                &mut self.referenced_options,
+                                &mut self.absolute_paths,
+                            );
+                            self.packets_authenticated += 1;
+                        }
+                        Err(error) if is_admission_exhausted(&error) => return Err(error),
                         Err(error) => {
+                            carrier.scan.note_rejected(origin.offset, origin.length);
                             self.packets_rejected += 1;
-                            return Err(error);
+                            tracing::debug!(
+                                source = source.0,
+                                offset = origin.offset,
+                                error = %error,
+                                "PAR3 set refused an authenticated packet"
+                            );
                         }
                     }
                 }
@@ -518,6 +701,7 @@ impl Par3Job {
                         carrier.resume =
                             Some(carrier.resume.map_or(position, |old| old.min(position)));
                         carrier.scanner.seek(next.start)?;
+                        carrier.scan.note_unavailable(next.start);
                         self.ranges_unavailable += 1;
                         continue;
                     }
@@ -525,12 +709,77 @@ impl Par3Job {
                     return Ok(());
                 }
                 ScanEvent::End => {
+                    carrier.scan.note_end(carrier.published.len);
                     carrier.revision = revision;
                     return Ok(());
                 }
             }
         }
     }
+
+    /// Every carrier that reported damage, newest scan state, bounded so one
+    /// summary can never grow with the carrier count.
+    fn damage_report(&self) -> Vec<carriers::CarrierDamage> {
+        const SHOWN: usize = 8;
+        self.carriers
+            .iter()
+            .filter(|(_, carrier)| carrier.scan.is_damaged())
+            .take(SHOWN)
+            .map(|(&source, carrier)| carriers::CarrierDamage {
+                source,
+                first_damage_offset: carrier.scan.first_damage_offset.unwrap_or_default(),
+                damaged_bytes: carrier.scan.damaged_bytes,
+                rejected: carrier.scan.rejected,
+                unavailable_ranges: carrier.scan.unavailable_ranges,
+            })
+            .collect()
+    }
+
+    /// Authenticated packets of each family across every carrier of this job.
+    fn authenticated_families(&self) -> [u64; carriers::Par3PacketKind::COUNT] {
+        let mut totals = [0u64; carriers::Par3PacketKind::COUNT];
+        for carrier in self.carriers.values() {
+            for (total, count) in totals.iter_mut().zip(carrier.scan.authenticated) {
+                *total = (*total).saturating_add(count);
+            }
+        }
+        totals
+    }
+
+    /// What this job's carriers said about option packets: how many distinct
+    /// option packets authenticated, how many distinct option packets the
+    /// metadata points at, and how many of those pointers name nothing that
+    /// authenticated.
+    fn option_packet_tally(&self) -> OptionPacketTally {
+        OptionPacketTally {
+            present: self.option_packets.len() as u64,
+            referenced: self.referenced_options.len() as u64,
+            unresolved: self
+                .referenced_options
+                .difference(&self.option_packets)
+                .count() as u64,
+            absolute_paths: self.absolute_paths,
+        }
+    }
+
+    /// Readable carrier bytes across this job that produced no authenticated
+    /// packet.
+    fn damaged_bytes(&self) -> u64 {
+        self.carriers.values().fold(0u64, |bytes, carrier| {
+            bytes.saturating_add(carrier.scan.damaged_bytes)
+        })
+    }
+}
+
+/// Whether an engine refusal is about the job's exhausted budget rather than
+/// about the one packet it was handed.
+fn is_admission_exhausted(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::ResourceLimit(_)
+            | EngineError::Cancelled
+            | EngineError::OutputInterrupted { .. }
+    )
 }
 
 impl Pipeline {
@@ -1123,6 +1372,7 @@ mod acquisition;
 mod assessment;
 mod bindings;
 mod budget;
+pub(in crate::pipeline) mod carriers;
 pub(in crate::pipeline) mod cohorts;
 mod completion;
 mod coordination;
@@ -1133,6 +1383,7 @@ mod identity;
 pub(in crate::pipeline) mod inside;
 pub(in crate::pipeline) mod outcome;
 mod outputs;
+pub(in crate::pipeline) mod paths;
 mod placement;
 mod readback;
 pub(in crate::pipeline) mod virtual_source;

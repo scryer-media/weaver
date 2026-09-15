@@ -245,10 +245,12 @@ pub enum Par3OutcomeClass {
     WaitingForMemory,
     DoesNotFit,
     CarrierDamage,
+    UnsafePath,
+    NoOutputSpace,
 }
 
 impl Par3OutcomeClass {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 10;
 
     pub const ALL: [Self; Self::COUNT] = [
         Self::Unrecoverable,
@@ -259,6 +261,8 @@ impl Par3OutcomeClass {
         Self::WaitingForMemory,
         Self::DoesNotFit,
         Self::CarrierDamage,
+        Self::UnsafePath,
+        Self::NoOutputSpace,
     ];
 
     pub const fn index(self) -> usize {
@@ -271,6 +275,8 @@ impl Par3OutcomeClass {
             Self::WaitingForMemory => 5,
             Self::DoesNotFit => 6,
             Self::CarrierDamage => 7,
+            Self::UnsafePath => 8,
+            Self::NoOutputSpace => 9,
         }
     }
 
@@ -284,6 +290,8 @@ impl Par3OutcomeClass {
             Self::WaitingForMemory => "waiting_for_memory",
             Self::DoesNotFit => "does_not_fit",
             Self::CarrierDamage => "carrier_damage",
+            Self::UnsafePath => "unsafe_path",
+            Self::NoOutputSpace => "no_output_space",
         }
     }
 }
@@ -390,6 +398,7 @@ pub struct Par3Metrics {
     pub packets_authenticated_total: AtomicU64,
     pub packets_rejected_total: AtomicU64,
     pub carrier_ranges_unavailable_total: AtomicU64,
+    pub carrier_damaged_bytes_total: AtomicU64,
 
     // ---- stalls ----------------------------------------------------------
     slots: [Par3Slot; PAR3_SLOTS],
@@ -598,6 +607,7 @@ impl Par3Metrics {
             packets_authenticated_total: load(&self.packets_authenticated_total),
             packets_rejected_total: load(&self.packets_rejected_total),
             carrier_ranges_unavailable_total: load(&self.carrier_ranges_unavailable_total),
+            carrier_damaged_bytes_total: load(&self.carrier_damaged_bytes_total),
             slots,
             stalls_total: load(&self.stalls_total),
             stall_duration_ms: load(&self.stall_duration_ms),
@@ -678,6 +688,7 @@ pub struct Par3MetricsSnapshot {
     pub packets_authenticated_total: u64,
     pub packets_rejected_total: u64,
     pub carrier_ranges_unavailable_total: u64,
+    pub carrier_damaged_bytes_total: u64,
     pub slots: [Par3SlotSnapshot; PAR3_SLOTS],
     pub stalls_total: u64,
     pub stall_duration_ms: u64,

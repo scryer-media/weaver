@@ -31,6 +31,7 @@ struct EngineCounters {
     packets_authenticated: u64,
     packets_rejected: u64,
     ranges_unavailable: u64,
+    damaged_bytes: u64,
 }
 
 /// The engine stage each tracked class maps to.
@@ -98,6 +99,7 @@ impl EngineCounters {
             packets_authenticated: runtime.packets_authenticated,
             packets_rejected: runtime.packets_rejected,
             ranges_unavailable: runtime.ranges_unavailable,
+            damaged_bytes: runtime.damaged_bytes(),
             ..Self::default()
         };
         for (tracked, stage) in TRACKED_STAGES {
@@ -186,6 +188,10 @@ impl EngineCounters {
             &par3.carrier_ranges_unavailable_total,
             self.ranges_unavailable
                 .saturating_sub(before.ranges_unavailable),
+        );
+        add(
+            &par3.carrier_damaged_bytes_total,
+            self.damaged_bytes.saturating_sub(before.damaged_bytes),
         );
         par3.reserved_bytes.store(self.reserved_bytes, Relaxed);
         par3.retained_bytes.store(self.retained_bytes, Relaxed);
@@ -413,6 +419,12 @@ struct JobSlot {
     /// Cohorts with losses named by the assessment the in-flight repair was
     /// dispatched against, credited only once that repair comes back whole.
     repair_cohorts: u64,
+    /// Whether this job has already said its carriers were damaged. The
+    /// summary is a job-level fact, not a per-handback one.
+    damage_reported: bool,
+    /// Whether this job has already reported the option packets its set
+    /// carries that weaver does not apply.
+    options_reported: bool,
 }
 
 impl Default for JobSlot {
@@ -444,6 +456,8 @@ impl Default for JobSlot {
             waiting_for_memory_since: None,
             last_outcome: None,
             repair_cohorts: 0,
+            damage_reported: false,
+            options_reported: false,
         }
     }
 }
@@ -599,6 +613,54 @@ impl Coordinator {
                     .filter(|carrier| carrier.needed.is_some())
                     .count() as u64
             })
+    }
+
+    /// The vital packet family no carrier of this job produced a single
+    /// authenticated copy of, if there is one. A set cannot be planned without
+    /// a Start, a matrix and a Root, and a family with a zero count is a
+    /// different complaint from a set that is merely still arriving.
+    pub(in crate::pipeline) fn missing_vital_packet(
+        &self,
+        job_id: JobId,
+    ) -> Option<super::carriers::Par3PacketKind> {
+        let families = self
+            .jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())?
+            .authenticated_families();
+        super::carriers::Par3PacketKind::VITAL
+            .into_iter()
+            .find(|kind| families[kind.index()] == 0)
+    }
+
+    /// What this job's carriers have found damaged so far.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn carrier_damage(
+        &self,
+        job_id: JobId,
+    ) -> Vec<super::carriers::CarrierDamage> {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())
+            .map(super::Par3Job::damage_report)
+            .unwrap_or_default()
+    }
+
+    /// This job's option-packet tally, the first time it is asked for.
+    ///
+    /// Options are reported, never applied, so one line per job is the whole
+    /// obligation; later calls return nothing so a repeated completion check
+    /// cannot repeat the line.
+    pub(in crate::pipeline) fn take_option_packet_report(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<super::OptionPacketTally> {
+        let job = self.jobs.get_mut(&job_id)?;
+        let tally = job.runtime.as_ref()?.option_packet_tally();
+        if tally.is_silent() || std::mem::replace(&mut job.options_reported, true) {
+            return None;
+        }
+        Some(tally)
     }
 
     /// Whether another job currently owns a PAR3 work unit, and with it the
@@ -1959,22 +2021,30 @@ impl Coordinator {
                 }
             }
             counters.apply(job.engine_baseline, &self.metrics);
-            let damage = (
-                counters
-                    .packets_rejected
-                    .saturating_sub(job.engine_baseline.packets_rejected),
-                counters
-                    .ranges_unavailable
-                    .saturating_sub(job.engine_baseline.ranges_unavailable),
-            );
+            let rejected_packets = counters
+                .packets_rejected
+                .saturating_sub(job.engine_baseline.packets_rejected);
+            let unavailable_ranges = counters
+                .ranges_unavailable
+                .saturating_sub(job.engine_baseline.ranges_unavailable);
+            let damaged_bytes = counters
+                .damaged_bytes
+                .saturating_sub(job.engine_baseline.damaged_bytes);
             job.engine_baseline = counters;
-            if damage != (0, 0) {
+            if (rejected_packets, unavailable_ranges, damaged_bytes) != (0, 0, 0) {
                 // Informational: it never fails the job on its own, but it is
                 // the last verdict the job reached and worth reporting.
                 let damage = outcome::Par3Outcome::CarrierDamage {
-                    rejected_packets: damage.0,
-                    unavailable_ranges: damage.1,
+                    carriers: runtime.damage_report(),
+                    rejected_packets,
+                    unavailable_ranges,
+                    damaged_bytes,
                 };
+                // One line per job, not one per handback: a job that keeps
+                // scanning a damaged carrier says this once.
+                if !std::mem::replace(&mut job.damage_reported, true) {
+                    tracing::warn!(job_id = done.job_id.0, summary = %damage, "PAR3 carrier damage");
+                }
                 if job.last_outcome.as_ref() != Some(&damage) {
                     par3.note_outcome(damage.class());
                     job.last_outcome = Some(damage);

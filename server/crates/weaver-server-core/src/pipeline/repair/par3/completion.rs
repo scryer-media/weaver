@@ -203,6 +203,14 @@ impl Pipeline {
             return false;
         }
         if let Some(error) = runtime.error(job_id) {
+            // A set whose metadata outgrows an engine ceiling stops at that
+            // ceiling by name. Report the limit as a typed verdict rather than
+            // as an engine string, so the class is countable and the check
+            // always terminates on the same answer.
+            if let Some(limit) = outcome::execution_limit(error) {
+                self.settle_par3_outcome(job_id, outcome::Par3Outcome::NotExecutable { limit });
+                return true;
+            }
             self.fail_job(job_id, format!("PAR3 assessment failed: {error}"));
             return true;
         }
@@ -290,6 +298,35 @@ impl Pipeline {
         match status {
             RepairStatus::Complete => false,
             RepairStatus::Ready => {
+                // Everything below writes: the direct-unpack preparation, the
+                // output reservations and then the repair itself. Both set
+                // defects that make a plan unexecutable are decided here,
+                // before the first output byte exists.
+                if let Some((path, reason)) = self.par3_unsafe_output_path(job_id, set) {
+                    self.settle_par3_outcome(
+                        job_id,
+                        outcome::Par3Outcome::UnsafePath { path, reason },
+                    );
+                    return true;
+                }
+                if let Some(shortfall) = self.par3_output_space_shortfall(job_id, set).await {
+                    self.settle_par3_outcome(job_id, shortfall);
+                    return true;
+                }
+                if let Some(options) = self
+                    .par3_runtime
+                    .as_mut()
+                    .expect("admitted job")
+                    .take_option_packet_report(job_id)
+                {
+                    // Links and permissions are metadata weaver does not
+                    // install. Say so once, and install the file bytes.
+                    tracing::warn!(
+                        job_id = job_id.0,
+                        options = %options,
+                        "PAR3 set carries option packets weaver does not apply"
+                    );
+                }
                 self.prepare_direct_unpack_for_par3_repair(job_id);
                 if self.job_has_active_extraction_tasks(job_id) {
                     return true;

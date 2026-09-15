@@ -137,6 +137,7 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         recovery_queue_depth: 0,
         articles_per_sec: 3.0,
         decode_rate_mbps: 1.5,
+        par3: Default::default(),
     }
 }
 
