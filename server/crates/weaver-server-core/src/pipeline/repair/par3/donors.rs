@@ -7,11 +7,6 @@ use par3_rs::session::RepairStatus;
 use std::ops::Range;
 
 const READ_LIMIT: u64 = 1 << 30;
-/// Wall time one extent may spend looking for a donor. The byte limit above is
-/// cumulative for the whole job; this one is per extent, so a single pathological
-/// extent cannot hold the worker while other extents still have candidates. It
-/// is checked between placement calls only — no timer is handed to the engine.
-const EXTENT_SEARCH_TIME: std::time::Duration = std::time::Duration::from_millis(100);
 type Key = (par3_rs::Fingerprint, usize, SourceId);
 
 struct Attempt {
@@ -25,9 +20,7 @@ struct Attempt {
 #[derive(Default)]
 pub(super) struct Cache {
     attempts: BTreeMap<Key, Attempt>,
-    pub(super) read_bytes: u64,
-    /// Extents abandoned because they reached [`EXTENT_SEARCH_TIME`].
-    pub(super) time_cap_hits: u64,
+    read_bytes: u64,
     pub exhaustive: bool,
     pub exhausted: bool,
 }
@@ -171,38 +164,8 @@ fn search_pass(
             }) {
                 continue;
             }
-            let extent_started = std::time::Instant::now();
             for &(source, snapshot, revision) in candidates {
                 options.cancel.check()?;
-                if extent_started.elapsed() >= EXTENT_SEARCH_TIME {
-                    // This extent has had its share of the worker. Retire it
-                    // for every candidate already in the cache at this
-                    // generation, exactly as a negative search would, so the
-                    // remaining extents still get their own attempts. New
-                    // coverage still reopens it through the revision check.
-                    cache.time_cap_hits = cache.time_cap_hits.saturating_add(1);
-                    let flag = if sliding { 2 } else { 1 };
-                    for &(candidate, snapshot, revision) in candidates {
-                        if let Some(attempt) = cache
-                            .attempts
-                            .get_mut(&(layout.identity(), file_index, candidate))
-                            .filter(|attempt| {
-                                attempt.snapshot == snapshot && attempt.revision == revision
-                            })
-                        {
-                            attempt.checked[extent_index] |= flag;
-                        }
-                    }
-                    tracing::debug!(
-                        stage = "donor_search",
-                        sliding,
-                        file = file_index,
-                        extent = extent_index,
-                        cap_ms = EXTENT_SEARCH_TIME.as_millis() as u64,
-                        "PAR3 donor search reached its per-extent time cap"
-                    );
-                    break;
-                }
                 if !sliding && state.source == Some(source) {
                     continue;
                 }

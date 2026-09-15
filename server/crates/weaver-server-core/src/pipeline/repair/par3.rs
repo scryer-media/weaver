@@ -74,11 +74,6 @@ pub(in crate::pipeline) struct Par3Job {
     donor_search: donors::Cache,
     publication_memory: BTreeMap<SourceId, assessment::ViewReservation>,
     virtual_readers: Arc<virtual_source::ReaderCache>,
-    /// Carrier-scan tallies. Plain integers advanced by the scan loop and
-    /// folded into the process metrics once, at the work unit's handback.
-    packets_authenticated: u64,
-    packets_rejected: u64,
-    ranges_unavailable: u64,
 }
 
 impl Default for Par3Job {
@@ -95,9 +90,6 @@ impl Default for Par3Job {
             donor_search: donors::Cache::default(),
             publication_memory: BTreeMap::new(),
             virtual_readers: Arc::default(),
-            packets_authenticated: 0,
-            packets_rejected: 0,
-            ranges_unavailable: 0,
         }
     }
 }
@@ -499,13 +491,10 @@ impl Par3Job {
                             )?,
                         );
                     }
-                    match self.sets.get_mut(&id).expect("inserted set").merge(packet) {
-                        Ok(()) => self.packets_authenticated += 1,
-                        Err(error) => {
-                            self.packets_rejected += 1;
-                            return Err(error);
-                        }
-                    }
+                    self.sets
+                        .get_mut(&id)
+                        .expect("inserted set")
+                        .merge(packet)?;
                 }
                 ScanEvent::NeedData { offset } => {
                     carrier.needed = Some(carrier.needed.map_or(offset, |old| old.min(offset)));
@@ -518,7 +507,6 @@ impl Par3Job {
                         carrier.resume =
                             Some(carrier.resume.map_or(position, |old| old.min(position)));
                         carrier.scanner.seek(next.start)?;
-                        self.ranges_unavailable += 1;
                         continue;
                     }
                     carrier.revision = revision;
@@ -608,10 +596,7 @@ impl Pipeline {
             return;
         }
         self.par3_runtime.get_or_insert_with(|| {
-            Box::new(work::Coordinator::new(
-                self.repair_work_done_tx.clone(),
-                Arc::clone(&self.metrics),
-            ))
+            Box::new(work::Coordinator::new(self.repair_work_done_tx.clone()))
         });
         if let Err(error) = self.enqueue_par3_file_with_inside(job_id, file_id, embedded) {
             self.fail_job(job_id, format!("PAR3 discovery failed: {error}"));
@@ -1104,18 +1089,6 @@ impl Pipeline {
         if let (Some(job_id), Some(result)) = (job_id, readback) {
             self.apply_par3_readback(job_id, result).await;
         }
-        // This handback released a share of the PAR3 budget, so every job
-        // parked on memory gets another completion check — not only the job
-        // that handed back. Without this a parked job would wait forever for
-        // a check that nothing else schedules.
-        let parked = self
-            .par3_runtime
-            .as_ref()
-            .map(|coordinator| coordinator.jobs_awaiting_memory())
-            .unwrap_or_default();
-        for job_id in parked {
-            self.schedule_job_completion_check(job_id);
-        }
     }
 }
 
@@ -1123,7 +1096,6 @@ mod acquisition;
 mod assessment;
 mod bindings;
 mod budget;
-pub(in crate::pipeline) mod cohorts;
 mod completion;
 mod coordination;
 #[cfg(windows)]
@@ -1131,7 +1103,6 @@ mod disk_windows;
 mod donors;
 mod identity;
 pub(in crate::pipeline) mod inside;
-pub(in crate::pipeline) mod outcome;
 mod outputs;
 mod placement;
 mod readback;

@@ -17,11 +17,6 @@ impl ViewReservation {
                 _reservation: reservation,
             })
     }
-
-    /// Retained host bytes this lease charges, for the queue-depth gauge.
-    pub fn bytes(&self) -> usize {
-        self._reservation.bytes()
-    }
 }
 
 pub(in crate::pipeline) struct AssessmentView {

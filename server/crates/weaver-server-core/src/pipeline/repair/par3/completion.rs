@@ -29,13 +29,9 @@ impl Pipeline {
             })
         });
         let Some(index) = index else {
-            // No direct set backs this source, so there is no disk image to
-            // fall back to at any budget. Waiting cannot change that.
-            self.settle_par3_outcome(
+            self.fail_job(
                 job_id,
-                outcome::Par3Outcome::NotExecutable {
-                    limit: "the refused source has no disk fallback",
-                },
+                "PAR3 memory admission failed: source has no disk fallback".into(),
             );
             return true;
         };
@@ -48,16 +44,6 @@ impl Pipeline {
             .collect();
         let required = set.plan().volumes.keys().try_fold(0u64, |bytes, volume| {
             bytes.checked_add(set.virtual_volume_len(*volume, 0))
-        });
-        // What the refused image alone asks for. The sum above is what the
-        // fallback needs; this is the floor to report when that sum cannot be
-        // taken, so a refusal never claims it needed nothing.
-        let refused_bytes = u32::try_from(source.0).ok().and_then(|file| {
-            set.plan()
-                .volumes
-                .iter()
-                .find(|(_, index)| **index == file)
-                .map(|(volume, _)| set.virtual_volume_len(*volume, 0))
         });
         let path = self.jobs[&job_id].working_dir.clone();
         let reserve = self.direct_store.settings().holds_disk_reserve_bytes;
@@ -74,35 +60,8 @@ impl Pipeline {
             _ => false,
         };
         if !admitted {
-            self.metrics.par3.note_admission_refused(
-                crate::operations::metrics::Par3AdmissionReason::DiskFallbackSpace,
-            );
-            // The peer work unit's handback can still free the native memory
-            // this image was refused for, so that refusal is a wait. Nothing
-            // frees disk in the meantime: with no peer in flight the verdict
-            // is terminal and names the budget that actually refused it.
-            let peer = self
-                .par3_runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.peer_holds_par3_memory(job_id));
-            if peer {
-                self.refuse_par3_memory(job_id, source, required.or(refused_bytes).unwrap_or(0));
-            } else {
-                self.settle_par3_outcome(
-                    job_id,
-                    outcome::Par3Outcome::NotExecutable {
-                        limit: "the disk fallback has no room for the refused source",
-                    },
-                );
-            }
+            self.fail_job(job_id, "PAR3 memory admission failed and disk fallback has insufficient or unavailable free space".into());
             return true;
-        }
-        self.metrics
-            .par3
-            .spills_to_disk_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(runtime) = self.par3_runtime.as_mut() {
-            runtime.resume_from_memory(job_id);
         }
         tracing::info!(
             job_id = job_id.0,
@@ -162,10 +121,7 @@ impl Pipeline {
             // A completely unavailable index never emits a decode event. Its
             // remaining carriers still deserve bounded metadata discovery.
             let runtime = self.par3_runtime.get_or_insert_with(|| {
-                Box::new(work::Coordinator::new(
-                    self.repair_work_done_tx.clone(),
-                    Arc::clone(&self.metrics),
-                ))
+                Box::new(work::Coordinator::new(self.repair_work_done_tx.clone()))
             });
             if let Err(error) = runtime
                 .admit(job_id)
@@ -274,10 +230,9 @@ impl Pipeline {
                 if self.promote_par3_recovery(job_id) {
                     return true;
                 }
-                let missing = self.par3_missing_metadata(job_id);
-                self.settle_par3_outcome(
+                self.fail_job(
                     job_id,
-                    outcome::Par3Outcome::MetadataIncomplete { missing },
+                    "PAR3 carriers contain no complete authenticated set".into(),
                 );
                 return true;
             }
@@ -317,11 +272,6 @@ impl Pipeline {
                     return true;
                 }
                 let output = self.jobs[&job_id].working_dir.clone();
-                // Low-frequency: once per dispatched repair, never per block.
-                self.note_stage_started(
-                    job_id,
-                    crate::operations::instrumentation::JobStageKind::Repair,
-                );
                 if let Err(error) = self
                     .par3_runtime
                     .as_mut()
@@ -335,19 +285,7 @@ impl Pipeline {
             }
             RepairStatus::IncompleteMetadata | RepairStatus::NeedRecovery => {
                 if !self.promote_par3_recovery(job_id) {
-                    // Donor search finds *source* blocks, which lower a
-                    // cohort's `lost`; it never manufactures a recovery index.
-                    // Running it is only worth a worker while some cohort that
-                    // has outrun its own recovery span still has losses left
-                    // to cover.
-                    let spent = self.par3_cohort_plan(job_id).exhausted();
-                    let donors_could_close = !self
-                        .par3_runtime
-                        .as_ref()
-                        .expect("admitted job")
-                        .donor_search_exhausted(job_id)
-                        && (spent.is_empty() || spent.iter().any(|cohort| cohort.lost != 0));
-                    if status == RepairStatus::NeedRecovery && donors_could_close {
+                    if status == RepairStatus::NeedRecovery {
                         match self
                             .par3_runtime
                             .as_mut()
@@ -365,34 +303,26 @@ impl Pipeline {
                             }
                         }
                     }
-                    let outcome = if status == RepairStatus::IncompleteMetadata {
-                        outcome::Par3Outcome::MetadataIncomplete {
-                            missing: self.par3_missing_metadata(job_id),
-                        }
+                    let reason = if status == RepairStatus::IncompleteMetadata {
+                        "authenticated metadata remains incomplete"
+                    } else if self
+                        .par3_runtime
+                        .as_ref()
+                        .expect("admitted job")
+                        .donor_search_exhausted(job_id)
+                    {
+                        "compatible recovery remains insufficient; bounded donor search exhausted"
                     } else {
-                        // Name the cohorts whose own admissible span is spent
-                        // when there are any; otherwise every deficient cohort
-                        // is equally responsible for the verdict.
-                        let plan = self.par3_cohort_plan(job_id);
-                        let exhausted = plan.exhausted();
-                        outcome::Par3Outcome::Unrecoverable {
-                            cohorts: if exhausted.is_empty() {
-                                plan.deficits()
-                            } else {
-                                exhausted
-                            },
-                        }
+                        "compatible recovery remains insufficient for one or more cohorts"
                     };
-                    self.settle_par3_outcome(job_id, outcome);
+                    self.fail_job(job_id, format!("PAR3 recovery exhausted: {reason}"));
                 }
                 true
             }
             RepairStatus::Unsupported => {
-                self.settle_par3_outcome(
+                self.fail_job(
                     job_id,
-                    outcome::Par3Outcome::Unsupported {
-                        detail: "the engine does not execute this matrix kind",
-                    },
+                    "PAR3 set requires an unsupported repair geometry".into(),
                 );
                 true
             }
@@ -457,13 +387,6 @@ impl Pipeline {
         if !self.jobs.contains_key(&job_id) {
             return;
         }
-        // Low-frequency: once per repair handback. Closes the timer armed when
-        // the repair was dispatched, so a PAR3 repair lands in the same stage
-        // histogram a PAR2 repair does.
-        self.note_stage_finished(
-            job_id,
-            crate::operations::instrumentation::JobStageKind::Repair,
-        );
         let installed = match &result {
             Ok(report) => report.installed.as_slice(),
             Err(EngineError::RepairInterrupted { installed, .. }) => installed.as_slice(),
@@ -564,12 +487,6 @@ impl Pipeline {
                     Some("downloading"),
                 );
                 self.schedule_job_completion_check(job_id);
-            }
-            // An execution mode the engine recognizes but does not run is a
-            // verdict about the set, not an I/O failure of this attempt.
-            Err(EngineError::Unsupported(detail)) => {
-                self.fail_direct_unpack_after_repair(job_id, detail);
-                self.settle_par3_outcome(job_id, outcome::Par3Outcome::Unsupported { detail });
             }
             Err(error) => {
                 self.fail_direct_unpack_after_repair(job_id, &error.to_string());

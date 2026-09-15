@@ -1,6 +1,5 @@
 use super::*;
 
-use crate::operations::metrics::Par3MetricsSnapshot;
 use crate::{DownloadState, JobId, PostState, RunState};
 
 fn upsert_raw_point_for_test(db: &Database, point: RawMetricsHistoryPoint) {
@@ -186,7 +185,6 @@ fn sample_snapshot(
         recovery_queue_depth: 0,
         articles_per_sec,
         decode_rate_mbps,
-        par3: Par3MetricsSnapshot::default(),
     }
 }
 

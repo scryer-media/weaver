@@ -407,12 +407,6 @@ impl Pipeline {
             return;
         }
         if let Err(error) = self.place_par3_readback(job_id, done).await {
-            // A window that cannot be placed is a readback that did not match
-            // what the router expected of it.
-            self.metrics
-                .par3
-                .readback_mismatch_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Verified native images remain available. Reconstructing this
             // partially rewritten router could overwrite those good images.
             self.fail_direct_unpack_after_repair(job_id, &error);
