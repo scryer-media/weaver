@@ -1068,3 +1068,58 @@ async fn terminal_claims_require_current_bound_source_evidence() {
     coordinator.forget(JobId(1));
     assert!(!coordinator.verified_file(JobId(1), SourceId(2)));
 }
+
+#[tokio::test]
+async fn in_flight_release_waits_for_the_session_a_worker_holds() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    let mut coordinator = Coordinator::default();
+    let id = JobId(1);
+    coordinator.enqueue(id, SourceId(0), path.clone()).unwrap();
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    let (set, matrix) = {
+        let (set, view) = coordinator.assessments(id).next().unwrap();
+        let matrix = view
+            .requirements
+            .first()
+            .map(|need| need.matrix)
+            .unwrap_or_default();
+        (set, matrix)
+    };
+    coordinator
+        .begin_recovery_batch(id, Vec::new(), false)
+        .unwrap();
+    coordinator
+        .jobs
+        .get_mut(&id)
+        .unwrap()
+        .acquisition
+        .batch
+        .as_mut()
+        .unwrap()
+        .declared = vec![(set, matrix, vec![5, 6])];
+    // A second carrier takes the session out to a worker; the window drains
+    // while it is away.
+    coordinator.enqueue(id, SourceId(1), path).unwrap();
+    coordinator.dispatch().unwrap();
+    assert!(coordinator.jobs[&id].runtime.is_none());
+    coordinator.forget_recovery_in_flight(id);
+    let job = &coordinator.jobs[&id];
+    assert_eq!(job.acquisition.deferred_release.len(), 1);
+    assert!(
+        job.acquisition.batch.as_ref().unwrap().declared.is_empty(),
+        "the window keeps nothing it has already handed over"
+    );
+    assert!(!job.pending.contains_key(&WorkKey::Assess));
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    let job = &coordinator.jobs[&id];
+    assert!(job.acquisition.deferred_release.is_empty());
+    assert!(
+        job.pending.contains_key(&WorkKey::Assess),
+        "the handback that applies the release must be followed by a reassessment"
+    );
+    assert!(coordinator.has_work(id));
+}
