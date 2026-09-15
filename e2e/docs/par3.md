@@ -23,7 +23,8 @@ WEAVER_PAR3_E2E_BIN="$(cd .. && pwd)/target/debug/weaver" \
   go test -mod=readonly ./internal/weaver -run '^TestPar3E2E$' -count=1 -v -timeout 8m
 ```
 
-The checked-in carriers under `internal/weaver/testdata/par3-native` come from
+The checked-in carriers under
+`server/crates/weaver-server-core/tests/fixtures/par3-native` come from
 the pinned official reference. Their provenance, command transcript and SHA-256
 manifest accompany them. The protected input is regenerated in the test; only
 input bytes or article availability are damaged. No packet is assembled or edited.
