@@ -36,7 +36,7 @@ PAR3 support includes selective recovery downloads, virtual and renamed sources,
 Cauchy and low-rate FFT sets, deduplicated blocks, Data packets, and protection
 embedded in ZIP/ZIP64 and 7z. Weaver verifies, repairs and extracts existing sets;
 it does not create them. Embedded discovery runs only for jobs without PAR2;
-PAR2 takes priority in mixed jobs.
+PAR2 takes priority in mixed jobs. See the [native scenarios](e2e/docs/par3.md) for resource limits and validation.
 
 Instead of the traditional sequential approach (download everything, then repair, then extract), Weaver can run downloading and extraction concurrently*. Extraction begins as soon as the first archive volume finishes downloading, so files appear on disk while the rest of the job is still in progress.
 
@@ -53,9 +53,8 @@ Instead of the traditional sequential approach (download everything, then repair
 
 See [Installation](https://www.scryer.media/weaver/docs/installation/) for supported install methods and [Getting Started](https://www.scryer.media/weaver/docs/getting-started/) for first-run setup.
 
-See [Configuration](https://www.scryer.media/weaver/docs/installation/configuration/) and
-[Reverse proxy](https://www.scryer.media/weaver/docs/installation/reverse-proxy/) for
-environment overrides, setup codes, and trusted proxies.
+See [Network setup and browser access](docs/network-setup.md) for Compose defaults,
+one-time setup codes, environment overrides, trusted proxies, and legacy compatibility.
 
 ## API
 
