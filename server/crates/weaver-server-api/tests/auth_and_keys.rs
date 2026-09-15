@@ -106,6 +106,35 @@ async fn list_api_keys_hides_raw_key() {
 }
 
 #[tokio::test]
+async fn listed_api_key_reports_the_creation_time_in_epoch_ms() {
+    let h = TestHarness::new().await;
+
+    let resp = h
+        .execute(
+            r#"mutation {
+                createApiKey(name: "dated", scope: READ) {
+                    key { createdAt }
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let created = response_data(&resp)["createApiKey"]["key"]["createdAt"]
+        .as_f64()
+        .unwrap();
+
+    let resp = h.execute(r#"{ apiKeys { createdAt } }"#).await;
+    assert_no_errors(&resp);
+    let listed = response_data(&resp)["apiKeys"][0]["createdAt"].as_f64().unwrap();
+
+    // The key is stored in epoch milliseconds; the list must not scale it again.
+    assert!(
+        (listed - created).abs() < 60_000.0,
+        "listed {listed} vs created {created}"
+    );
+}
+
+#[tokio::test]
 async fn delete_api_key() {
     let h = TestHarness::new().await;
 
