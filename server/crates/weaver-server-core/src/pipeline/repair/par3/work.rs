@@ -1,7 +1,10 @@
 //! Retained ownership and bounded dispatch for PAR3 blocking work.
 
 use super::*;
-use crate::operations::metrics::{Par3Phase, Par3Stage, PipelineMetrics};
+use crate::operations::metrics::{
+    PAR3_MEMORY_CATEGORIES, Par3EngineNarrowing, Par3EngineRefusal, Par3Phase, Par3Stage,
+    PipelineMetrics,
+};
 use crate::pipeline::RepairWorkDone;
 use par3_rs::runtime::CancellationToken;
 use tokio::sync::mpsc;
@@ -31,8 +34,36 @@ struct EngineCounters {
     packets_authenticated: u64,
     packets_rejected: u64,
     ranges_unavailable: u64,
+    /// The engine's categorised ledger: current and peak reservations per
+    /// category. Absolute values, so these are published rather than folded.
+    ledger_bytes: [u64; PAR3_MEMORY_CATEGORIES],
+    ledger_peak_bytes: [u64; PAR3_MEMORY_CATEGORIES],
+    /// The widths the engine last admitted. Also absolute by the engine's own
+    /// definition: each field holds the most recent admission.
+    admitted: [u64; ADMITTED_WIDTHS],
+    /// Cumulative refusals by cause, narrowings by width, and the bytes a
+    /// bounded working set pushed onto the I/O layer. These fold in as deltas.
+    refusals: [u64; Par3EngineRefusal::COUNT],
+    narrowed: [u64; Par3EngineNarrowing::COUNT],
+    reread_bytes: u64,
+    reconstructed_bytes: u64,
+    /// What the engine's admission caches currently hold. Absolute.
+    cache_entries: u64,
+    cache_bytes: u64,
+    /// Transform and coefficient work the engine's codecs performed.
+    /// Cumulative, so these fold in as deltas.
+    codec: [u64; CODEC_COUNTERS],
+    /// Carrier bytes the scanner read and could not authenticate. Cumulative
+    /// per job, so this folds in as a delta.
     damaged_bytes: u64,
 }
+
+/// Admitted widths captured per handback, in the order the fields below are
+/// published. Fixed so the capture allocates nothing.
+const ADMITTED_WIDTHS: usize = 6;
+
+/// Codec work counters captured per handback, in the order they are published.
+const CODEC_COUNTERS: usize = 6;
 
 /// The engine stage each tracked class maps to.
 const TRACKED_STAGES: [(Par3Stage, par3_rs::runtime::Stage); Par3Stage::COUNT] = [
@@ -99,9 +130,63 @@ impl EngineCounters {
             packets_authenticated: runtime.packets_authenticated,
             packets_rejected: runtime.packets_rejected,
             ranges_unavailable: runtime.ranges_unavailable,
+            admitted: {
+                let admission = diagnostics.admission();
+                [
+                    admission.stripe_bytes,
+                    admission.stripe_buffers,
+                    admission.output_tile,
+                    admission.verify_batch,
+                    admission.workers,
+                    admission.window_bytes,
+                ]
+            },
+            refusals: {
+                let refusals = diagnostics.refusals();
+                [
+                    refusals.exceeds_limit,
+                    refusals.peer_contention,
+                    refusals.unmeasured,
+                ]
+            },
+            narrowed: {
+                let waits = diagnostics.waits();
+                [
+                    waits.stripe_narrowed,
+                    waits.workers_refused,
+                    waits.batch_narrowed,
+                ]
+            },
+            reread_bytes: diagnostics.amplification().reread_bytes,
+            reconstructed_bytes: diagnostics.amplification().reconstructed_bytes,
+            cache_entries: diagnostics.caches().entries,
+            cache_bytes: diagnostics.caches().bytes,
+            codec: {
+                let codec = diagnostics.codec();
+                [
+                    codec.transform_calls,
+                    codec.butterflies,
+                    codec.butterflies_skipped,
+                    codec.multiply_accumulates,
+                    codec.factors_computed,
+                    codec.factors_reused,
+                ]
+            },
             damaged_bytes: runtime.damaged_bytes(),
             ..Self::default()
         };
+        // The ledger is read straight off the budget these diagnostics were
+        // first used with; reading it allocates nothing and takes no lock.
+        if let Some(ledger) = diagnostics.memory() {
+            for (index, category) in par3_rs::runtime::MemoryCategory::ALL
+                .into_iter()
+                .enumerate()
+            {
+                let entry = ledger.category(category);
+                counters.ledger_bytes[index] = entry.current;
+                counters.ledger_peak_bytes[index] = entry.peak;
+            }
+        }
         for (tracked, stage) in TRACKED_STAGES {
             let snapshot = diagnostics.stage(stage);
             counters.stage_calls[tracked.index()] = snapshot.calls;
@@ -197,6 +282,50 @@ impl EngineCounters {
         par3.retained_bytes.store(self.retained_bytes, Relaxed);
         par3.reserved_peak_bytes
             .store(self.reserved_peak_bytes, Relaxed);
+        par3.store_ledger(self.ledger_bytes, self.ledger_peak_bytes);
+        for (field, value) in [
+            (&par3.engine_admitted_stripe_bytes, self.admitted[0]),
+            (&par3.engine_admitted_stripe_buffers, self.admitted[1]),
+            (&par3.engine_admitted_output_tile, self.admitted[2]),
+            (&par3.engine_admitted_verify_batch, self.admitted[3]),
+            (&par3.engine_admitted_workers, self.admitted[4]),
+            (&par3.engine_admitted_window_bytes, self.admitted[5]),
+        ] {
+            field.store(value, Relaxed);
+        }
+        par3.note_engine_refusals(std::array::from_fn(|index| {
+            self.refusals[index].saturating_sub(before.refusals[index])
+        }));
+        par3.note_engine_narrowed(std::array::from_fn(|index| {
+            self.narrowed[index].saturating_sub(before.narrowed[index])
+        }));
+        add(
+            &par3.engine_reread_bytes_total,
+            self.reread_bytes.saturating_sub(before.reread_bytes),
+        );
+        add(
+            &par3.engine_reconstructed_bytes_total,
+            self.reconstructed_bytes
+                .saturating_sub(before.reconstructed_bytes),
+        );
+        par3.engine_cache_entries.store(self.cache_entries, Relaxed);
+        par3.engine_cache_bytes.store(self.cache_bytes, Relaxed);
+        // The codec counts arrive cumulative for the session's whole life, so
+        // what this handback contributed is the difference against the
+        // baseline the same work unit was dispatched with.
+        for (index, field) in [
+            &par3.engine_codec_transform_calls_total,
+            &par3.engine_codec_butterflies_total,
+            &par3.engine_codec_butterflies_skipped_total,
+            &par3.engine_codec_multiply_accumulates_total,
+            &par3.engine_codec_factors_computed_total,
+            &par3.engine_codec_factors_reused_total,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            add(field, self.codec[index].saturating_sub(before.codec[index]));
+        }
     }
 }
 
@@ -268,7 +397,7 @@ impl PendingInput {
                     .capacity()
                     .checked_mul(2)
                     .and_then(|cost| cost.checked_add(1024))
-                    .ok_or(EngineError::ResourceLimit("PAR3 virtual publication"));
+                    .ok_or(budget::host_limit("PAR3 virtual publication"));
             }
             Self::Repair { path, .. } => (path, Some(0)),
             Self::CompleteFile { path, name } => (path, name.capacity().checked_mul(2)),
@@ -301,10 +430,10 @@ impl PendingInput {
             .checked_add(
                 path.capacity()
                     .checked_mul(2)
-                    .ok_or(EngineError::ResourceLimit("PAR3 queued path"))?,
+                    .ok_or(budget::host_limit("PAR3 queued path"))?,
             )
             .and_then(|bytes| bytes.checked_add(extra?))
-            .ok_or(EngineError::ResourceLimit("PAR3 queued publication"))
+            .ok_or(budget::host_limit("PAR3 queued publication"))
     }
 }
 
@@ -353,6 +482,10 @@ pub(super) struct RecoveryBatch {
     settled: bool,
     job_id: JobId,
     cohorts: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, u64)>,
+    /// Recovery indices this window declared to the engine as being acquired,
+    /// so a reassessment taken while it is in flight does not ask for them
+    /// again. Retracted verbatim when the window drains.
+    declared: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)>,
     epoch: u64,
     assessment: u64,
     admitted_at: std::time::Instant,
@@ -405,6 +538,10 @@ struct JobSlot {
     errors: BTreeMap<SourceId, EngineError>,
     donor_error: Option<EngineError>,
     spill: Option<SourceId>,
+    /// The engine refusal that forced the spill, kept so the verdict can be
+    /// classified against the numbers the engine actually measured rather
+    /// than against the configured budget read back later.
+    spill_limit: Option<par3_rs::runtime::ResourceLimit>,
     spill_disk: Option<budget::DiskReservation>,
     completed_repair: Option<RepairCompletion>,
     completed_readback: Option<EngineResult<readback::ReadbackDone>>,
@@ -447,6 +584,7 @@ impl Default for JobSlot {
             errors: BTreeMap::new(),
             donor_error: None,
             spill: None,
+            spill_limit: None,
             spill_disk: None,
             completed_repair: None,
             completed_readback: None,
@@ -553,12 +691,98 @@ impl Coordinator {
             settled: false,
             job_id,
             cohorts,
+            declared: Vec::new(),
             epoch: job.epoch,
             assessment: job.last_used,
             admitted_at: std::time::Instant::now(),
             _reservation: reservation,
         });
         Ok(())
+    }
+
+    /// Declare the recovery indices the window just admitted is expected to
+    /// deliver, so a reassessment taken while it is in flight does not ask for
+    /// them again.
+    ///
+    /// `spans` are the advertised index spans of the carriers this window
+    /// selected. Only indices the engine itself named as still wanted are
+    /// declared, and only where a selected carrier advertises them: a carrier
+    /// whose name says nothing declares nothing, which merely means those
+    /// indices stay askable.
+    pub(in crate::pipeline) fn declare_recovery_in_flight(
+        &mut self,
+        job_id: JobId,
+        spans: &[std::ops::Range<u64>],
+    ) -> EngineResult<()> {
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let declared: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)> = self
+            .assessments(job_id)
+            .flat_map(|(set, view)| {
+                view.requirements.iter().filter_map(move |need| {
+                    let indices: Vec<u64> = need
+                        .next_indices
+                        .iter()
+                        .copied()
+                        .filter(|index| spans.iter().any(|span| span.contains(index)))
+                        .collect();
+                    (!indices.is_empty()).then_some((set, need.matrix, indices))
+                })
+            })
+            .collect();
+        if declared.is_empty() {
+            return Ok(());
+        }
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return Ok(());
+        };
+        let Some(runtime) = job.runtime.as_mut() else {
+            return Ok(());
+        };
+        for (set, matrix, indices) in &declared {
+            if let Some(session) = runtime.sets.get_mut(set) {
+                session.native.note_recovery_in_flight(*matrix, indices)?;
+            }
+        }
+        if let Some(batch) = job.acquisition.batch.as_mut() {
+            batch.declared = declared;
+        }
+        // The retained view still answers the assessment that produced these
+        // indices; take a fresh one so the deficit this job publishes is what
+        // is left to ask for rather than what was asked for. Sources have not
+        // changed, so that assessment reads nothing.
+        self.queue_reassessment(job_id)
+    }
+
+    /// Retract everything the drained window declared. The window is over, so
+    /// nothing it named is still being acquired: an index that arrived is now
+    /// the engine's own `available`, and one that did not must become askable
+    /// again rather than sit in flight forever.
+    pub(in crate::pipeline) fn forget_recovery_in_flight(&mut self, job_id: JobId) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let declared = match job.acquisition.batch.as_mut() {
+            Some(batch) => std::mem::take(&mut batch.declared),
+            None => return,
+        };
+        // A window that declared nothing releases nothing, and must not cost
+        // the job an assessment it did not need.
+        if declared.is_empty() {
+            return;
+        }
+        let Some(runtime) = job.runtime.as_mut() else {
+            return;
+        };
+        for (set, matrix, indices) in &declared {
+            if let Some(session) = runtime.sets.get_mut(set) {
+                session.native.forget_recovery_in_flight(*matrix, indices);
+            }
+        }
+        // What was released has to become askable again, which only a fresh
+        // assessment can say.
+        let _ = self.queue_reassessment(job_id);
     }
 
     pub(in crate::pipeline) fn new(
@@ -667,12 +891,6 @@ impl Coordinator {
     /// share of the native budget this job's refusal collided with.
     pub(in crate::pipeline) fn peer_holds_par3_memory(&self, job_id: JobId) -> bool {
         self.in_flight.values().any(|(owner, _)| *owner != job_id)
-    }
-
-    /// The configured native budget's ceiling and current headroom.
-    pub(in crate::pipeline) fn native_budget(&self) -> (u64, u64) {
-        let budget = &budget::budgets().native;
-        (budget.limit() as u64, budget.available() as u64)
     }
 
     /// Publish the queue depth, worker allowance and in-flight gauges.
@@ -852,7 +1070,7 @@ impl Coordinator {
 
     pub(in crate::pipeline) fn admit(&mut self, job_id: JobId) -> EngineResult<()> {
         if !self.jobs.contains_key(&job_id) && self.jobs.len() >= MAX_JOBS {
-            return Err(EngineError::ResourceLimit("PAR3 job count"));
+            return Err(budget::host_limit("PAR3 job count"));
         }
         self.jobs.entry(job_id).or_default();
         Ok(())
@@ -898,14 +1116,14 @@ impl Coordinator {
                     .checked_add(path.capacity().checked_mul(16)?)?
                     .checked_add(file.path.len().checked_mul(16)?)
             });
-        let outputs = outputs.ok_or(EngineError::ResourceLimit("PAR3 repair result paths"))?;
+        let outputs = outputs.ok_or(budget::host_limit("PAR3 repair result paths"))?;
         self.check_pending_capacity(job_id, WorkKey::Repair(set))?;
         let input = PendingInput::Repair { set, path };
         let reservation = assessment::ViewReservation::acquire(
             input
                 .retained_cost()?
                 .checked_add(outputs)
-                .ok_or(EngineError::ResourceLimit("PAR3 repair result paths"))?,
+                .ok_or(budget::host_limit("PAR3 repair result paths"))?,
         )?;
         let cohorts = view
             .requirements
@@ -1005,6 +1223,16 @@ impl Coordinator {
         job.spill.take()
     }
 
+    /// The refusal that forced the pending spill, when the engine measured
+    /// one. A host-side ceiling refuses without a native measurement, so the
+    /// caller must still have a verdict for `None`.
+    pub(super) fn take_spill_limit(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<par3_rs::runtime::ResourceLimit> {
+        self.jobs.get_mut(&job_id)?.spill_limit.take()
+    }
+
     pub(super) fn reserve_spill_disk(
         &mut self,
         job_id: JobId,
@@ -1031,13 +1259,21 @@ impl Coordinator {
     /// and start or continue this job's wait for PAR3 memory. There is no
     /// timer here: the wait ends when a peer hands its work unit back and the
     /// completion check runs again.
-    pub(in crate::pipeline) fn park_for_memory(&mut self, job_id: JobId, source: SourceId) {
+    pub(in crate::pipeline) fn park_for_memory(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        limit: Option<par3_rs::runtime::ResourceLimit>,
+    ) {
         use std::sync::atomic::Ordering::Relaxed;
         let now_ms = self.metrics.now_ms();
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
         job.spill = Some(source);
+        // The refusal is restored with the spill: the retry after the peer
+        // hands back classifies against the same measurement.
+        job.spill_limit = limit;
         if job.waiting_for_memory_since.is_none() {
             job.waiting_for_memory_since = Some(std::time::Instant::now());
             self.metrics
@@ -1091,9 +1327,16 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(in crate::pipeline) fn force_spill(&mut self, job_id: JobId, source: SourceId) {
+    pub(in crate::pipeline) fn force_spill(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        limit: Option<par3_rs::runtime::ResourceLimit>,
+    ) {
         self.admit(job_id).unwrap();
-        self.jobs.get_mut(&job_id).unwrap().spill = Some(source);
+        let job = self.jobs.get_mut(&job_id).unwrap();
+        job.spill = Some(source);
+        job.spill_limit = limit;
     }
 
     pub(super) fn release_spilled_images(
@@ -1197,7 +1440,7 @@ impl Coordinator {
         let source = SourceId(u64::from(file_index));
         if !job.known.contains_key(&source) {
             if job.known.len() >= MAX_PENDING {
-                return Err(EngineError::ResourceLimit("PAR3 recovery candidates"));
+                return Err(budget::host_limit("PAR3 recovery candidates"));
             }
             job.known.insert(
                 source,
@@ -1268,7 +1511,7 @@ impl Coordinator {
         let epoch = job
             .epoch
             .checked_add(1)
-            .ok_or(EngineError::ResourceLimit("PAR3 source epochs"))?;
+            .ok_or(budget::host_limit("PAR3 source epochs"))?;
         job.sources.withdraw(source)?;
         job.known
             .get_mut(&source)
@@ -1341,7 +1584,7 @@ impl Coordinator {
                 .len()
                 .checked_mul(32)
                 .and_then(|bytes| bytes.checked_add(256))
-                .ok_or(EngineError::ResourceLimit("PAR3 materialized ranges"))?;
+                .ok_or(budget::host_limit("PAR3 materialized ranges"))?;
             let reservation = assessment::ViewReservation::acquire(bytes)?;
             let ranges = extents
                 .iter()
@@ -1350,7 +1593,7 @@ impl Coordinator {
                     offset
                         .checked_add(len)
                         .map(|end| offset..end)
-                        .ok_or(EngineError::ResourceLimit("PAR3 materialized offsets"))
+                        .ok_or(budget::host_limit("PAR3 materialized offsets"))
                 })
                 .collect::<EngineResult<Vec<_>>>()?;
             Ok(MaterializedRanges {
@@ -1372,7 +1615,7 @@ impl Coordinator {
             .and_then(|job| job.materialized.get(&source))
         {
             Some(Ok(entry)) => Ok(Some(entry.ranges.as_slice())),
-            Some(Err(_)) => Err(EngineError::ResourceLimit("PAR3 materialized ranges")),
+            Some(Err(_)) => Err(budget::host_limit("PAR3 materialized ranges")),
             None => Ok(None),
         }
     }
@@ -1473,13 +1716,13 @@ impl Coordinator {
         input: PendingInput,
     ) -> EngineResult<()> {
         if !self.jobs.contains_key(&job_id) && self.jobs.len() >= MAX_JOBS {
-            return Err(EngineError::ResourceLimit("PAR3 job count"));
+            return Err(budget::host_limit("PAR3 job count"));
         }
         self.check_pending_capacity(job_id, WorkKey::Source(source))?;
         let reservation = assessment::ViewReservation::acquire(input.retained_cost()?)?;
         let job = self.jobs.entry(job_id).or_default();
         if !job.known.contains_key(&source) && job.known.len() >= MAX_PENDING {
-            return Err(EngineError::ResourceLimit("PAR3 known sources"));
+            return Err(budget::host_limit("PAR3 known sources"));
         }
         let carrier = matches!(
             input,
@@ -1536,7 +1779,7 @@ impl Coordinator {
                 .sum::<usize>()
                 >= MAX_PENDING
         {
-            return Err(EngineError::ResourceLimit("pending PAR3 work"));
+            return Err(budget::host_limit("pending PAR3 work"));
         }
         Ok(())
     }
@@ -1684,7 +1927,7 @@ impl Coordinator {
         let ticket = self
             .next_ticket
             .checked_add(1)
-            .ok_or(EngineError::ResourceLimit("PAR3 worker tickets"))?;
+            .ok_or(budget::host_limit("PAR3 worker tickets"))?;
         let Some(mut runtime) = job.runtime.take() else {
             return Err(EngineError::InvalidState(
                 "PAR3 session already owned by a worker",
@@ -2139,29 +2382,38 @@ impl Coordinator {
             }
             // Repair reports still pass through installation reconciliation.
         }
-        let pressure = match &done.result {
+        // The refusal travels with the source it fenced: the verdict this
+        // spill eventually reaches is classified from the engine's own
+        // measurement, which is only in hand here.
+        let refusal = match &done.result {
             Err(error)
                 if matches!(
                     done.key,
                     WorkKey::Source(_) | WorkKey::Donors | WorkKey::Repair(_)
                 ) =>
             {
-                budget::error_pressure_source(error).or_else(|| match done.key {
-                    WorkKey::Source(source) if budget::is_host_pressure(error) => Some(source),
-                    _ => None,
+                budget::error_pressure_source(error)
+                    .or_else(|| match done.key {
+                        WorkKey::Source(source) if budget::is_host_pressure(error) => Some(source),
+                        _ => None,
+                    })
+                    .map(|source| (source, Some(error)))
+            }
+            Ok(WorkOutput::Repaired(completion)) => {
+                completion.result.as_ref().err().and_then(|error| {
+                    budget::error_pressure_source(error).map(|source| (source, Some(error)))
                 })
             }
-            Ok(WorkOutput::Repaired(completion)) => completion
-                .result
-                .as_ref()
-                .err()
-                .and_then(budget::error_pressure_source),
             _ => None,
         };
-        if let Some(source) = pressure {
+        let pressure = refusal.map(|(source, _)| source);
+        if let Some((source, error)) = refusal {
             // Fence dispatch now, but preserve repair reports: installed files
             // must still pass reconciliation before the completion gate spills.
             job.spill.get_or_insert(source);
+            if let Some(limit) = error.and_then(budget::engine_limit) {
+                job.spill_limit.get_or_insert(limit);
+            }
             let stage = match done.key {
                 WorkKey::Donors => "donor_search",
                 WorkKey::Repair(_) => "repair",

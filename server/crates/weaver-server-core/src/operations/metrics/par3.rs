@@ -180,6 +180,92 @@ impl Par3AdmissionReason {
     }
 }
 
+/// Memory categories the engine's ledger is divided into. The count is the
+/// engine's, so a new category is a compile error here rather than a silently
+/// dropped series.
+pub const PAR3_MEMORY_CATEGORIES: usize = par3_rs::runtime::MEMORY_CATEGORIES;
+
+/// The engine's own stable category names, in ledger order. These are the
+/// exported label values: the engine owns the vocabulary, weaver only carries
+/// it, so a rename travels with the engine rather than being mirrored here.
+pub fn par3_memory_category_names() -> [&'static str; PAR3_MEMORY_CATEGORIES] {
+    par3_rs::runtime::MemoryCategory::ALL.map(|category| category.name())
+}
+
+/// How the engine classified an admission it refused.
+///
+/// Indexes a fixed array; the order is the exported label order and must not
+/// change once released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Par3EngineRefusal {
+    /// The request does not fit this session's own ceiling.
+    ExceedsLimit,
+    /// The same request fits once another reservation releases.
+    PeerContention,
+    /// A ceiling that was never expressed in bytes.
+    Unmeasured,
+}
+
+impl Par3EngineRefusal {
+    pub const COUNT: usize = 3;
+
+    pub const ALL: [Self; Self::COUNT] =
+        [Self::ExceedsLimit, Self::PeerContention, Self::Unmeasured];
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::ExceedsLimit => 0,
+            Self::PeerContention => 1,
+            Self::Unmeasured => 2,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExceedsLimit => "exceeds_limit",
+            Self::PeerContention => "peer_contention",
+            Self::Unmeasured => "unmeasured",
+        }
+    }
+}
+
+/// Which width had to give when a stage ran narrower than it was configured
+/// to. These are not stalls: the engine never blocks on memory, it proceeds at
+/// the width it could admit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Par3EngineNarrowing {
+    /// A codec stripe admitted below the configured stripe size.
+    Stripe,
+    /// A worker pool that could not be admitted, so the stage ran serially.
+    Workers,
+    /// A verification batch cut short because the next file was not admitted.
+    VerifyBatch,
+}
+
+impl Par3EngineNarrowing {
+    pub const COUNT: usize = 3;
+
+    pub const ALL: [Self; Self::COUNT] = [Self::Stripe, Self::Workers, Self::VerifyBatch];
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Stripe => 0,
+            Self::Workers => 1,
+            Self::VerifyBatch => 2,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stripe => "stripe",
+            Self::Workers => "workers",
+            Self::VerifyBatch => "verify_batch",
+        }
+    }
+}
+
 /// Engine stages this layer folds back at handback. Deliberately a subset of
 /// the engine's stage list: creation-only stages never run on the repair path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,9 +423,42 @@ pub struct Par3Metrics {
     pub retained_bytes: AtomicU64,
     pub reserved_peak_bytes: AtomicU64,
     /// Stripe size the coordinator asked the engine to use for the last work
-    /// unit. par3-rs 0.3.1 does not report the size it actually admitted after
-    /// shrinking on contention, so this is the requested value.
+    /// unit. The engine reports the width it actually admitted separately, in
+    /// `engine_admitted_stripe_bytes`; the two differ under contention.
     pub effective_stripe_bytes: AtomicU64,
+
+    // ---- engine memory ledger --------------------------------------------
+    // Exported per category under the engine's own stable names. Written once
+    // per work-unit handback, one relaxed store per category.
+    ledger_bytes: [AtomicU64; PAR3_MEMORY_CATEGORIES],
+    ledger_peak_bytes: [AtomicU64; PAR3_MEMORY_CATEGORIES],
+
+    // ---- engine diagnostics ----------------------------------------------
+    // The widths the engine last admitted, and what its own bounded working
+    // sets cost. Admission and cache occupancy are last-observed values by the
+    // engine's own definition; refusals, narrowings and amplification are
+    // cumulative, so those fold in as deltas.
+    pub engine_admitted_stripe_bytes: AtomicU64,
+    pub engine_admitted_stripe_buffers: AtomicU64,
+    pub engine_admitted_output_tile: AtomicU64,
+    pub engine_admitted_verify_batch: AtomicU64,
+    pub engine_admitted_workers: AtomicU64,
+    pub engine_admitted_window_bytes: AtomicU64,
+    engine_refusals: [AtomicU64; Par3EngineRefusal::COUNT],
+    engine_narrowed: [AtomicU64; Par3EngineNarrowing::COUNT],
+    pub engine_reread_bytes_total: AtomicU64,
+    pub engine_reconstructed_bytes_total: AtomicU64,
+    pub engine_cache_entries: AtomicU64,
+    pub engine_cache_bytes: AtomicU64,
+    // Transform and coefficient work the engine's codecs performed. Counted
+    // once per call with that call's own totals, never per symbol, so these
+    // are cheap enough for the engine to keep and cumulative here.
+    pub engine_codec_transform_calls_total: AtomicU64,
+    pub engine_codec_butterflies_total: AtomicU64,
+    pub engine_codec_butterflies_skipped_total: AtomicU64,
+    pub engine_codec_multiply_accumulates_total: AtomicU64,
+    pub engine_codec_factors_computed_total: AtomicU64,
+    pub engine_codec_factors_reused_total: AtomicU64,
 
     // ---- CPU and work slots ----------------------------------------------
     pub pending_work_depth: AtomicUsize,
@@ -414,6 +533,55 @@ impl Par3Metrics {
 
     pub fn admission_refused(&self) -> [u64; Par3AdmissionReason::COUNT] {
         std::array::from_fn(|index| self.admission_refused[index].load(Ordering::Relaxed))
+    }
+
+    /// Publish the engine's categorised ledger. Called once per work-unit
+    /// handback: two relaxed stores per category and nothing else.
+    pub fn store_ledger(
+        &self,
+        current: [u64; PAR3_MEMORY_CATEGORIES],
+        peak: [u64; PAR3_MEMORY_CATEGORIES],
+    ) {
+        for index in 0..PAR3_MEMORY_CATEGORIES {
+            self.ledger_bytes[index].store(current[index], Ordering::Relaxed);
+            self.ledger_peak_bytes[index].store(peak[index], Ordering::Relaxed);
+        }
+    }
+
+    pub fn ledger_bytes(&self) -> [u64; PAR3_MEMORY_CATEGORIES] {
+        std::array::from_fn(|index| self.ledger_bytes[index].load(Ordering::Relaxed))
+    }
+
+    pub fn ledger_peak_bytes(&self) -> [u64; PAR3_MEMORY_CATEGORIES] {
+        std::array::from_fn(|index| self.ledger_peak_bytes[index].load(Ordering::Relaxed))
+    }
+
+    /// Fold one handback's refused admissions in, by cause.
+    pub fn note_engine_refusals(&self, deltas: [u64; Par3EngineRefusal::COUNT]) {
+        for cause in Par3EngineRefusal::ALL {
+            let delta = deltas[cause.index()];
+            if delta != 0 {
+                self.engine_refusals[cause.index()].fetch_add(delta, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn engine_refusals(&self) -> [u64; Par3EngineRefusal::COUNT] {
+        std::array::from_fn(|index| self.engine_refusals[index].load(Ordering::Relaxed))
+    }
+
+    /// Fold one handback's narrowed admissions in, by the width that gave.
+    pub fn note_engine_narrowed(&self, deltas: [u64; Par3EngineNarrowing::COUNT]) {
+        for width in Par3EngineNarrowing::ALL {
+            let delta = deltas[width.index()];
+            if delta != 0 {
+                self.engine_narrowed[width.index()].fetch_add(delta, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn engine_narrowed(&self) -> [u64; Par3EngineNarrowing::COUNT] {
+        std::array::from_fn(|index| self.engine_narrowed[index].load(Ordering::Relaxed))
     }
 
     pub fn note_outcome(&self, class: Par3OutcomeClass) {
@@ -563,6 +731,30 @@ impl Par3Metrics {
             retained_bytes: load(&self.retained_bytes),
             reserved_peak_bytes: load(&self.reserved_peak_bytes),
             effective_stripe_bytes: load(&self.effective_stripe_bytes),
+            ledger_bytes: self.ledger_bytes(),
+            ledger_peak_bytes: self.ledger_peak_bytes(),
+            engine_admitted_stripe_bytes: load(&self.engine_admitted_stripe_bytes),
+            engine_admitted_stripe_buffers: load(&self.engine_admitted_stripe_buffers),
+            engine_admitted_output_tile: load(&self.engine_admitted_output_tile),
+            engine_admitted_verify_batch: load(&self.engine_admitted_verify_batch),
+            engine_admitted_workers: load(&self.engine_admitted_workers),
+            engine_admitted_window_bytes: load(&self.engine_admitted_window_bytes),
+            engine_refusals: self.engine_refusals(),
+            engine_narrowed: self.engine_narrowed(),
+            engine_reread_bytes_total: load(&self.engine_reread_bytes_total),
+            engine_reconstructed_bytes_total: load(&self.engine_reconstructed_bytes_total),
+            engine_cache_entries: load(&self.engine_cache_entries),
+            engine_cache_bytes: load(&self.engine_cache_bytes),
+            engine_codec_transform_calls_total: load(&self.engine_codec_transform_calls_total),
+            engine_codec_butterflies_total: load(&self.engine_codec_butterflies_total),
+            engine_codec_butterflies_skipped_total: load(
+                &self.engine_codec_butterflies_skipped_total,
+            ),
+            engine_codec_multiply_accumulates_total: load(
+                &self.engine_codec_multiply_accumulates_total,
+            ),
+            engine_codec_factors_computed_total: load(&self.engine_codec_factors_computed_total),
+            engine_codec_factors_reused_total: load(&self.engine_codec_factors_reused_total),
             pending_work_depth: count(&self.pending_work_depth),
             pending_work_bytes: load(&self.pending_work_bytes),
             dispatch_refused_slots_total: load(&self.dispatch_refused_slots_total),
@@ -646,6 +838,26 @@ pub struct Par3MetricsSnapshot {
     pub retained_bytes: u64,
     pub reserved_peak_bytes: u64,
     pub effective_stripe_bytes: u64,
+    pub ledger_bytes: [u64; PAR3_MEMORY_CATEGORIES],
+    pub ledger_peak_bytes: [u64; PAR3_MEMORY_CATEGORIES],
+    pub engine_admitted_stripe_bytes: u64,
+    pub engine_admitted_stripe_buffers: u64,
+    pub engine_admitted_output_tile: u64,
+    pub engine_admitted_verify_batch: u64,
+    pub engine_admitted_workers: u64,
+    pub engine_admitted_window_bytes: u64,
+    pub engine_refusals: [u64; Par3EngineRefusal::COUNT],
+    pub engine_narrowed: [u64; Par3EngineNarrowing::COUNT],
+    pub engine_reread_bytes_total: u64,
+    pub engine_reconstructed_bytes_total: u64,
+    pub engine_cache_entries: u64,
+    pub engine_cache_bytes: u64,
+    pub engine_codec_transform_calls_total: u64,
+    pub engine_codec_butterflies_total: u64,
+    pub engine_codec_butterflies_skipped_total: u64,
+    pub engine_codec_multiply_accumulates_total: u64,
+    pub engine_codec_factors_computed_total: u64,
+    pub engine_codec_factors_reused_total: u64,
     pub pending_work_depth: usize,
     pub pending_work_bytes: u64,
     pub dispatch_refused_slots_total: u64,

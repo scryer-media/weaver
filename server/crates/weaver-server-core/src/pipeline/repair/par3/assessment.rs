@@ -47,16 +47,15 @@ impl AssessmentView {
                 .checked_add(file.unresolved.len().checked_mul(32)?)
         });
         let cost = assessment.requirements.iter().try_fold(
-            cost.ok_or(EngineError::ResourceLimit("PAR3 assessment view size"))?,
+            cost.ok_or(budget::host_limit("PAR3 assessment view size"))?,
             |bytes, requirement| {
                 bytes
                     .checked_add(256)?
                     .checked_add(requirement.available.len().checked_mul(16)?)
             },
         );
-        let reservation = ViewReservation::acquire(
-            cost.ok_or(EngineError::ResourceLimit("PAR3 assessment view size"))?,
-        )?;
+        let reservation =
+            ViewReservation::acquire(cost.ok_or(budget::host_limit("PAR3 assessment view size"))?)?;
         let mut files = assessment.files.clone();
         for file in &mut files {
             if file.source == Some(bindings::RETIRED_SOURCE) {
@@ -175,10 +174,12 @@ mod tests {
 
     #[test]
     fn oversized_view_reservation_fails_without_changing_accounting() {
-        assert!(matches!(
-            ViewReservation::acquire(usize::MAX),
-            Err(EngineError::ResourceLimit(_))
-        ));
+        assert!(
+            ViewReservation::acquire(usize::MAX)
+                .as_ref()
+                .err()
+                .is_some_and(budget::is_limit)
+        );
         // An independent small reservation still succeeds and releases on drop.
         drop(ViewReservation::acquire(1).unwrap());
     }

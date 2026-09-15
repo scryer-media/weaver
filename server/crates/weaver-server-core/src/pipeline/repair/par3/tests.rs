@@ -943,6 +943,10 @@ fn a_set_with_no_authenticated_root_names_the_missing_family() {
 
 /// Deliverable: a link or permission packet is counted as present and ignored,
 /// never applied and never a reason to refuse the set.
+///
+/// The count is the set's own: an option packet is retained by the set that
+/// admitted it, so the set has to be resolved before anyone can be told how
+/// many it carries. That is the same moment the plan becomes reportable.
 #[test]
 fn an_option_packet_is_reported_and_never_applied() {
     let bytes = carrier_with(
@@ -952,7 +956,10 @@ fn an_option_packet_is_reported_and_never_applied() {
             body: vec![1, 2, 3, 4],
         },
     );
-    let job = scan_carrier(&bytes);
+    let mut job = scan_carrier(&bytes);
+    for set in job.sets.values_mut() {
+        set.assess().expect("the index carrier resolves its set");
+    }
     let tally = job.option_packet_tally();
     assert_eq!(tally.present, 1, "the option packet authenticated");
     assert_eq!(tally.referenced, 0);
@@ -1030,7 +1037,9 @@ fn hostile_metadata_stops_at_a_named_ceiling() {
         "the refusal names its own ceiling: {error}"
     );
     let outcome = outcome::Par3Outcome::NotExecutable {
-        limit: outcome::execution_limit(&error).expect("named limit"),
+        limit: outcome::execution_limit(&error)
+            .expect("named limit")
+            .into(),
     };
     assert_eq!(
         outcome.class(),

@@ -92,7 +92,9 @@ impl PublishedSources {
         mode: PublicationMode,
     ) -> EngineResult<SourceSnapshot> {
         if ranges.len() > MAX_RANGES {
-            return Err(EngineError::ResourceLimit("published source ranges"));
+            return Err(crate::pipeline::repair::par3::budget::host_limit(
+                "published source ranges",
+            ));
         }
         let mut end = 0;
         for range in &ranges {
@@ -124,11 +126,15 @@ impl PublishedSources {
             return Err(EngineError::SourceChanged(source));
         }
         if old.is_none() && registry.sources.len() >= MAX_SOURCES {
-            return Err(EngineError::ResourceLimit("published source count"));
+            return Err(crate::pipeline::repair::par3::budget::host_limit(
+                "published source count",
+            ));
         }
         let total = registry.ranges - old.map_or(0, |old| old.ranges.len()) + ranges.len();
         if total > MAX_RANGES {
-            return Err(EngineError::ResourceLimit("published source ranges"));
+            return Err(crate::pipeline::repair::par3::budget::host_limit(
+                "published source ranges",
+            ));
         }
         if arrival
             && let Some(old) = old
@@ -138,17 +144,14 @@ impl PublishedSources {
         }
         let generation = match old {
             Some(old) if arrival => old.snapshot.generation,
-            Some(old) => old
-                .snapshot
-                .generation
-                .checked_add(1)
-                .ok_or(EngineError::ResourceLimit("source generations"))?,
+            Some(old) => old.snapshot.generation.checked_add(1).ok_or(
+                crate::pipeline::repair::par3::budget::host_limit("source generations"),
+            )?,
             None => 1,
         };
-        let revision = old
-            .map_or(0, |old| old.revision)
-            .checked_add(1)
-            .ok_or(EngineError::ResourceLimit("source revisions"))?;
+        let revision = old.map_or(0, |old| old.revision).checked_add(1).ok_or(
+            crate::pipeline::repair::par3::budget::host_limit("source revisions"),
+        )?;
         let snapshot = SourceSnapshot { len, generation };
         registry.sources.insert(
             source,
@@ -206,15 +209,12 @@ impl PublishedSources {
         let Some(old) = registry.sources.get(&source) else {
             return Ok(());
         };
-        let generation = old
-            .snapshot
-            .generation
-            .checked_add(1)
-            .ok_or(EngineError::ResourceLimit("source generations"))?;
-        let revision = old
-            .revision
-            .checked_add(1)
-            .ok_or(EngineError::ResourceLimit("source revisions"))?;
+        let generation = old.snapshot.generation.checked_add(1).ok_or(
+            crate::pipeline::repair::par3::budget::host_limit("source generations"),
+        )?;
+        let revision = old.revision.checked_add(1).ok_or(
+            crate::pipeline::repair::par3::budget::host_limit("source revisions"),
+        )?;
         let replacement = Arc::new(Publication {
             access: Arc::clone(&old.access),
             backing: old.backing,

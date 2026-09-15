@@ -33,9 +33,8 @@ fn reclaimable(error: &io::Error) -> bool {
     budget::pressure_source(error).is_some()
         || error.get_ref().is_some_and(|inner| {
             inner.downcast_ref::<EngineError>().is_some_and(|error| {
-                matches!(error, EngineError::ResourceLimit(_))
-                    || budget::error_pressure_source(error).is_some()
-            })
+                budget::is_limit(error) || budget::error_pressure_source(error).is_some()
+            }) || inner.downcast_ref::<budget::HostLimit>().is_some()
         })
 }
 

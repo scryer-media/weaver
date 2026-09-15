@@ -552,6 +552,26 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_par3_reserved_peak_bytes` | gauge | — | Peak bytes ever reserved against the PAR3 engine memory budget. |
 | `weaver_par3_retained_bytes` | gauge | — | Bytes reserved against weaver's own PAR3 host-state and retained-payload budgets. |
 | `weaver_par3_effective_stripe_bytes` | gauge | — | Repair stripe size requested of the engine for the most recent PAR3 work unit. |
+| `weaver_par3_ledger_bytes` | gauge | `category` | Bytes the PAR3 engine has reserved in each of its own memory categories, as of the last work-unit handback. |
+| `weaver_par3_ledger_peak_bytes` | gauge | `category` | Highest bytes the PAR3 engine ever held in each of its own memory categories. |
+| `weaver_par3_engine_admitted_stripe_bytes` | gauge | — | Codec stripe size the PAR3 engine actually admitted for its most recent pass. |
+| `weaver_par3_engine_admitted_stripe_buffers` | gauge | — | Stripe-sized buffers the PAR3 engine's most recent admission covered. |
+| `weaver_par3_engine_admitted_output_tile_rows` | gauge | — | Lost rows the PAR3 engine solved per tile in its most recent Cauchy pass. |
+| `weaver_par3_engine_admitted_verify_batch_files` | gauge | — | Files in the PAR3 engine's most recently admitted verification batch. |
+| `weaver_par3_engine_admitted_workers` | gauge | — | Worker threads the PAR3 engine's most recently admitted pool holds; one means it ran on the calling thread. |
+| `weaver_par3_engine_admitted_window_bytes` | gauge | — | Bytes in the PAR3 engine's most recently admitted sequential read window. |
+| `weaver_par3_engine_refusals_total` | counter | `cause` | Admissions the PAR3 engine refused, by the cause it gave. |
+| `weaver_par3_engine_narrowed_total` | counter | `width` | Stages the PAR3 engine ran narrower than configured, by the width that had to give. These are not stalls. |
+| `weaver_par3_engine_reread_bytes_total` | counter | — | Source bytes the PAR3 engine read again because one pass could not hold the block. |
+| `weaver_par3_engine_reconstructed_bytes_total` | counter | — | Bytes the PAR3 codec reconstructed and scattered into staged output. |
+| `weaver_par3_engine_cache_entries` | gauge | — | Entries the PAR3 engine's admission and deduplication caches currently retain. |
+| `weaver_par3_engine_cache_bytes` | gauge | — | Bytes the PAR3 engine's admission and deduplication cache entries are charged. |
+| `weaver_par3_engine_codec_transform_calls_total` | counter | — | Additive-transform invocations the PAR3 codec made, including the ones a pruning plan split. |
+| `weaver_par3_engine_codec_butterflies_total` | counter | — | Butterflies the PAR3 codec executed across those transform calls. |
+| `weaver_par3_engine_codec_butterflies_skipped_total` | counter | — | Butterflies a PAR3 transform plan established were not needed; add these to the executed ones for what the same decode would have cost unpruned. |
+| `weaver_par3_engine_codec_multiply_accumulates_total` | counter | — | Symbol-wide multiply-accumulates those butterflies performed: one per butterfly per symbol in the rows it joined. |
+| `weaver_par3_engine_codec_factors_computed_total` | counter | — | Cauchy code-matrix elements the PAR3 codec computed. |
+| `weaver_par3_engine_codec_factors_reused_total` | counter | — | Cauchy code-matrix elements the PAR3 codec answered from an admitted table instead of recomputing. |
 | `weaver_par3_pending_work_depth` | gauge | — | PAR3 work units queued and not yet dispatched. |
 | `weaver_par3_pending_work_bytes` | gauge | — | Host bytes leased by queued PAR3 work units. |
 | `weaver_par3_dispatch_refused_total` | counter | `reason` | Dispatch attempts that left queued PAR3 work waiting, by what was unavailable. |

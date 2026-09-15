@@ -19,6 +19,15 @@ fn execution_options() -> ExecutionOptions {
     static HANDLES: OnceLock<HandleBudget> = OnceLock::new();
     let mut options = ExecutionOptions::default();
     options.memory = budget::budgets().native.clone();
+    // What a session retains follows its set's block count, not its byte size
+    // and not the host's RAM: measured against the engine's own ledger, the
+    // same block count retained identical bytes at 512 B and at 64 KiB blocks.
+    // The measured line is about 48 bytes per block plus roughly 90 KB fixed —
+    // 0.29 MB at 4 096 blocks, 0.88 MB at 16 384, 3.25 MB at 65 531, and a few
+    // hundred KB for small sets. Half the native budget therefore admits sets
+    // of order ten million blocks, far above anything measured here, and this
+    // is a ceiling rather than a reservation: a session that never approaches
+    // it costs nothing, while a lower one would refuse large sets outright.
     options.retained_bytes = options.memory.limit() / 2;
     options.handles = HANDLES.get_or_init(|| HandleBudget::new(128)).clone();
     options.open_handles = 128;
@@ -81,10 +90,6 @@ pub(in crate::pipeline) struct Par3Job {
     packets_authenticated: u64,
     packets_rejected: u64,
     ranges_unavailable: u64,
-    /// Option packets (links, permissions) authenticated from any carrier.
-    /// Weaver retains their identity so it can say they were ignored; it
-    /// never applies one.
-    option_packets: std::collections::BTreeSet<par3_rs::Fingerprint>,
     /// Option packets that File, Directory and Root packets point at.
     referenced_options: std::collections::BTreeSet<par3_rs::Fingerprint>,
     /// Whether any authenticated Root declares the set's paths absolute.
@@ -99,8 +104,6 @@ pub(in crate::pipeline) struct Par3Job {
 /// before the packet is handed to its set.
 enum PacketNote {
     Nothing,
-    /// This packet is itself an option packet weaver does not apply.
-    Option(par3_rs::Fingerprint),
     /// This packet points at option packets, and may declare absolute paths.
     References {
         hashes: Vec<par3_rs::Fingerprint>,
@@ -112,7 +115,9 @@ enum PacketNote {
 /// option packet, so this exists to be reported, never to change a plan.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(in crate::pipeline) struct OptionPacketTally {
-    /// Distinct link and permission packets that authenticated.
+    /// Distinct link and permission packets the resolved sets retained. The
+    /// engine keeps them verbatim and interprets none of them, so this is the
+    /// count it already holds rather than one weaver keeps beside it.
     pub present: u64,
     /// Distinct option packets File, Directory and Root packets point at.
     pub referenced: u64,
@@ -143,9 +148,10 @@ impl std::fmt::Display for OptionPacketTally {
     }
 }
 
-/// The most option-packet identities one job retains. Past this the counts
-/// still rise; only the identities stop being remembered, so a set with a
-/// hostile number of options cannot grow this map without bound.
+/// The most option-packet pointers one job remembers. Past this the reference
+/// count stops rising, so a set with a hostile number of pointers cannot grow
+/// this set without bound. The option packets themselves are not counted here:
+/// the engine already holds each resolved set's own tally.
 const MAX_OPTION_HASHES: usize = 4096;
 
 impl PacketNote {
@@ -160,11 +166,6 @@ impl PacketNote {
     fn of(packet: &par3_rs::packet::Packet, block_size: Option<u64>) -> Self {
         use par3_rs::packet::{PacketBody, PacketType, file::FilePacket};
         match packet.body() {
-            PacketBody::Opaque {
-                packet_type:
-                    PacketType::Link | PacketType::UnixPermissions | PacketType::FatPermissions,
-                ..
-            } => Self::Option(packet.hash()),
             PacketBody::Opaque {
                 packet_type: PacketType::File,
                 body,
@@ -197,17 +198,11 @@ impl PacketNote {
 
     fn apply(
         self,
-        options: &mut std::collections::BTreeSet<par3_rs::Fingerprint>,
         referenced: &mut std::collections::BTreeSet<par3_rs::Fingerprint>,
         absolute: &mut bool,
     ) {
         match self {
             Self::Nothing => {}
-            Self::Option(hash) => {
-                if options.len() < MAX_OPTION_HASHES {
-                    options.insert(hash);
-                }
-            }
             Self::References {
                 hashes,
                 absolute: declared,
@@ -241,7 +236,6 @@ impl Default for Par3Job {
             packets_authenticated: 0,
             packets_rejected: 0,
             ranges_unavailable: 0,
-            option_packets: std::collections::BTreeSet::new(),
             referenced_options: std::collections::BTreeSet::new(),
             absolute_paths: false,
             set_block_sizes: std::collections::BTreeMap::new(),
@@ -261,7 +255,7 @@ impl Par3Job {
         if !self.disk_publications.contains_key(&source)
             && self.disk_publications.len() >= MAX_CARRIERS
         {
-            return Err(EngineError::ResourceLimit("PAR3 disk publications"));
+            return Err(budget::host_limit("PAR3 disk publications"));
         }
         let access = disk_source(source, path.clone(), &self.options)?;
         let backing = access.snapshot(source)?.ok_or(EngineError::Unavailable {
@@ -313,7 +307,7 @@ impl Par3Job {
     ) -> EngineResult<SourceSnapshot> {
         bindings::check_source(source)?;
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
-            return Err(EngineError::ResourceLimit("PAR3 source bindings"));
+            return Err(budget::host_limit("PAR3 source bindings"));
         }
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
@@ -468,7 +462,7 @@ impl Par3Job {
     ) -> EngineResult<()> {
         bindings::check_source(source)?;
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
-            return Err(EngineError::ResourceLimit("PAR3 source bindings"));
+            return Err(budget::host_limit("PAR3 source bindings"));
         }
         self.retire_name_bindings(source, &name)?;
         self.bindings.retain(|_, bound| *bound != source);
@@ -571,7 +565,7 @@ impl Par3Job {
     ) -> EngineResult<()> {
         bindings::check_source(source)?;
         if !self.carriers.contains_key(&source) && self.carriers.len() >= MAX_CARRIERS {
-            return Err(EngineError::ResourceLimit("job carrier count"));
+            return Err(budget::host_limit("job carrier count"));
         }
         let backing = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
@@ -639,7 +633,7 @@ impl Par3Job {
 
                     if !self.sets.contains_key(&id) {
                         if self.sets.len() >= MAX_SETS {
-                            return Err(EngineError::ResourceLimit("job PAR3 set count"));
+                            return Err(budget::host_limit("job PAR3 set count"));
                         }
                         self.sets.insert(
                             id,
@@ -670,11 +664,7 @@ impl Par3Job {
                     match self.sets.get_mut(&id).expect("inserted set").merge(packet) {
                         Ok(()) => {
                             carrier.scan.note_packet(kind, origin.offset, origin.length);
-                            note.apply(
-                                &mut self.option_packets,
-                                &mut self.referenced_options,
-                                &mut self.absolute_paths,
-                            );
+                            note.apply(&mut self.referenced_options, &mut self.absolute_paths);
                             self.packets_authenticated += 1;
                         }
                         Err(error) if is_admission_exhausted(&error) => return Err(error),
@@ -746,17 +736,26 @@ impl Par3Job {
         totals
     }
 
-    /// What this job's carriers said about option packets: how many distinct
-    /// option packets authenticated, how many distinct option packets the
-    /// metadata points at, and how many of those pointers name nothing that
-    /// authenticated.
+    /// What this job said about option packets: how many each resolved set
+    /// retained, how many distinct option packets the metadata points at, and
+    /// how many of those pointers name nothing the set holds.
+    ///
+    /// The packets themselves are the engine's own tally, read off each
+    /// resolved set rather than kept a second time here. The pointers are not:
+    /// a resolved set exposes the File and Directory packets its Root tree
+    /// reaches, so a pointer in an authenticated packet the tree never names
+    /// is invisible there and is counted from the scan instead.
     fn option_packet_tally(&self) -> OptionPacketTally {
+        let resolved = || self.sets.values().filter_map(|set| set.native.set());
         OptionPacketTally {
-            present: self.option_packets.len() as u64,
+            present: resolved().fold(0u64, |count, set| {
+                count.saturating_add(set.option_packet_count() as u64)
+            }),
             referenced: self.referenced_options.len() as u64,
             unresolved: self
                 .referenced_options
-                .difference(&self.option_packets)
+                .iter()
+                .filter(|hash| !resolved().any(|set| set.option_packet(hash).is_some()))
                 .count() as u64,
             absolute_paths: self.absolute_paths,
         }
@@ -1007,14 +1006,14 @@ impl Pipeline {
             }
             let end = offset
                 .checked_add(u64::from(len))
-                .ok_or(EngineError::ResourceLimit("PAR3 source offsets"))?;
+                .ok_or(budget::host_limit("PAR3 source offsets"))?;
             if let Some(last) = ranges.last_mut()
                 && last.end == offset
             {
                 last.end = end;
             } else {
                 if ranges.len() >= 262_144 {
-                    return Err(EngineError::ResourceLimit("PAR3 source ranges"));
+                    return Err(budget::host_limit("PAR3 source ranges"));
                 }
                 ranges.push(offset..end);
             }
@@ -1057,7 +1056,7 @@ impl Pipeline {
                 .chain(persisted.map(|(offset, len)| offset..offset.saturating_add(len as u64)))
             {
                 if ranges.len() >= 262_144 {
-                    return Err(EngineError::ResourceLimit("PAR3 source ranges"));
+                    return Err(budget::host_limit("PAR3 source ranges"));
                 }
                 ranges.push(range);
             }
@@ -1260,7 +1259,7 @@ impl Pipeline {
                         || (0..file.total_segments()).any(|part| file.has_segment(part)))
                 {
                     if dirty.len() >= MAX_CARRIERS {
-                        return Err(EngineError::ResourceLimit("PAR3 source count"));
+                        return Err(budget::host_limit("PAR3 source count"));
                     }
                     dirty.push(source);
                 }
@@ -1371,7 +1370,7 @@ impl Pipeline {
 mod acquisition;
 mod assessment;
 mod bindings;
-mod budget;
+pub(in crate::pipeline) mod budget;
 pub(in crate::pipeline) mod carriers;
 pub(in crate::pipeline) mod cohorts;
 mod completion;

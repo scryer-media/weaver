@@ -8,7 +8,9 @@
 
 use super::*;
 use crate::operations::metrics::{Par3AdmissionReason, Par3OutcomeClass};
+use par3_rs::runtime::{LimitCause, MemoryCategory};
 use par3_rs::session::RecoveryRequirement;
+use std::borrow::Cow;
 
 /// One cohort's shortfall, as the engine's assessment reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +108,11 @@ pub(in crate::pipeline) enum Par3Outcome {
     MetadataIncomplete { missing: MissingMetadata },
     /// A matrix kind or geometry the engine does not execute.
     Unsupported { detail: &'static str },
-    /// Admissible, but over a hard engine ceiling.
-    NotExecutable { limit: &'static str },
+    /// Admissible, but the engine will not run it: a hard ceiling the set is
+    /// over, or a rule the engine refuses to break for it. The reason is
+    /// borrowed where it is a fixed label and owned where the engine names a
+    /// particular offender.
+    NotExecutable { limit: Cow<'static, str> },
     /// Fits alone, but not beside the peer work unit currently holding
     /// PAR3 memory.
     WaitingForMemory { need: u64, have: u64 },
@@ -235,7 +240,10 @@ impl std::fmt::Display for Par3Outcome {
                 )
             }
             Self::NotExecutable { limit } => {
-                write!(f, "PAR3 repair exceeds an engine execution limit: {limit}")
+                // One sentence carries both shapes of refusal in this class: a
+                // ceiling the set is over, and a rule it asks the engine to
+                // break. Each reason is written to complete it on its own.
+                write!(f, "PAR3 repair is not executable: {limit}")
             }
             Self::WaitingForMemory { need, have } => write!(
                 f,
@@ -284,72 +292,115 @@ impl std::fmt::Display for Par3Outcome {
 /// Decide whether a refused PAR3 reservation is a transient peer collision or
 /// a budget the set can never fit into.
 ///
-/// **This is an inference, not engine data.** par3-rs 0.3.1 reports only
-/// `ResourceLimit(&'static str)`: it does not say how many bytes the refused
-/// operation wanted, nor how many the budget could ever grant. Until the
-/// engine reports its own `{need, limit, available}` for a refusal, weaver
-/// infers both from the budget it configured and from whether another work
-/// unit held PAR3 memory at the moment of refusal. Replace the whole body when
-/// that engine data exists; the callers and the two outcome classes stay.
+/// The engine measures its own refusals now, so nothing here is inferred from
+/// the configured budget: `need`, `limit` and `available` are the numbers the
+/// refusal carried, and `cause()` is the engine's own reading of them.
+///
+/// One thing the engine deliberately does not decide is *whose* reservations
+/// crowded the request out. `LimitCause::PeerContention` means "the same
+/// request fits once the memory currently held is released", and the holder may
+/// be another work unit or this session's own earlier reservations — layout,
+/// evidence and assessment state are all still charged when codec scratch is
+/// asked for. Only weaver knows which, because only weaver knows whether a peer
+/// work unit is in flight; with no peer, waiting frees nothing and the refusal
+/// is terminal.
 pub(in crate::pipeline) fn classify_memory_refusal(
-    need: u64,
-    limit: u64,
-    available: u64,
+    limit: par3_rs::runtime::ResourceLimit,
     peer_in_flight: bool,
 ) -> Par3Outcome {
-    if peer_in_flight && need <= limit {
-        Par3Outcome::WaitingForMemory {
+    let need = limit.need as u64;
+    let ceiling = limit.limit as u64;
+    match limit.cause() {
+        LimitCause::PeerContention if peer_in_flight => Par3Outcome::WaitingForMemory {
             need,
-            have: available,
-        }
-    } else {
-        Par3Outcome::DoesNotFit { need, limit }
+            have: limit.available as u64,
+        },
+        // Nothing else is in flight, so the memory in the way is this job's own
+        // and no handback will release it.
+        LimitCause::PeerContention | LimitCause::ExceedsLimit => Par3Outcome::DoesNotFit {
+            need,
+            limit: ceiling,
+        },
+        // A ceiling that was never expressed in bytes is structural: a handle
+        // count, a packet count, a bound the set's own geometry trips.
+        LimitCause::Unmeasured => Par3Outcome::NotExecutable {
+            limit: format!("it is over an engine execution limit on {}", limit.what).into(),
+        },
     }
 }
 
-/// The engine ceiling an error names, when it names one.
+/// The ceiling an error names, when it names one.
 ///
 /// Hostile or merely enormous metadata — thousands of File packets, a
 /// directory tree that nests without end, a chunk list longer than the data it
-/// describes — reaches weaver as a named `ResourceLimit` rather than as host
-/// exhaustion. Naming that ceiling turns it into a typed verdict instead of an
-/// opaque engine string.
+/// describes — stops at a ceiling somebody set rather than at exhaustion.
+/// Naming that ceiling turns it into a typed verdict instead of an opaque
+/// engine string. Which side set it does not change the verdict: a plan that
+/// cannot be executed under a stated bound is unexecutable whether the bound
+/// was the engine's or weaver's, and the label says which one it was.
 pub(in crate::pipeline) fn execution_limit(error: &EngineError) -> Option<&'static str> {
+    super::budget::limit_label(error)
+}
+
+/// The path violation behind an engine error, however it was wrapped.
+///
+/// A refused name can be reached after earlier files of the same repair have
+/// staged, and the engine then hands the refusal back inside the interruption
+/// that carries those temporaries. The verdict is the same either way, so the
+/// cause is read through the wrapper exactly as a refused reservation is.
+pub(in crate::pipeline) fn unsafe_path(error: &EngineError) -> Option<&par3_rs::PathViolation> {
     match error {
-        EngineError::ResourceLimit(limit) => Some(limit),
+        EngineError::UnsafePath(violation) => Some(violation),
+        EngineError::RepairInterrupted { cause, .. } => unsafe_path(cause),
         EngineError::Io(error) => error
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<EngineError>())
-            .and_then(execution_limit),
-        EngineError::RepairInterrupted { cause, .. } => execution_limit(cause),
+            .and_then(unsafe_path),
         _ => None,
     }
 }
 
-/// Which admission budget an engine resource limit names. The strings are the
-/// engine's own labels and the ones weaver passes to `ResourceLimit`.
+/// The verdict on a set that names a file the engine refuses to write.
+///
+/// Weaver checks the same names before it plans anything, so this is the
+/// engine's own refusal reaching the same class from the other end: the last
+/// line rather than the first. Nothing weaver can do changes the answer — no
+/// retry, no further recovery blocks and no larger budget makes the name
+/// admissible — so the verdict is terminal, and it keeps the engine's words
+/// for the rule when weaver's table states nothing equivalent.
+pub(in crate::pipeline) fn refuse_unsafe_path(violation: &par3_rs::PathViolation) -> Par3Outcome {
+    Par3Outcome::UnsafePath {
+        path: violation.path.clone(),
+        reason: super::paths::UnsafePath::from_engine(violation),
+    }
+}
+
+/// Which admission budget a refusal names. The labels are the engine's own and
+/// the ones weaver's host-side budgets refuse under; `limit_label` reads both.
 pub(in crate::pipeline) fn admission_reason(error: &EngineError) -> Par3AdmissionReason {
-    match error {
-        EngineError::ResourceLimit(label) => match *label {
-            "memory budget" | "minimum repair stripe" | "open handles" => {
-                Par3AdmissionReason::RetainedState
-            }
-            "PAR3 retained payload" => Par3AdmissionReason::ResolvedMetadata,
-            "PAR3 host state" | "PAR3 assessment view size" => Par3AdmissionReason::AssessmentView,
-            "PAR3 disk fallback space" => Par3AdmissionReason::DiskFallbackSpace,
-            "job carrier count"
-            | "PAR3 disk publications"
-            | "PAR3 source bindings"
-            | "PAR3 source count"
-            | "PAR3 source ranges" => Par3AdmissionReason::CarrierCount,
-            "job PAR3 set count" | "PAR3 job count" => Par3AdmissionReason::SetCount,
-            _ => Par3AdmissionReason::Other,
-        },
-        EngineError::Io(error) => error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<EngineError>())
-            .map_or(Par3AdmissionReason::Other, admission_reason),
-        EngineError::RepairInterrupted { cause, .. } => admission_reason(cause),
+    let Some(label) = super::budget::limit_label(error) else {
+        return Par3AdmissionReason::Other;
+    };
+    match label {
+        "minimum repair stripe" | "open handles" => Par3AdmissionReason::RetainedState,
+        "PAR3 retained payload" => Par3AdmissionReason::ResolvedMetadata,
+        "PAR3 host state" | "PAR3 assessment view size" => Par3AdmissionReason::AssessmentView,
+        "PAR3 disk fallback space" => Par3AdmissionReason::DiskFallbackSpace,
+        "job carrier count"
+        | "PAR3 disk publications"
+        | "PAR3 source bindings"
+        | "PAR3 source count"
+        | "PAR3 source ranges" => Par3AdmissionReason::CarrierCount,
+        "job PAR3 set count" | "PAR3 job count" => Par3AdmissionReason::SetCount,
+        // Every charge against the engine's native budget now names the memory
+        // category it pays for. `Uncategorized` is still `memory budget`, so
+        // the refusals that landed on retained state before still do.
+        _ if MemoryCategory::ALL
+            .iter()
+            .any(|category| category.name() == label) =>
+        {
+            Par3AdmissionReason::RetainedState
+        }
         _ => Par3AdmissionReason::Other,
     }
 }
@@ -409,26 +460,51 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         source: SourceId,
+        limit: par3_rs::runtime::ResourceLimit,
+    ) {
+        let Some(runtime) = self.par3_runtime.as_ref() else {
+            return;
+        };
+        let outcome = classify_memory_refusal(limit, runtime.peer_holds_par3_memory(job_id));
+        let waiting = matches!(outcome, Par3Outcome::WaitingForMemory { .. });
+        self.settle_par3_outcome(job_id, outcome);
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            if waiting {
+                runtime.park_for_memory(job_id, source, Some(limit));
+            } else {
+                runtime.resume_from_memory(job_id);
+            }
+        }
+    }
+
+    /// A host-side ceiling refused the image, so there is no native
+    /// measurement to classify: weaver knows only what it asked for. A peer
+    /// work unit still holds the payload that ceiling is sized against, so the
+    /// park/wake path is the same one an engine refusal takes.
+    pub(in crate::pipeline) fn refuse_par3_host_memory(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
         need: u64,
     ) {
         let Some(runtime) = self.par3_runtime.as_ref() else {
             return;
         };
-        let (limit, available) = runtime.native_budget();
-        let outcome = classify_memory_refusal(
-            need,
-            limit,
-            available,
-            runtime.peer_holds_par3_memory(job_id),
-        );
-        let waiting = matches!(outcome, Par3Outcome::WaitingForMemory { .. });
-        self.settle_par3_outcome(job_id, outcome);
-        if let Some(runtime) = self.par3_runtime.as_mut() {
-            if waiting {
-                runtime.park_for_memory(job_id, source);
-            } else {
+        if !runtime.peer_holds_par3_memory(job_id) {
+            self.settle_par3_outcome(
+                job_id,
+                Par3Outcome::NotExecutable {
+                    limit: "the disk fallback has no room for the refused source".into(),
+                },
+            );
+            if let Some(runtime) = self.par3_runtime.as_mut() {
                 runtime.resume_from_memory(job_id);
             }
+            return;
+        }
+        self.settle_par3_outcome(job_id, Par3Outcome::WaitingForMemory { need, have: 0 });
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            runtime.park_for_memory(job_id, source, None);
         }
     }
 
@@ -474,6 +550,66 @@ mod tests {
     }
 
     #[test]
+    fn an_unsafe_path_is_a_terminal_refusal_that_names_the_rule() {
+        use super::super::paths::UnsafePath;
+
+        // An engine refusal reaches the class weaver's own pre-write check
+        // uses, with the path it refused and weaver's word for the rule.
+        let violation = par3_rs::paths::validate_relative_path("payload/../../etc/passwd")
+            .expect_err("a parent-directory component is not a writable name");
+        let refused = refuse_unsafe_path(&violation);
+        assert_eq!(refused.class(), Par3OutcomeClass::UnsafePath);
+        assert!(refused.is_terminal());
+        assert_eq!(
+            refused,
+            Par3Outcome::UnsafePath {
+                path: "payload/../../etc/passwd".into(),
+                reason: UnsafePath::ParentDirectory,
+            }
+        );
+        let message = refused.to_string();
+        assert!(message.contains("a `..` component"), "{message}");
+        assert!(message.contains("payload/../../etc/passwd"), "{message}");
+
+        // Every rule the two tables state the same way maps to weaver's own
+        // word for it; the rules only the engine states keep the engine's.
+        for (path, expected) in [
+            ("/etc/passwd", UnsafePath::Absolute),
+            ("sub//a.bin", UnsafePath::EmptyComponent),
+            ("./a.bin", UnsafePath::CurrentDirectory),
+            ("sub\\a.bin", UnsafePath::SeparatorInComponent),
+            ("stream:name", UnsafePath::SeparatorInComponent),
+            ("sub/CON.txt", UnsafePath::ReservedDeviceName),
+            ("a\0.bin", UnsafePath::Nul),
+            (
+                "trailing. ",
+                UnsafePath::EngineRule(par3_rs::PathRule::TrailingSpaceOrDot),
+            ),
+            (
+                &"x".repeat(par3_rs::MAX_COMPONENT_BYTES + 1),
+                UnsafePath::EngineRule(par3_rs::PathRule::ComponentTooLong),
+            ),
+        ] {
+            let violation = par3_rs::paths::validate_relative_path(path)
+                .expect_err("the engine refuses this name");
+            assert_eq!(UnsafePath::from_engine(&violation), expected, "{path:?}");
+            // Whichever table the word comes from, it is in the message.
+            let message = refuse_unsafe_path(&violation).to_string();
+            assert!(message.contains(expected.reason()), "{message}");
+        }
+
+        // The same verdict has to survive the wrapper the engine uses when
+        // earlier files of the repair had already staged.
+        let interrupted = EngineError::RepairInterrupted {
+            installed: Vec::new(),
+            temporary: vec![std::path::PathBuf::from("staged.part")],
+            cause: Box::new(EngineError::UnsafePath(violation.clone())),
+        };
+        assert_eq!(unsafe_path(&interrupted), Some(&violation));
+        assert_eq!(unsafe_path(&EngineError::Cancelled), None);
+    }
+
+    #[test]
     fn every_class_has_a_distinct_index_and_a_message() {
         let outcomes = [
             Par3Outcome::Unrecoverable {
@@ -492,7 +628,9 @@ mod tests {
                 },
             },
             Par3Outcome::Unsupported { detail: "matrix" },
-            Par3Outcome::NotExecutable { limit: "lost cap" },
+            Par3Outcome::NotExecutable {
+                limit: "lost cap".into(),
+            },
             Par3Outcome::WaitingForMemory { need: 10, have: 4 },
             Par3Outcome::DoesNotFit { need: 10, limit: 4 },
             Par3Outcome::CarrierDamage {
@@ -533,34 +671,50 @@ mod tests {
 
     #[test]
     fn memory_refusal_separates_a_peer_collision_from_an_impossible_set() {
+        // The engine cannot tell a peer's reservations from this session's own,
+        // so the same refusal reads two ways depending on what weaver has in
+        // flight. Both refusals below are the engine's, not modelled ones.
+        let contended = super::super::budget::engine_refusal(LimitCause::PeerContention);
         assert_eq!(
-            classify_memory_refusal(100, 400, 150, true),
+            classify_memory_refusal(contended, true),
             Par3Outcome::WaitingForMemory {
-                need: 100,
-                have: 150
+                need: contended.need as u64,
+                have: contended.available as u64
             }
         );
         assert_eq!(
-            classify_memory_refusal(100, 400, 150, false),
+            classify_memory_refusal(contended, false),
             Par3Outcome::DoesNotFit {
-                need: 100,
-                limit: 400
+                need: contended.need as u64,
+                limit: contended.limit as u64
             }
         );
-        // Over the whole budget is never a peer collision, even under one.
+        // Over the whole ceiling is never a peer collision, even under one.
+        let alone = super::super::budget::engine_refusal(LimitCause::ExceedsLimit);
         assert_eq!(
-            classify_memory_refusal(900, 400, 0, true),
+            classify_memory_refusal(alone, true),
             Par3Outcome::DoesNotFit {
-                need: 900,
-                limit: 400
+                need: alone.need as u64,
+                limit: alone.limit as u64
+            }
+        );
+        // A ceiling that is a count, not a byte budget, cannot be waited out
+        // and does not pretend to report bytes.
+        let structural = super::super::budget::engine_refusal(LimitCause::Unmeasured);
+        assert_eq!(
+            classify_memory_refusal(structural, true),
+            Par3Outcome::NotExecutable {
+                limit: "it is over an engine execution limit on open handles".into()
             }
         );
     }
 
     #[test]
-    fn admission_reasons_follow_the_budget_the_engine_named() {
+    fn admission_reasons_follow_the_budget_that_refused() {
         for (label, expected) in [
             ("memory budget", Par3AdmissionReason::RetainedState),
+            ("codec scratch", Par3AdmissionReason::RetainedState),
+            ("worker stacks", Par3AdmissionReason::RetainedState),
             ("PAR3 host state", Par3AdmissionReason::AssessmentView),
             (
                 "PAR3 retained payload",
@@ -575,11 +729,19 @@ mod tests {
             ("something else entirely", Par3AdmissionReason::Other),
         ] {
             assert_eq!(
-                admission_reason(&EngineError::ResourceLimit(label)),
+                admission_reason(&super::super::budget::host_limit(label)),
                 expected,
                 "{label}"
             );
         }
+        // An engine refusal reaches the same slot as a weaver one naming the
+        // same budget, whichever error shape carried it.
+        assert_eq!(
+            admission_reason(&EngineError::ResourceLimit(
+                super::super::budget::engine_refusal(LimitCause::Unmeasured)
+            )),
+            Par3AdmissionReason::RetainedState
+        );
         assert_eq!(
             admission_reason(&EngineError::Cancelled),
             Par3AdmissionReason::Other

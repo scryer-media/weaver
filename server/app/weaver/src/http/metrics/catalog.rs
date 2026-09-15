@@ -500,6 +500,47 @@ metric_families! {
     PAR3_STRIPE_BYTES = ("weaver_par3_effective_stripe_bytes", Gauge, [],
         "Repair stripe size requested of the engine for the most recent PAR3 work unit.");
 
+    PAR3_LEDGER_BYTES = ("weaver_par3_ledger_bytes", Gauge, ["category"],
+        "Bytes the PAR3 engine has reserved in each of its own memory categories, as of the last work-unit handback.");
+    PAR3_LEDGER_PEAK_BYTES = ("weaver_par3_ledger_peak_bytes", Gauge, ["category"],
+        "Highest bytes the PAR3 engine ever held in each of its own memory categories.");
+    PAR3_ENGINE_ADMITTED_STRIPE_BYTES = ("weaver_par3_engine_admitted_stripe_bytes", Gauge, [],
+        "Codec stripe size the PAR3 engine actually admitted for its most recent pass.");
+    PAR3_ENGINE_ADMITTED_STRIPE_BUFFERS = ("weaver_par3_engine_admitted_stripe_buffers", Gauge, [],
+        "Stripe-sized buffers the PAR3 engine's most recent admission covered.");
+    PAR3_ENGINE_ADMITTED_OUTPUT_TILE = ("weaver_par3_engine_admitted_output_tile_rows", Gauge, [],
+        "Lost rows the PAR3 engine solved per tile in its most recent Cauchy pass.");
+    PAR3_ENGINE_ADMITTED_VERIFY_BATCH = ("weaver_par3_engine_admitted_verify_batch_files", Gauge, [],
+        "Files in the PAR3 engine's most recently admitted verification batch.");
+    PAR3_ENGINE_ADMITTED_WORKERS = ("weaver_par3_engine_admitted_workers", Gauge, [],
+        "Worker threads the PAR3 engine's most recently admitted pool holds; one means it ran on the calling thread.");
+    PAR3_ENGINE_ADMITTED_WINDOW_BYTES = ("weaver_par3_engine_admitted_window_bytes", Gauge, [],
+        "Bytes in the PAR3 engine's most recently admitted sequential read window.");
+    PAR3_ENGINE_REFUSALS = ("weaver_par3_engine_refusals_total", Counter, ["cause"],
+        "Admissions the PAR3 engine refused, by the cause it gave.");
+    PAR3_ENGINE_NARROWED = ("weaver_par3_engine_narrowed_total", Counter, ["width"],
+        "Stages the PAR3 engine ran narrower than configured, by the width that had to give. These are not stalls.");
+    PAR3_ENGINE_REREAD_BYTES = ("weaver_par3_engine_reread_bytes_total", Counter, [],
+        "Source bytes the PAR3 engine read again because one pass could not hold the block.");
+    PAR3_ENGINE_RECONSTRUCTED_BYTES = ("weaver_par3_engine_reconstructed_bytes_total", Counter, [],
+        "Bytes the PAR3 codec reconstructed and scattered into staged output.");
+    PAR3_ENGINE_CACHE_ENTRIES = ("weaver_par3_engine_cache_entries", Gauge, [],
+        "Entries the PAR3 engine's admission and deduplication caches currently retain.");
+    PAR3_ENGINE_CACHE_BYTES = ("weaver_par3_engine_cache_bytes", Gauge, [],
+        "Bytes the PAR3 engine's admission and deduplication cache entries are charged.");
+    PAR3_ENGINE_CODEC_TRANSFORM_CALLS = ("weaver_par3_engine_codec_transform_calls_total", Counter, [],
+        "Additive-transform invocations the PAR3 codec made, including the ones a pruning plan split.");
+    PAR3_ENGINE_CODEC_BUTTERFLIES = ("weaver_par3_engine_codec_butterflies_total", Counter, [],
+        "Butterflies the PAR3 codec executed across those transform calls.");
+    PAR3_ENGINE_CODEC_BUTTERFLIES_SKIPPED = ("weaver_par3_engine_codec_butterflies_skipped_total", Counter, [],
+        "Butterflies a PAR3 transform plan established were not needed; add these to the executed ones for what the same decode would have cost unpruned.");
+    PAR3_ENGINE_CODEC_MULTIPLY_ACCUMULATES = ("weaver_par3_engine_codec_multiply_accumulates_total", Counter, [],
+        "Symbol-wide multiply-accumulates those butterflies performed: one per butterfly per symbol in the rows it joined.");
+    PAR3_ENGINE_CODEC_FACTORS_COMPUTED = ("weaver_par3_engine_codec_factors_computed_total", Counter, [],
+        "Cauchy code-matrix elements the PAR3 codec computed.");
+    PAR3_ENGINE_CODEC_FACTORS_REUSED = ("weaver_par3_engine_codec_factors_reused_total", Counter, [],
+        "Cauchy code-matrix elements the PAR3 codec answered from an admitted table instead of recomputing.");
+
     PAR3_PENDING_WORK = ("weaver_par3_pending_work_depth", Gauge, [],
         "PAR3 work units queued and not yet dispatched.");
     PAR3_PENDING_BYTES = ("weaver_par3_pending_work_bytes", Gauge, [],

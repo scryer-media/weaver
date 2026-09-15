@@ -12,35 +12,76 @@ use super::outcome::CohortDeficit;
 use par3_rs::session::RecoveryRequirement;
 use std::ops::Range;
 
-/// One deficient cohort's admissible index span, with the indices already held
-/// discounted. A cohort in surplus never appears here.
+/// One deficient cohort's admissible index span and the exact indices the
+/// engine says are still to be asked for. A cohort in surplus never appears
+/// here.
 #[derive(Debug, Clone)]
 pub(in crate::pipeline) struct CohortWindow {
     pub deficit: CohortDeficit,
     /// Admissible global recovery-index span for the whole cohort.
     pub indices: Range<u64>,
-    /// Distinct compatible indices already held, inside `indices`.
+    /// Exactly the indices this cohort still has to fetch: neither already
+    /// available nor already declared in flight. The engine derives these, so
+    /// nothing here re-counts congruence or re-subtracts what is held.
+    next: Vec<u64>,
+    /// Distinct compatible indices already held, inside `indices`. Carrier
+    /// exclusion needs these because a carrier may publish any admissible
+    /// index, not only the lowest ones the engine would ask for next.
     held: Vec<u64>,
-    /// Admissible indices in `indices` that are not yet held.
-    pub remaining: u64,
+    /// What still has to be asked for, as the engine counts it. This is
+    /// `additional` less whatever acquisition has already declared in flight,
+    /// so a reassessment mid-fetch never asks for the same index twice.
+    outstanding: u64,
 }
 
 impl CohortWindow {
-    /// Whether any index this cohort still admits falls inside `span`.
+    /// Whether a carrier advertising `span` could supply anything this cohort
+    /// still wants. The engine names the indices it would ask for next, but a
+    /// carrier is free to publish any admissible index, so this walks the
+    /// overlap by congruence and stops at the first one not already held.
+    /// A cohort whose whole deficit is in flight wants nothing.
     pub fn admits_span(&self, span: &Range<u64>) -> bool {
+        if self.outstanding == 0 || self.deficit.cohorts == 0 {
+            return false;
+        }
         let overlap = intersect(&self.indices, span);
-        let admissible = congruent_count(&overlap, self.deficit.cohort, self.deficit.cohorts);
-        let held = self
-            .held
-            .iter()
-            .filter(|index| overlap.contains(index))
-            .count() as u64;
-        admissible > held
+        let Some(mut index) = first_congruent(&overlap, self.deficit.cohort, self.deficit.cohorts)
+        else {
+            return false;
+        };
+        // `held` is the handful of indices already in hand, so the first
+        // candidate that is not one of them ends this walk immediately.
+        while index < overlap.end {
+            if !self.held.contains(&index) {
+                return true;
+            }
+            let Some(next) = index.checked_add(self.deficit.cohorts) else {
+                return false;
+            };
+            index = next;
+        }
+        false
     }
 
     /// Whether this cohort's own span can no longer supply what it still needs.
+    /// The engine stops generating indices at the end of the admissible span,
+    /// so a short list is its exhaustion signal.
     pub fn is_exhausted(&self) -> bool {
-        self.deficit.additional != 0 && self.remaining < self.deficit.additional
+        self.outstanding != 0 && self.remaining() < self.outstanding
+    }
+
+    /// The indices this cohort still has to fetch, lowest first. The engine
+    /// derives these; the coordinator reads them straight off the requirement
+    /// when it declares a window, so this accessor exists for the tests that
+    /// pin the derivation.
+    #[cfg(test)]
+    pub fn next_indices(&self) -> &[u64] {
+        &self.next
+    }
+
+    /// How many indices this cohort still has to fetch.
+    pub fn remaining(&self) -> u64 {
+        self.next.len() as u64
     }
 }
 
@@ -63,25 +104,27 @@ impl CohortPlan {
             if need.additional == 0 {
                 continue;
             }
+            // Only what is not yet spoken for is asked for again: a cohort
+            // whose whole deficit is in flight contributes no bytes and admits
+            // no carrier until those articles land or fail.
             self.needed_bytes = self
                 .needed_bytes
-                .saturating_add(need.additional.saturating_mul(block_size));
-            let held: Vec<u64> = need
-                .available
-                .iter()
-                .copied()
-                .filter(|index| {
-                    need.recovery_indices.contains(index)
-                        && need.cohorts != 0
-                        && index % need.cohorts == need.cohort
-                })
-                .collect();
-            let admissible = congruent_count(&need.recovery_indices, need.cohort, need.cohorts);
+                .saturating_add(need.outstanding.saturating_mul(block_size));
             self.windows.push(CohortWindow {
                 deficit: CohortDeficit::from_requirement(need),
                 indices: need.recovery_indices.clone(),
-                remaining: admissible.saturating_sub(held.len() as u64),
-                held,
+                next: need.next_indices.clone(),
+                held: need
+                    .available
+                    .iter()
+                    .copied()
+                    .filter(|index| {
+                        need.recovery_indices.contains(index)
+                            && need.cohorts != 0
+                            && index % need.cohorts == need.cohort
+                    })
+                    .collect(),
+                outstanding: need.outstanding,
             });
         }
     }
@@ -116,17 +159,19 @@ fn intersect(left: &Range<u64>, right: &Range<u64>) -> Range<u64> {
     start..end.max(start)
 }
 
-/// Count the indices in `range` congruent to `cohort` modulo `cohorts`.
-fn congruent_count(range: &Range<u64>, cohort: u64, cohorts: u64) -> u64 {
+/// The lowest index in `range` congruent to `cohort` modulo `cohorts`.
+fn first_congruent(range: &Range<u64>, cohort: u64, cohorts: u64) -> Option<u64> {
     if cohorts == 0 || cohort >= cohorts || range.start >= range.end {
-        return 0;
+        return None;
     }
-    let below = |limit: u64| {
-        let whole = limit / cohorts;
-        let rest = limit % cohorts;
-        whole + u64::from(cohort < rest)
+    let rest = range.start % cohorts;
+    let step = if rest <= cohort {
+        cohort - rest
+    } else {
+        cohorts - rest + cohort
     };
-    below(range.end).saturating_sub(below(range.start))
+    let index = range.start.checked_add(step)?;
+    (index < range.end).then_some(index)
 }
 
 /// The global recovery-index span a PAR3 volume name advertises, when it
@@ -155,6 +200,31 @@ mod tests {
         held: &[u64],
         additional: u64,
     ) -> RecoveryRequirement {
+        requirement_in_flight(cohort, cohorts, span, held, additional, &[])
+    }
+
+    /// Mirrors what the engine derives: `outstanding` is the deficit less what
+    /// the host has declared in flight, and `next_indices` is exactly that
+    /// many admissible indices that are neither held nor in flight.
+    fn requirement_in_flight(
+        cohort: u64,
+        cohorts: u64,
+        span: Range<u64>,
+        held: &[u64],
+        additional: u64,
+        in_flight: &[u64],
+    ) -> RecoveryRequirement {
+        let outstanding = additional.saturating_sub(in_flight.len() as u64);
+        let next_indices: Vec<u64> = span
+            .clone()
+            .filter(|index| {
+                cohorts != 0
+                    && index % cohorts == cohort
+                    && !held.contains(index)
+                    && !in_flight.contains(index)
+            })
+            .take(outstanding as usize)
+            .collect();
         RecoveryRequirement {
             matrix: [cohort as u8; 16],
             cohort,
@@ -163,20 +233,21 @@ mod tests {
             lost: additional,
             available: held.to_vec(),
             additional,
+            in_flight: in_flight.len() as u64,
+            outstanding,
+            next_indices,
         }
     }
 
     #[test]
-    fn congruent_counting_matches_a_direct_scan() {
+    fn the_first_admissible_index_matches_a_direct_scan() {
         for cohorts in 1..5u64 {
             for cohort in 0..cohorts {
                 for start in 0..7u64 {
                     for end in start..12u64 {
-                        let direct = (start..end)
-                            .filter(|index| index % cohorts == cohort)
-                            .count() as u64;
+                        let direct = (start..end).find(|index| index % cohorts == cohort);
                         assert_eq!(
-                            congruent_count(&(start..end), cohort, cohorts),
+                            first_congruent(&(start..end), cohort, cohorts),
                             direct,
                             "cohort {cohort}/{cohorts} over {start}..{end}"
                         );
@@ -184,8 +255,39 @@ mod tests {
                 }
             }
         }
-        assert_eq!(congruent_count(&(0..10), 0, 0), 0);
-        assert_eq!(congruent_count(&(0..10), 3, 2), 0);
+        assert_eq!(first_congruent(&(0..10), 0, 0), None);
+        assert_eq!(first_congruent(&(0..10), 3, 2), None);
+    }
+
+    /// Deliverable: a reassessment taken while articles are in flight asks for
+    /// nothing that was already requested. The engine subtracts what the host
+    /// declared, and the plan spends only what is left.
+    #[test]
+    fn indices_already_in_flight_are_never_requested_again() {
+        const BLOCK: u64 = 1024;
+        let mut plan = CohortPlan::default();
+        // Cohort 1 of 2 over 0..10 admits 1, 3, 5, 7, 9. It holds 1, is short
+        // two blocks, and has already declared index 3 in flight.
+        plan.push_view(&[requirement_in_flight(1, 2, 0..10, &[1], 2, &[3])], BLOCK);
+        assert_eq!(plan.needed_bytes, BLOCK, "only the unspoken-for block");
+        assert_eq!(plan.windows[0].next_indices(), [5]);
+        assert_eq!(plan.windows[0].remaining(), 1);
+        assert!(!plan.windows[0].is_exhausted());
+
+        // Declaring the rest in flight leaves nothing to ask for, and no
+        // carrier is worth fetching until those articles land or fail.
+        let mut spoken = CohortPlan::default();
+        spoken.push_view(
+            &[requirement_in_flight(1, 2, 0..10, &[1], 2, &[3, 5])],
+            BLOCK,
+        );
+        assert_eq!(spoken.needed_bytes, 0);
+        assert!(spoken.windows[0].next_indices().is_empty());
+        assert!(spoken.excludes_span(&(0..10)));
+        assert!(
+            !spoken.windows[0].is_exhausted(),
+            "fully spoken for is not the same as out of indices"
+        );
     }
 
     #[test]
@@ -201,8 +303,10 @@ mod tests {
         assert_eq!(plan.windows.len(), 1);
         assert_eq!(plan.windows[0].deficit.cohort, 1);
         assert_eq!(plan.needed_bytes, 4096);
-        // Cohort 1 admits 1, 3, 5, 7 and already holds 1.
-        assert_eq!(plan.windows[0].remaining, 3);
+        // Cohort 1 admits 1, 3, 5, 7, already holds 1, and is short one: the
+        // engine names index 3 as the one still to ask for.
+        assert_eq!(plan.windows[0].next_indices(), [3]);
+        assert_eq!(plan.windows[0].remaining(), 1);
         assert!(!plan.windows[0].is_exhausted());
     }
 
@@ -232,7 +336,7 @@ mod tests {
         // Cohort 1 of 2 over 0..4 admits 1 and 3; it holds both and still
         // needs one more, so nothing published anywhere can close it.
         plan.push_view(&[requirement(1, 2, 0..4, &[1, 3], 1)], 512);
-        assert_eq!(plan.windows[0].remaining, 0);
+        assert_eq!(plan.windows[0].remaining(), 0);
         assert!(plan.windows[0].is_exhausted());
         assert_eq!(plan.exhausted().len(), 1);
         assert_eq!(plan.exhausted()[0].cohort, 1);

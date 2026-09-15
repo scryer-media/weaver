@@ -107,7 +107,10 @@ impl Par3Job {
                 match result {
                     Ok(true) => set.assess()?,
                     Ok(false) => {}
-                    Err(EngineError::ResourceLimit("placement read work")) => {
+                    Err(EngineError::ResourceLimit(par3_rs::runtime::ResourceLimit {
+                        what: "placement read work",
+                        ..
+                    })) => {
                         self.donor_search.exhausted = true;
                         tracing::debug!(
                             stage = "donor_search",
@@ -328,7 +331,12 @@ fn locate(
     );
     if matches!(
         result,
-        Err(EngineError::ResourceLimit("placement read work"))
+        Err(EngineError::ResourceLimit(
+            par3_rs::runtime::ResourceLimit {
+                what: "placement read work",
+                ..
+            }
+        ))
     ) {
         tracing::debug!(
             stage = "donor_search",

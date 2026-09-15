@@ -384,24 +384,34 @@ async fn withheld_recovery_articles_show_as_a_wait_a_deficit_and_a_stall() {
 #[test]
 fn an_over_budget_admission_names_its_budget_and_its_class() {
     use crate::operations::metrics::{Par3AdmissionReason, Par3OutcomeClass};
+    use crate::pipeline::repair::par3::budget::{engine_refusal, host_limit};
     use crate::pipeline::repair::par3::outcome::{admission_reason, classify_memory_refusal};
-    use par3_rs::runtime::EngineError;
+    use par3_rs::runtime::LimitCause;
 
-    // A refusal while a peer holds a work unit, for a set that would fit
-    // alone, is a wait: the peer's handback resolves it.
-    let waiting = classify_memory_refusal(4 << 20, 16 << 20, 1 << 20, true);
+    // The engine measures its own refusals now, so every case below is
+    // provoked from a real native budget rather than described by hand.
+    //
+    // A refusal caused by a peer holding the budget, while a peer work unit is
+    // in flight, is a wait: the peer's handback resolves it.
+    let waiting = classify_memory_refusal(engine_refusal(LimitCause::PeerContention), true);
     assert_eq!(waiting.class(), Par3OutcomeClass::WaitingForMemory);
     assert!(!waiting.is_terminal(), "a peer collision is not a failure");
 
-    // The same need with no peer in flight, or a need past the ceiling, can
+    // The same refusal with no peer in flight, or a need past the ceiling, can
     // never be satisfied by waiting.
     for outcome in [
-        classify_memory_refusal(4 << 20, 16 << 20, 1 << 20, false),
-        classify_memory_refusal(64 << 20, 16 << 20, 16 << 20, true),
+        classify_memory_refusal(engine_refusal(LimitCause::PeerContention), false),
+        classify_memory_refusal(engine_refusal(LimitCause::ExceedsLimit), true),
     ] {
         assert_eq!(outcome.class(), Par3OutcomeClass::DoesNotFit);
         assert!(outcome.is_terminal());
     }
+
+    // A ceiling the engine cannot measure in bytes is terminal whatever else
+    // is in flight, and it names the budget that refused.
+    let unmeasured = classify_memory_refusal(engine_refusal(LimitCause::Unmeasured), true);
+    assert_eq!(unmeasured.class(), Par3OutcomeClass::NotExecutable);
+    assert!(unmeasured.is_terminal());
 
     // Each refusal reaches the slot its own budget names.
     for (label, expected) in [
@@ -420,7 +430,7 @@ fn an_over_budget_admission_names_its_budget_and_its_class() {
         ("something the engine invented", Par3AdmissionReason::Other),
     ] {
         let metrics = crate::operations::metrics::Par3Metrics::default();
-        let reason = admission_reason(&EngineError::ResourceLimit(label));
+        let reason = admission_reason(&host_limit(label));
         assert_eq!(reason, expected, "{label}");
         metrics.note_admission_refused(reason);
         let refused = metrics.admission_refused();
@@ -476,7 +486,7 @@ async fn a_peer_handback_wakes_every_job_parked_on_par3_memory() {
     coordinator
         .force_dispatch(peer, SourceId(0), carrier)
         .unwrap();
-    coordinator.force_spill(parked, SourceId(0));
+    coordinator.force_spill(parked, SourceId(0), None);
     pipeline.par3_runtime = Some(Box::new(coordinator));
 
     assert!(pipeline.spill_par3_source(parked).await);
@@ -1236,9 +1246,9 @@ async fn an_unresolved_option_reference_does_not_block_recovery() {
     );
 }
 
-/// Deliverable: metadata built to exhaust the host stops at a named engine
-/// ceiling instead, the verdict names that ceiling, and the completion check
-/// still reaches an answer and stops.
+/// Deliverable: metadata built to exhaust the host stops at a named ceiling
+/// instead, the verdict names that ceiling, and the completion check still
+/// reaches an answer and stops.
 #[tokio::test]
 async fn hostile_metadata_fails_with_the_ceiling_it_reached() {
     let root = TempDir::new().unwrap();
@@ -1270,9 +1280,9 @@ async fn hostile_metadata_fails_with_the_ceiling_it_reached() {
     let failure = verdict
         .failure
         .clone()
-        .unwrap_or_else(|| panic!("a set past an engine ceiling fails: {verdict:#?}"));
+        .unwrap_or_else(|| panic!("a set past a stated ceiling fails: {verdict:#?}"));
     assert!(
-        failure.contains("exceeds an engine execution limit"),
+        failure.contains("PAR3 repair is not executable"),
         "{failure}"
     );
     assert!(
@@ -1287,5 +1297,367 @@ async fn hostile_metadata_fails_with_the_ceiling_it_reached() {
     assert!(
         verdict.terminated,
         "the completion check reached its verdict and stopped"
+    );
+}
+
+/// Build a job over `root` whose payload is damaged at `damage`, publish its
+/// carriers, and drive PAR3 until it stops asking for a next step. The
+/// pipeline is returned still live so a caller can keep driving it.
+///
+/// Calling this twice with the same `root` and `job_id` is a restart: the
+/// second pipeline is new, its coordinator holds nothing, and the sources it
+/// finds on disk are byte-for-byte the ones the first run left there.
+async fn settled_par3_job(
+    root: &TempDir,
+    job_id: JobId,
+    damage: &[usize],
+    settle: bool,
+    database: &str,
+) -> (Pipeline, Vec<(String, Vec<u8>)>, std::path::PathBuf) {
+    // The three storage roots are shared, because that is what makes the second
+    // call a restart over the very same bytes. The database is not: the first
+    // run's handle is dropped but its background maintenance may still hold the
+    // file, and a restart is supposed to prove that the sources on disk carry
+    // the verdict, not that two runs can share one journal.
+    let (mut pipeline, _, _) = new_direct_pipeline_at_roots(
+        root.path().join("data"),
+        root.path().join("intermediate"),
+        root.path().join("complete"),
+        root.path().join(database),
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        0,
+        None,
+    )
+    .await;
+    let mut files: Vec<(String, Vec<u8>)> = damaged_payload(damage)
+        .into_iter()
+        .map(|(name, bytes)| (name.to_string(), bytes))
+        .collect();
+    let first_carrier = files.len() as u32;
+    files.push(("set.par3".into(), INDEX.to_vec()));
+    files.push(("set.vol0+1.par3".into(), VOLUME.to_vec()));
+    let mut spec = standalone_job_spec(
+        "restart determinism",
+        &files
+            .iter()
+            .map(|(name, bytes)| (name.clone(), bytes.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    let working = insert_active_job(&mut pipeline, job_id, spec).await;
+    let _ = tokio::fs::create_dir(working.join("sub")).await;
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+    }
+    for offset in 0..2u32 {
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: first_carrier + offset,
+                },
+            )
+            .await;
+        settle_par3_recovery(&mut pipeline, job_id).await;
+    }
+    if settle {
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .download_queue
+            .extract_matching(|_| true);
+        for _ in 0..16 {
+            if !pipeline.check_par3_completion(job_id).await {
+                break;
+            }
+            settle_par3_recovery(&mut pipeline, job_id).await;
+        }
+    }
+    (pipeline, files, working)
+}
+
+/// The engine's own source-read counters as weaver folds them in.
+fn source_reads(pipeline: &Pipeline) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let par3 = &pipeline.metrics.par3;
+    (
+        par3.source_reads_total.load(Relaxed),
+        par3.source_read_bytes_total.load(Relaxed),
+    )
+}
+
+/// Deliverable: a job whose acquisition is interrupted and taken up again with
+/// unchanged sources reaches the same verdict class and the same rendered
+/// message, and resuming that acquisition reads no protected source bytes at
+/// all.
+#[tokio::test]
+async fn a_restarted_acquisition_reaches_the_same_verdict_without_rereading_sources() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(3410);
+    let damage = [300usize, 2300, 4300];
+
+    let (first, _, _) = settled_par3_job(&root, job_id, &damage, true, "first.db").await;
+    let before_classes = first.metrics.par3.outcomes();
+    let before_failure = match job_status_for_assert(&first, job_id) {
+        Some(JobStatus::Failed { error }) => Some(error),
+        _ => None,
+    };
+    assert!(
+        before_failure.is_some(),
+        "the damaged fixture must reach a terminal verdict for this to compare"
+    );
+    drop(first);
+
+    // The restart: a brand new pipeline and coordinator over the very same
+    // on-disk sources and carriers.
+    let (mut second, _, _) = settled_par3_job(&root, job_id, &damage, true, "second.db").await;
+    let after_failure = match job_status_for_assert(&second, job_id) {
+        Some(JobStatus::Failed { error }) => Some(error),
+        _ => None,
+    };
+    assert_eq!(
+        second.metrics.par3.outcomes(),
+        before_classes,
+        "a restart changed which verdict classes the job passed through"
+    );
+    assert_eq!(
+        after_failure, before_failure,
+        "a restart changed the rendered verdict"
+    );
+
+    // Taking the acquisition up again reads nothing: the retained assessment
+    // already answers, so neither read counter moves.
+    let before = source_reads(&second);
+    for _ in 0..4 {
+        second.check_par3_completion(job_id).await;
+        settle_par3_recovery(&mut second, job_id).await;
+        second.promote_par3_recovery_window(job_id, false);
+        settle_par3_recovery(&mut second, job_id).await;
+    }
+    assert_eq!(
+        source_reads(&second),
+        before,
+        "resuming acquisition reread protected sources"
+    );
+}
+
+/// Deliverable: only a source whose bytes actually changed is verified again.
+/// An unchanged peer is not reread merely because something else was.
+#[tokio::test]
+async fn only_a_source_whose_generation_changed_is_verified_again() {
+    let root = TempDir::new().unwrap();
+    let job_id = JobId(3411);
+    let (mut pipeline, files, working) =
+        settled_par3_job(&root, job_id, &[300, 2300, 4300], false, "weaver.db").await;
+    let (_, bytes_before) = source_reads(&pipeline);
+
+    // Rewrite one payload file and announce it again. Its generation changes;
+    // the other two sources are untouched.
+    let changed = 0u32;
+    let mut replacement = files[changed as usize].1.clone();
+    replacement[7] ^= 0xff;
+    tokio::fs::write(working.join(&files[changed as usize].0), &replacement)
+        .await
+        .unwrap();
+    pipeline.invalidate_par3_source_write(NzbFileId {
+        job_id,
+        file_index: changed,
+    });
+    pipeline.refresh_par3_sources(job_id).unwrap();
+    for _ in 0..8 {
+        if !pipeline.check_par3_completion(job_id).await {
+            break;
+        }
+        settle_par3_recovery(&mut pipeline, job_id).await;
+    }
+
+    let (_, bytes_after) = source_reads(&pipeline);
+    let reread = bytes_after - bytes_before;
+    let changed_len = replacement.len() as u64;
+    assert!(
+        reread != 0,
+        "a source whose bytes changed must be verified again"
+    );
+    assert!(
+        reread <= changed_len,
+        "only the changed source may be reread: {reread} bytes for a {changed_len}-byte file"
+    );
+}
+
+/// Every recovery requirement the retained assessments currently carry.
+fn requirements(pipeline: &Pipeline, job_id: JobId) -> Vec<par3_rs::session::RecoveryRequirement> {
+    pipeline
+        .par3_runtime
+        .as_ref()
+        .into_iter()
+        .flat_map(|runtime| {
+            runtime
+                .assessments(job_id)
+                .flat_map(|(_, view)| view.requirements.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Deliverable: a recovery-only merge does not duplicate acquisition. Once a
+/// window declares the indices it is fetching, the reassessment that merge
+/// triggers asks for none of them a second time; abandoning the window puts
+/// them back in play.
+#[tokio::test]
+async fn a_recovery_only_merge_never_requests_an_index_twice() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3412);
+    let mut files: Vec<(String, Vec<u8>)> = damaged_payload(&[300, 2300])
+        .into_iter()
+        .map(|(name, bytes)| (name.to_string(), bytes))
+        .collect();
+    files.push(("set.par3".into(), INDEX.to_vec()));
+    // Two recovery carriers are announced and neither has arrived: their
+    // segments stay queued, which is what an acquisition window is admitted
+    // against. The first is delivered later as a recovery-only merge; the
+    // second never arrives at all.
+    files.push(("set.vol0+1.par3".into(), Vec::new()));
+    files.push(("set.vol1+1.par3".into(), Vec::new()));
+    let mut spec = standalone_job_spec(
+        "recovery-only merge",
+        &files
+            .iter()
+            .map(|(name, bytes)| (name.clone(), (bytes.len() as u32).max(600_000)))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    spec.files[4].segments = vec![segment_spec! {
+        number: 0,
+        bytes: VOLUME.len() as u32,
+        message_id: "cohort-zero@invented.test".to_string(),
+    }];
+    spec.files[5].segments = (0..4)
+        .map(|number| {
+            segment_spec! {
+                number: number,
+                bytes: 600_000,
+                message_id: format!("cohort-one-{number}@invented.test"),
+            }
+        })
+        .collect();
+    let working = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::create_dir(working.join("sub")).await.unwrap();
+    for (index, (name, bytes)) in files[..4].iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+    }
+    pipeline
+        .try_load_par3_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 3,
+            },
+        )
+        .await;
+    settle_par3_recovery(&mut pipeline, job_id).await;
+
+    let before = requirements(&pipeline, job_id);
+    assert_eq!(before.len(), 1, "the fixture set has one cohort");
+    assert_eq!(before[0].in_flight, 0, "nothing has been asked for yet");
+    assert_eq!(before[0].outstanding, before[0].additional);
+    let wanted = before[0].next_indices.clone();
+    assert!(!wanted.is_empty(), "a short cohort must name what it wants");
+
+    // The payload and index files are complete; their own spent segments must
+    // not compete with the recovery window for its budget.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .extract_matching(|work| work.segment_id.file_id.file_index < 4);
+    assert!(pipeline.promote_par3_recovery_window(job_id, false));
+    settle_par3_recovery(&mut pipeline, job_id).await;
+    let declared = requirements(&pipeline, job_id);
+    assert_ne!(
+        declared[0].in_flight, 0,
+        "an admitted window must declare what it is fetching"
+    );
+    assert_eq!(
+        declared[0].outstanding,
+        declared[0].additional - declared[0].in_flight
+    );
+    for index in &declared[0].next_indices {
+        assert!(
+            !wanted[..declared[0].in_flight as usize].contains(index),
+            "index {index} was declared in flight and is being asked for again"
+        );
+    }
+
+    // The recovery-only merge: one of the carriers arrives, no protected byte
+    // changes, and the assessment is taken again.
+    tokio::fs::write(working.join("set.vol0+1.par3"), VOLUME)
+        .await
+        .unwrap();
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let file_id = NzbFileId {
+            job_id,
+            file_index: 4,
+        };
+        let file = state.assembly.file_mut(file_id).unwrap();
+        file.record_placement(0, 0, VOLUME.len() as u32);
+        file.commit_segment(0, VOLUME.len() as u32).unwrap();
+    }
+    pipeline
+        .try_load_par3_metadata(
+            job_id,
+            NzbFileId {
+                job_id,
+                file_index: 4,
+            },
+        )
+        .await;
+    settle_par3_recovery(&mut pipeline, job_id).await;
+    let after = requirements(&pipeline, job_id);
+    assert_eq!(
+        after[0].available,
+        wanted[..1],
+        "the merged carrier's recovery index must be available now"
+    );
+    assert!(
+        after[0].additional < before[0].additional,
+        "a recovery-only merge must reduce what the cohort is short by"
+    );
+    for index in &after[0].next_indices {
+        assert!(
+            !after[0].available.contains(index),
+            "index {index} already arrived and must not be asked for again"
+        );
+        assert!(
+            !wanted[..declared[0].in_flight as usize].contains(index),
+            "index {index} is still in flight and must not be asked for again"
+        );
+    }
+
+    // Abandoning the window puts everything it declared back in play, so the
+    // deficit is askable again rather than stranded in flight forever.
+    pipeline.settle_par3_recovery_batch_for_test(job_id);
+    settle_par3_recovery(&mut pipeline, job_id).await;
+    let released = requirements(&pipeline, job_id);
+    assert_eq!(
+        released[0].in_flight, 0,
+        "an abandoned window must release what it declared"
+    );
+    assert_eq!(released[0].outstanding, released[0].additional);
+    assert_eq!(
+        released[0].next_indices.len() as u64,
+        released[0].outstanding
     );
 }

@@ -58,7 +58,7 @@ async fn par3_spill_preserves_encrypted_boundary_holds_as_posted_bytes() {
         pipeline.repair_work_done_tx.clone(),
         std::sync::Arc::clone(&pipeline.metrics),
     );
-    coordinator.force_spill(job_id, SourceId(0));
+    coordinator.force_spill(job_id, SourceId(0), None);
     pipeline.par3_runtime = Some(Box::new(coordinator));
     assert!(pipeline.spill_par3_source(job_id).await);
     settle_direct_post_repair_work(&mut pipeline).await;
@@ -107,7 +107,7 @@ async fn spill_held_article(deny_disk: bool) {
         pipeline.repair_work_done_tx.clone(),
         std::sync::Arc::clone(&pipeline.metrics),
     );
-    coordinator.force_spill(job_id, SourceId(0));
+    coordinator.force_spill(job_id, SourceId(0), None);
     pipeline.par3_runtime = Some(Box::new(coordinator));
     assert!(pipeline.spill_par3_source(job_id).await);
     if deny_disk {

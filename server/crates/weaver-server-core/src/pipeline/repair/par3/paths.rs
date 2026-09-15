@@ -27,6 +27,13 @@ pub(in crate::pipeline) enum UnsafePath {
     ReservedDeviceName,
     /// Longer than the reconstructed-output identity allows.
     TooLong,
+    /// A rule only the engine's table states. Weaver's own check never
+    /// produces this: it is how an engine refusal that no rule above says the
+    /// same thing about keeps its own words instead of borrowing a weaker
+    /// one's. The engine's table is deliberately the stricter of the two, and
+    /// it is `#[non_exhaustive]`, so a rule it gains later lands here rather
+    /// than silently becoming one of weaver's.
+    EngineRule(par3_rs::PathRule),
 }
 
 impl UnsafePath {
@@ -40,6 +47,34 @@ impl UnsafePath {
             Self::SeparatorInComponent => "a separator inside a component",
             Self::ReservedDeviceName => "a reserved device name",
             Self::TooLong => "more bytes than an output identity allows",
+            Self::EngineRule(rule) => rule.describe(),
+        }
+    }
+
+    /// The narrowest of weaver's own reasons that says the same thing as an
+    /// engine refusal, or the engine's rule kept verbatim when none does.
+    ///
+    /// The two tables are one vocabulary for one idea, but they are not the
+    /// same table: the engine bounds a component at 255 bytes and a path at
+    /// 4096, refuses every ASCII control byte rather than NUL alone, and
+    /// refuses a trailing space or dot, none of which weaver states. Claiming
+    /// one of weaver's reasons for those would be a wrong sentence about why
+    /// the name was refused, so they keep the engine's.
+    pub(in crate::pipeline) fn from_engine(violation: &par3_rs::PathViolation) -> Self {
+        use par3_rs::PathRule;
+        match violation.rule {
+            PathRule::Empty => Self::EmptyComponent,
+            PathRule::Absolute => Self::Absolute,
+            PathRule::CurrentDirectory => Self::CurrentDirectory,
+            PathRule::ParentDirectory => Self::ParentDirectory,
+            // Weaver refuses a backslash and a colon under one reason, because
+            // both make one name mean two things on two machines.
+            PathRule::Backslash | PathRule::Colon => Self::SeparatorInComponent,
+            PathRule::ReservedDevice => Self::ReservedDeviceName,
+            // The engine refuses every control byte under one rule. A NUL is
+            // the one weaver also names, and the component says which it was.
+            PathRule::Control if violation.component.contains('\0') => Self::Nul,
+            rule => Self::EngineRule(rule),
         }
     }
 }
