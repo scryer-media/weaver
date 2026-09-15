@@ -172,8 +172,11 @@ func TestParseRustToolchainChannel(t *testing.T) {
 func TestWeaverImagePlanDockerfilePublishedShape(t *testing.T) {
 	plan := weaverImagePlan{Toolchain: "1.97.1"}
 	dockerfile := plan.dockerfile()
-	if !strings.Contains(dockerfile, "cargo build --release --locked -p weaver") {
+	if !strings.Contains(dockerfile, "cargo build --locked -p weaver") {
 		t.Fatalf("published dockerfile must restore --locked:\n%s", dockerfile)
+	}
+	if strings.Contains(dockerfile, "--release") || strings.Contains(dockerfile, "unknown-linux-musl") {
+		t.Fatalf("the e2e image must stay a glibc debug build:\n%s", dockerfile)
 	}
 	if strings.Contains(dockerfile, "COPY --from=") && strings.Contains(dockerfile, "/rarpar") {
 		t.Fatalf("published dockerfile must not carry a patch context:\n%s", dockerfile)
@@ -186,7 +189,9 @@ func TestWeaverImagePlanDockerfilePublishedShape(t *testing.T) {
 		"COPY apps/weaver-web/package.json apps/weaver-web/package-lock.json",
 		"--mount=type=cache,id=weaver-e2e-npm,target=/root/.npm,sharing=locked",
 		"--mount=type=cache,id=weaver-e2e-cargo-target,target=/app/target,sharing=locked",
-		"CARGO_INCREMENTAL=1 CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16",
+		"CARGO_PROFILE_DEV_DEBUG=line-tables-only",
+		"COPY --from=builder /app/apps/weaver-web/dist /app/apps/weaver-web/dist",
+		"mkdir -p /config /data /app/server/app/weaver",
 	} {
 		if !strings.Contains(dockerfile, fragment) {
 			t.Fatalf("published dockerfile is missing cache optimization %q:\n%s", fragment, dockerfile)

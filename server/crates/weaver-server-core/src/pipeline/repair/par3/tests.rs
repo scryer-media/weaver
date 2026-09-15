@@ -43,7 +43,7 @@ fn retired_binding_identity_cannot_be_published() {
 fn embedded_name_rebinding_withdraws_old_native_identity_without_rescanning() {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../e2e/internal/weaver/testdata/par3-inside/archive.zip"
+        "/tests/fixtures/par3-inside/archive.zip"
     ));
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("archive.zip");
@@ -115,10 +115,7 @@ fn embedded_name_rebinding_withdraws_old_native_identity_without_rescanning() {
 
 #[test]
 fn shared_description_consistency_requires_no_source_reads() {
-    const ROOT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../e2e/internal/weaver/testdata/par3-shared"
-    );
+    const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/par3-shared");
     for conflict in [false, true] {
         let mut job = Par3Job::default();
         job.scan_file(SourceId(99), PathBuf::from(ROOT).join("cauchy.par3"), None)
@@ -174,7 +171,7 @@ fn shared_description_consistency_requires_no_source_reads() {
 fn embedded_late_metadata_rewinds_once_and_preserves_hole_continuity() {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../e2e/internal/weaver/testdata/par3-inside/archive.zip"
+        "/tests/fixtures/par3-inside/archive.zip"
     ));
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("archive.zip");
@@ -278,7 +275,7 @@ fn retained_sessions_share_the_process_memory_pool_and_release_their_charge() {
 fn scanning_resumes_after_a_hole_and_revisits_the_unfinished_packet_on_arrival() {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../e2e/internal/weaver/testdata/par3-native/set.vol1+2.par3"
+        "/tests/fixtures/par3-native/set.vol1+2.par3"
     ));
     let len = bytes.len() as u64;
     let mut job = Par3Job::default();

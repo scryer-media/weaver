@@ -38,7 +38,7 @@ func TestPar3E2E(t *testing.T) {
 	for i := range payload {
 		payload[i] = byte(i*17 + (i>>8)*13 + 7)
 	}
-	fixtureDir := filepath.Join("testdata", "par3-native")
+	fixtureDir := filepath.Join(weaverRepoPath(), "server", "crates", "weaver-server-core", "tests", "fixtures", "par3-native")
 	manifestBytes, err := os.ReadFile(filepath.Join(fixtureDir, "sha256.json"))
 	if err != nil {
 		t.Fatal(err)

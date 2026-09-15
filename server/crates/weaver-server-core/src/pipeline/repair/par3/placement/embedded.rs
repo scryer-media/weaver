@@ -155,7 +155,7 @@ mod tests {
     fn embedded_identity_waits_for_holes_and_rejects_stale_proposals() {
         let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../e2e/internal/weaver/testdata/par3-inside/archive.zip"
+            "/tests/fixtures/par3-inside/archive.zip"
         ));
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("opaque.dat");
