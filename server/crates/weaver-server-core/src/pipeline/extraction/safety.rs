@@ -164,6 +164,19 @@ struct ActiveState {
 /// ordinary contention.
 const PROCESS_MEMORY_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
 
+/// The part of the process memory limit an optional ceiling allowance never
+/// takes: a thirty-second of the limit, at least 256 MiB, and never more than a
+/// quarter of it.
+///
+/// Retained admissions (a submitted NZB's scheduling metadata, repeated-article
+/// indexes) reserve without waiting and fail outright when the budget is full.
+/// A ceiling grants whatever retained state leaves, so without a carve-out a
+/// conventional 7z extraction fills the budget to the limit and every
+/// submission made during it is rejected.
+fn ceiling_headroom_bytes(limit: u64) -> u64 {
+    (limit / 32).max(256 * MIB).min(limit / 4)
+}
+
 /// Shared reservations for scheduling state, PAR2 packet metadata, and archive
 /// decoders in this pipeline. Normal extraction and direct chases use one pool.
 ///
@@ -176,6 +189,7 @@ const PROCESS_MEMORY_WAIT_WARN_AFTER: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub(crate) struct ProcessMemoryBudget {
     limit: u64,
+    ceiling_headroom: u64,
     reserved: Arc<AtomicU64>,
     retained: Arc<AtomicU64>,
     total_retained: Arc<AtomicU64>,
@@ -189,6 +203,7 @@ impl ProcessMemoryBudget {
     pub(crate) fn new(limit: u64) -> Self {
         Self {
             limit,
+            ceiling_headroom: ceiling_headroom_bytes(limit),
             reserved: Arc::new(AtomicU64::new(0)),
             retained: Arc::new(AtomicU64::new(0)),
             total_retained: Arc::new(AtomicU64::new(0)),
@@ -214,6 +229,7 @@ impl ProcessMemoryBudget {
             });
         Arc::new(Self {
             limit: self.limit,
+            ceiling_headroom: self.ceiling_headroom,
             reserved: Arc::clone(&self.reserved),
             retained,
             total_retained: Arc::clone(&self.total_retained),
@@ -308,19 +324,23 @@ impl ProcessMemoryBudget {
             // requirement. Recompute it under the admission lock so metadata
             // published since the budget was created cannot strand all waiters.
             // Active decoder reservations still cause a wait, never a shrink.
+            // The headroom stays free for retained admissions, which cannot wait.
+            let allowance_limit = if ceiling {
+                self.limit.saturating_sub(self.ceiling_headroom)
+            } else {
+                self.limit
+            };
             let granted = if ceiling {
                 bytes.min(
-                    self.limit
-                        .saturating_sub(self.total_retained.load(Ordering::Acquire)),
+                    allowance_limit.saturating_sub(self.total_retained.load(Ordering::Acquire)),
                 )
             } else {
                 bytes
             };
             // Only this owner's metadata makes the request intrinsically too
             // large. Other jobs can release their retained state while we wait.
-            let own_available = self
-                .limit
-                .saturating_sub(self.retained.load(Ordering::Acquire));
+            let own_available =
+                allowance_limit.saturating_sub(self.retained.load(Ordering::Acquire));
             if (ceiling && own_available == 0) || (!ceiling && bytes > own_available) {
                 return Err("WEAVER_RESOURCE_LIMIT[memory]: decoder and retained job state exceed the process limit".to_string());
             }
@@ -1860,14 +1880,60 @@ mod tests {
         let own = pool.for_job(1).try_reserve_retained(4 * MIB).unwrap();
         let peer = pool.for_job(2).try_reserve_retained(8 * MIB).unwrap();
         let permit = budget.reserve_memory_ceiling_wait().unwrap();
-        assert_eq!(permit.bytes, 52 * MIB);
-        assert_eq!(pool.reserved_bytes(), 64 * MIB);
-        assert_eq!(budget.memory_reserved.load(Ordering::Acquire), 52 * MIB);
+        // 64 MiB less the 16 MiB headroom, less the 12 MiB now retained.
+        assert_eq!(permit.bytes, 36 * MIB);
+        assert_eq!(pool.reserved_bytes(), 48 * MIB);
+        assert_eq!(budget.memory_reserved.load(Ordering::Acquire), 36 * MIB);
         assert!(!pool.has_waiters());
         drop(permit);
         assert_eq!(budget.memory_reserved.load(Ordering::Acquire), 0);
         drop((own, peer));
         assert_eq!(pool.total_retained.load(Ordering::Acquire), 0);
+        assert_eq!(pool.reserved_bytes(), 0);
+    }
+
+    /// A held ceiling must leave room for retained admissions, which reserve
+    /// without waiting: an NZB submitted while a conventional 7z extraction
+    /// runs is admitted, not rejected with a resource limit.
+    #[test]
+    fn ceiling_allowance_leaves_headroom_for_retained_admissions() {
+        assert_eq!(ceiling_headroom_bytes(64 * GIB), 2 * GIB);
+        assert_eq!(ceiling_headroom_bytes(4 * GIB), 256 * MIB);
+        assert_eq!(ceiling_headroom_bytes(64 * MIB), 16 * MIB);
+
+        let pool = Arc::new(ProcessMemoryBudget::new(64 * MIB));
+        let root = tempfile::tempdir().unwrap();
+        let existing = pool.for_job(2).try_reserve_retained(4 * MIB).unwrap();
+        let budget = JobExtractionBudget::new_with_process_memory(
+            limits(),
+            pool.for_job(1),
+            root.path().into(),
+            1,
+            0,
+            0,
+            PipelineMetrics::new(),
+        )
+        .unwrap();
+        let ceiling = budget.reserve_memory_ceiling_wait().unwrap();
+
+        // A submission's metadata and a repeated-article index, both admitted
+        // while the ceiling is held.
+        let submitted = pool
+            .for_job(3)
+            .try_reserve_retained(64 * 1024)
+            .expect("a submission must be admitted while a ceiling is held");
+        let index = pool
+            .for_job(2)
+            .try_reserve_retained(8 * MIB)
+            .expect("retained state must be admitted while a ceiling is held");
+        // 64 MiB less the 16 MiB headroom, less the 4 MiB retained at grant.
+        assert_eq!(ceiling.bytes, 44 * MIB);
+        let retained_total = 4 * MIB + 64 * 1024 + 8 * MIB;
+        assert_eq!(pool.reserved_bytes(), 44 * MIB + retained_total);
+
+        drop(ceiling);
+        assert_eq!(pool.reserved_bytes(), retained_total);
+        drop((existing, submitted, index));
         assert_eq!(pool.reserved_bytes(), 0);
     }
 
