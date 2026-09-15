@@ -1,6 +1,7 @@
 import type { ComponentType } from "react";
 import { createBrowserRouter, Navigate } from "react-router";
-import { NextRouteError, NextRouteFallback } from "./shell/route-states";
+import { RouteErrorPage } from "@/lib/error-page";
+import { NextRouteFallback } from "./shell/route-states";
 
 const basename = window.__WEAVER_BASE__ || "/";
 
@@ -28,7 +29,7 @@ function lazyRoute<TModule extends Record<string, unknown>, TKey extends keyof T
 export const nextRouter = createBrowserRouter(
   [
     {
-      errorElement: <NextRouteError />,
+      errorElement: <RouteErrorPage />,
       children: [
         { index: true, ...lazyRoute(() => import("./pages/DownloadsPage"), "DownloadsPage") },
         { path: "history", ...lazyRoute(() => import("./pages/CompletedPage"), "CompletedPage") },

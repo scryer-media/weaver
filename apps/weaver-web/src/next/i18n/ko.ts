@@ -50,13 +50,17 @@ export const nextKo: LocaleDictionary = {
   "next.categories.all": "모든 카테고리",
   "next.categories.uncategorised": "카테고리 없음",
 
-  // Route errors
-  "next.routeError.notFound": "페이지를 찾을 수 없습니다",
-  "next.routeError.requestFailed": "요청 실패 ({{status}})",
-  "next.routeError.routingBody": "페이지 로드가 끝나기 전에 라우팅 오류가 발생했습니다.",
-  "next.routeError.title": "문제가 발생했습니다",
-  "next.routeError.renderBody": "이 화면을 표시하는 중 예기치 않은 오류가 발생했습니다.",
-  "next.routeError.goBack": "뒤로",
+  // Error page
+  "next.errorPage.notFound": "페이지를 찾을 수 없습니다",
+  "next.errorPage.requestFailed": "요청 실패 ({{status}})",
+  "next.errorPage.routingBody": "페이지 로드가 끝나기 전에 라우팅 오류가 발생했습니다.",
+  "next.errorPage.title": "문제가 발생했습니다",
+  "next.errorPage.renderBody": "이 화면을 표시하는 중 예기치 않은 오류가 발생했습니다.",
+  "next.errorPage.goBack": "뒤로",
+  "next.errorPage.retry": "다시 시도",
+  "next.errorPage.checking": "확인 중…",
+  "next.errorPage.unreachable": "Weaver가 응답하지 않습니다. 응답하는 즉시 이 페이지가 Weaver를 엽니다.",
+  "next.errorPage.details": "기술 세부 정보",
 
   // Shared components
   "next.common.clear": "지우기",

@@ -50,13 +50,17 @@ export const nextEs: LocaleDictionary = {
   "next.categories.all": "Todas las categorías",
   "next.categories.uncategorised": "Sin categoría",
 
-  // Route errors
-  "next.routeError.notFound": "Página no encontrada",
-  "next.routeError.requestFailed": "La solicitud falló ({{status}})",
-  "next.routeError.routingBody": "Weaver encontró un error de enrutamiento antes de que la página terminara de cargar.",
-  "next.routeError.title": "Algo salió mal",
-  "next.routeError.renderBody": "Weaver encontró un error inesperado al mostrar esta pantalla.",
-  "next.routeError.goBack": "Volver",
+  // Error page
+  "next.errorPage.notFound": "Página no encontrada",
+  "next.errorPage.requestFailed": "La solicitud falló ({{status}})",
+  "next.errorPage.routingBody": "Weaver encontró un error de enrutamiento antes de que la página terminara de cargar.",
+  "next.errorPage.title": "Algo salió mal",
+  "next.errorPage.renderBody": "Weaver encontró un error inesperado al mostrar esta pantalla.",
+  "next.errorPage.goBack": "Volver",
+  "next.errorPage.retry": "Reintentar",
+  "next.errorPage.checking": "Comprobando…",
+  "next.errorPage.unreachable": "Weaver no responde. Esta página lo abrirá en cuanto responda.",
+  "next.errorPage.details": "Detalles técnicos",
 
   // Shared components
   "next.common.clear": "Limpiar",
