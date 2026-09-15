@@ -237,6 +237,13 @@ impl Pipeline {
         // before a new window can admit the same indices again.
         self.settle_par3_recovery_batch(job_id);
         if (prefetch && prefetched) || (!prefetch && engine_busy) {
+            tracing::info!(
+                job_id = job_id.0,
+                prefetch,
+                prefetched,
+                engine_busy,
+                "PAR3 recovery window deferred"
+            );
             return false;
         }
         let Some(state) = self.jobs.get(&job_id) else {
@@ -254,6 +261,13 @@ impl Pipeline {
         let plan = self.par3_cohort_plan(job_id);
         let needed_bytes = plan.needed_bytes;
         if plan.views != 0 && needed_bytes == 0 && !plan.metadata_incomplete {
+            tracing::info!(
+                job_id = job_id.0,
+                views = plan.views,
+                cohorts_short = plan.windows.len(),
+                deficits = ?plan.deficits(),
+                "PAR3 recovery window refused: the retained view has nothing outstanding"
+            );
             return false;
         }
         if plan.metadata_incomplete {
@@ -359,6 +373,17 @@ impl Pipeline {
             bytes = bytes.saturating_add(estimate);
         }
         if selected.is_empty() {
+            tracing::info!(
+                job_id = job_id.0,
+                pool = pool.len(),
+                candidates = candidates.len(),
+                views = plan.views,
+                cohorts_short = plan.windows.len(),
+                needed_bytes,
+                byte_limit,
+                prefetch,
+                "PAR3 recovery window refused: no article selected"
+            );
             for work in pool {
                 state.recovery_queue.push(work);
             }
@@ -415,7 +440,7 @@ impl Pipeline {
             self.metrics
                 .par3
                 .note_admission_refused(super::outcome::admission_reason(&error));
-            tracing::debug!(
+            tracing::warn!(
                 job_id = job_id.0,
                 %error,
                 "PAR3 recovery in-flight declaration refused"

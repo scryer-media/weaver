@@ -389,6 +389,22 @@ impl Pipeline {
                     if self.par3_recovery_in_progress(job_id) {
                         return true;
                     }
+                    {
+                        let plan = self.par3_cohort_plan(job_id);
+                        tracing::info!(
+                            job_id = job_id.0,
+                            ?status,
+                            views = plan.views,
+                            cohorts_short = plan.windows.len(),
+                            needed_bytes = plan.needed_bytes,
+                            exhausted = plan.exhausted().len(),
+                            engine_has_work = self
+                                .par3_runtime
+                                .as_ref()
+                                .is_some_and(|runtime| runtime.has_work(job_id)),
+                            "PAR3 recovery verdict pass: no window admitted and nothing in progress"
+                        );
+                    }
                     // Donor search finds *source* blocks, which lower a
                     // cohort's `lost`; it never manufactures a recovery index.
                     // Running it is only worth a worker while some cohort that
