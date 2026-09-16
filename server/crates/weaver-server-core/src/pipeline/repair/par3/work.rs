@@ -736,7 +736,11 @@ impl Coordinator {
             .assessments(job_id)
             .flat_map(|(set, view)| {
                 view.requirements.iter().filter_map(move |need| {
-                    let indices = super::cohorts::declarable_indices(&need.next_indices, carriers);
+                    let indices = super::cohorts::declarable_indices(
+                        &need.next_indices,
+                        carriers,
+                        need.cohorts,
+                    );
                     (!indices.is_empty()).then_some((set, need.matrix, indices))
                 })
             })

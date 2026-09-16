@@ -40,10 +40,21 @@ impl CohortWindow {
     /// carrier is free to publish any admissible index, so this walks the
     /// overlap by congruence and stops at the first one not already held.
     /// A cohort whose whole deficit is in flight wants nothing.
+    ///
+    /// `span` is what the carrier's name advertises. An interleaved set's
+    /// name can count rows within a cohort rather than global indices, so
+    /// the carrier is weighed under every reading and admitted if any holds
+    /// something this cohort still wants.
     pub fn admits_span(&self, span: &Range<u64>) -> bool {
         if self.outstanding == 0 || self.deficit.cohorts == 0 {
             return false;
         }
+        carrier_readings(span, self.deficit.cohorts)
+            .iter()
+            .any(|reading| self.admits_global(reading))
+    }
+
+    fn admits_global(&self, span: &Range<u64>) -> bool {
         let overlap = intersect(&self.indices, span);
         let Some(mut index) = first_congruent(&overlap, self.deficit.cohort, self.deficit.cohorts)
         else {
@@ -168,19 +179,41 @@ impl CohortPlan {
 pub(in crate::pipeline) fn declarable_indices(
     next: &[u64],
     carriers: &[(Range<u64>, usize)],
+    cohorts: u64,
 ) -> Vec<u64> {
     let mut declared: Vec<u64> = Vec::new();
     for (span, admitted) in carriers {
+        let readings = carrier_readings(span, cohorts);
         let fresh: Vec<u64> = next
             .iter()
             .copied()
-            .filter(|index| span.contains(index) && !declared.contains(index))
+            .filter(|index| {
+                readings.iter().any(|reading| reading.contains(index)) && !declared.contains(index)
+            })
             .take(*admitted)
             .collect();
         declared.extend(fresh);
     }
     declared.sort_unstable();
     declared
+}
+
+/// The global index spans a volume name can stand for in a set of `cohorts`
+/// cohorts.
+///
+/// A creator that numbers volumes by global index advertises the span as
+/// written. The reference creator numbers an interleaved set's volumes by row
+/// within a cohort: its `vol0511+512` of a two-cohort set carries every
+/// cohort's rows 511..1023, which are global indices 1022..2046. Reading such
+/// a name as global indices finds every one of them already held from the
+/// previous volume and excludes the carrier that holds the rest of the set's
+/// recovery. A name is only ever used to exclude, so both readings are
+/// offered and a carrier is dropped only when neither can help. For a
+/// noninterleaved set the readings coincide.
+pub(in crate::pipeline) fn carrier_readings(span: &Range<u64>, cohorts: u64) -> [Range<u64>; 2] {
+    let cohorts = cohorts.max(1);
+    let by_row = span.start.saturating_mul(cohorts)..span.end.saturating_mul(cohorts);
+    [span.clone(), by_row]
 }
 
 fn intersect(left: &Range<u64>, right: &Range<u64>) -> Range<u64> {
@@ -346,15 +379,17 @@ mod tests {
         plan.push_view(
             &[
                 requirement(0, 2, 0..8, &[], 0),
-                requirement(1, 2, 0..8, &[1, 3], 1),
+                requirement(1, 2, 0..8, &[1, 3, 7], 1),
             ],
             1024,
         );
-        // vol4+1 publishes index 4 only: cohort 0, which is in surplus.
+        // vol4+1 publishes index 4 only: cohort 0, which is in surplus. Read
+        // by row it would be 8..10, outside the span.
         assert!(plan.excludes_span(&(4..5)));
         // vol5+1 publishes index 5: cohort 1, still wanted.
         assert!(!plan.excludes_span(&(5..6)));
-        // An index the cohort already holds is not wanted again.
+        // An index the cohort already holds is not wanted again; read by row
+        // the name is 6..8, and 7 is held too.
         assert!(plan.excludes_span(&(3..4)));
         // Outside the admissible span entirely.
         assert!(plan.excludes_span(&(90..99)));
@@ -393,19 +428,21 @@ mod tests {
         );
 
         // (a) Only the deficient cohort is planned for, and only spans holding
-        // an index it still admits survive the filter. Each name here is one
-        // volume a real acquisition pass would weigh.
+        // an index it still admits under either reading of the name survive
+        // the filter. Each name here is one volume a real acquisition pass
+        // would weigh; "by row" is the reference creator's numbering, where
+        // vol<n>+<c> of a two-cohort set carries global indices 2n..2(n+c).
         assert_eq!(plan.windows.len(), 1);
         assert_eq!(plan.windows[0].deficit.cohort, 1);
         let admitted: Vec<&str> = [
-            "set.vol0+1.par3",  // index 0   -> cohort 0, in surplus
-            "set.vol1+1.par3",  // index 1   -> cohort 1, already held
-            "set.vol2+1.par3",  // index 2   -> cohort 0, in surplus
-            "set.vol4+1.par3",  // index 4   -> cohort 0, in surplus
-            "set.vol5+1.par3",  // index 5   -> cohort 1, wanted
-            "set.vol7+2.par3",  // 7, 8      -> 7 is cohort 1, wanted
-            "set.vol9+1.par3",  // index 9   -> cohort 1, wanted
-            "set.vol20+4.par3", // outside the admissible span entirely
+            "set.vol0+1.par3",  // index 0: surplus; by row 0..2: 1 is held
+            "set.vol1+1.par3",  // index 1: held;    by row 2..4: 3 is held
+            "set.vol2+1.par3",  // index 2: surplus; by row 4..6: 5 is wanted
+            "set.vol4+1.par3",  // index 4: surplus; by row 8..10: 9 is wanted
+            "set.vol5+1.par3",  // index 5: wanted
+            "set.vol7+2.par3",  // 7, 8: 7 is wanted
+            "set.vol9+1.par3",  // index 9: wanted
+            "set.vol20+4.par3", // outside the admissible span under both readings
             "set.par3",         // advertises nothing: never excluded
         ]
         .into_iter()
@@ -414,6 +451,8 @@ mod tests {
         assert_eq!(
             admitted,
             vec![
+                "set.vol2+1.par3",
+                "set.vol4+1.par3",
                 "set.vol5+1.par3",
                 "set.vol7+2.par3",
                 "set.vol9+1.par3",
@@ -451,19 +490,44 @@ mod tests {
         // 271 still wanted, all inside one 512-index carrier: a 32-article
         // window declares 32, not the whole span.
         let next: Vec<u64> = (511..782).collect();
-        let declared = declarable_indices(&next, &[(511..1023, 32)]);
+        let declared = declarable_indices(&next, &[(511..1023, 32)], 1);
         assert_eq!(declared, (511..543).collect::<Vec<_>>());
 
         // Two carriers in one window each contribute their own admitted
         // count, indices outside every span are never declared, and a carrier
         // with more articles than wanted indices declares only what exists.
         let next: Vec<u64> = vec![1, 3, 5, 7, 9, 11, 40, 41];
-        let declared = declarable_indices(&next, &[(0..8, 2), (8..12, 5), (20..30, 3)]);
+        let declared = declarable_indices(&next, &[(0..8, 2), (8..12, 5), (20..30, 3)], 1);
         assert_eq!(declared, vec![1, 3, 9, 11]);
 
         // No carrier, or no admitted articles, declares nothing.
-        assert!(declarable_indices(&next, &[]).is_empty());
-        assert!(declarable_indices(&next, &[(0..100, 0)]).is_empty());
+        assert!(declarable_indices(&next, &[], 1).is_empty());
+        assert!(declarable_indices(&next, &[(0..100, 0)], 1).is_empty());
+    }
+
+    /// Deliverable: a two-cohort set numbered by row, the way the reference
+    /// creator writes it. Every volume up to `vol0511+512` is in hand, so
+    /// cohort 1 holds all of its indices below 2046 and is still short. The
+    /// last volume, `vol1023+798`, carries global indices 2046..3642; read
+    /// as global indices its name names only held indices, and it used to be
+    /// excluded, leaving the set unrecoverable with 798 rows unfetched.
+    #[test]
+    fn a_volume_numbered_by_row_is_not_excluded_for_indices_it_does_not_carry() {
+        const SPAN: Range<u64> = 0..4096;
+        let held: Vec<u64> = (1..2046).step_by(2).collect();
+        let mut plan = CohortPlan::default();
+        plan.push_view(&[requirement(1, 2, SPAN, &held, 547)], 768_000);
+        assert_eq!(plan.windows[0].next_indices()[0], 2047);
+
+        // Read by row, vol1023+798 carries what is wanted next.
+        assert!(!plan.excludes_span(&volume_span("set.vol1023+798.par3").unwrap()));
+        // Volumes spent under both readings stay excluded.
+        assert!(plan.excludes_span(&volume_span("set.vol0511+512.par3").unwrap()));
+        assert!(plan.excludes_span(&volume_span("set.vol0255+256.par3").unwrap()));
+        // A window taking 32 articles from vol1023+798 declares the 32 lowest
+        // wanted indices the name can stand for, and no more.
+        let declared = declarable_indices(plan.windows[0].next_indices(), &[(1023..1821, 32)], 2);
+        assert_eq!(declared, (2047..2111).step_by(2).collect::<Vec<_>>());
     }
 
     #[test]
