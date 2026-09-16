@@ -2268,10 +2268,12 @@ jobs:
       - verify-release-tag
       - rust-fmt
       - rust-clippy
+      - rust-clippy-windows
       - rust-audit
       - rust-test
       - rust-test-arm
       - rust-test-sde
+      - rust-test-windows
       - rust-yenc-simd-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-arm64-portable

@@ -16,6 +16,7 @@ pub(crate) mod integrity;
 mod orchestrator;
 mod progress;
 mod repair;
+mod server_attribution;
 
 pub(crate) use orchestrator::check_disk_space;
 pub(crate) use orchestrator::{close_cached_write_handles_under, release_cached_write_handle};
@@ -2876,6 +2877,9 @@ pub struct Pipeline {
     pub(super) nzb_dir: PathBuf,
     /// Per-file contiguous write floors awaiting persistence.
     pub(super) pending_file_progress: HashMap<NzbFileId, u64>,
+    /// Jobs whose provider shares have moved since the last checkpoint.
+    pub(super) dirty_server_attribution: HashSet<JobId>,
+    pub(super) server_attribution_checkpoint_at: Instant,
     /// Last queued/persisted contiguous write floor per file.
     pub(super) persisted_file_progress: HashMap<NzbFileId, u64>,
     /// Streaming checksum state for files whose decoded bytes have been observed in order.

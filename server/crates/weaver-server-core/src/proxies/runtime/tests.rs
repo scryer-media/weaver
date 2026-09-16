@@ -1,4 +1,5 @@
 use super::*;
+mod credentials;
 mod http3;
 mod review_regressions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -428,6 +429,7 @@ fn backup_restores_encrypted_profiles_ordered_routes_and_host_trust() {
     let key = source.encryption_key().unwrap().clone();
     source.insert_server(&server(1)).unwrap();
     let mut p = profile(1);
+    p.secrets.username = Some("backup-user".into());
     p.secrets.password = Some("backup-only-secret".into());
     source.save_proxy_profile(&p).unwrap();
     source.save_proxy_profile(&profile(2)).unwrap();
@@ -474,6 +476,7 @@ fn backup_restores_encrypted_profiles_ordered_routes_and_host_trust() {
         policy
     );
     let profiles = target.list_proxy_profiles().unwrap();
+    assert_eq!(profiles[0].secrets.username.as_deref(), Some("backup-user"));
     assert_eq!(
         profiles[0].secrets.password.as_deref(),
         Some("backup-only-secret")

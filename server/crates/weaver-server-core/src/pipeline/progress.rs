@@ -177,6 +177,8 @@ impl Pipeline {
             state.downloaded_wire_bytes = state.downloaded_wire_bytes.saturating_add(raw_size);
             if let Some(server_id) = server_id {
                 state.server_attribution.note_article(server_id, raw_size);
+                self.dirty_server_attribution
+                    .insert(segment_id.file_id.job_id);
             }
         }
     }

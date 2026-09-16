@@ -9,6 +9,9 @@ fn invalid() -> TunnelError {
 }
 static NEXT_ID: AtomicU16 = AtomicU16::new(1);
 
+/// Ceiling on one address-family query, dial and CNAME walk included.
+const FAMILY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub async fn resolve(
     provider: &dyn TunnelProvider,
     servers: &[IpAddr],
@@ -24,17 +27,19 @@ pub async fn resolve(
     }
     for server in servers {
         let mut addresses = Vec::new();
-        let mut failed = false;
         for qtype in [1u16, 28] {
-            match query(provider, *server, host, qtype).await {
-                Ok(found) => addresses.extend(found),
-                Err(_) => {
-                    failed = true;
-                    break;
-                }
+            // A resolver may answer for only one family. A failing or silent
+            // peer query must neither erase the answers already collected nor
+            // stop the other family from being asked, and its own wait is
+            // bounded so it cannot spend the caller's whole deadline.
+            if let Ok(Ok(found)) =
+                tokio::time::timeout(FAMILY_QUERY_TIMEOUT, query(provider, *server, host, qtype))
+                    .await
+            {
+                addresses.extend(found);
             }
         }
-        if !failed && !addresses.is_empty() {
+        if !addresses.is_empty() {
             addresses.sort();
             addresses.dedup();
             return Ok(addresses);
@@ -226,6 +231,7 @@ fn parse_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod families;
     #[test]
     fn compression_cycles_and_truncation_are_rejected() {
         assert!(read_name(&[0xc0, 0], &mut 0).is_err());

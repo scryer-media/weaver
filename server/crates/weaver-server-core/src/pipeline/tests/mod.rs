@@ -59,6 +59,7 @@ mod par3_recovery;
 mod rar_extraction;
 mod restore_history;
 mod sequential_unpack;
+mod server_attribution;
 mod sfv_completion;
 mod terminal_settlement;
 mod zip64;

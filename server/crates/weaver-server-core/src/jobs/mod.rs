@@ -12,6 +12,7 @@ pub mod record;
 pub(crate) mod repair_outputs;
 pub mod repository;
 pub mod server_attribution;
+mod server_attribution_persistence;
 pub mod service;
 pub mod working_dir;
 

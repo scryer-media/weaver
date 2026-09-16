@@ -150,6 +150,7 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::I64(job_id.0 as i64),
         SqlArg::I64(job_id.0 as i64),
         SqlArg::OptText(history.server_attribution.clone()),
+        SqlArg::I64(job_id.0 as i64),
     ]
 }
 
@@ -177,7 +178,8 @@ async fn archive_job_sql(
                          (SELECT nzb_zstd FROM active_jobs WHERE job_id = {}),
                          {}, {}, {},
                          COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
-                         (SELECT script_results_json FROM active_jobs WHERE job_id = {}), {})
+                         (SELECT script_results_json FROM active_jobs WHERE job_id = {}),
+                         COALESCE({}, (SELECT server_attribution FROM active_jobs WHERE job_id = {})))
                  ON CONFLICT(job_id) DO UPDATE SET
                     job_hash = excluded.job_hash,
                     name = excluded.name,
