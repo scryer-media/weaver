@@ -11,6 +11,8 @@ const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
 const VOLUME: &[u8] = include_bytes!("../repair/backend/fixtures/set.vol0+1.par3");
 
 /// A set whose File packets name a Windows reserved device, kept as produced.
+/// Only the Unix test below can build the protected file it covers.
+#[cfg(unix)]
 const RESERVED_NAME_SET: &[(&str, &[u8])] = &[
     (
         "kestrel.par3",
