@@ -209,6 +209,51 @@ async fn par3_failed_name_move_rolls_back_live_and_restored_identity() {
     );
 }
 
+/// A move that reached the directory but not the identity row leaves an intent
+/// whose source is gone and whose target is there. Restore adopts the file that
+/// exists rather than treating the job as broken.
+#[tokio::test]
+async fn par3_name_intent_completed_on_disk_is_adopted_by_restore() {
+    use crate::jobs::record::FileIdentitySource;
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job = JobId(3193);
+    let working = insert_active_job(
+        &mut pipeline,
+        job,
+        standalone_job_spec("name intent", &[("opaque.dat".into(), 4)]),
+    )
+    .await;
+    write_and_complete_file(&mut pipeline, job, 0, "opaque.dat", b"data").await;
+    let id = NzbFileId {
+        job_id: job,
+        file_index: 0,
+    };
+    let previous = pipeline.effective_file_identity(job, id).unwrap();
+    let mut intent = previous.clone();
+    intent.classification_source = FileIdentitySource::Par3Pending;
+    intent.canonical_filename = Some("payload.bin".into());
+    pipeline.db.save_file_identity(job, &intent).unwrap();
+    // The move itself already happened; only the identity row is behind.
+    std::fs::rename(working.join("opaque.dat"), working.join("payload.bin")).unwrap();
+
+    let mut identities = HashMap::from([(0, intent)]);
+    pipeline
+        .restore_pending_par3_content_names(job, &working, &mut identities)
+        .unwrap();
+
+    assert_eq!(identities[&0].current_filename, "payload.bin");
+    assert_eq!(
+        identities[&0].classification_source,
+        FileIdentitySource::Par3
+    );
+    assert_eq!(
+        pipeline.db.load_active_jobs().unwrap()[&job].file_identities[&0],
+        identities[&0]
+    );
+    assert_eq!(std::fs::read(working.join("payload.bin")).unwrap(), b"data");
+}
+
 #[tokio::test]
 async fn embedded_discovery_cache_is_withdrawn_before_admission_on_writes_and_rebinding() {
     let root = TempDir::new().unwrap();
