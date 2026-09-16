@@ -179,6 +179,70 @@ async fn rar_chase_settle_ignores_partial_topology_but_fences_reordered_parts() 
     );
 }
 
+/// Extraction can take a chase before the chase hears that its last part
+/// finished: the commit that completes a part can start extraction before it
+/// publishes the part's floor. The handoff has to tell the chase, or the
+/// worker parks on bytes already on disk until the consumption deadline.
+#[tokio::test]
+async fn handing_a_chase_to_extraction_publishes_parts_that_finished_unheard() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Disabled);
+    pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+        gate: DirectUnpackGate::Enabled,
+    });
+    let bytes = rar5_fixture_bytes("rar5_multifile_lz.rar");
+    let volumes = vec![("mixed.rar".to_string(), bytes.clone())];
+    let job_id = JobId(41952);
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        direct_store_job_spec("Unheard completion", &volumes),
+    )
+    .await;
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, "mixed")
+        .unwrap();
+    assert!(!coverage.part_is_complete(0));
+
+    // The last article reaches the disk and the assembly, and its notice
+    // never reaches the chase.
+    std::fs::write(working_dir.join("mixed.rar"), &bytes).unwrap();
+    let (start, end) = article_extent(bytes.len(), 1, 2);
+    let file = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .file_mut(NzbFileId {
+            job_id,
+            file_index: 0,
+        })
+        .unwrap();
+    file.commit_segment(1, (end - start) as u32).unwrap();
+    assert!(file.is_complete());
+    assert!(!coverage.part_is_complete(0));
+
+    let disposition = pipeline.take_direct_unpack_disposition(job_id, "mixed");
+    let crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) = disposition
+    else {
+        panic!("the armed chase must be handed over while it runs");
+    };
+    assert!(coverage.part_is_complete(0));
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(20), pending.handle)
+        .await
+        .expect("the chase must finish once the handoff publishes the finished part");
+    let outcome = joined.unwrap().unwrap();
+    assert_eq!(
+        outcome.extracted.len(),
+        unrar_rs::RarArchive::open(std::io::Cursor::new(bytes))
+            .unwrap()
+            .len()
+    );
+}
+
 async fn drop_partial_chase(transfer_to_consumer: bool) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
