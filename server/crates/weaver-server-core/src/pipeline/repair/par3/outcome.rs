@@ -131,8 +131,8 @@ pub(in crate::pipeline) enum Par3Outcome {
         path: String,
         reason: super::paths::UnsafePath,
     },
-    /// The working directory cannot hold the set's outputs and the staging
-    /// copy the installation writes beside them.
+    /// The working directory cannot hold the outputs the installation stages
+    /// beside their destinations.
     NoOutputSpace {
         need: u64,
         available: u64,

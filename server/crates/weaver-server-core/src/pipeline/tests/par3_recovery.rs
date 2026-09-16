@@ -864,8 +864,8 @@ fn fixture_carriers() -> Vec<(String, Vec<u8>)> {
 /// names the shortfall in bytes.
 ///
 /// Only the ten-byte file is damaged, so the shortfall proves what was
-/// counted: twenty bytes, the one rebuilt output and its staging copy, with
-/// the nine thousand intact bytes beside it excluded.
+/// counted: ten bytes, the one rebuilt output staged once, with the nine
+/// thousand intact bytes beside it excluded and no second copy for the rename.
 #[tokio::test]
 async fn output_planning_names_its_byte_shortfall_before_any_output_byte() {
     use crate::pipeline::direct_store::wiring::DirectStoreRuntime;
@@ -889,11 +889,11 @@ async fn output_planning_names_its_byte_shortfall_before_any_output_byte() {
         .clone()
         .unwrap_or_else(|| panic!("planning must refuse: {verdict:#?}"));
     assert!(
-        failure.contains("PAR3 output planning is 20 bytes short"),
-        "only the rebuilt output and its staging copy are counted: {failure}"
+        failure.contains("PAR3 output planning is 10 bytes short"),
+        "only the rebuilt output is counted, once: {failure}"
     );
     assert!(
-        failure.contains("needs 20 bytes"),
+        failure.contains("needs 10 bytes"),
         "the verdict names what installing this set needs: {failure}"
     );
     assert_ne!(

@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
+use std::task::Poll;
+use std::time::Duration;
 
 use crate::StateError;
 use crate::bandwidth::IspBandwidthCapWeekday;
@@ -230,9 +232,18 @@ pub fn server_seed_applies(config: &Config, seed: &EnvSeedConfig) -> bool {
     config.servers.is_empty() && !seed.servers.is_empty()
 }
 
+/// How long boot waits, in all, for the seeded servers to answer. The probes
+/// run before the seed is stored and before the listener opens, so a server
+/// that never answers must not hold startup for its full connect timeouts.
+pub const SEED_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Ask every seeded server whose pipelining flag the environment left unstated
 /// whether it pipelines, and keep what came back. The caller supplies the
 /// question so the seed can be exercised without a server to reach.
+///
+/// Every server is asked at once, and all of them share one
+/// [`SEED_PROBE_DEADLINE`]. A server with no answer by then is treated like
+/// one that could not be reached: it keeps the sequential default.
 pub async fn probe_seeded_server_pipelining<P, F>(
     seed: &mut EnvSeedConfig,
     probe: P,
@@ -241,13 +252,58 @@ where
     P: Fn(ServerConfig) -> F,
     F: Future<Output = ServerConnectivityResult>,
 {
-    let mut outcomes = Vec::new();
-    for server in &mut seed.servers {
-        if server.pipelining_pinned || !server.config.active {
-            continue;
+    let deadline = tokio::time::Instant::now() + SEED_PROBE_DEADLINE;
+    let mut probes: Vec<_> = seed
+        .servers
+        .iter()
+        .enumerate()
+        .filter(|(_, server)| !server.pipelining_pinned && server.config.active)
+        .map(|(index, server)| {
+            (
+                index,
+                Box::pin(tokio::time::timeout_at(
+                    deadline,
+                    probe(server.config.clone()),
+                )),
+                None,
+            )
+        })
+        .collect();
+    std::future::poll_fn(|cx| {
+        let mut waiting = false;
+        for (_, probe, answer) in &mut probes {
+            if answer.is_none() {
+                match probe.as_mut().poll(cx) {
+                    Poll::Ready(result) => *answer = Some(result),
+                    Poll::Pending => waiting = true,
+                }
+            }
         }
+        if waiting {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
 
-        let result = probe(server.config.clone()).await;
+    let mut outcomes = Vec::new();
+    for (index, _, answer) in probes {
+        let server = &mut seed.servers[index];
+        let result =
+            answer
+                .expect("every probe finished")
+                .unwrap_or_else(|_| ServerConnectivityResult {
+                    success: false,
+                    message: format!("no answer within {} seconds", SEED_PROBE_DEADLINE.as_secs()),
+                    latency_ms: None,
+                    first_byte_latency_ms: None,
+                    first_byte_latency_band: None,
+                    supports_pipelining: false,
+                    adoptable_tls_name_mismatch_certificate_der: None,
+                    tls_cipher_suite: None,
+                    tls_honors_client_cipher_order: None,
+                });
         if result.success {
             server.config.supports_pipelining = result.supports_pipelining;
             outcomes.push(SeededServerProbeOutcome {
@@ -935,6 +991,48 @@ mod tests {
         assert!(outcomes.is_empty());
         assert!(!config.servers[0].supports_pipelining);
         assert!(!db.list_servers().unwrap()[0].supports_pipelining);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn asks_every_seeded_server_at_once_under_one_deadline() {
+        let mut seed = parse(&[
+            ("WEAVER_SERVER_1_HOSTNAME", "slow.example.com"),
+            ("WEAVER_SERVER_2_HOSTNAME", "slower.example.com"),
+            ("WEAVER_SERVER_3_HOSTNAME", "silent.example.com"),
+        ])
+        .unwrap();
+        let started = tokio::time::Instant::now();
+
+        // Asked one after another, the first two would not both fit inside the
+        // deadline, and the silent one would hold boot forever.
+        let outcomes = probe_seeded_server_pipelining(&mut seed, |server| async move {
+            match server.id {
+                1 | 2 => {
+                    tokio::time::sleep(SEED_PROBE_DEADLINE * 3 / 5).await;
+                    probe_answer(true, true)
+                }
+                _ => std::future::pending().await,
+            }
+        })
+        .await;
+
+        assert_eq!(started.elapsed(), SEED_PROBE_DEADLINE);
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| (outcome.server_id, outcome.failure.is_none()))
+                .collect::<Vec<_>>(),
+            vec![(1, true), (2, true), (3, false)]
+        );
+        assert!(seed.servers[0].config.supports_pipelining);
+        assert!(seed.servers[1].config.supports_pipelining);
+        assert!(!seed.servers[2].config.supports_pipelining);
+        assert!(
+            outcomes[2]
+                .failure
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no answer"))
+        );
     }
 
     #[tokio::test]

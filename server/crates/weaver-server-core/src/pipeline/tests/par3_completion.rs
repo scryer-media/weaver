@@ -777,6 +777,106 @@ async fn par3_windows_preserve_byte_limits_pause_and_unassessed_arrivals() {
     }
 }
 
+#[tokio::test]
+async fn par3_recovery_window_fetches_a_carrier_whose_name_misstates_its_span() {
+    let root = TempDir::new().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&root).await;
+    let job_id = JobId(3212);
+    let expected: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
+    // The only recovery block is index 0, but the carrier's name claims a
+    // span no deficient cohort admits.
+    let carrier = "set.vol300+1.par3";
+    let files = [
+        ("a.bin", expected.clone()),
+        ("b.txt", b"qrstuvwxyz".to_vec()),
+        (
+            "sub/c.bin",
+            (0..4000u32).map(|i| (i * 13 + 1) as u8).collect(),
+        ),
+        ("set.par3", INDEX.to_vec()),
+    ];
+    let mut specs: Vec<(String, u32)> = files
+        .iter()
+        .map(|(name, bytes)| ((*name).into(), bytes.len() as u32))
+        .collect();
+    specs.push((carrier.into(), 3000));
+    let mut spec = standalone_job_spec("PAR3 misnamed carrier", &specs);
+    spec.files[0].segments = [2100, 2100, 1100]
+        .into_iter()
+        .enumerate()
+        .map(|(number, bytes)| {
+            segment_spec! {
+                number: number as u32, bytes: bytes, message_id: format!("misnamed-{number}@example.com"),
+            }
+        })
+        .collect();
+    for file in &mut spec.files[3..] {
+        file.role = FileRole::from_filename(&file.filename);
+    }
+    let working = insert_active_job(&mut pipeline, job_id, spec).await;
+    tokio::fs::create_dir(working.join("sub")).await.unwrap();
+    let mut damaged = expected.clone();
+    damaged[2000..4000].fill(0);
+    tokio::fs::write(working.join("a.bin"), damaged)
+        .await
+        .unwrap();
+    {
+        let file = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .assembly
+            .file_mut(NzbFileId {
+                job_id,
+                file_index: 0,
+            })
+            .unwrap();
+        file.record_placement(0, 0, 2000);
+        file.commit_segment(0, 2000).unwrap();
+        file.record_placement(2, 4000, 1000);
+        file.commit_segment(2, 1000).unwrap();
+    }
+    for (index, (name, bytes)) in files.iter().enumerate().skip(1) {
+        write_and_complete_file(&mut pipeline, job_id, index as u32, name, bytes).await;
+        pipeline
+            .try_load_par3_metadata(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: index as u32,
+                },
+            )
+            .await;
+    }
+    settle_par3(&mut pipeline, job_id).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        for work in state.download_queue.drain_all() {
+            state.recovery_queue.push(work);
+        }
+    }
+    let span = crate::pipeline::repair::par3::cohorts::volume_span(carrier).unwrap();
+    assert!(
+        pipeline.par3_cohort_plan(job_id).excludes_span(&span),
+        "the carrier's name must argue against it for this test to mean anything"
+    );
+    // Speculation skips it; demanded recovery still asks for it.
+    assert!(!pipeline.promote_par3_recovery_window(job_id, true));
+    assert!(pipeline.promote_par3_recovery_window(job_id, false));
+    let promoted = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .drain_all();
+    assert!(!promoted.is_empty());
+    assert!(
+        promoted
+            .iter()
+            .all(|work| work.segment_id.file_id.file_index == 4)
+    );
+}
+
 async fn settle_par3(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline.par3_runtime.as_ref().unwrap().has_work(job_id) {
         let done =

@@ -166,22 +166,26 @@ fn canonical_browser_origin(headers: &HeaderMap) -> Result<String, StatusCode> {
     Ok(url.origin().ascii_serialization())
 }
 
-/// Whether a canonical browser origin names the same host as the request's
-/// authority. Ports are left out: an origin drops the scheme's default port
-/// while the header keeps it, and the host is what identifies the page.
+/// Whether a canonical browser origin names the same host and port as the
+/// request's authority. Either side may leave out the scheme's default port,
+/// so both are compared as the port the origin's scheme would actually use:
+/// another page on the same host is a different origin.
 fn origin_host_matches(origin: &str, host: &weaver_server_core::security::HttpAuthority) -> bool {
-    reqwest::Url::parse(origin)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .map(|origin_host| {
-            let origin_host = origin_host
-                .strip_prefix('[')
-                .and_then(|host| host.strip_suffix(']'))
-                .map(str::to_string)
-                .unwrap_or(origin_host);
-            origin_host == host.host()
-        })
-        .unwrap_or(false)
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    let Some(origin_host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    let origin_host = origin_host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .map(str::to_string)
+        .unwrap_or(origin_host);
+    let origin_port = url.port_or_known_default();
+    origin_host == host.host()
+        && origin_port.is_some()
+        && host.port().or(origin_port) == origin_port
 }
 
 fn epoch_seconds() -> i64 {
