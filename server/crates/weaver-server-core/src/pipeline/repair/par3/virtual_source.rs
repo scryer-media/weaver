@@ -33,13 +33,20 @@ fn reclaimable(error: &io::Error) -> bool {
     budget::pressure_source(error).is_some()
         || error.get_ref().is_some_and(|inner| {
             inner.downcast_ref::<EngineError>().is_some_and(|error| {
-                matches!(error, EngineError::ResourceLimit(_))
-                    || budget::error_pressure_source(error).is_some()
-            })
+                budget::is_limit(error) || budget::error_pressure_source(error).is_some()
+            }) || inner.downcast_ref::<budget::HostLimit>().is_some()
         })
 }
 
 impl ReaderCache {
+    /// Cumulative reader reuses and evictions, read once per work handback.
+    pub(super) fn counters(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.evictions.load(Ordering::Relaxed),
+        )
+    }
+
     pub(super) fn clear(&self) -> EngineResult<()> {
         let mut cache = self
             .inner

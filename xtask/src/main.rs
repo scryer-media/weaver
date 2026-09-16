@@ -38,6 +38,7 @@ const LSOF_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const TCP_PORT_PROBE_TIMEOUT: StdDuration = StdDuration::from_millis(200);
 const RELEASE_DRY_RUN_CACHE_FILE: &str = "tmp/xtask-release-dry-run.json";
 const RELEASE_DRY_RUN_CACHE_DIR: &str = "tmp/xtask-release-dry-run-cache";
+const RELEASE_NOTES_DIR: &str = "release-notes";
 #[cfg(unix)]
 const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
 const LOCAL_AGENT_API_KEY_NAME: &str = "xtask-local-agent";
@@ -411,6 +412,10 @@ struct ReleaseDryRunCache {
     next_version: String,
     tag_name: String,
     validated_steps: Vec<String>,
+    #[serde(default)]
+    release_notes_path: Option<String>,
+    #[serde(default)]
+    release_notes_sha256: Option<String>,
     failure_message: Option<String>,
 }
 
@@ -421,6 +426,8 @@ struct ReleaseDryRunExpectations<'a> {
     latest_tag_seen: Option<&'a str>,
     next_version: &'a str,
     tag_name: &'a str,
+    release_notes_path: &'a str,
+    release_notes_sha256: &'a str,
 }
 
 #[derive(Default)]
@@ -897,6 +904,30 @@ fn git_status_porcelain(ctx: &TaskContext) -> Result<String> {
     git_capture(ctx, &["status", "--porcelain"])
 }
 
+fn porcelain_status_paths(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter(|line| line.len() > 3)
+        .map(|line| {
+            let entry = line[3..].trim();
+            entry
+                .rsplit_once(" -> ")
+                .map_or(entry, |(_, renamed)| renamed)
+                .trim_matches('"')
+                .to_string()
+        })
+        .collect()
+}
+
+/// True when the only uncommitted path is this release's notes file.
+///
+/// Release notes are a required input written before the dry run, so a tree that
+/// carries nothing else is treated as ready instead of prompting the operator.
+fn dirty_paths_are_release_notes_only(status: &str, release_notes_relative: &str) -> bool {
+    let paths = porcelain_status_paths(status);
+    !paths.is_empty() && paths.iter().all(|path| path == release_notes_relative)
+}
+
 fn git_tracked_dirty_paths(ctx: &TaskContext) -> Result<Vec<PathBuf>> {
     let mut command = ctx.command_in("git", &ctx.repo_root);
     command.args(["diff", "--name-only", "HEAD", "--"]);
@@ -1102,6 +1133,283 @@ fn git_stash_create_snapshot(ctx: &TaskContext) -> Result<Option<String>> {
     }
 }
 
+fn release_notes_path(ctx: &TaskContext, tag_name: &str) -> PathBuf {
+    ctx.path(RELEASE_NOTES_DIR).join(format!("{tag_name}.md"))
+}
+
+fn release_notes_path_relative(tag_name: &str) -> String {
+    format!("{RELEASE_NOTES_DIR}/{tag_name}.md")
+}
+
+fn release_notes_context_path(ctx: &TaskContext, tag_name: &str) -> PathBuf {
+    ctx.path("tmp")
+        .join("xtask-release-notes")
+        .join(format!("{tag_name}-context.md"))
+}
+
+fn release_notes_sha256(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| {
+        format!(
+            "failed to read release notes for checksum at {}",
+            path.display()
+        )
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn release_notes_headings(tag_name: &str, next_version: &Version) -> (String, String) {
+    (
+        format!("# Weaver {next_version} release notes"),
+        format!("# {tag_name}"),
+    )
+}
+
+fn release_notes_context(
+    ctx: &TaskContext,
+    latest_tag: Option<&str>,
+    tag_name: &str,
+    next_version: &Version,
+) -> String {
+    let range = latest_tag
+        .map(|tag| format!("{tag}..HEAD"))
+        .unwrap_or_else(|| "HEAD".to_string());
+    let commit_log = git_capture(
+        ctx,
+        &[
+            "log",
+            "--no-merges",
+            "--no-show-signature",
+            "--date=short",
+            "--pretty=format:%h %ad %s",
+            &range,
+        ],
+    )
+    .unwrap_or_default();
+    let changed_files = if let Some(tag) = latest_tag {
+        git_capture(ctx, &["diff", "--name-status", &format!("{tag}..HEAD")]).unwrap_or_default()
+    } else {
+        git_capture(ctx, &["ls-files"]).unwrap_or_default()
+    };
+    let diffstat = if latest_tag.is_some() {
+        git_capture(ctx, &["diff", "--stat", &range]).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let (preferred_heading, tag_heading) = release_notes_headings(tag_name, next_version);
+
+    format!(
+        r#"# Release Notes Authoring Context
+
+Proposed tag: {tag_name}
+Proposed version: {next_version}
+Previous tag: {previous_tag}
+Commit range: {range}
+Write the notes to: {notes_path}
+
+## Required output contract
+
+- Write Markdown only.
+- The first line must be exactly `{preferred_heading}` or `{tag_heading}`.
+- Summarize user-facing changes first, under `## Highlights`.
+- Describe what changed for someone running Weaver, not which files or commits changed.
+- Keep wording suitable for a GitHub Release.
+- Do not mention local filesystem paths.
+- Do not include AI, agent, or release-process markers.
+- Do not include placeholder text.
+- Do not use the word `placeholder`; describe missing data directly.
+
+## Commit log
+
+```text
+{commit_log}
+```
+
+## Changed files
+
+```text
+{changed_files}
+```
+
+## Diffstat
+
+```text
+{diffstat}
+```
+"#,
+        previous_tag = latest_tag.unwrap_or("none"),
+        notes_path = release_notes_path_relative(tag_name),
+    )
+}
+
+fn write_release_notes_context(
+    ctx: &TaskContext,
+    latest_tag: Option<&str>,
+    tag_name: &str,
+    next_version: &Version,
+) -> Result<PathBuf> {
+    let context_path = release_notes_context_path(ctx, tag_name);
+    if let Some(parent) = context_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let context = release_notes_context(ctx, latest_tag, tag_name, next_version);
+    fs::write(&context_path, context)
+        .with_context(|| format!("failed to write {}", context_path.display()))?;
+    Ok(context_path)
+}
+
+fn validate_release_notes_document(
+    path: &Path,
+    tag_name: &str,
+    next_version: &Version,
+) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read release notes at {}", path.display()))?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        bail!("release notes are empty");
+    }
+    let (preferred_heading, tag_heading) = release_notes_headings(tag_name, next_version);
+    let heading = trimmed.lines().next();
+    if heading != Some(preferred_heading.as_str()) && heading != Some(tag_heading.as_str()) {
+        bail!("release notes must start with `{preferred_heading}` or `{tag_heading}`");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for placeholder in ["todo:", "tbd", "placeholder", "<insert", "lorem ipsum"] {
+        if lower.contains(placeholder) {
+            bail!("release notes contain placeholder text: {placeholder}");
+        }
+    }
+    let violations = scan_release_hygiene_content(path, &content);
+    if !violations.is_empty() {
+        bail!(
+            "release notes contain release hygiene violations:\n{}",
+            violations.join("\n")
+        );
+    }
+    Ok(())
+}
+
+fn release_notes_authoring_instructions(
+    latest_tag: Option<&str>,
+    tag_name: &str,
+    next_version: &Version,
+    context_path: Option<&str>,
+    dry_run: bool,
+) -> String {
+    let (preferred_heading, tag_heading) = release_notes_headings(tag_name, next_version);
+    let notes_path = release_notes_path_relative(tag_name);
+    let context_step = context_path.map_or_else(
+        || {
+            let range = latest_tag.map_or_else(|| "HEAD".to_string(), |tag| format!("{tag}..HEAD"));
+            format!(
+                "  1. Read `git log --no-merges {range}` to learn what changed in this release."
+            )
+        },
+        |path| {
+            format!("  1. Read {path} for this release's commit log, changed files, and diffstat.")
+        },
+    );
+    let retry = if dry_run {
+        "  5. Re-run the same `cargo xtask release --dry-run` command."
+    } else {
+        "  5. Re-run `cargo xtask release --dry-run` with the same release selection, then retry \
+         this release."
+    };
+
+    format!(
+        "The release workflow does not write release notes. Author them, then run the release \
+         again.\n\n\
+         If you are an agent running this command, do this now instead of stopping:\n\
+         {context_step}\n\
+         \x20 2. Read the two or three most recent files in {RELEASE_NOTES_DIR}/ for tone, \
+         structure, and level of detail.\n\
+         \x20 3. Write {notes_path} yourself, in your own words.\n\
+         \x20 4. Requirements:\n\
+         \x20    - First line exactly `{preferred_heading}` (or `{tag_heading}`).\n\
+         \x20    - Lead with user-facing changes under `## Highlights`.\n\
+         \x20    - Say what changed for someone running Weaver, not which files or commits \
+         changed.\n\
+         \x20    - No placeholder text (`TODO:`, `TBD`, `placeholder`, `<insert`).\n\
+         \x20    - No AI, agent, or release-process markers.\n\
+         \x20    - No local filesystem paths.\n\
+         {retry}"
+    )
+}
+
+/// Refuses a release, dry or real, whose notes are missing or unusable.
+///
+/// The failure writes an authoring context (commit log, changed files, diffstat)
+/// under `tmp/` and says how to write the notes, so the next run can proceed.
+fn require_release_notes(
+    ctx: &TaskContext,
+    latest_tag: Option<&str>,
+    tag_name: &str,
+    next_version: &Version,
+    dry_run: bool,
+) -> Result<PathBuf> {
+    let notes_path = release_notes_path(ctx, tag_name);
+    let notes_relative = release_notes_path_relative(tag_name);
+    let problem = if notes_path.is_file() {
+        validate_release_notes_document(&notes_path, tag_name, next_version)
+            .err()
+            .map(|error| format!("release notes at {notes_relative} are not usable: {error:#}"))
+    } else {
+        Some(format!(
+            "release notes are missing: {notes_relative} does not exist"
+        ))
+    };
+
+    let Some(problem) = problem else {
+        return Ok(notes_path);
+    };
+
+    let context_relative = write_release_notes_context(ctx, latest_tag, tag_name, next_version)
+        .ok()
+        .map(|path| {
+            path.strip_prefix(&ctx.repo_root)
+                .unwrap_or(path.as_path())
+                .display()
+                .to_string()
+        });
+    let instructions = release_notes_authoring_instructions(
+        latest_tag,
+        tag_name,
+        next_version,
+        context_relative.as_deref(),
+        dry_run,
+    );
+    bail!("{problem}\n\n{instructions}")
+}
+
+/// Commits this release's notes on their own when they are uncommitted.
+///
+/// Only the notes path is committed, whatever else is staged, so the dry run and
+/// the real release both validate and cache a tree that already carries them.
+fn commit_release_notes_if_changed(
+    ctx: &TaskContext,
+    notes_path: &Path,
+    next_version: &Version,
+) -> Result<bool> {
+    if !changed_file(ctx, notes_path)? {
+        return Ok(false);
+    }
+    let mut add = ctx.command_in("git", &ctx.repo_root);
+    add.arg("add").arg("--").arg(notes_path);
+    run_checked(&mut add)?;
+    let mut commit = ctx.command_in("git", &ctx.repo_root);
+    commit
+        .args([
+            "commit",
+            "-m",
+            &format!("docs: add Weaver {next_version} release notes"),
+            "--",
+        ])
+        .arg(notes_path);
+    run_checked(&mut commit)?;
+    Ok(true)
+}
+
 fn release_args_signature(explicit: Option<&Version>, bump: VersionBump) -> String {
     explicit.map_or_else(
         || format!("bump:{}", version_bump_label(bump)),
@@ -1197,6 +1505,12 @@ fn release_dry_run_cache_rejection_reason(
     }
     if cache.tag_name != expected.tag_name {
         return Some("computed release tag changed since dry run".to_string());
+    }
+    if cache.release_notes_path.as_deref() != Some(expected.release_notes_path) {
+        return Some("release notes path changed since dry run".to_string());
+    }
+    if cache.release_notes_sha256.as_deref() != Some(expected.release_notes_sha256) {
+        return Some("release notes changed since dry run".to_string());
     }
     None
 }
@@ -1668,7 +1982,9 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
     );
     println!("   Next tag   : {tag_name}");
     if args.dry_run {
-        println!("   {YELLOW}(dry run — no commits, tags, or pushes){RESET}");
+        println!(
+            "   {YELLOW}(dry run — no tags or pushes; only uncommitted release notes are committed){RESET}"
+        );
     }
 
     step("Pre-flight checks");
@@ -1677,12 +1993,30 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
         bail!("Tag {tag_name} already exists");
     }
     let branch = current_branch(ctx)?;
-    let git_commit = current_head_commit(ctx)?;
     println!("   Branch : {branch}");
-    let worktree_clean_at_start = git_status_porcelain(ctx)?.trim().is_empty();
-    if !worktree_clean_at_start {
-        prompt_continue_if_dirty(ctx)?;
+    let release_notes_file = require_release_notes(
+        ctx,
+        latest_tag.as_deref(),
+        &tag_name,
+        &next_version,
+        args.dry_run,
+    )?;
+    let release_notes_relative = release_notes_path_relative(&tag_name);
+    println!("   Notes  : {release_notes_relative}");
+    let status_at_start = git_status_porcelain(ctx)?;
+    if !status_at_start.trim().is_empty() {
+        if dirty_paths_are_release_notes_only(&status_at_start, &release_notes_relative) {
+            println!("   {YELLOW}Release notes are uncommitted; committing them first{RESET}");
+        } else {
+            prompt_continue_if_dirty(ctx)?;
+        }
     }
+    if commit_release_notes_if_changed(ctx, &release_notes_file, &next_version)? {
+        ok(format!("Committed {release_notes_relative}"));
+    }
+    let git_commit = current_head_commit(ctx)?;
+    let worktree_clean_at_start = git_status_porcelain(ctx)?.trim().is_empty();
+    let release_notes_sha256 = release_notes_sha256(&release_notes_file)?;
     require_command("gh")?;
     ok("Pre-flight OK");
 
@@ -1704,6 +2038,8 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                 next_version: next_version.to_string(),
                 tag_name: tag_name.clone(),
                 validated_steps: Vec::new(),
+                release_notes_path: None,
+                release_notes_sha256: None,
                 failure_message: Some("dry run did not complete".to_string()),
             },
         )?;
@@ -1754,6 +2090,8 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                             latest_tag_seen: latest_tag.as_deref(),
                             next_version: &next_version_text,
                             tag_name: &tag_name,
+                            release_notes_path: &release_notes_relative,
+                            release_notes_sha256: &release_notes_sha256,
                         };
                         if let Some(reason) =
                             release_dry_run_cache_rejection_reason(&cache, &expected)
@@ -1824,6 +2162,8 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                             next_version: next_version.to_string(),
                             tag_name: tag_name.clone(),
                             validated_steps,
+                            release_notes_path: Some(release_notes_relative.clone()),
+                            release_notes_sha256: Some(release_notes_sha256.clone()),
                             failure_message: None,
                         },
                     )?;

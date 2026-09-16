@@ -731,6 +731,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "rayon-core",
 ]
 
 [[package]]
@@ -3476,9 +3477,9 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "149eee4bf758f8c50555b9867bb3d91acdb665143922bb9f3e6be4baba3adb44"
+checksum = "4fb5b98d15b2131ab7f04f17da856efc2cd80c0cd000db2966cf0e27da739835"
 dependencies = [
  "blake3",
  "crc-fast",
@@ -5218,7 +5219,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5925,7 +5926,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -5981,14 +5982,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -6016,7 +6017,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "quick-xml",
  "serde",
@@ -6027,7 +6028,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6058,7 +6059,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -6128,7 +6129,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6147,7 +6148,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "cc",
  "crc-fast",

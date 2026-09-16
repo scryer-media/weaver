@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { refreshSessionCookie } from "@/graphql/client";
+import { authHeaders, refreshSessionCookie } from "@/graphql/client";
 import { formatSetupCode } from "@/lib/setup-code";
 
 /**
@@ -150,9 +150,12 @@ export function useRestartAction() {
   const restart = async () => {
     setError(null);
     try {
+      // The session cookie alone is refused: a browser request that changes
+      // state also has to carry the CSRF value loaded with the session.
       const response = await fetch(restartUrl(), {
         method: "POST",
         credentials: "include",
+        headers: authHeaders(),
       });
       if (!response.ok) {
         const payload = (await response.json().catch(() => ({}))) as { error?: string };

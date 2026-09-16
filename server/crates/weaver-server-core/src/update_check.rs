@@ -40,6 +40,20 @@ const GITHUB_LATEST_RELEASE_ENDPOINT: &str =
 /// Release tags are cut as `weaver-v{version}` by `cargo xtask release`.
 const RELEASE_TAG_PREFIX: &str = "weaver-v";
 
+/// Turns the release check off entirely when set to `0`.
+const ENV_UPDATE_CHECK: &str = "WEAVER_UPDATE_CHECK";
+
+/// What the status reports while the check is switched off, so a deployment
+/// that never polls is distinguishable from one whose polls keep failing.
+const DISABLED_NOTICE: &str = "release checks are turned off by WEAVER_UPDATE_CHECK=0";
+
+/// Whether this process may poll for releases at all. Read once, at startup:
+/// an operator who turns the check off expects it to stay off for the run.
+fn release_checks_enabled() -> bool {
+    !std::env::var(ENV_UPDATE_CHECK)
+        .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+}
+
 /// Settings key holding the JSON-encoded [`PersistedUpdateState`].
 const UPDATE_CHECK_SETTING_KEY: &str = "update_check_state";
 
@@ -167,6 +181,8 @@ struct UpdateCheckInner {
     status: watch::Sender<UpdateStatus>,
     /// Conditional-request validator from the last successful fetch.
     etag: std::sync::Mutex<Option<String>>,
+    /// Whether this process polls at all.
+    enabled: bool,
 }
 
 impl UpdateCheckService {
@@ -176,6 +192,10 @@ impl UpdateCheckService {
     }
 
     pub(crate) fn with_fetcher(db: Database, fetcher: Arc<dyn ReleaseFetcher>) -> Self {
+        Self::with_fetcher_enabled(db, fetcher, release_checks_enabled())
+    }
+
+    fn with_fetcher_enabled(db: Database, fetcher: Arc<dyn ReleaseFetcher>, enabled: bool) -> Self {
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         let persisted = load_persisted_state(&db);
         let mut status = UpdateStatus::initial(current_version);
@@ -193,6 +213,11 @@ impl UpdateCheckService {
             status.latest_version = persisted.latest_version;
         }
 
+        if !enabled {
+            status.checking = false;
+            status.last_error = Some(DISABLED_NOTICE.to_string());
+        }
+
         let (tx, _rx) = watch::channel(status);
         Self {
             inner: Arc::new(UpdateCheckInner {
@@ -200,6 +225,7 @@ impl UpdateCheckService {
                 fetcher,
                 status: tx,
                 etag: std::sync::Mutex::new(etag),
+                enabled,
             }),
         }
     }
@@ -218,6 +244,10 @@ impl UpdateCheckService {
     pub fn start_background_loop(&self) -> JoinHandle<()> {
         let service = self.clone();
         tokio::spawn(async move {
+            if !service.inner.enabled {
+                tracing::info!("{DISABLED_NOTICE}");
+                return;
+            }
             tokio::time::sleep(startup_delay()).await;
             loop {
                 let wait = match service.run_check().await {
@@ -237,6 +267,9 @@ impl UpdateCheckService {
     /// The `Err` arm reports the fetch failure to the caller for logging; the
     /// failure has already been folded into the published status by then.
     pub(crate) async fn run_check(&self) -> Result<Option<Duration>, String> {
+        if !self.inner.enabled {
+            return Ok(None);
+        }
         self.publish(|status| status.checking = true);
 
         let etag = self

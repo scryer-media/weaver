@@ -6,6 +6,13 @@ fn carrier(root: &std::path::Path) -> PathBuf {
     path
 }
 
+/// Whether a coordinator call was refused by a budget — weaver's own or the
+/// engine's. The two no longer share one error variant, so asking "did a
+/// ceiling refuse this?" is a question for the label, not for the shape.
+fn refused<T>(result: EngineResult<T>) -> bool {
+    result.as_ref().err().is_some_and(budget::is_limit)
+}
+
 async fn next(coordinator: &mut Coordinator) -> WorkDone {
     tokio::time::timeout(std::time::Duration::from_secs(10), coordinator.recv())
         .await
@@ -26,7 +33,7 @@ async fn peer_pressure_waits_for_retirement_then_retries_once_in_isolation() {
     let mut failed = next(&mut coordinator).await;
     let peer = next(&mut coordinator).await;
     let id = failed.job_id;
-    failed.result = Err(EngineError::ResourceLimit("memory budget"));
+    failed.result = Err(budget::host_limit("memory budget"));
     assert_eq!(coordinator.settle(failed), Some(id));
     assert!(coordinator.error(id).is_none());
     assert!(coordinator.jobs[&id].retry_serial.is_some());
@@ -41,12 +48,12 @@ async fn peer_pressure_waits_for_retirement_then_retries_once_in_isolation() {
     assert_eq!(coordinator.in_flight.len(), 1);
     let mut solo = next(&mut coordinator).await;
     assert_eq!(solo.job_id, id);
-    solo.result = Err(EngineError::ResourceLimit("memory budget"));
+    solo.result = Err(budget::host_limit("memory budget"));
     coordinator.settle(solo);
-    assert!(matches!(
-        coordinator.error(id),
-        Some(EngineError::ResourceLimit("memory budget"))
-    ));
+    assert_eq!(
+        coordinator.error(id).and_then(budget::limit_label),
+        Some("memory budget")
+    );
     assert!(
         !coordinator.has_work(id),
         "a solo failure cannot become an unbounded retry loop"
@@ -67,7 +74,7 @@ async fn successful_isolated_retry_restores_shared_scheduling() {
     let mut failed = next(&mut coordinator).await;
     let peer = next(&mut coordinator).await;
     let id = failed.job_id;
-    failed.result = Err(EngineError::ResourceLimit("memory budget"));
+    failed.result = Err(budget::host_limit("memory budget"));
     coordinator.settle(failed);
     coordinator.settle(peer);
     coordinator.enqueue(id, SourceId(0), path.clone()).unwrap();
@@ -701,24 +708,26 @@ fn queued_carriers_and_jobs_have_explicit_limits_and_deduplicate_replays() {
         .enqueue(JobId(0), SourceId(0), PathBuf::from("renamed.par3"))
         .unwrap();
     assert_eq!(coordinator.jobs[&JobId(0)].pending.len(), MAX_PENDING);
-    assert!(matches!(
-        coordinator.enqueue(JobId(0), SourceId(MAX_PENDING as u64), PathBuf::new()),
-        Err(EngineError::ResourceLimit(_))
-    ));
-    assert!(matches!(
-        coordinator.check_pending_capacity(JobId(1), WorkKey::Repair(par3_rs::InputSetId([0; 8]))),
-        Err(EngineError::ResourceLimit(_))
-    ));
+    assert!(refused(coordinator.enqueue(
+        JobId(0),
+        SourceId(MAX_PENDING as u64),
+        PathBuf::new()
+    )));
+    assert!(refused(coordinator.check_pending_capacity(
+        JobId(1),
+        WorkKey::Repair(par3_rs::InputSetId([0; 8]))
+    )));
     coordinator.forget(JobId(0));
     for id in 0..MAX_JOBS {
         coordinator
             .enqueue(JobId(id as u64), SourceId(0), PathBuf::new())
             .unwrap();
     }
-    assert!(matches!(
-        coordinator.enqueue(JobId(MAX_JOBS as u64), SourceId(0), PathBuf::new()),
-        Err(EngineError::ResourceLimit(_))
-    ));
+    assert!(refused(coordinator.enqueue(
+        JobId(MAX_JOBS as u64),
+        SourceId(0),
+        PathBuf::new()
+    )));
 }
 
 fn ready_inline_repair(root: &std::path::Path) -> (Coordinator, par3_rs::InputSetId) {
@@ -861,10 +870,7 @@ fn excessive_repair_result_paths_are_rejected_before_dispatch_or_installation() 
     // One output carries a 16x accounting multiplier; exceed even the largest
     // memory-scaled metadata allowance, without relying on machine RAM size.
     let output = PathBuf::from("x".repeat(4 << 20));
-    assert!(matches!(
-        coordinator.request_repair(JobId(1), set, output),
-        Err(EngineError::ResourceLimit(_))
-    ));
+    assert!(refused(coordinator.request_repair(JobId(1), set, output)));
     assert!(coordinator.in_flight.is_empty());
     assert!(!coordinator.has_work(JobId(1)));
     assert!(!root.path().join("b.txt").exists());
@@ -983,7 +989,7 @@ async fn pending_spill_allows_verified_installation_readback_to_finish() {
     let path = root.path().join("repaired.rar");
     std::fs::write(&path, vec![7; readback::STRIPE_BYTES as usize + 1]).unwrap();
     let mut coordinator = Coordinator::default();
-    coordinator.force_spill(JobId(1), SourceId(7));
+    coordinator.force_spill(JobId(1), SourceId(7), None);
     coordinator
         .queue_readback(JobId(1), readback_installation(path, &execution_options()))
         .unwrap();
@@ -1061,4 +1067,59 @@ async fn terminal_claims_require_current_bound_source_evidence() {
     );
     coordinator.forget(JobId(1));
     assert!(!coordinator.verified_file(JobId(1), SourceId(2)));
+}
+
+#[tokio::test]
+async fn in_flight_release_waits_for_the_session_a_worker_holds() {
+    let root = tempfile::tempdir().unwrap();
+    let path = carrier(root.path());
+    let mut coordinator = Coordinator::default();
+    let id = JobId(1);
+    coordinator.enqueue(id, SourceId(0), path.clone()).unwrap();
+    coordinator.dispatch().unwrap();
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    let (set, matrix) = {
+        let (set, view) = coordinator.assessments(id).next().unwrap();
+        let matrix = view
+            .requirements
+            .first()
+            .map(|need| need.matrix)
+            .unwrap_or_default();
+        (set, matrix)
+    };
+    coordinator
+        .begin_recovery_batch(id, Vec::new(), false)
+        .unwrap();
+    coordinator
+        .jobs
+        .get_mut(&id)
+        .unwrap()
+        .acquisition
+        .batch
+        .as_mut()
+        .unwrap()
+        .declared = vec![(set, matrix, vec![5, 6])];
+    // A second carrier takes the session out to a worker; the window drains
+    // while it is away.
+    coordinator.enqueue(id, SourceId(1), path).unwrap();
+    coordinator.dispatch().unwrap();
+    assert!(coordinator.jobs[&id].runtime.is_none());
+    coordinator.forget_recovery_in_flight(id);
+    let job = &coordinator.jobs[&id];
+    assert_eq!(job.acquisition.deferred_release.len(), 1);
+    assert!(
+        job.acquisition.batch.as_ref().unwrap().declared.is_empty(),
+        "the window keeps nothing it has already handed over"
+    );
+    assert!(!job.pending.contains_key(&WorkKey::Assess));
+    let done = next(&mut coordinator).await;
+    coordinator.settle(done);
+    let job = &coordinator.jobs[&id];
+    assert!(job.acquisition.deferred_release.is_empty());
+    assert!(
+        job.pending.contains_key(&WorkKey::Assess),
+        "the handback that applies the release must be followed by a reassessment"
+    );
+    assert!(coordinator.has_work(id));
 }

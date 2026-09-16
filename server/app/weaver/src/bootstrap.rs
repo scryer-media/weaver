@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tracing::{error, info, warn};
 
@@ -224,16 +225,54 @@ pub(crate) fn apply_core_env_seed(
     Ok(seeded)
 }
 
-pub(crate) fn apply_server_env_seed(
+/// Seed the servers from the environment, and return the distance each
+/// reachable seeded server answered from, which the download runtime wants
+/// before its lanes pick a first pipelining depth.
+pub(crate) async fn apply_server_env_seed(
     db: &Database,
     config: &mut Config,
-    seed: &EnvSeedConfig,
-) -> Result<usize, StateError> {
+    seed: &mut EnvSeedConfig,
+) -> Result<Vec<(u32, Duration)>, StateError> {
+    let mut probe_latencies = Vec::new();
+    // A server saved through the server form is asked for its capabilities
+    // before it is stored. A seeded server is asked the same question here,
+    // unless the environment already stated the answer.
+    if weaver_server_core::settings::env_seed::server_seed_applies(config, seed) {
+        let outcomes =
+            weaver_server_core::settings::env_seed::probe_seeded_server_pipelining(
+                seed,
+                |server| async move {
+                    weaver_server_core::servers::probe_server_connection(&server).await
+                },
+            )
+            .await;
+        for outcome in outcomes {
+            match outcome.failure {
+                Some(reason) => warn!(
+                    server = outcome.server_id,
+                    %reason,
+                    "could not ask a seeded server for its capabilities; it stays sequential until it is saved again"
+                ),
+                None => {
+                    info!(
+                        server = outcome.server_id,
+                        pipelining = outcome.supports_pipelining,
+                        "asked a seeded server for its capabilities"
+                    );
+                    if let Some(latency_ms) = outcome.first_byte_latency_ms {
+                        probe_latencies
+                            .push((outcome.server_id, Duration::from_millis(latency_ms)));
+                    }
+                }
+            }
+        }
+    }
+
     let seeded = weaver_server_core::settings::env_seed::apply_server_seed(db, config, seed)?;
     if seeded > 0 {
         info!(servers = seeded, "seeded NNTP servers from environment");
     }
-    Ok(seeded)
+    Ok(probe_latencies)
 }
 
 pub(crate) fn default_data_dir_from_config_path(config_path: &Path, config: &mut Config) {

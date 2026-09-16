@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useClient, useMutation, useQuery } from "urql";
 import {
   ACCESS_POLICY_QUERY,
@@ -19,15 +19,21 @@ import {
 import { authHeaders } from "@/graphql/client";
 import { useTranslate } from "@/lib/context/translate-context";
 import { noteLoginEnabled } from "@/lib/login-required";
+import { takeApiKeyLink } from "@/lib/api-key-link";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Dialog } from "../../../components/Dialog";
+import { Icon } from "../../../components/icons";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { DangerButton, PrimaryButton, SecondaryButton, TextField } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import { formatDate } from "../../../data/format";
-import { needsPasswordCheck, usePasswordCheck } from "../../../features/PasswordCheckDialog";
+import {
+  needsPasswordCheck,
+  usePasswordCheck,
+  type CheckedOutcome,
+} from "../../../features/PasswordCheckDialog";
 import {
   PanelControls,
   SettingsBlocks,
@@ -421,6 +427,24 @@ function SecurityPanelBody({
   const [createdKey, setCreatedKey] = useState<{ name: string; rawKey: string } | null>(null);
   const [copied, setCopied] = useState(false);
   const [removeKey, setRemoveKey] = useState<ApiKey | null>(null);
+  const keyFieldRef = useRef<HTMLInputElement | null>(null);
+
+  // A key can be read once, so the dialog opens with it selected: copying it is
+  // the next keystroke, whether the dialog came from the form or a deep link.
+  useEffect(() => {
+    if (!createdKey) return;
+    const frame = window.requestAnimationFrame(() => {
+      keyFieldRef.current?.focus();
+      keyFieldRef.current?.select();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [createdKey]);
+
+  const copyCreatedKey = () => {
+    if (!createdKey) return;
+    keyFieldRef.current?.select();
+    void navigator.clipboard?.writeText(createdKey.rawKey).then(() => setCopied(true));
+  };
 
   const submitEnable = async (): Promise<"done" | "password"> => {
     if (enableForm.password !== enableForm.confirm) {
@@ -469,26 +493,69 @@ function SecurityPanelBody({
     return "done";
   };
 
-  const submitKey = async (): Promise<"done" | "password"> => {
-    if (!keyForm.name.trim()) {
+  /**
+   * Mint one key. Reports "failed" rather than "done" when the message it left
+   * in `keyError` still needs somewhere to be read: the form dialog shows it,
+   * a deep link has to open that dialog itself.
+   */
+  const mintKey = async (name: string, scope: string): Promise<CheckedOutcome | "failed"> => {
+    const trimmed = name.trim();
+    if (!trimmed) {
       setKeyError(t("next.security.keyNameRequired"));
-      return "done";
+      return "failed";
     }
     setBusy(true);
-    const result = await createApiKey({ name: keyForm.name.trim(), scope: keyForm.scope });
+    const result = await createApiKey({ name: trimmed, scope });
     setBusy(false);
     if (needsPasswordCheck(result.error)) return "password";
     if (result.error || !result.data?.createApiKey?.rawKey) {
       setKeyError(result.error ? cleanMessage(result.error.message) : t("next.security.keyCreateFailed"));
-      return "done";
+      return "failed";
     }
     setKeyOpen(false);
-    setCreatedKey({ name: keyForm.name.trim(), rawKey: result.data.createApiKey.rawKey });
+    setCreatedKey({ name: trimmed, rawKey: result.data.createApiKey.rawKey });
     setCopied(false);
     setKeyForm({ name: "", scope: "CONTROL" });
     void refetchKeys({ requestPolicy: "network-only" });
     return "done";
   };
+
+  const submitKey = async (): Promise<CheckedOutcome> => {
+    const outcome = await mintKey(keyForm.name, keyForm.scope);
+    return outcome === "password" ? "password" : "done";
+  };
+
+  // A deep link mints its key on arrival and opens the dialog with it already
+  // selected, so whoever followed it lands on a key they can copy. The link is
+  // consumed first: a reload must not quietly mint a second key. An install
+  // that wants a recent password check asks for it here, then mints the key.
+  const keyLinkSpent = useRef(false);
+  useEffect(() => {
+    if (keyLinkSpent.current) return;
+    const { link, search } = takeApiKeyLink(window.location.search);
+    if (!link) return;
+    keyLinkSpent.current = true;
+    window.history.replaceState(
+      window.history.state,
+      "",
+      `${window.location.pathname}${search ? `?${search}` : ""}${window.location.hash}`,
+    );
+
+    setKeyError(null);
+    void passwordCheck.run(async () => {
+      const outcome = await mintKey(link.name, link.scope);
+      if (outcome === "failed") {
+        // The panel itself has nowhere to show a key error, so the form opens
+        // on the link's name and scope: the message is read there, and one
+        // click tries again.
+        setKeyForm({ name: link.name, scope: link.scope });
+        setKeyOpen(true);
+      }
+      return outcome === "password" ? "password" : "done";
+    });
+    // The link is read once on arrival; nothing it depends on changes after that.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const submitRemoveKey = async (key: ApiKey): Promise<"done" | "password"> => {
     setBusy(true);
@@ -995,13 +1062,7 @@ function SecurityPanelBody({
         onDismiss={() => setCreatedKey(null)}
         footer={
           <>
-            <SecondaryButton
-              onClick={() => {
-                if (createdKey) {
-                  void navigator.clipboard.writeText(createdKey.rawKey).then(() => setCopied(true));
-                }
-              }}
-            >
+            <SecondaryButton onClick={copyCreatedKey}>
               {copied ? t("next.security.copied") : t("next.security.copyKey")}
             </SecondaryButton>
             <PrimaryButton onClick={() => setCreatedKey(null)}>{t("next.security.done")}</PrimaryButton>
@@ -1012,13 +1073,26 @@ function SecurityPanelBody({
           <div className="text-[13px] leading-[1.55] text-wv-secondary">
             {t("next.security.copyNow")}
           </div>
-          <TextField
-            label={t("next.security.apiKey")}
-            value={createdKey?.rawKey ?? ""}
-            onChange={() => undefined}
-            secret
-            className="w-full"
-          />
+          <div className="relative w-full">
+            <TextField
+              ref={keyFieldRef}
+              label={t("next.security.apiKey")}
+              value={createdKey?.rawKey ?? ""}
+              onChange={() => undefined}
+              onFocus={() => keyFieldRef.current?.select()}
+              secret
+              className="w-full pr-10"
+            />
+            <button
+              type="button"
+              title={copied ? t("next.security.copied") : t("next.security.copyKey")}
+              aria-label={copied ? t("next.security.copied") : t("next.security.copyKey")}
+              onClick={copyCreatedKey}
+              className="absolute inset-y-0 right-0 flex w-10 cursor-pointer items-center justify-center text-wv-dim hover:text-wv-fg"
+            >
+              <Icon name={copied ? "copied" : "copy"} size={15} />
+            </button>
+          </div>
         </div>
       </Dialog>
 

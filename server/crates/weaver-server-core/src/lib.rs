@@ -64,7 +64,9 @@ pub use operations::instrumentation::{
 };
 pub use operations::metrics::{
     DispatchShareMode, DownloadPressureReason, DownloadPressureState, MetricsSnapshot,
-    PipelineMetrics, SpilloverDecision,
+    PAR3_MEMORY_CATEGORIES, PAR3_SLOTS, PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason,
+    Par3EngineNarrowing, Par3EngineRefusal, Par3MetricsSnapshot, Par3OutcomeClass, Par3Phase,
+    Par3SlotSnapshot, Par3Stage, PipelineMetrics, SpilloverDecision, par3_memory_category_names,
 };
 pub use operations::{
     AsyncOperationState, AsyncOperationTargetState, COUNTER_METRIC_KEYS, CounterRollupValue,
@@ -82,3 +84,52 @@ pub use runtime::affinity::{
     install_tokio_worker_affinity, pin_current_thread_for_hot_download_path,
 };
 pub use runtime::tuning::{RuntimeTuner, TunedParameters};
+
+/// Allocation counter for the tests that assert a hot path allocates nothing.
+///
+/// Test builds only. It forwards every request to the system allocator and
+/// counts allocations *per thread*, which is the only way to prove from inside
+/// a multi-threaded test binary that one closure performed none: a
+/// process-wide counter would pick up every other test running beside it.
+#[cfg(test)]
+pub(crate) mod alloc_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    // `const`-initialized and `Drop`-free, so reading or writing it cannot
+    // itself allocate or re-enter the allocator during thread teardown.
+    thread_local! {
+        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn record() {
+        let _ = ALLOCATIONS.try_with(|count| count.set(count.get().wrapping_add(1)));
+    }
+
+    pub(crate) struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    /// Allocations the calling thread has made so far.
+    pub(crate) fn allocations() -> u64 {
+        ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;

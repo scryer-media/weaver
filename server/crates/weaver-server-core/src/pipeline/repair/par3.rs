@@ -19,6 +19,15 @@ fn execution_options() -> ExecutionOptions {
     static HANDLES: OnceLock<HandleBudget> = OnceLock::new();
     let mut options = ExecutionOptions::default();
     options.memory = budget::budgets().native.clone();
+    // What a session retains follows its set's block count, not its byte size
+    // and not the host's RAM: measured against the engine's own ledger, the
+    // same block count retained identical bytes at 512 B and at 64 KiB blocks.
+    // The measured line is about 48 bytes per block plus roughly 90 KB fixed —
+    // 0.29 MB at 4 096 blocks, 0.88 MB at 16 384, 3.25 MB at 65 531, and a few
+    // hundred KB for small sets. Half the native budget therefore admits sets
+    // of order ten million blocks, far above anything measured here, and this
+    // is a ceiling rather than a reservation: a session that never approaches
+    // it costs nothing, while a lower one would refuse large sets outright.
     options.retained_bytes = options.memory.limit() / 2;
     options.handles = HANDLES.get_or_init(|| HandleBudget::new(128)).clone();
     options.open_handles = 128;
@@ -53,6 +62,8 @@ struct Carrier {
     revision: u64,
     needed: Option<u64>,
     resume: Option<u64>,
+    /// What this carrier's own scan has found so far.
+    scan: carriers::CarrierScan,
 }
 
 struct DiskPublication {
@@ -74,6 +85,138 @@ pub(in crate::pipeline) struct Par3Job {
     donor_search: donors::Cache,
     publication_memory: BTreeMap<SourceId, assessment::ViewReservation>,
     virtual_readers: Arc<virtual_source::ReaderCache>,
+    /// Carrier-scan tallies. Plain integers advanced by the scan loop and
+    /// folded into the process metrics once, at the work unit's handback.
+    packets_authenticated: u64,
+    packets_rejected: u64,
+    ranges_unavailable: u64,
+    /// Option packets that File, Directory and Root packets point at.
+    referenced_options: std::collections::BTreeSet<par3_rs::Fingerprint>,
+    /// Whether any authenticated Root declares the set's paths absolute.
+    absolute_paths: bool,
+    /// Each admitted set's input block size, from its own Start packet. A File
+    /// packet cannot be read without it. Bounded by the set ceiling, because
+    /// an entry is only made for a set that was admitted.
+    set_block_sizes: std::collections::BTreeMap<par3_rs::InputSetId, u64>,
+}
+
+/// What one authenticated metadata packet says about option packets, captured
+/// before the packet is handed to its set.
+enum PacketNote {
+    Nothing,
+    /// This packet points at option packets, and may declare absolute paths.
+    References {
+        hashes: Vec<par3_rs::Fingerprint>,
+        absolute: bool,
+    },
+}
+
+/// What one job's carriers said about option packets. Weaver applies no
+/// option packet, so this exists to be reported, never to change a plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::pipeline) struct OptionPacketTally {
+    /// Distinct link and permission packets the resolved sets retained. The
+    /// engine keeps them verbatim and interprets none of them, so this is the
+    /// count it already holds rather than one weaver keeps beside it.
+    pub present: u64,
+    /// Distinct option packets File, Directory and Root packets point at.
+    pub referenced: u64,
+    /// Pointers naming an option packet nothing authenticated.
+    pub unresolved: u64,
+    /// Whether a Root declared the set's paths absolute.
+    pub absolute_paths: bool,
+}
+
+impl OptionPacketTally {
+    /// Whether there is anything worth saying about this job's options.
+    pub fn is_silent(&self) -> bool {
+        self.present == 0 && self.referenced == 0 && !self.absolute_paths
+    }
+}
+
+impl std::fmt::Display for OptionPacketTally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} option packet(s) ignored, {} referenced, {} reference(s) unresolved",
+            self.present, self.referenced, self.unresolved
+        )?;
+        if self.absolute_paths {
+            f.write_str(", set declares absolute paths")?;
+        }
+        Ok(())
+    }
+}
+
+/// The most option-packet pointers one job remembers. Past this the reference
+/// count stops rising, so a set with a hostile number of pointers cannot grow
+/// this set without bound. The option packets themselves are not counted here:
+/// the engine already holds each resolved set's own tally.
+const MAX_OPTION_HASHES: usize = 4096;
+
+impl PacketNote {
+    /// Read what one authenticated packet says about option packets.
+    ///
+    /// A File packet's body cannot be parsed without its set's block size, so
+    /// the scanner retains it verbatim. `block_size` is what this job has
+    /// learned from that set's Start packet, and is `None` until the Start
+    /// packet authenticates: a File packet that arrives ahead of its own Start
+    /// contributes no reference, which under-reports option pointers and never
+    /// over-reports them.
+    fn of(packet: &par3_rs::packet::Packet, block_size: Option<u64>) -> Self {
+        use par3_rs::packet::{PacketBody, PacketType, file::FilePacket};
+        match packet.body() {
+            PacketBody::Opaque {
+                packet_type: PacketType::File,
+                body,
+            } => block_size
+                .and_then(|block_size| FilePacket::parse(body, block_size).ok())
+                .filter(|file| !file.option_hashes.is_empty())
+                .map_or(Self::Nothing, |file| Self::References {
+                    hashes: file.option_hashes,
+                    absolute: false,
+                }),
+            PacketBody::File(file) if !file.option_hashes.is_empty() => Self::References {
+                hashes: file.option_hashes.clone(),
+                absolute: false,
+            },
+            PacketBody::Directory(directory) if !directory.option_hashes.is_empty() => {
+                Self::References {
+                    hashes: directory.option_hashes.clone(),
+                    absolute: false,
+                }
+            }
+            PacketBody::Root(root) if !root.option_hashes.is_empty() || root.is_absolute_path() => {
+                Self::References {
+                    hashes: root.option_hashes.clone(),
+                    absolute: root.is_absolute_path(),
+                }
+            }
+            _ => Self::Nothing,
+        }
+    }
+
+    fn apply(
+        self,
+        referenced: &mut std::collections::BTreeSet<par3_rs::Fingerprint>,
+        absolute: &mut bool,
+    ) {
+        match self {
+            Self::Nothing => {}
+            Self::References {
+                hashes,
+                absolute: declared,
+            } => {
+                *absolute |= declared;
+                for hash in hashes {
+                    if referenced.len() >= MAX_OPTION_HASHES {
+                        break;
+                    }
+                    referenced.insert(hash);
+                }
+            }
+        }
+    }
 }
 
 impl Default for Par3Job {
@@ -90,6 +233,12 @@ impl Default for Par3Job {
             donor_search: donors::Cache::default(),
             publication_memory: BTreeMap::new(),
             virtual_readers: Arc::default(),
+            packets_authenticated: 0,
+            packets_rejected: 0,
+            ranges_unavailable: 0,
+            referenced_options: std::collections::BTreeSet::new(),
+            absolute_paths: false,
+            set_block_sizes: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -106,7 +255,7 @@ impl Par3Job {
         if !self.disk_publications.contains_key(&source)
             && self.disk_publications.len() >= MAX_CARRIERS
         {
-            return Err(EngineError::ResourceLimit("PAR3 disk publications"));
+            return Err(budget::host_limit("PAR3 disk publications"));
         }
         let access = disk_source(source, path.clone(), &self.options)?;
         let backing = access.snapshot(source)?.ok_or(EngineError::Unavailable {
@@ -158,7 +307,7 @@ impl Par3Job {
     ) -> EngineResult<SourceSnapshot> {
         bindings::check_source(source)?;
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
-            return Err(EngineError::ResourceLimit("PAR3 source bindings"));
+            return Err(budget::host_limit("PAR3 source bindings"));
         }
         let snapshot = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
@@ -313,7 +462,7 @@ impl Par3Job {
     ) -> EngineResult<()> {
         bindings::check_source(source)?;
         if !self.bindings.contains_key(&name) && self.bindings.len() >= MAX_CARRIERS {
-            return Err(EngineError::ResourceLimit("PAR3 source bindings"));
+            return Err(budget::host_limit("PAR3 source bindings"));
         }
         self.retire_name_bindings(source, &name)?;
         self.bindings.retain(|_, bound| *bound != source);
@@ -416,7 +565,7 @@ impl Par3Job {
     ) -> EngineResult<()> {
         bindings::check_source(source)?;
         if !self.carriers.contains_key(&source) && self.carriers.len() >= MAX_CARRIERS {
-            return Err(EngineError::ResourceLimit("job carrier count"));
+            return Err(budget::host_limit("job carrier count"));
         }
         let backing = access.snapshot(source)?.ok_or(EngineError::Unavailable {
             source_id: source,
@@ -452,6 +601,7 @@ impl Par3Job {
                     revision: 0,
                     needed: None,
                     resume: None,
+                    scan: carriers::CarrierScan::default(),
                 },
             );
         }
@@ -478,9 +628,12 @@ impl Par3Job {
             match carrier.scanner.poll()? {
                 ScanEvent::Packet(packet) => {
                     let id = packet.input_set_id();
+                    let kind = carriers::Par3PacketKind::of(&packet);
+                    let origin = packet.origin();
+
                     if !self.sets.contains_key(&id) {
                         if self.sets.len() >= MAX_SETS {
-                            return Err(EngineError::ResourceLimit("job PAR3 set count"));
+                            return Err(budget::host_limit("job PAR3 set count"));
                         }
                         self.sets.insert(
                             id,
@@ -491,10 +644,41 @@ impl Par3Job {
                             )?,
                         );
                     }
-                    self.sets
-                        .get_mut(&id)
-                        .expect("inserted set")
-                        .merge(packet)?;
+                    // A Start packet is what makes every File packet of its
+                    // own set readable, so remember its block size before the
+                    // packet moves into the set.
+                    if let Some(metadata) = packet.metadata()
+                        && let par3_rs::packet::PacketBody::Start(start) = metadata.body()
+                    {
+                        self.set_block_sizes.insert(id, start.block_size);
+                    }
+                    let note = packet.metadata().map_or(PacketNote::Nothing, |metadata| {
+                        PacketNote::of(metadata, self.set_block_sizes.get(&id).copied())
+                    });
+                    // A set that will not admit an authenticated packet has
+                    // said something about that packet, not about the rest of
+                    // the carrier. Record the refusal and keep scanning, so
+                    // one refused copy cannot cost every packet behind it. An
+                    // exhausted budget is different: it is about the job, and
+                    // scanning further would only deepen it.
+                    match self.sets.get_mut(&id).expect("inserted set").merge(packet) {
+                        Ok(()) => {
+                            carrier.scan.note_packet(kind, origin.offset, origin.length);
+                            note.apply(&mut self.referenced_options, &mut self.absolute_paths);
+                            self.packets_authenticated += 1;
+                        }
+                        Err(error) if is_admission_exhausted(&error) => return Err(error),
+                        Err(error) => {
+                            carrier.scan.note_rejected(origin.offset, origin.length);
+                            self.packets_rejected += 1;
+                            tracing::debug!(
+                                source = source.0,
+                                offset = origin.offset,
+                                error = %error,
+                                "PAR3 set refused an authenticated packet"
+                            );
+                        }
+                    }
                 }
                 ScanEvent::NeedData { offset } => {
                     carrier.needed = Some(carrier.needed.map_or(offset, |old| old.min(offset)));
@@ -507,18 +691,94 @@ impl Par3Job {
                         carrier.resume =
                             Some(carrier.resume.map_or(position, |old| old.min(position)));
                         carrier.scanner.seek(next.start)?;
+                        carrier.scan.note_unavailable(next.start);
+                        self.ranges_unavailable += 1;
                         continue;
                     }
                     carrier.revision = revision;
                     return Ok(());
                 }
                 ScanEvent::End => {
+                    carrier.scan.note_end(carrier.published.len);
                     carrier.revision = revision;
                     return Ok(());
                 }
             }
         }
     }
+
+    /// Every carrier that reported damage, newest scan state, bounded so one
+    /// summary can never grow with the carrier count.
+    fn damage_report(&self) -> Vec<carriers::CarrierDamage> {
+        const SHOWN: usize = 8;
+        self.carriers
+            .iter()
+            .filter(|(_, carrier)| carrier.scan.is_damaged())
+            .take(SHOWN)
+            .map(|(&source, carrier)| carriers::CarrierDamage {
+                source,
+                first_damage_offset: carrier.scan.first_damage_offset.unwrap_or_default(),
+                damaged_bytes: carrier.scan.damaged_bytes,
+                rejected: carrier.scan.rejected,
+                unavailable_ranges: carrier.scan.unavailable_ranges,
+            })
+            .collect()
+    }
+
+    /// Authenticated packets of each family across every carrier of this job.
+    fn authenticated_families(&self) -> [u64; carriers::Par3PacketKind::COUNT] {
+        let mut totals = [0u64; carriers::Par3PacketKind::COUNT];
+        for carrier in self.carriers.values() {
+            for (total, count) in totals.iter_mut().zip(carrier.scan.authenticated) {
+                *total = (*total).saturating_add(count);
+            }
+        }
+        totals
+    }
+
+    /// What this job said about option packets: how many each resolved set
+    /// retained, how many distinct option packets the metadata points at, and
+    /// how many of those pointers name nothing the set holds.
+    ///
+    /// The packets themselves are the engine's own tally, read off each
+    /// resolved set rather than kept a second time here. The pointers are not:
+    /// a resolved set exposes the File and Directory packets its Root tree
+    /// reaches, so a pointer in an authenticated packet the tree never names
+    /// is invisible there and is counted from the scan instead.
+    fn option_packet_tally(&self) -> OptionPacketTally {
+        let resolved = || self.sets.values().filter_map(|set| set.native.set());
+        OptionPacketTally {
+            present: resolved().fold(0u64, |count, set| {
+                count.saturating_add(set.option_packet_count() as u64)
+            }),
+            referenced: self.referenced_options.len() as u64,
+            unresolved: self
+                .referenced_options
+                .iter()
+                .filter(|hash| !resolved().any(|set| set.option_packet(hash).is_some()))
+                .count() as u64,
+            absolute_paths: self.absolute_paths,
+        }
+    }
+
+    /// Readable carrier bytes across this job that produced no authenticated
+    /// packet.
+    fn damaged_bytes(&self) -> u64 {
+        self.carriers.values().fold(0u64, |bytes, carrier| {
+            bytes.saturating_add(carrier.scan.damaged_bytes)
+        })
+    }
+}
+
+/// Whether an engine refusal is about the job's exhausted budget rather than
+/// about the one packet it was handed.
+fn is_admission_exhausted(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::ResourceLimit(_)
+            | EngineError::Cancelled
+            | EngineError::OutputInterrupted { .. }
+    )
 }
 
 impl Pipeline {
@@ -563,8 +823,18 @@ impl Pipeline {
             match tokio::task::spawn_blocking(move || inside::probe(path)).await {
                 Ok(Ok(start)) => start,
                 Ok(Err(error)) => {
-                    tracing::warn!(job_id = job_id.0, file_index = file_id.file_index, %error,
-                        "embedded PAR3 probe unavailable; continuing without a carrier hint");
+                    // A budget that had no room for the probe says nothing
+                    // about the file: forgetting the attempt lets a later
+                    // completion pass ask again, rather than ignoring an
+                    // embedded set for the rest of the job.
+                    if budget::is_limit(&error) {
+                        self.par3_inside_probes.remove(file_id);
+                        tracing::debug!(job_id = job_id.0, file_index = file_id.file_index, %error,
+                            "embedded PAR3 probe had no budget; it will be retried");
+                    } else {
+                        tracing::warn!(job_id = job_id.0, file_index = file_id.file_index, %error,
+                            "embedded PAR3 probe unavailable; continuing without a carrier hint");
+                    }
                     None
                 }
                 Err(error) => {
@@ -596,7 +866,10 @@ impl Pipeline {
             return;
         }
         self.par3_runtime.get_or_insert_with(|| {
-            Box::new(work::Coordinator::new(self.repair_work_done_tx.clone()))
+            Box::new(work::Coordinator::new(
+                self.repair_work_done_tx.clone(),
+                Arc::clone(&self.metrics),
+            ))
         });
         if let Err(error) = self.enqueue_par3_file_with_inside(job_id, file_id, embedded) {
             self.fail_job(job_id, format!("PAR3 discovery failed: {error}"));
@@ -743,14 +1016,14 @@ impl Pipeline {
             }
             let end = offset
                 .checked_add(u64::from(len))
-                .ok_or(EngineError::ResourceLimit("PAR3 source offsets"))?;
+                .ok_or(budget::host_limit("PAR3 source offsets"))?;
             if let Some(last) = ranges.last_mut()
                 && last.end == offset
             {
                 last.end = end;
             } else {
                 if ranges.len() >= 262_144 {
-                    return Err(EngineError::ResourceLimit("PAR3 source ranges"));
+                    return Err(budget::host_limit("PAR3 source ranges"));
                 }
                 ranges.push(offset..end);
             }
@@ -793,7 +1066,7 @@ impl Pipeline {
                 .chain(persisted.map(|(offset, len)| offset..offset.saturating_add(len as u64)))
             {
                 if ranges.len() >= 262_144 {
-                    return Err(EngineError::ResourceLimit("PAR3 source ranges"));
+                    return Err(budget::host_limit("PAR3 source ranges"));
                 }
                 ranges.push(range);
             }
@@ -996,7 +1269,7 @@ impl Pipeline {
                         || (0..file.total_segments()).any(|part| file.has_segment(part)))
                 {
                     if dirty.len() >= MAX_CARRIERS {
-                        return Err(EngineError::ResourceLimit("PAR3 source count"));
+                        return Err(budget::host_limit("PAR3 source count"));
                     }
                     dirty.push(source);
                 }
@@ -1089,13 +1362,27 @@ impl Pipeline {
         if let (Some(job_id), Some(result)) = (job_id, readback) {
             self.apply_par3_readback(job_id, result).await;
         }
+        // This handback released a share of the PAR3 budget, so every job
+        // parked on memory gets another completion check — not only the job
+        // that handed back. Without this a parked job would wait forever for
+        // a check that nothing else schedules.
+        let parked = self
+            .par3_runtime
+            .as_ref()
+            .map(|coordinator| coordinator.jobs_awaiting_memory())
+            .unwrap_or_default();
+        for job_id in parked {
+            self.schedule_job_completion_check(job_id);
+        }
     }
 }
 
 mod acquisition;
 mod assessment;
 mod bindings;
-mod budget;
+pub(in crate::pipeline) mod budget;
+pub(in crate::pipeline) mod carriers;
+pub(in crate::pipeline) mod cohorts;
 mod completion;
 mod coordination;
 #[cfg(windows)]
@@ -1103,7 +1390,9 @@ mod disk_windows;
 mod donors;
 mod identity;
 pub(in crate::pipeline) mod inside;
+pub(in crate::pipeline) mod outcome;
 mod outputs;
+pub(in crate::pipeline) mod paths;
 mod placement;
 mod readback;
 pub(in crate::pipeline) mod virtual_source;

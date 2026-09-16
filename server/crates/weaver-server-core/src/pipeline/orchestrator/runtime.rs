@@ -263,6 +263,8 @@ impl Pipeline {
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
             pending_file_progress: HashMap::new(),
+            dirty_server_attribution: HashSet::new(),
+            server_attribution_checkpoint_at: Instant::now(),
             persisted_file_progress: HashMap::new(),
             file_hash_states: HashMap::new(),
             deferred_file_hash_data: HashMap::new(),
@@ -728,6 +730,7 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
+        self.dirty_server_attribution.remove(&job_id);
         self.blocked_restores.remove(&job_id);
         self.pending_file_progress
             .retain(|file_id, _| file_id.job_id != job_id);
@@ -1166,6 +1169,7 @@ impl Pipeline {
     }
 
     fn refresh_periodic_snapshot(&mut self) {
+        self.checkpoint_server_attribution_if_due();
         self.sample_phase_progress();
         self.shared_state.refresh_metrics_snapshot();
         self.flush_pending_snapshot();
@@ -1506,6 +1510,7 @@ impl Pipeline {
         {
             warn!(error = %error, "failed to flush file progress floors during drain");
         }
+        self.flush_server_attribution();
         if let Err(error) = self.flush_download_bandwidth_usage() {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }
@@ -1514,6 +1519,16 @@ impl Pipeline {
         // progress floors flushed above, or runtime writes) so shutdown does not
         // drop them. Bounded so a stuck write cannot hang shutdown forever.
         self.join_fire_and_forget_tasks().await;
+        match tokio::time::timeout(
+            Self::FIRE_AND_FORGET_DRAIN_TIMEOUT,
+            self.db.flush_write_queue(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "failed to flush ordered database writes during drain"),
+            Err(_) => warn!("timed out flushing ordered database writes during drain"),
+        }
     }
 
     fn has_download_or_decode_drain_work(&self) -> bool {

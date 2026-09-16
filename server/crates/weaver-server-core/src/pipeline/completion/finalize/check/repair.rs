@@ -1760,7 +1760,22 @@ impl Pipeline {
         set_runtime.post_verdict_reconcile_attempts = 0;
         // A settled set owes no repair.
         set_runtime.pending_repair = None;
+        let settled_by_repair = matches!(reason, Par2SetSettlementReason::Repaired);
         self.mark_par2_verified(job_id).await;
+        // A set settling by repair is the moment that repair is accepted, and
+        // that is true whether or not this settlement is what first carried the
+        // aggregate. The purge inside `mark_par2_verified` fires only on the
+        // aggregate's first transition, which a job can have spent long before
+        // it was repaired: a set that settled clean on a claim the
+        // authoritative pass later contradicted leaves the aggregate verified,
+        // so the repair that followed it finds no transition left to ride and
+        // its backups reach the completed folder. Gated on the aggregate for
+        // the same reason the transition is: a sibling set that is still
+        // unsettled may yet rewrite this directory, and its own settlement — or
+        // the transition, if it settles clean — carries the purge instead.
+        if settled_by_repair && self.par2_verified.contains(&job_id) {
+            self.purge_par2_repair_leftovers(job_id);
+        }
         if let Par2SetSettlementReason::Clean {
             slice_size,
             verification_mode,
@@ -1984,9 +1999,11 @@ impl Pipeline {
             self.finalize_ready_direct_sets(job_id).await;
             // The aggregate has just settled, so every set that was going to
             // rewrite this directory has done so and the leftovers can be named
-            // by difference. This is the only place that is true: a job whose
-            // last set settled *clean* never re-enters the repair tail, so
-            // purging only from there leaves the earlier sets' backups on disk.
+            // by difference. This covers the job whose last set settled
+            // *clean*, which never re-enters the repair tail: purging only from
+            // there would leave the earlier sets' backups on disk. A set that
+            // settles by repair carries its own purge, in `settle_par2_set`,
+            // for the job that had already spent this transition.
             // Ordered after direct finalization so a set that renames its
             // partials into place is already wearing its final names when the
             // keep-set is built from the assembly.

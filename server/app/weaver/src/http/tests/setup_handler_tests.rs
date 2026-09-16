@@ -598,3 +598,56 @@ async fn a_code_challenge_still_requires_its_code() {
     assert_eq!(outcome.payload["code"], "SETUP_CODE_REQUIRED");
     assert!(db.get_auth_credentials().unwrap().is_none());
 }
+
+#[tokio::test]
+async fn codeless_setup_refuses_a_host_name_the_browser_did_not_resolve() {
+    let (db, app) = authenticated_setup_router(setup_code::SetupChallenge::open());
+    let outcome = post_setup_with_headers(
+        app,
+        administrator(),
+        &[
+            ("host", "attacker.test"),
+            ("origin", "http://attacker.test"),
+        ],
+    )
+    .await;
+
+    assert_eq!(outcome.status, StatusCode::FORBIDDEN, "{}", outcome.payload);
+    assert_eq!(outcome.payload["code"], "SETUP_LOCAL_ONLY");
+    assert!(db.get_auth_credentials().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn codeless_setup_proceeds_from_a_literal_address() {
+    let (db, app) = authenticated_setup_router(setup_code::SetupChallenge::open());
+    let outcome = post_setup_with_headers(
+        app,
+        administrator(),
+        &[
+            ("host", "127.0.0.1:9090"),
+            ("origin", "http://127.0.0.1:9090"),
+        ],
+    )
+    .await;
+
+    assert_eq!(outcome.status, StatusCode::OK, "{}", outcome.payload);
+    assert!(db.get_auth_credentials().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn codeless_setup_refuses_an_origin_from_another_host() {
+    let (db, app) = authenticated_setup_router(setup_code::SetupChallenge::open());
+    let outcome = post_setup_with_headers(
+        app,
+        administrator(),
+        &[
+            ("host", "127.0.0.1:9090"),
+            ("origin", "http://attacker.test"),
+        ],
+    )
+    .await;
+
+    assert_eq!(outcome.status, StatusCode::FORBIDDEN, "{}", outcome.payload);
+    assert_eq!(outcome.payload["code"], "SETUP_LOCAL_ONLY");
+    assert!(db.get_auth_credentials().unwrap().is_none());
+}

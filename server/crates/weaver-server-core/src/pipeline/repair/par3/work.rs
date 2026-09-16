@@ -1,12 +1,333 @@
 //! Retained ownership and bounded dispatch for PAR3 blocking work.
 
 use super::*;
+use crate::operations::metrics::{
+    PAR3_MEMORY_CATEGORIES, Par3EngineNarrowing, Par3EngineRefusal, Par3Phase, Par3Stage,
+    PipelineMetrics,
+};
 use crate::pipeline::RepairWorkDone;
 use par3_rs::runtime::CancellationToken;
 use tokio::sync::mpsc;
 
 const MAX_JOBS: usize = 256;
 const MAX_PENDING: usize = 4096;
+
+/// Engine counters sampled once at dispatch and once at handback. The deltas
+/// between the two are the only PAR3 engine telemetry weaver folds into its
+/// own metrics: nothing in this crate counts per byte, per block or per stripe.
+#[derive(Debug, Default, Clone, Copy)]
+struct EngineCounters {
+    source_read_bytes: u64,
+    source_reads: u64,
+    stage_calls: [u64; Par3Stage::COUNT],
+    stage_millis: [u64; Par3Stage::COUNT],
+    stage_completed: [u64; Par3Stage::COUNT],
+    file_sync_calls: u64,
+    file_sync_millis: u64,
+    donor_read_bytes: u64,
+    donor_time_cap_hits: u64,
+    reader_cache_hits: u64,
+    reader_cache_evictions: u64,
+    reserved_bytes: u64,
+    reserved_peak_bytes: u64,
+    retained_bytes: u64,
+    packets_authenticated: u64,
+    packets_rejected: u64,
+    ranges_unavailable: u64,
+    /// The engine's categorised ledger: current and peak reservations per
+    /// category. Absolute values, so these are published rather than folded.
+    ledger_bytes: [u64; PAR3_MEMORY_CATEGORIES],
+    ledger_peak_bytes: [u64; PAR3_MEMORY_CATEGORIES],
+    /// The widths the engine last admitted. Also absolute by the engine's own
+    /// definition: each field holds the most recent admission.
+    admitted: [u64; ADMITTED_WIDTHS],
+    /// Cumulative refusals by cause, narrowings by width, and the bytes a
+    /// bounded working set pushed onto the I/O layer. These fold in as deltas.
+    refusals: [u64; Par3EngineRefusal::COUNT],
+    narrowed: [u64; Par3EngineNarrowing::COUNT],
+    reread_bytes: u64,
+    reconstructed_bytes: u64,
+    /// What the engine's admission caches currently hold. Absolute.
+    cache_entries: u64,
+    cache_bytes: u64,
+    /// Transform and coefficient work the engine's codecs performed.
+    /// Cumulative, so these fold in as deltas.
+    codec: [u64; CODEC_COUNTERS],
+    /// Carrier bytes the scanner read and could not authenticate. Cumulative
+    /// per job, so this folds in as a delta.
+    damaged_bytes: u64,
+}
+
+/// Admitted widths captured per handback, in the order the fields below are
+/// published. Fixed so the capture allocates nothing.
+const ADMITTED_WIDTHS: usize = 6;
+
+/// Codec work counters captured per handback, in the order they are published.
+const CODEC_COUNTERS: usize = 6;
+
+/// The engine stage each tracked class maps to.
+const TRACKED_STAGES: [(Par3Stage, par3_rs::runtime::Stage); Par3Stage::COUNT] = [
+    (Par3Stage::Scan, par3_rs::runtime::Stage::Scan),
+    (Par3Stage::Metadata, par3_rs::runtime::Stage::Metadata),
+    (Par3Stage::Verify, par3_rs::runtime::Stage::Verify),
+    (Par3Stage::Assess, par3_rs::runtime::Stage::Assess),
+    (Par3Stage::Placement, par3_rs::runtime::Stage::Placement),
+    (Par3Stage::Repair, par3_rs::runtime::Stage::Repair),
+    (Par3Stage::Checkpoint, par3_rs::runtime::Stage::Checkpoint),
+];
+
+fn as_millis(elapsed: std::time::Duration) -> u64 {
+    elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// The phase an engine stage puts a work slot in.
+fn engine_phase(stage: par3_rs::runtime::Stage) -> Par3Phase {
+    use par3_rs::runtime::Stage;
+    match stage {
+        Stage::Scan => Par3Phase::ScanningCarriers,
+        Stage::Metadata | Stage::Container | Stage::Checkpoint => Par3Phase::ResolvingMetadata,
+        Stage::Verify => Par3Phase::Verifying,
+        Stage::Assess => Par3Phase::Assessing,
+        Stage::Placement => Par3Phase::DonorSearch,
+        Stage::Create | Stage::Carrier | Stage::Repair | Stage::Encode | Stage::Decode => {
+            Par3Phase::Repairing
+        }
+    }
+}
+
+/// The phase a queued work unit puts its slot in before the engine speaks.
+fn pending_phase(input: &PendingInput) -> Par3Phase {
+    match input {
+        PendingInput::Assess => Par3Phase::Assessing,
+        PendingInput::Donors => Par3Phase::DonorSearch,
+        PendingInput::Readback(_) => Par3Phase::Readback,
+        PendingInput::Repair { .. } => Par3Phase::Repairing,
+        PendingInput::Carrier { .. } | PendingInput::Embedded { .. } => Par3Phase::ScanningCarriers,
+        PendingInput::Virtual { .. }
+        | PendingInput::CompleteFile { .. }
+        | PendingInput::File { .. } => Par3Phase::ResolvingMetadata,
+    }
+}
+
+impl EngineCounters {
+    fn capture(runtime: &Par3Job) -> Self {
+        let diagnostics = &runtime.options.diagnostics;
+        let source = diagnostics.source_io();
+        let sync = diagnostics.file_sync();
+        let (reader_cache_hits, reader_cache_evictions) = runtime.virtual_readers.counters();
+        let mut counters = Self {
+            source_read_bytes: source.read_bytes,
+            source_reads: source.read_calls,
+            file_sync_calls: sync.calls,
+            file_sync_millis: as_millis(sync.elapsed),
+            donor_read_bytes: runtime.donor_search.read_bytes,
+            donor_time_cap_hits: runtime.donor_search.time_cap_hits,
+            reader_cache_hits,
+            reader_cache_evictions,
+            reserved_bytes: runtime.options.memory.used() as u64,
+            reserved_peak_bytes: runtime.options.memory.peak() as u64,
+            retained_bytes: super::budget::budgets().host_used(),
+            packets_authenticated: runtime.packets_authenticated,
+            packets_rejected: runtime.packets_rejected,
+            ranges_unavailable: runtime.ranges_unavailable,
+            admitted: {
+                let admission = diagnostics.admission();
+                [
+                    admission.stripe_bytes,
+                    admission.stripe_buffers,
+                    admission.output_tile,
+                    admission.verify_batch,
+                    admission.workers,
+                    admission.window_bytes,
+                ]
+            },
+            refusals: {
+                let refusals = diagnostics.refusals();
+                [
+                    refusals.exceeds_limit,
+                    refusals.peer_contention,
+                    refusals.unmeasured,
+                ]
+            },
+            narrowed: {
+                let waits = diagnostics.waits();
+                [
+                    waits.stripe_narrowed,
+                    waits.workers_refused,
+                    waits.batch_narrowed,
+                ]
+            },
+            reread_bytes: diagnostics.amplification().reread_bytes,
+            reconstructed_bytes: diagnostics.amplification().reconstructed_bytes,
+            cache_entries: diagnostics.caches().entries,
+            cache_bytes: diagnostics.caches().bytes,
+            codec: {
+                let codec = diagnostics.codec();
+                [
+                    codec.transform_calls,
+                    codec.butterflies,
+                    codec.butterflies_skipped,
+                    codec.multiply_accumulates,
+                    codec.factors_computed,
+                    codec.factors_reused,
+                ]
+            },
+            damaged_bytes: runtime.damaged_bytes(),
+            ..Self::default()
+        };
+        // The ledger is read straight off the budget these diagnostics were
+        // first used with; reading it allocates nothing and takes no lock.
+        if let Some(ledger) = diagnostics.memory() {
+            for (index, category) in par3_rs::runtime::MemoryCategory::ALL
+                .into_iter()
+                .enumerate()
+            {
+                let entry = ledger.category(category);
+                counters.ledger_bytes[index] = entry.current;
+                counters.ledger_peak_bytes[index] = entry.peak;
+            }
+        }
+        for (tracked, stage) in TRACKED_STAGES {
+            let snapshot = diagnostics.stage(stage);
+            counters.stage_calls[tracked.index()] = snapshot.calls;
+            counters.stage_millis[tracked.index()] = as_millis(snapshot.elapsed);
+            counters.stage_completed[tracked.index()] = snapshot.completed;
+        }
+        counters
+    }
+
+    /// Fold this handback's deltas into the live metrics. One load per counter
+    /// and one `fetch_add` per non-zero delta; never called from a work loop.
+    fn apply(self, before: Self, metrics: &PipelineMetrics) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let add = |counter: &std::sync::atomic::AtomicU64, delta: u64| {
+            if delta != 0 {
+                counter.fetch_add(delta, Relaxed);
+            }
+        };
+        let par3 = &metrics.par3;
+        add(
+            &par3.source_read_bytes_total,
+            self.source_read_bytes
+                .saturating_sub(before.source_read_bytes),
+        );
+        add(
+            &par3.source_reads_total,
+            self.source_reads.saturating_sub(before.source_reads),
+        );
+        add(
+            &par3.file_sync_calls_total,
+            self.file_sync_calls.saturating_sub(before.file_sync_calls),
+        );
+        add(
+            &par3.file_sync_ms_total,
+            self.file_sync_millis
+                .saturating_sub(before.file_sync_millis),
+        );
+        add(
+            &par3.donor_read_bytes_total,
+            self.donor_read_bytes
+                .saturating_sub(before.donor_read_bytes),
+        );
+        add(
+            &par3.donor_time_cap_hits_total,
+            self.donor_time_cap_hits
+                .saturating_sub(before.donor_time_cap_hits),
+        );
+        add(
+            &par3.encrypted_reader_cache_hits_total,
+            self.reader_cache_hits
+                .saturating_sub(before.reader_cache_hits),
+        );
+        add(
+            &par3.encrypted_reader_cache_evictions_total,
+            self.reader_cache_evictions
+                .saturating_sub(before.reader_cache_evictions),
+        );
+        for (tracked, _) in TRACKED_STAGES {
+            let index = tracked.index();
+            par3.note_stage_delta(
+                tracked,
+                self.stage_calls[index].saturating_sub(before.stage_calls[index]),
+                self.stage_millis[index].saturating_sub(before.stage_millis[index]),
+            );
+        }
+        // Repair stage units are output bytes, so its completed delta is the
+        // reconstructed byte count without any per-byte counting here.
+        let repair = Par3Stage::Repair.index();
+        add(
+            &par3.repair_bytes_reconstructed_total,
+            self.stage_completed[repair].saturating_sub(before.stage_completed[repair]),
+        );
+        add(
+            &par3.packets_authenticated_total,
+            self.packets_authenticated
+                .saturating_sub(before.packets_authenticated),
+        );
+        add(
+            &par3.packets_rejected_total,
+            self.packets_rejected
+                .saturating_sub(before.packets_rejected),
+        );
+        add(
+            &par3.carrier_ranges_unavailable_total,
+            self.ranges_unavailable
+                .saturating_sub(before.ranges_unavailable),
+        );
+        add(
+            &par3.carrier_damaged_bytes_total,
+            self.damaged_bytes.saturating_sub(before.damaged_bytes),
+        );
+        par3.reserved_bytes.store(self.reserved_bytes, Relaxed);
+        par3.retained_bytes.store(self.retained_bytes, Relaxed);
+        par3.reserved_peak_bytes
+            .store(self.reserved_peak_bytes, Relaxed);
+        par3.store_ledger(self.ledger_bytes, self.ledger_peak_bytes);
+        for (field, value) in [
+            (&par3.engine_admitted_stripe_bytes, self.admitted[0]),
+            (&par3.engine_admitted_stripe_buffers, self.admitted[1]),
+            (&par3.engine_admitted_output_tile, self.admitted[2]),
+            (&par3.engine_admitted_verify_batch, self.admitted[3]),
+            (&par3.engine_admitted_workers, self.admitted[4]),
+            (&par3.engine_admitted_window_bytes, self.admitted[5]),
+        ] {
+            field.store(value, Relaxed);
+        }
+        par3.note_engine_refusals(std::array::from_fn(|index| {
+            self.refusals[index].saturating_sub(before.refusals[index])
+        }));
+        par3.note_engine_narrowed(std::array::from_fn(|index| {
+            self.narrowed[index].saturating_sub(before.narrowed[index])
+        }));
+        add(
+            &par3.engine_reread_bytes_total,
+            self.reread_bytes.saturating_sub(before.reread_bytes),
+        );
+        add(
+            &par3.engine_reconstructed_bytes_total,
+            self.reconstructed_bytes
+                .saturating_sub(before.reconstructed_bytes),
+        );
+        par3.engine_cache_entries.store(self.cache_entries, Relaxed);
+        par3.engine_cache_bytes.store(self.cache_bytes, Relaxed);
+        // The codec counts arrive cumulative for the session's whole life, so
+        // what this handback contributed is the difference against the
+        // baseline the same work unit was dispatched with.
+        for (index, field) in [
+            &par3.engine_codec_transform_calls_total,
+            &par3.engine_codec_butterflies_total,
+            &par3.engine_codec_butterflies_skipped_total,
+            &par3.engine_codec_multiply_accumulates_total,
+            &par3.engine_codec_factors_computed_total,
+            &par3.engine_codec_factors_reused_total,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            add(field, self.codec[index].saturating_sub(before.codec[index]));
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WorkKey {
@@ -76,7 +397,7 @@ impl PendingInput {
                     .capacity()
                     .checked_mul(2)
                     .and_then(|cost| cost.checked_add(1024))
-                    .ok_or(EngineError::ResourceLimit("PAR3 virtual publication"));
+                    .ok_or(budget::host_limit("PAR3 virtual publication"));
             }
             Self::Repair { path, .. } => (path, Some(0)),
             Self::CompleteFile { path, name } => (path, name.capacity().checked_mul(2)),
@@ -109,10 +430,10 @@ impl PendingInput {
             .checked_add(
                 path.capacity()
                     .checked_mul(2)
-                    .ok_or(EngineError::ResourceLimit("PAR3 queued path"))?,
+                    .ok_or(budget::host_limit("PAR3 queued path"))?,
             )
             .and_then(|bytes| bytes.checked_add(extra?))
-            .ok_or(EngineError::ResourceLimit("PAR3 queued publication"))
+            .ok_or(budget::host_limit("PAR3 queued publication"))
     }
 }
 
@@ -152,12 +473,24 @@ impl Drop for WorkTiming {
 pub(super) struct Acquisition {
     pub batch: Option<RecoveryBatch>,
     pub prefetched: bool,
+    /// Indices a drained window retracted while a worker held the engine
+    /// session. The retraction lands on the session at its handback, followed
+    /// by the reassessment that makes those indices askable again; dropping
+    /// it would leave them counted in flight for the rest of the job.
+    deferred_release: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)>,
 }
 
 pub(super) struct RecoveryBatch {
     pub articles: Vec<crate::jobs::ids::SegmentId>,
+    /// Whether this window's articles have already been accounted for as
+    /// arrivals or losses. Each admitted article is counted exactly once.
+    settled: bool,
     job_id: JobId,
     cohorts: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, u64)>,
+    /// Recovery indices this window declared to the engine as being acquired,
+    /// so a reassessment taken while it is in flight does not ask for them
+    /// again. Retracted verbatim when the window drains.
+    declared: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)>,
     epoch: u64,
     assessment: u64,
     admitted_at: std::time::Instant,
@@ -210,11 +543,30 @@ struct JobSlot {
     errors: BTreeMap<SourceId, EngineError>,
     donor_error: Option<EngineError>,
     spill: Option<SourceId>,
+    /// The engine refusal that forced the spill, kept so the verdict can be
+    /// classified against the numbers the engine actually measured rather
+    /// than against the configured budget read back later.
+    spill_limit: Option<par3_rs::runtime::ResourceLimit>,
     spill_disk: Option<budget::DiskReservation>,
     completed_repair: Option<RepairCompletion>,
     completed_readback: Option<EngineResult<readback::ReadbackDone>>,
     installing: bool,
     verification: Option<verification::Receipt>,
+    /// Engine counters as of this job's last dispatch.
+    engine_baseline: EngineCounters,
+    /// When this job's current wait for PAR3 memory began.
+    waiting_for_memory_since: Option<std::time::Instant>,
+    /// The last typed verdict this job reached, for tests and diagnostics.
+    last_outcome: Option<outcome::Par3Outcome>,
+    /// Cohorts with losses named by the assessment the in-flight repair was
+    /// dispatched against, credited only once that repair comes back whole.
+    repair_cohorts: u64,
+    /// Whether this job has already said its carriers were damaged. The
+    /// summary is a job-level fact, not a per-handback one.
+    damage_reported: bool,
+    /// Whether this job has already reported the option packets its set
+    /// carries that weaver does not apply.
+    options_reported: bool,
 }
 
 impl Default for JobSlot {
@@ -237,11 +589,18 @@ impl Default for JobSlot {
             errors: BTreeMap::new(),
             donor_error: None,
             spill: None,
+            spill_limit: None,
             spill_disk: None,
             completed_repair: None,
             completed_readback: None,
             installing: false,
             verification: None,
+            engine_baseline: EngineCounters::default(),
+            waiting_for_memory_since: None,
+            last_outcome: None,
+            repair_cohorts: 0,
+            damage_reported: false,
+            options_reported: false,
         }
     }
 }
@@ -267,6 +626,7 @@ pub(in crate::pipeline) struct Coordinator {
     next_ticket: u64,
     last_job: Option<JobId>,
     tx: mpsc::Sender<RepairWorkDone>,
+    metrics: Arc<PipelineMetrics>,
     #[cfg(test)]
     test_rx: Option<mpsc::Receiver<RepairWorkDone>>,
 }
@@ -275,7 +635,7 @@ pub(in crate::pipeline) struct Coordinator {
 impl Default for Coordinator {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel(1);
-        let mut coordinator = Self::new(tx);
+        let mut coordinator = Self::new(tx, PipelineMetrics::new());
         coordinator.test_rx = Some(rx);
         coordinator
     }
@@ -284,6 +644,25 @@ impl Default for Coordinator {
 impl Coordinator {
     pub(super) fn acquisition(&self, job_id: JobId) -> Option<&Acquisition> {
         self.jobs.get(&job_id).map(|job| &job.acquisition)
+    }
+
+    /// The articles of an acquisition window whose downloads have all
+    /// finished, handed back once so no article is accounted for twice.
+    pub(super) fn take_unsettled_articles(
+        &mut self,
+        job_id: JobId,
+    ) -> Vec<crate::jobs::ids::SegmentId> {
+        let Some(batch) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|job| job.acquisition.batch.as_mut())
+        else {
+            return Vec::new();
+        };
+        if std::mem::replace(&mut batch.settled, true) {
+            return Vec::new();
+        }
+        batch.articles.clone()
     }
 
     pub(super) fn begin_recovery_batch(
@@ -314,8 +693,10 @@ impl Coordinator {
         job.acquisition.prefetched |= prefetch;
         job.acquisition.batch = Some(RecoveryBatch {
             articles,
+            settled: false,
             job_id,
             cohorts,
+            declared: Vec::new(),
             epoch: job.epoch,
             assessment: job.last_used,
             admitted_at: std::time::Instant::now(),
@@ -324,7 +705,146 @@ impl Coordinator {
         Ok(())
     }
 
-    pub(in crate::pipeline) fn new(tx: mpsc::Sender<RepairWorkDone>) -> Self {
+    /// Declare the recovery indices the window just admitted is expected to
+    /// deliver, so a reassessment taken while it is in flight does not ask for
+    /// them again.
+    ///
+    /// `carriers` pairs each selected carrier's advertised index span with
+    /// how many of its articles this window admitted. Only indices the engine
+    /// itself named as still wanted are declared, only where a selected
+    /// carrier advertises them, and never more of one carrier's span than the
+    /// window will actually fetch from it: a carrier whose name says nothing
+    /// declares nothing, which merely means those indices stay askable.
+    pub(in crate::pipeline) fn declare_recovery_in_flight(
+        &mut self,
+        job_id: JobId,
+        carriers: &[(std::ops::Range<u64>, usize)],
+    ) -> EngineResult<()> {
+        if carriers.is_empty() {
+            tracing::info!(
+                job_id = job_id.0,
+                "PAR3 recovery in-flight declaration skipped: no carrier span"
+            );
+            return Ok(());
+        }
+        let views = self.assessments(job_id).count();
+        let wanted: usize = self
+            .assessments(job_id)
+            .flat_map(|(_, view)| view.requirements.iter().map(|need| need.next_indices.len()))
+            .sum();
+        let declared: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)> = self
+            .assessments(job_id)
+            .flat_map(|(set, view)| {
+                view.requirements.iter().filter_map(move |need| {
+                    let indices = super::cohorts::declarable_indices(
+                        &need.next_indices,
+                        carriers,
+                        need.cohorts,
+                    );
+                    (!indices.is_empty()).then_some((set, need.matrix, indices))
+                })
+            })
+            .collect();
+        let count: usize = declared.iter().map(|(_, _, indices)| indices.len()).sum();
+        let first = declared
+            .iter()
+            .flat_map(|(_, _, indices)| indices.first().copied())
+            .min();
+        tracing::info!(
+            job_id = job_id.0,
+            views,
+            wanted,
+            declared = count,
+            first_index = first,
+            carriers = ?carriers,
+            "PAR3 recovery in-flight declared"
+        );
+        if declared.is_empty() {
+            return Ok(());
+        }
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return Ok(());
+        };
+        let Some(runtime) = job.runtime.as_mut() else {
+            return Ok(());
+        };
+        for (set, matrix, indices) in &declared {
+            if let Some(session) = runtime.sets.get_mut(set) {
+                session.native.note_recovery_in_flight(*matrix, indices)?;
+            }
+        }
+        if let Some(batch) = job.acquisition.batch.as_mut() {
+            batch.declared = declared;
+        }
+        // The retained view still answers the assessment that produced these
+        // indices; take a fresh one so the deficit this job publishes is what
+        // is left to ask for rather than what was asked for. Sources have not
+        // changed, so that assessment reads nothing.
+        self.queue_reassessment(job_id)
+    }
+
+    /// Retract everything the drained window declared. The window is over, so
+    /// nothing it named is still being acquired: an index that arrived is now
+    /// the engine's own `available`, and one that did not must become askable
+    /// again rather than sit in flight forever.
+    pub(in crate::pipeline) fn forget_recovery_in_flight(&mut self, job_id: JobId) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let declared = match job.acquisition.batch.as_mut() {
+            Some(batch) => std::mem::take(&mut batch.declared),
+            None => {
+                tracing::info!(
+                    job_id = job_id.0,
+                    "PAR3 recovery in-flight release: no window"
+                );
+                return;
+            }
+        };
+        let count: usize = declared.iter().map(|(_, _, indices)| indices.len()).sum();
+        tracing::info!(
+            job_id = job_id.0,
+            released = count,
+            "PAR3 recovery in-flight released"
+        );
+        // A window that declared nothing releases nothing, and must not cost
+        // the job an assessment it did not need.
+        if declared.is_empty() {
+            return;
+        }
+        let Some(runtime) = job.runtime.as_mut() else {
+            // A worker holds the session: the retraction waits for its
+            // handback rather than being lost with the session absent.
+            tracing::info!(
+                job_id = job_id.0,
+                released = count,
+                "PAR3 recovery in-flight release deferred to the worker handback"
+            );
+            job.acquisition.deferred_release.extend(declared);
+            return;
+        };
+        for (set, matrix, indices) in &declared {
+            if let Some(session) = runtime.sets.get_mut(set) {
+                session.native.forget_recovery_in_flight(*matrix, indices);
+            }
+        }
+        // What was released has to become askable again, which only a fresh
+        // assessment can say. A refusal here leaves the retained view stale
+        // with the released indices still counted in flight, so it is never
+        // silent.
+        if let Err(error) = self.queue_reassessment(job_id) {
+            tracing::warn!(
+                job_id = job_id.0,
+                %error,
+                "PAR3 reassessment after an in-flight release could not be queued"
+            );
+        }
+    }
+
+    pub(in crate::pipeline) fn new(
+        tx: mpsc::Sender<RepairWorkDone>,
+        metrics: Arc<PipelineMetrics>,
+    ) -> Self {
         Self {
             jobs: BTreeMap::new(),
             in_flight: BTreeMap::new(),
@@ -337,8 +857,134 @@ impl Coordinator {
             next_ticket: 0,
             last_job: None,
             tx,
+            metrics,
             #[cfg(test)]
             test_rx: None,
+        }
+    }
+
+    /// Record this job's typed verdict, counting it once per distinct value.
+    /// A job that keeps reaching the same verdict while it waits for more
+    /// bytes is one verdict, not one per completion check.
+    pub(in crate::pipeline) fn note_outcome(
+        &mut self,
+        job_id: JobId,
+        outcome: outcome::Par3Outcome,
+    ) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            if job.last_outcome.as_ref() == Some(&outcome) {
+                return;
+            }
+            job.last_outcome = Some(outcome.clone());
+        }
+        self.metrics.par3.note_outcome(outcome.class());
+    }
+
+    /// Carriers whose scanner stopped short and still wants bytes it has not
+    /// seen. A nonzero count means metadata discovery is not finished.
+    pub(in crate::pipeline) fn carriers_awaiting_bytes(&self, job_id: JobId) -> u64 {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())
+            .map_or(0, |runtime| {
+                runtime
+                    .carriers
+                    .values()
+                    .filter(|carrier| carrier.needed.is_some())
+                    .count() as u64
+            })
+    }
+
+    /// The vital packet family no carrier of this job produced a single
+    /// authenticated copy of, if there is one. A set cannot be planned without
+    /// a Start, a matrix and a Root, and a family with a zero count is a
+    /// different complaint from a set that is merely still arriving.
+    pub(in crate::pipeline) fn missing_vital_packet(
+        &self,
+        job_id: JobId,
+    ) -> Option<super::carriers::Par3PacketKind> {
+        let families = self
+            .jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())?
+            .authenticated_families();
+        super::carriers::Par3PacketKind::VITAL
+            .into_iter()
+            .find(|kind| families[kind.index()] == 0)
+    }
+
+    /// What this job's carriers have found damaged so far.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn carrier_damage(
+        &self,
+        job_id: JobId,
+    ) -> Vec<super::carriers::CarrierDamage> {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())
+            .map(super::Par3Job::damage_report)
+            .unwrap_or_default()
+    }
+
+    /// This job's option-packet tally, the first time it is asked for.
+    ///
+    /// Options are reported, never applied, so one line per job is the whole
+    /// obligation; later calls return nothing so a repeated completion check
+    /// cannot repeat the line.
+    pub(in crate::pipeline) fn take_option_packet_report(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<super::OptionPacketTally> {
+        let job = self.jobs.get_mut(&job_id)?;
+        let tally = job.runtime.as_ref()?.option_packet_tally();
+        if tally.is_silent() || std::mem::replace(&mut job.options_reported, true) {
+            return None;
+        }
+        Some(tally)
+    }
+
+    /// Whether another job currently owns a PAR3 work unit, and with it the
+    /// share of the native budget this job's refusal collided with.
+    pub(in crate::pipeline) fn peer_holds_par3_memory(&self, job_id: JobId) -> bool {
+        self.in_flight.values().any(|(owner, _)| *owner != job_id)
+    }
+
+    /// Publish the queue depth, worker allowance and in-flight gauges.
+    fn publish_dispatch_gauges(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let par3 = &self.metrics.par3;
+        let (depth, bytes) = self
+            .jobs
+            .values()
+            .fold((0usize, 0u64), |(depth, bytes), job| {
+                (
+                    depth + job.pending.len(),
+                    job.pending.values().fold(bytes, |bytes, queued| {
+                        bytes.saturating_add(queued.reservation.bytes() as u64)
+                    }),
+                )
+            });
+        par3.pending_work_depth.store(depth, Relaxed);
+        par3.pending_work_bytes.store(bytes, Relaxed);
+        par3.in_flight.store(self.in_flight.len(), Relaxed);
+        par3.workers_admitted
+            .store(self.worker_allowances.values().sum::<usize>(), Relaxed);
+        // A job that owns no worker, has nothing queued, is not installing and
+        // is not parked on memory is waiting on the pipeline, not on PAR3.
+        // Releasing its slot here is the single place a phase returns to idle,
+        // so no handback path can leave a stale phase behind and invent a
+        // stall — and a parked job keeps its phase, so its wait keeps ageing
+        // towards the stall threshold instead of being reset to idle.
+        let now = self.metrics.now_ms();
+        for (&job_id, job) in &self.jobs {
+            if job.ticket.is_none()
+                && job.pending.is_empty()
+                && !job.installing
+                && job.spill.is_none()
+                && job.waiting_for_memory_since.is_none()
+            {
+                par3.store_phase(job_id.0, Par3Phase::Idle, now);
+            }
         }
     }
     pub(in crate::pipeline) fn authenticated_set_count(&self, job_id: JobId) -> usize {
@@ -480,7 +1126,7 @@ impl Coordinator {
 
     pub(in crate::pipeline) fn admit(&mut self, job_id: JobId) -> EngineResult<()> {
         if !self.jobs.contains_key(&job_id) && self.jobs.len() >= MAX_JOBS {
-            return Err(EngineError::ResourceLimit("PAR3 job count"));
+            return Err(budget::host_limit("PAR3 job count"));
         }
         self.jobs.entry(job_id).or_default();
         Ok(())
@@ -526,19 +1172,23 @@ impl Coordinator {
                     .checked_add(path.capacity().checked_mul(16)?)?
                     .checked_add(file.path.len().checked_mul(16)?)
             });
-        let outputs = outputs.ok_or(EngineError::ResourceLimit("PAR3 repair result paths"))?;
+        let outputs = outputs.ok_or(budget::host_limit("PAR3 repair result paths"))?;
         self.check_pending_capacity(job_id, WorkKey::Repair(set))?;
         let input = PendingInput::Repair { set, path };
         let reservation = assessment::ViewReservation::acquire(
             input
                 .retained_cost()?
                 .checked_add(outputs)
-                .ok_or(EngineError::ResourceLimit("PAR3 repair result paths"))?,
+                .ok_or(budget::host_limit("PAR3 repair result paths"))?,
         )?;
-        self.jobs
-            .get_mut(&job_id)
-            .expect("assessed job")
-            .pending
+        let cohorts = view
+            .requirements
+            .iter()
+            .filter(|need| need.lost != 0)
+            .count() as u64;
+        let job = self.jobs.get_mut(&job_id).expect("assessed job");
+        job.repair_cohorts = cohorts;
+        job.pending
             .insert(WorkKey::Repair(set), QueuedInput::new(input, reservation));
         self.dispatch()
     }
@@ -629,6 +1279,16 @@ impl Coordinator {
         job.spill.take()
     }
 
+    /// The refusal that forced the pending spill, when the engine measured
+    /// one. A host-side ceiling refuses without a native measurement, so the
+    /// caller must still have a verdict for `None`.
+    pub(super) fn take_spill_limit(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<par3_rs::runtime::ResourceLimit> {
+        self.jobs.get_mut(&job_id)?.spill_limit.take()
+    }
+
     pub(super) fn reserve_spill_disk(
         &mut self,
         job_id: JobId,
@@ -651,10 +1311,88 @@ impl Coordinator {
         self.jobs.get_mut(&job_id)?.spill_disk.take()
     }
 
+    /// Re-arm a refused spill so the peer's handback drives another attempt,
+    /// and start or continue this job's wait for PAR3 memory. There is no
+    /// timer here: the wait ends when a peer hands its work unit back and the
+    /// completion check runs again.
+    pub(in crate::pipeline) fn park_for_memory(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        limit: Option<par3_rs::runtime::ResourceLimit>,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now_ms = self.metrics.now_ms();
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        job.spill = Some(source);
+        // The refusal is restored with the spill: the retry after the peer
+        // hands back classifies against the same measurement.
+        job.spill_limit = limit;
+        if job.waiting_for_memory_since.is_none() {
+            job.waiting_for_memory_since = Some(std::time::Instant::now());
+            self.metrics
+                .par3
+                .waiting_for_memory_active
+                .fetch_add(1, Relaxed);
+        }
+        self.metrics
+            .par3
+            .store_phase(job_id.0, Par3Phase::AwaitingMemory, now_ms);
+    }
+
+    /// Every job currently parked on PAR3 memory. A handback frees the share
+    /// of the budget they collided with, so each of them is owed another
+    /// completion check whether or not it is the job that handed back.
+    pub(in crate::pipeline) fn jobs_awaiting_memory(&self) -> Vec<JobId> {
+        self.jobs
+            .iter()
+            .filter(|(_, job)| job.waiting_for_memory_since.is_some())
+            .map(|(&job_id, _)| job_id)
+            .collect()
+    }
+
+    /// End this job's memory wait, crediting however long it lasted. Safe to
+    /// call for a job that was never waiting.
+    pub(in crate::pipeline) fn resume_from_memory(&mut self, job_id: JobId) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let Some(since) = job.waiting_for_memory_since.take() else {
+            return;
+        };
+        let par3 = &self.metrics.par3;
+        par3.waiting_for_memory_active.fetch_sub(1, Relaxed);
+        par3.waiting_for_memory_ms_total
+            .fetch_add(as_millis(since.elapsed()), Relaxed);
+    }
+
+    /// Occupy a coordinator slot with one real carrier work unit, the way the
+    /// dispatcher does, so a peer collision can be staged from the pipeline.
     #[cfg(test)]
-    pub(in crate::pipeline) fn force_spill(&mut self, job_id: JobId, source: SourceId) {
+    pub(in crate::pipeline) fn force_dispatch(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+    ) -> EngineResult<()> {
+        self.enqueue_complete_carrier(job_id, source, path)?;
+        self.dispatch()
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn force_spill(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        limit: Option<par3_rs::runtime::ResourceLimit>,
+    ) {
         self.admit(job_id).unwrap();
-        self.jobs.get_mut(&job_id).unwrap().spill = Some(source);
+        let job = self.jobs.get_mut(&job_id).unwrap();
+        job.spill = Some(source);
+        job.spill_limit = limit;
     }
 
     pub(super) fn release_spilled_images(
@@ -758,7 +1496,7 @@ impl Coordinator {
         let source = SourceId(u64::from(file_index));
         if !job.known.contains_key(&source) {
             if job.known.len() >= MAX_PENDING {
-                return Err(EngineError::ResourceLimit("PAR3 recovery candidates"));
+                return Err(budget::host_limit("PAR3 recovery candidates"));
             }
             job.known.insert(
                 source,
@@ -829,7 +1567,7 @@ impl Coordinator {
         let epoch = job
             .epoch
             .checked_add(1)
-            .ok_or(EngineError::ResourceLimit("PAR3 source epochs"))?;
+            .ok_or(budget::host_limit("PAR3 source epochs"))?;
         job.sources.withdraw(source)?;
         job.known
             .get_mut(&source)
@@ -902,7 +1640,7 @@ impl Coordinator {
                 .len()
                 .checked_mul(32)
                 .and_then(|bytes| bytes.checked_add(256))
-                .ok_or(EngineError::ResourceLimit("PAR3 materialized ranges"))?;
+                .ok_or(budget::host_limit("PAR3 materialized ranges"))?;
             let reservation = assessment::ViewReservation::acquire(bytes)?;
             let ranges = extents
                 .iter()
@@ -911,7 +1649,7 @@ impl Coordinator {
                     offset
                         .checked_add(len)
                         .map(|end| offset..end)
-                        .ok_or(EngineError::ResourceLimit("PAR3 materialized offsets"))
+                        .ok_or(budget::host_limit("PAR3 materialized offsets"))
                 })
                 .collect::<EngineResult<Vec<_>>>()?;
             Ok(MaterializedRanges {
@@ -933,7 +1671,7 @@ impl Coordinator {
             .and_then(|job| job.materialized.get(&source))
         {
             Some(Ok(entry)) => Ok(Some(entry.ranges.as_slice())),
-            Some(Err(_)) => Err(EngineError::ResourceLimit("PAR3 materialized ranges")),
+            Some(Err(_)) => Err(budget::host_limit("PAR3 materialized ranges")),
             None => Ok(None),
         }
     }
@@ -1034,13 +1772,13 @@ impl Coordinator {
         input: PendingInput,
     ) -> EngineResult<()> {
         if !self.jobs.contains_key(&job_id) && self.jobs.len() >= MAX_JOBS {
-            return Err(EngineError::ResourceLimit("PAR3 job count"));
+            return Err(budget::host_limit("PAR3 job count"));
         }
         self.check_pending_capacity(job_id, WorkKey::Source(source))?;
         let reservation = assessment::ViewReservation::acquire(input.retained_cost()?)?;
         let job = self.jobs.entry(job_id).or_default();
         if !job.known.contains_key(&source) && job.known.len() >= MAX_PENDING {
-            return Err(EngineError::ResourceLimit("PAR3 known sources"));
+            return Err(budget::host_limit("PAR3 known sources"));
         }
         let carrier = matches!(
             input,
@@ -1097,7 +1835,7 @@ impl Coordinator {
                 .sum::<usize>()
                 >= MAX_PENDING
         {
-            return Err(EngineError::ResourceLimit("pending PAR3 work"));
+            return Err(budget::host_limit("pending PAR3 work"));
         }
         Ok(())
     }
@@ -1165,17 +1903,39 @@ impl Coordinator {
     }
 
     fn dispatch_one(&mut self) -> EngineResult<()> {
+        self.publish_dispatch_gauges();
         let available = self
             .cpu_limit
             .saturating_sub(self.worker_allowances.values().sum::<usize>());
-        if self.in_flight.len() >= 2
-            || available == 0
+        let slots_full = self.in_flight.len() >= 2
             || self.in_flight.values().any(|(id, _)| {
                 self.jobs
                     .get(id)
                     .is_some_and(|job| job.retry_serial.is_some())
-            })
-        {
+            });
+        if slots_full || available == 0 {
+            // Only a job that actually has queued work is being held back; an
+            // idle coordinator is not waiting for anything.
+            let waiting: Vec<JobId> = self
+                .jobs
+                .iter()
+                .filter(|(_, job)| job.ticket.is_none() && !job.pending.is_empty())
+                .map(|(&id, _)| id)
+                .collect();
+            if !waiting.is_empty() {
+                let counter = if slots_full {
+                    &self.metrics.par3.dispatch_refused_slots_total
+                } else {
+                    &self.metrics.par3.dispatch_refused_cpu_total
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let now = self.metrics.now_ms();
+                for job_id in waiting {
+                    self.metrics
+                        .par3
+                        .store_phase(job_id.0, Par3Phase::AwaitingCpuAllowance, now);
+                }
+            }
             return Ok(());
         }
         let ready = |job: &&JobSlot| {
@@ -1223,20 +1983,39 @@ impl Coordinator {
         let ticket = self
             .next_ticket
             .checked_add(1)
-            .ok_or(EngineError::ResourceLimit("PAR3 worker tickets"))?;
+            .ok_or(budget::host_limit("PAR3 worker tickets"))?;
         let Some(mut runtime) = job.runtime.take() else {
             return Err(EngineError::InvalidState(
                 "PAR3 session already owned by a worker",
             ));
         };
         runtime.options.workers = workers;
-        runtime.options.progress.get_or_insert_with(|| {
+        let stripe_bytes = runtime.options.stripe_bytes as u64;
+        let serial_retry = job.retry_serial.is_some();
+        // One load of the engine's own counters per dispatch. Every PAR3
+        // number weaver publishes is a delta between this sample and the one
+        // taken at handback, so no engine loop ever touches weaver's metrics.
+        job.engine_baseline = EngineCounters::capture(&runtime);
+        let metrics = Arc::clone(&self.metrics);
+        runtime.options.progress.get_or_insert_with(move || {
+            // At most two relaxed atomic operations per event, no lock, no log,
+            // no allocation, and no path that can panic. The engine calls this
+            // synchronously from its own bounded work units.
             par3_rs::runtime::ProgressCallback::new(move |event| {
-                if matches!(event.phase, par3_rs::runtime::ProgressPhase::End) {
-                    tracing::debug!(job_id = job_id.0, operation = event.operation,
-                        stage = ?event.stage, completed = event.completed,
-                        execution_us = event.elapsed.as_micros() as u64,
-                        "PAR3 engine stage finished");
+                let now = metrics.now_ms();
+                match event.phase {
+                    par3_rs::runtime::ProgressPhase::Begin
+                    | par3_rs::runtime::ProgressPhase::End => {
+                        metrics
+                            .par3
+                            .note_engine_phase(job_id.0, engine_phase(event.stage), now);
+                    }
+                    // `completed` is cumulative within the scope, so adding it
+                    // here would over-count. The bytes come from the Repair
+                    // stage's own total at handback instead.
+                    par3_rs::runtime::ProgressPhase::Advance => {
+                        metrics.par3.note_progress(job_id.0, now);
+                    }
                 }
             })
         });
@@ -1274,6 +2053,30 @@ impl Coordinator {
             self.contended.extend(self.in_flight.keys());
         }
         self.worker_allowances.insert(ticket, workers);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let par3 = &self.metrics.par3;
+            let now = self.metrics.now_ms();
+            par3.store_phase(job_id.0, pending_phase(&input.input), now);
+            par3.effective_stripe_bytes.store(stripe_bytes, Relaxed);
+            par3.dispatch_wait_ms_total
+                .fetch_add(as_millis(input.queued_at.elapsed()), Relaxed);
+            if serial_retry {
+                par3.verify_serial_fallback_total.fetch_add(1, Relaxed);
+            }
+            // Source publication is not counted here: the engine's own
+            // read counters cover it and arrive as a delta at handback.
+            let started = match key {
+                WorkKey::Repair(_) => Some(&par3.repairs_started_total),
+                WorkKey::Donors => Some(&par3.donor_searches_total),
+                WorkKey::Assess => Some(&par3.reassessments_total),
+                WorkKey::Readback => Some(&par3.readback_windows_total),
+                WorkKey::Source(_) => None,
+            };
+            if let Some(counter) = started {
+                counter.fetch_add(1, Relaxed);
+            }
+        }
         tracing::debug!(
             job_id = job_id.0,
             ticket,
@@ -1473,6 +2276,80 @@ impl Coordinator {
         job.ticket = None;
         job.last_used = done.ticket;
         let mut runtime = done.runtime.unwrap_or_default();
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let par3 = &self.metrics.par3;
+            // The whole engine fold for this work unit: one capture, one set
+            // of deltas, one pass of `fetch_add`. Nothing below runs per byte.
+            let counters = EngineCounters::capture(&runtime);
+            let read_bytes = counters
+                .source_read_bytes
+                .saturating_sub(job.engine_baseline.source_read_bytes);
+            if done.key == WorkKey::Assess && read_bytes == 0 {
+                par3.reassessments_zero_read_total.fetch_add(1, Relaxed);
+            }
+            if done.epoch != job.epoch {
+                par3.reverify_generation_changed_total.fetch_add(1, Relaxed);
+            }
+            if done.key == WorkKey::Donors && runtime.donor_search.exhausted {
+                par3.donor_search_exhausted_total.fetch_add(1, Relaxed);
+            }
+            if let Ok(WorkOutput::Readback(readback::ReadbackDone {
+                result: Ok(readback::ReadbackUnit::Stripe(span)),
+                ..
+            })) = &done.result
+            {
+                par3.readback_bytes_total.fetch_add(span.len, Relaxed);
+            }
+            if matches!(done.key, WorkKey::Repair(_))
+                && let Ok(WorkOutput::Repaired(completion)) = &done.result
+            {
+                if matches!(
+                    completion.result,
+                    Err(EngineError::Cancelled | EngineError::RepairInterrupted { .. })
+                ) {
+                    par3.repair_cancelled_total.fetch_add(1, Relaxed);
+                } else if completion.result.is_ok() {
+                    // The cohorts this repair was dispatched against are only
+                    // processed once its report comes back whole.
+                    let cohorts = std::mem::take(&mut job.repair_cohorts);
+                    if cohorts != 0 {
+                        par3.repair_cohorts_processed_total
+                            .fetch_add(cohorts, Relaxed);
+                    }
+                }
+            }
+            counters.apply(job.engine_baseline, &self.metrics);
+            let rejected_packets = counters
+                .packets_rejected
+                .saturating_sub(job.engine_baseline.packets_rejected);
+            let unavailable_ranges = counters
+                .ranges_unavailable
+                .saturating_sub(job.engine_baseline.ranges_unavailable);
+            let damaged_bytes = counters
+                .damaged_bytes
+                .saturating_sub(job.engine_baseline.damaged_bytes);
+            job.engine_baseline = counters;
+            if (rejected_packets, unavailable_ranges, damaged_bytes) != (0, 0, 0) {
+                // Informational: it never fails the job on its own, but it is
+                // the last verdict the job reached and worth reporting.
+                let damage = outcome::Par3Outcome::CarrierDamage {
+                    carriers: runtime.damage_report(),
+                    rejected_packets,
+                    unavailable_ranges,
+                    damaged_bytes,
+                };
+                // One line per job, not one per handback: a job that keeps
+                // scanning a damaged carrier says this once.
+                if !std::mem::replace(&mut job.damage_reported, true) {
+                    tracing::warn!(job_id = done.job_id.0, summary = %damage, "PAR3 carrier damage");
+                }
+                if job.last_outcome.as_ref() != Some(&damage) {
+                    par3.note_outcome(damage.class());
+                    job.last_outcome = Some(damage);
+                }
+            }
+        }
         if done.epoch != job.epoch {
             // A write raced this operation. Keep capacity until this handback,
             // retain unrelated evidence, and require fresh publication before
@@ -1498,8 +2375,33 @@ impl Coordinator {
                 }
             }
         }
+        let deferred_release = std::mem::take(&mut job.acquisition.deferred_release);
+        for (set, matrix, indices) in &deferred_release {
+            if let Some(session) = runtime.sets.get_mut(set) {
+                session.native.forget_recovery_in_flight(*matrix, indices);
+            }
+        }
         job.sources = runtime.sources.clone();
         job.runtime = Some(runtime);
+        if !deferred_release.is_empty() {
+            // The window drained while this worker was out; only a fresh
+            // assessment can put what it released back on offer.
+            match assessment::ViewReservation::acquire(1024) {
+                Ok(reservation) => {
+                    job.pending.insert(
+                        WorkKey::Assess,
+                        QueuedInput::new(PendingInput::Assess, reservation),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = done.job_id.0,
+                        %error,
+                        "PAR3 reassessment after a deferred in-flight release could not be queued"
+                    );
+                }
+            }
+        }
         if done.epoch != job.epoch {
             if matches!(done.key, WorkKey::Repair(_)) {
                 // Installation may have finished before the racing write. The
@@ -1561,29 +2463,38 @@ impl Coordinator {
             }
             // Repair reports still pass through installation reconciliation.
         }
-        let pressure = match &done.result {
+        // The refusal travels with the source it fenced: the verdict this
+        // spill eventually reaches is classified from the engine's own
+        // measurement, which is only in hand here.
+        let refusal = match &done.result {
             Err(error)
                 if matches!(
                     done.key,
                     WorkKey::Source(_) | WorkKey::Donors | WorkKey::Repair(_)
                 ) =>
             {
-                budget::error_pressure_source(error).or_else(|| match done.key {
-                    WorkKey::Source(source) if budget::is_host_pressure(error) => Some(source),
-                    _ => None,
+                budget::error_pressure_source(error)
+                    .or_else(|| match done.key {
+                        WorkKey::Source(source) if budget::is_host_pressure(error) => Some(source),
+                        _ => None,
+                    })
+                    .map(|source| (source, Some(error)))
+            }
+            Ok(WorkOutput::Repaired(completion)) => {
+                completion.result.as_ref().err().and_then(|error| {
+                    budget::error_pressure_source(error).map(|source| (source, Some(error)))
                 })
             }
-            Ok(WorkOutput::Repaired(completion)) => completion
-                .result
-                .as_ref()
-                .err()
-                .and_then(budget::error_pressure_source),
             _ => None,
         };
-        if let Some(source) = pressure {
+        let pressure = refusal.map(|(source, _)| source);
+        if let Some((source, error)) = refusal {
             // Fence dispatch now, but preserve repair reports: installed files
             // must still pass reconciliation before the completion gate spills.
             job.spill.get_or_insert(source);
+            if let Some(limit) = error.and_then(budget::engine_limit) {
+                job.spill_limit.get_or_insert(limit);
+            }
             let stage = match done.key {
                 WorkKey::Donors => "donor_search",
                 WorkKey::Repair(_) => "repair",
@@ -1639,6 +2550,10 @@ impl Coordinator {
     }
 
     pub(in crate::pipeline) fn forget(&mut self, job_id: JobId) {
+        self.resume_from_memory(job_id);
+        self.metrics
+            .par3
+            .store_phase(job_id.0, Par3Phase::Idle, self.metrics.now_ms());
         self.jobs.remove(&job_id);
         for (owner, token) in self.in_flight.values() {
             if *owner == job_id {

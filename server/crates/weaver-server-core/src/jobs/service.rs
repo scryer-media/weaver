@@ -1518,6 +1518,13 @@ impl Pipeline {
 
     async fn install_blocked_restore(&mut self, request: RestoreJobRequest, error: String) {
         let job_id = request.job_id;
+        let server_attribution = self
+            .db_blocking(move |db| db.load_active_server_attribution(job_id))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, job_id = job_id.0, "could not load blocked job attribution");
+                Default::default()
+            });
         let resume = request.paused_resume_status.clone().unwrap_or_else(|| {
             if matches!(request.status, JobStatus::Paused) {
                 JobStatus::Downloading
@@ -1578,7 +1585,7 @@ impl Pipeline {
             downloaded_bytes: 0,
             restored_download_floor_bytes: floor,
             downloaded_wire_bytes: 0,
-            server_attribution: Default::default(),
+            server_attribution,
             failed_bytes: 0,
             probe_projected_failed_bytes: 0,
             par2_bytes: request.spec.par2_bytes(),
@@ -1873,6 +1880,10 @@ impl Pipeline {
                 .then_some(staging_dir)
         };
 
+        let server_attribution = self
+            .db_blocking(move |db| db.load_active_server_attribution(job_id))
+            .await?;
+
         let _ = self.event_tx.send(PipelineEvent::JobCreated {
             job_id,
             name: spec.name.clone(),
@@ -1965,7 +1976,7 @@ impl Pipeline {
             downloaded_bytes,
             restored_download_floor_bytes,
             downloaded_wire_bytes: 0,
-            server_attribution: Default::default(),
+            server_attribution,
             failed_bytes: 0,
             probe_projected_failed_bytes: 0,
             par2_bytes,

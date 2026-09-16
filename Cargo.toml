@@ -14,7 +14,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.12.0"
+version = "0.12.1"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -116,7 +116,11 @@ windows-sys = { version = "0.61", default-features = false }
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 par2-rs = { version = "0.10", default-features = false, features = ["native-crypto"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
-par3-rs = { version = "0.3.1", default-features = false }
+# 0.4.1 is a floor, not just a preference: before it, a session alone on the
+# budget that could not fit its own admitted packets was reported as peer
+# contention, so the caller parked waiting for memory nobody else held. It now
+# reports the ceiling it exceeded, which weaver settles as a terminal refusal.
+par3-rs = { version = "0.4.1", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x

@@ -2021,6 +2021,200 @@ async fn repair_leftovers_are_purged_only_after_acceptance() {
     assert!(!pipeline.par2_pre_repair_dir_entries.contains_key(&job_id));
 }
 
+/// A job that spent its aggregate verification on a clean claim the
+/// authoritative pass then contradicted still sheds the backup its repair
+/// renamed aside — the repaired RAR set is replanned and extracted, and the
+/// working directory carries nothing but the payload into the final move.
+#[tokio::test]
+async fn a_repair_after_a_contradicted_clean_verdict_still_sheds_its_leftovers() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30351);
+    let mut files = build_multifile_multivolume_rar_set();
+    let repaired_filename = files[1].0.clone();
+    files[1].1.resize(20 * 1024, 0);
+    let repaired_volume = files[1].1.clone();
+    let notes_filename = "show.nfo";
+    let notes = b"contradicted clean verdict fixture".to_vec();
+    let index_filename = "show.par2";
+    let par2_bytes = build_test_par2_index_for_files(
+        &[
+            (files[0].0.as_str(), files[0].1.as_slice()),
+            (repaired_filename.as_str(), repaired_volume.as_slice()),
+            (notes_filename, notes.as_slice()),
+        ],
+        1024,
+    );
+    let posted_files = vec![
+        files[0].clone(),
+        files[1].clone(),
+        files[2].clone(),
+        files[3].clone(),
+        (notes_filename.to_string(), notes.clone()),
+        (index_filename.to_string(), par2_bytes.clone()),
+    ];
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Contradicted Clean Verdict", &posted_files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for file_index in [0usize, 1, 2, 3] {
+        write_and_complete_rar_volume(
+            &mut pipeline,
+            job_id,
+            file_index as u32,
+            &posted_files[file_index].0,
+            &posted_files[file_index].1,
+        )
+        .await;
+    }
+    write_and_complete_file(&mut pipeline, job_id, 4, notes_filename, &notes).await;
+    write_and_complete_file(&mut pipeline, job_id, 5, index_filename, &par2_bytes).await;
+
+    let par2_set = build_repairable_par2_set_for_files(
+        &[
+            (files[0].0.as_str(), files[0].1.as_slice()),
+            (repaired_filename.as_str(), repaired_volume.as_slice()),
+            (notes_filename, notes.as_slice()),
+        ],
+        1024,
+        1,
+    );
+    let carried_rar_id = par2_set.recovery_file_ids[0];
+    let repaired_rar_id = par2_set.recovery_file_ids[1];
+    let carried_notes_id = par2_set.recovery_file_ids[2];
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        par2_set,
+        &[(5, index_filename, 0, false)],
+    );
+    let par2_set = pipeline.par2_set(job_id).cloned().unwrap();
+    let set_id = par2_set.recovery_set_id;
+
+    // The verdict this job spends its aggregate verification on: a clean claim
+    // taken without reading the files, which the authoritative pass below
+    // contradicts.
+    let _ = pipeline
+        .settle_par2_set(
+            job_id,
+            set_id,
+            Par2SetSettlementReason::Clean {
+                slice_size: 1024,
+                verification_mode: CleanPar2VerificationMode::StrongDecode,
+            },
+        )
+        .await;
+    assert!(
+        pipeline.par2_verified.contains(&job_id),
+        "the clean claim must carry the aggregate, which is what this test is about"
+    );
+
+    // What the directory held before the repair, and the damaged original the
+    // repairer renamed aside to install the repaired volume in its place.
+    pipeline.par2_pre_repair_dir_entries.insert(
+        job_id,
+        posted_files
+            .iter()
+            .map(|(filename, _)| filename.clone())
+            .collect(),
+    );
+    let backup = working_dir.join(format!("{repaired_filename}.1"));
+    tokio::fs::write(&backup, &repaired_volume).await.unwrap();
+    tokio::fs::write(working_dir.join(&repaired_filename), &repaired_volume)
+        .await
+        .unwrap();
+
+    let valid_slices = |len: usize| vec![true; len.div_ceil(1024)];
+    let mut damaged_slices = valid_slices(repaired_volume.len());
+    *damaged_slices.last_mut().unwrap() = false;
+    let pre_repair = par2_rs::VerificationResult {
+        files: vec![
+            par2_rs::verify::FileVerification {
+                file_id: carried_rar_id,
+                filename: files[0].0.clone(),
+                status: par2_rs::verify::FileStatus::Complete,
+                valid_slices: valid_slices(files[0].1.len()),
+                missing_slice_count: 0,
+            },
+            par2_rs::verify::FileVerification {
+                file_id: repaired_rar_id,
+                filename: repaired_filename.clone(),
+                status: par2_rs::verify::FileStatus::Damaged(1),
+                valid_slices: damaged_slices,
+                missing_slice_count: 1,
+            },
+            par2_rs::verify::FileVerification {
+                file_id: carried_notes_id,
+                filename: notes_filename.to_string(),
+                status: par2_rs::verify::FileStatus::Complete,
+                valid_slices: valid_slices(notes.len()),
+                missing_slice_count: 0,
+            },
+        ],
+        recovery_blocks_available: 1,
+        total_missing_blocks: 1,
+        repairable: par2_rs::verify::Repairability::Repairable {
+            blocks_needed: 1,
+            blocks_available: 1,
+        },
+    };
+    let outcome = par2_rs::Par2RepairOutcome {
+        status: par2_rs::Par2RepairStatus::Repaired,
+        files_complete: 3,
+        files_renamed: 0,
+        files_damaged: 0,
+        files_missing: 0,
+        available_blocks: 1,
+        missing_blocks: 0,
+        recovery_blocks_available: 1,
+        recovery_blocks_used: 1,
+        bytes_copied: 0,
+        bytes_reconstructed: 1024,
+        packets: par2_rs::PacketDiagnostics::default(),
+        scan: par2_rs::ScanDiagnostics::default(),
+        carry: par2_rs::repairer::CarryDiagnostics::default(),
+        verification: pre_repair.clone(),
+    };
+
+    pipeline
+        .finish_par2_repair(
+            job_id,
+            Arc::clone(&par2_set),
+            working_dir.clone(),
+            &pre_repair,
+            outcome,
+            true,
+        )
+        .await;
+    drain_rar_refreshes(&mut pipeline).await;
+
+    assert!(
+        !backup.exists(),
+        "an accepted repair must not leave the damaged original to be delivered"
+    );
+    assert!(
+        !pipeline.par2_pre_repair_dir_entries.contains_key(&job_id),
+        "the snapshot must not survive its own purge"
+    );
+    assert_eq!(
+        tokio::fs::read(working_dir.join(&repaired_filename))
+            .await
+            .unwrap(),
+        repaired_volume,
+        "the repaired volume must survive the purge"
+    );
+    assert!(
+        pipeline
+            .load_rar_snapshot(job_id, "show")
+            .is_some_and(|headers| !headers.is_empty()),
+        "the repaired set must be replanned from its repaired headers"
+    );
+}
+
 /// A protected file left incomplete whose verified bytes are nowhere still
 /// fails the job; one whose bytes are on disk only warns.
 ///

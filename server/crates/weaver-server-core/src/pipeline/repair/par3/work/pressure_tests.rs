@@ -1,7 +1,7 @@
 use super::*;
 
 fn reader_pressure() -> EngineError {
-    budget::source_pressure(SourceId(7), EngineError::ResourceLimit("PAR3 host state")).into()
+    budget::source_pressure(SourceId(7), budget::host_limit("PAR3 host state")).into()
 }
 
 fn settle_result(key: WorkKey, result: EngineResult<WorkOutput>, stale: bool) -> Coordinator {
@@ -84,7 +84,7 @@ fn non_pressure_and_stale_outcomes_do_not_select_spill() {
         EngineError::SourceChanged(SourceId(7)),
         EngineError::Io(std::io::Error::other("disk failed")),
         EngineError::InvalidState("invalid layout"),
-        EngineError::ResourceLimit("native memory"),
+        budget::host_limit("native memory"),
     ] {
         let mut coordinator = settle_result(WorkKey::Donors, Err(error), false);
         assert!(coordinator.error(JobId(1)).is_some());

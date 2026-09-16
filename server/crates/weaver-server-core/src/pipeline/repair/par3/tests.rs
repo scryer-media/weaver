@@ -813,3 +813,251 @@ fn available_recovery(job: &mut Par3Job) -> usize {
         .map(|requirement| requirement.available.len())
         .sum()
 }
+
+/// The fixture index's Root packet, so a test can damage exactly one copy of
+/// one vital packet and leave every other packet in the carrier intact.
+const ROOT_PACKET: std::ops::Range<usize> = 672..781;
+
+/// Damage a packet in place: past its 48-byte header, so the scanner still
+/// finds the packet and still reads its declared length, and only the hash it
+/// carries no longer describes the body behind it. That is what a bad sector
+/// or a truncated article looks like to the scanner.
+fn with_damaged_packet(carrier: &[u8], packet: std::ops::Range<usize>) -> Vec<u8> {
+    let mut bytes = carrier.to_vec();
+    for byte in &mut bytes[packet.start + 48..packet.end] {
+        *byte ^= 0xff;
+    }
+    bytes
+}
+
+/// The input set every packet of the fixture carriers belongs to, read from
+/// the first packet's own header.
+fn fixture_set_id() -> par3_rs::InputSetId {
+    par3_rs::InputSetId(INDEX[32..40].try_into().expect("packet header"))
+}
+
+/// Append one packet of weaver's choosing to a carrier, built and hashed by
+/// the engine's own packet builder so it authenticates like any other.
+fn carrier_with(carrier: &[u8], body: par3_rs::packet::PacketBody) -> Vec<u8> {
+    let mut bytes = carrier.to_vec();
+    bytes.extend_from_slice(&par3_rs::packet::Packet::new(fixture_set_id(), body).to_bytes());
+    bytes
+}
+
+fn scan_carrier(bytes: &[u8]) -> Par3Job {
+    let mut job = Par3Job::default();
+    let len = bytes.len() as u64;
+    job.publish_carrier(
+        SourceId(0),
+        source(bytes),
+        len,
+        std::iter::once(0..len).collect(),
+        true,
+    )
+    .unwrap();
+    job.scan(SourceId(0)).unwrap();
+    job
+}
+
+/// Deliverable: a damaged copy of a vital packet is reported as a damaged byte
+/// range at its own offset, and the scan continues past it.
+#[test]
+fn a_damaged_vital_packet_is_reported_at_its_own_offset() {
+    let bytes = with_damaged_packet(INDEX, ROOT_PACKET);
+    let job = scan_carrier(&bytes);
+    let damage = job.damage_report();
+    assert_eq!(damage.len(), 1, "one carrier was damaged: {damage:?}");
+    assert_eq!(damage[0].source, SourceId(0));
+    assert_eq!(
+        damage[0].first_damage_offset, ROOT_PACKET.start as u64,
+        "the damaged run starts where the refused packet did"
+    );
+    assert_eq!(
+        damage[0].damaged_bytes,
+        ROOT_PACKET.len() as u64,
+        "only the refused packet's own bytes are damaged"
+    );
+    let families = job.authenticated_families();
+    assert_eq!(
+        families[carriers::Par3PacketKind::Root.index()],
+        0,
+        "the only Root copy in this carrier did not authenticate"
+    );
+    assert_eq!(
+        families[carriers::Par3PacketKind::File.index()],
+        3,
+        "every packet behind the damage still authenticated"
+    );
+    assert_eq!(families[carriers::Par3PacketKind::Start.index()], 1);
+    assert_eq!(families[carriers::Par3PacketKind::Matrix.index()], 1);
+    assert_eq!(families[carriers::Par3PacketKind::Directory.index()], 1);
+}
+
+/// Deliverable: the volume carrier repeats every vital packet, so an index
+/// that never arrives costs the set nothing.
+#[test]
+fn the_volume_carrier_alone_holds_every_vital_packet() {
+    let job = scan_carrier(RECOVERY);
+    let families = job.authenticated_families();
+    for kind in carriers::Par3PacketKind::VITAL {
+        assert_ne!(
+            families[kind.index()],
+            0,
+            "the volume carrier alone must supply an authenticated {} packet",
+            kind.label()
+        );
+    }
+    assert!(
+        job.damage_report().is_empty(),
+        "an undamaged carrier reports no damage"
+    );
+}
+
+/// Deliverable: a set with no authenticated Root copy anywhere names Root as
+/// the packet family it is short of.
+#[test]
+fn a_set_with_no_authenticated_root_names_the_missing_family() {
+    let bytes = with_damaged_packet(INDEX, ROOT_PACKET);
+    let job = scan_carrier(&bytes);
+    let families = job.authenticated_families();
+    let missing = carriers::Par3PacketKind::VITAL
+        .into_iter()
+        .find(|kind| families[kind.index()] == 0);
+    assert_eq!(missing, Some(carriers::Par3PacketKind::Root));
+    let outcome = outcome::Par3Outcome::MetadataIncomplete {
+        missing: outcome::MissingMetadata {
+            sets: 1,
+            carriers_awaiting_bytes: 0,
+            unresolved_files: 3,
+            missing_vital: missing,
+        },
+    };
+    assert!(
+        outcome.to_string().contains("no authenticated root packet"),
+        "{outcome}"
+    );
+}
+
+/// Deliverable: a link or permission packet is counted as present and ignored,
+/// never applied and never a reason to refuse the set.
+///
+/// The count is the set's own: an option packet is retained by the set that
+/// admitted it, so the set has to be resolved before anyone can be told how
+/// many it carries. That is the same moment the plan becomes reportable.
+#[test]
+fn an_option_packet_is_reported_and_never_applied() {
+    let bytes = carrier_with(
+        INDEX,
+        par3_rs::packet::PacketBody::Opaque {
+            packet_type: par3_rs::packet::PacketType::UnixPermissions,
+            body: vec![1, 2, 3, 4],
+        },
+    );
+    let mut job = scan_carrier(&bytes);
+    for set in job.sets.values_mut() {
+        set.assess().expect("the index carrier resolves its set");
+    }
+    let tally = job.option_packet_tally();
+    assert_eq!(tally.present, 1, "the option packet authenticated");
+    assert_eq!(tally.referenced, 0);
+    assert_eq!(tally.unresolved, 0);
+    assert!(
+        !tally.is_silent(),
+        "a present option packet is worth a line"
+    );
+    assert!(
+        job.damage_report().is_empty(),
+        "an option packet is not damage"
+    );
+}
+
+/// Deliverable: an option packet a File packet points at but that nothing
+/// authenticated is counted as unresolved, and the carrier still scans.
+#[test]
+fn an_unresolved_option_reference_is_counted_and_does_not_stop_the_scan() {
+    let bytes = carrier_with(
+        INDEX,
+        par3_rs::packet::PacketBody::File(par3_rs::packet::file::FilePacket {
+            name: "kestrel.bin".into(),
+            quick_rolling_hash: 0,
+            fingerprint: [0; 16],
+            option_hashes: vec![[0x5a; 16]],
+            chunks: Vec::new(),
+        }),
+    );
+    let job = scan_carrier(&bytes);
+    let tally = job.option_packet_tally();
+    assert_eq!(tally.referenced, 1, "the File packet named one option");
+    assert_eq!(tally.unresolved, 1, "nothing authenticated that option");
+    assert_eq!(tally.present, 0);
+    assert!(
+        job.authenticated_families()[carriers::Par3PacketKind::Root.index()] != 0,
+        "the rest of the carrier still authenticated"
+    );
+}
+
+/// Deliverable: hostile metadata stops at a named engine ceiling rather than
+/// at host exhaustion, and the ceiling reaches the pipeline as a typed limit.
+#[test]
+fn hostile_metadata_stops_at_a_named_ceiling() {
+    let mut bytes = Vec::new();
+    // One authenticated Creator packet per fabricated input set, built by the
+    // engine's own builder. Nothing about them is malformed: the hostility is
+    // that there are more sets than one job will ever hold open.
+    for index in 0..=MAX_SETS as u64 {
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&index.to_le_bytes());
+        bytes.extend_from_slice(
+            &par3_rs::packet::Packet::new(
+                par3_rs::InputSetId(id),
+                par3_rs::packet::PacketBody::Creator(par3_rs::packet::creator::CreatorPacket::new(
+                    "kestrel",
+                )),
+            )
+            .to_bytes(),
+        );
+    }
+    let mut job = Par3Job::default();
+    let len = bytes.len() as u64;
+    job.publish_carrier(
+        SourceId(0),
+        source(&bytes),
+        len,
+        std::iter::once(0..len).collect(),
+        true,
+    )
+    .unwrap();
+    let error = job.scan(SourceId(0)).expect_err("the set ceiling holds");
+    assert_eq!(
+        outcome::execution_limit(&error),
+        Some("job PAR3 set count"),
+        "the refusal names its own ceiling: {error}"
+    );
+    let outcome = outcome::Par3Outcome::NotExecutable {
+        limit: outcome::execution_limit(&error)
+            .expect("named limit")
+            .into(),
+    };
+    assert_eq!(
+        outcome.class(),
+        crate::operations::metrics::Par3OutcomeClass::NotExecutable
+    );
+    assert!(
+        outcome.to_string().contains("job PAR3 set count"),
+        "{outcome}"
+    );
+}
+
+/// A probe that never ran because the host budget was full says nothing about
+/// the file, so the attempt is forgotten and made again later; a probe that
+/// read the file and failed is a verdict about the file and stands.
+#[test]
+fn an_embedded_probe_is_retried_only_when_the_budget_refused_it() {
+    let exhausted = budget::host_budget_limit("PAR3 host state", 66 << 10, 64 << 20, 0);
+    assert!(budget::is_limit(&exhausted), "{exhausted}");
+    let unreadable = EngineError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    assert!(!budget::is_limit(&unreadable), "{unreadable}");
+    assert!(!budget::is_limit(&EngineError::Unsupported(
+        "embedded destination path"
+    )));
+}
