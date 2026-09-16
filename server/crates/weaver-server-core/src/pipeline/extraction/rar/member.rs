@@ -700,9 +700,7 @@ impl Pipeline {
             budget.reject_unsafe_path(format!("RAR partial output escaped staging root: {error}"))
         })?;
         let partial_file = root.create_file(partial_relative, &budget)?;
-        let shared = Rc::new(RefCell::new(SharedOutputFile {
-            inner: std::io::BufWriter::with_capacity(8 * 1024 * 1024, partial_file),
-        }));
+        let shared = Rc::new(RefCell::new(SharedOutputFile::new(partial_file)));
         let checkpoint = Arc::new(ExtractionCheckpointState {
             job_id,
             set_name: set_name.to_string(),
@@ -1993,6 +1991,156 @@ mod tests {
         ));
         bytes.extend_from_slice(&build_test_rar_end_header(false));
         bytes
+    }
+
+    /// Deterministic filler that no run-length or all-same-byte shortcut can
+    /// reproduce, so a byte-identity assertion over it actually pins the copy.
+    fn build_extraction_filler(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// A non-solid RAR5 `store` member split across volumes, the shape the
+    /// chunked streaming path handles: the whole-file checksum rides the last
+    /// volume's header and every volume carries its own slice of the payload.
+    fn build_store_multivolume_rar_set(
+        filename: &str,
+        volume_payloads: &[Vec<u8>],
+    ) -> Vec<(String, Vec<u8>)> {
+        let volume_count = volume_payloads.len();
+        assert!(volume_count >= 2);
+        let unpacked_size: usize = volume_payloads.iter().map(|slice| slice.len()).sum();
+        let payload_crc = par2_rs::checksum::crc32(
+            &volume_payloads
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<u8>>(),
+        );
+
+        volume_payloads
+            .iter()
+            .enumerate()
+            .map(|(volume, slice)| {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&TEST_RAR5_SIG);
+                bytes.extend_from_slice(&build_test_rar_main_header(
+                    if volume == 0 { 0x0001 } else { 0x0001 | 0x0002 },
+                    (volume > 0).then_some(volume as u64),
+                ));
+                let split_flags = match volume {
+                    0 => 0x0010,
+                    v if v + 1 == volume_count => 0x0008,
+                    _ => 0x0010 | 0x0008,
+                };
+                bytes.extend_from_slice(&build_test_rar_file_header(
+                    filename,
+                    split_flags,
+                    0,
+                    slice.len() as u64,
+                    unpacked_size as u64,
+                    (volume + 1 == volume_count).then_some(payload_crc),
+                ));
+                bytes.extend_from_slice(slice);
+                bytes.extend_from_slice(&build_test_rar_end_header(volume + 1 != volume_count));
+                (format!("crate.part{volume:03}.rar"), bytes)
+            })
+            .collect()
+    }
+
+    /// A member larger than one copy chunk must reach the file unchanged.
+    ///
+    /// The chunked path hands down spans of up to 4 MiB and the output buffer
+    /// sits below that, so the large spans bypass the buffer and the short tail
+    /// is coalesced. Both routes have to produce the same bytes.
+    #[test]
+    fn multi_megabyte_store_member_extracts_byte_identical_through_the_chunked_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let member_name = "signal-drift.bin";
+        let volume_payloads = vec![
+            build_extraction_filler(5 * 1024 * 1024),
+            build_extraction_filler(1_234_567),
+        ];
+        let expected = volume_payloads
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<u8>>();
+        let files = build_store_multivolume_rar_set(member_name, &volume_payloads);
+
+        let volume_paths = files
+            .iter()
+            .enumerate()
+            .map(|(volume, (filename, bytes))| {
+                let path = temp.path().join(filename);
+                std::fs::write(&path, bytes).unwrap();
+                (volume as u32, path)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let requested = vec![member_name.to_string()];
+        let mut archive =
+            Pipeline::open_rar_archive_from_snapshot_or_disk(RarArchiveSnapshotOpenRequest {
+                set_name: "chunked-store",
+                volume_paths: volume_paths.clone(),
+                password_candidates: Vec::new(),
+                cached_headers: None,
+                shared_kdf_cache: std::sync::Arc::new(unrar_rs::crypto::KdfCache::new()),
+                open_mode: RarArchiveOpenMode::AttachOnly,
+                requested_members: Some(&requested),
+                already_extracted: None,
+                budget: None,
+            })
+            .unwrap()
+            .value;
+        assert!(
+            !archive.is_solid(),
+            "fixture must be non-solid or this exercises the wrong branch"
+        );
+
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(8);
+        let options = unrar_rs::ExtractOptions {
+            verify: true,
+            password: None,
+            restore_owners: false,
+        };
+        let member_names = archive.member_names();
+        let idx = archive
+            .find_member_sanitized(member_name)
+            .unwrap_or_else(|| {
+                panic!("missing {member_name} in decoded members: {member_names:?}")
+            });
+
+        let (name, written, unpacked) = Pipeline::extract_rar_member_to_output(
+            &mut archive,
+            RarExtractionContext::new(
+                &volume_paths,
+                &event_tx,
+                JobId(91),
+                "chunked-store",
+                &output_dir,
+                &options,
+            ),
+            idx,
+        )
+        .unwrap();
+
+        assert_eq!(name, member_name);
+        assert_eq!(written, expected.len() as u64);
+        assert_eq!(unpacked, expected.len() as u64);
+        assert_eq!(
+            std::fs::read(output_dir.join(member_name)).unwrap(),
+            expected
+        );
     }
 
     fn build_solid_store_multivolume_rar_set(volume_count: usize) -> Vec<(String, Vec<u8>)> {
