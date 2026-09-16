@@ -717,11 +717,7 @@ fn render_par3(out: &mut Encoder, par3: &Par3MetricsSnapshot) {
         out.sample_f64(
             &f::PAR3_SLOT_PHASE_SECONDS,
             &[("slot", slot_label(index))],
-            seconds(
-                slot.last_progress_ms
-                    .max(slot.phase_entered_ms)
-                    .saturating_sub(slot.phase_entered_ms),
-            ),
+            seconds(slot.phase_age_ms),
         );
     }
     for (index, slot) in par3.slots.iter().enumerate() {

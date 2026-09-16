@@ -300,15 +300,19 @@ impl Pipeline {
             .iter()
             .enumerate()
             .filter(|(_, file)| matches!(file.role, FileRole::Par3 { .. }))
-            // A volume whose advertised span provably holds no index any
-            // deficient cohort still admits cannot close this window. The name
-            // is only ever used to exclude: a volume that advertises nothing
-            // parsable stays eligible.
-            .filter(|(_, file)| {
-                super::cohorts::volume_span(&file.filename)
-                    .is_none_or(|span| !plan.excludes_span(&span))
-            })
             .map(|(index, _)| index as u32)
+            .collect();
+        // A volume whose advertised span holds no index any deficient cohort
+        // still admits is fetched last. The name is a hint about contents a
+        // rename can falsify, so it orders carriers and never removes one:
+        // only the authenticated packets can say what a carrier holds.
+        let name_unwanted: std::collections::BTreeSet<u32> = candidates
+            .iter()
+            .copied()
+            .filter(|&index| {
+                super::cohorts::volume_span(&state.spec.files[index as usize].filename)
+                    .is_some_and(|span| plan.excludes_span(&span))
+            })
             .collect();
         let state = self.jobs.get_mut(&job_id).expect("live job");
         let mut pool = state.recovery_queue.drain_all();
@@ -337,6 +341,7 @@ impl Pipeline {
                 } else {
                     2
                 },
+                name_unwanted.contains(&id.file_id.file_index),
                 id.file_id.file_index,
                 id.segment_number,
             )
@@ -356,6 +361,11 @@ impl Pipeline {
                     .file(id.file_id)
                     .is_some_and(|file| file.is_complete())
             {
+                continue;
+            }
+            // Speculation has no demand to justify a carrier its own name
+            // argues against.
+            if prefetch && name_unwanted.contains(&id.file_id.file_index) {
                 continue;
             }
             let estimate = u64::from(work.byte_estimate.max(1));

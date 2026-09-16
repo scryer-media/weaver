@@ -406,6 +406,10 @@ pub struct Par3SlotSnapshot {
     pub phase: Par3Phase,
     pub phase_entered_ms: u64,
     pub last_progress_ms: u64,
+    /// Time in the current phase as of this snapshot, whether or not the
+    /// phase has reported progress.
+    #[serde(default)]
+    pub phase_age_ms: u64,
     /// Age of the stall in progress; zero when this slot is not stalled.
     pub current_stall_ms: u64,
 }
@@ -706,11 +710,13 @@ impl Par3Metrics {
                 0
             };
             current = current.max(age);
+            let entered = slot.phase_entered_ms.load(Ordering::Relaxed);
             Par3SlotSnapshot {
                 job_id: slot.job_id.load(Ordering::Relaxed),
                 phase,
-                phase_entered_ms: slot.phase_entered_ms.load(Ordering::Relaxed),
+                phase_entered_ms: entered,
                 last_progress_ms: last,
+                phase_age_ms: now_ms.saturating_sub(entered),
                 current_stall_ms: age,
             }
         });
@@ -972,6 +978,10 @@ mod tests {
         assert_eq!(fresh[0].job_id, 4);
         assert_eq!(fresh[0].phase, Par3Phase::AwaitingRecoveryArticles);
         assert_eq!(fresh[0].current_stall_ms, 0, "well inside the threshold");
+        assert_eq!(
+            fresh[0].phase_age_ms, 500,
+            "phase age runs without progress"
+        );
         assert_eq!(metrics.stalls_total.load(Ordering::Relaxed), 0);
 
         // One millisecond past the threshold starts exactly one stall, and the
@@ -993,6 +1003,11 @@ mod tests {
         metrics.set_last_progress_for_test(4, crossed + 4_000);
         let cleared = metrics.observe(crossed + 4_100);
         assert_eq!(cleared[0].current_stall_ms, 0);
+        assert_eq!(
+            cleared[0].phase_age_ms,
+            crossed + 3_100,
+            "progress does not reset or freeze the phase age"
+        );
         assert_eq!(metrics.stall_duration_ms.load(Ordering::Relaxed), 4_101);
         assert_eq!(metrics.current_stall_ms.load(Ordering::Relaxed), 0);
     }

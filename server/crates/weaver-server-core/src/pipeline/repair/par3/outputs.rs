@@ -46,11 +46,13 @@ impl Pipeline {
     /// would refuse a large set on a disk that comfortably holds the handful
     /// of damaged files in it.
     ///
-    /// Of those that will be written, the allowance is every output length
-    /// plus one more copy of the largest, because the engine writes each
-    /// reconstruction to a temporary file beside its destination and renames
-    /// it into place. A damaged output already on disk is still counted in
-    /// full: its bytes are not free until that rename lands.
+    /// Of those that will be written, the allowance is every output length:
+    /// the engine stages each reconstruction in full beside its destination
+    /// before it renames any of them into place, and a damaged file already on
+    /// disk is not free space until that rename lands, so the probe has
+    /// already left it out. A rename adds nothing. Only an embedded carrier's
+    /// self-repair also keeps a scratch tree beside its staged archive, and
+    /// only that path is allowed one more copy of its output.
     pub(super) async fn par3_output_space_shortfall(
         &mut self,
         job: JobId,
@@ -70,7 +72,11 @@ impl Pipeline {
                 .map(|(_, length)| *length)
         };
         let total = rebuilt().try_fold(0u64, |bytes, length| bytes.checked_add(length));
-        let staging = rebuilt().max().unwrap_or(0);
+        let staging = if view.embedded_source.is_some() {
+            rebuilt().max().unwrap_or(0)
+        } else {
+            0
+        };
         let need = total.and_then(|total| total.checked_add(staging))?;
         if need == 0 {
             return None;
