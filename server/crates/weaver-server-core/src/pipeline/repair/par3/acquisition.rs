@@ -157,6 +157,65 @@ impl Pipeline {
         }
     }
 
+    /// Tally a drained acquisition window: each article it admitted either
+    /// reached the assembly or did not. Counted once per window.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn settle_par3_recovery_batch_for_test(&mut self, job_id: JobId) {
+        self.settle_par3_recovery_batch(job_id);
+    }
+
+    fn settle_par3_recovery_batch(&mut self, job_id: JobId) {
+        let articles = match self.par3_runtime.as_mut() {
+            Some(runtime) => runtime.take_unsettled_articles(job_id),
+            None => return,
+        };
+        if articles.is_empty() {
+            return;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let received = articles
+            .iter()
+            .filter(|id| {
+                state
+                    .assembly
+                    .file(id.file_id)
+                    .is_some_and(|file| file.has_segment(id.segment_number))
+            })
+            .count() as u64;
+        let par3 = &self.metrics.par3;
+        use std::sync::atomic::Ordering::Relaxed;
+        if received != 0 {
+            par3.recovery_articles_received_total
+                .fetch_add(received, Relaxed);
+        }
+        let failed = articles.len() as u64 - received;
+        if failed != 0 {
+            par3.recovery_articles_failed_total
+                .fetch_add(failed, Relaxed);
+        }
+        // The window is over either way: an index that arrived is the engine's
+        // own `available` now, and one whose article failed has to become
+        // askable again instead of sitting in flight forever.
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            runtime.forget_recovery_in_flight(job_id);
+        }
+    }
+
+    /// Whether recovery acquisition for this job is still moving: a window's
+    /// articles are in the download pipeline, or the engine holds work for
+    /// the job — including the reassessment a drained window queues when it
+    /// retracts its in-flight declaration. While either is true, a window
+    /// that could not be admitted says nothing about whether recovery
+    /// remains; the retained view predates the retraction.
+    pub(in crate::pipeline) fn par3_recovery_in_progress(&self, job_id: JobId) -> bool {
+        self.par3_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.has_work(job_id))
+            || self.par3_batch_has_activity(job_id)
+    }
+
     pub(in crate::pipeline) fn promote_par3_recovery_window(
         &mut self,
         job_id: JobId,
@@ -168,10 +227,23 @@ impl Pipeline {
         let Some(acquisition) = runtime.acquisition(job_id) else {
             return false;
         };
+        let prefetched = acquisition.prefetched;
+        let engine_busy = runtime.has_work(job_id);
         if self.par3_batch_has_activity(job_id) {
             return true;
         }
-        if (prefetch && acquisition.prefetched) || (!prefetch && runtime.has_work(job_id)) {
+        // Nothing of the previous window is still moving, so every article it
+        // admitted has either landed or been given up on. Account for it
+        // before a new window can admit the same indices again.
+        self.settle_par3_recovery_batch(job_id);
+        if (prefetch && prefetched) || (!prefetch && engine_busy) {
+            tracing::info!(
+                job_id = job_id.0,
+                prefetch,
+                prefetched,
+                engine_busy,
+                "PAR3 recovery window deferred"
+            );
             return false;
         }
         let Some(state) = self.jobs.get(&job_id) else {
@@ -183,20 +255,33 @@ impl Pipeline {
         ) {
             return false;
         }
-        let mut views = 0;
-        let mut incomplete = false;
-        let mut needed_bytes = 0u64;
-        for (_, view) in runtime.assessments(job_id) {
-            views += 1;
-            incomplete |= view.status == RepairStatus::IncompleteMetadata;
-            for need in &view.requirements {
-                needed_bytes =
-                    needed_bytes.saturating_add(need.additional.saturating_mul(view.block_size));
-            }
-        }
-        if views != 0 && needed_bytes == 0 && !incomplete {
+        // Only cohorts that are actually short enter the plan. A cohort in
+        // surplus contributes no bytes and admits no index, so nothing below
+        // can spend this window's budget on parity it cannot use.
+        let plan = self.par3_cohort_plan(job_id);
+        let needed_bytes = plan.needed_bytes;
+        if plan.views != 0 && needed_bytes == 0 && !plan.metadata_incomplete {
+            tracing::info!(
+                job_id = job_id.0,
+                views = plan.views,
+                cohorts_short = plan.windows.len(),
+                deficits = ?plan.deficits(),
+                "PAR3 recovery window refused: the retained view has nothing outstanding"
+            );
             return false;
         }
+        if plan.metadata_incomplete {
+            self.metrics
+                .par3
+                .metadata_incomplete_waits_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let Some(runtime) = self.par3_runtime.as_ref() else {
+            return false;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
         let limit = if prefetch {
             self.nntp.pool().fill_connection_capacity().clamp(1, 8)
         } else {
@@ -215,6 +300,14 @@ impl Pipeline {
             .iter()
             .enumerate()
             .filter(|(_, file)| matches!(file.role, FileRole::Par3 { .. }))
+            // A volume whose advertised span provably holds no index any
+            // deficient cohort still admits cannot close this window. The name
+            // is only ever used to exclude: a volume that advertises nothing
+            // parsable stays eligible.
+            .filter(|(_, file)| {
+                super::cohorts::volume_span(&file.filename)
+                    .is_none_or(|span| !plan.excludes_span(&span))
+            })
             .map(|(index, _)| index as u32)
             .collect();
         let state = self.jobs.get_mut(&job_id).expect("live job");
@@ -255,6 +348,13 @@ impl Pipeline {
             if !candidates.contains(&id.file_id.file_index)
                 || selected.contains(&id)
                 || runtime.article_promoted(job_id, id.file_id.file_index, id.segment_number)
+                // A carrier whose own file is already whole has nothing left to
+                // fetch. Its leftover queue entries must not take a slot or a
+                // byte of this window's budget from a carrier that does.
+                || state
+                    .assembly
+                    .file(id.file_id)
+                    .is_some_and(|file| file.is_complete())
             {
                 continue;
             }
@@ -273,8 +373,25 @@ impl Pipeline {
             bytes = bytes.saturating_add(estimate);
         }
         if selected.is_empty() {
+            tracing::info!(
+                job_id = job_id.0,
+                pool = pool.len(),
+                candidates = candidates.len(),
+                views = plan.views,
+                cohorts_short = plan.windows.len(),
+                needed_bytes,
+                byte_limit,
+                prefetch,
+                "PAR3 recovery window refused: no article selected"
+            );
             for work in pool {
                 state.recovery_queue.push(work);
+            }
+            if needed_bytes != 0 {
+                self.metrics
+                    .par3
+                    .need_data_waits_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return false;
         }
@@ -290,9 +407,46 @@ impl Pipeline {
             for work in pool {
                 state.recovery_queue.push(work);
             }
+            self.metrics
+                .par3
+                .note_admission_refused(super::outcome::admission_reason(&error));
             self.fail_job(job_id, format!("PAR3 acquisition failed: {error}"));
             return true;
         }
+        // Tell the engine what this window is expected to deliver. The next
+        // reassessment then subtracts it, so nothing already being fetched is
+        // requested a second time. A refusal here costs deduplication, not
+        // correctness, so it is recorded and the window still runs.
+        // Each carrier declares at most as many indices as articles this
+        // window took from it. Its advertised span bounds which indices those
+        // can be; it never stands in for the articles that were not admitted.
+        let carriers: Vec<(std::ops::Range<u64>, usize)> = {
+            let mut admitted: std::collections::BTreeMap<u32, usize> =
+                std::collections::BTreeMap::new();
+            for id in &selected {
+                *admitted.entry(id.file_id.file_index).or_default() += 1;
+            }
+            let state = self.jobs.get(&job_id).expect("live job");
+            admitted
+                .into_iter()
+                .filter_map(|(index, count)| {
+                    let file = state.spec.files.get(index as usize)?;
+                    super::cohorts::volume_span(&file.filename).map(|span| (span, count))
+                })
+                .collect()
+        };
+        let runtime = self.par3_runtime.as_mut().expect("admitted job");
+        if let Err(error) = runtime.declare_recovery_in_flight(job_id, &carriers) {
+            self.metrics
+                .par3
+                .note_admission_refused(super::outcome::admission_reason(&error));
+            tracing::warn!(
+                job_id = job_id.0,
+                %error,
+                "PAR3 recovery in-flight declaration refused"
+            );
+        }
+        let state = self.jobs.get_mut(&job_id).expect("live job");
         let mut remaining: std::collections::HashSet<_> = selected.iter().copied().collect();
         for mut work in pool {
             if remaining.remove(&work.segment_id) {
@@ -303,11 +457,19 @@ impl Pipeline {
                 state.recovery_queue.push(work);
             }
         }
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let par3 = &self.metrics.par3;
+            par3.recovery_windows_admitted_total.fetch_add(1, Relaxed);
+            par3.recovery_articles_requested_total
+                .fetch_add(selected.len() as u64, Relaxed);
+        }
         tracing::info!(
             job_id = job_id.0,
             articles = selected.len(),
             estimated_bytes = bytes,
             needed_bytes,
+            cohorts_short = plan.windows.len(),
             prefetch,
             "PAR3 recovery window admitted"
         );
@@ -319,6 +481,16 @@ impl Pipeline {
             );
         }
         self.update_queue_metrics();
+        // Not a failure: the admitted window *is* the plan for the cohorts
+        // that are still short, and recording it keeps every verdict, wait and
+        // failure on one counter.
+        self.settle_par3_outcome(
+            job_id,
+            super::outcome::Par3Outcome::NeedsRecovery {
+                cohorts: plan.deficits(),
+                bytes: needed_bytes,
+            },
+        );
         true
     }
 }

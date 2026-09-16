@@ -731,6 +731,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "rayon-core",
 ]
 
 [[package]]
@@ -3476,9 +3477,9 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "149eee4bf758f8c50555b9867bb3d91acdb665143922bb9f3e6be4baba3adb44"
+checksum = "6c944d97879f8a1460f1f233844fa25e9e44c45cacce6ce02bbe42101daf810d"
 dependencies = [
  "blake3",
  "crc-fast",

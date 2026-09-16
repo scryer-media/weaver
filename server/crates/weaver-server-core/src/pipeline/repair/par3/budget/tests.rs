@@ -47,10 +47,10 @@ fn failed_admission_releases_partial_leases_and_replacements_do_not_accumulate()
     let bytes: Arc<[u8]> = vec![1; 100].into();
     let first = budgets.retain(&bytes).unwrap();
     let second: Arc<[u8]> = vec![2; 100].into();
-    assert!(matches!(
-        budgets.retain(&second),
-        Err(EngineError::ResourceLimit("PAR3 retained payload"))
-    ));
+    assert_eq!(
+        budgets.retain(&second).as_ref().err().and_then(limit_label),
+        Some("PAR3 retained payload")
+    );
     assert_eq!(budgets.payload.used.load(Ordering::Acquire), 100);
     assert_eq!(budgets.metadata.used.load(Ordering::Acquire), 256);
     drop(first);
@@ -86,18 +86,24 @@ fn concurrent_jobs_share_a_single_live_allocation_lease() {
 
 #[test]
 fn only_explicit_host_pressure_selects_disk_fallback() {
-    assert!(is_host_pressure(&EngineError::ResourceLimit(
-        "PAR3 retained payload"
-    )));
+    assert!(is_host_pressure(&host_limit("PAR3 retained payload")));
     assert!(is_host_pressure(&EngineError::Io(std::io::Error::other(
-        EngineError::ResourceLimit("PAR3 host state")
+        host_limit("PAR3 host state")
     ))));
-    assert!(!is_host_pressure(&EngineError::ResourceLimit(
-        "placement read work"
-    )));
+    assert!(!is_host_pressure(&host_limit("placement read work")));
     assert!(!is_host_pressure(&EngineError::Io(std::io::Error::other(
         "disk failed"
     ))));
+    // A weaver ceiling and an engine ceiling answer the same question the
+    // same way, whichever error shape carried it.
+    assert_eq!(
+        limit_label(&host_budget_limit("PAR3 host state", 9, 8, 0)),
+        Some("PAR3 host state")
+    );
+    assert!(is_native_pressure(&host_limit(
+        par3_rs::runtime::MemoryCategory::CodecScratch.name()
+    )));
+    assert!(!is_limit(&EngineError::Cancelled));
 }
 
 #[test]

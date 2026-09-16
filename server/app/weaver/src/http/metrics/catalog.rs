@@ -478,6 +478,167 @@ metric_families! {
     DISK_AVAILABLE_BYTES = ("weaver_disk_available_bytes", Gauge, ["role", "path"],
         "Space available to this process on the filesystem backing a configured directory role.");
 
+    // ---- PAR3 recovery -----------------------------------------------------------------------------
+    // Every series here is fed from `MetricsSnapshot::par3`, which is a plain
+    // fixed-size struct copy taken on the pipeline's own snapshot tick. The
+    // phase and reason label values are the stringified enum codes; the codes
+    // themselves are the exported gauge contract and are never renumbered.
+    PAR3_ADMISSION_REFUSED = ("weaver_par3_admission_refused_total", Counter, ["reason"],
+        "PAR3 memory reservations refused, by the budget that refused them.");
+    PAR3_WAITING_FOR_MEMORY = ("weaver_par3_waiting_for_memory", Gauge, [],
+        "PAR3 jobs currently parked waiting for a peer work unit to release memory.");
+    PAR3_WAITING_FOR_MEMORY_SECONDS = ("weaver_par3_waiting_for_memory_seconds_total", Counter, [],
+        "Cumulative time PAR3 jobs spent parked waiting for memory.");
+    PAR3_SPILLS = ("weaver_par3_spills_to_disk_total", Counter, [],
+        "PAR3 sources reconstructed on disk after an in-memory image was refused.");
+    PAR3_RESERVED_BYTES = ("weaver_par3_reserved_bytes", Gauge, [],
+        "Bytes reserved against the PAR3 engine memory budget as of the last work-unit handback.");
+    PAR3_RESERVED_PEAK_BYTES = ("weaver_par3_reserved_peak_bytes", Gauge, [],
+        "Peak bytes ever reserved against the PAR3 engine memory budget.");
+    PAR3_RETAINED_BYTES = ("weaver_par3_retained_bytes", Gauge, [],
+        "Bytes reserved against weaver's own PAR3 host-state and retained-payload budgets.");
+    PAR3_STRIPE_BYTES = ("weaver_par3_effective_stripe_bytes", Gauge, [],
+        "Repair stripe size requested of the engine for the most recent PAR3 work unit.");
+
+    PAR3_LEDGER_BYTES = ("weaver_par3_ledger_bytes", Gauge, ["category"],
+        "Bytes the PAR3 engine has reserved in each of its own memory categories, as of the last work-unit handback.");
+    PAR3_LEDGER_PEAK_BYTES = ("weaver_par3_ledger_peak_bytes", Gauge, ["category"],
+        "Highest bytes the PAR3 engine ever held in each of its own memory categories.");
+    PAR3_ENGINE_ADMITTED_STRIPE_BYTES = ("weaver_par3_engine_admitted_stripe_bytes", Gauge, [],
+        "Codec stripe size the PAR3 engine actually admitted for its most recent pass.");
+    PAR3_ENGINE_ADMITTED_STRIPE_BUFFERS = ("weaver_par3_engine_admitted_stripe_buffers", Gauge, [],
+        "Stripe-sized buffers the PAR3 engine's most recent admission covered.");
+    PAR3_ENGINE_ADMITTED_OUTPUT_TILE = ("weaver_par3_engine_admitted_output_tile_rows", Gauge, [],
+        "Lost rows the PAR3 engine solved per tile in its most recent Cauchy pass.");
+    PAR3_ENGINE_ADMITTED_VERIFY_BATCH = ("weaver_par3_engine_admitted_verify_batch_files", Gauge, [],
+        "Files in the PAR3 engine's most recently admitted verification batch.");
+    PAR3_ENGINE_ADMITTED_WORKERS = ("weaver_par3_engine_admitted_workers", Gauge, [],
+        "Worker threads the PAR3 engine's most recently admitted pool holds; one means it ran on the calling thread.");
+    PAR3_ENGINE_ADMITTED_WINDOW_BYTES = ("weaver_par3_engine_admitted_window_bytes", Gauge, [],
+        "Bytes in the PAR3 engine's most recently admitted sequential read window.");
+    PAR3_ENGINE_REFUSALS = ("weaver_par3_engine_refusals_total", Counter, ["cause"],
+        "Admissions the PAR3 engine refused, by the cause it gave.");
+    PAR3_ENGINE_NARROWED = ("weaver_par3_engine_narrowed_total", Counter, ["width"],
+        "Stages the PAR3 engine ran narrower than configured, by the width that had to give. These are not stalls.");
+    PAR3_ENGINE_REREAD_BYTES = ("weaver_par3_engine_reread_bytes_total", Counter, [],
+        "Source bytes the PAR3 engine read again because one pass could not hold the block.");
+    PAR3_ENGINE_RECONSTRUCTED_BYTES = ("weaver_par3_engine_reconstructed_bytes_total", Counter, [],
+        "Bytes the PAR3 codec reconstructed and scattered into staged output.");
+    PAR3_ENGINE_CACHE_ENTRIES = ("weaver_par3_engine_cache_entries", Gauge, [],
+        "Entries the PAR3 engine's admission and deduplication caches currently retain.");
+    PAR3_ENGINE_CACHE_BYTES = ("weaver_par3_engine_cache_bytes", Gauge, [],
+        "Bytes the PAR3 engine's admission and deduplication cache entries are charged.");
+    PAR3_ENGINE_CODEC_TRANSFORM_CALLS = ("weaver_par3_engine_codec_transform_calls_total", Counter, [],
+        "Additive-transform invocations the PAR3 codec made, including the ones a pruning plan split.");
+    PAR3_ENGINE_CODEC_BUTTERFLIES = ("weaver_par3_engine_codec_butterflies_total", Counter, [],
+        "Butterflies the PAR3 codec executed across those transform calls.");
+    PAR3_ENGINE_CODEC_BUTTERFLIES_SKIPPED = ("weaver_par3_engine_codec_butterflies_skipped_total", Counter, [],
+        "Butterflies a PAR3 transform plan established were not needed; add these to the executed ones for what the same decode would have cost unpruned.");
+    PAR3_ENGINE_CODEC_MULTIPLY_ACCUMULATES = ("weaver_par3_engine_codec_multiply_accumulates_total", Counter, [],
+        "Symbol-wide multiply-accumulates those butterflies performed: one per butterfly per symbol in the rows it joined.");
+    PAR3_ENGINE_CODEC_FACTORS_COMPUTED = ("weaver_par3_engine_codec_factors_computed_total", Counter, [],
+        "Cauchy code-matrix elements the PAR3 codec computed.");
+    PAR3_ENGINE_CODEC_FACTORS_REUSED = ("weaver_par3_engine_codec_factors_reused_total", Counter, [],
+        "Cauchy code-matrix elements the PAR3 codec answered from an admitted table instead of recomputing.");
+
+    PAR3_PENDING_WORK = ("weaver_par3_pending_work_depth", Gauge, [],
+        "PAR3 work units queued and not yet dispatched.");
+    PAR3_PENDING_BYTES = ("weaver_par3_pending_work_bytes", Gauge, [],
+        "Host bytes leased by queued PAR3 work units.");
+    PAR3_DISPATCH_REFUSED = ("weaver_par3_dispatch_refused_total", Counter, ["reason"],
+        "Dispatch attempts that left queued PAR3 work waiting, by what was unavailable.");
+    PAR3_DISPATCH_WAIT_SECONDS = ("weaver_par3_dispatch_wait_seconds_total", Counter, [],
+        "Cumulative time PAR3 work units spent queued before a worker took them.");
+    PAR3_WORKERS_ADMITTED = ("weaver_par3_workers_admitted", Gauge, [],
+        "CPU workers currently allotted across the PAR3 work slots.");
+    PAR3_IN_FLIGHT = ("weaver_par3_in_flight", Gauge, [],
+        "PAR3 work units currently owned by a blocking worker.");
+
+    PAR3_RECOVERY_WINDOWS = ("weaver_par3_recovery_windows_admitted_total", Counter, [],
+        "PAR3 recovery acquisition windows admitted.");
+    PAR3_RECOVERY_ARTICLES = ("weaver_par3_recovery_articles_total", Counter, ["outcome"],
+        "Recovery articles a PAR3 window requested, and how they ended.");
+    PAR3_RECOVERY_NEEDED_BYTES = ("weaver_par3_recovery_needed_bytes", Gauge, [],
+        "Recovery bytes the deficient cohorts of the current assessments are short by.");
+    PAR3_COHORTS_WITH_DEFICIT = ("weaver_par3_cohorts_with_deficit", Gauge, [],
+        "Cohorts across the current assessments that still need recovery blocks.");
+    PAR3_WAITS = ("weaver_par3_waits_total", Counter, ["reason"],
+        "PAR3 acquisition passes that could not proceed, by what they were waiting on.");
+
+    PAR3_SOURCE_READ_BYTES = ("weaver_par3_source_read_bytes_total", Counter, [],
+        "Bytes the PAR3 engine read from published sources.");
+    PAR3_SOURCE_READS = ("weaver_par3_source_reads_total", Counter, [],
+        "Read calls the PAR3 engine made against published sources.");
+    PAR3_REASSESSMENTS = ("weaver_par3_reassessments_total", Counter, [],
+        "PAR3 assessment work units dispatched.");
+    PAR3_REASSESSMENTS_ZERO_READ = ("weaver_par3_reassessments_zero_read_total", Counter, [],
+        "PAR3 assessments that completed without reading a single source byte.");
+    PAR3_REVERIFY_GENERATION_CHANGED = ("weaver_par3_reverify_generation_changed_total", Counter, [],
+        "PAR3 work units whose job was written to before they handed back.");
+    PAR3_VERIFY_SERIAL_FALLBACK = ("weaver_par3_verify_serial_fallback_total", Counter, [],
+        "PAR3 work units re-run alone after a shared-CPU attempt hit native pressure.");
+    PAR3_READER_CACHE = ("weaver_par3_reader_cache_total", Counter, ["event"],
+        "Encrypted virtual reader cache hits and evictions.");
+
+    PAR3_DONOR_SEARCHES = ("weaver_par3_donor_searches_total", Counter, [],
+        "Bounded PAR3 donor searches dispatched.");
+    PAR3_DONOR_SEARCH_EXHAUSTED = ("weaver_par3_donor_search_exhausted_total", Counter, [],
+        "PAR3 donor searches that exhausted their candidate list.");
+    PAR3_DONOR_READ_BYTES = ("weaver_par3_donor_read_bytes_total", Counter, [],
+        "Bytes read while searching for PAR3 donor blocks.");
+    PAR3_DONOR_TIME_CAP = ("weaver_par3_donor_time_cap_hits_total", Counter, [],
+        "PAR3 extents whose donor search stopped on its own per-extent time cap.");
+
+    PAR3_STAGE_CALLS = ("weaver_par3_stage_calls_total", Counter, ["stage"],
+        "PAR3 engine stage invocations, folded in once per work-unit handback.");
+    PAR3_STAGE_SECONDS = ("weaver_par3_stage_seconds_total", Counter, ["stage"],
+        "Time the PAR3 engine spent in each stage, folded in once per work-unit handback.");
+    PAR3_FILE_SYNC_CALLS = ("weaver_par3_file_sync_calls_total", Counter, [],
+        "Output file sync calls the PAR3 engine made.");
+    PAR3_FILE_SYNC_SECONDS = ("weaver_par3_file_sync_seconds_total", Counter, [],
+        "Time the PAR3 engine spent syncing output files.");
+
+    PAR3_REPAIRS_STARTED = ("weaver_par3_repairs_started_total", Counter, [],
+        "PAR3 repair work units dispatched.");
+    PAR3_OUTCOMES = ("weaver_par3_outcomes_total", Counter, ["class"],
+        "Typed PAR3 verdicts reached, by class. Waits and informational classes are counted here too, so this is not a failure count.");
+    PAR3_REPAIR_COHORTS = ("weaver_par3_repair_cohorts_processed_total", Counter, [],
+        "Cohorts a PAR3 repair actually processed.");
+    PAR3_REPAIR_BYTES = ("weaver_par3_repair_bytes_reconstructed_total", Counter, [],
+        "Protected bytes the PAR3 engine reconstructed, taken from its own Repair stage total at handback.");
+    PAR3_REPAIR_CANCELLED = ("weaver_par3_repair_cancelled_total", Counter, [],
+        "PAR3 repairs that were cancelled or interrupted.");
+    PAR3_READBACK_WINDOWS = ("weaver_par3_readback_windows_total", Counter, [],
+        "PAR3 readback work units dispatched after installation.");
+    PAR3_READBACK_BYTES = ("weaver_par3_readback_bytes_total", Counter, [],
+        "Bytes read back from installed PAR3 output.");
+    PAR3_READBACK_MISMATCH = ("weaver_par3_readback_mismatch_total", Counter, [],
+        "PAR3 readbacks whose placement was refused after installation.");
+
+    PAR3_PACKETS = ("weaver_par3_packets_total", Counter, ["outcome"],
+        "PAR3 packets the carrier scanner authenticated or rejected.");
+    PAR3_CARRIER_RANGES_UNAVAILABLE = ("weaver_par3_carrier_ranges_unavailable_total", Counter, [],
+        "Holes the PAR3 carrier scanner had to seek past.");
+    PAR3_CARRIER_DAMAGED_BYTES = ("weaver_par3_carrier_damaged_bytes_total", Counter, [],
+        "Readable PAR3 carrier bytes that produced no authenticated packet.");
+
+    PAR3_SLOT_PHASE = ("weaver_par3_slot_phase", Gauge, ["slot", "phase"],
+        "Current phase of each PAR3 work slot; exactly one phase is 1 per slot.");
+    PAR3_SLOT_JOB = ("weaver_par3_slot_job_id", Gauge, ["slot"],
+        "Job id owning each PAR3 work slot; zero when the slot is free.");
+    PAR3_SLOT_PHASE_SECONDS = ("weaver_par3_slot_phase_seconds", Gauge, ["slot"],
+        "Time each PAR3 work slot has been in its current phase.");
+    PAR3_SLOT_STALL_SECONDS = ("weaver_par3_slot_current_stall_seconds", Gauge, ["slot"],
+        "Age of the stall in progress on each PAR3 work slot; zero when it is not stalled.");
+    PAR3_STALLS = ("weaver_par3_stalls_total", Counter, [],
+        "PAR3 work slot stalls started.");
+    PAR3_STALL_SECONDS = ("weaver_par3_stall_seconds_total", Counter, [],
+        "Cumulative time PAR3 work slots spent stalled, credited when each stall clears.");
+    PAR3_CURRENT_STALL_SECONDS = ("weaver_par3_current_stall_seconds", Gauge, [],
+        "Oldest PAR3 stall in progress across the work slots; zero when nothing is stalled.");
+    PAR3_STALL_THRESHOLD_SECONDS = ("weaver_par3_stall_threshold_seconds", Gauge, [],
+        "Age at which a PAR3 work slot with no progress is declared stalled.");
+
     // ---- HTTP surface ----------------------------------------------------------------------------
     HTTP_REQUESTS = ("weaver_http_requests_total", Counter, ["route", "method", "status"],
         "HTTP requests served, by route template, method and status code. Routes are templates rather than raw paths, and status codes outside a known allow-list collapse to their class boundary; scrapes of /metrics itself are not counted.");

@@ -397,7 +397,7 @@ fn article_extent(volume_len: usize, segment_number: u32, articles: usize) -> (u
 
 /// Two articles per volume, so a volume's payload arrives after its header and
 /// routing has to split at least one article across destinations.
-fn direct_store_job_spec(name: &str, volumes: &[(String, Vec<u8>)]) -> JobSpec {
+pub(super) fn direct_store_job_spec(name: &str, volumes: &[(String, Vec<u8>)]) -> JobSpec {
     direct_store_job_spec_with_articles(name, volumes, 2)
 }
 
@@ -445,7 +445,7 @@ fn in_order_arrivals(volume_count: usize) -> Vec<(u32, u32)> {
         .collect()
 }
 
-async fn submit_volume_article(
+pub(super) async fn submit_volume_article(
     pipeline: &mut Pipeline,
     job_id: JobId,
     volumes: &[(String, Vec<u8>)],
@@ -1274,7 +1274,7 @@ async fn run_damaged_par2_gate(
 /// Removes one segment from the job's queue, standing in for the dispatch that
 /// pops it in the real pipeline. Without this the harness's queue still holds
 /// every article, and "already queued" would cover everything.
-fn take_queued_segment(pipeline: &mut Pipeline, job_id: JobId, segment_id: SegmentId) {
+pub(super) fn take_queued_segment(pipeline: &mut Pipeline, job_id: JobId, segment_id: SegmentId) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let queued = state.download_queue.drain_all();
     let before = queued.len();
@@ -1448,7 +1448,7 @@ async fn demote_mid_download_leaving_the_sweep_outstanding(
 
 /// The set the fixtures above demote: one member across three store volumes,
 /// with volume 0 whole, volume 1 half covered and volume 2 not started.
-fn demotion_fixture_volumes(member_name: &str) -> Vec<(String, Vec<u8>)> {
+pub(super) fn demotion_fixture_volumes(member_name: &str) -> Vec<(String, Vec<u8>)> {
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
     single_member_store_set(member_name, &payload, 3)
 }

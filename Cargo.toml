@@ -116,7 +116,7 @@ windows-sys = { version = "0.61", default-features = false }
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 par2-rs = { version = "0.10", default-features = false, features = ["native-crypto"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
-par3-rs = { version = "0.3.1", default-features = false }
+par3-rs = { version = "0.4", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x

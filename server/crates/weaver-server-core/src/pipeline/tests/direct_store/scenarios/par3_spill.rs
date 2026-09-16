@@ -54,8 +54,11 @@ async fn par3_spill_preserves_encrypted_boundary_holds_as_posted_bytes() {
         set.volume_coverage_with_holds(0),
         "an encrypted edge must still be held across the lost article"
     );
-    let mut coordinator = Coordinator::new(pipeline.repair_work_done_tx.clone());
-    coordinator.force_spill(job_id, SourceId(0));
+    let mut coordinator = Coordinator::new(
+        pipeline.repair_work_done_tx.clone(),
+        std::sync::Arc::clone(&pipeline.metrics),
+    );
+    coordinator.force_spill(job_id, SourceId(0), None);
     pipeline.par3_runtime = Some(Box::new(coordinator));
     assert!(pipeline.spill_par3_source(job_id).await);
     settle_direct_post_repair_work(&mut pipeline).await;
@@ -100,8 +103,11 @@ async fn spill_held_article(deny_disk: bool) {
         &[(start as u64, end as u64)]
     );
     assert!(!working.join(&volumes[0].0).exists());
-    let mut coordinator = Coordinator::new(pipeline.repair_work_done_tx.clone());
-    coordinator.force_spill(job_id, SourceId(0));
+    let mut coordinator = Coordinator::new(
+        pipeline.repair_work_done_tx.clone(),
+        std::sync::Arc::clone(&pipeline.metrics),
+    );
+    coordinator.force_spill(job_id, SourceId(0), None);
     pipeline.par3_runtime = Some(Box::new(coordinator));
     assert!(pipeline.spill_par3_source(job_id).await);
     if deny_disk {

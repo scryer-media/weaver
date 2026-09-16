@@ -336,6 +336,7 @@ fn renders_prometheus_download_observed_limiter_states() {
         recovery_queue_depth: 0,
         articles_per_sec: 0.0,
         decode_rate_mbps: 0.0,
+        par3: Par3MetricsSnapshot::default(),
     };
     let unblocked = DownloadBlockState {
         kind: DownloadBlockKind::None,
@@ -1188,6 +1189,92 @@ fn docs_metrics_table_matches_catalog() {
     assert!(
         extra.is_empty(),
         "docs/metrics.md documents metrics the exporter cannot emit: {extra:?}"
+    );
+}
+
+/// The first family in `rendered` whose lines are not one contiguous group,
+/// or `None` when every family is emitted once, start to finish.
+///
+/// A family owns its `# HELP`, its `# TYPE` and every sample that follows,
+/// and the exposition format requires all of them together. Nothing else here
+/// checks that: the duplicate-HELP gate catches a second descriptor, but a
+/// renderer that emits one descriptor and then alternates two families'
+/// samples passes every naming, typing and duplication rule while producing
+/// text a scraper is entitled to reject.
+fn interleaved_family(rendered: &str) -> Option<String> {
+    // Only summaries and histograms own suffixed series, and only once their
+    // base family has declared a TYPE, so a sample is attributed by stripping
+    // a suffix that resolves to a declared family and never otherwise.
+    let mut declared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut closed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut current: Option<&str> = None;
+
+    for line in rendered.lines() {
+        let family = if let Some(rest) = line.strip_prefix("# HELP ") {
+            rest.split_once(' ').map_or(rest, |(name, _)| name)
+        } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let name = rest.split_once(' ').map_or(rest, |(name, _)| name);
+            declared.insert(name);
+            name
+        } else if line.starts_with('#') {
+            continue;
+        } else {
+            let name = line
+                .split_once(['{', ' '])
+                .map_or(line, |(name, _)| name)
+                .trim();
+            ["_bucket", "_sum", "_count"]
+                .into_iter()
+                .find_map(|suffix| {
+                    name.strip_suffix(suffix)
+                        .and_then(|base| declared.get(base).copied())
+                })
+                .unwrap_or(name)
+        };
+        if current == Some(family) {
+            continue;
+        }
+        if closed.contains(family) {
+            return Some(family.to_string());
+        }
+        if let Some(previous) = current {
+            closed.insert(previous);
+        }
+        current = Some(family);
+    }
+    None
+}
+
+/// Every family the exporter renders arrives as one uninterrupted group.
+#[test]
+fn rendered_families_are_emitted_as_contiguous_groups() {
+    // The detector itself has to be able to see the fault, or its silence
+    // about the real exposition means nothing. This is the shape a loop that
+    // renders two families one category at a time produces.
+    const INTERLEAVED: &str = "\
+# HELP weaver_example_bytes Current bytes.
+# TYPE weaver_example_bytes gauge
+weaver_example_bytes{slot=\"a\"} 1
+# HELP weaver_example_peak_bytes Peak bytes.
+# TYPE weaver_example_peak_bytes gauge
+weaver_example_peak_bytes{slot=\"a\"} 1
+weaver_example_bytes{slot=\"b\"} 2
+weaver_example_peak_bytes{slot=\"b\"} 2
+";
+    assert_eq!(
+        interleaved_family(INTERLEAVED).as_deref(),
+        Some("weaver_example_bytes"),
+        "the detector cannot see an interleaved family"
+    );
+
+    let snapshot = populated_metrics_snapshot();
+    let jobs = vec![sample_job(42, "Silver Horizon", JobStatus::Downloading)];
+    let rendered =
+        metrics::render_prometheus_metrics(&snapshot, &jobs, true, &manual_pause_block(), &[], 0);
+    assert_eq!(
+        interleaved_family(&rendered),
+        None,
+        "a family's lines are split by another family's:\n{rendered}"
     );
 }
 

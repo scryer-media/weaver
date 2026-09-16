@@ -19,7 +19,9 @@ use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot
 use weaver_server_core::settings::PerJobSeries;
 use weaver_server_core::{
     DispatchShareMode, DownloadPressureReason, DownloadPressureState, JobInfo, JobStatus,
-    MetricsSnapshot, SpilloverDecision,
+    MetricsSnapshot, PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3EngineNarrowing,
+    Par3EngineRefusal, Par3MetricsSnapshot, Par3OutcomeClass, Par3Phase, Par3Stage,
+    SpilloverDecision, par3_memory_category_names,
 };
 
 use super::catalog as f;
@@ -27,6 +29,9 @@ use super::encode::{Encoder, MetricFamily};
 use super::{BuildInfo, ServerHealthInfo, ServerStateKind, ServerStateReason, job_is_exported};
 
 const BYTES_PER_MEBIBYTE: f64 = 1_048_576.0;
+
+/// Stable label values for the PAR3 work slots, indexed by array position.
+const SLOT_LABELS: [&str; weaver_server_core::PAR3_SLOTS] = ["0", "1"];
 
 /// Limiter labels for `weaver_pipeline_download_observed_limiter`, sorted so
 /// the exposition order is stable.
@@ -209,6 +214,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
 
     render_stalls_and_workers(&mut out, snapshot);
+    render_par3(&mut out, &snapshot.par3);
     render_rates(&mut out, snapshot);
     render_jobs(&mut out, jobs, per_job_series);
     render_servers(&mut out, server_health, runtime_generation);
@@ -406,6 +412,339 @@ fn render_queues(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     }
 }
 
+/// PAR3 recovery telemetry.
+///
+/// Every label set comes from an enum's `ALL`, so a new phase, stage, refusal
+/// reason or outcome class is a compile error here rather than a series that
+/// quietly stops being exported. Millisecond fields are divided once, at the
+/// edge; nothing upstream stores a float.
+fn render_par3(out: &mut Encoder, par3: &Par3MetricsSnapshot) {
+    const MILLIS_PER_SECOND: f64 = 1000.0;
+    let seconds = |millis: u64| millis as f64 / MILLIS_PER_SECOND;
+
+    for reason in Par3AdmissionReason::ALL {
+        out.sample(
+            &f::PAR3_ADMISSION_REFUSED,
+            &[("reason", reason.as_str())],
+            par3.admission_refused[reason.index()],
+        );
+    }
+    out.sample(
+        &f::PAR3_WAITING_FOR_MEMORY,
+        &[],
+        par3.waiting_for_memory_active as u64,
+    );
+    out.sample_f64(
+        &f::PAR3_WAITING_FOR_MEMORY_SECONDS,
+        &[],
+        seconds(par3.waiting_for_memory_ms_total),
+    );
+    out.sample(&f::PAR3_SPILLS, &[], par3.spills_to_disk_total);
+    out.sample(&f::PAR3_RESERVED_BYTES, &[], par3.reserved_bytes);
+    out.sample(&f::PAR3_RESERVED_PEAK_BYTES, &[], par3.reserved_peak_bytes);
+    out.sample(&f::PAR3_RETAINED_BYTES, &[], par3.retained_bytes);
+    out.sample(&f::PAR3_STRIPE_BYTES, &[], par3.effective_stripe_bytes);
+
+    // The category label values are the engine's own stable names, taken in
+    // ledger order, so the two arrays and the names cannot drift apart.
+    // Each family's samples are emitted together, because the exposition
+    // format requires one contiguous group per family.
+    for (family, values) in [
+        (&f::PAR3_LEDGER_BYTES, &par3.ledger_bytes),
+        (&f::PAR3_LEDGER_PEAK_BYTES, &par3.ledger_peak_bytes),
+    ] {
+        for (index, category) in par3_memory_category_names().into_iter().enumerate() {
+            out.sample(family, &[("category", category)], values[index]);
+        }
+    }
+    for (family, value) in [
+        (
+            &f::PAR3_ENGINE_ADMITTED_STRIPE_BYTES,
+            par3.engine_admitted_stripe_bytes,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_STRIPE_BUFFERS,
+            par3.engine_admitted_stripe_buffers,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_OUTPUT_TILE,
+            par3.engine_admitted_output_tile,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_VERIFY_BATCH,
+            par3.engine_admitted_verify_batch,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_WORKERS,
+            par3.engine_admitted_workers,
+        ),
+        (
+            &f::PAR3_ENGINE_ADMITTED_WINDOW_BYTES,
+            par3.engine_admitted_window_bytes,
+        ),
+    ] {
+        out.sample(family, &[], value);
+    }
+    for cause in Par3EngineRefusal::ALL {
+        out.sample(
+            &f::PAR3_ENGINE_REFUSALS,
+            &[("cause", cause.as_str())],
+            par3.engine_refusals[cause.index()],
+        );
+    }
+    for width in Par3EngineNarrowing::ALL {
+        out.sample(
+            &f::PAR3_ENGINE_NARROWED,
+            &[("width", width.as_str())],
+            par3.engine_narrowed[width.index()],
+        );
+    }
+    out.sample(
+        &f::PAR3_ENGINE_REREAD_BYTES,
+        &[],
+        par3.engine_reread_bytes_total,
+    );
+    out.sample(
+        &f::PAR3_ENGINE_RECONSTRUCTED_BYTES,
+        &[],
+        par3.engine_reconstructed_bytes_total,
+    );
+    out.sample(
+        &f::PAR3_ENGINE_CACHE_ENTRIES,
+        &[],
+        par3.engine_cache_entries,
+    );
+    out.sample(&f::PAR3_ENGINE_CACHE_BYTES, &[], par3.engine_cache_bytes);
+    for (family, value) in [
+        (
+            &f::PAR3_ENGINE_CODEC_TRANSFORM_CALLS,
+            par3.engine_codec_transform_calls_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_BUTTERFLIES,
+            par3.engine_codec_butterflies_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_BUTTERFLIES_SKIPPED,
+            par3.engine_codec_butterflies_skipped_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_MULTIPLY_ACCUMULATES,
+            par3.engine_codec_multiply_accumulates_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_FACTORS_COMPUTED,
+            par3.engine_codec_factors_computed_total,
+        ),
+        (
+            &f::PAR3_ENGINE_CODEC_FACTORS_REUSED,
+            par3.engine_codec_factors_reused_total,
+        ),
+    ] {
+        out.sample(family, &[], value);
+    }
+
+    out.sample(&f::PAR3_PENDING_WORK, &[], par3.pending_work_depth as u64);
+    out.sample(&f::PAR3_PENDING_BYTES, &[], par3.pending_work_bytes);
+    for (reason, value) in [
+        ("slots", par3.dispatch_refused_slots_total),
+        ("cpu", par3.dispatch_refused_cpu_total),
+    ] {
+        out.sample(&f::PAR3_DISPATCH_REFUSED, &[("reason", reason)], value);
+    }
+    out.sample_f64(
+        &f::PAR3_DISPATCH_WAIT_SECONDS,
+        &[],
+        seconds(par3.dispatch_wait_ms_total),
+    );
+    out.sample(&f::PAR3_WORKERS_ADMITTED, &[], par3.workers_admitted as u64);
+    out.sample(&f::PAR3_IN_FLIGHT, &[], par3.in_flight as u64);
+
+    out.sample(
+        &f::PAR3_RECOVERY_WINDOWS,
+        &[],
+        par3.recovery_windows_admitted_total,
+    );
+    for (outcome, value) in [
+        ("requested", par3.recovery_articles_requested_total),
+        ("received", par3.recovery_articles_received_total),
+        ("failed", par3.recovery_articles_failed_total),
+    ] {
+        out.sample(&f::PAR3_RECOVERY_ARTICLES, &[("outcome", outcome)], value);
+    }
+    out.sample(
+        &f::PAR3_RECOVERY_NEEDED_BYTES,
+        &[],
+        par3.recovery_needed_bytes,
+    );
+    out.sample(
+        &f::PAR3_COHORTS_WITH_DEFICIT,
+        &[],
+        par3.cohorts_with_deficit as u64,
+    );
+    for (reason, value) in [
+        ("metadata_incomplete", par3.metadata_incomplete_waits_total),
+        ("need_data", par3.need_data_waits_total),
+    ] {
+        out.sample(&f::PAR3_WAITS, &[("reason", reason)], value);
+    }
+
+    out.sample(
+        &f::PAR3_SOURCE_READ_BYTES,
+        &[],
+        par3.source_read_bytes_total,
+    );
+    out.sample(&f::PAR3_SOURCE_READS, &[], par3.source_reads_total);
+    out.sample(&f::PAR3_REASSESSMENTS, &[], par3.reassessments_total);
+    out.sample(
+        &f::PAR3_REASSESSMENTS_ZERO_READ,
+        &[],
+        par3.reassessments_zero_read_total,
+    );
+    out.sample(
+        &f::PAR3_REVERIFY_GENERATION_CHANGED,
+        &[],
+        par3.reverify_generation_changed_total,
+    );
+    out.sample(
+        &f::PAR3_VERIFY_SERIAL_FALLBACK,
+        &[],
+        par3.verify_serial_fallback_total,
+    );
+    for (event, value) in [
+        ("hit", par3.encrypted_reader_cache_hits_total),
+        ("eviction", par3.encrypted_reader_cache_evictions_total),
+    ] {
+        out.sample(&f::PAR3_READER_CACHE, &[("event", event)], value);
+    }
+
+    out.sample(&f::PAR3_DONOR_SEARCHES, &[], par3.donor_searches_total);
+    out.sample(
+        &f::PAR3_DONOR_SEARCH_EXHAUSTED,
+        &[],
+        par3.donor_search_exhausted_total,
+    );
+    out.sample(&f::PAR3_DONOR_READ_BYTES, &[], par3.donor_read_bytes_total);
+    out.sample(&f::PAR3_DONOR_TIME_CAP, &[], par3.donor_time_cap_hits_total);
+
+    for stage in Par3Stage::ALL {
+        out.sample(
+            &f::PAR3_STAGE_CALLS,
+            &[("stage", stage.as_str())],
+            par3.stage_calls[stage.index()],
+        );
+    }
+    for stage in Par3Stage::ALL {
+        out.sample_f64(
+            &f::PAR3_STAGE_SECONDS,
+            &[("stage", stage.as_str())],
+            seconds(par3.stage_ms[stage.index()]),
+        );
+    }
+    out.sample(&f::PAR3_FILE_SYNC_CALLS, &[], par3.file_sync_calls_total);
+    out.sample_f64(
+        &f::PAR3_FILE_SYNC_SECONDS,
+        &[],
+        seconds(par3.file_sync_ms_total),
+    );
+
+    out.sample(&f::PAR3_REPAIRS_STARTED, &[], par3.repairs_started_total);
+    for class in Par3OutcomeClass::ALL {
+        out.sample(
+            &f::PAR3_OUTCOMES,
+            &[("class", class.as_str())],
+            par3.outcomes[class.index()],
+        );
+    }
+    out.sample(
+        &f::PAR3_REPAIR_COHORTS,
+        &[],
+        par3.repair_cohorts_processed_total,
+    );
+    out.sample(
+        &f::PAR3_REPAIR_BYTES,
+        &[],
+        par3.repair_bytes_reconstructed_total,
+    );
+    out.sample(&f::PAR3_REPAIR_CANCELLED, &[], par3.repair_cancelled_total);
+    out.sample(&f::PAR3_READBACK_WINDOWS, &[], par3.readback_windows_total);
+    out.sample(&f::PAR3_READBACK_BYTES, &[], par3.readback_bytes_total);
+    out.sample(
+        &f::PAR3_READBACK_MISMATCH,
+        &[],
+        par3.readback_mismatch_total,
+    );
+
+    for (outcome, value) in [
+        ("authenticated", par3.packets_authenticated_total),
+        ("rejected", par3.packets_rejected_total),
+    ] {
+        out.sample(&f::PAR3_PACKETS, &[("outcome", outcome)], value);
+    }
+    out.sample(
+        &f::PAR3_CARRIER_RANGES_UNAVAILABLE,
+        &[],
+        par3.carrier_ranges_unavailable_total,
+    );
+    out.sample(
+        &f::PAR3_CARRIER_DAMAGED_BYTES,
+        &[],
+        par3.carrier_damaged_bytes_total,
+    );
+
+    // The slot label is the array position, which is stable for the life of the
+    // process; the job id says who currently owns that position. Each family
+    // gets its own pass over the slots, because the exposition format wants a
+    // family's samples together rather than a slot's.
+    let slot_label = |index: usize| SLOT_LABELS[index.min(SLOT_LABELS.len() - 1)];
+    for (index, slot) in par3.slots.iter().enumerate() {
+        for phase in Par3Phase::ALL {
+            out.sample(
+                &f::PAR3_SLOT_PHASE,
+                &[("slot", slot_label(index)), ("phase", phase.as_str())],
+                u8::from(slot.phase == phase),
+            );
+        }
+    }
+    for (index, slot) in par3.slots.iter().enumerate() {
+        out.sample(
+            &f::PAR3_SLOT_JOB,
+            &[("slot", slot_label(index))],
+            slot.job_id,
+        );
+    }
+    for (index, slot) in par3.slots.iter().enumerate() {
+        out.sample_f64(
+            &f::PAR3_SLOT_PHASE_SECONDS,
+            &[("slot", slot_label(index))],
+            seconds(
+                slot.last_progress_ms
+                    .max(slot.phase_entered_ms)
+                    .saturating_sub(slot.phase_entered_ms),
+            ),
+        );
+    }
+    for (index, slot) in par3.slots.iter().enumerate() {
+        out.sample_f64(
+            &f::PAR3_SLOT_STALL_SECONDS,
+            &[("slot", slot_label(index))],
+            seconds(slot.current_stall_ms),
+        );
+    }
+    out.sample(&f::PAR3_STALLS, &[], par3.stalls_total);
+    out.sample_f64(&f::PAR3_STALL_SECONDS, &[], seconds(par3.stall_duration_ms));
+    out.sample_f64(
+        &f::PAR3_CURRENT_STALL_SECONDS,
+        &[],
+        seconds(par3.current_stall_ms),
+    );
+    out.sample_f64(
+        &f::PAR3_STALL_THRESHOLD_SECONDS,
+        &[],
+        seconds(PAR3_STALL_THRESHOLD_MS),
+    );
+}
+
 /// Cumulative counter behind each spillover decision.
 ///
 /// `None` is a resting state, not an event, so it has no counter. The
@@ -470,12 +809,16 @@ fn render_hot_dispatch(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         snapshot.hot_dispatch_lent_connections,
     );
 
+    // One pass per family: the exposition format wants every sample of a
+    // family together, so the two decision families cannot share a loop.
     for decision in SpilloverDecision::ALL {
         out.sample(
             &f::HOT_LAST_SPILLOVER_DECISION,
             &[("decision", decision.as_str())],
             u8::from(snapshot.hot_dispatch_last_spillover_decision == decision),
         );
+    }
+    for decision in SpilloverDecision::ALL {
         if let Some(value) = spillover_decision_total(snapshot, decision) {
             out.sample(
                 &f::HOT_SPILLOVER_DECISIONS,
