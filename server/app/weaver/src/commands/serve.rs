@@ -18,6 +18,7 @@ pub(crate) async fn run(
     port: u16,
     base_url: &str,
     log_ring_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
+    seeded_probe_latencies: Vec<(u32, std::time::Duration)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started_at = std::time::Instant::now();
     let mut security = RuntimeSecurityConfig::from_env()?;
@@ -174,6 +175,11 @@ pub(crate) async fn run(
     handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
     handle.set_proxy_runtime(proxies.clone());
     handle.set_nntp_pool(Arc::clone(nntp.pool()));
+    // A server seeded at startup was measured the same way the server form
+    // measures one, so its lanes can open at a depth that suits the distance.
+    for (server_id, latency) in seeded_probe_latencies {
+        handle.note_server_probe_latency(server_id, latency);
+    }
 
     let recovered_state =
         weaver_server_core::operations::recover_server_state(&db, &data_dir, &intermediate_dir)

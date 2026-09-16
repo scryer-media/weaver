@@ -248,7 +248,7 @@ async fn async_main() {
             }
         }
     };
-    let env_seed = match bootstrap::parse_env_seed_from_process() {
+    let mut env_seed = match bootstrap::parse_env_seed_from_process() {
         Ok(seed) => seed,
         Err(error) => {
             error!("invalid environment config: {error}");
@@ -267,10 +267,14 @@ async fn async_main() {
         error!("failed to seed config settings from environment: {error}");
         std::process::exit(1);
     }
-    if let Err(error) = bootstrap::apply_server_env_seed(&db, &mut config, &env_seed) {
-        error!("failed to seed servers from environment: {error}");
-        std::process::exit(1);
-    }
+    let seeded_probe_latencies =
+        match bootstrap::apply_server_env_seed(&db, &mut config, &mut env_seed).await {
+            Ok(latencies) => latencies,
+            Err(error) => {
+                error!("failed to seed servers from environment: {error}");
+                std::process::exit(1);
+            }
+        };
 
     if let Err(errors) = bootstrap::validate_config(&config) {
         for message in &errors {
@@ -348,6 +352,7 @@ async fn async_main() {
                 port,
                 &base_url,
                 log_ring_buffer.clone(),
+                seeded_probe_latencies,
             )
             .await
             {
