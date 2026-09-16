@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
 
 use crate::StateError;
 use crate::bandwidth::IspBandwidthCapWeekday;
 use crate::persistence::Database;
-use crate::servers::{ServerConfig, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
+use crate::servers::{
+    ServerConfig, ServerConnectivityResult, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod,
+};
 use crate::settings::Config;
 
 pub const ENV_DATA_DIR: &str = "WEAVER_DATA_DIR";
@@ -41,7 +44,27 @@ const SERVER_FIELD_PIPELINING: &str = "PIPELINING";
 #[derive(Debug, Clone, Default)]
 pub struct EnvSeedConfig {
     pub core: EnvCoreSeed,
-    pub servers: Vec<ServerConfig>,
+    pub servers: Vec<EnvSeedServer>,
+}
+
+/// One seeded server, plus whether the environment stated its pipelining flag
+/// outright. A stated flag is a pin and is taken at its word; every other
+/// seeded server is asked, the way a server saved through the server form is.
+#[derive(Debug, Clone)]
+pub struct EnvSeedServer {
+    pub config: ServerConfig,
+    pub pipelining_pinned: bool,
+}
+
+/// What asking one seeded server about pipelining came back with. A server
+/// that could not be reached reports the reason and keeps the sequential
+/// default, so a provider that is down at boot cannot stop the seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeededServerProbeOutcome {
+    pub server_id: u32,
+    pub supports_pipelining: bool,
+    pub first_byte_latency_ms: Option<u64>,
+    pub failure: Option<String>,
 }
 
 impl EnvSeedConfig {
@@ -201,17 +224,66 @@ pub fn apply_core_seed(
     Ok(seeded)
 }
 
+/// Whether the seeded servers are the ones this install will actually run on.
+/// Nothing is asked of a server the seed is not going to store.
+pub fn server_seed_applies(config: &Config, seed: &EnvSeedConfig) -> bool {
+    config.servers.is_empty() && !seed.servers.is_empty()
+}
+
+/// Ask every seeded server whose pipelining flag the environment left unstated
+/// whether it pipelines, and keep what came back. The caller supplies the
+/// question so the seed can be exercised without a server to reach.
+pub async fn probe_seeded_server_pipelining<P, F>(
+    seed: &mut EnvSeedConfig,
+    probe: P,
+) -> Vec<SeededServerProbeOutcome>
+where
+    P: Fn(ServerConfig) -> F,
+    F: Future<Output = ServerConnectivityResult>,
+{
+    let mut outcomes = Vec::new();
+    for server in &mut seed.servers {
+        if server.pipelining_pinned || !server.config.active {
+            continue;
+        }
+
+        let result = probe(server.config.clone()).await;
+        if result.success {
+            server.config.supports_pipelining = result.supports_pipelining;
+            outcomes.push(SeededServerProbeOutcome {
+                server_id: server.config.id,
+                supports_pipelining: result.supports_pipelining,
+                first_byte_latency_ms: result.first_byte_latency_ms,
+                failure: None,
+            });
+        } else {
+            outcomes.push(SeededServerProbeOutcome {
+                server_id: server.config.id,
+                supports_pipelining: false,
+                first_byte_latency_ms: None,
+                failure: Some(result.message),
+            });
+        }
+    }
+    outcomes
+}
+
 pub fn apply_server_seed(
     db: &Database,
     config: &mut Config,
     seed: &EnvSeedConfig,
 ) -> Result<usize, StateError> {
-    if !config.servers.is_empty() || seed.servers.is_empty() {
+    if !server_seed_applies(config, seed) {
         return Ok(0);
     }
 
-    db.replace_servers(&seed.servers)?;
-    config.servers = seed.servers.clone();
+    let servers: Vec<ServerConfig> = seed
+        .servers
+        .iter()
+        .map(|server| server.config.clone())
+        .collect();
+    db.replace_servers(&servers)?;
+    config.servers = servers;
     Ok(seed.servers.len())
 }
 
@@ -228,7 +300,7 @@ pub fn apply_seed(
     })
 }
 
-fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, EnvSeedError> {
+fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<EnvSeedServer>, EnvSeedError> {
     let mut partials = BTreeMap::<u32, PartialServerSeed>::new();
     for (key, value) in vars {
         let Some(rest) = key.strip_prefix(SERVER_PREFIX) else {
@@ -355,9 +427,9 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
             password: partial.password,
             connections,
             active: partial.active.unwrap_or(true),
-            // Seeded servers are never probed for CAPABILITIES, so the
-            // pipelining flag the connectivity check would set is taken from
-            // the environment instead; unset keeps the sequential default.
+            // A stated pipelining flag is a pin and stands as given. Left
+            // unstated, this is only the value the seed starts from: the
+            // server is asked for its capabilities before it is stored.
             supports_pipelining: partial.pipelining.unwrap_or(false),
             pipelining_depth: None,
             priority: partial.priority.unwrap_or(0),
@@ -371,7 +443,10 @@ fn parse_servers(vars: &HashMap<String, String>) -> Result<Vec<ServerConfig>, En
         server.validate_download_limits().map_err(|error| {
             EnvSeedError::new(format!("WEAVER_SERVER_{index} download limits: {error}"))
         })?;
-        servers.push(server);
+        servers.push(EnvSeedServer {
+            config: server,
+            pipelining_pinned: partial.pipelining.is_some(),
+        });
     }
 
     Ok(servers)
@@ -518,7 +593,7 @@ mod tests {
         let seed = parse(&[("WEAVER_SERVER_1_HOSTNAME", "news.example.com")]).unwrap();
 
         assert_eq!(seed.servers.len(), 1);
-        let server = &seed.servers[0];
+        let server = &seed.servers[0].config;
         assert_eq!(server.id, 1);
         assert_eq!(server.host, "news.example.com");
         assert_eq!(server.port, 563);
@@ -527,6 +602,7 @@ mod tests {
         assert!(server.active);
         assert_eq!(server.priority, 0);
         assert!(!server.supports_pipelining);
+        assert!(!seed.servers[0].pipelining_pinned);
         assert_eq!(server.max_download_speed, 0);
         assert_eq!(server.download_quota, ServerDownloadQuotaConfig::default());
     }
@@ -548,7 +624,7 @@ mod tests {
         ])
         .unwrap();
 
-        let server = &seed.servers[0];
+        let server = &seed.servers[0].config;
         assert_eq!(server.max_download_speed, 2_500_000);
         assert!(server.download_quota.enabled);
         assert_eq!(server.download_quota.limit_bytes, 9_000_000);
@@ -581,20 +657,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(seed.servers.len(), 2);
-        assert!(!seed.servers[0].supports_pipelining);
-        assert!(seed.servers[1].supports_pipelining);
-        assert_eq!(seed.servers[1].pipelining_depth, None);
-        assert_eq!(seed.servers[0].port, 119);
-        assert!(!seed.servers[0].tls);
-        assert_eq!(seed.servers[0].connections, 4);
-        assert_eq!(seed.servers[1].port, 443);
-        assert_eq!(seed.servers[1].username.as_deref(), Some("user"));
-        assert_eq!(seed.servers[1].password.as_deref(), Some("pass"));
-        assert_eq!(seed.servers[1].priority, 1);
+        // Unstated is not the same answer as stated false: only the second
+        // server carries a pin the probe must leave alone.
+        assert!(!seed.servers[0].config.supports_pipelining);
+        assert!(!seed.servers[0].pipelining_pinned);
+        assert!(seed.servers[1].config.supports_pipelining);
+        assert!(seed.servers[1].pipelining_pinned);
+        assert_eq!(seed.servers[1].config.pipelining_depth, None);
+        assert_eq!(seed.servers[0].config.port, 119);
+        assert!(!seed.servers[0].config.tls);
+        assert_eq!(seed.servers[0].config.connections, 4);
+        assert_eq!(seed.servers[1].config.port, 443);
+        assert_eq!(seed.servers[1].config.username.as_deref(), Some("user"));
+        assert_eq!(seed.servers[1].config.password.as_deref(), Some("pass"));
+        assert_eq!(seed.servers[1].config.priority, 1);
         assert_eq!(
-            seed.servers[1].tls_ca_cert.as_deref(),
+            seed.servers[1].config.tls_ca_cert.as_deref(),
             Some(std::path::Path::new("/etc/ssl/custom.pem"))
         );
+    }
+
+    #[test]
+    fn records_an_explicitly_disabled_pipelining_flag_as_a_pin() {
+        let seed = parse(&[
+            ("WEAVER_SERVER_1_HOSTNAME", "news.example.com"),
+            ("WEAVER_SERVER_1_PIPELINING", "false"),
+        ])
+        .unwrap();
+
+        assert!(!seed.servers[0].config.supports_pipelining);
+        assert!(seed.servers[0].pipelining_pinned);
     }
 
     #[test]
@@ -767,6 +859,134 @@ mod tests {
         assert_eq!(persisted[0].username.as_deref(), Some("user"));
     }
 
+    fn probe_answer(success: bool, supports_pipelining: bool) -> ServerConnectivityResult {
+        ServerConnectivityResult {
+            success,
+            message: if success {
+                "Connected successfully".to_string()
+            } else {
+                "connection refused".to_string()
+            },
+            latency_ms: success.then_some(12),
+            first_byte_latency_ms: success.then_some(34),
+            first_byte_latency_band: None,
+            supports_pipelining: success && supports_pipelining,
+            adoptable_tls_name_mismatch_certificate_der: None,
+            tls_cipher_suite: None,
+            tls_honors_client_cipher_order: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stores_what_the_probe_found_for_a_server_left_unstated() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = db.load_config().unwrap();
+        let mut seed = parse(&[("WEAVER_SERVER_1_HOSTNAME", "news.example.com")]).unwrap();
+
+        let outcomes =
+            probe_seeded_server_pipelining(&mut seed, |_| async { probe_answer(true, true) }).await;
+        apply_server_seed(&db, &mut config, &seed).unwrap();
+
+        assert_eq!(
+            outcomes,
+            vec![SeededServerProbeOutcome {
+                server_id: 1,
+                supports_pipelining: true,
+                first_byte_latency_ms: Some(34),
+                failure: None,
+            }]
+        );
+        assert!(config.servers[0].supports_pipelining);
+        assert!(db.list_servers().unwrap()[0].supports_pipelining);
+    }
+
+    #[tokio::test]
+    async fn keeps_the_sequential_default_when_a_seeded_server_cannot_be_reached() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = db.load_config().unwrap();
+        let mut seed = parse(&[("WEAVER_SERVER_1_HOSTNAME", "news.example.com")]).unwrap();
+
+        let outcomes =
+            probe_seeded_server_pipelining(&mut seed, |_| async { probe_answer(false, true) })
+                .await;
+        let seeded = apply_server_seed(&db, &mut config, &seed).unwrap();
+
+        assert_eq!(seeded, 1);
+        assert_eq!(outcomes[0].failure.as_deref(), Some("connection refused"));
+        assert!(!outcomes[0].supports_pipelining);
+        assert!(!config.servers[0].supports_pipelining);
+        assert!(!db.list_servers().unwrap()[0].supports_pipelining);
+    }
+
+    #[tokio::test]
+    async fn leaves_a_stated_pipelining_flag_alone() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = db.load_config().unwrap();
+        let mut seed = parse(&[
+            ("WEAVER_SERVER_1_HOSTNAME", "news.example.com"),
+            ("WEAVER_SERVER_1_PIPELINING", "false"),
+        ])
+        .unwrap();
+
+        let outcomes =
+            probe_seeded_server_pipelining(&mut seed, |_| async { probe_answer(true, true) }).await;
+        apply_server_seed(&db, &mut config, &seed).unwrap();
+
+        assert!(outcomes.is_empty());
+        assert!(!config.servers[0].supports_pipelining);
+        assert!(!db.list_servers().unwrap()[0].supports_pipelining);
+    }
+
+    #[tokio::test]
+    async fn does_not_ask_an_inactive_seeded_server() {
+        let mut seed = parse(&[
+            ("WEAVER_SERVER_1_HOSTNAME", "news.example.com"),
+            ("WEAVER_SERVER_1_ACTIVE", "false"),
+        ])
+        .unwrap();
+
+        let outcomes =
+            probe_seeded_server_pipelining(&mut seed, |_| async { probe_answer(true, true) }).await;
+
+        assert!(outcomes.is_empty());
+        assert!(!seed.servers[0].config.supports_pipelining);
+    }
+
+    #[test]
+    fn asks_nothing_when_the_database_already_has_servers() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = db.load_config().unwrap();
+        config.servers = db.list_servers().unwrap();
+        let seed = parse(&[("WEAVER_SERVER_1_HOSTNAME", "news.example.com")]).unwrap();
+        assert!(server_seed_applies(&config, &seed));
+
+        config.servers = vec![existing_server()];
+
+        assert!(!server_seed_applies(&config, &seed));
+    }
+
+    fn existing_server() -> ServerConfig {
+        ServerConfig {
+            id: 1,
+            host: "ui.example.com".to_string(),
+            port: 563,
+            tls: true,
+            username: None,
+            password: None,
+            connections: 5,
+            active: true,
+            supports_pipelining: false,
+            pipelining_depth: None,
+            tls_name_mismatch_certificate_der: None,
+            priority: 0,
+            backfill: false,
+            retention_days: 0,
+            max_download_speed: 0,
+            download_quota: ServerDownloadQuotaConfig::default(),
+            tls_ca_cert: None,
+        }
+    }
+
     #[test]
     fn preserves_existing_servers() {
         let db = Database::open_in_memory().unwrap();
@@ -775,25 +995,7 @@ mod tests {
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,
-            servers: vec![ServerConfig {
-                id: 1,
-                host: "ui.example.com".to_string(),
-                port: 563,
-                tls: true,
-                username: None,
-                password: None,
-                connections: 5,
-                active: true,
-                supports_pipelining: false,
-                pipelining_depth: None,
-                tls_name_mismatch_certificate_der: None,
-                priority: 0,
-                backfill: false,
-                retention_days: 0,
-                max_download_speed: 0,
-                download_quota: ServerDownloadQuotaConfig::default(),
-                tls_ca_cert: None,
-            }],
+            servers: vec![existing_server()],
             categories: vec![CategoryConfig {
                 id: 1,
                 name: "Movies".to_string(),
