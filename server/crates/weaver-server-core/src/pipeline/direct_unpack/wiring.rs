@@ -2470,6 +2470,10 @@ impl Pipeline {
             return ChaseDisposition::None;
         }
 
+        // The last notices this chase will ever get: once it leaves `armed`,
+        // commit notices for its parts have nowhere to go.
+        self.publish_finished_parts_before_handoff(job_id, set_name);
+
         // A tainted chase is never still armed: tainting ends it on the spot.
         let Some(armed) = self.direct_unpack.armed.remove(&key) else {
             return ChaseDisposition::None;
@@ -2493,6 +2497,46 @@ impl Pipeline {
             coverage: armed.coverage,
             set_name: set_name.to_string(),
         })
+    }
+
+    /// Tell an armed chase about every one of its parts that has finished.
+    ///
+    /// Extraction can take a chase before the chase hears that its last part
+    /// finished. The segment commit that completes a part can start extraction
+    /// before the part's floor is published, and a RAR part never passes the
+    /// completion seam in [`Self::try_arm_direct_unpack_for_file`] at all. A
+    /// worker that misses those notices parks on bytes that are already on
+    /// disk until the consumption deadline.
+    fn publish_finished_parts_before_handoff(&mut self, job_id: JobId, set_name: &str) {
+        let Some(targets) = self.direct_unpack.watermark_targets.get(&job_id) else {
+            return;
+        };
+        let parts: HashSet<&str> = targets
+            .iter()
+            .filter(|(_, (target_set, _))| target_set == set_name)
+            .map(|(filename, _)| filename.as_str())
+            .collect();
+        if parts.is_empty() {
+            return;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let finished: Vec<_> = state
+            .assembly
+            .files()
+            .filter(|file| file.is_complete())
+            .filter_map(|file| {
+                let filename = self.current_filename_for_file(job_id, file);
+                parts
+                    .contains(filename.as_str())
+                    .then(|| (file.file_id(), filename, file.received_bytes()))
+            })
+            .collect();
+        for (file_id, filename, received) in finished {
+            self.direct_unpack_note_commit(file_id, &filename, received, true);
+            self.refresh_chased_part_by_filename(file_id, &filename, false);
+        }
     }
 
     /// Mark a set's chase unusable because repair replaced bytes it read.
