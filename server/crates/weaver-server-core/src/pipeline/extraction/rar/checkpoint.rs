@@ -1,8 +1,31 @@
 use super::*;
 
+/// Coalescing buffer in front of a member's partial output file, deliberately
+/// smaller than the spans the extractor hands down.
+///
+/// Store members arrive as 4 MiB copy chunks and the compressed paths flush
+/// decoded output in spans of up to 4 MiB, while the same spans get broken into
+/// much smaller pieces at a dictionary wrap or around a filtered subrange.
+/// `BufWriter` bypasses its buffer only for a single write at or above its
+/// capacity, so a capacity at or above the largest span would copy every
+/// extracted byte through this buffer and save no syscall at all. Below the
+/// span, whole chunks go straight to the file and only the short writes are
+/// gathered.
+const MEMBER_OUTPUT_BUFFER_BYTES: usize = 512 * 1024;
+
 pub(crate) struct SharedOutputFile {
     pub(crate) inner:
         std::io::BufWriter<crate::pipeline::extraction::BudgetedWriter<cap_std::fs::File>>,
+}
+
+impl SharedOutputFile {
+    pub(crate) fn new(
+        file: crate::pipeline::extraction::BudgetedWriter<cap_std::fs::File>,
+    ) -> Self {
+        Self {
+            inner: std::io::BufWriter::with_capacity(MEMBER_OUTPUT_BUFFER_BYTES, file),
+        }
+    }
 }
 
 pub(crate) struct DirectOutputWriter {
