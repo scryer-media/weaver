@@ -166,6 +166,24 @@ fn canonical_browser_origin(headers: &HeaderMap) -> Result<String, StatusCode> {
     Ok(url.origin().ascii_serialization())
 }
 
+/// Whether a canonical browser origin names the same host as the request's
+/// authority. Ports are left out: an origin drops the scheme's default port
+/// while the header keeps it, and the host is what identifies the page.
+fn origin_host_matches(origin: &str, host: &weaver_server_core::security::HttpAuthority) -> bool {
+    reqwest::Url::parse(origin)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .map(|origin_host| {
+            let origin_host = origin_host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .map(str::to_string)
+                .unwrap_or(origin_host);
+            origin_host == host.host()
+        })
+        .unwrap_or(false)
+}
+
 fn epoch_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -722,8 +740,31 @@ pub(super) async fn setup_handler(
         // Without a code, a loopback listener is the only proof. A proxy on
         // this machine could still be relaying someone else's browser, and
         // its headers are the tell.
-        if !challenge.code_required()
-            && security.forwarding_headers_ignored(Some(peer_addr), &headers)
+        let codeless = !challenge.code_required();
+        if codeless && security.forwarding_headers_ignored(Some(peer_addr), &headers) {
+            return failure(
+                StatusCode::FORBIDDEN,
+                "SETUP_LOCAL_ONLY",
+                "Finish setup in a browser on the machine Weaver runs on.",
+            );
+        }
+        // A name can be pointed at this listener from anywhere, so a codeless
+        // setup is only reachable through an address this browser resolved
+        // itself: a literal, or `localhost`. Named access stays open once
+        // setup is finished.
+        let request_host = match super::routes::host_header_authority(&headers) {
+            Ok(host) => host,
+            Err(_) => {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_BROWSER_REQUEST",
+                    "A single valid Host is required.",
+                );
+            }
+        };
+        if codeless
+            && let Some(host) = request_host.as_ref()
+            && !(host.is_ip_literal() || host.host() == "localhost")
         {
             return failure(
                 StatusCode::FORBIDDEN,
@@ -741,6 +782,18 @@ pub(super) async fn setup_handler(
                 );
             }
         };
+        // The page asking for the administrator account has to be the one this
+        // listener served, not one that merely aimed a request at it.
+        if codeless
+            && let Some(host) = request_host.as_ref()
+            && !origin_host_matches(&origin, host)
+        {
+            return failure(
+                StatusCode::FORBIDDEN,
+                "SETUP_LOCAL_ONLY",
+                "Finish setup in a browser on the machine Weaver runs on.",
+            );
+        }
         let secure = match browser_cookie_secure(&security, peer_addr, &headers, &origin) {
             Ok(secure) => secure,
             Err(status) => {

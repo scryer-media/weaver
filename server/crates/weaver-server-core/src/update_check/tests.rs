@@ -519,3 +519,24 @@ fn startup_delay_always_falls_inside_the_jitter_window() {
         assert!(delay < STARTUP_DELAY + STARTUP_JITTER);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_disabled_check_never_polls_and_says_so() {
+    let db = Database::open_in_memory().expect("in-memory database");
+    let fetcher = ScriptedFetcher::new(vec![fetched(FUTURE_VERSION)]);
+    let service = UpdateCheckService::with_fetcher_enabled(db, fetcher.clone(), false);
+
+    assert_eq!(
+        service.status().last_error.as_deref(),
+        Some(DISABLED_NOTICE)
+    );
+    assert!(!service.status().checking);
+
+    let task = service.start_background_loop();
+    tokio::time::advance(CHECK_INTERVAL * 4).await;
+    assert!(service.run_check().await.unwrap().is_none());
+
+    assert_eq!(fetcher.calls(), 0, "a disabled check opens no request");
+    assert!(!service.status().update_available);
+    task.abort();
+}

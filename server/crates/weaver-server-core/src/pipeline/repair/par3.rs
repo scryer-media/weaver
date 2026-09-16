@@ -823,8 +823,18 @@ impl Pipeline {
             match tokio::task::spawn_blocking(move || inside::probe(path)).await {
                 Ok(Ok(start)) => start,
                 Ok(Err(error)) => {
-                    tracing::warn!(job_id = job_id.0, file_index = file_id.file_index, %error,
-                        "embedded PAR3 probe unavailable; continuing without a carrier hint");
+                    // A budget that had no room for the probe says nothing
+                    // about the file: forgetting the attempt lets a later
+                    // completion pass ask again, rather than ignoring an
+                    // embedded set for the rest of the job.
+                    if budget::is_limit(&error) {
+                        self.par3_inside_probes.remove(file_id);
+                        tracing::debug!(job_id = job_id.0, file_index = file_id.file_index, %error,
+                            "embedded PAR3 probe had no budget; it will be retried");
+                    } else {
+                        tracing::warn!(job_id = job_id.0, file_index = file_id.file_index, %error,
+                            "embedded PAR3 probe unavailable; continuing without a carrier hint");
+                    }
                     None
                 }
                 Err(error) => {

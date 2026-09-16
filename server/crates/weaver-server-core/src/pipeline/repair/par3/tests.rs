@@ -1047,3 +1047,17 @@ fn hostile_metadata_stops_at_a_named_ceiling() {
         "{outcome}"
     );
 }
+
+/// A probe that never ran because the host budget was full says nothing about
+/// the file, so the attempt is forgotten and made again later; a probe that
+/// read the file and failed is a verdict about the file and stands.
+#[test]
+fn an_embedded_probe_is_retried_only_when_the_budget_refused_it() {
+    let exhausted = budget::host_budget_limit("PAR3 host state", 66 << 10, 64 << 20, 0);
+    assert!(budget::is_limit(&exhausted), "{exhausted}");
+    let unreadable = EngineError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    assert!(!budget::is_limit(&unreadable), "{unreadable}");
+    assert!(!budget::is_limit(&EngineError::Unsupported(
+        "embedded destination path"
+    )));
+}

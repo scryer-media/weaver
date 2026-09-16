@@ -10,6 +10,26 @@ use crate::pipeline::tests::direct_store::{
 const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
 const VOLUME: &[u8] = include_bytes!("../repair/backend/fixtures/set.vol0+1.par3");
 
+/// A set whose File packets name a Windows reserved device, kept as produced.
+const RESERVED_NAME_SET: &[(&str, &[u8])] = &[
+    (
+        "kestrel.par3",
+        include_bytes!("../repair/backend/fixtures/reserved_name/kestrel.par3"),
+    ),
+    (
+        "kestrel.vol0+1.par3",
+        include_bytes!("../repair/backend/fixtures/reserved_name/kestrel.vol0+1.par3"),
+    ),
+    (
+        "kestrel.vol1+2.par3",
+        include_bytes!("../repair/backend/fixtures/reserved_name/kestrel.vol1+2.par3"),
+    ),
+    (
+        "kestrel.vol3+1.par3",
+        include_bytes!("../repair/backend/fixtures/reserved_name/kestrel.vol3+1.par3"),
+    ),
+];
+
 /// The protected payload the fixture carriers were built over, with `damage`
 /// applied so more blocks are lost than the single recovery block can cover.
 fn damaged_payload(damage: &[usize]) -> Vec<(&'static str, Vec<u8>)> {
@@ -1009,33 +1029,13 @@ async fn a_set_naming_a_reserved_device_fails_before_any_output_byte() {
     let alpha: Vec<u8> = (0..5000u32).map(|i| (i * 11 + 5) as u8).collect();
     let device = b"kestrel".to_vec();
     std::fs::write(source_dir.join("alpha.bin"), &alpha).unwrap();
-    std::fs::write(source_dir.join("CON"), &device).unwrap();
-    // The engine's own creation API builds the set. It stores the name as
-    // given, so this is a genuine PAR3 set over a genuinely named file — not a
-    // hand-edited packet.
-    let report = par3_rs::create(
-        &par3_rs::InputSpec::new(
-            &source_dir,
-            &[
-                std::path::PathBuf::from("alpha.bin"),
-                std::path::PathBuf::from("CON"),
-            ],
-        ),
-        &root.path().join("kestrel"),
-        &par3_rs::CreateOptions::default()
-            .with_block_size(2000)
-            .with_recovery(par3_rs::RecoveryAmount::Blocks(4)),
-    )
-    .expect("the engine builds a set over the reserved name");
-    let carriers: Vec<(String, Vec<u8>)> = report
-        .files_written
+    // A genuine set, stored as it was produced rather than built here: a
+    // producer that stores the name as given is the only way this set exists,
+    // because an engine that refuses to protect a name it cannot write can no
+    // longer make one. The packets are untouched.
+    let carriers: Vec<(String, Vec<u8>)> = RESERVED_NAME_SET
         .iter()
-        .map(|path| {
-            (
-                path.file_name().unwrap().to_string_lossy().into_owned(),
-                std::fs::read(path).unwrap(),
-            )
-        })
+        .map(|(name, bytes)| ((*name).to_string(), bytes.to_vec()))
         .collect();
     let mut damaged = alpha.clone();
     damaged[300] ^= 0xff;

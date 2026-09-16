@@ -14,19 +14,16 @@ use weaver_server_core::security::{HttpAuthority, RuntimeSecurityConfig};
 pub(super) const NZBGET_RPC_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostRejection {
+pub(super) enum HostRejection {
     BadRequest,
 }
 
-fn request_authority(req: &Request) -> Result<HttpAuthority, HostRejection> {
-    let uri_authority = req
-        .uri()
-        .authority()
-        .map(|authority| HttpAuthority::parse(authority.as_str()))
-        .transpose()
-        .map_err(|_| HostRejection::BadRequest)?;
-
-    let mut host_values = req.headers().get_all(header::HOST).iter();
+/// The single authority the `Host` header names, if it carries one. More than
+/// one header, or one that is not an authority, is a malformed request.
+pub(super) fn host_header_authority(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<HttpAuthority>, HostRejection> {
+    let mut host_values = headers.get_all(header::HOST).iter();
     let host_authority = host_values
         .next()
         .map(|value| {
@@ -41,6 +38,18 @@ fn request_authority(req: &Request) -> Result<HttpAuthority, HostRejection> {
     if host_values.next().is_some() {
         return Err(HostRejection::BadRequest);
     }
+    Ok(host_authority)
+}
+
+fn request_authority(req: &Request) -> Result<HttpAuthority, HostRejection> {
+    let uri_authority = req
+        .uri()
+        .authority()
+        .map(|authority| HttpAuthority::parse(authority.as_str()))
+        .transpose()
+        .map_err(|_| HostRejection::BadRequest)?;
+
+    let host_authority = host_header_authority(req.headers())?;
 
     match (uri_authority, host_authority) {
         (Some(uri), Some(host)) if !uri.matches(&host) => Err(HostRejection::BadRequest),

@@ -323,6 +323,17 @@ impl HttpAuthority {
     pub fn matches(&self, other: &Self) -> bool {
         self.host == other.host && self.port == other.port
     }
+
+    /// The host alone, lowercased, with an IPv6 literal's brackets removed.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Whether the host is a literal address rather than a name, which is the
+    /// part a DNS answer cannot repoint at a different machine.
+    pub fn is_ip_literal(&self) -> bool {
+        self.ip_literal
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

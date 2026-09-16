@@ -99,6 +99,12 @@ impl ProxyProfile {
                 }
             }
             ProxyKind::Socks5 => {
+                // A username is what carries the password on the wire, so a
+                // password alone would be dropped and the proxy dialled
+                // unauthenticated.
+                if self.secrets.password.is_some() && self.secrets.username.is_none() {
+                    return Err(invalid("SOCKS5 proxy password requires a username"));
+                }
                 if self
                     .secrets
                     .username
