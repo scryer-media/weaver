@@ -151,3 +151,55 @@ async fn both_successful_families_are_retained() {
     assert!(result.iter().any(IpAddr::is_ipv4));
     assert!(result.iter().any(IpAddr::is_ipv6));
 }
+
+/// A route that cannot carry anything: every dial is refused, or never
+/// completes.
+struct DeadRoute {
+    hang: bool,
+    dials: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl TunnelProvider for DeadRoute {
+    fn describe(&self) -> String {
+        "dead route".into()
+    }
+
+    async fn dial(
+        &self,
+        host: &str,
+        _port: u16,
+    ) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+        self.dials.lock().unwrap().push(host.to_string());
+        if self.hang {
+            std::future::pending::<()>().await;
+        }
+        Err(TunnelError::Engine("route refused the connection".into()))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dead_route_is_dialled_once_per_server_not_once_per_family() {
+    for hang in [false, true] {
+        let route = DeadRoute {
+            hang,
+            dials: Default::default(),
+        };
+        let started = tokio::time::Instant::now();
+        let result = resolve(
+            &route,
+            &["192.0.2.53".parse().unwrap(), "192.0.2.54".parse().unwrap()],
+            "fixture.invalid",
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            *route.dials.lock().unwrap(),
+            ["192.0.2.53", "192.0.2.54"],
+            "hang={hang}"
+        );
+        if hang {
+            assert_eq!(started.elapsed(), FAMILY_QUERY_TIMEOUT * 2);
+        }
+    }
+}

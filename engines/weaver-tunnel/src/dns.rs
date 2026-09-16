@@ -32,11 +32,20 @@ pub async fn resolve(
             // peer query must neither erase the answers already collected nor
             // stop the other family from being asked, and its own wait is
             // bounded so it cannot spend the caller's whole deadline.
-            if let Ok(Ok(found)) =
-                tokio::time::timeout(FAMILY_QUERY_TIMEOUT, query(provider, *server, host, qtype))
-                    .await
+            //
+            // A route that cannot reach the server at all is different: the
+            // other family would only dial the same dead route again, and the
+            // caller's ladder moves on sooner for being told once.
+            let mut reached = false;
+            match tokio::time::timeout(
+                FAMILY_QUERY_TIMEOUT,
+                query(provider, *server, host, qtype, &mut reached),
+            )
+            .await
             {
-                addresses.extend(found);
+                Ok(Ok(found)) => addresses.extend(found),
+                _ if !reached => break,
+                _ => {}
             }
         }
         if !addresses.is_empty() {
@@ -55,6 +64,7 @@ async fn query(
     server: IpAddr,
     host: &str,
     qtype: u16,
+    reached: &mut bool,
 ) -> Result<Vec<IpAddr>, TunnelError> {
     let mut name = host.trim_end_matches('.').to_ascii_lowercase();
     for _ in 0..8 {
@@ -75,6 +85,7 @@ async fn query(
         packet.extend_from_slice(&qtype.to_be_bytes());
         packet.extend_from_slice(&[0, 1]);
         let mut stream = provider.dial(&server.to_string(), 53).await?;
+        *reached = true;
         stream
             .write_u16(packet.len() as u16)
             .await
