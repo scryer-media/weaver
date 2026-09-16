@@ -19,13 +19,16 @@ const DELIVERY_EVIDENCE_PERCENT: u32 = 10;
 ///
 /// The census asks this of every file that counts toward health, and the whole
 /// terminal record follows from the answers. Nothing here consults a filename
-/// to decide *whether* a file is claimed: bindings resolve through the PAR2
-/// description identity, direct sets through the plan's own file index. Names
+/// to decide *whether* a file is claimed: recovery bindings resolve through
+/// PAR2 description identities or PAR3 source identities, and direct sets
+/// through the plan's own file index. Names
 /// appear only in what the operator is told afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) enum TerminalFileClaim {
-    /// A settled recovery-set verdict verified or repaired this file.
+    /// A settled PAR2 recovery-set verdict verified or repaired this file.
     Par2Verdict,
+    /// A current authenticated PAR3 assessment verified this bound source.
+    Par3Verdict,
     /// A finalized direct set routed this file's bytes into its output; the
     /// file itself was never written and never needed to be.
     InStreamProof,
@@ -52,6 +55,7 @@ impl TerminalFileClaim {
         matches!(
             self,
             TerminalFileClaim::Par2Verdict
+                | TerminalFileClaim::Par3Verdict
                 | TerminalFileClaim::InStreamProof
                 | TerminalFileClaim::Unprotected
                 | TerminalFileClaim::Discarded(TerminalDiscardKind::RepairLeftover)
@@ -220,7 +224,9 @@ impl Pipeline {
                         bytes: row.declared_bytes,
                     });
                 }
-                TerminalFileClaim::Par2Verdict | TerminalFileClaim::InStreamProof => {}
+                TerminalFileClaim::Par2Verdict
+                | TerminalFileClaim::Par3Verdict
+                | TerminalFileClaim::InStreamProof => {}
                 TerminalFileClaim::Unprotected => {
                     failed_bytes = failed_bytes.saturating_add(row.terminal_failed_bytes);
                 }
@@ -325,6 +331,15 @@ impl Pipeline {
         }
         if self.direct_set_delivered_file(file_id) {
             return TerminalFileClaim::InStreamProof;
+        }
+
+        if self.par3_runtime.as_ref().is_some_and(|runtime| {
+            runtime.verified_file(
+                job_id,
+                par3_rs::source::SourceId(u64::from(file_id.file_index)),
+            )
+        }) {
+            return TerminalFileClaim::Par3Verdict;
         }
 
         let servable = self.par2_servable_set_ids(job_id);

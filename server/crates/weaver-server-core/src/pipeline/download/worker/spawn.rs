@@ -354,6 +354,13 @@ impl Pipeline {
                 .all(|work| initial_lease.compatibility.matches(work))
         );
 
+        if !self.repeated_articles.is_empty()
+            && let Some(cache) = self.repeated_articles.get(&initial_lease.job_id)
+        {
+            self.spawn_repeated_download_batch(initial_lease, Arc::clone(cache));
+            return;
+        }
+
         if self.should_use_owned_blocking_lane(&initial_lease) {
             if let Err(lease) = self.owned_download_lane_pool.submit(
                 Arc::clone(&self.nntp),

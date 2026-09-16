@@ -1,0 +1,14 @@
+{
+  "slug": "par3-inside-zip-header-repair",
+  "title": "E2E.Test.PAR3.Inside.ZIP.Header.Repair.Azure.Kiln.S01E03.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A self-protected ZIP whose leading local file header is zeroed, so it does not parse as a ZIP until the inserted protection restores it.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "azure.kiln.s01e03.mkv": "f93595ec4e9b284bc45d9679e07ae08f90ed1b644059b302b90a3e68fbe33063"
+  },
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

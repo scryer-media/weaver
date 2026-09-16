@@ -138,6 +138,7 @@ async fn export_and_import_stable_state_roundtrip() {
             "[[\"k\",\"v\"],[\"__weaver_diagnostic_source_job_id\",\"77\"],[\"__weaver_diagnostic_include_server_hostnames\",\"false\"]]"
                 .into(),
         ),
+        server_attribution: None,
     })
     .unwrap();
     src.insert_job_events(&[JobEvent {
@@ -278,6 +279,7 @@ fn restore_target_is_not_pristine_with_history() {
         created_at: 1,
         completed_at: 1,
         metadata: None,
+        server_attribution: None,
     })
     .unwrap();
     assert!(!db.restore_target_is_pristine().unwrap());

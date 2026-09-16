@@ -792,6 +792,9 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default(),
         output_dir: row.output_dir,
+        server_attribution: crate::jobs::server_attribution::contributions_from_storage(
+            row.server_attribution.as_deref(),
+        ),
         error: if let JobStatus::Failed { error } = &status {
             Some(error.clone())
         } else {
@@ -830,17 +833,31 @@ mod tests {
             },
         ];
 
+        // Rewritten paths are rebuilt one component at a time under the new
+        // root, so the expected values use the host's own separator.
         assert_eq!(
             rewrite_path_with_roots("/old/complete/movie/file.mkv", &roots),
-            new_complete.join("movie/file.mkv").display().to_string()
+            new_complete
+                .join("movie")
+                .join("file.mkv")
+                .display()
+                .to_string()
         );
         assert_eq!(
             rewrite_path_with_roots("/old/intermediate/job/file.part", &roots),
-            new_intermediate.join("job/file.part").display().to_string()
+            new_intermediate
+                .join("job")
+                .join("file.part")
+                .display()
+                .to_string()
         );
         assert_eq!(
             rewrite_path_with_roots("/old/complete-ish/file", &roots),
-            "/new/complete-ish/file"
+            PathBuf::from("/new")
+                .join("complete-ish")
+                .join("file")
+                .display()
+                .to_string()
         );
     }
 
@@ -853,7 +870,9 @@ mod tests {
 
         assert_eq!(
             rewrite_path_with_roots(r"c:\weaver\data\complete\Movie\Feature.mkv", &roots),
-            PathBuf::from("/library/Movie/Feature.mkv")
+            PathBuf::from("/library")
+                .join("Movie")
+                .join("Feature.mkv")
                 .display()
                 .to_string()
         );
@@ -899,6 +918,7 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
+            server_attribution: None,
         });
         assert_eq!(repairing.status, crate::JobStatus::Repairing);
         assert_eq!(repairing.download_state, crate::DownloadState::Complete);
@@ -922,6 +942,7 @@ mod tests {
             created_at: 1,
             completed_at: 2,
             metadata: None,
+            server_attribution: None,
         });
         assert_eq!(moving.status, crate::JobStatus::Moving);
         assert_eq!(moving.download_state, crate::DownloadState::Complete);

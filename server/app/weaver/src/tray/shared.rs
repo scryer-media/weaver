@@ -10,10 +10,11 @@
     reason = "the Windows and macOS wrappers each use a subset of this module, and neither is compiled on other platforms"
 )]
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -644,9 +645,29 @@ pub(crate) struct ServerSupervisor {
     profile_dir: PathBuf,
     port: u16,
     server: Option<Child>,
+    setup_code: Arc<Mutex<Option<String>>>,
     /// How long the log was when the owned server was started, so a failed
     /// start is reported with its own error rather than an earlier run's.
     log_offset: u64,
+}
+
+fn forward_server_stderr(stderr: impl Read, setup_code: Arc<Mutex<Option<String>>>) {
+    let mut captured = false;
+    for line in BufReader::new(stderr).lines() {
+        let Ok(line) = line else { break };
+        if let Some(code) = parse_setup_code_line(&line) {
+            if !captured {
+                *setup_code.lock().expect("setup code lock poisoned") = Some(code);
+                captured = true;
+            }
+            continue;
+        }
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+}
+
+fn parse_setup_code_line(line: &str) -> Option<String> {
+    weaver_server_core::auth::find_setup_code(line).map(str::to_string)
 }
 
 impl ServerSupervisor {
@@ -655,6 +676,7 @@ impl ServerSupervisor {
             profile_dir,
             port,
             server: None,
+            setup_code: Arc::new(Mutex::new(None)),
             log_offset: 0,
         }
     }
@@ -673,6 +695,10 @@ impl ServerSupervisor {
 
     pub(crate) fn port(&self) -> u16 {
         self.port
+    }
+
+    pub(crate) fn take_setup_code(&self) -> Option<String> {
+        self.setup_code.lock().ok()?.take()
     }
 
     /// Create the profile the server is about to be pointed at. The server
@@ -726,13 +752,19 @@ impl ServerSupervisor {
             .arg("--log-file")
             .arg(&log_file)
             .args(["serve", "--port", &self.port.to_string()]);
+        command.stderr(Stdio::piped());
         configure_server_command(&mut command);
-        let child = command.spawn().map_err(|error| {
+        self.setup_code = Arc::new(Mutex::new(None));
+        let mut child = command.spawn().map_err(|error| {
             format!(
                 "failed to start Weaver from {}: {error}",
                 server_executable.display()
             )
         })?;
+        if let Some(stderr) = child.stderr.take() {
+            let setup_code = self.setup_code.clone();
+            thread::spawn(move || forward_server_stderr(stderr, setup_code));
+        }
         self.server = Some(child);
         Ok(())
     }
@@ -743,6 +775,7 @@ impl ServerSupervisor {
         let Some(mut child) = self.server.take() else {
             return Ok(());
         };
+        *self.setup_code.lock().expect("setup code lock poisoned") = None;
         if child
             .try_wait()
             .map_err(|error| format!("failed to check Weaver server status: {error}"))?
@@ -1047,9 +1080,24 @@ mod tests {
         HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
         decode_chunked, desktop_profile_dir_from, format_bytes, format_speed, http_origin,
         is_weaver_document, last_logged_error, logged_error_message, opens_in_external_browser,
-        parse_http_response, popover_content_from_graphql, remove_desktop_profile, row_detail,
-        set_cookie_value,
+        parse_http_response, parse_setup_code_line, popover_content_from_graphql,
+        remove_desktop_profile, row_detail, set_cookie_value,
     };
+
+    #[test]
+    fn setup_code_parser_accepts_only_the_exact_marker() {
+        use weaver_server_core::auth::SETUP_CODE_MARKER;
+        let code = "K7P-M2X";
+        assert_eq!(
+            parse_setup_code_line(&format!("#   {SETUP_CODE_MARKER}{code}   #")),
+            Some(code.to_string())
+        );
+        assert_eq!(
+            parse_setup_code_line(&format!("{SETUP_CODE_MARKER}short")),
+            None
+        );
+        assert_eq!(parse_setup_code_line("unrelated setup code"), None);
+    }
 
     #[test]
     fn desktop_profile_is_isolated_from_legacy_portable_state() {

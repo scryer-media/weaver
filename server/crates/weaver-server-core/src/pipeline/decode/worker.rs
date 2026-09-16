@@ -23,6 +23,7 @@ enum OutOfOrderPersistReason {
     PerFileMaxPending,
     GlobalWriteBacklog,
     QuiescentFlush,
+    DirectUnpack,
 }
 
 impl OutOfOrderPersistReason {
@@ -31,6 +32,7 @@ impl OutOfOrderPersistReason {
             Self::PerFileMaxPending => "download.write_buffer.out_of_order.per_file_max_pending",
             Self::GlobalWriteBacklog => "download.write_buffer.out_of_order.global_write_backlog",
             Self::QuiescentFlush => "download.write_buffer.out_of_order.quiescent_flush",
+            Self::DirectUnpack => "download.write_buffer.out_of_order.direct_unpack",
         }
     }
 }
@@ -749,9 +751,8 @@ impl Pipeline {
                     // had already proven Damaged (the yEnc aggregate CRC it was
                     // gated on is the poster's own declaration, not independent
                     // evidence). Files land in the deferral paths below instead
-                    // and are adjudicated by the dual-CRC slice verdicts, like
-                    // SABnzbd's quick-check and NZBGet's ParQuick, which only
-                    // ever compare observed values against expectations.
+                    // and are adjudicated by the dual-CRC slice verdicts, which
+                    // compare observed values against expectations.
                     let file_crc_matched = expected_file_crc
                         .is_some_and(|expected_file_crc| streamed.crc32 == expected_file_crc);
                     // A poster who supplied an aggregate `=yend crc32` has to
@@ -988,7 +989,7 @@ impl Pipeline {
                 exclude_servers = ?work.exclude_servers,
                 "queued unverified segment for whole-file CRC recovery"
             );
-            self.requeue_retry_work(work);
+            self.enqueue_download_work(work);
         }
         self.update_queue_metrics();
         warn!(
@@ -1018,6 +1019,7 @@ impl Pipeline {
             return;
         };
 
+        self.invalidate_par3_source_write(file_id);
         let segment = match write_segment_to_disk(&file_path, file_offset, segment).await {
             Ok(segment) => segment,
             Err(error) => {
@@ -1237,8 +1239,8 @@ impl Pipeline {
     /// Handle a decode failure by re-queuing the segment for re-download.
     ///
     /// yEnc decode failures (CRC/size mismatch, malformed data) indicate the
-    /// article body was corrupted — either in transit or on the server. Following
-    /// NZBGet's approach, we re-download the segment (which may hit a different
+    /// article body was corrupted — either in transit or on the server. We
+    /// re-download the segment (which may hit a different
     /// server via the connection pool's failover logic). After `MAX_SEGMENT_RETRIES`
     /// decode failures for the same segment, mark it as permanently failed and
     /// update health.
@@ -2570,6 +2572,7 @@ impl Pipeline {
             "download.persist_ready_segments.batch_bytes",
             ready_bytes as u64,
         );
+        self.invalidate_par3_source_write(file_id);
         let write_result = write_segments_to_disk(&file_path, ready).await;
         self.release_write_buffered(ready_bytes, ready_count);
 
@@ -2629,12 +2632,13 @@ impl Pipeline {
         if self.demotion_sweep_owns_file(file_id) {
             return Ok(());
         }
+        let direct_unpack = self.direct_unpack_wants_committed_ranges(file_id);
         loop {
             let batch = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
                     return Ok(());
                 };
-                if !write_buf.exceeds_max_pending() {
+                if !direct_unpack && !write_buf.exceeds_max_pending() {
                     return Ok(());
                 }
                 write_buf.take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
@@ -2647,7 +2651,11 @@ impl Pipeline {
             self.persist_out_of_order_segments(
                 file_id,
                 batch,
-                OutOfOrderPersistReason::PerFileMaxPending,
+                if direct_unpack {
+                    OutOfOrderPersistReason::DirectUnpack
+                } else {
+                    OutOfOrderPersistReason::PerFileMaxPending
+                },
             )
             .await?;
         }
@@ -2788,6 +2796,7 @@ impl Pipeline {
         };
 
         let write_start = Instant::now();
+        self.invalidate_par3_source_write(file_id);
         let write_result = write_segments_to_disk(&file_path, segments).await;
         // Hot-path safe: reuses the `write_start` this path already keeps for
         // the `disk_write_latency_us` gauge, so the histogram costs no extra
@@ -2955,6 +2964,16 @@ impl Pipeline {
                     );
                 }
 
+                if was_duplicate && self.direct_unpack_wants_committed_ranges(file_id) {
+                    self.taint_direct_unpack_for_file(job_id, filename);
+                }
+                self.direct_unpack_note_range(
+                    file_id,
+                    filename,
+                    file_offset,
+                    u64::from(decoded_size),
+                );
+
                 // The file hash is a *running* stream: every chunk must be fed
                 // once, in offset order. A duplicate's bytes were already fed
                 // by the original arrival, so re-feeding them is what trips the
@@ -3061,6 +3080,7 @@ impl Pipeline {
                             let mut leftovers = leftovers.into_iter();
                             while let Some((offset, buffered)) = leftovers.next() {
                                 let buffered_bytes = buffered.len_bytes();
+                                self.invalidate_par3_source_write(file_id);
                                 if let Err(e) =
                                     write_segment_to_disk(file_path, offset, buffered).await
                                 {
@@ -3139,15 +3159,38 @@ impl Pipeline {
                                 return;
                             }
                         }
-                        crate::pipeline::release_cached_write_handle(file_path);
-                        self.fail_job(
-                            job_id,
-                            format!(
-                                "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
-                                file_checksum.crc32
-                            ),
-                        );
-                        return;
+                        if self.par2_can_recover_file_crc(file_id, total_bytes, expected_crc) {
+                            self.taint_direct_unpack_for_file(job_id, filename);
+                            let file_index = file_id.file_index;
+                            if let Err(error) = self
+                                .db_blocking(move |db| db.mark_file_incomplete(job_id, file_index))
+                                .await
+                            {
+                                crate::pipeline::release_cached_write_handle(file_path);
+                                self.fail_job(
+                                    job_id,
+                                    format!("failed to persist CRC damage: {error}"),
+                                );
+                                return;
+                            }
+                            warn!(
+                                job_id = job_id.0,
+                                file_id = %file_id,
+                                expected_crc = format_args!("{expected_crc:08x}"),
+                                actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                "whole-file CRC mismatch; matching PAR2 metadata requires repair before acceptance"
+                            );
+                        } else {
+                            crate::pipeline::release_cached_write_handle(file_path);
+                            self.fail_job(
+                                job_id,
+                                format!(
+                                    "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
+                                    file_checksum.crc32
+                                ),
+                            );
+                            return;
+                        }
                     }
                     self.ensure_par2_runtime(job_id)
                         .completed_checksums
@@ -3208,7 +3251,9 @@ impl Pipeline {
                         total_bytes,
                     });
 
-                    {
+                    // A CRC-rejected source must not become a durable completed
+                    // file before PAR2 accepts it. A restart must revisit it.
+                    if expected_file_crc.is_none_or(|expected| expected == file_checksum.crc32) {
                         let file_index = file_id.file_index;
                         let fname = filename.to_string();
                         if let Err(e) = self
@@ -3229,7 +3274,9 @@ impl Pipeline {
                     self.pending_file_progress.remove(&file_id);
                     self.persisted_file_progress.remove(&file_id);
                     self.file_hash_states.remove(&file_id);
-                    self.expected_file_crcs.remove(&file_id);
+                    if expected_file_crc.is_none_or(|expected| expected == file_checksum.crc32) {
+                        self.expected_file_crcs.remove(&file_id);
+                    }
                     self.file_hash_reread_required.remove(&file_id);
                     self.unverified_segments.remove(&file_id);
                     self.file_crc_recoveries.remove(&file_id);
@@ -3245,6 +3292,7 @@ impl Pipeline {
                         stage_ms = stage_start.elapsed().as_millis() as u64,
                         "file-complete stage: try_load_par2_metadata"
                     );
+                    self.try_load_par3_metadata(job_id, file_id).await;
                     stage_start = Instant::now();
                     self.try_merge_par2_recovery(job_id, file_id).await;
                     crate::runtime::perf_probe::record(

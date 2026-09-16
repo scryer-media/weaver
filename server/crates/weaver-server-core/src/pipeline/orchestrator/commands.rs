@@ -145,6 +145,10 @@ impl Pipeline {
                         } else {
                             serde_json::to_string(&state.spec.metadata).ok()
                         },
+                        // A cancelled job keeps whatever it managed to pull
+                        // before the cancel: the servers did the work, and the
+                        // row is the only place left to say so.
+                        server_attribution: state.server_attribution.to_storage_json(),
                     };
                     let archive_result = self
                         .db_blocking({

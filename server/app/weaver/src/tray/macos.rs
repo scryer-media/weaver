@@ -13,8 +13,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::fs::File;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -61,6 +63,19 @@ const INSTANCE_LOCK_FILE: &str = "weaver-tray.lock";
 
 /// How often the wrapper checks whether the server has come up.
 const READY_POLL_INTERVAL: f64 = 0.25;
+
+fn copy_setup_code_to_clipboard(code: &str) -> std::io::Result<()> {
+    let mut child = Command::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(code.as_bytes())?;
+    }
+    if !child.wait()?.success() {
+        return Err(std::io::Error::other("clipboard copy failed"));
+    }
+    Ok(())
+}
 
 /// The app window's default size. Weaver's UI is a dense table layout, so the
 /// first-run window is sized for it rather than for the smallest usable frame.
@@ -705,9 +720,29 @@ impl WeaverDelegate {
 
     /// Used by the menu items that only need a server, not a window.
     fn ensure_server_ready(&self) -> Result<(), String> {
-        let mut supervisor = self.ivars().supervisor.borrow_mut();
-        supervisor.start()?;
-        supervisor.wait_until_ready()
+        {
+            let mut supervisor = self.ivars().supervisor.borrow_mut();
+            supervisor.start()?;
+            supervisor.wait_until_ready()?;
+        }
+        self.show_setup_code_if_needed();
+        Ok(())
+    }
+
+    fn show_setup_code_if_needed(&self) {
+        let Some(code) = self.ivars().supervisor.borrow().take_setup_code() else {
+            return;
+        };
+        let alert = NSAlert::new(self.mtm());
+        alert.setMessageText(&NSString::from_str("Finish Weaver setup"));
+        alert.setInformativeText(&NSString::from_str(&format!(
+            "Enter this one-time setup code in the browser wizard:\n\n{code}\n\nChoose Copy code to place it on the clipboard."
+        )));
+        alert.addButtonWithTitle(&NSString::from_str("Copy code"));
+        alert.addButtonWithTitle(&NSString::from_str("Close"));
+        if alert.runModal() == NSAlertFirstButtonReturn {
+            let _ = copy_setup_code_to_clipboard(&code);
+        }
     }
 
     fn show_window(&self) {
@@ -1070,6 +1105,7 @@ impl WeaverDelegate {
     }
 
     fn load_app(&self) {
+        self.show_setup_code_if_needed();
         let Some(url) = NSURL::URLWithString(&NSString::from_str(&self.ivars().url)) else {
             self.load_html(&startup_failure_html());
             return;

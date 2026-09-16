@@ -1292,7 +1292,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         .download_queue
         .pop()
         .expect("transport retry should remain in the batched infrastructure queue");
-    assert_eq!(retry.retry_count, 1);
+    assert_eq!(retry.retry_count, 0);
 
     pipeline.active_downloads = 1;
     pipeline.active_download_passes.insert(job_id);
@@ -1316,25 +1316,34 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         })
         .await;
 
-    assert!(matches!(
+    assert_eq!(
         job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Failed { .. })
-    ));
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(pipeline.jobs[&job_id].failed_bytes, 0);
     assert_eq!(
         pipeline
             .metrics
             .segments_failed_permanent
             .load(Ordering::Relaxed),
-        1
+        0
     );
-    assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
     assert_eq!(
         pipeline
             .metrics
             .parked_infrastructure_work
             .load(Ordering::Relaxed),
-        0
+        1
     );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
 }
 
 /// A transport-failure retry must point away from the server that just
@@ -1400,7 +1409,7 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
         retry.exclude_servers.is_empty(),
         "rotation must not enter the article-not-found exhaustion ledger"
     );
-    assert_eq!(retry.retry_count, 1);
+    assert_eq!(retry.retry_count, 0);
 }
 
 /// With a single configured server there is nowhere to rotate to: the retry
@@ -1551,6 +1560,16 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
 
 #[test]
 fn lane_acquire_failure_preserves_retry_semantics() {
+    for error in [
+        weaver_nntp::NntpError::SoftTimeout(15),
+        weaver_nntp::NntpError::TruncatedMultilineBody,
+        weaver_nntp::NntpError::MalformedMultilineTerminator,
+    ] {
+        let failure = DownloadFailure::from_nntp(error);
+        assert_eq!(failure.kind, DownloadFailureKind::EstablishedTransport);
+        assert!(failure.kind.preserves_article_retry_budget());
+        assert!(failure.kind.infrastructure_wait_reason().is_some());
+    }
     let unavailable = DownloadFailure::from_lane_acquire_failure(None);
     assert_eq!(unavailable.kind, DownloadFailureKind::LaneUnavailable);
 
@@ -1580,11 +1599,82 @@ fn lane_acquire_failure_preserves_retry_semantics() {
     assert_eq!(setup_failure.kind, DownloadFailureKind::ContentOrProtocol);
 }
 
+#[tokio::test]
+async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20024);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Group discovery", "group.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            runtime_generation: 0,
+            lane_id: 0,
+            segment_id,
+            data: Err(DownloadError::from_nntp(
+                weaver_nntp::NntpError::NoGroupSelected,
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.failed_bytes, 0);
+    assert_eq!(state.status, JobStatus::Downloading);
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(retry.segment_id, segment_id);
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
+    assert!(retry.exclude_servers.is_empty());
+    assert_eq!(
+        retry.avoid_server, None,
+        "the same provider can select the learned group"
+    );
+
+    let setup =
+        DownloadFailure::from_lane_acquire_failure(Some(&weaver_nntp::NntpError::NoGroupSelected));
+    assert!(setup.kind.preserves_article_retry_budget());
+}
+
 #[test]
-fn only_pre_body_infrastructure_failures_preserve_article_retry_budget() {
+fn infrastructure_failures_preserve_article_retry_budget() {
     for kind in [
         DownloadFailureKind::CapacityUnavailable,
         DownloadFailureKind::ConnectionEstablishment,
+        DownloadFailureKind::EstablishedTransport,
         DownloadFailureKind::Auth,
         DownloadFailureKind::ServerQuota,
         DownloadFailureKind::LaneUnavailable,
@@ -1593,7 +1683,6 @@ fn only_pre_body_infrastructure_failures_preserve_article_retry_budget() {
         assert!(kind.preserves_article_retry_budget(), "kind={kind:?}");
     }
     for kind in [
-        DownloadFailureKind::EstablishedTransport,
         DownloadFailureKind::ArticleNotFound,
         DownloadFailureKind::ContentOrProtocol,
     ] {
@@ -3308,6 +3397,7 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
                 "article not found on source server",
             )),
             attempts: vec![weaver_nntp::client::FetchAttemptTrace {
+                connection_health: None,
                 server_idx: 0,
                 remote_ip: None,
                 elapsed: Duration::from_millis(5),
@@ -3333,11 +3423,10 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
     );
     assert!(pipeline.pending_completion_checks.is_empty());
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let work = pipeline
-        .retry_rx
-        .try_recv()
+    let work = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+        .await
         .expect("source miss should requeue against another server")
+        .expect("retry channel must stay open")
         .work;
     assert_eq!(work.exclude_servers, vec![0]);
     assert_eq!(work.retry_count, 0);

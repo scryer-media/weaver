@@ -153,6 +153,11 @@ impl Pipeline {
         if self.ip_replacement_trial_extra_connections == 0 || self.ip_replacement_burst_active {
             return;
         }
+        // Cache replays cannot measure a provider IP and must not fetch the
+        // same message again through an experimental lane.
+        if self.repeated_articles.contains_key(&hot_job_id) {
+            return;
+        }
         // A trial is only worth an extra connection when the ordinary budget is
         // already fully committed — and never while recovery articles are on
         // the wire, since those are what a repair is waiting on.
@@ -201,7 +206,11 @@ impl Pipeline {
                 .await
             {
                 Ok(lane) => {
-                    let candidate_ip = lane.remote_ip();
+                    let Some(candidate_ip) = lane.remote_ip() else {
+                        lane.discard().await;
+                        let _ = trial_tx.send(IpReplacementTrialEvent::AcquireFailed).await;
+                        return;
+                    };
                     if candidate_ip == candidate.old_key.ip {
                         lane.discard().await;
                         let _ = trial_tx.send(IpReplacementTrialEvent::SameIpRejected).await;

@@ -22,6 +22,9 @@ crates/*/tests
 crates/*/examples
 
 docs
+# The upgrade holding page is served before the web bundle exists, so the
+# server embeds the lockup straight from here.
+!docs/img/weaver-lockup-on-dark.svg
 scripts
 tasks
 tests

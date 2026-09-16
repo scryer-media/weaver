@@ -145,7 +145,7 @@ async fn strict_security_refuses_trusting_modes_and_exposed_binds() {
 async fn no_login_is_refused_while_a_login_exists() {
     let harness = TestHarness::new().await;
     let response = harness
-        .execute(r#"mutation { enableLogin(username: "admin", password: "pass") }"#)
+        .execute(r#"mutation { enableLogin(username: "admin", password: "long-enough-pass") }"#)
         .await;
     assert_no_errors(&response);
 

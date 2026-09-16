@@ -275,12 +275,23 @@ pub enum FetchAttemptOutcome {
     QuotaBlocked,
     QuotaUnrequested,
     AuthenticationFailure,
+    GroupSelectionRequired,
     TransientFailure,
     PermanentFailure,
 }
 
+impl FetchAttemptOutcome {
+    pub(crate) fn transient(error: &NntpError) -> Self {
+        match error {
+            NntpError::NoGroupSelected => Self::GroupSelectionRequired,
+            _ => Self::TransientFailure,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FetchAttemptTrace {
+    pub connection_health: Option<Arc<crate::recovery::ConnectionHealth>>,
     pub server_idx: usize,
     pub remote_ip: Option<IpAddr>,
     pub elapsed: Duration,
@@ -414,7 +425,8 @@ pub struct BodyLaneLease {
     client: NntpClient,
     server_id: ServerId,
     conn: Option<PooledConnection>,
-    remote_ip: IpAddr,
+    health_lease: Option<Arc<crate::recovery::ConnectionHealthLease>>,
+    remote_ip: Option<IpAddr>,
     groups: Vec<String>,
     mode: BodyLaneMode,
     /// Command-to-status-line wait, sampled only when nothing else was
@@ -452,7 +464,7 @@ impl BodyLaneLease {
             .map(|control| control.snapshot())
     }
 
-    pub fn remote_ip(&self) -> IpAddr {
+    pub fn remote_ip(&self) -> Option<IpAddr> {
         self.remote_ip
     }
 
@@ -506,9 +518,16 @@ impl BodyLaneLease {
     ) -> DecodedBodyTrace {
         self.mode = BodyLaneMode::Sequential;
         let started = Instant::now();
-        let result = self
-            .read_decoded_body(message_id, estimated_body_bytes)
-            .await;
+        let result = if self
+            .conn
+            .as_ref()
+            .is_none_or(|conn| !conn.accepts_new_work())
+        {
+            Err(DecodedBodyError::Nntp(NntpError::PoolExhausted))
+        } else {
+            self.read_decoded_body(message_id, estimated_body_bytes)
+                .await
+        };
         let elapsed = started.elapsed();
         let policy_elapsed = result.as_ref().map_or(elapsed, |decoded| {
             elapsed.saturating_sub(decoded.io.throttle_wait)
@@ -584,7 +603,24 @@ impl BodyLaneLease {
         F: FnMut(usize, DecodedBodyTrace, BodyLaneTraceMeta) -> Fut,
         Fut: Future<Output = ()>,
     {
-        let offered = message_ids.len().min(max_depth);
+        let recovery_depth = self.health_lease.as_ref().map_or(max_depth, |lease| {
+            if !lease.0.current() {
+                0
+            } else if lease.0.probing() {
+                1
+            } else {
+                max_depth
+            }
+        });
+        let offered = if self
+            .conn
+            .as_ref()
+            .is_none_or(|conn| !conn.accepts_new_work())
+        {
+            0
+        } else {
+            message_ids.len().min(recovery_depth)
+        };
         let batch_started = Instant::now();
         let mut stats = BodyLaneBatchStats {
             offered,
@@ -865,7 +901,8 @@ impl BodyLaneLease {
             .client
             .classify_decoded_batch_item(
                 self.server_id.0,
-                Some(self.remote_ip),
+                self.health_lease.as_ref().map(|lease| &*lease.0),
+                self.remote_ip,
                 message_id,
                 item,
                 &mut attempts,
@@ -1055,7 +1092,7 @@ impl NntpClient {
         extra: bool,
         excluded_ips: &[IpAddr],
     ) -> Result<BodyLaneLease> {
-        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut deadline = TokioInstant::now() + self.soft_timeout;
         // A BODY lane fetches by message-id, which RFC 3977 answers with no
         // group selected, so the GROUP round trip is pure added latency on
         // every lane start. The candidate group is still offered to connect:
@@ -1064,32 +1101,21 @@ impl NntpClient {
         // walks the candidate list below.
         let initial_group = groups.first().map(String::as_str);
         let mut conn = if extra {
-            match tokio::time::timeout_at(
-                deadline,
-                self.pool
-                    .acquire_extra_excluding_for_group(server, excluded_ips, initial_group),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => return Err(self.acquire_timeout_error()),
-            }
+            self.pool
+                .acquire_extra_before_deadline(server, excluded_ips, initial_group, &mut deadline)
+                .await
         } else {
-            match tokio::time::timeout_at(
-                deadline,
-                self.pool.acquire_for_group(server, initial_group),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => return Err(self.acquire_timeout_error()),
-            }
-        };
+            self.pool
+                .acquire_before_deadline(server, initial_group, true, &mut deadline)
+                .await
+        }
+        .map_err(|error| self.map_acquire_timeout(error))?;
 
         if !conn.needs_group_prologue() {
             return Ok(BodyLaneLease {
                 client: self.clone(),
                 server_id: server,
+                health_lease: conn.health_lease.clone(),
                 remote_ip: conn.remote_ip(),
                 conn: Some(conn),
                 groups: groups.to_vec(),
@@ -1104,6 +1130,7 @@ impl NntpClient {
             Ok(Ok(_)) => Ok(BodyLaneLease {
                 client: self.clone(),
                 server_id: server,
+                health_lease: conn.health_lease.clone(),
                 remote_ip: conn.remote_ip(),
                 conn: Some(conn),
                 groups: groups.to_vec(),
@@ -1182,13 +1209,9 @@ impl NntpClient {
                 Err(NntpError::AuthenticationFailed)
                 | Err(NntpError::AuthenticationRejected)
                 | Err(NntpError::AccessDenied) => {
-                    self.record_server_failure(idx, true).await;
                     last_error = Some(NntpError::AuthenticationFailed);
                 }
                 Err(e) if is_retryable_stat_error(&e) => {
-                    if let Some(reason) = stat_cooldown_reason(&e) {
-                        self.record_server_cooldown(idx, reason).await;
-                    }
                     had_retryable_uncertainty = true;
                     last_error = Some(e);
                 }
@@ -1403,6 +1426,7 @@ impl NntpClient {
                     let elapsed = start.elapsed();
                     self.record_server_success(idx, elapsed).await;
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip,
                         elapsed,
@@ -1418,6 +1442,7 @@ impl NntpClient {
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
@@ -1431,6 +1456,7 @@ impl NntpClient {
                 }
                 Err(e @ NntpError::QuotaBlocked(_)) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: Duration::ZERO,
@@ -1444,30 +1470,31 @@ impl NntpClient {
                 | Err(NntpError::AuthenticationRejected)
                 | Err(NntpError::AccessDenied) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::AuthenticationFailure,
                         error: Some("authentication/access failure".to_string()),
                     });
-                    self.record_server_failure(idx, true).await;
                     last_error = Some(NntpError::AuthenticationFailed);
                     continue;
                 }
                 Err(e) if is_transient(&e) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::TransientFailure,
+                        outcome: FetchAttemptOutcome::transient(&e),
                         error: Some(e.to_string()),
                     });
-                    self.record_transient_server_failure(idx, &e).await;
                     last_retryable_error = Some(e);
                     continue;
                 }
                 Err(e) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
@@ -1642,22 +1669,27 @@ impl NntpClient {
         let mut last_errors: Vec<Option<DecodedBodyError>> =
             (0..message_ids.len()).map(|_| None).collect();
         let mut pending: Vec<usize> = (0..message_ids.len()).collect();
-
-        for idx in order {
-            if pending.is_empty() {
-                break;
-            }
-
-            let pending_now = std::mem::take(&mut pending);
+        let mut providers = order.into_iter();
+        let mut continuation = None;
+        loop {
+            let (idx, pending_now) = if let Some(next) = continuation.take() {
+                next
+            } else {
+                let Some(idx) = providers.next() else { break };
+                if pending.is_empty() {
+                    break;
+                }
+                (idx, std::mem::take(&mut pending))
+            };
             let pending_ids: Vec<String> = pending_now
                 .iter()
                 .map(|message_idx| message_ids[*message_idx].to_string())
                 .collect();
 
-            let setup_deadline = TokioInstant::now() + self.soft_timeout;
+            let mut setup_deadline = TokioInstant::now() + self.soft_timeout;
             let batch_started = Instant::now();
             let mut conn = match self
-                .acquire_before_deadline(ServerId(idx), setup_deadline)
+                .acquire_before_deadline(ServerId(idx), &mut setup_deadline)
                 .await
             {
                 Ok(conn) => conn,
@@ -1671,6 +1703,7 @@ impl NntpClient {
                         match self
                             .classify_decoded_batch_item(
                                 idx,
+                                None,
                                 None,
                                 message_ids[message_idx],
                                 item,
@@ -1697,7 +1730,8 @@ impl NntpClient {
                     continue;
                 }
             };
-            let remote_ip = Some(conn.remote_ip());
+            let remote_ip = conn.remote_ip();
+            let health_lease = conn.health_lease.clone();
 
             let group_result = match tokio::time::timeout_at(
                 setup_deadline,
@@ -1718,6 +1752,7 @@ impl NntpClient {
                         match self
                             .classify_decoded_batch_item(
                                 idx,
+                                health_lease.as_ref().map(|lease| &*lease.0),
                                 remote_ip,
                                 message_ids[message_idx],
                                 item,
@@ -1758,6 +1793,7 @@ impl NntpClient {
                     match self
                         .classify_decoded_batch_item(
                             idx,
+                            health_lease.as_ref().map(|lease| &*lease.0),
                             remote_ip,
                             message_ids[message_idx],
                             item,
@@ -1785,7 +1821,9 @@ impl NntpClient {
             let mut request_write_error = None;
             let mut admitted = 0usize;
             let mut quota_rejection = None;
-            for (pending_idx, message_id) in pending_ids.iter().enumerate() {
+            let recovery_probe = health_lease.as_ref().is_some_and(|lease| lease.0.probing());
+            let admission_limit = if recovery_probe { 1 } else { pending_ids.len() };
+            for (pending_idx, message_id) in pending_ids.iter().take(admission_limit).enumerate() {
                 match conn.write_body_request(message_id).await {
                     Ok(()) => admitted += 1,
                     Err(NntpError::QuotaBlocked(rejection)) => {
@@ -1806,6 +1844,12 @@ impl NntpClient {
                 request_write_error = Some(error);
             }
 
+            let deferred = if recovery_probe && admitted == 1 && request_write_error.is_none() {
+                pending_now.iter().copied().skip(1).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
             if let Some(error) = request_write_error {
                 if is_connection_error(&error) {
                     self.discard_connection_error(idx, conn).await;
@@ -1819,6 +1863,7 @@ impl NntpClient {
                     match self
                         .classify_decoded_batch_item(
                             idx,
+                            health_lease.as_ref().map(|lease| &*lease.0),
                             remote_ip,
                             message_ids[message_idx],
                             item,
@@ -1852,6 +1897,7 @@ impl NntpClient {
                 match self
                     .classify_decoded_batch_item(
                         idx,
+                        health_lease.as_ref().map(|lease| &*lease.0),
                         remote_ip,
                         message_ids[message_idx],
                         item,
@@ -1905,6 +1951,7 @@ impl NntpClient {
                 match self
                     .classify_decoded_batch_item(
                         idx,
+                        health_lease.as_ref().map(|lease| &*lease.0),
                         remote_ip,
                         message_ids[message_idx],
                         item,
@@ -1947,6 +1994,7 @@ impl NntpClient {
                         match self
                             .classify_decoded_batch_item(
                                 idx,
+                                health_lease.as_ref().map(|lease| &*lease.0),
                                 remote_ip,
                                 message_ids[unread_idx],
                                 item,
@@ -1971,6 +2019,15 @@ impl NntpClient {
                         }
                     }
                     break;
+                }
+            }
+            if !deferred.is_empty() {
+                if self.pool.requires_recovery(idx) {
+                    pending.extend(deferred);
+                } else {
+                    // The probe settled transport recovery. Its unsent tail
+                    // still deserves this provider before normal failover.
+                    continuation = Some((idx, deferred));
                 }
             }
         }
@@ -2002,9 +2059,13 @@ impl NntpClient {
             .result
     }
 
+    // Keep socket provenance separate from article identity and the caller's
+    // attempt/error accumulators; all three survive different retry boundaries.
+    #[allow(clippy::too_many_arguments)]
     async fn classify_decoded_batch_item(
         &self,
         server_idx: usize,
+        ticket: Option<&crate::recovery::ConnectionHealth>,
         remote_ip: Option<IpAddr>,
         message_id: &str,
         item: DecodedBatchItem,
@@ -2012,10 +2073,14 @@ impl NntpClient {
         last_error: &mut Option<DecodedBodyError>,
     ) -> DecodedBatchDisposition {
         let elapsed = item.elapsed;
+        if let Some(ticket) = ticket {
+            self.record_decoded_connection_outcome(server_idx, ticket, &item.result)
+                .await;
+        }
         match item.result {
             Ok(decoded) => {
-                self.record_server_success(server_idx, elapsed).await;
                 attempts.push(FetchAttemptTrace {
+                    connection_health: None,
                     server_idx,
                     remote_ip,
                     elapsed,
@@ -2025,8 +2090,8 @@ impl NntpClient {
                 DecodedBatchDisposition::Terminal(Ok(decoded))
             }
             Err(DecodedBodyError::Decode { raw_size, error }) => {
-                self.record_server_success(server_idx, elapsed).await;
                 attempts.push(FetchAttemptTrace {
+                    connection_health: None,
                     server_idx,
                     remote_ip,
                     elapsed,
@@ -2041,6 +2106,7 @@ impl NntpClient {
                 | NntpError::NoArticleWithNumber,
             )) => {
                 attempts.push(FetchAttemptTrace {
+                    connection_health: None,
                     server_idx,
                     remote_ip,
                     elapsed,
@@ -2054,6 +2120,7 @@ impl NntpClient {
             }
             Err(DecodedBodyError::Nntp(NntpError::QuotaBlocked(rejection))) => {
                 attempts.push(FetchAttemptTrace {
+                    connection_health: None,
                     server_idx,
                     remote_ip,
                     elapsed,
@@ -2065,6 +2132,7 @@ impl NntpClient {
             }
             Err(DecodedBodyError::Nntp(error @ NntpError::BodyNotRequestedDueToQuota { .. })) => {
                 attempts.push(FetchAttemptTrace {
+                    connection_health: None,
                     server_idx,
                     remote_ip,
                     elapsed,
@@ -2080,30 +2148,31 @@ impl NntpClient {
                 | NntpError::AccessDenied,
             )) => {
                 attempts.push(FetchAttemptTrace {
+                    connection_health: None,
                     server_idx,
                     remote_ip,
                     elapsed,
                     outcome: FetchAttemptOutcome::AuthenticationFailure,
                     error: Some("authentication/access failure".to_string()),
                 });
-                self.record_server_failure(server_idx, true).await;
                 *last_error = Some(DecodedBodyError::Nntp(NntpError::AuthenticationFailed));
                 DecodedBatchDisposition::Retry
             }
             Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
                 attempts.push(FetchAttemptTrace {
+                    connection_health: None,
                     server_idx,
                     remote_ip,
                     elapsed,
-                    outcome: FetchAttemptOutcome::TransientFailure,
+                    outcome: FetchAttemptOutcome::transient(&e),
                     error: Some(e.to_string()),
                 });
-                self.record_transient_server_failure(server_idx, &e).await;
                 *last_error = Some(DecodedBodyError::Nntp(e));
                 DecodedBatchDisposition::Retry
             }
             Err(other) => {
                 attempts.push(FetchAttemptTrace {
+                    connection_health: None,
                     server_idx,
                     remote_ip,
                     elapsed,
@@ -2146,6 +2215,7 @@ impl NntpClient {
                     let elapsed = start.elapsed().saturating_sub(decoded.io.throttle_wait);
                     self.record_server_success(idx, elapsed).await;
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed,
@@ -2159,6 +2229,7 @@ impl NntpClient {
                 }
                 Err(DecodedBodyError::Decode { raw_size, error }) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
@@ -2176,6 +2247,7 @@ impl NntpClient {
                     | NntpError::NoArticleWithNumber,
                 )) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
@@ -2189,6 +2261,7 @@ impl NntpClient {
                 }
                 Err(DecodedBodyError::Nntp(e @ NntpError::QuotaBlocked(_))) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: Duration::ZERO,
@@ -2204,30 +2277,31 @@ impl NntpClient {
                     | NntpError::AccessDenied,
                 )) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
                         outcome: FetchAttemptOutcome::AuthenticationFailure,
                         error: Some("authentication/access failure".to_string()),
                     });
-                    self.record_server_failure(idx, true).await;
                     last_error = Some(DecodedBodyError::Nntp(NntpError::AuthenticationFailed));
                     continue;
                 }
                 Err(DecodedBodyError::Nntp(e)) if is_transient(&e) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
-                        outcome: FetchAttemptOutcome::TransientFailure,
+                        outcome: FetchAttemptOutcome::transient(&e),
                         error: Some(e.to_string()),
                     });
-                    self.record_transient_server_failure(idx, &e).await;
                     last_retryable_error = Some(DecodedBodyError::Nntp(e));
                     continue;
                 }
                 Err(other) => {
                     attempts.push(FetchAttemptTrace {
+                        connection_health: None,
                         server_idx: idx,
                         remote_ip: None,
                         elapsed: start.elapsed(),
@@ -2304,6 +2378,25 @@ impl NntpClient {
         exclude: &[usize],
         requested_body_bytes: u64,
     ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
+        self.acquire_blocking_lane(groups, exclude, requested_body_bytes, true)
+    }
+
+    pub fn try_warm_blocking_body_lane(
+        &self,
+        groups: &[String],
+        exclude: &[usize],
+        requested_body_bytes: u64,
+    ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
+        self.acquire_blocking_lane(groups, exclude, requested_body_bytes, false)
+    }
+
+    fn acquire_blocking_lane(
+        &self,
+        groups: &[String],
+        exclude: &[usize],
+        requested_body_bytes: u64,
+        demanded: bool,
+    ) -> std::result::Result<crate::blocking::BlockingBodyLane, BlockingBodyLaneAcquireError> {
         let Some(selection) = self.try_blocking_body_server_selection(
             exclude,
             requested_body_bytes,
@@ -2324,7 +2417,10 @@ impl NntpClient {
         let mut provider_capacity_error = None;
         let mut other_error = None;
         for server in selection.eligible {
-            let permit = match self.pool.try_acquire_blocking_permit(server) {
+            let permit = match self
+                .pool
+                .try_acquire_blocking_permit_for_work(server, demanded)
+            {
                 Ok(permit) => permit,
                 Err(_) => {
                     saw_local_capacity = true;
@@ -2351,23 +2447,31 @@ impl NntpClient {
                 }
             };
             let started = Instant::now();
-            match crate::blocking::BlockingBodyLane::connect(
-                server,
-                self.pool.stable_server_id(server).unwrap_or_default(),
-                self.pool.server_transfer_control(server),
-                &config,
-                &excluded_ips,
-                address_offset,
-                groups,
-                self.soft_timeout,
-                permit,
-            ) {
+            let health_lease = Arc::clone(&permit.health_lease);
+            match self.pool.with_blocking_connect_admission(server, || {
+                crate::blocking::BlockingBodyLane::connect(
+                    server,
+                    self.pool.stable_server_id(server).unwrap_or_default(),
+                    self.pool.server_transfer_control(server),
+                    &config,
+                    &excluded_ips,
+                    address_offset,
+                    groups,
+                    self.soft_timeout,
+                    permit,
+                )
+            }) {
                 Ok(lane) => {
                     self.pool.note_provider_admitted(server, admission);
                     return Ok(lane);
                 }
                 Err(error) => {
-                    self.record_blocking_connect_failure(server.0, admission, &error);
+                    self.record_blocking_connect_failure(
+                        server.0,
+                        admission,
+                        &error,
+                        &health_lease.0,
+                    );
                     // Debug for every failure, and one WARN per server per
                     // window carrying how many it stands for. A lane that
                     // cannot connect is invisible otherwise: the work is
@@ -2464,6 +2568,31 @@ impl NntpClient {
 
     pub fn record_blocking_attempts(&self, attempts: &[FetchAttemptTrace]) {
         for attempt in attempts {
+            if let Some(ticket) = &attempt.connection_health {
+                let success = matches!(
+                    attempt.outcome,
+                    FetchAttemptOutcome::Success | FetchAttemptOutcome::NotFound
+                );
+                let failure = matches!(
+                    attempt.outcome,
+                    FetchAttemptOutcome::TransientFailure
+                        | FetchAttemptOutcome::AuthenticationFailure
+                );
+                if success || failure {
+                    let mut health = self.pool.health().blocking_lock();
+                    health.record_connection_outcome(
+                        attempt.server_idx,
+                        ticket,
+                        success,
+                        matches!(attempt.outcome, FetchAttemptOutcome::AuthenticationFailure),
+                    );
+                    if success {
+                        health.record_latency(attempt.server_idx, attempt.elapsed);
+                    }
+                }
+                self.pool.retire_quarantined_idle(attempt.server_idx);
+                continue;
+            }
             match attempt.outcome {
                 FetchAttemptOutcome::Success => {
                     let mut health = self.pool.health().blocking_lock();
@@ -2485,6 +2614,7 @@ impl NntpClient {
                 FetchAttemptOutcome::NotFound
                 | FetchAttemptOutcome::QuotaBlocked
                 | FetchAttemptOutcome::QuotaUnrequested
+                | FetchAttemptOutcome::GroupSelectionRequired
                 | FetchAttemptOutcome::PermanentFailure => {}
             }
         }
@@ -2589,6 +2719,7 @@ impl NntpClient {
         server_idx: usize,
         admission: FreshConnectAdmission,
         error: &NntpError,
+        ticket: &crate::recovery::ConnectionHealth,
     ) {
         if matches!(error, NntpError::TooManyConnections) {
             // Provider admission pressure parks new sockets, it does not make
@@ -2605,51 +2736,100 @@ impl NntpClient {
             error,
             NntpError::AuthenticationFailed
                 | NntpError::AuthenticationRejected
+                | NntpError::AuthenticationRequired
                 | NntpError::AccessDenied
         ) {
             self.pool
                 .health()
                 .blocking_lock()
-                .record_failure(server_idx, true);
-        } else if let Some(reason) = cooldown_reason(error) {
+                .record_connection_outcome(server_idx, ticket, false, true);
+        } else if cooldown_reason(error).is_some() {
             self.pool
                 .health()
                 .blocking_lock()
-                .record_cooldown(server_idx, reason);
+                .record_connection_outcome(server_idx, ticket, false, false);
         }
+        self.pool.retire_quarantined_idle(server_idx);
     }
 
     async fn record_server_success(&self, server_idx: usize, elapsed: Duration) {
         let mut health = self.pool.health().lock().await;
-        health.record_success(server_idx);
         health.record_latency(server_idx, elapsed);
     }
 
-    async fn record_server_failure(&self, server_idx: usize, is_auth: bool) {
-        let mut health = self.pool.health().lock().await;
-        health.record_failure(server_idx, is_auth);
-    }
-
-    async fn record_transient_server_failure(&self, server_idx: usize, error: &NntpError) {
-        if !matches!(
-            error,
-            NntpError::TooManyConnections
-                | NntpError::ServerOverLimit { .. }
-                | NntpError::PoolExhausted
-                | NntpError::PoolShutdown
-                // Learning session setup is not a server health failure.
-                | NntpError::NoGroupSelected
-                // Local capacity: we never reached the server, so this must
-                // not walk it toward Degraded/Disabled.
-                | NntpError::AcquireTimeout(_)
-        ) {
-            self.record_server_failure(server_idx, false).await;
+    async fn record_connection_reply(
+        &self,
+        idx: usize,
+        ticket: &crate::recovery::ConnectionHealth,
+        error: Option<&NntpError>,
+    ) {
+        let success = error.is_none_or(|error| {
+            matches!(
+                error,
+                NntpError::ArticleNotFound
+                    | NntpError::NoSuchArticle { .. }
+                    | NntpError::NoArticleWithNumber
+            )
+        });
+        let auth = error.is_some_and(|error| {
+            matches!(
+                error,
+                NntpError::AuthenticationFailed
+                    | NntpError::AuthenticationRejected
+                    | NntpError::AuthenticationRequired
+                    | NntpError::AccessDenied
+            )
+        });
+        let failure = error.is_some_and(|error| {
+            stat_cooldown_reason(error).is_some()
+                && !matches!(
+                    error,
+                    NntpError::PoolExhausted
+                        | NntpError::PoolShutdown
+                        | NntpError::TooManyConnections
+                        | NntpError::ServerOverLimit { .. }
+                        | NntpError::AcquireTimeout(_)
+                )
+        });
+        if success || auth || failure {
+            self.pool
+                .health()
+                .lock()
+                .await
+                .record_connection_outcome(idx, ticket, success, auth);
+            self.pool.retire_quarantined_idle(idx);
         }
     }
 
-    async fn record_server_cooldown(&self, server_idx: usize, reason: CooldownReason) {
-        let mut health = self.pool.health().lock().await;
-        health.record_cooldown(server_idx, reason);
+    async fn record_decoded_connection_outcome(
+        &self,
+        idx: usize,
+        ticket: &crate::recovery::ConnectionHealth,
+        result: &std::result::Result<DecodedBody, DecodedBodyError>,
+    ) {
+        let error = match result {
+            Err(DecodedBodyError::Nntp(error)) => Some(error),
+            _ => None,
+        };
+        self.record_connection_reply(idx, ticket, error).await;
+    }
+
+    async fn record_metadata_reply(
+        &self,
+        idx: usize,
+        ticket: &crate::recovery::ConnectionHealth,
+        error: Option<&NntpError>,
+    ) {
+        if let Some(reason) = error.and_then(stat_cooldown_reason) {
+            self.pool
+                .health()
+                .lock()
+                .await
+                .record_connection_cooldown(idx, ticket, reason);
+            self.pool.retire_quarantined_idle(idx);
+        } else {
+            self.record_connection_reply(idx, ticket, error).await;
+        }
     }
 
     async fn record_premature_death_if_needed(&self, server_idx: usize, age: Duration) {
@@ -2667,6 +2847,10 @@ impl NntpClient {
     /// away turned a single refused command into a fleet-wide cold dial.
     async fn discard_connection_error(&self, server_idx: usize, conn: PooledConnection) {
         let age = conn.created_at().elapsed();
+        if let Some(lease) = &conn.health_lease {
+            self.record_connection_reply(server_idx, &lease.0, Some(&NntpError::ConnectionClosed))
+                .await;
+        }
         conn.discard();
         self.record_premature_death_if_needed(server_idx, age).await;
     }
@@ -2680,13 +2864,29 @@ impl NntpClient {
     async fn acquire_before_deadline(
         &self,
         server: ServerId,
-        deadline: TokioInstant,
+        deadline: &mut TokioInstant,
     ) -> Result<PooledConnection> {
-        match tokio::time::timeout_at(deadline, self.pool.acquire(server)).await {
-            Ok(result) => result,
-            // Nothing was sent: we never got a socket. This is our own
-            // capacity, not the server's health.
-            Err(_) => Err(self.acquire_timeout_error()),
+        self.pool
+            .acquire_before_deadline(server, None, true, deadline)
+            .await
+            .map_err(|error| self.map_acquire_timeout(error))
+    }
+
+    async fn acquire_metadata_before_deadline(
+        &self,
+        server: ServerId,
+        deadline: &mut TokioInstant,
+    ) -> Result<PooledConnection> {
+        self.pool
+            .acquire_before_deadline(server, None, false, deadline)
+            .await
+            .map_err(|error| self.map_acquire_timeout(error))
+    }
+
+    fn map_acquire_timeout(&self, error: NntpError) -> NntpError {
+        match error {
+            NntpError::AcquireTimeout(_) => self.acquire_timeout_error(),
+            other => other,
         }
     }
 
@@ -2924,7 +3124,6 @@ impl NntpClient {
                         server = idx,
                         message_id, "authentication/access failure, trying next server"
                     );
-                    self.record_server_failure(idx, true).await;
                     last_error = Some(NntpError::AuthenticationFailed);
                     continue;
                 }
@@ -2948,7 +3147,6 @@ impl NntpClient {
                             "transient error, trying next server"
                         );
                     }
-                    self.record_transient_server_failure(idx, &e).await;
                     last_retryable_error = Some(e);
                     continue;
                 }
@@ -2998,9 +3196,9 @@ impl NntpClient {
         let mut attempts = 0u32;
 
         loop {
-            let deadline = TokioInstant::now() + self.soft_timeout;
-            let mut conn = self.acquire_before_deadline(server, deadline).await?;
-            let remote_ip = Some(conn.remote_ip());
+            let mut deadline = TokioInstant::now() + self.soft_timeout;
+            let mut conn = self.acquire_before_deadline(server, &mut deadline).await?;
+            let remote_ip = conn.remote_ip();
 
             // Try to select a group — iterate through the list on failure.
             let group_result =
@@ -3054,6 +3252,10 @@ impl NntpClient {
             let result = conn
                 .body_by_id_raw_with_active_budget(message_id, &mut budget)
                 .await;
+            if let Some(lease) = &conn.health_lease {
+                self.record_connection_reply(server.0, &lease.0, result.as_ref().err())
+                    .await;
+            }
             match result {
                 Ok(response) => return Ok((response.data, remote_ip)),
                 Err(NntpError::ArticleNotFound)
@@ -3102,9 +3304,9 @@ impl NntpClient {
         let mut attempts = 0u32;
 
         loop {
-            let deadline = TokioInstant::now() + self.soft_timeout;
+            let mut deadline = TokioInstant::now() + self.soft_timeout;
             let mut conn = self
-                .acquire_before_deadline(server, deadline)
+                .acquire_before_deadline(server, &mut deadline)
                 .await
                 .map_err(DecodedBodyError::Nntp)?;
 
@@ -3146,6 +3348,14 @@ impl NntpClient {
                 .stream_yenc_article_with_active_budget(message_id, 0, &mut budget, |_| Ok(()))
                 .await;
 
+            if let Some(lease) = &conn.health_lease {
+                let error = match &stream_result {
+                    Err(FusedYencError::Nntp(error)) => Some(error),
+                    _ => None,
+                };
+                self.record_connection_reply(server.0, &lease.0, error)
+                    .await;
+            }
             match stream_result {
                 Ok(article) => {
                     return Ok(DecodedBody {
@@ -3261,11 +3471,13 @@ impl NntpClient {
         if message_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
-            let mut conn = self.acquire_before_deadline(server, deadline).await?;
+            let mut conn = self
+                .acquire_metadata_before_deadline(server, &mut deadline)
+                .await?;
             let result = match tokio::time::timeout_at(deadline, async {
                 if conn.capabilities().supports_pipelining() {
                     conn.head_pipeline(message_ids).await
@@ -3289,11 +3501,23 @@ impl NntpClient {
             {
                 Ok(result) => result,
                 Err(_) => {
+                    if let Some(lease) = &conn.health_lease {
+                        self.record_metadata_reply(
+                            server.0,
+                            &lease.0,
+                            Some(&self.soft_timeout_error()),
+                        )
+                        .await;
+                    }
                     self.discard_connection_error(server.0, conn).await;
                     return Err(self.soft_timeout_error());
                 }
             };
 
+            if let Some(lease) = &conn.health_lease {
+                self.record_metadata_reply(server.0, &lease.0, result.as_ref().err())
+                    .await;
+            }
             match result {
                 Ok(results) => return Ok(results),
                 Err(error) if is_retryable_stat_error(&error) => {
@@ -3343,11 +3567,13 @@ impl NntpClient {
             return self.head_many_from_server(server, message_ids).await;
         }
 
-        let deadline = TokioInstant::now() + self.soft_timeout;
+        let mut deadline = TokioInstant::now() + self.soft_timeout;
         let mut attempts = 0u32;
 
         loop {
-            let mut conn = self.acquire_before_deadline(server, deadline).await?;
+            let mut conn = self
+                .acquire_metadata_before_deadline(server, &mut deadline)
+                .await?;
 
             let result = match tokio::time::timeout_at(deadline, async {
                 if conn.capabilities().supports_pipelining() {
@@ -3364,11 +3590,23 @@ impl NntpClient {
             {
                 Ok(result) => result,
                 Err(_) => {
+                    if let Some(lease) = &conn.health_lease {
+                        self.record_metadata_reply(
+                            server.0,
+                            &lease.0,
+                            Some(&self.soft_timeout_error()),
+                        )
+                        .await;
+                    }
                     self.discard_connection_error(server.0, conn).await;
                     return Err(self.soft_timeout_error());
                 }
             };
 
+            if let Some(lease) = &conn.health_lease {
+                self.record_metadata_reply(server.0, &lease.0, result.as_ref().err())
+                    .await;
+            }
             match result {
                 Ok(results) => return Ok(results),
                 // The server has just told us it does not implement STAT. The
@@ -3424,8 +3662,13 @@ impl NntpClient {
         let mut attempts = 0u32;
 
         loop {
-            let deadline = TokioInstant::now() + self.soft_timeout;
-            let mut conn = self.acquire_before_deadline(server, deadline).await?;
+            let mut deadline = TokioInstant::now() + self.soft_timeout;
+            let mut conn = if matches!(kind, FetchKind::Body) {
+                self.acquire_before_deadline(server, &mut deadline).await?
+            } else {
+                self.acquire_metadata_before_deadline(server, &mut deadline)
+                    .await?
+            };
 
             let result = match kind {
                 FetchKind::Body => {
@@ -3452,6 +3695,10 @@ impl NntpClient {
                 }
             };
 
+            if let Some(lease) = &conn.health_lease {
+                self.record_connection_reply(server.0, &lease.0, result.as_ref().err())
+                    .await;
+            }
             match result {
                 Ok(response) => return Ok(response.data),
                 Err(NntpError::ArticleNotFound) | Err(NntpError::NoSuchArticle { .. }) => {

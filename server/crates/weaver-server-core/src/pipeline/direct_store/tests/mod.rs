@@ -401,6 +401,7 @@ fn direct_active_job() -> crate::ActiveJob {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     }
 }
 
@@ -1158,4 +1159,6 @@ fn encrypted_crypt_router_partial(
 }
 
 mod par2_fileaccess_adapter_over;
+mod par3_source_access;
 mod recording_test_doubles;
+mod repair_transactions;

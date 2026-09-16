@@ -31,6 +31,7 @@ import { formatSpeed } from "@/components/SpeedDisplay";
 import { Badge } from "@/components/ui/badge";
 import { Sparkline } from "@/components/ui/sparkline";
 import { UploadModal } from "@/components/UploadModal";
+import { BrandLockup } from "@/lib/brand";
 import { useSpeedHistory } from "@/lib/hooks/use-speed-history";
 import { LiveDataProvider, type DownloadBlockState } from "@/lib/context/live-data-context";
 import type { JobDownloadRate } from "@/lib/live-job-download-rates";
@@ -41,6 +42,8 @@ import { usePwa } from "@/lib/context/pwa-context";
 import { settingsNav } from "@/pages/settings/settings-nav";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import { setUiVariant } from "@/lib/ui-variant";
 import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
 import { UpdateNotificationLink } from "@/features/updates/update-notification-link";
 import {
@@ -164,6 +167,24 @@ function SponsorLink({ label }: { label: string }) {
       <Heart className="size-3.5 text-status-failed/70" aria-hidden="true" />
       <span>{label}</span>
     </a>
+  );
+}
+
+/** The switch to the new interface. Switching reloads the page, so it only ever reads off here. */
+function InterfaceSwitch({ label }: { label: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-[9px] px-2 py-1 text-[11.5px] font-medium text-muted-foreground/80">
+      <span className="truncate">{label}</span>
+      <Switch
+        checked={false}
+        onCheckedChange={(enabled) => {
+          if (enabled) {
+            setUiVariant("next");
+          }
+        }}
+        aria-label={label}
+      />
+    </div>
   );
 }
 
@@ -437,10 +458,8 @@ export function Layout() {
         {/* Desktop sidebar */}
         <aside className="hidden w-52 shrink-0 flex-col border-r border-border bg-card/40 backdrop-blur-md min-[1600px]:flex min-[1600px]:w-[248px]">
           <div className="flex items-start justify-between border-b border-border px-5 py-5">
-            <Link to="/" className="min-w-0">
-              <div className="font-space-grotesk text-[22px] font-bold leading-none tracking-tight text-foreground">
-                Weaver
-              </div>
+            <Link to="/" className="min-w-0 text-foreground">
+              <BrandLockup className="h-[18px] w-auto min-[1600px]:h-[21px]" />
             </Link>
             <ThemeToggle />
           </div>
@@ -466,8 +485,9 @@ export function Layout() {
                     </Link>
 
                     {item.to === "/settings" && settingsOpen ? (
-                      <div className="mt-1 mb-1 ml-5 space-y-0.5 border-l border-border pl-3">
+                      <div className="mt-1 mb-1 ml-5 space-y-0.5 border-l border-border pl-2">
                         {settingsNav.map((entry) => {
+                          const EntryIcon = entry.icon;
                           const childActive = location.pathname === entry.to;
                           return (
                             <Link
@@ -480,7 +500,10 @@ export function Layout() {
                                   : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
                               )}
                             >
-                              <span>{t(entry.labelKey)}</span>
+                              <span className="flex items-center gap-2">
+                                <EntryIcon className="size-4 shrink-0" />
+                                <span>{t(entry.labelKey)}</span>
+                              </span>
                               {entry.beta ? (
                                 <Badge variant="secondary" className="px-1 py-0 text-[9px] uppercase tracking-[0.08em]">
                                   Beta
@@ -532,6 +555,7 @@ export function Layout() {
                   v{versionData.version}
                 </div>
               ) : null}
+              <InterfaceSwitch label={t("next.general.newInterface")} />
             </div>
           </div>
         </aside>
@@ -547,7 +571,7 @@ export function Layout() {
             >
               <Menu className="size-4" />
             </button>
-            <span className="font-space-grotesk text-lg font-bold tracking-tight">Weaver</span>
+            <BrandLockup className="h-[17px] w-auto flex-none text-foreground" />
             <span className="ml-auto font-space-grotesk text-[15px] font-bold text-foreground">
               {formatSpeed(liveData.speed)}
             </span>
@@ -579,8 +603,11 @@ export function Layout() {
       <Sheet open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
         <SheetContent side="left" className="w-[280px] border-border bg-card sm:max-w-[280px]">
           <SheetHeader className="border-b border-border px-5 py-5 text-left">
-            <SheetTitle className="font-space-grotesk text-xl font-bold text-foreground">
-              Weaver
+            <SheetTitle className="text-foreground">
+              {/* The drawer takes its accessible name from this title, so the
+                  name stays in text and the artwork beside it is decorative. */}
+              <BrandLockup className="h-[19px] w-auto" decorative />
+              <span className="sr-only">Weaver</span>
             </SheetTitle>
           </SheetHeader>
           <div className="flex min-h-0 flex-1 flex-col">
@@ -608,26 +635,30 @@ export function Layout() {
                       {item.to === "/settings" && settingsOpen ? (
                         <div className="mt-1 mb-1 ml-5 space-y-0.5 border-l border-border pl-4">
                           {settingsNav.map((entry) => {
+                            const EntryIcon = entry.icon;
                             const childActive = location.pathname === entry.to;
                             return (
                               <Link
                                 key={entry.to}
-                              to={entry.to}
-                              onClick={() => setMobileNavOpen(false)}
-                              className={cn(
-                                "flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-[13px] transition-colors",
-                                childActive
-                                  ? "bg-accent font-semibold text-foreground"
-                                  : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
-                              )}
-                            >
-                              <span>{t(entry.labelKey)}</span>
-                              {entry.beta ? (
-                                <Badge variant="secondary" className="px-1 py-0 text-[9px] uppercase tracking-[0.08em]">
-                                  Beta
-                                </Badge>
-                              ) : null}
-                            </Link>
+                                to={entry.to}
+                                onClick={() => setMobileNavOpen(false)}
+                                className={cn(
+                                  "flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-[13px] transition-colors",
+                                  childActive
+                                    ? "bg-accent font-semibold text-foreground"
+                                    : "font-medium text-muted-foreground hover:bg-accent/40 hover:text-foreground",
+                                )}
+                              >
+                                <span className="flex items-center gap-2">
+                                  <EntryIcon className="size-4 shrink-0" />
+                                  <span>{t(entry.labelKey)}</span>
+                                </span>
+                                {entry.beta ? (
+                                  <Badge variant="secondary" className="px-1 py-0 text-[9px] uppercase tracking-[0.08em]">
+                                    Beta
+                                  </Badge>
+                                ) : null}
+                              </Link>
                             );
                           })}
                         </div>
@@ -663,7 +694,10 @@ export function Layout() {
                 <FolderUp className="size-4" />
                 {t("nav.upload")}
               </Button>
-              <SponsorLink label={t("nav.sponsor")} />
+              <div className="flex flex-col gap-1">
+                <SponsorLink label={t("nav.sponsor")} />
+                <InterfaceSwitch label={t("next.general.newInterface")} />
+              </div>
             </div>
           </div>
         </SheetContent>

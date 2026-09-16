@@ -234,6 +234,8 @@ pub(crate) enum DemotionReason {
     /// pageable run is already in scratch and RAM is still over, which means one
     /// staged run is larger than the whole budget.
     HoldsBudgetExceeded,
+    /// PAR3 cannot retain the virtual image; preserve its posted bytes on disk.
+    Par3MemoryPressure,
     /// The holds scratch file could not be created, written or read.
     HoldsScratchFailed,
     /// Paging would push the holds scratch past its configured ceiling. Counted
@@ -515,6 +517,7 @@ impl DemotionReason {
             // Handing the conventional extractor the same image to fail against
             // is not a fallback; real files are.
             Self::ToleratedExtractionFailed => VolumeDemand::Real,
+            Self::Par3MemoryPressure => VolumeDemand::Real,
             // Holds are staged, unrouted bytes: a budget or scratch failure
             // ends *routing* and says nothing about the layout or about the
             // bytes already placed.
@@ -621,6 +624,7 @@ impl DemotionReason {
             Self::Par2Unbindable => "par2_unbindable",
             Self::ToleratedExtractionFailed => "tolerated_extraction_failed",
             Self::HoldsBudgetExceeded => "holds_budget",
+            Self::Par3MemoryPressure => "par3_memory_pressure",
             Self::HoldsScratchFailed => "holds_scratch_io",
             Self::HoldsScratchCeiling => "holds_scratch_ceiling",
             Self::HoldsScratchDiskReserve => "holds_scratch_disk_reserve",
@@ -2245,6 +2249,9 @@ pub(crate) struct DirectSetRouter {
     /// already true when this is consulted. See
     /// [`super::plan::spec_carries_par2`] for why an index alone counts.
     par2_available: bool,
+    /// A PAR3-only job may defer archive checksum failures until its native
+    /// verifier settles. Resolved verdicts never earn another deferral.
+    par3_verification_pending: bool,
     /// Volumes whose posted bytes failed an archive-level checksum that the
     /// wire's own yEnc CRC could not see.
     ///
@@ -2253,7 +2260,7 @@ pub(crate) struct DirectSetRouter {
     /// evidence (the wire is exactly what lied), and any member spanning the
     /// volume holds its whole-member gate until the repair has had its say.
     ///
-    /// Empty unless [`Self::par2_available`], and emptied per volume
+    /// Empty unless PAR2 or PAR3 can answer, and emptied per volume
     /// by [`Self::route_repaired`] — the repair's answer supersedes the
     /// question.
     damaged_volumes: std::collections::BTreeSet<u32>,
@@ -2276,6 +2283,13 @@ pub(crate) struct DirectSetRouter {
     /// both integrity layers only record; [`Self::settle_repair_gates`] runs
     /// them once, over the finished rewrite.
     repair_draining: bool,
+    /// A volume whose replacement spans are arriving across several calls.
+    /// Its integrity gates and durable coverage remain pending until the last
+    /// batch arrives. A different volume cannot finish this replacement.
+    repair_batch: Option<u32>,
+    /// Ordered volumes still awaiting replacement within a set-wide transaction.
+    /// An empty queue remains a fence until the caller confirms placement.
+    repair_transaction: Option<std::collections::VecDeque<u32>>,
     demoted: Option<DemotionReason>,
 }
 
@@ -2342,9 +2356,12 @@ impl DirectSetRouter {
             #[cfg(test)]
             parse_walks: 0,
             par2_available: false,
+            par3_verification_pending: false,
             damaged_volumes: std::collections::BTreeSet::new(),
             repair_rerouted: false,
             repair_draining: false,
+            repair_batch: None,
+            repair_transaction: None,
             demoted: None,
         }
     }
@@ -2357,7 +2374,49 @@ impl DirectSetRouter {
         self.par2_available = available;
     }
 
-    /// Volumes carrying a recorded part-checksum mismatch, awaiting PAR2's
+    pub(crate) fn note_par3_available(&mut self, available: bool) {
+        self.par3_verification_pending = available;
+    }
+
+    pub(crate) fn awaits_par3_verdict(&self) -> bool {
+        self.par3_verification_pending
+    }
+
+    /// Native verification has settled all protected sources. Re-run archive
+    /// checks once; disagreement must now fail rather than defer indefinitely.
+    pub(crate) fn settle_par3_verification(&mut self) -> Result<(), DemotionReason> {
+        if let Some(reason) = self.demoted {
+            return Err(reason);
+        }
+        if self.repair_batch_in_progress() {
+            return Err(self.fail(DemotionReason::RepairRerouteFailed));
+        }
+        self.par3_verification_pending = false;
+        self.damaged_volumes.clear();
+        self.settle_repair_gates()
+            .map_err(|reason| self.fail(reason))
+    }
+
+    fn record_member_checksum_damage(&mut self, member_id: u32) -> bool {
+        if !self.par3_verification_pending || self.repair_rerouted {
+            return false;
+        }
+        let Some(index) = self.layout_index_for_member(member_id) else {
+            return false;
+        };
+        let volumes: Vec<_> = self.layout_members()[index]
+            .parts
+            .iter()
+            .map(|part| part.volume)
+            .collect();
+        self.damaged_volumes.extend(volumes);
+        if let Some(member) = self.member_mut(member_id) {
+            member.verified = false;
+        }
+        true
+    }
+
+    /// Volumes carrying an archive-checksum mismatch, awaiting native recovery's
     /// answer. See [`Self::damaged_volumes`].
     pub(crate) fn damaged_volumes(&self) -> &std::collections::BTreeSet<u32> {
         &self.damaged_volumes
@@ -2383,7 +2442,7 @@ impl DirectSetRouter {
         member_id: u32,
         part_position: u32,
     ) -> bool {
-        if !self.par2_available || self.repair_rerouted {
+        if !(self.par2_available || self.par3_verification_pending) || self.repair_rerouted {
             return false;
         }
         self.damaged_volumes.insert(volume_index);
@@ -2640,8 +2699,19 @@ impl DirectSetRouter {
     /// from the neighbour's own destination reproduces exactly what was posted)
     /// and hands back to [`Self::route_repaired`] as unrepaired lead-in.
     pub(crate) fn cipher_edge_reads(&self, volume_index: u32) -> Vec<(u32, u64, u64)> {
+        self.cipher_edge_reads_bounded(volume_index, usize::MAX)
+            .expect("unbounded edge plan")
+    }
+
+    /// Refuse before allocating more than `limit` edge requests. The caller
+    /// reserves their metadata and bytes before requesting this plan.
+    pub(crate) fn cipher_edge_reads_bounded(
+        &self,
+        volume_index: u32,
+        limit: usize,
+    ) -> Option<Vec<(u32, u64, u64)>> {
         let mut reads = Vec::new();
-        for extent in self.volume_member_extents(volume_index) {
+        for extent in self.routed_extents.get(&volume_index).into_iter().flatten() {
             let Some(member) = self.members.get(&extent.member_id) else {
                 continue;
             };
@@ -2661,46 +2731,31 @@ impl DirectSetRouter {
                 if from >= to {
                     continue;
                 }
-                reads.extend(self.locate_member_cipher(extent.member_id, from, to - from));
-            }
-        }
-        reads.retain(|(volume, _, _)| *volume != volume_index);
-        reads
-    }
-
-    /// Where a member-logical (== cipher) range physically lives, as
-    /// `(volume, physical offset, length)` per volume it crosses.
-    ///
-    /// Read off the **routed extent history** rather than the layout's part
-    /// table, for the same reason: the history is what the destinations
-    /// actually are, and a member that turned ineligible after routing would
-    /// otherwise map its own bytes to the envelope.
-    fn locate_member_cipher(
-        &self,
-        member_id: u32,
-        logical_offset: u64,
-        len: u64,
-    ) -> Vec<(u32, u64, u64)> {
-        let end = logical_offset.saturating_add(len);
-        let mut found = Vec::new();
-        for (volume, extents) in &self.routed_extents {
-            for extent in extents {
-                if extent.member_id != member_id {
-                    continue;
-                }
-                let extent_end = extent.logical_offset.saturating_add(extent.len);
-                let from = logical_offset.max(extent.logical_offset);
-                let to = end.min(extent_end);
-                if from < to {
-                    found.push((
-                        *volume,
-                        extent.physical_offset + (from - extent.logical_offset),
-                        to - from,
-                    ));
+                for (volume, extents) in &self.routed_extents {
+                    if *volume == volume_index {
+                        continue;
+                    }
+                    for candidate in extents
+                        .iter()
+                        .filter(|candidate| candidate.member_id == extent.member_id)
+                    {
+                        let begin = from.max(candidate.logical_offset);
+                        let end = to.min(candidate.logical_offset.saturating_add(candidate.len));
+                        if begin < end {
+                            if reads.len() == limit {
+                                return None;
+                            }
+                            reads.push((
+                                *volume,
+                                candidate.physical_offset + (begin - candidate.logical_offset),
+                                end - begin,
+                            ));
+                        }
+                    }
                 }
             }
         }
-        found
+        Some(reads)
     }
 
     /// Whether some encrypted member this set has **routed bytes for** cannot
@@ -3298,7 +3353,9 @@ impl DirectSetRouter {
 
     /// Whether every learned member has passed its whole-member gate.
     pub(crate) fn all_members_verified(&self) -> bool {
-        !self.members.is_empty() && self.members.values().all(|member| member.verified)
+        !self.repair_batch_in_progress()
+            && !self.members.is_empty()
+            && self.members.values().all(|member| member.verified)
     }
 }
 

@@ -14,6 +14,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
+import { LoadingMark } from "@/lib/loading-mark";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -421,7 +422,8 @@ export function BackupRestoreSection({
               {inspectBusy ? t("settings.restoreAnalyzing") : t("settings.restoreAnalyze")}
             </Button>
             {statusLoading ? (
-              <span className="text-xs text-muted-foreground">
+              <span className="flex items-center gap-2 text-xs text-muted-foreground">
+                <LoadingMark />
                 {t("label.loading")}
               </span>
             ) : (
@@ -891,6 +893,7 @@ export function ApiKeysSection() {
               <Input
                 ref={keyFieldRef}
                 data-testid="raw-api-key"
+                secret
                 readOnly
                 value={createdKey?.rawKey ?? ""}
                 onFocus={handleKeyFieldFocus}

@@ -9,7 +9,9 @@ mod metrics;
 mod nzbget;
 mod request_metrics;
 mod routes;
+mod setup_code;
 mod system;
+mod upgrade_splash;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +38,7 @@ use weaver_server_core::settings::model::SharedConfig;
 
 pub(crate) use self::metrics::PrometheusMetricsExporter;
 pub(crate) use self::request_metrics::HttpMetricsHandle;
+pub(crate) use self::upgrade_splash::UpgradeSplash;
 
 #[derive(Clone)]
 struct SessionToken(Arc<String>);
@@ -176,6 +179,7 @@ pub async fn run_server(
         )
         .layer(cors);
     let app = routes::with_http_host_validation(app, host_security);
+    let app = routes::with_response_hardening(app);
 
     let addr = listener.local_addr()?;
     info!(%addr, base_url = if base_url.is_empty() { "/" } else { &base_url }, "starting HTTP server");

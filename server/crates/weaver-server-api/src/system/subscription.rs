@@ -1,5 +1,5 @@
 use super::*;
-use crate::system::types::{JobDownloadRate, ProviderHoldoff};
+use crate::system::types::{JobDownloadRate, ProviderConnections, ProviderHoldoff};
 
 #[derive(Default)]
 pub(crate) struct SystemSubscription;
@@ -69,9 +69,11 @@ async fn build_system_metrics_snapshot(
     let download_block = handle.get_download_block();
     let is_paused = handle.is_globally_paused();
     let speed_limit_bytes_per_sec = config.read().await.max_download_speed.unwrap_or(0);
-    let provider_holdoffs = handle
-        .nntp_pool()
-        .map(|pool| provider_holdoffs(&pool))
+    let pool = handle.nntp_pool();
+    let provider_holdoffs = pool.as_deref().map(provider_holdoffs).unwrap_or_default();
+    let provider_connections = pool
+        .as_deref()
+        .map(provider_connections)
         .unwrap_or_default();
     // Same read the queue readers make, minus the clone: the job list and the
     // metrics snapshot are both written by the orchestrator's 100 ms tick, so
@@ -90,7 +92,26 @@ async fn build_system_metrics_snapshot(
         global_state: global_queue_state(is_paused, &download_block, speed_limit_bytes_per_sec),
         provider_holdoffs,
         job_download_rates,
+        provider_connections,
     }
+}
+
+/// One atomic load per server, the same count `serverHealth` reports.
+fn provider_connections(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderConnections> {
+    pool.server_configs()
+        .iter()
+        .enumerate()
+        .map(|(idx, cfg)| {
+            let max = pool
+                .configured_connections(weaver_nntp::ServerId(idx))
+                .unwrap_or_else(|| pool.server_load(idx).1);
+            ProviderConnections {
+                label: format!("{}:{}", cfg.host, cfg.port),
+                active: pool.active_connections(idx) as u32,
+                max: max as u32,
+            }
+        })
+        .collect()
 }
 
 /// One atomic load per server; empty in the steady state.

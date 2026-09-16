@@ -1,4 +1,7 @@
-use async_graphql::{Enum, SimpleObject};
+use std::collections::HashSet;
+use std::net::SocketAddr;
+
+use async_graphql::{Enum, Error, ErrorExtensions, InputObject, SimpleObject};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
 pub enum ApiKeyScope {
@@ -130,6 +133,246 @@ pub struct AccessPolicyStatus {
     /// Exposed so the UI can disable those choices with the real reason rather
     /// than letting the operator pick one and fail on submit.
     pub strict_security: bool,
+}
+
+/// Request evidence made available to the network-access resolver by the HTTP
+/// transport. It is deliberately optional: schema-only callers cannot invent
+/// a peer or forwarding chain, and the resolver reports that absence instead
+/// of presenting a guess as a network diagnostic.
+#[derive(Clone)]
+pub struct NetworkRequestSecurityContext {
+    pub peer: Option<SocketAddr>,
+    pub headers: axum::http::HeaderMap,
+}
+
+/// The source controlling the trusted-network list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum NetworkAccessSource {
+    Environment,
+    Stored,
+}
+
+/// The observed request identity used for remembered-browser admission.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct NetworkClientDiagnostics {
+    /// False when the transport did not attach request evidence to GraphQL.
+    pub available: bool,
+    pub peer: Option<String>,
+    pub resolved_client: Option<String>,
+    pub forwarding_headers_ignored: bool,
+    /// `None` when no request evidence was available.
+    pub remembered_client_allowed: Option<bool>,
+}
+
+/// Complete, effective browser network policy with the running and stored
+/// listener state nested in one admin-only query.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct NetworkAccessStatus {
+    pub proxies_editable: bool,
+    pub proxies_env_pinned: bool,
+    pub proxies_source: NetworkAccessSource,
+    pub authenticated_access: bool,
+    pub legacy_compatibility: bool,
+    pub trusted_networks: Vec<String>,
+    /// Explicit `WEAVER_TRUSTED_PROXIES` entries only; the service never
+    /// discovers or infers proxies from a private network.
+    pub trusted_proxies: Vec<String>,
+    pub trusted_networks_source: NetworkAccessSource,
+    pub editable: bool,
+    pub env_pinned: bool,
+    pub remembered_policy_valid: bool,
+    pub current_client: NetworkClientDiagnostics,
+    pub bind_address: HttpBindAddressStatus,
+}
+
+/// A draft for validating the two network settings before a later mutation
+/// persists either one. An empty trusted-network list permits remembered
+/// sessions from any resolvable client in authenticated access mode.
+#[derive(Debug, Clone, InputObject)]
+pub struct NetworkAccessInput {
+    /// Omitted preserves the current proxy list; an empty list trusts no proxy.
+    pub trusted_proxies: Option<Vec<String>>,
+    pub trusted_networks: Vec<String>,
+    pub bind_address: Option<String>,
+}
+
+/// Normalized, non-persistent result of [`NetworkAccessInput`] validation.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct NetworkAccessPreview {
+    pub trusted_proxies: Vec<String>,
+    pub trusted_networks: Vec<String>,
+    /// `None` means the stored bind setting would be cleared to its loopback
+    /// default on restart.
+    pub bind_address: Option<String>,
+    /// Whether the submitted bind setting differs from the running listener.
+    pub restart_required: bool,
+    /// How the current observed client would fare under the submitted list.
+    /// `None` means this GraphQL request had no transport evidence attached.
+    pub current_client_allowed: Option<bool>,
+}
+
+pub(crate) fn network_client_diagnostics(
+    security: &weaver_server_core::security::RuntimeSecurityConfig,
+    request: Option<&NetworkRequestSecurityContext>,
+) -> NetworkClientDiagnostics {
+    let Some(request) = request else {
+        return NetworkClientDiagnostics {
+            available: false,
+            peer: None,
+            resolved_client: None,
+            forwarding_headers_ignored: false,
+            remembered_client_allowed: None,
+        };
+    };
+    let resolved_client = security.resolve_client_ip(request.peer, &request.headers);
+    NetworkClientDiagnostics {
+        available: true,
+        peer: request.peer.map(|peer| peer.ip().to_string()),
+        resolved_client: resolved_client.map(|ip| ip.to_string()),
+        forwarding_headers_ignored: security
+            .forwarding_headers_ignored(request.peer, &request.headers),
+        remembered_client_allowed: Some(
+            security.remembered_client_allowed(request.peer, &request.headers),
+        ),
+    }
+}
+
+pub(crate) fn preview_network_access(
+    input: &NetworkAccessInput,
+    security: &weaver_server_core::security::RuntimeSecurityConfig,
+    bind_status: &HttpBindAddressStatus,
+    request: Option<&NetworkRequestSecurityContext>,
+) -> Result<NetworkAccessPreview, Error> {
+    let normalized_networks = normalize_trusted_networks(&input.trusted_networks)?;
+    let normalized_proxies = input
+        .trusted_proxies
+        .as_ref()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    weaver_server_core::security::parse_ip_or_cidr(entry)
+                        .map(|network| network.trunc().to_string())
+                        .ok_or_else(|| {
+                            network_access_error(
+                                "INVALID_TRUSTED_PROXIES",
+                                format!("Invalid proxy address or CIDR: {entry}"),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+        })
+        .transpose()?;
+    let trusted_networks = if security.trust_env_pinned {
+        security
+            .trusted_cidrs()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        normalized_networks
+    };
+    let trusted_proxies: Vec<String> = if security.proxies_env_pinned() {
+        security
+            .trusted_proxies()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        normalized_proxies.unwrap_or_else(|| {
+            security
+                .trusted_proxies()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        })
+    };
+    let mut seen_proxies = HashSet::new();
+    if trusted_proxies
+        .iter()
+        .any(|proxy| !seen_proxies.insert(proxy))
+    {
+        return Err(network_access_error(
+            "DUPLICATE_TRUSTED_PROXY",
+            "Trusted proxies contains duplicate addresses",
+        ));
+    }
+    let bind_address = normalize_bind_address(input.bind_address.as_deref())?;
+    let (_, restart_required) = pending_bind_state(
+        security.http_bind_address,
+        if input.bind_address.is_some() {
+            bind_address.as_deref()
+        } else {
+            bind_status.stored_address.as_deref()
+        },
+        bind_status.editable,
+    );
+
+    let current_client_allowed = request.map(|request| {
+        let draft_networks = trusted_networks
+            .iter()
+            .filter_map(|network| weaver_server_core::security::parse_ip_or_cidr(network))
+            .collect::<Vec<_>>();
+        let draft_proxies = trusted_proxies
+            .iter()
+            .filter_map(|proxy| weaver_server_core::security::parse_ip_or_cidr(proxy))
+            .collect::<Vec<_>>();
+        security
+            .resolve_client_ip_with_proxies(request.peer, &request.headers, &draft_proxies)
+            .is_some_and(|client| {
+                draft_networks.is_empty()
+                    || draft_networks
+                        .iter()
+                        .any(|network| network.contains(&client))
+            })
+    });
+
+    Ok(NetworkAccessPreview {
+        trusted_proxies,
+        trusted_networks,
+        bind_address,
+        restart_required,
+        current_client_allowed,
+    })
+}
+
+fn normalize_trusted_networks(values: &[String]) -> Result<Vec<String>, Error> {
+    let json = serde_json::to_string(values)
+        .map_err(|error| network_access_error("INVALID_TRUSTED_NETWORKS", error.to_string()))?;
+    let parsed = weaver_server_core::security::parse_trusted_networks_json(&json)
+        .map_err(|error| network_access_error("INVALID_TRUSTED_NETWORKS", error.to_string()))?;
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(parsed.len());
+    for network in parsed {
+        let network = network.trunc().to_string();
+        if !seen.insert(network.clone()) {
+            return Err(network_access_error(
+                "DUPLICATE_TRUSTED_NETWORK",
+                format!("trusted networks contains duplicate CIDR {network:?}"),
+            ));
+        }
+        normalized.push(network);
+    }
+    Ok(normalized)
+}
+
+fn normalize_bind_address(value: Option<&str>) -> Result<Option<String>, Error> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let (address, _) = weaver_server_core::security::resolve_bind_address(None, Some(value))
+        .map_err(|error| network_access_error("INVALID_BIND_ADDRESS", error.to_string()))?;
+    Ok(Some(address.to_string()))
+}
+
+fn network_access_error(code: &'static str, message: impl Into<String>) -> Error {
+    Error::new(message.into()).extend_with(|_, extensions| {
+        extensions.set("code", code);
+    })
 }
 
 #[cfg(test)]

@@ -50,6 +50,8 @@ const LEGACY_V1_STABLE_TABLES: &[&str] = &[
     "schema_version",
     "settings",
     "servers",
+    "proxy_profiles",
+    "proxy_routes",
     "server_download_usage",
     "categories",
     "api_keys",
@@ -63,6 +65,8 @@ const LEGACY_V1_STABLE_TABLES: &[&str] = &[
 ];
 
 const LEGACY_V1_CLEAR_IMPORT_TABLES: &[&str] = &[
+    "proxy_routes",
+    "proxy_profiles",
     "metrics_history_chunks",
     "rss_seen_items",
     "rss_rules",
@@ -769,6 +773,21 @@ impl Database {
                             // Legacy v1 bundles predate the script model, so a
                             // restored history row starts with no summary.
                             let src_post_processing_summary = "'not_run'";
+                            // A bundle taken before per-job server attribution
+                            // existed has no such column; its rows restore with
+                            // no attribution rather than failing the import.
+                            let src_server_attribution = if table_has_column(
+                                &mut conn,
+                                "src",
+                                "job_history",
+                                "server_attribution",
+                            )
+                            .await?
+                            {
+                                "server_attribution"
+                            } else {
+                                "NULL"
+                            };
                             let src_server_backfill =
                                 if table_has_column(&mut conn, "src", "servers", "backfill")
                                     .await?
@@ -913,8 +932,9 @@ impl Database {
                                 ""
                             };
                             let mut tx = conn.begin().await.map_err(db_err)?;
+                            // Qualify the target while the source archive is attached.
                             for table in LEGACY_V1_CLEAR_IMPORT_TABLES {
-                                let sql = format!("DELETE FROM {table}");
+                                let sql = format!("DELETE FROM main.{table}");
                                 sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
                                     .execute(&mut *tx)
                                     .await
@@ -951,7 +971,8 @@ impl Database {
                                      (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                                       optional_recovery_bytes, optional_recovery_downloaded_bytes,
                                       failed_bytes, health, category, output_dir, nzb_path, created_at,
-                                      completed_at, metadata, post_processing_summary)
+                                      completed_at, metadata, post_processing_summary,
+                                      server_attribution)
                                      SELECT job_id, {src_job_hash}, name, status, error_message, total_bytes, downloaded_bytes,
                                             {src_optional_recovery_bytes}, {src_optional_recovery_downloaded_bytes},
                                             failed_bytes, health, category, output_dir, nzb_path, created_at, completed_at,
@@ -966,7 +987,8 @@ impl Database {
                                                      )
                                                 )
                                             END AS metadata,
-                                            {src_post_processing_summary}
+                                            {src_post_processing_summary},
+                                            {src_server_attribution}
                                      FROM src.job_history;
                                  INSERT INTO job_events (id, job_id, timestamp, kind, message, file_id)
                                      SELECT id, job_id, timestamp, kind, message, file_id FROM src.job_events;
@@ -992,6 +1014,20 @@ impl Database {
                             .await
                             .map_err(db_err)?;
                             rebuild_job_history_attributes_tx(&mut tx).await?;
+
+                            // Archives created before proxy routing omit these tables.
+                            // Restore both together so a restricted consumer cannot lose its policy.
+                            for (table, columns) in [
+                                ("proxy_profiles", "id, config, password"),
+                                ("proxy_routes", "consumer, policy"),
+                            ] {
+                                let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM src.sqlite_master WHERE type = 'table' AND name = ?")
+                                    .bind(table).fetch_one(&mut *tx).await.map_err(db_err)?;
+                                if exists != 0 {
+                                    let statement = format!("INSERT INTO main.{table} ({columns}) SELECT {columns} FROM src.{table}");
+                                    sqlx::raw_sql(AssertSqlSafe(statement.as_str())).execute(&mut *tx).await.map_err(db_err)?;
+                                }
+                            }
 
                             tx.commit().await.map_err(db_err)?;
                             Ok::<(), StateError>(())

@@ -20,7 +20,7 @@ pub(crate) use rar::validate_sanitized_rar_member_path;
 /// library defaults.
 pub(crate) use rar::{
     apply_server_rar_limits_with_memory_limit, ensure_rar_dictionary_within_limit,
-    rar_decoder_memory_bytes,
+    rar_decoder_memory_bytes, rar_member_decoder_memory_bytes,
 };
 
 /// And for the extraction itself: the tolerated members are taken under the

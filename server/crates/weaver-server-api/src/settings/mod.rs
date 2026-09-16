@@ -1,3 +1,5 @@
+pub mod first_run;
+pub mod security_upgrade_notice;
 pub mod types;
 
 pub use crate::schema::settings_mutation as mutation;

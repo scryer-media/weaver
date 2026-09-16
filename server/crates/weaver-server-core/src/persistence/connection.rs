@@ -1099,13 +1099,20 @@ impl Database {
     }
 
     /// Check if the database has no settings (i.e. fresh / needs migration).
+    ///
+    /// The install-generation stamp is written the moment a new database is
+    /// created, before any configuration is imported into it, so it does not
+    /// make the database hold settings of its own.
     pub fn is_empty(&self) -> Result<bool, StateError> {
+        use crate::persistence::sql_runtime::SqlArg;
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let count = crate::persistence::sql_runtime::SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT COUNT(*) AS count FROM settings",
-                &[],
+                "SELECT COUNT(*) AS count FROM settings WHERE key <> {}",
+                &[SqlArg::Text(
+                    crate::security::SETTING_INSTALL_GENERATION.to_string(),
+                )],
             )
             .await?
             .map(|row| row.i64("count"))
@@ -1427,6 +1434,9 @@ impl Database {
             for query in [
                 "SELECT password FROM servers WHERE password IS NOT NULL",
                 "SELECT password FROM rss_feeds WHERE password IS NOT NULL",
+                "SELECT password FROM proxy_profiles WHERE password IS NOT NULL",
+                "SELECT password FROM active_jobs WHERE password IS NOT NULL",
+                "SELECT source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
             ] {
                 let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
                 for row in rows {
@@ -1472,6 +1482,18 @@ impl Database {
                 (
                     "RSS feed",
                     "SELECT id, password FROM rss_feeds WHERE password IS NOT NULL",
+                ),
+                (
+                    "proxy",
+                    "SELECT id, password FROM proxy_profiles WHERE password IS NOT NULL",
+                ),
+                (
+                    "archive job",
+                    "SELECT job_id AS id, password FROM active_jobs WHERE password IS NOT NULL",
+                ),
+                (
+                    "archive candidate",
+                    "SELECT job_id AS id, source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
                 ),
             ] {
                 let rows = SqlRuntime::fetch_all(datastore.read_exec(), query, &[]).await?;
@@ -1589,6 +1611,37 @@ impl Database {
                     count = feed_rows.len(),
                     "encrypted plaintext RSS feed passwords"
                 );
+            }
+
+            for (select, update) in [
+                (
+                    "SELECT job_id, password FROM active_jobs WHERE password IS NOT NULL",
+                    "UPDATE active_jobs SET password = {} WHERE job_id = {} AND password = {}",
+                ),
+                (
+                    "SELECT job_id, source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
+                    "UPDATE semantic_duplicate_candidates SET source_password = {} WHERE job_id = {} AND source_password = {}",
+                ),
+            ] {
+                let rows = SqlRuntime::fetch_all(datastore.read_exec(), select, &[]).await?;
+                for row in rows {
+                    let password = row.text("password")?;
+                    if password.is_empty() || is_encrypted(&password) {
+                        continue;
+                    }
+                    let encrypted = crate::persistence::encryption::encrypt_value(&key, &password)
+                        .map_err(StateError::Database)?;
+                    SqlRuntime::execute(
+                        datastore.read_exec(),
+                        update,
+                        &[
+                            SqlArg::Text(encrypted),
+                            SqlArg::I64(row.i64("job_id")?),
+                            SqlArg::Text(password),
+                        ],
+                    )
+                    .await?;
+                }
             }
 
             Ok(())

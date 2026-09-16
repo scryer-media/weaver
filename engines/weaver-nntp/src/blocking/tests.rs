@@ -12,6 +12,9 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
+mod group_discovery;
+mod idle;
+
 enum TestArticle {
     Body(Vec<u8>),
     DelayedInitial {
@@ -40,11 +43,11 @@ fn assert_s2n_socket_timeout_slice(conn: &BlockingNntpConnection) {
         panic!("expected blocking S2N transport");
     };
     assert_eq!(
-        stream.tcp.read_timeout().unwrap(),
+        stream.tcp.tcp().unwrap().read_timeout().unwrap(),
         Some(S2N_BLOCKING_IO_SLICE)
     );
     assert_eq!(
-        stream.tcp.write_timeout().unwrap(),
+        stream.tcp.tcp().unwrap().write_timeout().unwrap(),
         Some(S2N_BLOCKING_IO_SLICE)
     );
 }
@@ -247,6 +250,8 @@ fn spawn_tls_nntp_server(
     });
 
     let config = ServerConfig {
+        proxy: None,
+        revocation: None,
         host: "localhost".to_string(),
         port,
         tls: true,
@@ -1782,14 +1787,13 @@ fn tcp_peer_closed_sees_a_server_side_close_on_an_idle_socket() {
         !tcp_peer_closed(&client),
         "an open idle socket is not closed"
     );
-    // Bytes the server sent but the client has not read yet do not mean the
-    // server is gone, and the probe must not consume them.
+    // A terminal response followed by FIN used to hide EOF indefinitely.
     {
         use std::io::Write;
-        (&server).write_all(b"200 hello\r\n").unwrap();
+        (&server).write_all(b"400 idle timeout\r\n").unwrap();
     }
     std::thread::sleep(Duration::from_millis(50));
-    assert!(!tcp_peer_closed(&client));
+    assert!(tcp_peer_closed(&client));
     let mut probe = [0u8; 1];
     assert_eq!(client.peek(&mut probe).unwrap(), 1);
 
@@ -1797,10 +1801,7 @@ fn tcp_peer_closed_sees_a_server_side_close_on_an_idle_socket() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut closed = false;
     while Instant::now() < deadline {
-        // The unread greeting keeps the peek answering "data": drain it, as
-        // the lane's own reads would have, then the close is visible.
-        let mut sink = [0u8; 64];
-        let _ = (&client).read(&mut sink);
+        // No drain is needed to detect an unusable idle session.
         if tcp_peer_closed(&client) {
             closed = true;
             break;
@@ -1808,6 +1809,8 @@ fn tcp_peer_closed_sees_a_server_side_close_on_an_idle_socket() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(closed, "a server-closed socket reports closed");
+    let mut sink = [0u8; 64];
+    assert!((&client).read(&mut sink).unwrap() > 0);
     // The probe leaves the socket in blocking mode for the lane's own reads.
     let mut byte = [0u8; 1];
     client

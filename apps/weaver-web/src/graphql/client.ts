@@ -4,11 +4,15 @@ import {
   type Client as GraphqlWsClient,
   createClient as createWSClient,
 } from "graphql-ws";
+import { canRetrySessionRequest } from "./session-request";
 
 const graphqlUrl = "graphql";
 const WS_KEEP_ALIVE_MS = 10_000;
 const WS_PONG_TIMEOUT_MS = 5_000;
 const CLIENT_RESTART_THROTTLE_MS = 2_000;
+let browserCsrf: string | null = null;
+let csrfRequest: Promise<boolean> | null = null;
+let csrfLoaded = false;
 
 export type GraphqlConnectionStatus = "connecting" | "connected" | "disconnected";
 
@@ -147,9 +151,14 @@ function tokenRefreshUrl(): string {
   return new URL(".", document.baseURI).href;
 }
 
-function withSessionCredentials(init?: RequestInit): RequestInit {
+function withSessionCredentials(input: RequestInfo | URL, init?: RequestInit): RequestInit {
+  const headers = new Headers(input instanceof Request ? input.headers : undefined);
+  new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+  const target = new URL(input instanceof Request ? input.url : String(input), document.baseURI);
+  if (browserCsrf && target.origin === window.location.origin) headers.set("X-Weaver-Csrf", browserCsrf);
   return {
     ...init,
+    headers,
     credentials: init?.credentials ?? "include",
   };
 }
@@ -158,8 +167,9 @@ export async function fetchWithSessionRetry(
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> {
-  let response = await fetch(input, withSessionCredentials(init));
-  if (response.status !== 401) {
+  if (!csrfLoaded) await refreshSessionCookie();
+  let response = await fetch(input, withSessionCredentials(input, init));
+  if (response.status !== 401 || !canRetrySessionRequest(input, init)) {
     return response;
   }
 
@@ -168,7 +178,7 @@ export async function fetchWithSessionRetry(
     return response;
   }
 
-  response = await fetch(input, withSessionCredentials(init));
+  response = await fetch(input, withSessionCredentials(input, init));
   return response;
 }
 
@@ -210,10 +220,15 @@ function createTrackedWsClient(transportId: number): GraphqlWsClient {
     // Keep the socket alive briefly across React StrictMode unmount/remount
     // cycles so subscriptions don't get killed and re-created.
     lazyCloseTimeout: 3_000,
-    retryAttempts: Number.POSITIVE_INFINITY,
-    // Always retry — auth failures (4401) after a server restart are
-    // recoverable once refreshSessionCookie() picks up the new cookie.
-    shouldRetry: () => true,
+    retryAttempts: 6,
+    connectionParams: async () => {
+      await refreshSessionCookie();
+      return browserCsrf ? { csrf: browserCsrf } : {};
+    },
+    shouldRetry: (event) => {
+      const { code } = getCloseEventMetadata(event);
+      return code !== 4401 && code !== 4403;
+    },
     retryWait: async (retries) => {
       const delay = retries === 0 ? 0 : Math.min(1_000 * 2 ** (retries - 1), 30_000);
       await new Promise((resolve) => setTimeout(resolve, delay));
@@ -323,23 +338,42 @@ export function useGraphqlClient(): Client {
 
 /** Headers that authenticate requests to the Weaver API. */
 export function authHeaders(): Record<string, string> {
-  return {};
+  return browserCsrf ? { "X-Weaver-Csrf": browserCsrf } : {};
 }
 
 /**
- * Fetch the index page from the server so it can issue a fresh HttpOnly
- * browser-session cookie after a server restart.
+ * Recover the current session's CSRF value. Legacy servers refresh their
+ * existing browser cookie through the entry page.
  */
 export async function refreshSessionCookie(): Promise<boolean> {
+  if (csrfRequest) return csrfRequest;
+  csrfRequest = (async () => {
+    try {
+      const csrf = await fetch(new URL("api/auth/csrf", document.baseURI), {
+        credentials: "include", cache: "no-store",
+      });
+      if (csrf.ok) {
+        const payload = await csrf.json();
+        browserCsrf = typeof payload.csrfToken === "string" ? payload.csrfToken : null;
+        csrfLoaded = true;
+        return browserCsrf !== null;
+      }
+      browserCsrf = null;
+      csrfLoaded = true;
+      if (csrf.status !== 404) return false;
+      const response = await fetch(tokenRefreshUrl(), { credentials: "include", cache: "no-store" });
+      if (!response.ok) return false;
+      await response.arrayBuffer();
+      return true;
+    } catch {
+      return false;
+    }
+  })();
   try {
-    const res = await fetch(tokenRefreshUrl(), { credentials: "include" });
-    if (!res.ok) return false;
-    await res.arrayBuffer();
-    return true;
-  } catch {
-    // Server still down — leave the current cookie as-is, will retry later.
+    return await csrfRequest;
+  } finally {
+    csrfRequest = null;
   }
-  return false;
 }
 
 export async function requestGraphqlClientRestart() {

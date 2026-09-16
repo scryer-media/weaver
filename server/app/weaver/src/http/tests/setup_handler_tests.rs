@@ -15,6 +15,7 @@ fn setup_test_router(
         .layer(axum::extract::connect_info::MockConnectInfo(peer))
         .layer(Extension(db))
         .layer(Extension(security))
+        .layer(Extension(assets::BaseUrl(Arc::new("/".to_string()))))
         .layer(Extension(auth_cache))
         .layer(Extension(SessionToken(Arc::new(
             "browser-session-token".to_string(),
@@ -46,15 +47,23 @@ struct SetupOutcome {
 }
 
 async fn post_setup(app: Router, body: serde_json::Value) -> SetupOutcome {
+    post_setup_with_headers(app, body, &[]).await
+}
+
+async fn post_setup_with_headers(
+    app: Router,
+    body: serde_json::Value,
+    headers: &[(&str, &str)],
+) -> SetupOutcome {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/auth/setup")
+        .header(header::CONTENT_TYPE, "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/setup")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
     let status = response.status();
@@ -221,6 +230,25 @@ async fn credentials_are_required_by_login_modes_and_refused_by_no_login() {
 
         let outcome = post_setup(app, serde_json::json!({ "mode": mode })).await;
         assert_eq!(outcome.status, StatusCode::BAD_REQUEST, "{mode}");
+        assert_nothing_written(&db);
+
+        let db = Database::open_in_memory().unwrap();
+        let app = setup_test_router(
+            db.clone(),
+            LoginAuthCache::default(),
+            RuntimeSecurityConfig::default(),
+            loopback_peer(),
+        );
+        let outcome = post_setup(
+            app,
+            serde_json::json!({ "mode": mode, "username": "admin", "password": "short" }),
+        )
+        .await;
+        assert_eq!(outcome.status, StatusCode::BAD_REQUEST, "{mode}");
+        assert_eq!(
+            outcome.payload["error"], "password must be at least 8 characters",
+            "{mode}"
+        );
         assert_nothing_written(&db);
     }
 
@@ -505,4 +533,68 @@ async fn setup_reports_whether_the_wizard_may_offer_a_restart() {
     if outcome.payload["restartSupported"] == false {
         assert!(outcome.payload["restartUnsupportedReason"].is_string());
     }
+}
+
+fn authenticated_setup_router(challenge: setup_code::SetupChallenge) -> (Database, Router) {
+    let db = Database::open_in_memory().unwrap();
+    db.mark_initial_setup_pending().unwrap();
+    let security = RuntimeSecurityConfig::default();
+    security.apply_stored_access_policy_revision(None, None, false);
+    assert!(security.authenticated_access_mode());
+    let app = setup_test_router(
+        db.clone(),
+        LoginAuthCache::default(),
+        security,
+        loopback_peer(),
+    )
+    .layer(Extension(challenge));
+    (db, app)
+}
+
+fn administrator() -> serde_json::Value {
+    serde_json::json!({
+        "mode": "login_required",
+        "username": "admin",
+        "password": "longpassword",
+    })
+}
+
+#[tokio::test]
+async fn a_loopback_install_sets_up_without_a_code() {
+    let (db, app) = authenticated_setup_router(setup_code::SetupChallenge::open());
+    let outcome =
+        post_setup_with_headers(app, administrator(), &[("origin", "http://127.0.0.1:9090")]).await;
+
+    assert_eq!(outcome.status, StatusCode::OK, "{}", outcome.payload);
+    assert!(db.get_auth_credentials().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_loopback_install_refuses_codeless_setup_relayed_by_a_proxy() {
+    let (db, app) = authenticated_setup_router(setup_code::SetupChallenge::open());
+    let outcome = post_setup_with_headers(
+        app,
+        administrator(),
+        &[
+            ("origin", "https://weaver.example.test"),
+            ("x-forwarded-for", "203.0.113.9"),
+        ],
+    )
+    .await;
+
+    assert_eq!(outcome.status, StatusCode::FORBIDDEN);
+    assert_eq!(outcome.payload["code"], "SETUP_LOCAL_ONLY");
+    assert!(db.get_auth_credentials().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_code_challenge_still_requires_its_code() {
+    let (challenge, _code) = setup_code::SetupChallenge::generate();
+    let (db, app) = authenticated_setup_router(challenge);
+    let outcome =
+        post_setup_with_headers(app, administrator(), &[("origin", "http://127.0.0.1:9090")]).await;
+
+    assert_eq!(outcome.status, StatusCode::FORBIDDEN);
+    assert_eq!(outcome.payload["code"], "SETUP_CODE_REQUIRED");
+    assert!(db.get_auth_credentials().unwrap().is_none());
 }

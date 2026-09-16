@@ -281,6 +281,62 @@ impl DirectSetRouter {
             .ok()
     }
 
+    /// CBC neighbours for complete replacement images, including part bytes
+    /// that never arrived. The layout supplies coordinates; the caller must
+    /// read them from verified outputs or generation-checked source coverage.
+    /// Refuse incomplete geometry or requests beyond the reserved limit.
+    pub(crate) fn cipher_replacement_edge_reads_bounded(
+        &self,
+        volume: u32,
+        limit: usize,
+    ) -> Option<Vec<(u32, u64, u64)>> {
+        let mut reads = Vec::new();
+        for (index, member) in self.layout_members().iter().enumerate() {
+            let Some(crypt) = self
+                .member_id_for_layout(index)
+                .and_then(|id| self.members.get(&id))
+                .and_then(|member| member.crypt.as_ref())
+            else {
+                continue;
+            };
+            for part in member.parts.iter().filter(|part| part.volume == volume) {
+                let low = part.logical_offset?;
+                let high = low.checked_add(part.data_size)?;
+                let cipher_size = crypt.cipher_size()?;
+                for (from, to) in [
+                    (block_floor(low).saturating_sub(AES_BLOCK), low),
+                    (high, block_ceil(high).min(cipher_size)),
+                ] {
+                    if from >= to {
+                        continue;
+                    }
+                    let mut cursor = from;
+                    while cursor < to {
+                        let candidate = member.parts.iter().find(|candidate| {
+                            candidate.logical_offset.is_some_and(|start| {
+                                cursor >= start && cursor - start < candidate.data_size
+                            })
+                        })?;
+                        let start = candidate.logical_offset?;
+                        let end = to.min(start.checked_add(candidate.data_size)?);
+                        if candidate.volume != volume {
+                            if reads.len() == limit {
+                                return None;
+                            }
+                            reads.push((
+                                candidate.volume,
+                                candidate.data_offset.checked_add(cursor - start)?,
+                                end - cursor,
+                            ));
+                        }
+                        cursor = end;
+                    }
+                }
+            }
+        }
+        Some(reads)
+    }
+
     /// Reads a member-logical (== cipher) range out of whatever source volumes
     /// hold it, through the layout's part table.
     ///
@@ -686,6 +742,9 @@ impl DirectSetRouter {
                 return Ok(());
             };
             if crypt.fold_member_crc(composed, uses_mac) != Some(expected) {
+                if self.record_member_checksum_damage(member_id) {
+                    return Ok(());
+                }
                 return Err(self.fail(DemotionReason::MemberChecksumMismatch));
             }
             if let Some(member) = self.member_mut(member_id) {
@@ -702,6 +761,9 @@ impl DirectSetRouter {
             composed = weaver_yenc::crc32_combine(composed, value, *len);
         }
         if composed != expected {
+            if self.record_member_checksum_damage(member_id) {
+                return Ok(());
+            }
             return Err(self.fail(DemotionReason::MemberChecksumMismatch));
         }
         if let Some(member) = self.member_mut(member_id) {

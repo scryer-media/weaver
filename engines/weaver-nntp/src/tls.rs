@@ -1,3 +1,4 @@
+use crate::route_stream::RouteStream;
 use std::io::{self, Cursor, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -115,7 +116,7 @@ fn is_name_mismatch(error: &RustlsError) -> bool {
 /// typechecks (pin-project-lite cannot cfg-gate variants) but can never be
 /// constructed because backend selection rejects s2n there.
 #[cfg(not(windows))]
-type S2nTransportStream = S2nTlsStream<TcpStream>;
+type S2nTransportStream = S2nTlsStream<RouteStream>;
 #[cfg(windows)]
 type S2nTransportStream = UnsupportedTlsStream;
 
@@ -166,13 +167,13 @@ pin_project_lite::pin_project! {
     #[project = NntpTransportProj]
     pub enum NntpTransport {
         /// Unencrypted TCP.
-        Plain { #[pin] inner: TcpStream, remote_addr: SocketAddr },
+        Plain { #[pin] inner: RouteStream, remote_addr: Option<SocketAddr> },
         /// TLS-encrypted TCP through tokio-rustls.
-        Tls { #[pin] inner: RustlsTlsStream<TcpStream>, remote_addr: SocketAddr },
+        Tls { #[pin] inner: RustlsTlsStream<RouteStream>, remote_addr: Option<SocketAddr> },
         /// TLS-encrypted TCP driven directly through rustls.
-        ManualTls { inner: ManualTlsStream, remote_addr: SocketAddr },
+        ManualTls { inner: ManualTlsStream, remote_addr: Option<SocketAddr> },
         /// TLS-encrypted TCP through s2n-tls (non-Windows only).
-        S2nTls { #[pin] inner: S2nTransportStream, remote_addr: SocketAddr },
+        S2nTls { #[pin] inner: S2nTransportStream, remote_addr: Option<SocketAddr> },
     }
 }
 
@@ -314,7 +315,7 @@ fn s2n_negotiated_cipher_suite(inner: &S2nTransportStream) -> Option<String> {
 }
 
 pub struct ManualTlsStream {
-    tcp: TcpStream,
+    tcp: RouteStream,
     session: RustlsSession,
     read_buffer: Vec<u8>,
 }
@@ -328,6 +329,12 @@ pub(crate) struct RustlsSession {
 }
 
 impl RustlsSession {
+    /// Idle NNTP has no application data. EOF, plaintext, and fatal TLS
+    /// errors all mean the cached transport must not serve another command.
+    pub(crate) fn idle_terminal(&mut self) -> bool {
+        !matches!(self.tls.reader().read(&mut [0; 1]), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+    }
+
     pub(crate) fn new(
         config: Arc<ClientConfig>,
         server_name: ServerName<'static>,
@@ -367,6 +374,69 @@ impl RustlsSession {
 }
 
 impl NntpTransport {
+    /// Inspect only idle transport state: no NNTP commands, waits, or more
+    /// than 64 KiB of ciphertext. Fragmented TLS state stays in the session.
+    pub(crate) fn idle_terminal(&mut self) -> bool {
+        let poll = |stream: &mut (dyn AsyncRead + Unpin)| {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut byte = [0; 1];
+            let mut buf = ReadBuf::new(&mut byte);
+            std::pin::Pin::new(stream)
+                .poll_read(&mut cx, &mut buf)
+                .is_ready()
+        };
+        match self {
+            Self::Plain { inner, .. } => poll(inner),
+            Self::Tls { inner, .. } => {
+                inner.get_mut().0.begin_inspection();
+                let terminal = poll(inner);
+                inner.get_mut().0.end_inspection();
+                terminal
+            }
+            #[cfg(not(windows))]
+            Self::S2nTls { inner, .. } => {
+                inner.get_mut().begin_inspection();
+                let terminal = poll(inner);
+                inner.get_mut().end_inspection();
+                terminal
+            }
+            #[cfg(windows)]
+            Self::S2nTls { inner, .. } => match *inner {},
+            Self::ManualTls { inner, .. } => {
+                let mut input = [0; 4096];
+                let mut plaintext = BytesMut::new();
+                for _ in 0..16 {
+                    if inner.session.idle_terminal() {
+                        return true;
+                    }
+                    match inner.tcp.try_read(&mut input) {
+                        Ok(0) => return true,
+                        Ok(n) => {
+                            if inner
+                                .session
+                                .feed_ciphertext_slice(&input[..n], &mut plaintext, None)
+                                .is_err()
+                                || !plaintext.is_empty()
+                            {
+                                return true;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            return false;
+                        }
+                        Err(_) => return true,
+                    }
+                }
+                inner.session.idle_terminal()
+            }
+        }
+    }
+
     /// Returns `true` if this transport is TLS-encrypted.
     pub fn is_tls(&self) -> bool {
         matches!(
@@ -377,7 +447,7 @@ impl NntpTransport {
         )
     }
 
-    pub fn remote_addr(&self) -> SocketAddr {
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
         match self {
             NntpTransport::Plain { remote_addr, .. }
             | NntpTransport::Tls { remote_addr, .. }
@@ -478,13 +548,13 @@ impl NntpTransport {
 
 impl ManualTlsStream {
     pub(crate) async fn connect(
-        tcp: TcpStream,
+        tcp: impl Into<RouteStream>,
         config: Arc<ClientConfig>,
         server_name: ServerName<'static>,
     ) -> Result<Self, NntpError> {
         let session = RustlsSession::new(config, server_name)?;
         let mut stream = Self {
-            tcp,
+            tcp: tcp.into(),
             session,
             read_buffer: vec![0u8; TLS_READ_BUFFER],
         };
@@ -1234,10 +1304,10 @@ fn s2n_handshake_error(error: s2n_tls::error::Error) -> NntpError {
 
 #[cfg(not(windows))]
 async fn connect_s2n_tls(
-    tcp: TcpStream,
+    tcp: impl Into<RouteStream>,
     tls_config: S2nConfig,
     host: &str,
-) -> Result<S2nTlsStream<TcpStream>, NntpError> {
+) -> Result<S2nTlsStream<RouteStream>, NntpError> {
     let builder = s2n_tls::connection::ModifiedBuilder::new(
         tls_config,
         |conn: &mut s2n_tls::connection::Connection| {
@@ -1246,7 +1316,7 @@ async fn connect_s2n_tls(
         },
     );
     S2nTlsConnector::new(builder)
-        .connect(host, tcp)
+        .connect(host, tcp.into())
         .await
         .map_err(s2n_handshake_error)
 }
@@ -1300,12 +1370,12 @@ fn filter_and_rotate_addrs(
 
 async fn connect_tcp_from_resolved(
     addrs: &[SocketAddr],
-) -> Result<(TcpStream, SocketAddr), NntpError> {
+) -> Result<(TcpStream, Option<SocketAddr>), NntpError> {
     let mut last_error = None;
     for addr in addrs {
         match TcpStream::connect(addr).await {
             Ok(tcp) => {
-                let remote_addr = tcp.peer_addr()?;
+                let remote_addr = Some(tcp.peer_addr()?);
                 tcp.set_nodelay(true)?;
                 set_keepalive(&tcp);
                 return Ok((tcp, remote_addr));
@@ -1333,18 +1403,136 @@ pub async fn inspect_tls_name_mismatch_certificate(
     port: u16,
     ca_cert_path: Option<&Path>,
 ) -> Result<Option<Vec<u8>>, NntpError> {
+    inspect_tls_name_mismatch_certificate_via(host, port, ca_cert_path, None).await
+}
+
+/// The hostnames a certificate is issued for, for showing to a person.
+///
+/// Returns the certificate's DNS subject alternative names, or its subject
+/// common name when it has none. Empty when the certificate cannot be parsed.
+pub fn certificate_names(der: &[u8]) -> Vec<String> {
+    let der = CertificateDer::from(der);
+    let Ok(cert) = webpki::EndEntityCert::try_from(&der) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for name in cert.valid_dns_names() {
+        if !names.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    if names.is_empty()
+        && let Some(common_name) = subject_common_name(cert.subject())
+    {
+        names.push(common_name);
+    }
+    names
+}
+
+/// The first common name in a DER subject whose outer `SEQUENCE` is removed.
+fn subject_common_name(mut subject: &[u8]) -> Option<String> {
+    const COMMON_NAME_OID: &[u8] = &[0x55, 0x04, 0x03];
+    while !subject.is_empty() {
+        let (tag, mut set, rest) = der_element(subject)?;
+        subject = rest;
+        if tag != 0x31 {
+            continue;
+        }
+        while !set.is_empty() {
+            let (tag, attribute, rest) = der_element(set)?;
+            set = rest;
+            if tag != 0x30 {
+                continue;
+            }
+            let (oid_tag, oid, value) = der_element(attribute)?;
+            if oid_tag != 0x06 || oid != COMMON_NAME_OID {
+                continue;
+            }
+            let (value_tag, value, _) = der_element(value)?;
+            // UTF8String, PrintableString, T61String, IA5String.
+            if !matches!(value_tag, 0x0c | 0x13 | 0x14 | 0x16) {
+                return None;
+            }
+            let name = std::str::from_utf8(value).ok()?.trim();
+            return (!name.is_empty()).then(|| name.to_string());
+        }
+    }
+    None
+}
+
+/// Split one DER element into its tag, contents and the bytes after it.
+fn der_element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&first, mut rest) = rest.split_first()?;
+    let len = if first & 0x80 == 0 {
+        usize::from(first)
+    } else {
+        let count = usize::from(first & 0x7f);
+        if count == 0 || count > std::mem::size_of::<usize>() || rest.len() < count {
+            return None;
+        }
+        let (bytes, tail) = rest.split_at(count);
+        rest = tail;
+        bytes
+            .iter()
+            .fold(0usize, |len, &byte| (len << 8) | usize::from(byte))
+    };
+    if rest.len() < len {
+        return None;
+    }
+    let (contents, after) = rest.split_at(len);
+    Some((tag, contents, after))
+}
+
+pub async fn inspect_tls_name_mismatch_certificate_via(
+    host: &str,
+    port: u16,
+    ca_cert_path: Option<&Path>,
+    proxy: Option<&Arc<weaver_tunnel::bridge::Bridge>>,
+) -> Result<Option<Vec<u8>>, NntpError> {
+    let timeout = proxy.map_or(std::time::Duration::from_secs(30), |p| p.connect_timeout);
+    tokio::time::timeout(
+        timeout,
+        inspect_certificate_inner(host, port, ca_cert_path, proxy),
+    )
+    .await
+    .map_err(|_| NntpError::Timeout)?
+}
+
+async fn inspect_certificate_inner(
+    host: &str,
+    port: u16,
+    ca_cert_path: Option<&Path>,
+    proxy: Option<&Arc<weaver_tunnel::bridge::Bridge>>,
+) -> Result<Option<Vec<u8>>, NntpError> {
     let captured_leaf_der = Arc::new(Mutex::new(None));
     let tls_config =
         build_tls_config_with_name_mismatch_capture(ca_cert_path, captured_leaf_der.clone())?;
     let server_name = make_server_name(host)?;
-    let addrs = resolve_connect_addrs(host, port, &[], 0).await?;
-    let (tcp, _) = connect_tcp_from_resolved(&addrs).await?;
+    let tcp: RouteStream = if let Some(proxy) = proxy {
+        proxy.dial(host, port).await?.0.into()
+    } else {
+        let addrs = resolve_connect_addrs(host, port, &[], 0).await?;
+        connect_tcp_from_resolved(&addrs).await?.0.into()
+    };
 
     let _ = ManualTlsStream::connect(tcp, tls_config, server_name).await;
     Ok(captured_leaf_der
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take())
+}
+
+/// Detect destination TLS errors without treating them as proxy establishment failures.
+pub fn is_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if error.is::<tokio_rustls::rustls::Error>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// Connect to a host with implicit TLS (e.g. port 563).
@@ -1425,7 +1613,7 @@ pub async fn connect_plain_with_ip_policy(
     let addrs = resolve_connect_addrs(host, port, excluded_ips, address_offset).await?;
     let (tcp, remote_addr) = connect_tcp_from_resolved(&addrs).await?;
     Ok(NntpTransport::Plain {
-        inner: tcp,
+        inner: tcp.into(),
         remote_addr,
     })
 }
@@ -1658,6 +1846,37 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn certificate_names_lists_the_hosts_a_certificate_is_issued_for() {
+        let certificate = rcgen::generate_simple_self_signed(vec![
+            "news.example".to_string(),
+            "*.news.example".to_string(),
+            "NEWS.example".to_string(),
+        ])
+        .expect("certificate");
+
+        assert_eq!(
+            certificate_names(certificate.cert.der()),
+            vec!["news.example".to_string(), "*.news.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn certificate_names_falls_back_to_the_common_name() {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "legacy.example");
+        let key = rcgen::KeyPair::generate().expect("key");
+        let certificate = params.self_signed(&key).expect("certificate");
+
+        assert_eq!(
+            certificate_names(certificate.der()),
+            vec!["legacy.example".to_string()]
+        );
+        assert!(certificate_names(b"not a certificate").is_empty());
     }
 
     #[test]
@@ -2021,7 +2240,7 @@ mod tests {
             .expect("s2n TLS connect");
         let mut transport = NntpTransport::S2nTls {
             inner: s2n_tls,
-            remote_addr: addr,
+            remote_addr: Some(addr),
         };
         let mut read_buf = BytesMut::with_capacity(TLS_TEST_BUFFER_BYTES);
         let mut total = 0usize;

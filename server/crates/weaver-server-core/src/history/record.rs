@@ -17,6 +17,12 @@ pub struct JobHistoryRow {
     pub created_at: i64,
     pub completed_at: i64,
     pub metadata: Option<String>,
+    /// Compact per-server article and byte counts for this job, as written by
+    /// [`crate::jobs::server_attribution::JobServerAttribution::to_storage_json`].
+    ///
+    /// `None` for a job that attributed nothing, and for every job finished
+    /// before this was recorded.
+    pub server_attribution: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -339,6 +339,7 @@ struct OwnedLaneRun {
 enum OwnedLanePoolCommand {
     Run(Box<OwnedLaneRun>),
     Reset,
+    RecallSocket(u64),
     /// Open a connection now, before there is work for it.
     ///
     /// A job whose first wave is held to a barrier — the PAR2 index bootstrap
@@ -565,6 +566,7 @@ impl OwnedDownloadLanePool {
             .map_err(|error| match error.0 {
                 OwnedLanePoolCommand::Run(run) => run.initial_lease,
                 OwnedLanePoolCommand::Reset
+                | OwnedLanePoolCommand::RecallSocket(_)
                 | OwnedLanePoolCommand::Warm(_)
                 | OwnedLanePoolCommand::Probe { .. } => {
                     unreachable!("only a Run command is sent from submit")
@@ -623,7 +625,7 @@ fn spawn_owned_lane_worker(
 fn run_owned_lane_worker(
     index: usize,
     rx: std_mpsc::Receiver<OwnedLanePoolCommand>,
-    shared: &std::sync::Mutex<OwnedLanePoolShared>,
+    shared: &Arc<std::sync::Mutex<OwnedLanePoolShared>>,
 ) {
     let mut cached_lane: Option<CachedOwnedLane> = None;
     'work: loop {
@@ -642,6 +644,16 @@ fn run_owned_lane_worker(
         // commands are answered in place and leave the worker idle, so the
         // idle marker is only re-published after a run.
         loop {
+            if let Some(cached) = cached_lane.as_ref() {
+                let owner = Arc::downgrade(shared);
+                cached.lane.mark_idle(Arc::new(move |id| {
+                    if let Some(owner) = owner.upgrade() {
+                        let _ = lock_pool(&owner).workers[index]
+                            .sender
+                            .send(OwnedLanePoolCommand::RecallSocket(id));
+                    }
+                }));
+            }
             let command = match rx.recv_timeout(CACHED_LANE_LIVENESS_INTERVAL) {
                 Ok(command) => command,
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {
@@ -657,6 +669,17 @@ fn run_owned_lane_worker(
                 Err(std_mpsc::RecvTimeoutError::Disconnected) => break 'work,
             };
             match command {
+                OwnedLanePoolCommand::RecallSocket(id) => {
+                    if cached_lane
+                        .as_ref()
+                        .is_some_and(|cached| cached.lane.socket_id() == id)
+                    {
+                        lock_pool(shared).note_idle_lane(index, None);
+                        // Local closure acknowledges this exact recall. No
+                        // waiting for QUIT, and no refund before socket drop.
+                        cached_lane.take();
+                    }
+                }
                 // The submit that sent this already claimed the worker, so
                 // there is no marker to clear.
                 OwnedLanePoolCommand::Run(run) => {
@@ -686,6 +709,10 @@ fn run_owned_lane_worker(
                     }
                     // The lane keeps its cached connection and its idle marker
                     // across a probe: a borrow of the socket, not a lease.
+                    discard_closed_cached_lane(&mut cached_lane);
+                    if let Some(cached) = cached_lane.as_ref() {
+                        cached.lane.mark_active();
+                    }
                     let answer = cached_lane
                         .as_mut()
                         .map(|cached: &mut CachedOwnedLane| cached.lane.probe_exists(&message_ids));
@@ -716,14 +743,15 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
     let OwnedLaneWarm {
         nntp,
         groups,
-        exclude_servers,
+        mut exclude_servers,
         byte_estimate,
     } = warm;
-    match nntp.try_acquire_blocking_body_lane_with_estimate(
-        &groups,
-        &exclude_servers,
-        byte_estimate,
-    ) {
+    exclude_servers = exclude_servers
+        .iter()
+        .copied()
+        .chain((0..nntp.pool().server_count()).filter(|&idx| nntp.pool().requires_recovery(idx)))
+        .collect();
+    match nntp.try_warm_blocking_body_lane(&groups, &exclude_servers, byte_estimate) {
         Ok(lane) => {
             *cached_lane = Some(CachedOwnedLane { nntp, lane });
         }
@@ -813,7 +841,7 @@ const CACHED_LANE_LIVENESS_INTERVAL: Duration = Duration::from_secs(15);
 /// than when the next lease finds the socket dead.
 fn discard_closed_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) -> bool {
     if !cached_lane
-        .as_ref()
+        .as_mut()
         .is_some_and(|cached| cached.lane.peer_closed())
     {
         return false;
@@ -886,6 +914,8 @@ enum LaneStop {
     /// BODY would expect it, so the ring still drains, but nothing more may be
     /// issued on it.
     PolicyBlocked,
+    RecoveryYield,
+    Quarantined,
     /// The hot job asked for this connection back.
     HotShareYield,
     /// The result or refill channel is gone; the orchestrator is shutting down.
@@ -895,6 +925,8 @@ enum LaneStop {
 fn lane_stop_park(stop: Option<LaneStop>) -> Option<(LaneParkReason, bool)> {
     Some(match stop? {
         LaneStop::ConnectionLost | LaneStop::Error => (LaneParkReason::Error, false),
+        LaneStop::RecoveryYield => (LaneParkReason::ProbeYield, true),
+        LaneStop::Quarantined => (LaneParkReason::Capacity, false),
         LaneStop::PolicyBlocked => (
             LaneParkReason::ServerQuota,
             keep_cached_lane_after_park(LaneParkReason::ServerQuota),
@@ -1009,6 +1041,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     // A cached connection the server closed while it sat idle serves nothing:
     // its first BODY would fail only after a read timeout and burn a retry.
     discard_closed_cached_lane(cached_lane);
+    if let Some(cached) = cached_lane.as_ref() {
+        cached.lane.mark_active();
+    }
     // A connection opened for another job's newsgroups is kept and re-pointed
     // rather than redialled; only a socket that cannot be re-pointed is let
     // go, and the dial below then replaces it.
@@ -1061,6 +1096,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         .lane;
     let server_idx = lane.server_id().0;
     let supports_pipelining = lane.supports_pipelining();
+    let recovery_probe = lane.is_recovery_probe();
 
     // The mode the scheduler booked this lane's depth gauge under. The initial
     // dispatch booked the requested mode; every granted refill rebooks the
@@ -1078,6 +1114,28 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         .into_iter()
         .map(|work| (work, Arc::clone(&context)))
         .collect();
+    if recovery_probe && pending.len() > 1 {
+        // Release every other article's actor reservation before issuing the
+        // probe. A slow recovery must not hold a normal multi-article lease.
+        let returned = pending
+            .split_off(1)
+            .into_iter()
+            .map(|(work, _)| work)
+            .collect();
+        if send_owned_batch(
+            &event_tx,
+            context.lane_id,
+            Vec::new(),
+            returned,
+            weaver_nntp::blocking::BlockingLaneStats::default(),
+            true,
+        )
+        .is_err()
+        {
+            park_cached_lane(cached_lane);
+            return;
+        }
+    }
     let mut inflight: VecDeque<(DownloadWork, Arc<LaneLeaseContext>)> = VecDeque::new();
     let mut pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>> = None;
     let mut refill_denied = false;
@@ -1133,6 +1191,10 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
 
         // Top the ring back up to the depth in force.
         while stop.is_none() && lane.ring_outstanding() < context.depth() {
+            if !lane.accepts_new_work() {
+                stop = Some(LaneStop::Quarantined);
+                break;
+            }
             let Some((work, work_context)) = pending.pop_front() else {
                 break;
             };
@@ -1142,6 +1204,10 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             let trace = match outcome {
                 weaver_nntp::blocking::RingIssueOutcome::Issued => {
                     inflight.push_back((work, work_context));
+                    if recovery_probe {
+                        stop = Some(LaneStop::RecoveryYield);
+                        break;
+                    }
                     continue;
                 }
                 weaver_nntp::blocking::RingIssueOutcome::Rejected(trace) => {
@@ -2001,6 +2067,7 @@ mod tests {
             0,
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: vec![weaver_nntp::client::FetchAttemptTrace {
+                    connection_health: None,
                     server_idx: 0,
                     remote_ip: None,
                     elapsed: Duration::from_millis(3),

@@ -149,8 +149,15 @@ pub fn platform_keystores(_data_dir: Option<PathBuf>) -> Vec<Box<dyn KeyStore>> 
         stores.push(Box::new(super::macos::MacOSKeychain::new()));
     }
 
+    // A non-interactive Windows process keeps the file-backed store, exactly
+    // as macOS does, so key persistence stays exercisable without touching
+    // the real Credential Manager.
     #[cfg(target_os = "windows")]
-    if !interactive_disabled {
+    if interactive_disabled {
+        if let Some(dir) = _data_dir.clone() {
+            stores.push(Box::new(super::key_file::KeyFile::new(dir)));
+        }
+    } else {
         stores.push(Box::new(
             super::windows::WindowsCredentialManager::for_data_dir(_data_dir.as_deref()),
         ));

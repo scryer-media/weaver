@@ -7,6 +7,14 @@ use super::repository::{encode_categories, encode_metadata};
 
 impl Database {
     pub fn insert_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
+        self.insert_rss_feed_with_routing(feed, None)
+    }
+
+    pub fn insert_rss_feed_with_routing(
+        &self,
+        feed: &RssFeedRow,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+    ) -> Result<(), StateError> {
         use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
@@ -14,9 +22,13 @@ impl Database {
         let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &feed.password)
             .map_err(StateError::Database)?;
         let args = rss_feed_args(feed, metadata, encrypted_password);
+        let routing = routing.cloned();
+        let consumer = crate::proxies::Consumer::Rss(feed.id);
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.read_exec(),
+            SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
+                let args = args.clone(); let routing = routing.clone();
+                Box::pin(async move {
+            tx.execute(
                 "INSERT INTO rss_feeds
                     (id, name, url, enabled, poll_interval_secs, username, password, default_category,
                      default_metadata, etag, last_modified, last_polled_at, last_success_at, last_error,
@@ -25,11 +37,22 @@ impl Database {
                 &args,
             )
             .await?;
+            crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref()).await?;
             Ok(())
+                })
+            }).await
         })
     }
 
     pub fn update_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
+        self.update_rss_feed_with_routing(feed, None)
+    }
+
+    pub fn update_rss_feed_with_routing(
+        &self,
+        feed: &RssFeedRow,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+    ) -> Result<(), StateError> {
         use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();
@@ -39,32 +62,52 @@ impl Database {
         let mut args = rss_feed_args(feed, metadata, encrypted_password);
         let id = args.remove(0);
         args.push(id);
+        let routing = routing.cloned();
+        let consumer = crate::proxies::Consumer::Rss(feed.id);
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.read_exec(),
-                "UPDATE rss_feeds
+            SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
+                let args = args.clone();
+                let routing = routing.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE rss_feeds
                     SET name = {}, url = {}, enabled = {}, poll_interval_secs = {}, username = {},
                         password = {}, default_category = {}, default_metadata = {}, etag = {},
                         last_modified = {}, last_polled_at = {}, last_success_at = {},
                         last_error = {}, consecutive_failures = {}
                   WHERE id = {}",
-                &args,
-            )
-            .await?;
-            Ok(())
+                        &args,
+                    )
+                    .await?;
+                    crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref())
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
         })
     }
 
     pub fn delete_rss_feed(&self, id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.read_exec(),
-                "DELETE FROM rss_feeds WHERE id = {}",
-                &[SqlArg::I64(i64::from(id))],
-            )
-            .await?;
-            Ok(changed > 0)
+            SqlRuntime::run_in_transaction(&datastore, "delete_routed_consumer", |tx| {
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "DELETE FROM rss_feeds WHERE id = {}",
+                            &[SqlArg::I64(i64::from(id))],
+                        )
+                        .await?;
+                    tx.execute(
+                        "DELETE FROM proxy_routes WHERE consumer = {}",
+                        &[SqlArg::Text(crate::proxies::Consumer::Rss(id).key())],
+                    )
+                    .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
         })
     }
 

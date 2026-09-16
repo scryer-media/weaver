@@ -83,3 +83,48 @@ fn jwt_secret_decode_rejects_malformed_values() {
         Err(JwtSecretError::InvalidHex(_))
     ));
 }
+
+#[test]
+fn setup_codes_are_two_hyphenated_groups_of_three() {
+    for _ in 0..64 {
+        let code = generate_setup_code();
+        assert!(is_setup_code(&code), "{code}");
+        assert_eq!(code.as_bytes()[3], b'-', "{code}");
+        assert_eq!(normalize_setup_code(&code).len(), SETUP_CODE_LENGTH);
+    }
+    assert!(!is_setup_code("K7PM2X"));
+    assert!(!is_setup_code("K7P-M2"));
+    assert!(!is_setup_code("K0P-M2X"));
+}
+
+#[test]
+fn setup_codes_compare_without_case_hyphen_or_spacing() {
+    assert_eq!(normalize_setup_code(" k7p-m2x "), "K7PM2X");
+    assert_eq!(normalize_setup_code("K7P M2X"), "K7PM2X");
+    assert_eq!(normalize_setup_code("K7PM2X"), "K7PM2X");
+}
+
+#[test]
+fn setup_code_is_found_in_a_banner_row_or_a_json_message() {
+    assert_eq!(
+        find_setup_code(&format!("{SETUP_CODE_MARKER}K7P-M2X")),
+        Some("K7P-M2X")
+    );
+    assert_eq!(
+        find_setup_code(&format!("#   {SETUP_CODE_MARKER}K7P-M2X        #")),
+        Some("K7P-M2X")
+    );
+    assert_eq!(
+        find_setup_code(&format!(
+            r#"{{"fields":{{"message":"{SETUP_CODE_MARKER}K7P-M2X. Enter it"}}}}"#
+        )),
+        Some("K7P-M2X")
+    );
+    assert_eq!(
+        find_setup_code(&format!("{SETUP_CODE_MARKER}K7P-M2XY")),
+        None
+    );
+    assert_eq!(find_setup_code(&format!("{SETUP_CODE_MARKER}K7PM2X")), None);
+    assert_eq!(find_setup_code(&format!("{SETUP_CODE_MARKER}K7P")), None);
+    assert_eq!(find_setup_code("unrelated setup code"), None);
+}

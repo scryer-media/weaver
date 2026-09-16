@@ -1,0 +1,33 @@
+[package]
+name = "weaver-tunnel"
+version.workspace = true
+edition.workspace = true
+license-file = "LICENSE"
+
+[features]
+default = []
+# In-process tunnel, DNS and proxy fixtures for consumer integration tests.
+# Never enabled in a product build.
+test-support = ["proxy-tunnels/test-support", "dep:bytes", "dep:http", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tokio-rustls", "dep:rcgen"]
+
+[dependencies]
+# Shared protocols pinned to an immutable signed version tag.
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.1.1", features = ["http3"] }
+base64 = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Reuse the approved HTTP/3 stack for local fixtures; absent from product builds.
+bytes = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+h3 = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.1.1", optional = true }
+h3-quinn = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.1.1", optional = true }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"], optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"], optional = true }
+
+[dev-dependencies]
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.1.1", features = ["http3", "test-support"] }
+tokio = { workspace = true, features = ["test-util"] }

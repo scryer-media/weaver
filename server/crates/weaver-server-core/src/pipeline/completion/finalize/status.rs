@@ -142,6 +142,7 @@ impl Pipeline {
         self.jobs
             .iter()
             .filter(|(_, state)| matches!(state.status, JobStatus::QueuedRepair))
+            .filter(|(job_id, _)| self.repair_phase_has_capacity(**job_id))
             .min_by(|(job_id_a, state_a), (job_id_b, state_b)| {
                 state_a
                     .queued_repair_at_epoch_ms
@@ -704,6 +705,40 @@ impl Pipeline {
     }
 
     pub(crate) async fn maybe_start_repair(&mut self, job_id: JobId) -> bool {
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            runtime.set_repair_phase(job_id, false);
+        }
+        self.start_repair_phase(job_id)
+    }
+
+    pub(crate) async fn maybe_start_par3_repair(&mut self, job_id: JobId) -> bool {
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            runtime.set_repair_phase(job_id, true);
+        }
+        self.start_repair_phase(job_id)
+    }
+
+    fn repair_phase_has_capacity(&self, job_id: JobId) -> bool {
+        let par3_owned = |id| {
+            self.par3_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.owns_repair_phase(id))
+        };
+        let limit = if par3_owned(job_id)
+            && self
+                .jobs
+                .iter()
+                .filter(|(_, state)| matches!(state.status, JobStatus::Repairing))
+                .all(|(&id, _)| par3_owned(id))
+        {
+            2
+        } else {
+            MAX_CONCURRENT_REPAIRS
+        };
+        self.active_repair_jobs() < limit
+    }
+
+    fn start_repair_phase(&mut self, job_id: JobId) -> bool {
         let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
             return false;
         };
@@ -722,7 +757,7 @@ impl Pipeline {
         if matches!(status, JobStatus::Repairing) {
             return true;
         }
-        if self.active_repair_jobs() >= MAX_CONCURRENT_REPAIRS {
+        if !self.repair_phase_has_capacity(job_id) {
             self.transition_postprocessing_status(
                 job_id,
                 JobStatus::QueuedRepair,
@@ -775,9 +810,6 @@ impl Pipeline {
     }
 
     pub(crate) fn promote_queued_repairs(&mut self) {
-        if self.active_repair_jobs() >= MAX_CONCURRENT_REPAIRS {
-            return;
-        }
         let Some(job_id) = self.next_queued_repair_job() else {
             return;
         };
@@ -824,29 +856,35 @@ impl Pipeline {
         }
     }
 
-    pub(super) async fn cleanup_par2_files(&self, job_id: JobId) {
+    pub(super) async fn cleanup_recovery_files(&self, job_id: JobId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
         let cleanup_dir = state.working_dir.clone();
-        let par2_files: Vec<String> = state
+        let recovery_files: Vec<String> = state
             .assembly
             .files()
-            .filter(|f| matches!(f.role(), weaver_model::files::FileRole::Par2 { .. }))
+            .filter(|f| {
+                matches!(
+                    f.role(),
+                    weaver_model::files::FileRole::Par2 { .. }
+                        | weaver_model::files::FileRole::Par3 { .. }
+                )
+            })
             .map(|f| self.current_filename_for_file(job_id, f))
             .collect();
-        if par2_files.is_empty() {
+        if recovery_files.is_empty() {
             return;
         }
 
         let mut removed = 0u32;
-        for filename in &par2_files {
+        for filename in &recovery_files {
             let path = cleanup_dir.join(filename);
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => removed += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    warn!(file = %path.display(), error = %e, "failed to delete PAR2 file");
+                    warn!(file = %path.display(), error = %e, "failed to delete recovery file");
                 }
             }
         }
@@ -854,8 +892,8 @@ impl Pipeline {
             info!(
                 job_id = job_id.0,
                 removed,
-                total = par2_files.len(),
-                "deleted PAR2 files"
+                total = recovery_files.len(),
+                "deleted recovery files"
             );
         }
     }
@@ -864,6 +902,9 @@ impl Pipeline {
         self.block_crcs.forget_job(job_id);
         self.direct_store.clear_pending_materializations(job_id);
         self.par2_runtime.remove(&job_id);
+        if let Some(coordinator) = self.par3_runtime.as_mut() {
+            coordinator.forget(job_id);
+        }
         self.par2_cancellations.remove(&job_id);
         self.direct_post_repair_in_flight.remove(&job_id);
         self.direct_post_repair_results.remove(&job_id);

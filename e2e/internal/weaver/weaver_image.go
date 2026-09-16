@@ -258,45 +258,43 @@ func rejectOutOfTreePatches(weaverRoot string, manifest string) error {
 func (plan weaverImagePlan) dockerfile() string {
 	return fmt.Sprintf(`# syntax=docker/dockerfile:1.7
 FROM %s AS builder
-ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev curl ca-certificates gnupg musl-tools && \
+    pkg-config libssl-dev curl ca-certificates gnupg && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR %s
-RUN arch="${TARGETARCH:-$(uname -m)}" && \
-    case "$arch" in \
-        amd64|x86_64) target="x86_64-unknown-linux-musl" ;; \
-        arm64|aarch64) target="aarch64-unknown-linux-musl" ;; \
-        *) echo "unsupported TARGETARCH: $arch" >&2; exit 1 ;; \
-    esac && \
-    rustup toolchain install %s --profile minimal --target "$target" && \
-    rustup default %s && \
-    echo "$target" > /tmp/weaver-target
+RUN rustup toolchain install %s --profile minimal && \
+    rustup default %s
 COPY apps/weaver-web/package.json apps/weaver-web/package-lock.json ./apps/weaver-web/
 RUN --mount=type=cache,id=weaver-e2e-npm,target=/root/.npm,sharing=locked \
     cd apps/weaver-web && npm ci --legacy-peer-deps
 COPY . .
 # Belt and braces: if rust-toolchain.toml resolves to something other than the
-# channel the harness parsed, rustup installs it here and the musl target is
-# added to whichever toolchain actually ends up active.
-RUN rustup show active-toolchain && rustup target add "$(cat /tmp/weaver-target)"
+# channel the harness parsed, rustup installs it here before the build.
+RUN rustup show active-toolchain
 RUN --mount=type=cache,id=weaver-e2e-npm,target=/root/.npm,sharing=locked \
     cd apps/weaver-web && npm run build
+# A debug build for the builder's own glibc target. The container phases test
+# behaviour, not throughput, so an optimized musl link is wasted time; the
+# runtime stage below is the same Debian release, so the glibc build runs there.
 RUN --mount=type=cache,id=weaver-e2e-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=weaver-e2e-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=weaver-e2e-cargo-target,target=/app/target,sharing=locked \
-    CARGO_INCREMENTAL=1 CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
-    cargo build --release --locked -p weaver --target "$(cat /tmp/weaver-target)" && \
-    cp "target/$(cat /tmp/weaver-target)/release/weaver" /tmp/weaver-portable
+    CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+    cargo build --locked -p weaver && \
+    cp target/debug/weaver /tmp/weaver-debug
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata util-linux wget && \
     rm -rf /var/lib/apt/lists/*
 COPY docker/entrypoint.sh /entrypoint.sh
-COPY --from=builder /tmp/weaver-portable /opt/weaver/weaver
-RUN chmod +x /entrypoint.sh /opt/weaver/weaver && mkdir -p /config /data
+COPY --from=builder /tmp/weaver-debug /opt/weaver/weaver
+# A debug build does not embed the web bundle: it reads it at runtime from the
+# absolute path the build saw, "<manifest dir>/../../../apps/weaver-web/dist".
+# Resolving that path needs the manifest directory to exist, so recreate both.
+COPY --from=builder %s/apps/weaver-web/dist %s/apps/weaver-web/dist
+RUN chmod +x /entrypoint.sh /opt/weaver/weaver && mkdir -p /config /data %s/server/app/weaver
 EXPOSE 9090
 VOLUME /config
 VOLUME /data
@@ -309,6 +307,9 @@ CMD ["--config", "/config", "serve", "--port", "9090"]
 		weaverImageBuilderWorkdir,
 		plan.Toolchain,
 		plan.Toolchain,
+		weaverImageBuilderWorkdir,
+		weaverImageBuilderWorkdir,
+		weaverImageBuilderWorkdir,
 	)
 }
 

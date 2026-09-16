@@ -2669,7 +2669,7 @@ async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
         runtime_generation: 0,
         job_id,
         server_idx: 0,
-        remote_ip: "127.0.0.1".parse().unwrap(),
+        remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
         spillover_loan_kind: None,
@@ -2711,7 +2711,7 @@ async fn rar_unlock_retry_requeue_marks_rar_volume_dirty_only() {
     insert_active_job(&mut pipeline, rar_job_id, rar_spec).await;
     pipeline.rar_unlock_priority_dirty_jobs.clear();
 
-    pipeline.requeue_retry_work(rar_unlock_work(rar_job_id, 2, 12));
+    pipeline.enqueue_download_work(rar_unlock_work(rar_job_id, 2, 12));
     assert!(
         pipeline
             .rar_unlock_priority_dirty_jobs
@@ -2726,7 +2726,7 @@ async fn rar_unlock_retry_requeue_marks_rar_volume_dirty_only() {
     insert_active_job(&mut pipeline, standalone_job_id, standalone_spec).await;
     pipeline.rar_unlock_priority_dirty_jobs.clear();
 
-    pipeline.requeue_retry_work(DownloadWork {
+    pipeline.enqueue_download_work(DownloadWork {
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id: standalone_job_id,

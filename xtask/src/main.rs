@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::{
@@ -179,6 +179,12 @@ struct ServeArgs {
         help = "Build and run the backend with the full production release profile"
     )]
     production_build: bool,
+    #[arg(
+        long = "OTP",
+        help = "Ask for the one-time setup code on first-time setup, as a container does; \
+                a loopback dev backend otherwise sets up without one"
+    )]
+    otp: bool,
     target: Option<String>,
 }
 
@@ -331,6 +337,8 @@ struct PgoCollectArgs {
 
 #[derive(Subcommand)]
 enum PerfCommand {
+    /// Compare matched PAR2 verification and repair workloads.
+    Par2Compare(perf::compare::Options),
     #[command(name = "par2-x86", disable_help_flag = true)]
     Par2X86(ForwardArgs),
     #[command(name = "real-download", disable_help_flag = true)]
@@ -440,6 +448,7 @@ fn main() -> Result<()> {
             ProfileCommand::Local(args) => profile_local::run(&ctx, args),
         },
         Commands::Perf(args) => match args.command {
+            PerfCommand::Par2Compare(args) => perf::compare::run(args),
             PerfCommand::Par2X86(args) => perf::run_par2_x86(&ctx, args.args),
             PerfCommand::RealDownload(args) => perf::run_real_download(&ctx, args.args),
         },
@@ -2355,8 +2364,13 @@ fn wait_for_backend(pid: u32, port: u16, log_path: &Path) -> Result<()> {
                 log_path.display()
             );
         }
+        // Only the exit status matters: the page body and the refused
+        // connections of a backend still starting are noise, and a real
+        // failure is reported with the log tail below.
         let status = Command::new("curl")
-            .args(["-fsS", &format!("http://127.0.0.1:{port}/")])
+            .args(["-fs", &format!("http://127.0.0.1:{port}/")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()?;
         if status.success() {
             return Ok(());
@@ -2487,6 +2501,44 @@ fn forward_backend_sigaction() -> libc::sigaction {
     action.sa_flags = 0;
     action.sa_sigaction = forward_backend_signal as *const () as usize;
     action
+}
+
+/// How the backend announces the code its first-run setup page asks for. It
+/// writes it to stderr only, never to tracing: a banner row in text logs, the
+/// message of one record in JSON logs. The code follows the marker as
+/// `K7P-M2X`.
+const SETUP_CODE_PREFIX: &str = "Weaver one-time setup code: ";
+
+fn parse_setup_code_line(line: &str) -> Option<&str> {
+    let (_, rest) = line.split_once(SETUP_CODE_PREFIX)?;
+    let code = rest.get(..7)?;
+    let shaped = code.bytes().enumerate().all(|(index, byte)| {
+        if index == 3 {
+            byte == b'-'
+        } else {
+            byte.is_ascii_alphanumeric()
+        }
+    });
+    let whole = !rest[7..]
+        .bytes()
+        .next()
+        .is_some_and(|next| next.is_ascii_alphanumeric() || next == b'-');
+    (shaped && whole).then_some(code)
+}
+
+/// The setup code a backend wrote to its log after `offset`. Skipping what
+/// came before keeps the bootstrap run's code, which died with it, out.
+fn read_setup_code(log_path: &Path, offset: u64) -> Result<Option<String>> {
+    let mut log = fs::File::open(log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    log.seek(SeekFrom::Start(offset))?;
+    let mut content = String::new();
+    log.read_to_string(&mut content)?;
+    Ok(content
+        .lines()
+        .rev()
+        .find_map(parse_setup_code_line)
+        .map(str::to_string))
 }
 
 fn tail_file(path: &Path, lines: usize) -> Result<String> {
@@ -2904,6 +2956,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         .create(true)
         .append(true)
         .open(&backend_log)?;
+    let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
     let mut backend = ctx.command(&backend_binary);
     configure_backend_process_group(&mut backend);
@@ -2919,6 +2972,9 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     backend.env("WEAVER_ENCRYPTION_KEY", &encryption_key);
+    if args.otp {
+        backend.env("WEAVER_REQUIRE_SETUP_CODE", "1");
+    }
     let mut backend = backend.spawn()?;
     let backend_pid = backend.id();
     let backend_signal_forwarder = install_backend_signal_forwarder(backend_pid)?;
@@ -2931,12 +2987,19 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         return Err(error);
     }
 
+    // The backend prints the code while it builds its routes, so it is in the
+    // log by the time the backend answers.
+    let setup_code = read_setup_code(&backend_log, log_offset)?;
+
     println!("==> Weaver backend ready");
     println!("    Backend:  {backend_url}");
     println!("    Frontend: {frontend_url}");
     println!("    State:    {}", state_dir.display());
     println!("    Data:     {}", data_dir.display());
     println!("    Log:      tail -f {}", backend_log.display());
+    if let Some(code) = &setup_code {
+        println!("    Setup code: {code}");
+    }
     println!(
         "    Local agent API key (Admin): {}",
         local_agent_key_file.display()

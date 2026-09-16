@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextDe } from "@/next/i18n/de";
 
 const de: LocaleDictionary = {
   // Brand
@@ -211,7 +212,7 @@ const de: LocaleDictionary = {
   "settings.generalPageDesc": "Downloadgeschwindigkeit, Speicherpfade, Bereinigungsverhalten und Wiederholungsrichtlinien an einem Ort konfigurieren.",
   "settings.language": "Sprache",
   "settings.languageDesc": "Wählen Sie die Anzeigesprache für die Weaver-Oberfläche.",
-  "settings.bandwidthCap": "ISP-Datenvolumen",
+  "settings.bandwidthCap": "Bandbreite",
   "settings.bandwidthCapDesc": "Neuen Downloadversand blockieren, sobald das aktuelle ISP-Kontingent verbraucht ist. Wartende Aufträge behalten ihre Position und bereits laufende Nachverarbeitung kann fortgesetzt werden.",
   "settings.bandwidthCapEnabled": "ISP-Limit aktivieren",
   "settings.bandwidthCapEnabledDesc": "Nutzung kontinuierlich verfolgen und nur neue Artikeldownloads blockieren, wenn das aktive Fenster erschöpft ist.",
@@ -638,6 +639,7 @@ const de: LocaleDictionary = {
   "systemInfo.diagnosticsHint": "Die Erfassung dauert etwa 15 Sekunden: Metriken werden zweimal im Abstand von zehn Sekunden erfasst. Passwörter, API-Schlüssel und andere Geheimnisse werden entfernt.",
   "systemInfo.diagnosticsFailed": "Das Diagnosepaket konnte nicht erstellt werden.",
   ...duplicateLocaleEntries.deu,
+  ...nextDe,
 };
 
 export default de;

@@ -19,6 +19,7 @@ const SYSTEM_INFO_QUERY: &str = r#"
       cgroupLimit
       decoderTier
       simdFeatures
+      kernels { component library ladder kernel pinnedBy }
     }
     memory {
       totalBytes
@@ -62,6 +63,37 @@ async fn system_info_exposes_safe_runtime_profile_to_read_scope() {
     assert_eq!(info["databaseEngine"].as_str().unwrap(), "SQLITE");
     assert_eq!(info["compute"]["physicalCores"].as_u64().unwrap(), 4);
     assert_eq!(info["compute"]["logicalCores"].as_u64().unwrap(), 8);
+    let kernels = info["compute"]["kernels"].as_array().unwrap();
+    let components: Vec<&str> = kernels
+        .iter()
+        .map(|kernel| kernel["component"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        components,
+        [
+            "YENC_DECODE",
+            "YENC_CRC32",
+            "PAR2_REPAIR",
+            "PAR2_MD5",
+            "PAR2_CRC32",
+            "RAR_RECOVERY",
+            "RAR_CRC32",
+            "RAR_SHA1",
+            "RAR_AES",
+        ]
+    );
+    for kernel in kernels {
+        let selected = kernel["kernel"].as_str().unwrap();
+        assert!(
+            kernel["ladder"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rung| rung.as_str() == Some(selected)),
+            "{kernel} selected a kernel off its ladder"
+        );
+        assert!(!kernel["library"].as_str().unwrap().is_empty());
+    }
     assert_eq!(
         info["memory"]["effectiveLimitBytes"].as_u64().unwrap(),
         8 * 1024 * 1024 * 1024
@@ -141,4 +173,39 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
         .unwrap();
     assert!(missing["capacity"].is_null());
     assert!(missing["error"].as_str().unwrap().contains("unavailable"));
+}
+
+#[tokio::test]
+async fn path_storage_reports_the_disk_a_missing_folder_would_be_created_on() {
+    let h = TestHarness::new().await;
+    let data_dir = std::path::PathBuf::from(&h.config.read().await.data_dir);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let missing = data_dir.join("not-yet").join("complete");
+
+    let mut variables = async_graphql::Variables::default();
+    variables.insert(
+        async_graphql::Name::new("path"),
+        async_graphql::Value::String(missing.display().to_string()),
+    );
+    let response = h
+        .execute_with_variables(
+            "query($path: String!) { pathStorage(path: $path) { path error capacity { totalBytes freeBytes } } }",
+            variables,
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let storage = &data["pathStorage"];
+    assert_eq!(storage["path"].as_str(), missing.to_str());
+    assert!(storage["error"].is_null(), "{storage}");
+    assert!(storage["capacity"]["totalBytes"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn path_storage_is_admin_only() {
+    let h = TestHarness::new().await;
+    let response = h
+        .execute_as(r#"{ pathStorage(path: "/") { path } }"#, CallerScope::Read)
+        .await;
+    assert!(!response.errors.is_empty());
 }

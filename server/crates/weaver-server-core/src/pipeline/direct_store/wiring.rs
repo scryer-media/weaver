@@ -70,6 +70,17 @@ use crate::pipeline::{
 /// keep the whole plan's resident cost to one buffer.
 const REARM_CHUNK_BYTES: usize = 256 * 1024;
 
+/// A placement failure before any coverage is admitted. The caller decides
+/// whether to reconstruct conventional volumes or retain verified repair output.
+#[derive(Debug)]
+pub(in crate::pipeline) enum DirectPlacementError {
+    Sparse {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    Write(std::io::Error),
+}
+
 #[derive(Clone, Default)]
 struct PendingDemotionMaterialization {
     files: HashSet<NzbFileId>,
@@ -738,7 +749,32 @@ pub(crate) struct ToleratedExtraction {
     /// commit loop: every file renamed into a directory bumps that directory's
     /// mtime, so restoring it before the members land would restore a value the
     /// next rename overwrites.
-    directories: Vec<(unrar_rs::MemberInfo, PathBuf)>,
+    directories: Vec<(ToleratedDirectoryMetadata, PathBuf)>,
+}
+
+#[derive(Debug)]
+enum ToleratedDirectoryMetadata {
+    Parsed(Box<unrar_rs::MemberInfo>),
+    // Installation already applied permissions and archive metadata. Only
+    // directory times can be changed by the stored-member renames that follow.
+    Installed {
+        accessed: filetime::FileTime,
+        modified: filetime::FileTime,
+    },
+}
+
+impl ToleratedDirectoryMetadata {
+    fn apply(&self, path: &std::path::Path) -> Result<(), String> {
+        match self {
+            Self::Parsed(info) => {
+                crate::pipeline::extraction::apply_rar_member_filesystem_metadata(info, path)
+            }
+            Self::Installed { accessed, modified } => {
+                filetime::set_file_times(path, *accessed, *modified)
+                    .map_err(|error| error.to_string())
+            }
+        }
+    }
 }
 
 /// Everything the authoritative PAR2 pass needs to read a job's direct sets
@@ -837,6 +873,9 @@ pub(crate) enum DirectPar2Resolution {
     /// to read the whole set again to reach the same answer. Boxed to keep this
     /// enum small on the branches that carry nothing.
     Clean(Box<par2_rs::VerificationResult>),
+    /// Native verification exhausted reachable PAR2 recovery. Preserve virtual
+    /// sources while the completion coordinator considers the PAR3 fallback.
+    RecoveryExhausted { needed: u32, available: u32 },
     /// Damage was found that the recovery *merged so far* cannot cover, but the
     /// recovery set as a whole can. Targeted recovery has been asked for and the
     /// sets stay direct until it lands. The caller must not run the repairer and
@@ -952,6 +991,7 @@ impl Pipeline {
             DirectSetPlan::discover(&state.spec, &state.working_dir, &destination_dir);
         let password = state.spec.password.clone();
         let par2_available = super::plan::spec_carries_par2(&state.spec);
+        let par3_available = self.par3_direct_checks_available(job_id);
         for (set_name, refusal) in refused {
             crate::runtime::perf_probe::record_owned(
                 format!("direct_store.refused.{}", refusal.metric()),
@@ -1039,6 +1079,7 @@ impl Pipeline {
                 // arrives later. Held in memory only.
                 set.router.set_password(password.as_deref());
                 set.router.note_par2_available(par2_available);
+                set.router.note_par3_available(par3_available);
                 set
             })
             .collect();
@@ -1680,10 +1721,12 @@ impl Pipeline {
             .jobs
             .get(&job_id)
             .is_some_and(|state| super::plan::spec_carries_par2(&state.spec));
+        let par3_available = self.par3_direct_checks_available(job_id);
         let mut set = DirectSet::new(job_id, plan);
         self.direct_store.apply_ceilings(&mut set);
         set.router.set_password(password);
         set.router.note_par2_available(par2_available);
+        set.router.note_par3_available(par3_available);
         let sets = self.direct_store.sets.entry(job_id).or_default();
         sets.push(set);
         sets.len() - 1

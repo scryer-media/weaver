@@ -2508,13 +2508,14 @@ async fn insert_damaged_job_ready_for_analysis(
 /// letting the pipeline see it. Tests that want the verdict *dropped* need the
 /// message in hand to prove the fence rejects it.
 async fn next_par2_analysis_done(pipeline: &mut Pipeline) -> crate::pipeline::Par2AnalysisWorkDone {
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        pipeline.par2_analysis_done_rx.recv(),
-    )
-    .await
-    .expect("the detached analysis should finish")
-    .expect("the analysis completion channel should stay open")
+    let done = tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
+        .await
+        .expect("the detached analysis should finish")
+        .expect("the analysis completion channel should stay open");
+    let crate::pipeline::RepairWorkDone::Par2(done) = done else {
+        panic!("PAR2-only fixture returned a different repair format");
+    };
+    done
 }
 
 mod decode_matrix_s_own;

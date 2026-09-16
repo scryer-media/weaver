@@ -107,6 +107,12 @@ async fn a_name_described_by_two_parsed_sets_is_not_bound() {
             .is_none(),
         "two recovery-set name answers must remain ambiguous"
     );
+    for set_id in pipeline.par2_runtime(job_id).unwrap().ordered_set_ids() {
+        assert!(
+            !pipeline.par2_set_is_absent_from_job(job_id, set_id),
+            "a known empty source still requires each describing set's native verdict"
+        );
+    }
 }
 
 #[tokio::test]

@@ -1,8 +1,7 @@
 /// Header damage that was tolerated rather than rejected.
 ///
-/// Reference decoders (SABnzbd/sabctools and nzbget) accept a range of
-/// malformed-but-recoverable yEnc articles that a strict parser would reject.
-/// Weaver accepts the same articles, but never silently: every field that was
+/// Weaver accepts recoverable yEnc articles even when their headers are
+/// malformed. Every field that was
 /// absent or unparseable is recorded here so callers can log the damage.
 ///
 /// A default (all-`false`) value means the headers were fully well-formed.

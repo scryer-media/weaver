@@ -1,4 +1,9 @@
-<h1 align="center">Weaver</h1>
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/weaver-lockup-on-dark.svg" />
+    <img src="docs/img/weaver-lockup-on-light.svg" alt="Weaver" width="440" />
+  </picture>
+</h1>
 
 <p align="center">
   A modern, all-in-one Usenet downloader built in Rust.<br/>
@@ -18,14 +23,20 @@
 </p>
 
 <p align="center">
-  <a href="https://www.scryer.media/weaver/"><img src="docs/img/weaver-overview.webp" alt="Weaver web interface" width="800" /></a>
+  <a href="https://www.scryer.media/weaver/"><img src="docs/img/weaver-overview-0-12.webp" alt="Weaver web interface" width="800" /></a>
 </p>
 
 ## What is Weaver?
 
-Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2 verification and repair, and extraction (RAR, 7z, etc) — all within a single self-contained binary. No need to install `unrar`, `par2repair`, or any other external tools.
+Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2/PAR3 verification and repair, and extraction (RAR, 7z, etc) — all within a single self-contained binary. No need to install `unrar`, `par2repair`, or any other external tools.
 
-Built on [rarpar](https://github.com/scryer-media/rarpar), the world's fastest Rust libraries for RAR extraction and PAR2 repair.
+Built on [rarpar](https://github.com/scryer-media/rarpar), Rust libraries for RAR extraction and PAR2/PAR3 repair.
+
+PAR3 support includes selective recovery downloads, virtual and renamed sources,
+Cauchy and low-rate FFT sets, deduplicated blocks, Data packets, and protection
+embedded in ZIP/ZIP64 and 7z. Weaver verifies, repairs and extracts existing sets;
+it does not create them. Embedded discovery runs only for jobs without PAR2;
+PAR2 takes priority in mixed jobs. See the [native scenarios](e2e/docs/par3.md) for resource limits and validation.
 
 Instead of the traditional sequential approach (download everything, then repair, then extract), Weaver can run downloading and extraction concurrently*. Extraction begins as soon as the first archive volume finishes downloading, so files appear on disk while the rest of the job is still in progress.
 
@@ -41,6 +52,9 @@ Instead of the traditional sequential approach (download everything, then repair
 ## Install
 
 See [Installation](https://www.scryer.media/weaver/docs/installation/) for supported install methods and [Getting Started](https://www.scryer.media/weaver/docs/getting-started/) for first-run setup.
+
+See [Network setup and browser access](docs/network-setup.md) for Compose defaults,
+one-time setup codes, environment overrides, trusted proxies, and legacy compatibility.
 
 ## API
 

@@ -481,6 +481,12 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_server_latency_seconds` | gauge | `server_id`, `server` | EWMA request latency per server. |
 | `weaver_server_connections_available` | gauge | `server_id`, `server` | Available connection permits per server. |
 | `weaver_server_connections_active` | gauge | `server_id`, `server` | Connections currently checked out per server. |
+| `weaver_server_sockets` | gauge | `server_id`, `server`, `phase` | Physical socket occupancy, including dialing, idle, closing and replacement sockets. |
+| `weaver_server_local_admission_denials_total` | counter | `server_id`, `server` | Physical socket acquisitions denied locally. |
+| `weaver_server_provider_refusals_total` | counter | `server_id`, `server` | Actual connection-capacity refusals received from the provider. |
+| `weaver_server_recovery_epoch` | gauge | `server_id`, `server` | Current transport recovery epoch. |
+| `weaver_server_recovery_probe` | gauge | `server_id`, `server` | Whether a demanded recovery probe is owned. |
+| `weaver_server_recovery_wait_seconds` | gauge | `server_id`, `server` | Remaining delay before a fresh demanded recovery attempt. |
 | `weaver_server_connections_max` | gauge | `server_id`, `server` | Maximum connections per server. |
 | `weaver_server_connections_configured` | gauge | `server_id`, `server` | Operator-configured maximum connections per server. |
 | `weaver_server_capacity_penalty_until_epoch_ms` | gauge | `server_id`, `server` | Provider over-limit holdoff deadline in unix epoch milliseconds. **Deprecated — use `weaver_server_capacity_penalty_until_seconds`.** |
@@ -505,15 +511,15 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_post_processing_attempts_total` | counter | `result` | Completed post-processing script executions by outcome. |
 | `weaver_post_processing_output_truncations` | counter | — | Post-processing script executions whose captured output was truncated. **Deprecated — use `weaver_post_processing_output_truncations_total`.** |
 | `weaver_post_processing_output_truncations_total` | counter | — | Post-processing script executions whose captured output was truncated. |
-| `weaver_server_article_attempts_total` | counter | `server_id`, `server`, `outcome`, `recovery` | Article fetch attempts per server by outcome, split by whether the attempt came from the recovery (PAR2 top-up) queue. Every combination is emitted, so the series pre-exist at zero. |
+| `weaver_server_article_attempts_total` | counter | `server_id`, `server`, `outcome`, `recovery` | Article fetch attempts per server by outcome, split by whether the attempt came from the recovery (PAR2 or PAR3 top-up) queue. Every combination is emitted, so the series pre-exist at zero. |
 | `weaver_server_article_latency_seconds` | histogram | `server_id`, `server` | Per-server article fetch latency. |
 | `weaver_jobs_submitted_total` | counter | `origin`, `category` | Jobs accepted into the queue, by intake origin and category. Category is empty when the job has none. |
 | `weaver_jobs_finished_total` | counter | `result`, `category` | Jobs that reached a terminal state, by result and category. |
 | `weaver_job_duration_seconds` | histogram | `result` | End-to-end wall-clock time from job submission to its terminal state. |
 | `weaver_job_stage_duration_seconds` | histogram | `stage` | Wall-clock time each job spent in a pipeline stage. |
-| `weaver_verifications_total` | counter | `result` | PAR2 verification outcomes. |
-| `weaver_repairs_total` | counter | `result` | PAR2 repair outcomes. |
-| `weaver_repair_slices_repaired_total` | counter | — | PAR2 slices reconstructed by repair. |
+| `weaver_verifications_total` | counter | `result` | Verification outcomes across PAR2 and PAR3. Repeated native assessment and recovery-only arrivals reuse retained evidence without counting new source verification. Reopening an evicted session performs and counts fresh verification. |
+| `weaver_repairs_total` | counter | `result` | Repair outcomes across PAR2 and PAR3. |
+| `weaver_repair_slices_repaired_total` | counter | — | PAR2 slices and PAR3 blocks reconstructed by repair. These aggregate counters keep their existing names and labels; per-job events identify native PAR3 work. |
 | `weaver_extractions_total` | counter | `result` | Archive extraction outcomes. |
 | `weaver_files_missing_total` | counter | — | Files that could not be completed because segments were unavailable. |
 | `weaver_missing_segments_total` | counter | — | Segments that were unavailable across every configured server. |

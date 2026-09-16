@@ -110,13 +110,9 @@ const fn padded_payload_chars(bytes: usize) -> usize {
 /// whole groups plus the tail so the group structure stays visible.
 ///
 /// Canonical encoders pad the final group out to four characters, but a family
-/// of broken encoders stops as soon as the bits run out. NZBGet decodes those
-/// natively: its tail arms read `iptr[0..1]` for a one-byte tail and
-/// `iptr[0..2]` for a two-byte tail, never demanding a fourth character. So
-/// accepting an unpadded final group is parity with the reference decoders, not
-/// leniency — and it matters, because that final line belongs to exactly the
-/// vintage of post that uuencode support exists for, which typically ships with
-/// no PAR2 to repair a dropped tail.
+/// of broken encoders stops as soon as the bits run out. Accepting an unpadded
+/// final group preserves the tail of older posts, which typically have no
+/// PAR2 to repair dropped bytes.
 ///
 /// This range — `[min_payload_chars, padded_payload_chars]` — also subsumes the
 /// broken-encoder length reading attributed to Fredrik Lundh. That reading,
@@ -610,11 +606,8 @@ impl UuDecoder {
 
     /// Scalar group-at-a-time decode, used for truncated and over-long lines.
     ///
-    /// Consumes only the characters each group's bits actually need, which is
-    /// what NZBGet's decoder does: its tail arms read two characters for a
-    /// one-byte tail and three for a two-byte tail rather than demanding a
-    /// padded fourth. A group that cannot even meet that minimum is where the
-    /// line was genuinely cut.
+    /// Consumes two characters for a one-byte tail and three for a two-byte
+    /// tail. A group with fewer characters than that minimum is truncated.
     fn decode_salvage(&mut self, declared: usize, payload: &[u8]) {
         let mut remaining = declared;
         let mut chars = payload;
@@ -1411,7 +1404,7 @@ mod tests {
 
     #[test]
     fn damage_does_not_stop_later_lines() {
-        // SAB keeps the bytes and lets PAR2 judge; a bad line in the middle
+        // Keep the bytes for PAR2 to judge; a bad line in the middle
         // must not cost the good lines around it.
         let first: Vec<u8> = (0..45u8).collect();
         let third: Vec<u8> = (45..90u8).collect();

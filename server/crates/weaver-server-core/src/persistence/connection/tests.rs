@@ -73,6 +73,7 @@ fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     }
 }
 
@@ -95,6 +96,7 @@ fn postgres_sample_history(job_id: crate::jobs::ids::JobId) -> JobHistoryRow {
         created_at: 1_700_000_000,
         completed_at: 1_700_000_100,
         metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
+        server_attribution: None,
     }
 }
 
@@ -621,6 +623,8 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
     matches!(
         (table, column),
         ("servers", "tls")
+            | ("browser_sessions", "remembered")
+            | ("server_tls_diagnostics", "honors_client_cipher_order")
             | ("servers", "active")
             | ("servers", "supports_pipelining")
             | ("servers", "backfill")
@@ -2337,6 +2341,7 @@ async fn postgres_runtime_smoke_when_configured() {
         paused_resume_status: None,
         paused_resume_download_state: None,
         paused_resume_post_state: None,
+        password_override: None,
     })
     .unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {
@@ -2367,6 +2372,7 @@ async fn postgres_runtime_smoke_when_configured() {
             created_at: 1_700_000_000,
             completed_at: 1_700_000_100,
             metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
+            server_attribution: None,
         },
     )
     .unwrap();
@@ -2551,6 +2557,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
         created_at: 1,
         completed_at: 2,
         metadata: None,
+        server_attribution: None,
     })
     .unwrap();
     let results = vec![crate::post_processing::model::ScriptResult {

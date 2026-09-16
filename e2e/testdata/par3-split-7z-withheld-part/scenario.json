@@ -1,0 +1,18 @@
+{
+  "slug": "par3-split-7z-withheld-part",
+  "title": "E2E.Test.PAR3.Split.7z.Withheld.Part.Silver.Horizon.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A five-part split 7z with PAR3 over all five parts, posted without the third. The set must rebuild the missing part before extraction can run.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "disabled": "An interior 7z part absent from the NZB is only waited on on the PAR2 path (job_has_sevenz_set_waiting_for_absent_volumes reads the served PAR2 set), and direct unpack settles strictly before PAR3 completion runs; no PAR3 run covers a single withheld part beside present siblings.",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ],
+  "expectedOutputBLAKE3": {
+    "silver_horizon.mkv": "779fad2c06e827cf1cd4a6793a655a1504119962c8ebfdc0b35d1eab2d84327a"
+  }
+}

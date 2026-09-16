@@ -1,0 +1,17 @@
+{
+  "slug": "par3-rar4-repair",
+  "title": "E2E.Test.PAR3.RAR4.Repair.Fallow.Ridge.S01E01.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A compressed RAR4 archive with an external PAR3 set and two blocks zeroed well past the headers.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "fallow.ridge.s01e01.mkv": "e72ab4bc13abda667561304a11309a7abde7c1441a01a9c287706d4701842f08"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed",
+    "ExtractionFailed"
+  ]
+}

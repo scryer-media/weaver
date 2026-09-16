@@ -1,0 +1,18 @@
+{
+  "slug": "par3-withheld-file",
+  "title": "E2E.Test.PAR3.Withheld.File.Birch.Quarry.S01.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "One PAR3 set over three payloads, posted without the middle one. Only the set knows that file exists, and it must be created from recovery blocks alone.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "birch.quarry.s01e01.mkv": "e3355ae5a84a08b4cfbc40d86f16764b3a30e6519ea8bec21f6d38cb82fac559",
+    "birch.quarry.s01e02.mkv": "f542a79f8df5ec0c8410a474b4fa2732db3cc2979bb517b16c62345c7463c82d",
+    "birch.quarry.s01e03.mkv": "8f619f407acf203a13a671c960f6d4d96af96dfd640100b49b8aa0f0771a0b7e"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

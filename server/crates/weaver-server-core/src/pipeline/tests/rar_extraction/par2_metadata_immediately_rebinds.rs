@@ -2947,7 +2947,7 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
 /// not even known to be missing, so the strong-decode fast path settled the set
 /// as clean and extraction opened a truncated set. And had a repair somehow
 /// run, the rebuilt part sat on disk under a name the assembly had never heard
-/// of, outside the topology and outside `sevenz_set_part_paths`.
+/// of, outside the topology and outside `archive_set_part_paths`.
 #[tokio::test]
 async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_follows() {
     for (job_id, withheld) in [(JobId(30084), 2usize), (JobId(30085), 6usize)] {
@@ -3059,7 +3059,7 @@ async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_foll
         }
         assert!(
             pipeline
-                .sevenz_set_part_paths(job_id, set_name)
+                .archive_set_part_paths(job_id, set_name)
                 .unwrap()
                 .iter()
                 .any(|path| path.ends_with(&withheld_name)),

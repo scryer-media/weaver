@@ -1,0 +1,1664 @@
+//! Retained ownership and bounded dispatch for PAR3 blocking work.
+
+use super::*;
+use crate::pipeline::RepairWorkDone;
+use par3_rs::runtime::CancellationToken;
+use tokio::sync::mpsc;
+
+const MAX_JOBS: usize = 256;
+const MAX_PENDING: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WorkKey {
+    Source(SourceId),
+    Assess,
+    Donors,
+    Repair(par3_rs::InputSetId),
+    Readback,
+}
+
+enum WorkOutput {
+    Published,
+    Repaired(RepairCompletion),
+    Readback(readback::ReadbackDone),
+}
+
+/// Keep output-path accounting alive through channel handback, partial-error
+/// handling and asynchronous assembly/database reconciliation.
+pub(super) struct RepairCompletion {
+    pub result: EngineResult<par3_rs::session_repair::SessionRepairReport>,
+    pub outputs: EngineResult<Vec<readback::VerifiedOutput>>,
+    /// True only when the embedded repair path installed a replacement.
+    pub embedded_replacement: bool,
+    pub _reservation: Option<assessment::ViewReservation>,
+}
+
+enum PendingInput {
+    Assess,
+    Donors,
+    Readback(Box<readback::Installation>),
+    Virtual {
+        image: virtual_source::VirtualInput,
+        name: String,
+    },
+    Repair {
+        set: par3_rs::InputSetId,
+        path: PathBuf,
+    },
+    CompleteFile {
+        path: PathBuf,
+        name: String,
+    },
+    Embedded {
+        path: PathBuf,
+        name: String,
+        ranges: Option<Vec<std::ops::Range<u64>>>,
+        start: u64,
+    },
+    Carrier {
+        path: PathBuf,
+        ranges: Option<Vec<std::ops::Range<u64>>>,
+    },
+    File {
+        path: PathBuf,
+        name: String,
+        ranges: Vec<std::ops::Range<u64>>,
+    },
+}
+
+impl PendingInput {
+    fn retained_cost(&self) -> EngineResult<usize> {
+        let (path, extra) = match self {
+            Self::Donors | Self::Assess => return Ok(1024),
+            Self::Readback(_) => return Ok(readback::STRIPE_RESERVATION),
+            Self::Virtual { name, .. } => {
+                return name
+                    .capacity()
+                    .checked_mul(2)
+                    .and_then(|cost| cost.checked_add(1024))
+                    .ok_or(EngineError::ResourceLimit("PAR3 virtual publication"));
+            }
+            Self::Repair { path, .. } => (path, Some(0)),
+            Self::CompleteFile { path, name } => (path, name.capacity().checked_mul(2)),
+            Self::Embedded {
+                path, name, ranges, ..
+            } => (
+                path,
+                name.capacity().checked_mul(2).and_then(|bytes| {
+                    bytes.checked_add(
+                        ranges
+                            .as_ref()
+                            .map_or(Some(0), |ranges| ranges.capacity().checked_mul(32))?,
+                    )
+                }),
+            ),
+            Self::Carrier { path, ranges } => (
+                path,
+                ranges
+                    .as_ref()
+                    .map_or(Some(0), |ranges| ranges.capacity().checked_mul(32)),
+            ),
+            Self::File { path, name, ranges } => (
+                path,
+                name.capacity()
+                    .checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(ranges.capacity().checked_mul(32)?)),
+            ),
+        };
+        1024usize
+            .checked_add(
+                path.capacity()
+                    .checked_mul(2)
+                    .ok_or(EngineError::ResourceLimit("PAR3 queued path"))?,
+            )
+            .and_then(|bytes| bytes.checked_add(extra?))
+            .ok_or(EngineError::ResourceLimit("PAR3 queued publication"))
+    }
+}
+
+struct QueuedInput {
+    input: PendingInput,
+    reservation: assessment::ViewReservation,
+    queued_at: std::time::Instant,
+}
+
+impl QueuedInput {
+    fn new(input: PendingInput, reservation: assessment::ViewReservation) -> Self {
+        Self {
+            input,
+            reservation,
+            queued_at: std::time::Instant::now(),
+        }
+    }
+}
+
+struct WorkTiming {
+    job_id: JobId,
+    key: WorkKey,
+    queued_at: std::time::Instant,
+    started: std::time::Instant,
+}
+
+impl Drop for WorkTiming {
+    fn drop(&mut self) {
+        tracing::info!(job_id = self.job_id.0, operation = ?self.key,
+            queue_wait_us = self.started.duration_since(self.queued_at).as_micros() as u64,
+            execution_us = self.started.elapsed().as_micros() as u64,
+            "PAR3 native work finished");
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Acquisition {
+    pub batch: Option<RecoveryBatch>,
+    pub prefetched: bool,
+}
+
+pub(super) struct RecoveryBatch {
+    pub articles: Vec<crate::jobs::ids::SegmentId>,
+    job_id: JobId,
+    cohorts: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, u64)>,
+    epoch: u64,
+    assessment: u64,
+    admitted_at: std::time::Instant,
+    _reservation: assessment::ViewReservation,
+}
+
+impl Drop for RecoveryBatch {
+    fn drop(&mut self) {
+        tracing::debug!(job_id = self.job_id.0, articles = self.articles.len(),
+            cohorts = ?self.cohorts, epoch = self.epoch, assessment = self.assessment,
+            retained_us = self.admitted_at.elapsed().as_micros() as u64,
+            "PAR3 acquisition window retired");
+    }
+}
+
+struct KnownSource {
+    carrier: bool,
+    protected: bool,
+    embedded_start: Option<u64>,
+    complete_disk_image: bool,
+    promoted: BTreeMap<u32, assessment::ViewReservation>,
+    // Retained source, dirty and error bookkeeping outlives queued work,
+    // including failed publications which never entered the engine.
+    _reservation: assessment::ViewReservation,
+}
+
+struct MaterializedRanges {
+    ranges: Vec<std::ops::Range<u64>>,
+    _reservation: assessment::ViewReservation,
+}
+
+/// Committed availability held across a synchronous content-preserving rename.
+/// Verification evidence is deliberately not part of this handoff.
+pub(super) struct MaterializedSources(BTreeMap<SourceId, EngineResult<MaterializedRanges>>);
+
+struct JobSlot {
+    acquisition: Acquisition,
+    repair_phase: bool,
+    retry_serial: Option<WorkKey>,
+    retry_repair: bool,
+    runtime: Option<Par3Job>,
+    sources: PublishedSources,
+    epoch: u64,
+    last_used: u64,
+    known: BTreeMap<SourceId, KnownSource>,
+    materialized: BTreeMap<SourceId, EngineResult<MaterializedRanges>>,
+    dirty: std::collections::BTreeSet<SourceId>,
+    pending: BTreeMap<WorkKey, QueuedInput>,
+    ticket: Option<u64>,
+    errors: BTreeMap<SourceId, EngineError>,
+    donor_error: Option<EngineError>,
+    spill: Option<SourceId>,
+    spill_disk: Option<budget::DiskReservation>,
+    completed_repair: Option<RepairCompletion>,
+    completed_readback: Option<EngineResult<readback::ReadbackDone>>,
+    installing: bool,
+    verification: Option<verification::Receipt>,
+}
+
+impl Default for JobSlot {
+    fn default() -> Self {
+        let runtime = Par3Job::default();
+        Self {
+            sources: runtime.sources.clone(),
+            acquisition: Acquisition::default(),
+            repair_phase: false,
+            retry_serial: None,
+            retry_repair: false,
+            runtime: Some(runtime),
+            epoch: 0,
+            last_used: 0,
+            known: BTreeMap::new(),
+            materialized: BTreeMap::new(),
+            dirty: std::collections::BTreeSet::new(),
+            pending: BTreeMap::new(),
+            ticket: None,
+            errors: BTreeMap::new(),
+            donor_error: None,
+            spill: None,
+            spill_disk: None,
+            completed_repair: None,
+            completed_readback: None,
+            installing: false,
+            verification: None,
+        }
+    }
+}
+
+pub(crate) struct WorkDone {
+    job_id: JobId,
+    ticket: u64,
+    epoch: u64,
+    key: WorkKey,
+    runtime: Option<Par3Job>,
+    result: EngineResult<WorkOutput>,
+}
+
+/// Created only on PAR3 admission. Two job workers bound dispatch even
+/// when many jobs arrive together. Retired tickets hold capacity until their
+/// cancelled workers return; recreating a job cannot evade that bound.
+pub(in crate::pipeline) struct Coordinator {
+    jobs: BTreeMap<JobId, JobSlot>,
+    in_flight: BTreeMap<u64, (JobId, CancellationToken)>,
+    worker_allowances: BTreeMap<u64, usize>,
+    contended: std::collections::BTreeSet<u64>,
+    cpu_limit: usize,
+    next_ticket: u64,
+    last_job: Option<JobId>,
+    tx: mpsc::Sender<RepairWorkDone>,
+    #[cfg(test)]
+    test_rx: Option<mpsc::Receiver<RepairWorkDone>>,
+}
+
+#[cfg(test)]
+impl Default for Coordinator {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        let mut coordinator = Self::new(tx);
+        coordinator.test_rx = Some(rx);
+        coordinator
+    }
+}
+
+impl Coordinator {
+    pub(super) fn acquisition(&self, job_id: JobId) -> Option<&Acquisition> {
+        self.jobs.get(&job_id).map(|job| &job.acquisition)
+    }
+
+    pub(super) fn begin_recovery_batch(
+        &mut self,
+        job_id: JobId,
+        articles: Vec<crate::jobs::ids::SegmentId>,
+        prefetch: bool,
+    ) -> EngineResult<()> {
+        let cohort_count = self
+            .assessments(job_id)
+            .map(|(_, view)| view.requirements.len())
+            .sum::<usize>();
+        let reservation =
+            assessment::ViewReservation::acquire(512 + articles.len() * 64 + cohort_count * 64)?;
+        let cohorts: Vec<_> = self
+            .assessments(job_id)
+            .flat_map(|(set, view)| {
+                view.requirements
+                    .iter()
+                    .filter(|need| need.additional != 0)
+                    .map(move |need| (set, need.matrix, need.cohort))
+            })
+            .collect();
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(EngineError::InvalidState("unknown PAR3 job"))?;
+        job.acquisition.prefetched |= prefetch;
+        job.acquisition.batch = Some(RecoveryBatch {
+            articles,
+            job_id,
+            cohorts,
+            epoch: job.epoch,
+            assessment: job.last_used,
+            admitted_at: std::time::Instant::now(),
+            _reservation: reservation,
+        });
+        Ok(())
+    }
+
+    pub(in crate::pipeline) fn new(tx: mpsc::Sender<RepairWorkDone>) -> Self {
+        Self {
+            jobs: BTreeMap::new(),
+            in_flight: BTreeMap::new(),
+            worker_allowances: BTreeMap::new(),
+            contended: std::collections::BTreeSet::new(),
+            cpu_limit: std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .saturating_sub(1)
+                .max(1),
+            next_ticket: 0,
+            last_job: None,
+            tx,
+            #[cfg(test)]
+            test_rx: None,
+        }
+    }
+    pub(in crate::pipeline) fn authenticated_set_count(&self, job_id: JobId) -> usize {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())
+            .map_or(0, |runtime| {
+                runtime.sets.len()
+                    + runtime
+                        .dormant_views
+                        .keys()
+                        .filter(|id| !runtime.sets.contains_key(id))
+                        .count()
+            })
+    }
+
+    pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|job| {
+            job.installing
+                || job.spill.is_some()
+                || job.ticket.is_some()
+                || !job.pending.is_empty()
+                || !job.dirty.is_empty()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn enqueue(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+    ) -> EngineResult<()> {
+        self.enqueue_complete_carrier(job_id, source, path)
+    }
+
+    pub(super) fn enqueue_complete_carrier(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+    ) -> EngineResult<()> {
+        self.enqueue_input(job_id, source, PendingInput::Carrier { path, ranges: None })
+    }
+
+    pub(super) fn enqueue_carrier_ranges(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> EngineResult<()> {
+        self.enqueue_input(
+            job_id,
+            source,
+            PendingInput::Carrier {
+                path,
+                ranges: Some(ranges),
+            },
+        )
+    }
+
+    pub(super) fn enqueue_embedded(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+        name: String,
+        ranges: Option<Vec<std::ops::Range<u64>>>,
+        start: u64,
+    ) -> EngineResult<()> {
+        self.enqueue_input(
+            job_id,
+            source,
+            PendingInput::Embedded {
+                path,
+                name,
+                ranges,
+                start,
+            },
+        )
+    }
+
+    pub(super) fn embedded_start(&self, job_id: JobId, source: SourceId) -> Option<u64> {
+        self.jobs.get(&job_id)?.known.get(&source)?.embedded_start
+    }
+
+    pub(super) fn has_complete_disk_image(&self, job_id: JobId, source: SourceId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.known.get(&source))
+            .is_some_and(|known| known.complete_disk_image)
+    }
+
+    pub(super) fn enqueue_file(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+        name: String,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> EngineResult<()> {
+        self.enqueue_input(job_id, source, PendingInput::File { path, name, ranges })
+    }
+
+    pub(in crate::pipeline) fn contains_job(&self, job_id: JobId) -> bool {
+        self.jobs.contains_key(&job_id)
+    }
+
+    pub(super) fn enqueue_virtual(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        volume: crate::pipeline::direct_store::provider::VirtualVolume,
+        name: String,
+    ) -> EngineResult<()> {
+        self.admit(job_id)?;
+        if self.jobs[&job_id].spill.is_some() {
+            return Ok(());
+        }
+        let result =
+            virtual_source::VirtualInput::new(volume, &execution_options()).and_then(|image| {
+                self.enqueue_input(job_id, source, PendingInput::Virtual { image, name })
+            });
+        match result {
+            Err(error) if budget::is_host_pressure(&error) => {
+                tracing::debug!(job_id = job_id.0, source = source.0, %error,
+                    stage = "virtual_publication", "PAR3 source requires disk fallback");
+                self.jobs
+                    .get_mut(&job_id)
+                    .expect("admitted job")
+                    .spill
+                    .get_or_insert(source);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    pub(in crate::pipeline) fn admit(&mut self, job_id: JobId) -> EngineResult<()> {
+        if !self.jobs.contains_key(&job_id) && self.jobs.len() >= MAX_JOBS {
+            return Err(EngineError::ResourceLimit("PAR3 job count"));
+        }
+        self.jobs.entry(job_id).or_default();
+        Ok(())
+    }
+
+    /// Publish actual disk bytes as candidates; this does not admit verification evidence.
+    pub(super) fn enqueue_complete_file(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        path: PathBuf,
+        name: String,
+    ) -> EngineResult<()> {
+        self.enqueue_input(job_id, source, PendingInput::CompleteFile { path, name })
+    }
+
+    pub(super) fn request_repair(
+        &mut self,
+        job_id: JobId,
+        set: par3_rs::InputSetId,
+        path: PathBuf,
+    ) -> EngineResult<()> {
+        let Some((_, view)) = self.assessments(job_id).find(|(id, view)| {
+            *id == set
+                && (view.status == par3_rs::session::RepairStatus::Ready
+                    || (view.status == par3_rs::session::RepairStatus::Complete
+                        && view
+                            .embedded_source
+                            .is_some_and(|source| self.embedded_start(job_id, source).is_some())))
+        }) else {
+            return Err(EngineError::InvalidState("PAR3 repair is not ready"));
+        };
+        // Reserve before execution can install anything. Include the native
+        // report, partial-error temporary paths, and reconciliation copies.
+        let replacing_carrier = view.status == par3_rs::session::RepairStatus::Complete;
+        let outputs = view
+            .files
+            .iter()
+            .filter(|file| replacing_carrier || !file.complete)
+            .try_fold(2048usize, |bytes, file| {
+                bytes
+                    .checked_add(4096)?
+                    .checked_add(path.capacity().checked_mul(16)?)?
+                    .checked_add(file.path.len().checked_mul(16)?)
+            });
+        let outputs = outputs.ok_or(EngineError::ResourceLimit("PAR3 repair result paths"))?;
+        self.check_pending_capacity(job_id, WorkKey::Repair(set))?;
+        let input = PendingInput::Repair { set, path };
+        let reservation = assessment::ViewReservation::acquire(
+            input
+                .retained_cost()?
+                .checked_add(outputs)
+                .ok_or(EngineError::ResourceLimit("PAR3 repair result paths"))?,
+        )?;
+        self.jobs
+            .get_mut(&job_id)
+            .expect("assessed job")
+            .pending
+            .insert(WorkKey::Repair(set), QueuedInput::new(input, reservation));
+        self.dispatch()
+    }
+
+    pub(super) fn is_installing(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|job| job.installing)
+    }
+
+    pub(in crate::pipeline) fn set_repair_phase(&mut self, job_id: JobId, owned: bool) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.repair_phase = owned;
+        }
+    }
+
+    pub(in crate::pipeline) fn owns_repair_phase(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|job| job.repair_phase)
+    }
+
+    pub(super) fn queue_readback(
+        &mut self,
+        job_id: JobId,
+        installation: Box<readback::Installation>,
+    ) -> EngineResult<()> {
+        self.check_pending_capacity(job_id, WorkKey::Readback)?;
+        let reservation = assessment::ViewReservation::acquire(readback::STRIPE_RESERVATION)?;
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(EngineError::InvalidState("missing PAR3 installation job"))?;
+        if job.ticket.is_some() || job.pending.contains_key(&WorkKey::Readback) {
+            return Err(EngineError::InvalidState("PAR3 readback already queued"));
+        }
+        job.installing = true;
+        job.pending.insert(
+            WorkKey::Readback,
+            QueuedInput::new(PendingInput::Readback(installation), reservation),
+        );
+        self.dispatch()
+    }
+
+    pub(super) fn take_readback(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<EngineResult<readback::ReadbackDone>> {
+        self.jobs.get_mut(&job_id)?.completed_readback.take()
+    }
+
+    pub(super) fn finish_installation(&mut self, job_id: JobId) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.installing = false;
+            job.repair_phase = false;
+        }
+    }
+
+    pub(super) fn take_repair_result(&mut self, job_id: JobId) -> Option<RepairCompletion> {
+        self.jobs.get_mut(&job_id)?.completed_repair.take()
+    }
+
+    pub(super) fn take_repair_retry(&mut self, job_id: JobId) -> bool {
+        self.jobs
+            .get_mut(&job_id)
+            .is_some_and(|job| std::mem::take(&mut job.retry_repair))
+    }
+
+    pub(super) fn queue_reassessment(&mut self, job_id: JobId) -> EngineResult<()> {
+        let reservation = assessment::ViewReservation::acquire(1024)?;
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(EngineError::InvalidState("unknown PAR3 job"))?;
+        job.pending.insert(
+            WorkKey::Assess,
+            QueuedInput::new(PendingInput::Assess, reservation),
+        );
+        self.dispatch()
+    }
+
+    pub(super) fn error(&self, job_id: JobId) -> Option<&EngineError> {
+        let job = self.jobs.get(&job_id)?;
+        job.errors.values().next().or(job.donor_error.as_ref())
+    }
+
+    pub(super) fn take_spill(&mut self, job_id: JobId) -> Option<SourceId> {
+        let job = self.jobs.get_mut(&job_id)?;
+        if job.ticket.is_some() || job.installing || job.completed_repair.is_some() {
+            return None;
+        }
+        job.spill.take()
+    }
+
+    pub(super) fn reserve_spill_disk(
+        &mut self,
+        job_id: JobId,
+        bytes: u64,
+        available: u64,
+        reserve: u64,
+    ) -> EngineResult<()> {
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(EngineError::InvalidState("PAR3 spill job disappeared"))?;
+        job.spill_disk = Some(budget::DiskReservation::acquire(bytes, available, reserve)?);
+        Ok(())
+    }
+
+    pub(in crate::pipeline) fn take_spill_disk(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<budget::DiskReservation> {
+        self.jobs.get_mut(&job_id)?.spill_disk.take()
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn force_spill(&mut self, job_id: JobId, source: SourceId) {
+        self.admit(job_id).unwrap();
+        self.jobs.get_mut(&job_id).unwrap().spill = Some(source);
+    }
+
+    pub(super) fn release_spilled_images(
+        &mut self,
+        job_id: JobId,
+        sources: &[SourceId],
+    ) -> EngineResult<()> {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return Ok(());
+        };
+        if job.ticket.is_some() {
+            return Err(EngineError::InvalidState("PAR3 spill still has a reader"));
+        }
+        for &source in sources {
+            job.sources.release_withdrawn_image(source)?;
+            job.errors.remove(&source);
+        }
+        if let Some(runtime) = job.runtime.as_ref() {
+            runtime.virtual_readers.clear()?;
+        }
+        Ok(())
+    }
+
+    /// Called only after the scheduler has exhausted available parity.
+    pub(in crate::pipeline) fn request_donor_search(
+        &mut self,
+        job_id: JobId,
+    ) -> EngineResult<bool> {
+        let Some(job) = self.jobs.get(&job_id) else {
+            return Ok(false);
+        };
+        let Some(runtime) = job.runtime.as_ref() else {
+            return Ok(false);
+        };
+        if runtime.donor_search.exhaustive
+            || runtime.donor_search.exhausted
+            || job.pending.contains_key(&WorkKey::Donors)
+        {
+            return Ok(false);
+        }
+        self.check_pending_capacity(job_id, WorkKey::Donors)?;
+        let reservation = assessment::ViewReservation::acquire(1024)?;
+        self.jobs
+            .get_mut(&job_id)
+            .expect("known job")
+            .pending
+            .insert(
+                WorkKey::Donors,
+                QueuedInput::new(PendingInput::Donors, reservation),
+            );
+        self.dispatch()?;
+        Ok(true)
+    }
+
+    pub(super) fn donor_search_exhausted(&self, job_id: JobId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())
+            .is_some_and(|runtime| runtime.donor_search.exhausted)
+    }
+
+    pub(in crate::pipeline) fn is_promoted(&self, job_id: JobId, file_index: u32) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.known.get(&SourceId(u64::from(file_index))))
+            .is_some_and(|source| !source.promoted.is_empty())
+    }
+
+    pub(in crate::pipeline) fn article_promoted(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        ordinal: u32,
+    ) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.known.get(&SourceId(u64::from(file_index))))
+            .is_some_and(|source| source.promoted.contains_key(&ordinal))
+    }
+
+    pub(super) fn needed_offset(&self, job_id: JobId, file_index: u32) -> Option<u64> {
+        self.jobs
+            .get(&job_id)?
+            .runtime
+            .as_ref()?
+            .carriers
+            .get(&SourceId(u64::from(file_index)))?
+            .needed
+    }
+
+    pub(super) fn promote(
+        &mut self,
+        job_id: JobId,
+        file_index: u32,
+        ordinal: u32,
+    ) -> EngineResult<()> {
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(EngineError::InvalidState("unknown PAR3 job"))?;
+        let source = SourceId(u64::from(file_index));
+        if !job.known.contains_key(&source) {
+            if job.known.len() >= MAX_PENDING {
+                return Err(EngineError::ResourceLimit("PAR3 recovery candidates"));
+            }
+            job.known.insert(
+                source,
+                KnownSource {
+                    carrier: true,
+                    protected: false,
+                    embedded_start: None,
+                    complete_disk_image: false,
+                    promoted: BTreeMap::new(),
+                    _reservation: assessment::ViewReservation::acquire(512)?,
+                },
+            );
+        }
+        let known = job.known.get_mut(&source).expect("admitted source");
+        if let std::collections::btree_map::Entry::Vacant(entry) = known.promoted.entry(ordinal) {
+            entry.insert(assessment::ViewReservation::acquire(96)?);
+        }
+        Ok(())
+    }
+
+    pub(super) fn is_carrier(&self, job_id: JobId, source: SourceId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.known.get(&source))
+            .is_some_and(|source| source.carrier)
+    }
+
+    /// Identity learned from an authenticated layout, not a verification claim.
+    /// Ordinary publication changes invalidate evidence but preserve this binding.
+    pub(super) fn protects_source(&self, job_id: JobId, source: SourceId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.known.get(&source))
+            .is_some_and(|source| source.protected)
+    }
+
+    pub(super) fn knows_source(&self, job_id: JobId, source: SourceId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .is_some_and(|job| job.known.contains_key(&source))
+    }
+
+    pub(super) fn dirty_sources(&self, job_id: JobId) -> Vec<SourceId> {
+        self.jobs
+            .get(&job_id)
+            .filter(|job| job.ticket.is_none() && !job.installing)
+            .map(|job| {
+                job.dirty
+                    .iter()
+                    .filter(|source| !job.pending.contains_key(&WorkKey::Source(**source)))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) fn invalidate_source(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<()> {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return Ok(());
+        };
+        if !job.known.contains_key(&source) {
+            return Ok(());
+        }
+        let epoch = job
+            .epoch
+            .checked_add(1)
+            .ok_or(EngineError::ResourceLimit("PAR3 source epochs"))?;
+        job.sources.withdraw(source)?;
+        job.known
+            .get_mut(&source)
+            .expect("known source")
+            .complete_disk_image = false;
+        job.epoch = epoch;
+        job.pending.remove(&WorkKey::Source(source));
+        job.pending
+            .retain(|key, _| !matches!(key, WorkKey::Repair(_)));
+        job.dirty.insert(source);
+        if let Some(runtime) = job.runtime.as_mut() {
+            for set in runtime.sets.values_mut() {
+                set.invalidate(source);
+            }
+            runtime.carriers.remove(&source);
+        }
+        Ok(())
+    }
+
+    pub(super) fn take_materialized_sources(
+        &mut self,
+        job_id: JobId,
+    ) -> Option<MaterializedSources> {
+        self.jobs
+            .get_mut(&job_id)
+            .map(|job| MaterializedSources(std::mem::take(&mut job.materialized)))
+    }
+
+    pub(super) fn restore_materialized_sources(
+        &mut self,
+        job_id: JobId,
+        sources: MaterializedSources,
+    ) {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.materialized = sources.0;
+        }
+    }
+
+    pub(super) fn invalidate_bindings(&mut self, job_id: JobId) -> EngineResult<()> {
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.materialized.clear();
+            for source in job.known.values_mut() {
+                source.protected = false;
+            }
+        }
+        let sources: Vec<_> = self
+            .jobs
+            .get(&job_id)
+            .into_iter()
+            .flat_map(|job| job.known.keys().copied())
+            .collect();
+        for source in sources {
+            self.invalidate_source(job_id, source)?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::pipeline) fn note_materialized_ranges(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        extents: &[(u64, u64)],
+    ) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        job.materialized.remove(&source);
+        let result = (|| {
+            let bytes = extents
+                .len()
+                .checked_mul(32)
+                .and_then(|bytes| bytes.checked_add(256))
+                .ok_or(EngineError::ResourceLimit("PAR3 materialized ranges"))?;
+            let reservation = assessment::ViewReservation::acquire(bytes)?;
+            let ranges = extents
+                .iter()
+                .filter(|(_, len)| *len != 0)
+                .map(|&(offset, len)| {
+                    offset
+                        .checked_add(len)
+                        .map(|end| offset..end)
+                        .ok_or(EngineError::ResourceLimit("PAR3 materialized offsets"))
+                })
+                .collect::<EngineResult<Vec<_>>>()?;
+            Ok(MaterializedRanges {
+                ranges,
+                _reservation: reservation,
+            })
+        })();
+        job.materialized.insert(source, result);
+    }
+
+    pub(super) fn materialized_ranges(
+        &self,
+        job_id: JobId,
+        source: SourceId,
+    ) -> EngineResult<Option<&[std::ops::Range<u64>]>> {
+        match self
+            .jobs
+            .get(&job_id)
+            .and_then(|job| job.materialized.get(&source))
+        {
+            Some(Ok(entry)) => Ok(Some(entry.ranges.as_slice())),
+            Some(Err(_)) => Err(EngineError::ResourceLimit("PAR3 materialized ranges")),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn name_match_source(&self, job_id: JobId) -> Option<SourceId> {
+        if self.has_work(job_id) {
+            return None;
+        }
+        self.jobs
+            .get(&job_id)
+            .filter(|job| job.errors.is_empty())
+            .and_then(|job| job.runtime.as_ref())
+            .and_then(|runtime| runtime.name_search.source())
+    }
+
+    pub(super) fn take_name_match(
+        &mut self,
+        job_id: JobId,
+    ) -> EngineResult<Option<placement::NameMatch>> {
+        if self.has_work(job_id) {
+            return Ok(None);
+        }
+        match self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|job| job.runtime.as_mut())
+        {
+            Some(runtime) => runtime.take_name_match(),
+            None => Ok(None),
+        }
+    }
+
+    pub(in crate::pipeline) fn assessments(
+        &self,
+        job_id: JobId,
+    ) -> impl Iterator<Item = (par3_rs::InputSetId, &assessment::AssessmentView)> {
+        self.jobs
+            .get(&job_id)
+            .filter(|job| {
+                !job.installing
+                    && job.ticket.is_none()
+                    && job.pending.is_empty()
+                    && job.errors.is_empty()
+                    && job.dirty.is_empty()
+            })
+            .and_then(|job| job.runtime.as_ref())
+            .into_iter()
+            .flat_map(|runtime| {
+                runtime
+                    .sets
+                    .iter()
+                    .filter_map(|(&id, set)| set.view.as_ref().map(|view| (id, view)))
+                    .chain(runtime.dormant_views.iter().map(|(&id, view)| (id, view)))
+            })
+    }
+
+    #[cfg(test)]
+    pub(in crate::pipeline) fn source_verifications(&self, job_id: JobId) -> u64 {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.runtime.as_ref())
+            .map_or(0, |runtime| {
+                runtime
+                    .sets
+                    .values()
+                    .map(|set| set.native.diagnostics().source_verifications)
+                    .sum()
+            })
+    }
+
+    pub(in crate::pipeline) fn verified(&self, job_id: JobId) -> bool {
+        let count = self.authenticated_set_count(job_id);
+        count != 0
+            && self
+                .assessments(job_id)
+                .filter(|(_, view)| view.status == par3_rs::session::RepairStatus::Complete)
+                .count()
+                == count
+    }
+
+    /// A terminal claim must name a bound protected source. A clean job does
+    /// not establish evidence for its unprotected files or recovery carriers.
+    pub(in crate::pipeline) fn verified_file(&self, job_id: JobId, source: SourceId) -> bool {
+        self.verified(job_id) && self.source_verified(job_id, source)
+    }
+
+    /// Current native evidence for one bound source can survive damage in a
+    /// sibling. Terminal delivery still requires the aggregate verdict above.
+    pub(in crate::pipeline) fn source_verified(&self, job_id: JobId, source: SourceId) -> bool {
+        self.assessments(job_id)
+            .any(|(_, view)| view.verified_sources.contains(&source))
+    }
+
+    fn enqueue_input(
+        &mut self,
+        job_id: JobId,
+        source: SourceId,
+        input: PendingInput,
+    ) -> EngineResult<()> {
+        if !self.jobs.contains_key(&job_id) && self.jobs.len() >= MAX_JOBS {
+            return Err(EngineError::ResourceLimit("PAR3 job count"));
+        }
+        self.check_pending_capacity(job_id, WorkKey::Source(source))?;
+        let reservation = assessment::ViewReservation::acquire(input.retained_cost()?)?;
+        let job = self.jobs.entry(job_id).or_default();
+        if !job.known.contains_key(&source) && job.known.len() >= MAX_PENDING {
+            return Err(EngineError::ResourceLimit("PAR3 known sources"));
+        }
+        let carrier = matches!(
+            input,
+            PendingInput::Carrier { .. } | PendingInput::Embedded { .. }
+        );
+        // This records byte availability, never a hash verdict. Explicit full
+        // disk publications supersede article holes until a later source write
+        // or identity rebind withdraws the publication.
+        let complete_disk_image = matches!(
+            input,
+            PendingInput::CompleteFile { .. }
+                | PendingInput::Carrier { ranges: None, .. }
+                | PendingInput::Embedded { ranges: None, .. }
+        );
+        let embedded_start = match &input {
+            PendingInput::Embedded { start, .. } => Some(*start),
+            _ => None,
+        };
+        if let Some(known) = job.known.get_mut(&source) {
+            known.carrier = carrier;
+            known.embedded_start = embedded_start;
+            known.complete_disk_image = complete_disk_image;
+        } else {
+            let reservation = assessment::ViewReservation::acquire(512)?;
+            job.known.insert(
+                source,
+                KnownSource {
+                    carrier,
+                    protected: false,
+                    embedded_start,
+                    complete_disk_image,
+                    promoted: BTreeMap::new(),
+                    _reservation: reservation,
+                },
+            );
+        }
+        job.pending.insert(
+            WorkKey::Source(source),
+            QueuedInput::new(input, reservation),
+        );
+        Ok(())
+    }
+
+    fn check_pending_capacity(&self, job_id: JobId, key: WorkKey) -> EngineResult<()> {
+        let already_pending = self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|job| job.pending.contains_key(&key));
+        if !already_pending
+            && self
+                .jobs
+                .values()
+                .map(|job| job.pending.len())
+                .sum::<usize>()
+                >= MAX_PENDING
+        {
+            return Err(EngineError::ResourceLimit("pending PAR3 work"));
+        }
+        Ok(())
+    }
+
+    /// Reclaim the least recently used recovery-waiting sessions before
+    /// admitting another work unit. PAR2 budgets and policy are independent.
+    fn evict_idle_sessions(&mut self, protected: JobId, headroom: usize) {
+        let Some(memory) = self
+            .jobs
+            .get(&protected)
+            .and_then(|job| job.runtime.as_ref())
+            .map(|runtime| runtime.options.memory.clone())
+        else {
+            return;
+        };
+        while memory.available() < headroom {
+            let victim = self
+                .jobs
+                .iter()
+                .filter(|(id, job)| {
+                    **id != protected
+                        && job.ticket.is_none()
+                        && !job.installing
+                        && job.pending.is_empty()
+                        && job.dirty.is_empty()
+                        && job.errors.is_empty()
+                        && job.completed_repair.is_none()
+                        && job.completed_readback.is_none()
+                        && job.runtime.as_ref().is_some_and(|runtime| {
+                            !runtime.sets.is_empty()
+                                && runtime.name_search.source().is_none()
+                                && runtime.sets.values().all(|set| {
+                                    set.view.as_ref().is_some_and(|view| {
+                                        view.status == par3_rs::session::RepairStatus::NeedRecovery
+                                    })
+                                })
+                        })
+                })
+                .min_by_key(|(id, job)| (job.last_used, **id))
+                .map(|(&id, _)| id);
+            let Some(victim) = victim else {
+                break;
+            };
+            let before = memory.used();
+            self.jobs
+                .get_mut(&victim)
+                .expect("idle victim")
+                .runtime
+                .as_mut()
+                .expect("retained idle runtime")
+                .evict_native_sessions();
+            tracing::debug!(
+                job_id = victim.0,
+                released_bytes = before.saturating_sub(memory.used()),
+                "evicted idle PAR3 sessions; current arrivals will reopen native analysis"
+            );
+        }
+    }
+
+    pub(super) fn dispatch(&mut self) -> EngineResult<()> {
+        for _ in 0..2 {
+            self.dispatch_one()?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_one(&mut self) -> EngineResult<()> {
+        let available = self
+            .cpu_limit
+            .saturating_sub(self.worker_allowances.values().sum::<usize>());
+        if self.in_flight.len() >= 2
+            || available == 0
+            || self.in_flight.values().any(|(id, _)| {
+                self.jobs
+                    .get(id)
+                    .is_some_and(|job| job.retry_serial.is_some())
+            })
+        {
+            return Ok(());
+        }
+        let ready = |job: &&JobSlot| {
+            job.ticket.is_none()
+                && (job.retry_serial.is_none() || self.in_flight.is_empty())
+                && (job.spill.is_none() || job.installing)
+                && if job.installing {
+                    job.pending.contains_key(&WorkKey::Readback)
+                } else {
+                    !job.pending.is_empty()
+                }
+        };
+        let next = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| ready(job))
+            .find(|(id, _)| self.last_job.is_none_or(|last| **id > last))
+            .or_else(|| self.jobs.iter().find(|(_, job)| ready(job)))
+            .map(|(&id, _)| id);
+        let Some(job_id) = next else {
+            return Ok(());
+        };
+        if self.jobs[&job_id].retry_serial.is_some() {
+            // A peer may have returned its worker while retaining idle readers.
+            // Return those cache leases too before the isolated retry; checked-
+            // out readers remain owned until they actually return.
+            for (&id, job) in &self.jobs {
+                if id != job_id
+                    && job.ticket.is_none()
+                    && let Some(runtime) = &job.runtime
+                {
+                    runtime.virtual_readers.clear()?;
+                }
+            }
+        }
+        let contenders = self
+            .jobs
+            .values()
+            .filter(ready)
+            .count()
+            .min(2 - self.in_flight.len());
+        let workers = (available / contenders.max(1)).max(1);
+        self.evict_idle_sessions(job_id, budget::budgets().native.limit() / 2);
+        let job = self.jobs.get_mut(&job_id).expect("selected ready job");
+        let ticket = self
+            .next_ticket
+            .checked_add(1)
+            .ok_or(EngineError::ResourceLimit("PAR3 worker tickets"))?;
+        let Some(mut runtime) = job.runtime.take() else {
+            return Err(EngineError::InvalidState(
+                "PAR3 session already owned by a worker",
+            ));
+        };
+        runtime.options.workers = workers;
+        runtime.options.progress.get_or_insert_with(|| {
+            par3_rs::runtime::ProgressCallback::new(move |event| {
+                if matches!(event.phase, par3_rs::runtime::ProgressPhase::End) {
+                    tracing::debug!(job_id = job_id.0, operation = event.operation,
+                        stage = ?event.stage, completed = event.completed,
+                        execution_us = event.elapsed.as_micros() as u64,
+                        "PAR3 engine stage finished");
+                }
+            })
+        });
+        for set in runtime.sets.values_mut() {
+            if let Err(error) = set
+                .native
+                .set_execution_limits(workers, runtime.options.stripe_bytes)
+            {
+                job.runtime = Some(runtime);
+                return Err(error);
+            }
+        }
+        if !runtime.dormant_views.is_empty() {
+            job.verification = None;
+        }
+        self.next_ticket = ticket;
+        self.last_job = Some(job_id);
+        let (key, input) = if job.installing {
+            (
+                WorkKey::Readback,
+                job.pending
+                    .remove(&WorkKey::Readback)
+                    .expect("pending readback"),
+            )
+        } else {
+            job.pending.pop_first().expect("pending input")
+        };
+        let epoch = job.epoch;
+        let assess =
+            job.pending.is_empty() && job.dirty.iter().all(|id| key == WorkKey::Source(*id));
+        job.ticket = Some(ticket);
+        self.in_flight
+            .insert(ticket, (job_id, runtime.options.cancel.clone()));
+        if self.in_flight.len() > 1 {
+            self.contended.extend(self.in_flight.keys());
+        }
+        self.worker_allowances.insert(ticket, workers);
+        tracing::debug!(
+            job_id = job_id.0,
+            ticket,
+            workers,
+            active_jobs = self.in_flight.len(),
+            "PAR3 worker admitted"
+        );
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let _timing = WorkTiming {
+                    job_id,
+                    key,
+                    queued_at: input.queued_at,
+                    started: std::time::Instant::now(),
+                };
+                // Keep the queue lease live while the worker owns its input;
+                // successful publication transfers it into retained state.
+                if matches!(input.input, PendingInput::Donors | PendingInput::Assess) {
+                    if matches!(input.input, PendingInput::Donors) {
+                        runtime.donor_search.exhaustive = true;
+                    }
+                    let result = runtime.assess().map(|()| WorkOutput::Published);
+                    return (runtime, result);
+                }
+                if let PendingInput::Readback(mut installation) = input.input {
+                    let result = installation.read_unit(&runtime.sources, &runtime.options);
+                    return (
+                        runtime,
+                        Ok(WorkOutput::Readback(readback::ReadbackDone {
+                            installation,
+                            result,
+                            _reservation: input.reservation,
+                        })),
+                    );
+                }
+                if let PendingInput::Repair { set, path } = input.input {
+                    let layout = runtime
+                        .sets
+                        .get_mut(&set)
+                        .ok_or(EngineError::InvalidState("missing PAR3 repair set"))
+                        .and_then(|set| set.native.layout())
+                        .and_then(|layout| {
+                            layout.ok_or(EngineError::InvalidState("missing PAR3 repair layout"))
+                        });
+                    let layout = match layout {
+                        Ok(layout) => layout,
+                        Err(error) => {
+                            return (
+                                runtime,
+                                Ok(WorkOutput::Repaired(RepairCompletion {
+                                    result: Err(error),
+                                    outputs: Ok(Vec::new()),
+                                    embedded_replacement: false,
+                                    _reservation: Some(input.reservation),
+                                })),
+                            );
+                        }
+                    };
+                    let result = runtime.repair(set, &path);
+                    let installed = match &result {
+                        Ok(report) => report.installed.as_slice(),
+                        Err(EngineError::RepairInterrupted { installed, .. }) => {
+                            installed.as_slice()
+                        }
+                        _ => &[],
+                    };
+                    let embedded_replacement = !installed.is_empty()
+                        && layout.files().iter().any(|file| {
+                            file.extents.iter().any(|extent| {
+                                matches!(extent.kind, par3_rs::layout::ExtentKind::Unprotected)
+                            })
+                        });
+                    let outputs = installed
+                        .iter()
+                        .map(|output| {
+                            let file = layout
+                                .files()
+                                .iter()
+                                .find(|file| path.join(&file.path) == output.path)
+                                .ok_or(EngineError::InvalidState(
+                                    "PAR3 output has no authenticated length",
+                                ))?;
+                            readback::VerifiedOutput::capture(
+                                output.path.clone(),
+                                file.len,
+                                &runtime.options,
+                            )
+                        })
+                        .collect();
+                    return (
+                        runtime,
+                        Ok(WorkOutput::Repaired(RepairCompletion {
+                            result,
+                            outputs,
+                            embedded_replacement,
+                            _reservation: Some(input.reservation),
+                        })),
+                    );
+                }
+                let WorkKey::Source(source) = key else {
+                    return (
+                        runtime,
+                        Err(EngineError::InvalidState("invalid PAR3 work key")),
+                    );
+                };
+                let before = runtime.sources.revision(source).ok().flatten();
+                let result = match input.input {
+                    PendingInput::Virtual { image, name } => {
+                        runtime.publish_virtual(source, image, name)
+                    }
+                    PendingInput::Repair { .. }
+                    | PendingInput::Readback(_)
+                    | PendingInput::Donors
+                    | PendingInput::Assess => {
+                        unreachable!("repair dispatched above")
+                    }
+                    PendingInput::CompleteFile { path, name } => std::fs::metadata(&path)
+                        .map_err(EngineError::from)
+                        .and_then(|metadata| {
+                            let ranges = if metadata.len() == 0 {
+                                Vec::new()
+                            } else {
+                                std::iter::once(0..metadata.len()).collect()
+                            };
+                            runtime.publish_file(source, path, name, ranges)
+                        }),
+                    PendingInput::Embedded {
+                        path,
+                        name,
+                        ranges,
+                        start,
+                    } => runtime.scan_embedded(source, path, name, ranges, start),
+                    PendingInput::Carrier { path, ranges } => {
+                        runtime.scan_file(source, path, ranges)
+                    }
+                    PendingInput::File { path, name, ranges } => {
+                        runtime.publish_file(source, path, name, ranges)
+                    }
+                };
+                if let Ok(Some(after)) = runtime.sources.revision(source)
+                    && Some(after) != before
+                {
+                    // Scanning can fail after publication succeeded. Keep its
+                    // lease even on that exit; the ranges are still retained.
+                    runtime.publication_memory.insert(source, input.reservation);
+                }
+                let result = result.and_then(|()| if assess { runtime.assess() } else { Ok(()) });
+                (runtime, result.map(|()| WorkOutput::Published))
+            })
+            .await;
+            let (runtime, result) = match result {
+                Ok((runtime, result)) => (Some(runtime), result),
+                Err(error) => (None, Err(std::io::Error::other(error).into())),
+            };
+            let _ = tx
+                .send(RepairWorkDone::Par3(Box::new(WorkDone {
+                    job_id,
+                    ticket,
+                    epoch,
+                    key,
+                    runtime,
+                    result,
+                })))
+                .await;
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn recv(&mut self) -> Option<WorkDone> {
+        match self
+            .test_rx
+            .as_mut()
+            .expect("test coordinator receiver")
+            .recv()
+            .await?
+        {
+            RepairWorkDone::Par3(done) => Some(*done),
+            RepairWorkDone::Par2(_) => panic!("PAR3 unit worker returned a PAR2 outcome"),
+        }
+    }
+
+    /// Return the live job to recheck, or discard a forgotten/stale result.
+    pub(super) fn settle(&mut self, done: WorkDone) -> Option<JobId> {
+        let (job_id, _) = self.in_flight.get(&done.ticket)?;
+        if *job_id != done.job_id {
+            return None;
+        }
+        self.in_flight.remove(&done.ticket);
+        self.worker_allowances.remove(&done.ticket);
+        let contended = self.contended.remove(&done.ticket);
+        let job = self.jobs.get_mut(&done.job_id)?;
+        if job.ticket != Some(done.ticket) {
+            return None;
+        }
+        job.ticket = None;
+        job.last_used = done.ticket;
+        let mut runtime = done.runtime.unwrap_or_default();
+        if done.epoch != job.epoch {
+            // A write raced this operation. Keep capacity until this handback,
+            // retain unrelated evidence, and require fresh publication before
+            // any returned scheduling view can be consumed.
+            if let WorkKey::Source(source) = done.key {
+                job.dirty.insert(source);
+            }
+            for &source in &job.dirty {
+                for set in runtime.sets.values_mut() {
+                    set.invalidate(source);
+                }
+                runtime.carriers.remove(&source);
+            }
+        } else if let WorkKey::Source(source) = done.key {
+            job.dirty.remove(&source);
+        }
+        if done.epoch == job.epoch {
+            for view in runtime.sets.values().filter_map(|set| set.view.as_ref()) {
+                for source in view.files.iter().filter_map(|file| file.source) {
+                    if let Some(known) = job.known.get_mut(&source) {
+                        known.protected = true;
+                    }
+                }
+            }
+        }
+        job.sources = runtime.sources.clone();
+        job.runtime = Some(runtime);
+        if done.epoch != job.epoch {
+            if matches!(done.key, WorkKey::Repair(_)) {
+                // Installation may have finished before the racing write. The
+                // caller must not certify its outputs against the newer epoch.
+                job.completed_repair = Some(RepairCompletion {
+                    result: Err(EngineError::InvalidState(
+                        "PAR3 repair output changed before handback",
+                    )),
+                    outputs: Ok(Vec::new()),
+                    embedded_replacement: false,
+                    _reservation: None,
+                });
+            } else if done.key == WorkKey::Readback {
+                job.completed_readback = Some(Err(EngineError::InvalidState(
+                    "PAR3 readback changed before handback",
+                )));
+            }
+            return Some(done.job_id);
+        }
+        let native_pressure = match &done.result {
+            Err(error) => budget::is_native_pressure(error),
+            Ok(WorkOutput::Repaired(completion)) => completion
+                .result
+                .as_ref()
+                .err()
+                .is_some_and(budget::is_native_pressure),
+            _ => false,
+        };
+        // A repair retry can perform an assessment first. Only the operation
+        // that needed isolation consumes the reservation; afterward this job
+        // participates in ordinary shared scheduling again.
+        if !contended && job.retry_serial == Some(done.key) {
+            job.retry_serial = None;
+        }
+        if contended && native_pressure {
+            job.retry_serial = Some(done.key);
+            job.retry_repair = matches!(done.key, WorkKey::Repair(_));
+            if let WorkKey::Source(source) = done.key {
+                job.dirty.insert(source);
+                job.errors.remove(&source);
+                return Some(done.job_id);
+            }
+            if matches!(done.key, WorkKey::Assess | WorkKey::Donors) {
+                let input = if done.key == WorkKey::Donors {
+                    PendingInput::Donors
+                } else {
+                    PendingInput::Assess
+                };
+                match assessment::ViewReservation::acquire(1024) {
+                    Ok(reservation) => {
+                        job.pending
+                            .insert(done.key, QueuedInput::new(input, reservation));
+                    }
+                    Err(error) => {
+                        job.donor_error = Some(error);
+                    }
+                }
+                return Some(done.job_id);
+            }
+            // Repair reports still pass through installation reconciliation.
+        }
+        let pressure = match &done.result {
+            Err(error)
+                if matches!(
+                    done.key,
+                    WorkKey::Source(_) | WorkKey::Donors | WorkKey::Repair(_)
+                ) =>
+            {
+                budget::error_pressure_source(error).or_else(|| match done.key {
+                    WorkKey::Source(source) if budget::is_host_pressure(error) => Some(source),
+                    _ => None,
+                })
+            }
+            Ok(WorkOutput::Repaired(completion)) => completion
+                .result
+                .as_ref()
+                .err()
+                .and_then(budget::error_pressure_source),
+            _ => None,
+        };
+        if let Some(source) = pressure {
+            // Fence dispatch now, but preserve repair reports: installed files
+            // must still pass reconciliation before the completion gate spills.
+            job.spill.get_or_insert(source);
+            let stage = match done.key {
+                WorkKey::Donors => "donor_search",
+                WorkKey::Repair(_) => "repair",
+                _ => "assessment",
+            };
+            tracing::debug!(
+                job_id = done.job_id.0,
+                source = source.0,
+                stage,
+                "PAR3 virtual reader requires disk fallback"
+            );
+        }
+        match (done.key, done.result) {
+            (WorkKey::Donors | WorkKey::Assess, result) => {
+                job.donor_error = if pressure.is_some() {
+                    None
+                } else {
+                    result.err()
+                };
+            }
+            (WorkKey::Readback, result) => {
+                job.completed_readback = Some(result.and_then(|output| match output {
+                    WorkOutput::Readback(done) => Ok(done),
+                    _ => Err(EngineError::InvalidState("missing PAR3 readback result")),
+                }));
+            }
+            (WorkKey::Repair(_), result) => {
+                job.completed_repair = Some(match result {
+                    Ok(WorkOutput::Repaired(completion)) => completion,
+                    other => RepairCompletion {
+                        result: Err(other
+                            .err()
+                            .unwrap_or(EngineError::InvalidState("missing PAR3 repair report"))),
+                        outputs: Ok(Vec::new()),
+                        embedded_replacement: false,
+                        _reservation: None,
+                    },
+                });
+            }
+            (WorkKey::Source(source), Ok(_)) => {
+                job.errors.remove(&source);
+            }
+            (WorkKey::Source(source), Err(error)) => {
+                if pressure.is_some() {
+                    job.errors.remove(&source);
+                } else {
+                    tracing::warn!(job_id = done.job_id.0, source = source.0, %error, "PAR3 carrier discovery incomplete");
+                    job.errors.insert(source, error);
+                }
+            }
+        }
+        Some(done.job_id)
+    }
+
+    pub(in crate::pipeline) fn forget(&mut self, job_id: JobId) {
+        self.jobs.remove(&job_id);
+        for (owner, token) in self.in_flight.values() {
+            if *owner == job_id {
+                token.cancel();
+            }
+        }
+    }
+}
+
+impl Drop for Coordinator {
+    fn drop(&mut self) {
+        for (_, token) in self.in_flight.values() {
+            token.cancel();
+        }
+    }
+}
+
+mod verification;
+
+#[cfg(test)]
+mod pressure_tests;
+#[cfg(test)]
+mod tests;

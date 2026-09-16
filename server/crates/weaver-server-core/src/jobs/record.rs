@@ -21,6 +21,9 @@ pub struct ActiveJob {
     pub paused_resume_status: Option<&'static str>,
     pub paused_resume_download_state: Option<&'static str>,
     pub paused_resume_post_state: Option<&'static str>,
+    /// Effective unpack password for restore. Database writes encrypt this
+    /// value; `None` keeps the NZB password and an empty string explicitly clears it.
+    pub password_override: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,9 @@ pub enum FileIdentitySource {
     Declared,
     Probe,
     Par2,
+    Par3,
+    /// A durable move intent: current_filename is the old path and canonical_filename the target.
+    Par3Pending,
     Nested,
 }
 
@@ -37,6 +43,8 @@ impl FileIdentitySource {
             Self::Declared => "declared",
             Self::Probe => "probe",
             Self::Par2 => "par2",
+            Self::Par3 => "par3",
+            Self::Par3Pending => "par3_pending",
             Self::Nested => "nested",
         }
     }
@@ -46,6 +54,8 @@ impl FileIdentitySource {
             "declared" => Some(Self::Declared),
             "probe" => Some(Self::Probe),
             "par2" => Some(Self::Par2),
+            "par3" => Some(Self::Par3),
+            "par3_pending" => Some(Self::Par3Pending),
             "nested" => Some(Self::Nested),
             _ => None,
         }

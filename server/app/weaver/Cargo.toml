@@ -63,6 +63,12 @@ embed-resource = "3.0.11"
 
 [dev-dependencies]
 tower = { workspace = true, default-features = false }
+# `test-util` for the paused clocks in this crate's own tests, which must not
+# compile only when another workspace member's dev-dependencies are built too.
+tokio = { workspace = true, features = ["test-util"] }
+# A real client for the GraphQL socket tests: an upgrade only happens on a live
+# connection, never through a one-shot router call.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 
 [target.'cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }

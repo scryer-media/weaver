@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Extension, Request};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -86,6 +86,32 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let session_token = super::SessionToken(Arc::new(generate_api_key()));
     let request_security = Arc::new(security.clone());
     let login_limiter = super::auth::LoginRateLimiter::default();
+    let setup_challenge = if security.authenticated_access_mode()
+        && auth_cache.snapshot().is_none()
+        && db
+            .get_setting(weaver_server_core::auth::repository::SETUP_PENDING_SETTING_KEY)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("pending")
+    {
+        if super::setup_code::setup_code_required(
+            security.http_bind_address,
+            !security.trusted_proxies.is_empty(),
+        ) {
+            let (challenge, code) = super::setup_code::SetupChallenge::generate();
+            crate::logging::announce_setup_code(&code);
+            tracing::warn!(
+                "first-time setup is waiting for the one-time setup code printed on the console (stderr)"
+            );
+            Some(challenge)
+        } else {
+            tracing::info!("first-time setup is open to a browser on this machine");
+            Some(super::setup_code::SetupChallenge::open())
+        }
+    } else {
+        None
+    };
     let backup_upload_limit =
         usize::try_from(security.backup_upload_limit_bytes).unwrap_or(usize::MAX);
     let backup_request_limit = backup_upload_limit
@@ -124,7 +150,10 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .route("/readyz", get(super::health::readyz_handler))
         .merge(nzbget_rpc_routes)
         .route("/graphql", post(super::graphql::graphql_handler))
-        .route("/graphql/ws", get(super::graphql::ws_handler))
+        .route(
+            "/graphql/ws",
+            get(super::graphql::ws_handler::<weaver_server_api::WeaverSchema>),
+        )
         .route(
             "/api/jobs/{job_id}/nzb",
             get(super::jobs::job_nzb_download_handler),
@@ -149,10 +178,20 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         )
         .route("/api/auth/setup", post(super::auth::setup_handler))
         .route("/api/login", post(super::auth::login_handler))
+        .route(
+            "/api/auth/verify",
+            post(super::auth::verify_password_handler),
+        )
+        .route(
+            "/api/auth/signout-all",
+            post(super::auth::sign_out_all_handler),
+        )
         .route("/api/logout", post(super::auth::logout_handler))
+        .route("/api/auth/csrf", get(super::auth::csrf_handler))
         .route("/api/auth/status", get(super::auth::auth_status_handler))
         .route("/", get(super::assets::static_handler))
         .fallback(get(super::assets::static_handler))
+        .layer(middleware::from_fn(super::auth::enforce_browser_csrf))
         .layer(Extension(handle))
         .layer(Extension(schema))
         .layer(Extension(backup))
@@ -182,6 +221,11 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
             async move { super::request_metrics::track_requests(http_metrics, req, next).await }
         }));
 
+    let inner = if let Some(challenge) = setup_challenge {
+        inner.layer(Extension(challenge))
+    } else {
+        inner
+    };
     if base_url.is_empty() {
         inner
     } else {
@@ -203,6 +247,27 @@ pub(super) fn with_http_host_validation(router: Router, security: RuntimeSecurit
     router.layer(middleware::from_fn(move |req, next| {
         let security = Arc::clone(&host_security);
         async move { enforce_http_host(&security, req, next).await }
+    }))
+}
+
+/// Browser protections every response carries, including refusals: the UI is
+/// never framed, content types are never sniffed, and paths under a base URL
+/// never leak to other sites through `Referer`.
+pub(super) fn with_response_hardening(router: Router) -> Router {
+    router.layer(middleware::from_fn(|req: Request, next: Next| async move {
+        let mut response = next.run(req).await;
+        let headers = response.headers_mut();
+        for (name, value) in [
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "same-origin"),
+        ] {
+            headers
+                .entry(name)
+                .or_insert(HeaderValue::from_static(value));
+        }
+        response
     }))
 }
 
@@ -308,6 +373,39 @@ mod tests {
         }
 
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_browser_hardening_headers() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = with_response_hardening(guarded_router(
+            RuntimeSecurityConfig::default(),
+            Arc::clone(&hits),
+        ));
+
+        for host in ["localhost:9090", "attacker.example.test"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(header::HOST, host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let headers = response.headers();
+            assert_eq!(
+                headers[header::CONTENT_SECURITY_POLICY],
+                "frame-ancestors 'none'",
+                "{host}"
+            );
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY", "{host}");
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{host}");
+            assert_eq!(headers[header::REFERRER_POLICY], "same-origin", "{host}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

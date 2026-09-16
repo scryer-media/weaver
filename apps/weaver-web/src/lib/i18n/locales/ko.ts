@@ -1,5 +1,6 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextKo } from "@/next/i18n/ko";
 
 const ko: LocaleDictionary = {
   // Brand
@@ -211,7 +212,7 @@ const ko: LocaleDictionary = {
   "settings.generalPageDesc": "다운로드 속도, 저장 경로, 정리 동작, 재시도 정책을 한 곳에서 조정하세요.",
   "settings.language": "언어",
   "settings.languageDesc": "Weaver 인터페이스의 표시 언어를 선택하세요.",
-  "settings.bandwidthCap": "ISP 대역폭 제한",
+  "settings.bandwidthCap": "대역폭",
   "settings.bandwidthCapDesc": "현재 ISP 허용량이 소진되면 새 다운로드 전송을 차단합니다. 대기 중인 작업은 위치를 유지하고 진행 중인 후처리는 계속될 수 있습니다.",
   "settings.bandwidthCapEnabled": "ISP 제한 활성화",
   "settings.bandwidthCapEnabledDesc": "사용량을 지속적으로 추적하고 활성 윈도우가 소진되면 새 아티클 다운로드만 차단합니다.",
@@ -637,6 +638,7 @@ const ko: LocaleDictionary = {
   "systemInfo.diagnosticsHint": "수집에는 약 15초가 걸립니다. 메트릭은 10초 간격으로 두 번 샘플링됩니다. 비밀번호, API 키 등의 비밀 정보는 제거됩니다.",
   "systemInfo.diagnosticsFailed": "진단 패키지를 만들 수 없습니다.",
   ...duplicateLocaleEntries.kor,
+  ...nextKo,
 };
 
 export default ko;

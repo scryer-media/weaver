@@ -1,4 +1,5 @@
 use super::*;
+mod zip64;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Read, Write};
@@ -827,4 +828,61 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
     let directory = fs::metadata(out_dir.join("Silver.Horizon")).unwrap();
     assert!(directory.is_dir());
     assert_eq!(directory.modified().unwrap(), directory_time);
+}
+
+fn phase_counters(total_bytes: u64, completed_bytes: u64) -> Arc<PhaseCounters> {
+    let counters = Arc::new(PhaseCounters::default());
+    counters.total_bytes.store(total_bytes, Ordering::Relaxed);
+    counters
+        .completed_bytes
+        .store(completed_bytes, Ordering::Relaxed);
+    counters
+}
+
+fn phase_bytes(counters: &PhaseCounters) -> (u64, u64) {
+    (
+        counters.total_bytes.load(Ordering::Relaxed),
+        counters.completed_bytes.load(Ordering::Relaxed),
+    )
+}
+
+#[test]
+fn chase_mirror_follows_a_finishing_chase_and_withdraws_when_not_installed() {
+    // Another set's extraction already has bytes in the phase.
+    let phase = phase_counters(100, 40);
+    let chase = phase_counters(1_000, 250);
+    let mut mirror = ChaseMirror::new(Arc::clone(&phase));
+
+    mirror.sync(&chase);
+    assert_eq!(phase_bytes(&phase), (1_100, 290));
+
+    chase.completed_bytes.store(600, Ordering::Relaxed);
+    mirror.sync(&chase);
+    assert_eq!(phase_bytes(&phase), (1_100, 640));
+
+    // A member that decoded shorter than its header declared gives back the
+    // difference.
+    chase.total_bytes.store(900, Ordering::Relaxed);
+    mirror.sync(&chase);
+    assert_eq!(phase_bytes(&phase), (1_000, 640));
+
+    drop(mirror);
+    assert_eq!(phase_bytes(&phase), (100, 40));
+}
+
+#[test]
+fn chase_mirror_settles_installed_bytes_exactly_once() {
+    let phase = phase_counters(0, 0);
+    let chase = phase_counters(1_000, 500);
+    let mut mirror = ChaseMirror::new(Arc::clone(&phase));
+    mirror.sync(&chase);
+
+    mirror.settle(1_000, 1_000);
+    assert_eq!(phase_bytes(&phase), (1_000, 1_000));
+
+    // A chase that was already done when consumption began is settled
+    // without ever being mirrored.
+    let phase = phase_counters(0, 0);
+    ChaseMirror::new(Arc::clone(&phase)).settle(700, 700);
+    assert_eq!(phase_bytes(&phase), (700, 700));
 }

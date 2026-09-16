@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUp, ChevronRight, Folder, FolderOpen, FolderPlus, Loader2 } from "lucide-react";
+import { ArrowUp, ChevronRight, Folder, FolderOpen, FolderPlus } from "lucide-react";
+import { LoadingMark } from "@/lib/loading-mark";
 import { useClient, useMutation } from "urql";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -250,7 +251,7 @@ export function DirectoryBrowserDialog({
                 className="shrink-0"
               >
                 {createState.fetching ? (
-                  <Loader2 className="size-4 animate-spin" />
+                  <LoadingMark />
                 ) : (
                   <FolderPlus className="size-4" />
                 )}
@@ -264,8 +265,8 @@ export function DirectoryBrowserDialog({
 
           <div className="flex min-h-[10rem] flex-1 flex-col overflow-hidden rounded-2xl border border-border/70 bg-background/70">
             {loading ? (
-              <div className="flex flex-1 items-center gap-2 px-3 py-4 text-sm text-muted-foreground">
-                <Loader2 className="size-4 animate-spin" />
+              <div className="flex flex-1 items-center gap-3 px-3 py-4 text-sm text-muted-foreground">
+                <LoadingMark className="h-5" />
                 {t("categories.directoryBrowserLoading")}
               </div>
             ) : error ? (

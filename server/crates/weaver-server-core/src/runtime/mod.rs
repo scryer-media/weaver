@@ -4,6 +4,7 @@ pub mod environment;
 pub(crate) mod file_cache;
 pub(crate) mod fs;
 pub(crate) mod glob;
+pub mod kernels;
 pub mod log_buffer;
 pub(crate) mod perf_probe;
 pub mod postprocess_pool;

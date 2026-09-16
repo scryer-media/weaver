@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::auth::FreshAdminGuard;
 use weaver_server_core::post_processing::executor::{
     PostProcessingExecutor, strict_security_enabled,
 };
@@ -20,7 +21,7 @@ pub(crate) struct PostProcessingMutation;
 
 #[Object]
 impl PostProcessingMutation {
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn set_post_processing_settings(
         &self,
         ctx: &Context<'_>,
@@ -87,7 +88,7 @@ impl PostProcessingMutation {
 
     /// Select the sole live source of post-processing scripts. Changing it
     /// clears name-based assignments and option values, never script files.
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn set_post_processing_script_directory(
         &self,
         ctx: &Context<'_>,
@@ -128,7 +129,7 @@ impl PostProcessingMutation {
     }
 
     /// Replace the global default list and every per-category override.
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn set_script_lists(
         &self,
         ctx: &Context<'_>,
@@ -145,7 +146,7 @@ impl PostProcessingMutation {
     }
 
     /// Replace the stored option values for one script, validated against its manifest.
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(guard = "FreshAdminGuard")]
     async fn set_script_options(
         &self,
         ctx: &Context<'_>,

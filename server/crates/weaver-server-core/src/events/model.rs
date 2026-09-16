@@ -152,6 +152,10 @@ pub enum PipelineEvent {
     /// Job-level PAR2 verification completed.
     JobVerificationComplete { job_id: JobId, passed: bool },
 
+    /// A settled native PAR3 assessment verified the described protected data
+    /// or established that it remains incomplete.
+    Par3VerificationComplete { job_id: JobId, passed: bool },
+
     /// Updated repair confidence after verification.
     RepairConfidenceUpdated {
         job_id: JobId,
@@ -161,13 +165,17 @@ pub enum PipelineEvent {
     },
 
     // ---- Repair stage ----
-    /// PAR2 repair started.
+    /// Recovery repair started.
     RepairStarted { job_id: JobId },
 
-    /// PAR2 repair completed.
+    /// Recovery repair completed.
     RepairComplete { job_id: JobId, slices_repaired: u32 },
 
-    /// PAR2 repair failed.
+    /// Embedded protection was replaced after verified repair; the original
+    /// carrier could not be restored byte for byte.
+    EmbeddedProtectionReplaced { job_id: JobId, blocks_repaired: u64 },
+
+    /// Recovery repair failed.
     RepairFailed { job_id: JobId, error: String },
 
     // ---- Extraction stage ----

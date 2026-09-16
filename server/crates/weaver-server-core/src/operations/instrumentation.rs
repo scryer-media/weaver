@@ -475,7 +475,7 @@ impl JobStageKind {
     }
 }
 
-/// Verdict of one PAR2 verification pass over a job.
+/// Verdict of a verification pass or a settled native recovery assessment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationOutcomeKind {
     Intact,

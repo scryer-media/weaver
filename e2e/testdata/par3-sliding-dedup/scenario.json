@@ -1,0 +1,13 @@
+{
+  "slug": "par3-sliding-dedup",
+  "title": "E2E.Test.PAR3.Sliding.Dedup.Lumen.Tract.S02E08.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "The repeating payload shifted off the block grid by a 123-byte lead, so only sliding deduplication (`-d2`) finds the repeats. Two windows are damaged.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "lumen.tract.s02e08.mkv": "519990773f56274a2bcb4774ec47214d6f00c6886f3092ad2e118fa2690a119f"
+  },
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

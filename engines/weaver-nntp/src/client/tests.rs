@@ -650,6 +650,7 @@ async fn group_requirement_discovery_retries_the_decoded_batch_item() {
         .classify_decoded_batch_item(
             0,
             None,
+            None,
             "<group-required@example.com>",
             DecodedBatchItem {
                 elapsed: Duration::ZERO,
@@ -661,7 +662,10 @@ async fn group_requirement_discovery_retries_the_decoded_batch_item() {
         .await;
 
     assert!(matches!(disposition, DecodedBatchDisposition::Retry));
-    assert_eq!(attempts[0].outcome, FetchAttemptOutcome::TransientFailure);
+    assert_eq!(
+        attempts[0].outcome,
+        FetchAttemptOutcome::GroupSelectionRequired
+    );
     assert!(matches!(
         last_error,
         Some(DecodedBodyError::Nntp(NntpError::NoGroupSelected))
@@ -822,12 +826,19 @@ async fn infrastructure_admission_failures_do_not_poison_server_health() {
         5,
     ));
 
+    let permit = client
+        .pool()
+        .try_acquire_blocking_permit(ServerId(0))
+        .unwrap();
+    let ticket = &permit.health_lease.0;
     for error in [
         NntpError::TooManyConnections,
         NntpError::PoolExhausted,
         NntpError::PoolShutdown,
     ] {
-        client.record_transient_server_failure(0, &error).await;
+        client
+            .record_connection_reply(0, ticket, Some(&error))
+            .await;
     }
     assert_eq!(
         client.pool().health().lock().await.server(0).failure_count,
@@ -835,7 +846,7 @@ async fn infrastructure_admission_failures_do_not_poison_server_health() {
     );
 
     client
-        .record_transient_server_failure(0, &NntpError::AcquireTimeout(15))
+        .record_connection_reply(0, ticket, Some(&NntpError::AcquireTimeout(15)))
         .await;
     assert_eq!(
         client.pool().health().lock().await.server(0).failure_count,
@@ -843,7 +854,7 @@ async fn infrastructure_admission_failures_do_not_poison_server_health() {
     );
 
     client
-        .record_transient_server_failure(0, &NntpError::SoftTimeout(15))
+        .record_connection_reply(0, ticket, Some(&NntpError::SoftTimeout(15)))
         .await;
     assert_eq!(
         client.pool().health().lock().await.server(0).failure_count,
@@ -1020,6 +1031,9 @@ async fn blocking_tls_capacity_rejection_parks_connects_without_health_poisoning
         0,
         crate::pool::FreshConnectAdmission::Open,
         &NntpError::TooManyConnections,
+        &crate::pool::BlockingConnectionPermit::for_tests()
+            .health_lease
+            .0,
     );
 
     assert_eq!(client.pool().configured_connections(ServerId(0)), Some(8));
@@ -1042,11 +1056,17 @@ async fn blocking_capacity_holdoff_never_cools_healthy_server() {
         0,
         crate::pool::FreshConnectAdmission::Open,
         &NntpError::TooManyConnections,
+        &crate::pool::BlockingConnectionPermit::for_tests()
+            .health_lease
+            .0,
     );
     client.record_blocking_connect_failure(
         0,
         crate::pool::FreshConnectAdmission::Open,
         &NntpError::TooManyConnections,
+        &crate::pool::BlockingConnectionPermit::for_tests()
+            .health_lease
+            .0,
     );
 
     assert_eq!(client.pool().configured_connections(ServerId(0)), Some(2));
@@ -2534,7 +2554,10 @@ async fn extra_body_lane_reports_remote_ip() {
         .await
         .expect("extra BODY lane should acquire");
 
-    assert_eq!(lane.remote_ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        lane.remote_ip(),
+        Some("127.0.0.1".parse::<IpAddr>().unwrap())
+    );
     lane.park();
 }
 

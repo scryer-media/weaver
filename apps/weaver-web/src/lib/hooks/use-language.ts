@@ -12,8 +12,19 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 const UI_LANGUAGE_STORAGE_KEY = "weaver.ui.language";
 
+// A language someone picks is kept for this browser, so it survives closing the
+// tab. Choices made before that lived only in the tab's session are still read.
+function readStorage(storage: () => Storage): string | null {
+  try {
+    return storage().getItem(UI_LANGUAGE_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
 function readStoredLanguageCode(): LocaleCode {
-  const stored = window.sessionStorage.getItem(UI_LANGUAGE_STORAGE_KEY);
+  const stored =
+    readStorage(() => window.localStorage) ?? readStorage(() => window.sessionStorage);
   if (!stored) {
     const browserLanguage = navigator.language.split("-")[0] ?? DEFAULT_LANGUAGE;
     return normalizeLocale(browserLanguage);
@@ -21,9 +32,12 @@ function readStoredLanguageCode(): LocaleCode {
   return normalizeLocale(stored);
 }
 
-function writeStoredLanguageCode(code: string) {
-  const normalized = normalizeLocale(code);
-  window.sessionStorage.setItem(UI_LANGUAGE_STORAGE_KEY, normalized);
+function writeStoredLanguageCode(code: LocaleCode) {
+  try {
+    window.localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, code);
+  } catch {
+    // Storage can be blocked; the choice then lasts until the page reloads.
+  }
 }
 
 export function useLanguage() {
@@ -33,7 +47,7 @@ export function useLanguage() {
   const initialLanguageRef = useRef(uiLanguage);
   const loadRequestIdRef = useRef(0);
 
-  const loadLanguage = useCallback(async (code: string) => {
+  const loadLanguage = useCallback(async (code: string, remember: boolean) => {
     const normalized = normalizeLocale(code);
     const requestId = loadRequestIdRef.current + 1;
     loadRequestIdRef.current = requestId;
@@ -45,13 +59,16 @@ export function useLanguage() {
 
     setDictionary(nextDictionary);
     setUiLanguage(normalized);
-    writeStoredLanguageCode(normalized);
+    // The browser's own language is only a default, never pinned as a choice.
+    if (remember) {
+      writeStoredLanguageCode(normalized);
+    }
     document.documentElement.lang = normalized;
     setIsReady(true);
   }, []);
 
   useEffect(() => {
-    void loadLanguage(initialLanguageRef.current);
+    void loadLanguage(initialLanguageRef.current, false);
   }, [loadLanguage]);
 
   const t = useCallback(
@@ -66,7 +83,7 @@ export function useLanguage() {
   );
 
   const setLanguagePreference = useCallback((code: string) => {
-    void loadLanguage(code);
+    void loadLanguage(code, true);
   }, [loadLanguage]);
 
   return {

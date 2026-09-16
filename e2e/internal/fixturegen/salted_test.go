@@ -132,12 +132,15 @@ func TestSaltedEntryMayNotCarryASizeOrDigest(t *testing.T) {
 }
 
 // The committed ledger is the real subject: exactly the fixtures whose writer
-// draws a salt are salted — the 7-Zip AES chains, and the RAR5 `-p` encrypted
-// repair set — and every one belongs to a recipe that admits it cannot pin its
-// bytes.
+// draws a salt are salted — the 7-Zip AES chains, and the encrypted RAR repair
+// sets under PAR2 and PAR3, whose recovery data covers the salted ciphertext —
+// and every one belongs to a recipe that admits it cannot pin its bytes.
 func saltedWriterPath(path string) bool {
 	return strings.Contains(path, "aes256") ||
 		strings.Contains(path, "direct-store-encrypted-par2-repair") ||
+		strings.Contains(path, "direct-store-encrypted-par3-repair") ||
+		strings.Contains(path, "direct-store-par3-withheld-volume") ||
+		strings.Contains(path, "par3-rar5-encrypted-repair") ||
 		strings.Contains(path, "direct-store-rar4-encrypted") ||
 		strings.Contains(path, "direct-store-hp")
 }

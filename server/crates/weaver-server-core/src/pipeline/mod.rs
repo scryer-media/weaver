@@ -61,6 +61,7 @@ use weaver_nntp::NntpClient;
 
 use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
+pub(crate) use self::extraction::safety::ProcessMemoryPermit;
 use self::extraction::{
     ExtractionLimits, ExtractionRoot, JobExtractionBudget, ProcessMemoryBudget,
 };
@@ -399,7 +400,7 @@ pub(super) struct DownloadLaneRefillRequest {
     pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
-    pub(super) remote_ip: IpAddr,
+    pub(super) remote_ip: Option<IpAddr>,
     pub(super) supports_pipelining: bool,
     /// The mode the scheduler last **booked** this lane's depth gauge under —
     /// not necessarily the one it is running. A lane started on a lease mode
@@ -1066,6 +1067,7 @@ impl DownloadFailureKind {
                 | Self::LaneUnavailable
                 | Self::Unrequested
                 | Self::ConnectionEstablishment
+                | Self::EstablishedTransport
                 | Self::Auth
         )
     }
@@ -1124,6 +1126,9 @@ impl DownloadFailure {
         use weaver_nntp::NntpError;
 
         match error {
+            // A 412 learns the GROUP prologue needed by the next connection;
+            // no article content has been received or rejected yet.
+            NntpError::NoGroupSelected => Some(DownloadFailureKind::ConnectionEstablishment),
             NntpError::PoolExhausted
             | NntpError::PoolShutdown
             | NntpError::TooManyConnections
@@ -1135,6 +1140,8 @@ impl DownloadFailure {
             | NntpError::AuthenticationRejected
             | NntpError::AuthenticationRequired
             | NntpError::AccessDenied => Some(DownloadFailureKind::Auth),
+            // Incomplete transport framing is not evidence of corrupt article
+            // content. Server health and parked retries bound repeated faults.
             NntpError::ServiceUnavailable
             | NntpError::Timeout
             | NntpError::SoftTimeout(_)
@@ -1163,7 +1170,6 @@ impl DownloadFailure {
         let kind = Self::infrastructure_kind(error, DownloadFailureKind::ConnectionEstablishment)
             .unwrap_or(match error {
                 NntpError::NoSuchGroup
-                | NntpError::NoGroupSelected
                 | NntpError::CommandNotRecognized
                 | NntpError::TlsRequired
                 | NntpError::UnexpectedResponse { .. }
@@ -1199,6 +1205,11 @@ impl DownloadFailure {
 #[derive(Debug, Clone)]
 pub(super) enum DownloadError {
     Fetch(DownloadFailure),
+    /// Local cache or resource failure; never evidence that an article is missing.
+    Local {
+        raw_size: u64,
+        error: String,
+    },
     Decode {
         raw_size: u64,
         error: String,
@@ -1207,6 +1218,10 @@ pub(super) enum DownloadError {
 }
 
 impl DownloadError {
+    pub(super) fn local(error: String) -> Self {
+        Self::Local { raw_size: 0, error }
+    }
+
     #[cfg(test)]
     pub(super) fn fetch(kind: DownloadFailureKind, message: impl Into<String>) -> Self {
         Self::Fetch(DownloadFailure::new(kind, message))
@@ -1238,7 +1253,7 @@ impl DownloadError {
                     | DownloadFailureKind::ServerQuota
                     | DownloadFailureKind::Unrequested
             ),
-            Self::Decode { .. } => false,
+            Self::Decode { .. } | Self::Local { .. } => false,
         }
     }
 }
@@ -1608,9 +1623,14 @@ pub(super) struct Par2SetRuntime {
     /// and reconciliation latch therefore live with the set rather than with
     /// the job.
     pub(super) settled: bool,
+    /// Integrity was deferred to archive extraction instead of a PAR2 hash pass.
+    pub(in crate::pipeline) settled_via_strong_decode: bool,
     /// A final answer that could not verify or repair this set.  The gate keeps
     /// processing later sets before turning these failures into the job result.
     pub(super) failure: Option<String>,
+    /// A native recoverability verdict can permit another format to try. I/O,
+    /// cancellation and other unclassified failures keep this empty.
+    pub(in crate::pipeline) alternate_repair: Option<repair::backend::AlternateRepairReason>,
     /// Damage observed while deciding this set.  The aggregate reports one
     /// job-level verification metric after every servable set has settled.
     pub(super) missing_blocks: u32,
@@ -1771,6 +1791,17 @@ pub(super) struct Par2AnalysisWorkDone {
     pub(super) outcome: completion::finalize::check::Par2AnalysisTicketOutcome,
 }
 
+/// Native outcomes share the existing repair completion queue. Dispatch occurs
+/// once per operation; block reads and native evidence stay format-specific.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keep the existing PAR2 result inline without adding a per-operation allocation"
+)]
+pub(super) enum RepairWorkDone {
+    Par2(Par2AnalysisWorkDone),
+    Par3(Box<repair::par3::work::WorkDone>),
+}
+
 /// One demoted set's reconstruction sweep, detached from the actor.
 ///
 /// The sweep reads every volume of the set out of the overlay and writes it to
@@ -1834,6 +1865,7 @@ pub(super) struct DirectPostRepairCarry {
 
 #[derive(Default)]
 pub(super) struct Par2RuntimeState {
+    pub(super) scan_budget: Option<Arc<std::sync::Mutex<repair::par2::Par2ScanBudget>>>,
     /// Every recovery set this job has met. Each parsed, described entry gets
     /// its own completion-gate pass; entries without an index remain only for
     /// attribution and an operator warning.
@@ -2407,6 +2439,7 @@ impl Default for CompletedFileChecksumState {
 pub(super) enum DecodedChunk {
     Contiguous(Box<[u8]>),
     Batches { chunks: Vec<Box<[u8]>>, len: usize },
+    Shared(Arc<download::repeated::SharedArticle>),
 }
 
 impl DecodedChunk {
@@ -2414,6 +2447,7 @@ impl DecodedChunk {
         match self {
             Self::Contiguous(bytes) => bytes.len(),
             Self::Batches { len, .. } => *len,
+            Self::Shared(body) => body.data.len_bytes(),
         }
     }
 
@@ -2423,6 +2457,7 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => f(bytes),
+            Self::Shared(body) => body.data.for_each_slice(f),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
                     f(chunk.as_ref());
@@ -2437,6 +2472,7 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => writer.write_all(bytes),
+            Self::Shared(body) => body.data.write_to(writer),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
                     writer.write_all(chunk.as_ref())?;
@@ -2451,6 +2487,7 @@ impl DecodedChunk {
     pub(super) fn push_io_slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
         match self {
             Self::Contiguous(bytes) => out.push(std::io::IoSlice::new(bytes)),
+            Self::Shared(body) => body.data.push_io_slices(out),
             Self::Batches { chunks, .. } => {
                 out.extend(chunks.iter().map(|chunk| std::io::IoSlice::new(chunk)));
             }
@@ -3106,8 +3143,8 @@ pub struct Pipeline {
             Result<par2_rs::Par2RepairOutcome, String>,
         ),
     >,
-    pub(super) par2_analysis_done_tx: mpsc::Sender<Par2AnalysisWorkDone>,
-    pub(super) par2_analysis_done_rx: mpsc::Receiver<Par2AnalysisWorkDone>,
+    pub(super) repair_work_done_tx: mpsc::Sender<RepairWorkDone>,
+    pub(super) repair_work_done_rx: mpsc::Receiver<RepairWorkDone>,
     /// Monotonic fence for demotion sweeps detached from the actor.
     pub(super) next_direct_demotion_work_id: u64,
     /// The demotion sweeps a job has outstanding, keyed by the set each one
@@ -3243,6 +3280,10 @@ pub struct Pipeline {
     pub(super) uu_park_requeues: HashMap<SegmentId, u32>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
+    /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.
+    par3_runtime: Option<Box<repair::par3::work::Coordinator>>,
+    /// Bounded archive framing probes, retired with each job and rebuilt on restore.
+    par3_inside_probes: repair::par3::inside::Probes,
     #[cfg(test)]
     pub(super) par2_binding_resolver_calls: std::sync::atomic::AtomicU64,
     /// Direct-store routing state: admitted archive sets, their routers and
@@ -3397,7 +3438,10 @@ pub struct Pipeline {
     pub(super) pp_pool: Arc<rayon::ThreadPool>,
     /// Environment-derived, always-on extraction ceilings.
     pub(super) extraction_limits: Arc<ExtractionLimits>,
-    /// One decoder-memory allowance shared by every extraction job.
+    /// Scheduling metadata retained by admitted jobs.
+    pub(super) job_scheduling_memory: HashMap<JobId, ProcessMemoryPermit>,
+    pub(super) repeated_articles: HashMap<JobId, Arc<download::repeated::RepeatedArticles>>,
+    /// Shared allowance for scheduling, repair metadata, and extraction decoders.
     pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,
     /// The post-processing pool again, for direct-unpack chases only.
     ///
@@ -3408,19 +3452,6 @@ pub struct Pipeline {
     /// extraction of any kind could start. Chases contend only with each other
     /// here.
     pub(super) chase_pool: Arc<rayon::ThreadPool>,
-    /// The same allowance again, for direct-unpack chases only.
-    ///
-    /// A chase takes its permit before it opens the archive and holds it until
-    /// it returns — across every park the gated reader does waiting on the
-    /// download it is chasing. Drawing that from the shared pool meant one
-    /// parked chase stopped every other 7z extraction in the process, including
-    /// the conventional extractions that were the job's actual critical path.
-    ///
-    /// Chases share this pool with each other, so at most one chase holds
-    /// decoder memory at a time no matter how many are armed. The cost is that
-    /// worst-case decoder memory is now two allowances rather than one: one
-    /// speculative chase plus one real extraction.
-    pub(super) direct_unpack_process_memory: Arc<ProcessMemoryBudget>,
     /// One shared output budget per job, retained across nested extraction layers.
     pub(super) extraction_budgets: HashMap<JobId, Arc<JobExtractionBudget>>,
     /// A job's normalized unacceptable-extension policy is fixed at its first

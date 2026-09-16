@@ -1,5 +1,6 @@
 use super::*;
 use crate::pipeline::direct_store::wiring::{DirectDamageResolution, DirectPar2Resolution};
+use crate::pipeline::repair::backend::RepairBackend;
 use crate::runtime::fs as runtime_fs;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -252,22 +253,22 @@ fn run_retained_par2_session(
     let mut retried_source_change = false;
     let mut result = if repair {
         if session.assessment().is_err() {
-            session.analyze().and_then(|_| session.repair())
+            session.assess().and_then(|_| session.execute(()))
         } else {
-            session.repair()
+            session.execute(())
         }
     } else {
-        session.analyze()
+        session.assess()
     };
     if should_retry_par2_source_change(&result, retried_source_change) {
         // One retry gets a fresh unresolved-only analysis. A second change is
         // returned to the caller instead of repeatedly trusting a moving path.
         retried_source_change = true;
         admitted_file_ids.clear();
-        session.invalidate_all_sources();
-        result = session.analyze();
+        session.invalidate(());
+        result = session.assess();
         if result.is_ok() && repair {
-            result = session.repair();
+            result = session.execute(());
         }
     }
     (
@@ -707,6 +708,44 @@ fn par2_description_padded_file_crc32(
         folded = combine.combine(folded, checksum.crc32);
     }
     Some(folded)
+}
+
+impl Pipeline {
+    /// Defer a transport CRC mismatch only when the bound recovery metadata
+    /// independently requires exactly that CRC and length. The downloaded bytes
+    /// remain unverified; the normal PAR2 gate must repair and verify them.
+    pub(in crate::pipeline) fn par2_can_recover_file_crc(
+        &self,
+        file_id: NzbFileId,
+        length: u64,
+        expected_crc: u32,
+    ) -> bool {
+        if self.par2_verified.contains(&file_id.job_id) {
+            return false;
+        }
+        let Some(binding) = self.resolve_par2_file_binding(file_id) else {
+            return false;
+        };
+        let Some(set) = self.par2_set_for(file_id.job_id, binding.recovery_set_id) else {
+            return false;
+        };
+        if binding.described_length != length
+            || !set.recovery_file_ids.contains(&binding.par2_file_id)
+        {
+            return false;
+        }
+        let Some(described_crc) =
+            par2_description_padded_file_crc32(set, &binding.par2_file_id, length, set.slice_size)
+        else {
+            return false;
+        };
+        pad_measured_file_crc32_to_slice_grid(
+            expected_crc,
+            length,
+            u64::from(set.slice_count_for_file(length)),
+            set.slice_size,
+        ) == described_crc
+    }
 }
 
 /// Carry a CRC32 measured over `length` real bytes into the padded domain the
@@ -1217,10 +1256,10 @@ pub(crate) struct Par2RarOutputRegistration {
     pub(crate) registered: usize,
     /// The RAR sets those volumes belong to.
     pub(crate) set_names: BTreeSet<String>,
-    /// Split 7z parts the NZB never carried, adopted into their set's
+    /// Numbered parts the NZB never carried, adopted into their set's
     /// topology. Counted apart from `registered` because nothing about them
     /// is a RAR plan to invalidate: the topology *is* their plan.
-    pub(crate) sevenz_parts: usize,
+    pub(crate) numbered_parts: usize,
 }
 
 pub(in crate::pipeline) fn par2_repair_write_set(

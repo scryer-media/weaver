@@ -179,6 +179,44 @@ fn member_bytes_written(spans: &[RoutedSpan]) -> u64 {
         .sum()
 }
 
+#[tokio::test]
+async fn cipher_edge_plans_refuse_before_exceeding_the_request_budget() {
+    let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        REPAIR_MEMBER,
+        &payload,
+        2,
+        REPAIR_PASSWORD,
+        Some(REPAIR_PASSWORD),
+        true,
+    );
+    let mut router = encrypted_router(&volumes, REPAIR_PASSWORD);
+    route_all(&mut router, &volumes);
+    let expected = router.cipher_edge_reads(1);
+    assert!(
+        !expected.is_empty(),
+        "the split member needs its predecessor"
+    );
+    assert!(
+        expected
+            .iter()
+            .all(|(volume, _, len)| *volume == 0 && *len <= 31)
+    );
+    assert!(
+        router
+            .cipher_edge_reads_bounded(1, expected.len() - 1)
+            .is_none()
+    );
+    assert_eq!(
+        router.cipher_edge_reads_bounded(1, expected.len()),
+        Some(expected)
+    );
+    assert!(
+        router.all_members_verified(),
+        "planning cannot mutate the router"
+    );
+}
+
 /// A repaired span in the middle of a member's part must route back in.
 ///
 /// PAR2 rebuilt these very cipher bytes, so the composition that describes them
@@ -505,6 +543,72 @@ async fn a_repaired_leading_slice_of_a_multi_article_encrypted_volume_reroutes()
     );
 }
 
+#[tokio::test]
+async fn repair_batches_rebuild_a_wholly_missing_last_volume() {
+    let payload: Vec<u8> = (0..12_000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = single_member_store_set(REPAIR_MEMBER, &payload, 3);
+    let mut router = plain_router(&volumes);
+    router.note_par2_available(true);
+    for (index, (_, bytes)) in volumes[..2].iter().enumerate() {
+        router.route(index as u32, 0, bytes).unwrap();
+        router.note_volume_complete(index as u32).unwrap();
+    }
+    let image = &volumes[2].1;
+    let mut written = 0;
+    for (stripe, bytes) in image.chunks(127).enumerate() {
+        let offset = stripe * 127;
+        let finish = offset + bytes.len() == image.len();
+        let spans = router
+            .route_repaired_batch(
+                2,
+                &[(offset as u64, std::sync::Arc::from(bytes))],
+                &[],
+                finish,
+                finish,
+            )
+            .expect("incomplete headers and unclassified bytes can wait for a later stripe");
+        written += member_bytes_written(&spans);
+        if !finish {
+            assert!(router.repair_batch_in_progress());
+            assert!(!router.all_members_verified());
+        }
+    }
+    assert_eq!(written, 4_000);
+    assert!(!router.repair_batch_in_progress());
+    assert!(router.all_members_verified());
+}
+
+#[tokio::test]
+async fn repair_batches_refuse_foreign_or_empty_closing_calls() {
+    let payload: Vec<u8> = (0..12_000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = single_member_store_set(REPAIR_MEMBER, &payload, 3);
+    let chunk = [(0, std::sync::Arc::from(&volumes[1].1[..64]))];
+    for invalid in 0..4 {
+        let mut router = plain_router(&volumes);
+        route_all(&mut router, &volumes);
+        assert!(router.all_members_verified());
+        router
+            .route_repaired_batch(1, &chunk, &[], false, false)
+            .unwrap();
+        assert!(!router.all_members_verified());
+        let result = match invalid {
+            0 => router.route_repaired_batch(2, &chunk, &[], false, true),
+            1 => router.route_repaired_batch(1, &[], &[], false, true),
+            2 => router.route_repaired_batch(1, &chunk, &[], true, false),
+            _ => router.route_repaired(1, &chunk, &[], false),
+        };
+        assert_eq!(result.unwrap_err(), DemotionReason::RepairRerouteFailed);
+        assert!(!router.all_members_verified());
+        assert_eq!(
+            router
+                .route_repaired_batch(1, &chunk, &[], false, true)
+                .unwrap_err(),
+            DemotionReason::RepairRerouteFailed,
+            "an invalid batch cannot be resumed as a successful repair",
+        );
+    }
+}
+
 /// The repairer hands the router one volume's rewrite at a time. A set with
 /// two damaged volumes therefore sees the first rewrite while the second
 /// volume's damage is still on record, and the gates that settle the first
@@ -600,18 +704,51 @@ fn plain_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
 /// one. Same mixture, same wrongful demotion.
 #[tokio::test]
 async fn a_repair_of_two_slices_in_one_plain_volume_reroutes() {
+    repair_two_slices(false, false);
+}
+
+#[tokio::test]
+async fn repair_batches_defer_plain_part_gates_until_the_final_stripe() {
+    repair_two_slices(true, false);
+}
+
+#[tokio::test]
+async fn repair_batches_defer_encrypted_part_gates_until_the_final_stripe() {
+    repair_two_slices(true, true);
+}
+
+fn repair_two_slices(batched: bool, encrypted: bool) {
     let payload: Vec<u8> = (0..12_000u32).map(|index| (index % 251) as u8).collect();
-    let volumes = single_member_store_set(REPAIR_MEMBER, &payload, 3);
-    let mut router = plain_router(&volumes);
+    let volumes = if encrypted {
+        encrypted_store_set(
+            REPAIR_MEMBER,
+            &payload,
+            3,
+            REPAIR_PASSWORD,
+            Some(REPAIR_PASSWORD),
+            true,
+        )
+    } else {
+        single_member_store_set(REPAIR_MEMBER, &payload, 3)
+    };
+    let mut router = if encrypted {
+        encrypted_router(&volumes, REPAIR_PASSWORD)
+    } else {
+        plain_router(&volumes)
+    };
     router.note_par2_available(true);
 
     const ARTICLE: usize = 1_000;
     let pristine = &volumes[1].1;
     let part = &payload[4_000..8_000];
-    let part_at = pristine
-        .windows(part.len())
-        .position(|window| window == part)
-        .expect("the fixture's part is in its own volume");
+    let part_at = if encrypted {
+        cipher_and_part_offsets(&payload, &volumes).1[1].0 as usize
+    } else {
+        pristine
+            .windows(part.len())
+            .position(|window| window == part)
+            .expect("the fixture's part is in its own volume")
+    };
     assert!(part_at < 500, "the fixture must hold several articles");
     let mut damaged = pristine.clone();
     for at in [500usize, 2_500] {
@@ -649,13 +786,41 @@ async fn a_repair_of_two_slices_in_one_plain_volume_reroutes() {
         .into_iter()
         .map(|at| (at as u64, std::sync::Arc::from(&pristine[at..at + ARTICLE])))
         .collect();
-    let spans = router
-        .route_repaired(1, &chunks, &[], false)
-        .expect("two repaired slices of one plain volume must route back into the member");
+    let spans = if batched {
+        let edges = if encrypted {
+            lead_in_for(&router, &volumes, 1, 0, ARTICLE as u64)
+        } else {
+            Vec::new()
+        };
+        let mut spans = router
+            .route_repaired_batch(1, &chunks[..1], &edges, false, false)
+            .expect("the first stripe must not judge the still-damaged second stripe");
+        assert!(router.repair_batch_in_progress());
+        assert!(!router.all_members_verified());
+        let edges = if encrypted {
+            lead_in_for(&router, &volumes, 1, (2 * ARTICLE) as u64, ARTICLE as u64)
+        } else {
+            Vec::new()
+        };
+        spans.extend(
+            router
+                .route_repaired_batch(1, &chunks[1..], &edges, false, true)
+                .expect("the final stripe settles the repaired composition"),
+        );
+        assert!(!router.repair_batch_in_progress());
+        spans
+    } else {
+        router
+            .route_repaired(1, &chunks, &[], false)
+            .expect("two repaired slices of one plain volume must route back into the member")
+    };
     assert!(
         member_bytes_written(&spans) > 0,
         "the repaired bytes must reach the member's partial"
     );
+    if encrypted {
+        close_stale_gaps(&mut router, &payload);
+    }
     assert!(
         !router.has_stale_gaps(),
         "article-shaped rewrites over article-shaped runs leave nothing to re-read"
@@ -664,4 +829,70 @@ async fn a_repair_of_two_slices_in_one_plain_volume_reroutes() {
         router.all_members_verified(),
         "the member must verify against the repaired image"
     );
+}
+
+#[tokio::test]
+async fn replacement_edges_include_unrouted_neighbour_tails() {
+    let payload: Vec<u8> = (0..16_000u32).map(|index| (index % 251) as u8).collect();
+    let volumes = encrypted_store_set(
+        REPAIR_MEMBER,
+        &payload,
+        4,
+        REPAIR_PASSWORD,
+        Some(REPAIR_PASSWORD),
+        true,
+    );
+    let mut router = encrypted_router(&volumes, REPAIR_PASSWORD);
+    for (index, (_, bytes)) in volumes.iter().enumerate() {
+        if index < 2 {
+            router
+                .route(index as u32, 0, &bytes[..bytes.len() / 2])
+                .unwrap();
+        } else {
+            router.route(index as u32, 0, bytes).unwrap();
+            router.note_volume_complete(index as u32).unwrap();
+        }
+    }
+    let plans: Vec<_> = (0..2)
+        .map(|volume| {
+            router
+                .cipher_replacement_edge_reads_bounded(volume, 16)
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        plans[1].iter().any(|(volume, offset, _)| {
+            *volume == 0 && *offset >= (volumes[0].1.len() / 2) as u64
+        }),
+        "the second rewrite needs CBC bytes the first volume never routed"
+    );
+    assert!(
+        router
+            .cipher_replacement_edge_reads_bounded(1, plans[1].len() - 1)
+            .is_none()
+    );
+    router.begin_repair_transaction(vec![0, 1]).unwrap();
+    for volume in 0..2usize {
+        let edges: Vec<_> = plans[volume]
+            .iter()
+            .map(|&(index, offset, len)| {
+                (
+                    index,
+                    offset,
+                    std::sync::Arc::from(
+                        &volumes[index as usize].1[offset as usize..(offset + len) as usize],
+                    ),
+                )
+            })
+            .collect();
+        let bytes = std::sync::Arc::from(volumes[volume].1.as_slice());
+        router
+            .route_repaired_batch(volume as u32, &[(0, bytes)], &edges, true, true)
+            .unwrap();
+        router.note_volume_complete(volume as u32).unwrap();
+        assert!(!router.all_members_verified());
+    }
+    router.finish_repair_transaction().unwrap();
+    close_stale_gaps(&mut router, &payload);
+    assert!(router.all_members_verified());
 }

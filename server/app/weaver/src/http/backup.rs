@@ -145,12 +145,8 @@ pub(super) async fn backup_export_handler(
     headers: HeaderMap,
     Json(body): Json<BackupExportRequest>,
 ) -> Response {
-    if let Err(status) = require_admin(
-        &request_auth.db,
-        &request_auth.auth_cache,
-        &request_auth.api_key_cache,
-        request_auth.session_token.0.as_str(),
-        &request_auth.security,
+    if let Err(status) = super::auth::require_fresh_admin(
+        &request_auth,
         peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
@@ -199,12 +195,15 @@ pub(super) async fn backup_inspect_handler(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(
-        &db,
-        &auth_cache,
-        &api_key_cache,
-        &session_token,
-        &security,
+    let request_auth = super::RequestAuthContext {
+        db: db.clone(),
+        auth_cache: auth_cache.clone(),
+        api_key_cache: api_key_cache.clone(),
+        session_token: super::SessionToken(session_token.clone()),
+        security: Arc::new(security.clone()),
+    };
+    if let Err(status) = super::auth::require_fresh_admin(
+        &request_auth,
         peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )
@@ -260,12 +259,15 @@ pub(super) async fn backup_restore_handler(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Response {
-    if let Err(status) = require_admin(
-        &db,
-        &auth_cache,
-        &api_key_cache,
-        &session_token,
-        &security,
+    let request_auth = super::RequestAuthContext {
+        db: db.clone(),
+        auth_cache: auth_cache.clone(),
+        api_key_cache: api_key_cache.clone(),
+        session_token: super::SessionToken(session_token.clone()),
+        security: Arc::new(security.clone()),
+    };
+    if let Err(status) = super::auth::require_fresh_admin(
+        &request_auth,
         peer.map(|Extension(ConnectInfo(peer))| peer),
         &headers,
     )

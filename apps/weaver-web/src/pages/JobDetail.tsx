@@ -8,6 +8,10 @@ import {
   type DuplicateSnapshot,
 } from "@/features/duplicates/DuplicateSnapshotPanel";
 import { JobProgress } from "@/components/JobProgress";
+import {
+  JobProvidersCard,
+  type JobServerContributionData,
+} from "@/components/JobProvidersCard";
 import { JobStatusBadgeGroup } from "@/components/JobStatusBadge";
 import { getJobStages } from "@/lib/job-stages";
 import { PageHeader } from "@/components/PageHeader";
@@ -55,6 +59,7 @@ import {
 import { useTranslate } from "@/lib/context/translate-context";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import { cn } from "@/lib/utils";
+import { LoadingMark } from "@/lib/loading-mark";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { getDisplayedJobProgress } from "@/lib/job-progress";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
@@ -75,6 +80,7 @@ interface JobDetailSnapshotData {
     message: string;
     timestamp: number;
   }>;
+  serverAttribution?: JobServerContributionData[] | null;
 }
 
 interface JobDetailQueryData {
@@ -222,7 +228,12 @@ export function JobDetail() {
   const showEta = job?.status === "DOWNLOADING" || job?.status === "QUEUED";
 
   if (fetching && !job) {
-    return <div className="text-muted-foreground">{t("label.loading")}</div>;
+    return (
+      <div role="status" className="flex items-center gap-3 text-muted-foreground">
+        <LoadingMark className="h-5" />
+        {t("label.loading")}
+      </div>
+    );
   }
 
   if (!job) {
@@ -515,6 +526,9 @@ export function JobDetail() {
           onForget={() => setDuplicateAction("forget")}
         />
       ) : null}
+
+      {/* Providers that served the articles */}
+      <JobProvidersCard contributions={jobQueryData?.serverAttribution} />
 
       {/* Output files */}
       <JobOutputFilesCard jobId={job.id} status={job.status} />
@@ -824,7 +838,10 @@ function JobOutputFilesCard({ jobId, status }: { jobId: number; status: string }
           <CardTitle>Output Files</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="text-sm text-muted-foreground">{t("label.loading")}</div>
+          <div className="flex items-center gap-3 text-sm text-muted-foreground">
+            <LoadingMark />
+            {t("label.loading")}
+          </div>
         </CardContent>
       </Card>
     );

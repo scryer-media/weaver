@@ -104,6 +104,7 @@ pub async fn recover_server_state(
                 job_status_from_persisted_str(&recovered.status, recovered.error.as_deref());
             let (download_state, post_state, run_state) =
                 runtime_lanes_from_status_snapshot(&status);
+            archive_unfinished_terminal_job(db, job_id, &recovered, &name, &status);
             initial_history.push(JobInfo {
                 job_id,
                 job_hash: Some(recovered.nzb_hash),
@@ -137,6 +138,10 @@ pub async fn recover_server_state(
                 category: recovered.category,
                 metadata: recovered.metadata,
                 output_dir: Some(recovered.output_dir.display().to_string()),
+                // Recovered from the active-job snapshot, which carries no
+                // attribution: the ledger lives with the finished job's
+                // history row.
+                server_attribution: Vec::new(),
                 created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
             });
         } else {
@@ -298,6 +303,9 @@ pub async fn recover_server_state(
                         .and_then(|metadata| serde_json::from_str(&metadata).ok())
                         .unwrap_or_default(),
                     output_dir: row.output_dir,
+                    server_attribution: crate::jobs::server_attribution::contributions_from_storage(
+                        row.server_attribution.as_deref(),
+                    ),
                     created_at_epoch_ms: row.created_at as f64 * 1000.0,
                 });
             }
@@ -357,6 +365,84 @@ pub async fn recover_server_state(
     })
 }
 
+/// Archives a job that stopped between its terminal status and its history row.
+///
+/// A job reaches a terminal status through one queued write and moves into
+/// `job_history` through a second one behind it, so a process that stops in
+/// between leaves the job terminal in `active_jobs` and absent from history.
+/// That job is then invisible from both ends: the queue no longer holds it
+/// because it finished, and every public history lookup reads `job_history`,
+/// which has nothing. Recovery is the one place that still sees both halves, so
+/// it finishes the archive the process did not get to.
+///
+/// The active row is all that survives, and it carries no byte counters, so the
+/// synthesized row states what is known and leaves the rest at the same zeros
+/// the recovered runtime entry already reports rather than inventing figures.
+fn archive_unfinished_terminal_job(
+    db: &Database,
+    job_id: crate::jobs::ids::JobId,
+    recovered: &crate::jobs::record::RecoveredJob,
+    name: &str,
+    status: &JobStatus,
+) {
+    // An archive is an upsert, so never run one over a row that already exists:
+    // a real history row holds the figures this one cannot reconstruct.
+    match db.get_job_history(job_id.0) {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to check history before archiving a terminal active job"
+            );
+            return;
+        }
+    }
+
+    let (status_str, error_message) = match status {
+        JobStatus::Complete => ("complete", None),
+        JobStatus::Failed { error } => ("failed", Some(error.clone())),
+        // Anything else reaching this branch is a status the active row calls
+        // finished but the runtime does not model as terminal; leave it alone.
+        _ => return,
+    };
+    let completed_at = (crate::jobs::epoch_ms_now() / 1_000.0) as i64;
+    let row = crate::JobHistoryRow {
+        job_id: job_id.0,
+        job_hash: Some(recovered.nzb_hash.to_vec()),
+        name: name.to_string(),
+        status: status_str.to_string(),
+        error_message,
+        total_bytes: 0,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: recovered.category.clone(),
+        output_dir: Some(recovered.output_dir.display().to_string()),
+        // Filled in from the active row the archive is about to consume.
+        nzb_path: None,
+        created_at: recovered.created_at as i64,
+        completed_at,
+        metadata: crate::jobs::persistence::metadata_json(&recovered.metadata).unwrap_or(None),
+        server_attribution: None,
+    };
+    match db.archive_job(job_id, &row) {
+        Ok(()) => info!(
+            job_id = job_id.0,
+            status = status_str,
+            "archived a job that stopped between its terminal status and its history row"
+        ),
+        Err(error) => warn!(
+            job_id = job_id.0,
+            error = %error,
+            "failed to archive a job that stopped before its history row"
+        ),
+    }
+}
+
 fn cleanup_unreferenced_intermediate_dirs(
     intermediate_dir: &Path,
     referenced_dirs: &HashSet<PathBuf>,
@@ -378,7 +464,7 @@ fn cleanup_unreferenced_intermediate_dirs(
         if referenced_dirs.contains(&path) {
             continue;
         }
-        std::fs::remove_dir_all(&path)?;
+        crate::jobs::working_dir::remove_weaver_owned_working_dir(intermediate_dir, &path)?;
         removed += 1;
     }
 
@@ -414,6 +500,7 @@ mod tests {
             paused_resume_status: None,
             paused_resume_download_state: None,
             paused_resume_post_state: None,
+            password_override: None,
         }
     }
 
@@ -478,7 +565,12 @@ mod tests {
         std::fs::create_dir_all(&unrelated_output_dir).unwrap();
         std::fs::write(working_dir_marker_path(&active_output_dir), []).unwrap();
         std::fs::write(working_dir_marker_path(&history_output_dir), []).unwrap();
-        std::fs::write(working_dir_marker_path(&orphan_output_dir), []).unwrap();
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(
+            &intermediate_dir,
+            &orphan_output_dir,
+            JobId(3),
+        )
+        .unwrap();
 
         let nzb_path = data_dir.join("active-job.nzb");
         std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();
@@ -514,6 +606,7 @@ mod tests {
             created_at: 1_700_000_000,
             completed_at: 1_700_000_100,
             metadata: None,
+            server_attribution: None,
         })
         .unwrap();
 
@@ -580,5 +673,108 @@ mod tests {
         assert_eq!(request.status, crate::JobStatus::Moving);
         assert_eq!(request.download_state, Some(crate::DownloadState::Complete));
         assert_eq!(request.post_state, Some(crate::PostState::Finalizing));
+    }
+
+    /// Terminal status and history archival are two separate writes, so a
+    /// process can stop holding only the first. The job must not come back
+    /// invisible to every public surface.
+    #[tokio::test]
+    async fn recovery_archives_a_terminal_job_that_never_reached_history() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let intermediate_dir = temp.path().join("intermediate");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&intermediate_dir).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let output_dir = intermediate_dir.join("completed-job");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(working_dir_marker_path(&output_dir), []).unwrap();
+        let nzb_path = data_dir.join("completed-job.nzb");
+        std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();
+
+        db.create_active_job(&sample_active_job(11, nzb_path, output_dir.clone()))
+            .unwrap();
+        // Exactly the write the pipeline makes before it queues the archive.
+        db.set_active_job_status(JobId(11), "complete", None)
+            .unwrap();
+        assert!(db.get_job_history(11).unwrap().is_none());
+
+        let recovered = recover_server_state(&db, &data_dir, &intermediate_dir)
+            .await
+            .unwrap();
+
+        let archived = db
+            .get_job_history(11)
+            .unwrap()
+            .expect("recovery must archive a terminal job with no history row");
+        assert_eq!(archived.status, "complete");
+        assert_eq!(archived.name, "completed-job");
+        assert_eq!(archived.output_dir, Some(output_dir.display().to_string()));
+        assert_eq!(archived.error_message, None);
+        // The archive consumes the active row, so the gap cannot reappear on
+        // the next startup.
+        assert_eq!(count_rows(&db, "active_jobs", 11), 0);
+        assert_eq!(recovered.to_restore.len(), 0);
+        assert!(
+            recovered
+                .initial_history
+                .iter()
+                .any(|job| job.job_id == JobId(11))
+        );
+    }
+
+    /// The archive is an upsert, so a job that already has a history row must
+    /// keep the figures that row carries.
+    #[tokio::test]
+    async fn recovery_keeps_an_existing_history_row_for_a_terminal_active_job() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let intermediate_dir = temp.path().join("intermediate");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&intermediate_dir).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let output_dir = intermediate_dir.join("failed-job");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(working_dir_marker_path(&output_dir), []).unwrap();
+        let nzb_path = data_dir.join("failed-job.nzb");
+        std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();
+
+        db.create_active_job(&sample_active_job(12, nzb_path, output_dir))
+            .unwrap();
+        db.set_active_job_status(JobId(12), "failed", Some("boom"))
+            .unwrap();
+        db.insert_job_history(&JobHistoryRow {
+            job_id: 12,
+            job_hash: None,
+            name: "already-archived".to_string(),
+            status: "failed".to_string(),
+            error_message: Some("boom".to_string()),
+            total_bytes: 4096,
+            downloaded_bytes: 2048,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 2048,
+            health: 500,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1_700_000_000,
+            completed_at: 1_700_000_100,
+            metadata: None,
+            server_attribution: None,
+        })
+        .unwrap();
+
+        recover_server_state(&db, &data_dir, &intermediate_dir)
+            .await
+            .unwrap();
+
+        let kept = db.get_job_history(12).unwrap().expect("history row");
+        assert_eq!(kept.name, "already-archived");
+        assert_eq!(kept.total_bytes, 4096);
+        assert_eq!(kept.downloaded_bytes, 2048);
+        assert_eq!(kept.health, 500);
     }
 }

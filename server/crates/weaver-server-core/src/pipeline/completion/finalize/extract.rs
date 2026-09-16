@@ -6,6 +6,8 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+pub(in crate::pipeline) mod sequential;
+
 static XZ_MT_DECODER_PERMIT: Mutex<()> = Mutex::new(());
 
 enum FilesystemXzDecoder<R: std::io::Read> {
@@ -318,9 +320,19 @@ where
             .archive()
             .files
             .iter()
-            .filter(|entry| !entry.is_directory())
+            .filter(|entry| !entry.is_directory() && !entry.is_anti_item())
             .map(|entry| entry.size())
-            .sum::<u64>();
+            .try_fold(0u64, |total, size| total.checked_add(size))
+            .ok_or_else(|| {
+                "WEAVER_RESOURCE_LIMIT[job_bytes]: declared 7z output size overflow".to_string()
+            })?;
+        let entry_count = archive_reader
+            .archive()
+            .files
+            .iter()
+            .filter(|entry| !entry.is_anti_item())
+            .count();
+        budget.check_archive_metadata(entry_count as u64, Some(known_total))?;
         // Sized here, while the parsed archive is in hand; reserved below,
         // once the header permit has been given back.
         let decode_reservation = match decode_memory {
@@ -574,6 +586,249 @@ fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -
     }
 }
 
+/// How often a chase that is still finishing after the download is mirrored
+/// into the job's Extracting phase.
+const CHASE_MIRROR_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The chase's bytes as the job's Extracting phase currently shows them.
+///
+/// A chase decodes against counters of its own so the download never shows an
+/// extraction running underneath it. Once every part is in, though, a chase
+/// that is still finishing is the extraction — so its progress is mirrored into
+/// the phase while it is awaited, and withdrawn again unless its members are
+/// installed, leaving a conventional fallback to count from where it would
+/// have started.
+struct ChaseMirror {
+    phase: Arc<PhaseCounters>,
+    total_bytes: u64,
+    completed_bytes: u64,
+    settled: bool,
+}
+
+impl ChaseMirror {
+    fn new(phase: Arc<PhaseCounters>) -> Self {
+        Self {
+            phase,
+            total_bytes: 0,
+            completed_bytes: 0,
+            settled: false,
+        }
+    }
+
+    /// Bring the phase to the chase's current bytes. Completed is read before
+    /// total: the chase reserves a member's total before decoding into it, so
+    /// the mirror never shows more done than there is to do.
+    fn sync(&mut self, chase: &PhaseCounters) {
+        let completed_bytes = chase.completed_bytes.load(Ordering::Relaxed);
+        let total_bytes = chase.total_bytes.load(Ordering::Relaxed);
+        self.show(total_bytes, completed_bytes);
+    }
+
+    fn show(&mut self, total_bytes: u64, completed_bytes: u64) {
+        shift_mirrored(&self.phase.total_bytes, &mut self.total_bytes, total_bytes);
+        shift_mirrored(
+            &self.phase.completed_bytes,
+            &mut self.completed_bytes,
+            completed_bytes,
+        );
+    }
+
+    /// The members were installed: keep their bytes in the phase for good.
+    fn settle(mut self, total_bytes: u64, completed_bytes: u64) {
+        self.show(total_bytes, completed_bytes);
+        self.settled = true;
+    }
+}
+
+impl Drop for ChaseMirror {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.show(0, 0);
+        }
+    }
+}
+
+fn shift_mirrored(phase: &std::sync::atomic::AtomicU64, mirrored: &mut u64, current: u64) {
+    if current > *mirrored {
+        phase.fetch_add(current - *mirrored, Ordering::Relaxed);
+    } else if current < *mirrored {
+        phase.fetch_sub(*mirrored - current, Ordering::Relaxed);
+    }
+    *mirrored = current;
+}
+
+pub(in crate::pipeline) async fn install_direct_unpack(
+    disposition: crate::pipeline::direct_unpack::wiring::ChaseDisposition,
+    staging_for_install: PathBuf,
+    phase_counters_for_install: Arc<PhaseCounters>,
+    job_id: JobId,
+    set_name_for_channel: &str,
+    policy: Option<&crate::post_processing::model::PostProcessingSettings>,
+    expected_names: Option<&HashSet<String>>,
+) -> Option<FullSetExtractionOutcome> {
+    let mut mirror = ChaseMirror::new(phase_counters_for_install);
+    // Resolve the chase first: if it produced usable members there is
+    // no reason to decode the archive a second time.
+    let chase = match disposition {
+        crate::pipeline::direct_unpack::wiring::ChaseDisposition::Ready(outcome) => {
+            Some((*outcome).into_installable())
+        }
+        crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) => {
+            // Every part is complete by now, so this is finishing at
+            // disk speed rather than at download speed — but "should
+            // finish quickly" is not a guarantee, and this await used to
+            // have no deadline. A chase that never exits (one still
+            // queued behind occupied chase workers, say, which cannot
+            // even see its own abort) made extraction never return, left
+            // the job in Extracting forever, and held a global
+            // extraction slot until the job was cancelled. That is the
+            // whole shape of the round-9 slow tail.
+            //
+            // On the deadline: end the chase's coverage so its worker
+            // has something to fail on if it is inside the reader, say
+            // so loudly, and extract conventionally. One warning line
+            // and a working job, instead of a wedge.
+            let deadline = tokio::time::sleep(
+                crate::pipeline::direct_unpack::wiring::pending_chase_deadline(),
+            );
+            tokio::pin!(deadline);
+            let mut handle = pending.handle;
+            let mut mirror_tick = tokio::time::interval(CHASE_MIRROR_INTERVAL);
+            mirror_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let joined = loop {
+                tokio::select! {
+                    joined = &mut handle => break Some(joined),
+                    _ = &mut deadline => break None,
+                    _ = mirror_tick.tick() => mirror.sync(&pending.counters),
+                }
+            };
+            match joined {
+                // The deadline won. End the chase's coverage so a worker
+                // inside the reader has something to fail on, drop its
+                // staging, and fall through to conventional extraction
+                // below — which is the whole point: the job finishes.
+                None => {
+                    tracing::warn!(
+                        job_id = job_id.0,
+                        set_name = %pending.set_name,
+                        waited_s =
+                            crate::pipeline::direct_unpack::wiring::pending_chase_deadline()
+                                .as_secs(),
+                        "chase did not finish within the consumption deadline; \
+                         ending it and extracting conventionally"
+                    );
+                    pending
+                        .coverage
+                        .abort("chase exceeded the consumption deadline");
+                    pending.budget.cancel();
+                    handle.abort();
+                    // Aborting a started blocking task does not stop it. Let
+                    // its cancellation checkpoints run before deleting paths
+                    // it can still be writing, without delaying fallback.
+                    tokio::spawn(async move {
+                        let _ = handle.await;
+                        let _ = tokio::fs::remove_dir_all(pending.staging_dir).await;
+                    });
+                    None
+                }
+                Some(joined) => match joined {
+                    Ok(Ok(outcome)) => Some((
+                        outcome,
+                        pending.staging_dir,
+                        pending.counters.total_bytes.load(Ordering::Relaxed),
+                        pending.counters.completed_bytes.load(Ordering::Relaxed),
+                    )),
+                    Ok(Err(error)) => {
+                        tracing::debug!(
+                            job_id = job_id.0,
+                            error = %error,
+                            "chase failed at consumption; extracting conventionally"
+                        );
+                        let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = job_id.0,
+                            error = %error,
+                            "chase worker panicked; extracting conventionally"
+                        );
+                        let _ = std::fs::remove_dir_all(&pending.staging_dir);
+                        None
+                    }
+                },
+            }
+        }
+        crate::pipeline::direct_unpack::wiring::ChaseDisposition::None => None,
+    };
+
+    if let Some((outcome, chase_staging, total_bytes, completed_bytes)) = chase {
+        if expected_names.is_some_and(|expected| {
+            outcome.extracted.iter().cloned().collect::<HashSet<_>>() != *expected
+        }) {
+            let _ = tokio::fs::remove_dir_all(chase_staging).await;
+            return None;
+        }
+        if policy.is_some_and(|policy| {
+            outcome
+                .extracted
+                .iter()
+                .any(|name| policy.unacceptable_extension_match(name).is_some())
+        }) {
+            let _ = tokio::fs::remove_dir_all(chase_staging).await;
+            return None;
+        }
+        // RAR supplies either its policy (whole set) or its mixed-member
+        // manifest. Other formats retain their existing installation path.
+        let rar_names =
+            (policy.is_some() || expected_names.is_some()).then(|| outcome.extracted.clone());
+        let install = tokio::task::spawn_blocking(move || {
+            if let Some(names) = rar_names {
+                crate::pipeline::direct_unpack::rar::install(
+                    &chase_staging,
+                    &staging_for_install,
+                    &names,
+                )
+            } else {
+                crate::pipeline::direct_unpack::wiring::install_chased_members(
+                    &chase_staging,
+                    &staging_for_install,
+                )
+            }
+        })
+        .await;
+
+        match install {
+            Ok(Ok(())) => {
+                // The decode already happened, most or all of it before the
+                // phase could see it. Settle it here, so the Extracting bar
+                // reports real bytes instead of a zero-byte lie.
+                mirror.settle(total_bytes, completed_bytes);
+                tracing::info!(
+                    job_id = job_id.0,
+                    set_name = %set_name_for_channel,
+                    members = outcome.extracted.len(),
+                    total_bytes,
+                    "installed direct-unpack members instead of re-extracting"
+                );
+                return Some(outcome);
+            }
+            Ok(Err(error)) => tracing::warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to install chased members; extracting conventionally"
+            ),
+            Err(error) => tracing::warn!(
+                job_id = job_id.0,
+                error = %error,
+                "install task panicked; extracting conventionally"
+            ),
+        }
+    }
+
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_zip(
     archive_path: &Path,
@@ -586,23 +841,49 @@ fn extract_zip(
     phase_counters: Option<Arc<PhaseCounters>>,
 ) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open zip: {e}"))?;
+    extract_zip_stream(
+        file,
+        root,
+        budget,
+        password,
+        event_tx,
+        job_id,
+        set_name,
+        phase_counters,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
+    file: R,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
+    password: Option<&str>,
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+    phase_counters: Option<Arc<PhaseCounters>>,
+) -> Result<Vec<String>, String> {
     let file = BudgetedReader::new(file, Arc::clone(budget));
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
+    budget.check_archive_metadata(
+        archive.len() as u64,
+        archive
+            .decompressed_size()
+            .and_then(|size| u64::try_from(size).ok()),
+    )?;
     let mut extracted = Vec::new();
-    let mut known_total = 0u64;
-    for i in 0..archive.len() {
-        let entry = archive
-            .by_index_raw(i)
-            .map_err(|e| format!("failed to read zip entry {i}: {e}"))?;
-        budget.check_member_metadata(entry.name(), entry.size())?;
-        let raw_name = entry.name();
+    // Names come from the central directory without seeking to every local
+    // header. Opening all members here would block the first extraction on
+    // headers in payload ranges that have not downloaded yet.
+    for raw_name in archive.file_names() {
         validate_zip_entry_path(raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
-        if !entry.is_dir() {
-            known_total = known_total.saturating_add(entry.size());
-        }
     }
-    if let Some(counters) = phase_counters.as_ref() {
+    let known_total = archive
+        .decompressed_size()
+        .and_then(|size| u64::try_from(size).ok());
+    if let (Some(counters), Some(known_total)) = (phase_counters.as_ref(), known_total) {
         counters
             .total_bytes
             .fetch_add(known_total, Ordering::Relaxed);
@@ -618,6 +899,7 @@ fn extract_zip(
                 .by_index(i)
                 .map_err(|e| format!("failed to read zip entry {i}: {e}"))?
         };
+        budget.check_member_metadata(entry.name(), entry.size())?;
         let raw_name = entry.name().to_string();
         let safe_path =
             validate_zip_entry_path(&raw_name).map_err(|error| budget.reject_unsafe_path(error))?;
@@ -626,6 +908,13 @@ fn extract_zip(
         if entry.is_dir() {
             root.create_dir(&safe_path, budget)?;
             continue;
+        }
+        if known_total.is_none()
+            && let Some(counters) = phase_counters.as_ref()
+        {
+            counters
+                .total_bytes
+                .fetch_add(entry.size(), Ordering::Relaxed);
         }
 
         let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
@@ -681,9 +970,15 @@ fn extract_tar(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    extract_tar_from_reader(file, root, budget, event_tx, job_id, set_name)
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Tar,
+        archive_path,
+        root,
+        budget,
+        event_tx,
+        job_id,
+        set_name,
+    })
 }
 
 fn extract_tar_gz(
@@ -694,11 +989,15 @@ fn extract_tar_gz(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar.gz: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let gz = flate2::read::GzDecoder::new(file);
-    extract_tar_from_reader(gz, root, budget, event_tx, job_id, set_name)
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::TarGz,
+        archive_path,
+        root,
+        budget,
+        event_tx,
+        job_id,
+        set_name,
+    })
 }
 
 fn extract_tar_bz2(
@@ -709,11 +1008,15 @@ fn extract_tar_bz2(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open tar.bz2: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let bz2 = bzip2::read::BzDecoder::new(file);
-    extract_tar_from_reader(bz2, root, budget, event_tx, job_id, set_name)
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::TarBz2,
+        archive_path,
+        root,
+        budget,
+        event_tx,
+        job_id,
+        set_name,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -725,8 +1028,15 @@ fn extract_tar_xz(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let xz = open_sequential_xz_decoder(archive_path, budget)?;
-    extract_tar_from_reader(xz, root, budget, event_tx, job_id, set_name)
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::TarXz,
+        archive_path,
+        root,
+        budget,
+        event_tx,
+        job_id,
+        set_name,
+    })
 }
 
 fn extract_tar_from_reader<R: std::io::Read>(
@@ -821,43 +1131,15 @@ fn extract_gz(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open gz: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let mut gz = flate2::read::GzDecoder::new(file);
-
-    // Output filename: strip .gz extension
-    let archive_name = archive_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let output_name = archive_name
-        .strip_suffix(".gz")
-        .or_else(|| archive_name.strip_suffix(".GZ"))
-        .unwrap_or(&archive_name);
-    let safe_path = root
-        .validate_relative_path(output_name)
-        .map_err(|error| budget.reject_unsafe_path(error))?;
-
-    let _ = event_tx.send(PipelineEvent::ExtractionMemberStarted {
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Gz,
+        archive_path,
+        root,
+        budget,
+        event_tx,
         job_id,
-        set_name: set_name.to_string(),
-        member: output_name.to_string(),
-    });
-
-    let mut outfile = buffered_extraction_output(root.create_file(&safe_path, budget)?);
-    let copied = std::io::copy(&mut gz, &mut outfile);
-    let bytes_written = copied
-        .and_then(|bytes| outfile.flush().map(|()| bytes))
-        .map_err(|e| format!("failed to decompress gz: {e}"))?;
-
-    let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
-        job_id,
-        set_name: set_name.to_string(),
-        member: output_name.to_string(),
-    });
-    tracing::info!(job_id = job_id.0, member = %output_name, bytes_written, "gz decompressed");
-
-    Ok(vec![output_name.to_string()])
+        set_name,
+    })
 }
 
 fn strip_ascii_case_suffix<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
@@ -930,20 +1212,15 @@ fn extract_brotli(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open br: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let reader = brotli::Decompressor::new(file, 4096);
-    extract_single_stream_to_file(
-        reader,
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Brotli,
         archive_path,
         root,
         budget,
-        &[".br"],
-        "br",
         event_tx,
         job_id,
         set_name,
-    )
+    })
 }
 
 fn extract_deflate(
@@ -954,21 +1231,15 @@ fn extract_deflate(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open deflate: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let reader = flate2::read::DeflateDecoder::new(file);
-    extract_single_stream_to_file(
-        reader,
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Deflate,
         archive_path,
         root,
         budget,
-        &[".deflate"],
-        "deflate",
         event_tx,
         job_id,
         set_name,
-    )
+    })
 }
 
 fn extract_zstd(
@@ -979,27 +1250,15 @@ fn extract_zstd(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|e| format!("failed to open zstd: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let mut reader =
-        zstd::stream::read::Decoder::new(file).map_err(|e| format!("failed to open zstd: {e}"))?;
-    let max_memory_bytes = budget.max_memory_bytes().max(1024);
-    let window_log = (63 - max_memory_bytes.leading_zeros()).clamp(10, 31);
-    reader
-        .window_log_max(window_log)
-        .map_err(|e| format!("failed to apply zstd memory limit: {e}"))?;
-    extract_single_stream_to_file(
-        reader,
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Zstd,
         archive_path,
         root,
         budget,
-        &[".zstd", ".zst"],
-        "zstd",
         event_tx,
         job_id,
         set_name,
-    )
+    })
 }
 
 fn extract_bzip2(
@@ -1010,20 +1269,15 @@ fn extract_bzip2(
     job_id: JobId,
     set_name: &str,
 ) -> Result<Vec<String>, String> {
-    let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open bz2: {e}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let reader = bzip2::read::BzDecoder::new(file);
-    extract_single_stream_to_file(
-        reader,
+    sequential::extract_file(&sequential::SequentialExtractionContext {
+        kind: SimpleArchiveKind::Bzip2,
         archive_path,
         root,
         budget,
-        &[".bz2"],
-        "bz2",
         event_tx,
         job_id,
         set_name,
-    )
+    })
 }
 
 fn extract_xz(
@@ -1047,18 +1301,6 @@ fn extract_xz(
         job_id,
         set_name,
     )
-}
-
-fn open_sequential_xz_decoder(
-    archive_path: &Path,
-    budget: &Arc<JobExtractionBudget>,
-) -> Result<impl std::io::Read, String> {
-    let file =
-        std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
-    let file = BudgetedReader::new(file, Arc::clone(budget));
-    let memory_limit = crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES.min(budget.max_memory_bytes());
-    crate::ingest::xz_multistream_decoder(file, memory_limit)
-        .map_err(|error| format!("failed to open xz decoder: {error}"))
 }
 
 fn open_filesystem_xz_decoder(
@@ -1379,7 +1621,30 @@ impl Pipeline {
         // Totals are reserved per member at extraction open (see
         // extract_rar_member_to_output); topology may not be rebuilt yet here.
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
+        let disposition = self.take_direct_unpack_disposition(job_id, set_name);
+        let staging_for_install = output_dir.clone();
+        let phase_counters_for_install = Arc::clone(&phase_counters);
         tokio::task::spawn(async move {
+            if let Some(outcome) = install_direct_unpack(
+                disposition,
+                staging_for_install,
+                phase_counters_for_install,
+                job_id,
+                &set_name_for_task,
+                Some(&policy),
+                None,
+            )
+            .await
+            {
+                let _ = extract_done_tx
+                    .send(ExtractionDone::FullSet {
+                        job_id,
+                        set_name: set_name_for_task,
+                        result: Ok(outcome),
+                    })
+                    .await;
+                return;
+            }
             let result = tokio::task::spawn_blocking(move || pp_pool.install(move || {
                 let _task_permit = task_permit;
                 let root = _task_permit.root();
@@ -1600,7 +1865,7 @@ impl Pipeline {
     /// identical list in the identical order — it reads the same bytes through
     /// a gated view — so the ordering lives here rather than being rebuilt at
     /// each call site.
-    pub(in crate::pipeline) fn sevenz_set_part_paths(
+    pub(in crate::pipeline) fn archive_set_part_paths(
         &self,
         job_id: JobId,
         set_name: &str,
@@ -1632,7 +1897,7 @@ impl Pipeline {
         }
         // Parts the topology lists that no NZB file answers to: a part PAR2
         // rebuilt because the post never carried it, adopted into the map by
-        // `adopt_verified_par2_sevenz_part`. Iterating the assembly alone would
+        // `adopt_verified_par2_numbered_part`. Iterating the assembly alone would
         // hand the extractor the same truncated set the repair just completed.
         for (filename, vol) in &topo.volume_map {
             if listed.contains(filename) {
@@ -1654,7 +1919,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let file_paths = self.sevenz_set_part_paths(job_id, set_name)?;
+        let file_paths = self.archive_set_part_paths(job_id, set_name)?;
         let password = self.primary_archive_password_for_job(job_id);
 
         let output_dir = self.extraction_staging_dir(job_id);
@@ -1677,136 +1942,25 @@ impl Pipeline {
         let phase_counters_for_install = Arc::clone(&phase_counters);
 
         tokio::task::spawn(async move {
-            // Resolve the chase first: if it produced usable members there is
-            // no reason to decode the archive a second time.
-            let chase = match disposition {
-                crate::pipeline::direct_unpack::wiring::ChaseDisposition::Ready(outcome) => {
-                    Some((*outcome).into_installable())
-                }
-                crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) => {
-                    // Every part is complete by now, so this is finishing at
-                    // disk speed rather than at download speed — but "should
-                    // finish quickly" is not a guarantee, and this await used to
-                    // have no deadline. A chase that never exits (one still
-                    // queued behind occupied chase workers, say, which cannot
-                    // even see its own abort) made extraction never return, left
-                    // the job in Extracting forever, and held a global
-                    // extraction slot until the job was cancelled. That is the
-                    // whole shape of the round-9 slow tail.
-                    //
-                    // On the deadline: end the chase's coverage so its worker
-                    // has something to fail on if it is inside the reader, say
-                    // so loudly, and extract conventionally. One warning line
-                    // and a working job, instead of a wedge.
-                    let deadline = tokio::time::sleep(
-                        crate::pipeline::direct_unpack::wiring::pending_chase_deadline(),
-                    );
-                    tokio::pin!(deadline);
-                    let mut handle = pending.handle;
-                    let joined = tokio::select! {
-                        joined = &mut handle => Some(joined),
-                        _ = &mut deadline => None,
-                    };
-                    match joined {
-                        // The deadline won. End the chase's coverage so a worker
-                        // inside the reader has something to fail on, drop its
-                        // staging, and fall through to conventional extraction
-                        // below — which is the whole point: the job finishes.
-                        None => {
-                            tracing::warn!(
-                                job_id = job_id.0,
-                                set_name = %pending.set_name,
-                                waited_s =
-                                    crate::pipeline::direct_unpack::wiring::pending_chase_deadline()
-                                        .as_secs(),
-                                "chase did not finish within the consumption deadline; \
-                                 ending it and extracting conventionally"
-                            );
-                            pending
-                                .coverage
-                                .abort("chase exceeded the consumption deadline");
-                            handle.abort();
-                            let _ = std::fs::remove_dir_all(&pending.staging_dir);
-                            None
-                        }
-                        Some(joined) => match joined {
-                            Ok(Ok(outcome)) => Some((
-                                outcome,
-                                pending.staging_dir,
-                                pending.counters.total_bytes.load(Ordering::Relaxed),
-                                pending.counters.completed_bytes.load(Ordering::Relaxed),
-                            )),
-                            Ok(Err(error)) => {
-                                tracing::debug!(
-                                    job_id = job_id.0,
-                                    error = %error,
-                                    "chase failed at consumption; extracting conventionally"
-                                );
-                                let _ = std::fs::remove_dir_all(&pending.staging_dir);
-                                None
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    job_id = job_id.0,
-                                    error = %error,
-                                    "chase worker panicked; extracting conventionally"
-                                );
-                                let _ = std::fs::remove_dir_all(&pending.staging_dir);
-                                None
-                            }
-                        },
-                    }
-                }
-                crate::pipeline::direct_unpack::wiring::ChaseDisposition::None => None,
-            };
-
-            if let Some((outcome, chase_staging, total_bytes, completed_bytes)) = chase {
-                let install = tokio::task::spawn_blocking(move || {
-                    crate::pipeline::direct_unpack::wiring::install_chased_members(
-                        &chase_staging,
-                        &staging_for_install,
-                    )
-                })
-                .await;
-
-                match install {
-                    Ok(Ok(())) => {
-                        // The decode already happened; the phase never saw it.
-                        // Attribute it once, here, so the Extracting bar
-                        // reports real bytes instead of a zero-byte lie.
-                        phase_counters_for_install
-                            .total_bytes
-                            .fetch_add(total_bytes, Ordering::Relaxed);
-                        phase_counters_for_install
-                            .completed_bytes
-                            .fetch_add(completed_bytes, Ordering::Relaxed);
-                        tracing::info!(
-                            job_id = job_id.0,
-                            set_name = %set_name_for_channel,
-                            members = outcome.extracted.len(),
-                            total_bytes,
-                            "installed direct-unpack members instead of re-extracting"
-                        );
-                        let _ = extract_done_tx
-                            .send(ExtractionDone::FullSet {
-                                job_id,
-                                set_name: set_name_for_channel,
-                                result: Ok(outcome),
-                            })
-                            .await;
-                        return;
-                    }
-                    Ok(Err(error)) => tracing::warn!(
-                        job_id = job_id.0,
-                        error = %error,
-                        "failed to install chased members; extracting conventionally"
-                    ),
-                    Err(error) => tracing::warn!(
-                        job_id = job_id.0,
-                        error = %error,
-                        "install task panicked; extracting conventionally"
-                    ),
-                }
+            if let Some(outcome) = install_direct_unpack(
+                disposition,
+                staging_for_install,
+                phase_counters_for_install,
+                job_id,
+                &set_name_for_channel,
+                None,
+                None,
+            )
+            .await
+            {
+                let _ = extract_done_tx
+                    .send(ExtractionDone::FullSet {
+                        job_id,
+                        set_name: set_name_for_channel,
+                        result: Ok(outcome),
+                    })
+                    .await;
+                return;
             }
 
             let result = tokio::task::spawn_blocking(move || {
@@ -1814,10 +1968,10 @@ impl Pipeline {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
                     // 7z can encode its own header and payload with different codecs. Reserve
-                    // the configured ceiling while this decoder is live so large archives do
-                    // not inherit a hardcoded small allowance and concurrent decoders cannot
-                    // exceed the shared job budget.
-                    let _memory_permit = budget.reserve_memory_wait(budget.max_memory_bytes())?;
+                    // the ceiling using retained state at admission, rather than the stale
+                    // snapshot from budget construction. Other active decoders still make
+                    // this wait; metadata growth cannot permanently strand the allowance.
+                    let _memory_permit = budget.reserve_memory_ceiling_wait()?;
                     if file_paths.is_empty() {
                         return Err(format!("no 7z files found for set '{set_name_owned}'"));
                     }
@@ -1931,39 +2085,16 @@ impl Pipeline {
         set_name: &str,
         kind: SimpleArchiveKind,
     ) -> Result<u32, String> {
-        let file_paths = {
-            let state = self
-                .jobs
-                .get(&job_id)
-                .ok_or_else(|| format!("job {job_id:?} not found"))?;
-            let topo = state
-                .assembly
-                .archive_topology_for(set_name)
-                .ok_or_else(|| format!("no topology for set '{set_name}'"))?;
-
-            let set_filenames: std::collections::HashSet<&str> =
-                topo.volume_map.keys().map(|s| s.as_str()).collect();
-            let mut parts: Vec<(u32, std::path::PathBuf)> = Vec::new();
-
-            for file_asm in state.assembly.files() {
-                let current_filename = self.current_filename_for_file(job_id, file_asm);
-                if set_filenames.contains(current_filename.as_str()) {
-                    let vol = topo.volume_map.get(&current_filename).copied().unwrap_or(0);
-                    if let Some(path) = self.resolve_job_input_path(job_id, &current_filename) {
-                        parts.push((vol, path));
-                    }
-                }
-            }
-            parts.sort_by_key(|(n, _)| *n);
-            parts
-                .into_iter()
-                .map(|(_, p)| p)
-                .collect::<Vec<std::path::PathBuf>>()
-        };
+        let file_paths = self.archive_set_part_paths(job_id, set_name)?;
         let password = self.primary_archive_password_for_job(job_id);
         let joined_output_already_present = matches!(kind, SimpleArchiveKind::Split)
             .then(|| self.present_split_join_output(job_id, set_name, &file_paths))
             .flatten();
+        if joined_output_already_present.is_some() {
+            // PAR2 may protect the joined file instead of its posted parts.
+            // A chase over those parts must never replace the verified join.
+            self.taint_direct_unpack_set(job_id, set_name);
+        }
 
         let output_dir = self.extraction_staging_dir(job_id);
         let budget = self.extraction_budget(job_id, &output_dir)?;
@@ -1976,8 +2107,32 @@ impl Pipeline {
         let pp_pool = self.pp_pool.clone();
         let xz_worker_threads = pp_pool.current_num_threads();
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
+        let disposition = self.take_direct_unpack_disposition(job_id, set_name);
+        let staging_for_install = output_dir.clone();
+        let phase_counters_for_install = Arc::clone(&phase_counters);
 
         tokio::task::spawn(async move {
+            if let Some(outcome) = install_direct_unpack(
+                disposition,
+                staging_for_install,
+                phase_counters_for_install,
+                job_id,
+                &set_name_for_channel,
+                None,
+                None,
+            )
+            .await
+            {
+                let _ = extract_done_tx
+                    .send(ExtractionDone::FullSet {
+                        job_id,
+                        set_name: set_name_for_channel,
+                        result: Ok(outcome),
+                    })
+                    .await;
+                return;
+            }
+
             let result = tokio::task::spawn_blocking(move || {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;
@@ -2154,6 +2309,10 @@ impl Pipeline {
                 && !self.par2_bypassed.contains(&job_id)
                 && !self.par2_verified.contains(&job_id)
         });
+        // PAR3 may still need this physical source for verification, content
+        // identity, or a different file's repair even after archive extraction
+        // has consumed it. Keep it until the native job verdict settles.
+        let par3_verification_pending = self.par3_verification_pending(job_id);
         let mut deleted_now = Vec::new();
         let mut ownership_ready = Vec::new();
 
@@ -2172,8 +2331,9 @@ impl Pipeline {
             };
 
             let claim_clean = Self::claim_clean_rar_volume(decision);
-            let verification_blocked =
-                par2_verification_pending || verified_suspect.contains(&volume);
+            let verification_blocked = par2_verification_pending
+                || par3_verification_pending
+                || verified_suspect.contains(&volume);
             let solid_blocked = plan.is_solid;
             let waiting_on_retry = plan.waiting_on_volumes.contains(&volume);
             let failed_member_claim = !decision.failed_owners.is_empty();

@@ -492,7 +492,10 @@ export function LogViewerPage() {
         data-code-font
         className={cn(
           "overflow-y-auto rounded-inner border border-border bg-background/40 text-xs leading-5",
-          isMobile ? "h-[50vh] min-h-[260px]" : "h-[28rem] min-h-[320px]",
+          // Fill the viewport below the toolbar; under 1600px the layout adds a top bar.
+          isMobile
+            ? "h-[50vh] min-h-[260px]"
+            : "h-[calc(100dvh-17rem)] min-h-[320px] min-[1600px]:h-[calc(100dvh-13rem)]",
         )}
         style={{ fontFamily: CODE_FONT }}
       >

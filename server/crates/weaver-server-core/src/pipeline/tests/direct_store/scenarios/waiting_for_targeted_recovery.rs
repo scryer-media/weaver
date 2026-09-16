@@ -1513,6 +1513,75 @@ async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_ho
     );
 }
 
+#[tokio::test]
+async fn direct_repair_placement_preserves_verified_output_on_sparse_failure() {
+    failed_direct_repair_placement(true).await;
+}
+
+#[tokio::test]
+async fn direct_repair_placement_preserves_verified_output_on_write_failure() {
+    failed_direct_repair_placement(false).await;
+}
+
+async fn failed_direct_repair_placement(sparse_failure: bool) {
+    use crate::pipeline::direct_store::sparse::SparseMarking;
+    use crate::pipeline::direct_store::wiring::DirectPlacementError;
+
+    let member_name = "Silver.Horizon.S01E53.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 151) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(41103);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+
+    // The native repair has installed only this volume. A failed reroute must
+    // return control without starting a reconstruction over its verified image.
+    let installed = working_dir.join(&volumes[1].0);
+    std::fs::write(&installed, &volumes[1].1).unwrap();
+    let set = pipeline.direct_store.set_mut(job_id, 0).unwrap();
+    let before = set.volume_coverage(1);
+    let clean_coverage = set.volume_coverage(0);
+    let envelope = working_dir.join(set.plan().envelope_relative_path(1));
+    let spans = set.router.route(1, 0, &volumes[1].1).unwrap();
+    assert!(!spans.is_empty());
+    if sparse_failure {
+        pipeline
+            .direct_store
+            .set_sparse_marking(SparseMarking::AlwaysFail);
+    } else {
+        std::fs::create_dir(&envelope).unwrap();
+    }
+    let failure = pipeline
+        .try_place_direct_spans(job_id, 0, &spans)
+        .await
+        .unwrap_err();
+    match failure {
+        DirectPlacementError::Sparse { path, error } => {
+            assert!(sparse_failure);
+            assert_eq!(path, envelope);
+            assert!(error.to_string().contains("test injection"));
+        }
+        DirectPlacementError::Write(error) => {
+            assert!(!sparse_failure);
+            assert!(
+                error.raw_os_error().is_some(),
+                "the original OS error must survive"
+            );
+        }
+    }
+    let set = pipeline.direct_store.set(job_id, 0).unwrap();
+    assert!(!set.is_demoted());
+    assert_eq!(set.volume_coverage(1), before);
+    assert_eq!(set.volume_coverage(0), clean_coverage);
+    assert!(!pipeline.direct_demotion_in_flight.contains_key(&job_id));
+    assert_eq!(std::fs::read(installed).unwrap(), volumes[1].1);
+    assert!(!working_dir.join(&volumes[0].0).exists());
+}
+
 /// The same rule for the holds scratch, which the router creates itself rather
 /// than through the destination-preparation seam.
 #[tokio::test]

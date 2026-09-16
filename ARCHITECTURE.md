@@ -280,6 +280,22 @@ Weaver-web should feel rich, but it should still be a projection client over bac
 
 NNTP, NZB, yEnc, PAR2, and RAR are real engine boundaries.
 
+The NNTP engine owns physical socket admission per durable server. A socket
+retains its slot through dialing, handshake, active use, idle caching and local
+closure, across client generations and transport backends. Dispatch bookings
+are separate from that budget. Reclaiming an idle transport targets its owner
+and socket identity; only closure refunds its slot. Explicit IP-replacement
+trials have a separate, bounded allowance.
+
+Transport quarantine has connection-scoped outcomes and recovery epochs. Old
+socket outcomes cannot settle a new episode. Recovery admits one fresh,
+demanded article; a completed BODY response or valid not-found response proves
+recovery, while handshake alone does not. The server actor returns surplus
+article reservations before issuing that probe. Transport retries start at
+30 seconds and cap at 60 seconds; authentication and provider capacity refusals
+retain their separate policies. Idle inspection processes transport state
+without article work, with bounded input and no blocking waits.
+
 Those crates should own protocol and algorithm concerns. They should not own product semantics such as:
 
 - queue policy
@@ -370,7 +386,64 @@ That means:
 - extraction rules stay explicit
 - file-role and archive-topology logic should live in coherent modules, not be scattered through unrelated helpers
 
+ZIP and ZIP64 direct unpack share the completed-file ZIP decoder. During a
+download, the reader exposes only committed byte ranges, including prioritized
+central-directory articles; sparse file length is never evidence of coverage.
+ZIP64 sizes and offsets remain 64-bit through seeking and extraction. A chase's
+staged output is installed only after verification and repair settle. Repair
+that may change consumed bytes discards that output and uses the repaired archive.
+
+TAR, compressed TAR, gzip, bzip2, XZ, Zstandard, Brotli, and DEFLATE use shared
+sequential decoders during download and at completion. Sequential chases start
+without knowing the archive length: gaps wait for committed bytes and EOF comes
+from the completed final part. Compressed TAR consumes its outer trailer before
+accepting output. Plain split sets join through the same reader after their
+ordered topology is known. All use the existing cancellation, resource budgets,
+staging, and PAR2 invalidation lifecycle. A verified joined file produced by PAR2
+takes precedence over a chase of its source parts.
+
 ### Engine Boundaries Stay Explicit
+
+`pipeline/repair/backend` is the operation boundary for retained PAR2 and PAR3
+engines. It preserves native assessments, evidence, source invalidation, errors,
+and repair requests. Calls are statically dispatched above block I/O; PAR2's
+readers, checksum substitutions, and buffer limits remain native. PAR3 carrier
+roles control discovery priority; authenticated packets alone establish set
+membership and recovery availability. Carrier scans run on blocking workers and
+retain lazy payload references. Extending visibility over unchanged disk backing
+preserves the scanner and pending packet hash; replay checks the path and logical
+generation before reusing progress. Published coverage keeps holes unavailable.
+Visibility extensions over unchanged backing retain source evidence, while
+actual writes withdraw it. Completed conventional files bind through committed
+decoded placements; restored complete disk images without placements are candidates
+for fresh verification. Native
+sessions retain their evidence, while bounded actor views carry file-coordinate
+damage and matrix/cohort requirements. Pending publications hide prior views;
+the shared worker queue rotates between PAR3 jobs. Conventional writes withdraw
+coverage before disk mutation, and worker epochs reject stale handbacks. Identity
+rebindings retire the corresponding source publications for fresh binding.
+`pipeline/repair/par3/coordination` keeps cross-format handoffs above block I/O.
+PAR2 recovery estimates exclude PAR3 carriers. PAR2 gets the first repair attempt;
+its writes fence the affected PAR3 sources and republish the installed images for
+fresh verification, retaining clean sibling evidence. After PAR2 exhausts its
+recovery, admitted PAR3 work can repair the shared files; affected PAR2 sets then
+verify the new bytes themselves. Conflicting native verdicts refuse delivery.
+Temporary handoff lists use the PAR3 host budget; PAR2-only jobs allocate none.
+Conventional PAR3 completion requests individual recovery articles and dispatches native
+staged repairs. Verified installed files reconcile assembly and persistence without
+translating PAR3 fingerprints into PAR2 MD5. PAR3 reads direct volume images through
+a separately bounded reader, retaining cipher frontiers and checking backing
+generations. Direct finalization waits for verification and application of the
+native verdict to the router's deferred archive checks. A verified native session
+alone cannot demote or finalize a set with those checks still pending. Live direct sets receive
+verified replacement volumes in bounded, generation-checked readback tickets.
+Set-wide transactions defer integrity checks and checkpoints until every affected
+volume is placed. Encrypted readback captures neighbour CBC edges from the known
+part layout before shared partials change, including bytes in other repaired
+volumes that never arrived. Coverage is admitted after placement and conventional
+completed-file rows are suppressed for those virtual sources. Earlier
+archive-checksum demotions still use conventional repair.
+Shared mutation views and restart evidence remain under integration.
 
 Engine crates should remain sharp and focused:
 

@@ -1,0 +1,347 @@
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { useQuery, useSubscription } from "urql";
+import { useGraphqlConnectionState, type GraphqlConnectionStatus } from "@/graphql/client";
+import {
+  CATEGORIES_QUERY,
+  HISTORY_JOBS_COUNT_QUERY,
+  LIVE_METRICS_QUERY,
+  LIVE_METRICS_SUBSCRIPTION,
+  SERVER_HEALTH_QUERY,
+  UPDATE_STATUS_QUERY,
+  UPDATE_STATUS_SUBSCRIPTION,
+  VERSION_QUERY,
+} from "@/graphql/queries";
+import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
+import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
+import { useTranslate } from "@/lib/context/translate-context";
+import type { DownloadBlockState } from "@/lib/context/live-data-context";
+import { formatRate } from "./format";
+import { withLiveConnections, type ProviderConnections } from "./provider-connections";
+import { useHistoryLiveRefresh } from "./use-history-live-refresh";
+import { useLiveQueue, type LiveQueue } from "./use-live-queue";
+
+/**
+ * Everything the Next chrome needs, resolved once above the router.
+ *
+ * The rail carries live values on every screen — download and history counts,
+ * throughput, provider load, attention items — so these queries belong to the
+ * shell rather than to whichever page happens to be mounted. Pages read the
+ * same context instead of opening a second subscription for the same data.
+ */
+
+export interface ProviderHealth {
+  host: string;
+  port: number;
+  label: string;
+  /** `PRIMARY` for the first configured server, `BACKUP` for the rest. */
+  tier: string;
+  state: string;
+  connectionsActive: number;
+  connectionsMax: number;
+  connectionsConfigured: number;
+  capacityPenaltyUntilEpochMs: number | null;
+  latencyMs: number;
+  bodyLatencyMs: number | null;
+  bodyLatencyBand: string | null;
+  successCount: number;
+  failureCount: number;
+  consecutiveFailures: number;
+  prematureDeaths: number;
+}
+
+interface ProviderHoldoff {
+  label: string;
+  untilEpochMs: number;
+}
+
+interface LiveMetricsSnapshot {
+  metrics: { currentDownloadSpeed: number };
+  globalState: { isPaused: boolean; speedLimitBytesPerSec: number; downloadBlock: DownloadBlockState };
+  providerHoldoffs?: ProviderHoldoff[];
+  providerConnections?: ProviderConnections[];
+}
+
+/** A category as it is configured, not as the queue happens to use it. */
+export interface ConfiguredCategory {
+  id: number;
+  name: string;
+  destDir: string | null;
+}
+
+export interface NextData {
+  version: string;
+  /** A newer release to advertise, once one has both a version and a page to open. */
+  update: { version: string; url: string } | undefined;
+  speed: number;
+  /** Highest speed seen since the tab opened; the rail and stat strip both note it. */
+  peakSpeed: number;
+  isPaused: boolean;
+  /** The configured download ceiling in bytes per second; 0 is unlimited. */
+  speedLimit: number;
+  downloadBlock: DownloadBlockState;
+  queue: LiveQueue;
+  /**
+   * The categories a person configured, in the order the daemon returns them.
+   *
+   * Deliberately not `queue.categories`, which is the set of categories the
+   * jobs in the queue happen to carry: a configured category with nothing in
+   * it right now is still a category you can filter by, and an empty rail is
+   * not the same statement as "you have no categories".
+   */
+  categories: ConfiguredCategory[];
+  /** Re-read the categories after a change made elsewhere in the interface. */
+  refreshCategories: () => void;
+  historyCount: number;
+  /** Re-read the history count after a change made elsewhere in the interface. */
+  refreshHistoryCount: () => void;
+  providers: ProviderHealth[];
+  /**
+   * Whether `providers` is an answer. It is also empty before server health
+   * first returns and while a read is failing, and neither of those says
+   * that nothing is configured.
+   */
+  providersLoaded: boolean;
+  holdoffs: ProviderHoldoff[];
+  connection: { status: GraphqlConnectionStatus; isDisconnected: boolean; isPolling: boolean };
+}
+
+const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
+  kind: "NONE",
+  capEnabled: false,
+  period: null,
+  usedBytes: 0,
+  limitBytes: 0,
+  remainingBytes: 0,
+  reservedBytes: 0,
+  windowStartsAtEpochMs: null,
+  windowEndsAtEpochMs: null,
+  timezoneName: "",
+  scheduledSpeedLimit: 0,
+};
+
+const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
+const EMPTY_PROVIDERS: ProviderHealth[] = [];
+const EMPTY_HOLDOFFS: ProviderHoldoff[] = [];
+
+const NextDataContext = createContext<NextData | null>(null);
+
+export function useNextData(): NextData {
+  const value = useContext(NextDataContext);
+  if (!value) {
+    throw new Error("useNextData must be used inside NextDataProvider");
+  }
+  return value;
+}
+
+export function NextDataProvider({ children }: { children: ReactNode }) {
+  const connectionState = useGraphqlConnectionState();
+  const queue = useLiveQueue();
+
+  const [{ data: versionData }] = useQuery<{ version: string }>({ query: VERSION_QUERY });
+  const [{ data: updateStatusData }] = useQuery<{ updateStatus: UpdateStatus }>({
+    query: UPDATE_STATUS_QUERY,
+  });
+  const [{ data: updateStatusLive }] = useSubscription<{ updateStatusUpdates: UpdateStatus }>({
+    query: UPDATE_STATUS_SUBSCRIPTION,
+    pause: connectionState.status === "disconnected",
+  });
+  const [{ data: historyCountData }, reexecuteHistoryCount] = useQuery<{ all: number }>({
+    query: HISTORY_JOBS_COUNT_QUERY,
+  });
+  const [{ data: categoryData }, reexecuteCategories] = useQuery<{ categories: ConfiguredCategory[] }>({
+    query: CATEGORIES_QUERY,
+  });
+  const [{ data: providerData }, reexecuteProviders] = useQuery<{
+    serverHealth: ProviderHealth[];
+  }>({ query: SERVER_HEALTH_QUERY });
+
+  const [{ data: metricsQueryData }, reexecuteMetrics] = useQuery<LiveMetricsSnapshot>({
+    query: LIVE_METRICS_QUERY,
+  });
+  const [{ data: metricsSubscriptionData, error: metricsSubscriptionError }] = useSubscription<{
+    systemMetricsUpdates: LiveMetricsSnapshot;
+  }>({ query: LIVE_METRICS_SUBSCRIPTION });
+
+  const [polledMetrics, setPolledMetrics] = useState<LiveMetricsSnapshot | undefined>();
+  const reconnectPolling = useReconnectPolling<LiveMetricsSnapshot>({
+    enabled: connectionState.status === "disconnected",
+    query: LIVE_METRICS_QUERY,
+    onData: setPolledMetrics,
+  });
+
+  useEffect(() => {
+    if (connectionState.status === "connected" && metricsSubscriptionData?.systemMetricsUpdates) {
+      setPolledMetrics(undefined);
+    }
+  }, [connectionState.status, metricsSubscriptionData]);
+
+  // The history count follows history itself: a job reaching an outcome or a
+  // row leaving it is a reason to count again, whichever screen is open.
+  // Removals are counted even while a delete runs, so the rail falls with it.
+  const refreshHistoryCount = useCallback(
+    () => reexecuteHistoryCount({ requestPolicy: "network-only" }),
+    [reexecuteHistoryCount],
+  );
+  useHistoryLiveRefresh({ refresh: refreshHistoryCount, deletesActive: false });
+
+  // Server health has no subscription; the queue's own refresh cadence is the
+  // right beat for it, so re-read it whenever the queue's shape changes.
+  const queueShape = `${queue.summary.totalItems}:${queue.summary.activeItems}`;
+  useEffect(() => {
+    void reexecuteProviders({ requestPolicy: "network-only" });
+    void reexecuteHistoryCount({ requestPolicy: "network-only" });
+  }, [queueShape, reexecuteHistoryCount, reexecuteProviders]);
+
+  // Providers drift on their own (latency, holdoffs) even with a still queue.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void reexecuteProviders({ requestPolicy: "network-only" });
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [reexecuteProviders]);
+
+  const snapshot = polledMetrics
+    ?? (connectionState.status === "connected" && !metricsSubscriptionError
+      ? metricsSubscriptionData?.systemMetricsUpdates
+      : undefined)
+    ?? metricsQueryData;
+
+  useEffect(() => {
+    if (!metricsSubscriptionError) {
+      return;
+    }
+    void reexecuteMetrics({ requestPolicy: "network-only" });
+  }, [metricsSubscriptionError, reexecuteMetrics]);
+
+  const speed = snapshot?.metrics?.currentDownloadSpeed ?? 0;
+  const peakSpeedRef = useRef(0);
+  if (speed > peakSpeedRef.current) {
+    peakSpeedRef.current = speed;
+  }
+
+  const globalState = snapshot?.globalState;
+  const downloadBlock = globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK;
+  const isPaused = globalState?.isPaused ?? false;
+  const speedLimit = globalState?.speedLimitBytesPerSec ?? 0;
+  const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
+  const refreshCategories = useCallback(
+    () => reexecuteCategories({ requestPolicy: "network-only" }),
+    [reexecuteCategories],
+  );
+  // Health is re-read on a slow beat; the counts on the meters follow the
+  // metrics stream instead, so they move as the pool opens connections.
+  const liveConnections = snapshot?.providerConnections;
+  const providers = useMemo(
+    () => withLiveConnections(providerData?.serverHealth ?? EMPTY_PROVIDERS, liveConnections),
+    [providerData, liveConnections],
+  );
+  const providersLoaded = providerData !== undefined;
+  const holdoffs = snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS;
+  const version = versionData?.version ?? "";
+  const update = useMemo(
+    () =>
+      releaseNotification(
+        updateStatusLive?.updateStatusUpdates ?? updateStatusData?.updateStatus,
+      ),
+    [updateStatusData?.updateStatus, updateStatusLive?.updateStatusUpdates],
+  );
+
+  useDocumentTitle(speed, isPaused);
+  const historyCount = historyCountData?.all ?? 0;
+  const isPolling = reconnectPolling.isPolling;
+
+  const value = useMemo<NextData>(
+    () => ({
+      version,
+      update,
+      speed,
+      peakSpeed: peakSpeedRef.current,
+      isPaused,
+      speedLimit,
+      downloadBlock,
+      queue,
+      categories,
+      refreshCategories,
+      historyCount,
+      refreshHistoryCount,
+      providers,
+      providersLoaded,
+      holdoffs,
+      connection: {
+        status: connectionState.status,
+        isDisconnected: connectionState.status === "disconnected",
+        isPolling,
+      },
+    }),
+    [
+      categories,
+      connectionState.status,
+      downloadBlock,
+      historyCount,
+      holdoffs,
+      isPaused,
+      isPolling,
+      providers,
+      providersLoaded,
+      queue,
+      refreshCategories,
+      refreshHistoryCount,
+      speed,
+      speedLimit,
+      update,
+      version,
+    ],
+  );
+
+  return <NextDataContext.Provider value={value}>{children}</NextDataContext.Provider>;
+}
+
+/** How long the tab title holds one speed before it takes the next. */
+const TITLE_HOLD_MS = 2500;
+
+/**
+ * The browser tab says what weaver is doing: the download speed while it
+ * fetches, "Paused" while everything is held. A speed that moves every second
+ * would make the tab flicker, so a new figure waits out the last one; a change
+ * of state — pausing, going idle — shows at once.
+ */
+function useDocumentTitle(speed: number, isPaused: boolean) {
+  const t = useTranslate();
+  const lastUpdate = useRef(0);
+  useEffect(() => {
+    const title = isPaused
+      ? t("next.title.paused")
+      : speed > 0
+        ? t("next.title.speed", { speed: formatRate(speed) })
+        : "Weaver";
+    const apply = () => {
+      lastUpdate.current = Date.now();
+      document.title = title;
+    };
+    // A held figure is applied once the hold runs out rather than dropped, or a
+    // speed that then stays put would never reach the tab.
+    const wait = speed > 0 && !isPaused ? lastUpdate.current + TITLE_HOLD_MS - Date.now() : 0;
+    if (wait <= 0) {
+      apply();
+      return;
+    }
+    const timer = window.setTimeout(apply, wait);
+    return () => window.clearTimeout(timer);
+  }, [isPaused, speed, t]);
+
+  useEffect(
+    () => () => {
+      document.title = "Weaver";
+    },
+    [],
+  );
+}

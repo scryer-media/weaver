@@ -153,6 +153,15 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
         &working_dir,
     )
     .await;
+    assert!(
+        pipeline
+            .db
+            .load_all_rar_volume_facts(job_id)
+            .unwrap()
+            .values()
+            .all(|rows| rows.is_empty()),
+        "without a pending PAR3 verdict, base discovery must discard facts for absent source files"
+    );
 
     // The set came back from its checkpoint rather than from zero.
     let set = pipeline

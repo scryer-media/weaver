@@ -26,6 +26,87 @@ pub(crate) struct DirectoryFingerprint {
     file_index: u64,
 }
 
+/// An atomic regular-file move with no copy or hard-link fallback. Callers
+/// journaling both names can replay an interruption without partial outputs.
+pub(crate) fn rename_file_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
+    if !std::fs::symlink_metadata(src)?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "move source is not a regular file",
+        ));
+    }
+    if src == dst {
+        return Ok(());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = |path: &Path| {
+            std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+        };
+        let src = path(src)?;
+        let dst = path(dst)?;
+        // The raw syscall rather than the libc wrapper: musl's static libc has
+        // no renameat2 symbol, so the portable release binary cannot link it.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                src.as_ptr(),
+                libc::AT_FDCWD,
+                dst.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe { libc::renamex_np(src.as_ptr(), dst.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let path = |path: &Path| -> io::Result<Vec<u16>> {
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if wide.contains(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path contains NUL",
+                ));
+            }
+            wide.push(0);
+            Ok(wide)
+        };
+        let src = path(src)?;
+        let dst = path(dst)?;
+        // No REPLACE_EXISTING or COPY_ALLOWED: the destination stays exclusive.
+        let result = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                src.as_ptr(),
+                dst.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic exclusive file moves are unsupported on this platform",
+        ))
+    }
+}
+
 pub(crate) fn paths_equivalent_for_placement(left: &Path, right: &Path) -> bool {
     path_equivalence_key(left) == path_equivalence_key(right)
 }
@@ -417,6 +498,24 @@ mod tests {
         rename_no_overwrite(&src, &dst).unwrap();
 
         assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    #[test]
+    fn rename_file_exclusive_moves_once_and_never_replaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src.bin");
+        let dst = temp.path().join("dst.bin");
+        std::fs::write(&src, b"source").unwrap();
+
+        rename_file_exclusive(&src, &dst).unwrap();
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+
+        std::fs::write(&src, b"second").unwrap();
+        let error = rename_file_exclusive(&src, &dst).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"second");
         assert_eq!(std::fs::read(&dst).unwrap(), b"source");
     }
 

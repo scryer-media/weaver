@@ -1,4 +1,4 @@
-//! Encryption at rest for sensitive values (NNTP passwords, RSS credentials).
+//! Encryption at rest for credentials, including NNTP, RSS and archive passwords.
 //!
 //! Uses AES-256-GCM with a 32-byte master key stored in platform-native secure storage.
 //! Encrypted values use the format `enc:v1:<base64(nonce || ciphertext || tag)>`.
@@ -6,7 +6,6 @@
 
 pub(crate) mod keystore;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod key_file;
 #[cfg(target_os = "linux")]
 mod linux;

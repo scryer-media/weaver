@@ -13,6 +13,19 @@
 /// once `folded` has been used, so `crc_fast::Digest::get_amount`/`combine` must
 /// not be surfaced through this wrapper without first tracking the folded bytes
 /// here.
+/// Whether large updates on this host fold through the 256-bit carry-less
+/// multiply kernel rather than `crc-fast`. Reads the gate [`Crc32::new`] reads.
+pub fn wide_fold_selected() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_vpclmul::available()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 #[derive(Clone)]
 pub struct Crc32 {
     hasher: crc_fast::Digest,

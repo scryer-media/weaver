@@ -1,7 +1,10 @@
 import type { LocaleDictionary } from "../types";
 import { duplicateLocaleEntries } from "../duplicate-locales";
+import { nextEn } from "@/next/i18n/en";
 
 const en: LocaleDictionary = {
+  "settings.proxies": "Proxies",
+  "settings.proxiesDesc": "Reusable proxy profiles and private routes for servers and RSS feeds.",
   // Brand
 
   // Navigation
@@ -194,6 +197,10 @@ const en: LocaleDictionary = {
   "job.notFound": "Job not found.",
   "job.passwordProtected": "Password protected",
   "job.eventLog": "Event Log",
+  "job.providersUsed": "Providers Used",
+  "job.providersUsedNote": "Shares are of the articles whose serving provider was recorded.",
+  "job.providerUnnamed": "Server {{id}}",
+  "job.providerArticles": "{{count}} articles",
   "job.metadata": "Metadata",
   "job.savedBandwidthSkipped": "Skipped unneeded PAR2 recovery download",
   "job.savedBandwidthUsedAll": "All optional PAR2 recovery was needed",
@@ -268,7 +275,7 @@ const en: LocaleDictionary = {
   "settings.generalPageDesc": "Tune download speed, storage paths, cleanup behavior, and retry policy from one place.",
   "settings.language": "Language",
   "settings.languageDesc": "Choose the display language for the Weaver interface.",
-  "settings.bandwidthCap": "ISP Bandwidth Cap",
+  "settings.bandwidthCap": "Bandwidth",
   "settings.bandwidthCapDesc": "Block new download dispatch once the current ISP allowance is used. Queued jobs still hold position and post-processing already in flight can continue.",
   "settings.bandwidthCapConfiguration": "Configuration",
   "settings.bandwidthCapEnabled": "Enable ISP cap",
@@ -775,6 +782,7 @@ const en: LocaleDictionary = {
   "upload.duplicateScorePlaceholder": "0",
   "upload.duplicateScoreHint": "Higher scores win within the same duplicate key; ties keep the existing candidate.",
   ...duplicateLocaleEntries.eng,
+  ...nextEn,
 };
 
 export default en;

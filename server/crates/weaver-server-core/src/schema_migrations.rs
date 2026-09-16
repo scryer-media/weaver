@@ -22,7 +22,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 45;
+const CURRENT_SCHEMA_VERSION: i64 = 49;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -465,13 +465,25 @@ async fn apply_version_range(
         .map(|row| row.version)
         .collect();
 
-    for migration in catalog.migrations.iter().filter(|migration| {
-        migration.version >= start_version && migration.version <= target_version
-    }) {
-        if applied_versions.contains(&migration.version) {
-            continue;
-        }
+    let unapplied: Vec<&CompiledMigration> = catalog
+        .migrations
+        .iter()
+        .filter(|migration| {
+            migration.version >= start_version
+                && migration.version <= target_version
+                && !applied_versions.contains(&migration.version)
+        })
+        .collect();
+    // Only an upgrade is worth showing: someone is waiting on an install that
+    // was already running.
+    let mut progress = (matches!(install_kind, MigrationInstallKind::Upgrade)
+        && !unapplied.is_empty())
+    .then(|| crate::schema_upgrade::UpgradeProgress::start(unapplied.len()));
+    for migration in unapplied {
         apply_single_migration(pool, migration, payload_bytes, install_kind).await?;
+        if let Some(progress) = progress.as_mut() {
+            progress.advance();
+        }
     }
     Ok(())
 }

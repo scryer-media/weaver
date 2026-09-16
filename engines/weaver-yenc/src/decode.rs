@@ -217,7 +217,7 @@ fn finalize_decode(
     };
     let defects = metadata.defects.merged(yend_defects);
 
-    // Validate decoded size against =yend size (like NZBGet's dsInvalidSize).
+    // Validate decoded size against =yend size.
     if let Some(expected_size) = yend_size
         && bytes_written as u64 != expected_size
     {
@@ -251,7 +251,7 @@ fn finalize_decode(
         expected_part_crc
     } else {
         // For single-part, crc32 is the file CRC which equals the part CRC.
-        // A poster may emit only `pcrc32=` there (sabctools verifies it);
+        // A poster may emit only `pcrc32=` there;
         // fall back so a lone part CRC is checked rather than read as absent.
         expected_file_crc.or(expected_part_crc)
     };
@@ -2038,8 +2038,8 @@ mod tests {
         let mut output = vec![0u8; 1024];
         let result = decode(&article, &mut output).unwrap();
 
-        // sabctools verifies a lone `pcrc32=` on single-part articles; the
-        // absent file CRC must fall back to it instead of reading Unverified.
+        // A lone `pcrc32=` on single-part articles must be verified when
+        // the file CRC is absent.
         assert_eq!(result.expected_file_crc, None);
         assert_eq!(result.expected_part_crc, Some(crc));
         assert_eq!(result.crc_status, CrcVerification::Verified);

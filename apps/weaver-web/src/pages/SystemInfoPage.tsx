@@ -10,6 +10,7 @@ import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { cn } from "@/lib/utils";
+import { LoadingMark } from "@/lib/loading-mark";
 
 interface DiskCapacity {
   totalBytes: number;
@@ -138,7 +139,7 @@ export function SystemInfoPage() {
               onClick={() => refresh({ requestPolicy: "network-only" })}
               disabled={fetching}
             >
-              <RefreshCw className={cn("size-4", fetching && "animate-spin")} />
+              {fetching ? <LoadingMark /> : <RefreshCw className="size-4" />}
               {t("action.refresh")}
             </Button>
           </>
@@ -164,7 +165,8 @@ export function SystemInfoPage() {
       ) : null}
 
       {!info && fetching ? (
-        <div role="status" className="text-sm text-muted-foreground">
+        <div role="status" className="flex items-center gap-3 text-sm text-muted-foreground">
+          <LoadingMark className="h-5" />
           {t("label.loading")}
         </div>
       ) : null}

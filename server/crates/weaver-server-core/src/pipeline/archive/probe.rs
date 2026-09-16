@@ -240,7 +240,16 @@ impl Pipeline {
         job_id: JobId,
         file: &crate::jobs::assembly::FileAssembly,
     ) -> FileRole {
-        self.file_identity(job_id, file.file_id())
+        let identity = self.file_identity(job_id, file.file_id());
+        if let Some(identity) = identity
+            && identity.classification_source == FileIdentitySource::Par3
+        {
+            // The whole-file fingerprint established this current name. It
+            // also supplies roles without a content-probe classification,
+            // including ZIP and ordinary split files.
+            return FileRole::from_filename(&identity.current_filename);
+        }
+        identity
             .and_then(|identity| identity.classification.as_ref())
             .or_else(|| self.detected_archive_identity(job_id, file.file_id()))
             .map(DetectedArchiveIdentity::effective_role)

@@ -348,6 +348,38 @@ impl SettingsMutation {
         Ok(settings)
     }
 
+    /// Hold first-run setup open until the wizard finishes it.
+    #[graphql(guard = "AdminGuard")]
+    async fn begin_first_run_setup(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::first_run::FirstRunSetup> {
+        let db = ctx.data::<Database>()?;
+        let config = ctx.data::<SharedConfig>()?;
+        crate::settings::first_run::begin(db, config).await
+    }
+
+    /// End first-run setup, finished or skipped, so it never shows again.
+    #[graphql(guard = "AdminGuard")]
+    async fn finish_first_run_setup(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::first_run::FirstRunSetup> {
+        let db = ctx.data::<Database>()?;
+        crate::settings::first_run::finish(db).await
+    }
+
+    /// Record that the access-model notice was read, so it never shows again.
+    #[graphql(guard = "AdminGuard")]
+    async fn dismiss_security_upgrade_notice(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::security_upgrade_notice::SecurityUpgradeNotice> {
+        let db = ctx.data::<Database>()?;
+        let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?;
+        crate::settings::security_upgrade_notice::dismiss(db, auth_cache).await
+    }
+
     #[graphql(guard = "AdminGuard")]
     async fn scan_watch_folder(&self, ctx: &Context<'_>) -> Result<WatchFolderScanReport> {
         let watch_folder = ctx.data::<WatchFolderService>()?;

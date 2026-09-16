@@ -22,6 +22,7 @@ pub struct OrphanActiveStateCounts {
     pub active_volume_status: usize,
     pub active_rar_verified_suspect: usize,
     pub active_direct_coverage: usize,
+    pub active_repair_outputs: usize,
 }
 
 impl OrphanActiveStateCounts {
@@ -40,12 +41,13 @@ impl OrphanActiveStateCounts {
             + self.active_volume_status
             + self.active_rar_verified_suspect
             + self.active_direct_coverage
+            + self.active_repair_outputs
     }
 }
 
 const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
@@ -60,6 +62,7 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
     "active_volume_status",
     "active_rar_verified_suspect",
     "active_direct_coverage",
+    "active_repair_outputs",
 ];
 
 async fn run_inline_incremental_vacuum(datastore: &StoreDatastore) -> Result<(), StateError> {
@@ -146,6 +149,7 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::OptText(history.metadata.clone()),
         SqlArg::I64(job_id.0 as i64),
         SqlArg::I64(job_id.0 as i64),
+        SqlArg::OptText(history.server_attribution.clone()),
     ]
 }
 
@@ -166,14 +170,14 @@ async fn archive_job_sql(
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
                   failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
                   created_at, completed_at, metadata,
-                  post_processing_summary, script_results_json)
+                  post_processing_summary, script_results_json, server_attribution)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
                          (SELECT nzb_zstd FROM active_jobs WHERE job_id = {}),
                          {}, {}, {},
                          COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
-                         (SELECT script_results_json FROM active_jobs WHERE job_id = {}))
+                         (SELECT script_results_json FROM active_jobs WHERE job_id = {}), {})
                  ON CONFLICT(job_id) DO UPDATE SET
                     job_hash = excluded.job_hash,
                     name = excluded.name,
@@ -193,11 +197,13 @@ async fn archive_job_sql(
                     completed_at = excluded.completed_at,
                     metadata = excluded.metadata,
                     post_processing_summary = excluded.post_processing_summary,
-                    script_results_json = excluded.script_results_json
+                    script_results_json = excluded.script_results_json,
+                    server_attribution =
+                        COALESCE(excluded.server_attribution, job_history.server_attribution)
                  RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
-                    created_at, completed_at, metadata",
+                    created_at, completed_at, metadata, server_attribution",
                 &args,
             )
             .await?
@@ -311,6 +317,8 @@ impl Database {
                                 "active_rar_verified_suspect",
                             )
                             .await?,
+                            active_repair_outputs: delete_orphan_rows(tx, "active_repair_outputs")
+                                .await?,
                             active_direct_coverage: delete_orphan_rows(
                                 tx,
                                 "active_direct_coverage",

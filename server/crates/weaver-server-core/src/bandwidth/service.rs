@@ -121,8 +121,7 @@ impl BandwidthCapRuntime {
         // The window is a calendar computation (local midnight, DST-resolved
         // reset times); it is recomputed only when the clock has left the one
         // in hand. Inside the window this is an integer compare, which is what
-        // the per-article refresh should cost. SABnzbd and NZBGet keep the
-        // same shape: a precomputed period end, compared per update.
+        // the per-article refresh should cost.
         let in_window = self
             .window
             .as_ref()

@@ -41,8 +41,22 @@ fn local_agent_key_generation_uses_weaver_key_shape() {
     assert_eq!(key.len(), 36);
 }
 
+/// Provisioning shells out to the `sqlite3` CLI, which not every host has.
+fn sqlite3_cli_available() -> bool {
+    Command::new("sqlite3")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[test]
 fn local_agent_key_provisioning_is_admin_and_rotates_the_previous_dev_key() {
+    if !sqlite3_cli_available() {
+        eprintln!("skipping: the sqlite3 CLI is not installed on this host");
+        return;
+    }
     let state = tempfile::tempdir().unwrap();
     let db_path = state.path().join("weaver.db");
     let mut schema = Command::new("sqlite3");
@@ -602,4 +616,58 @@ fn release_hygiene_allows_repo_local_paths() {
     );
 
     assert!(violations.is_empty());
+}
+
+#[test]
+fn setup_code_is_read_only_from_the_current_run() {
+    let stale = "AAA-AAA";
+    let current = "K7P-M2X";
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("backend.log");
+    let bootstrap = format!("{SETUP_CODE_PREFIX}{stale}\n");
+    fs::write(
+        &log,
+        format!("{bootstrap}2026-09-14T00:00:00Z INFO starting\n{SETUP_CODE_PREFIX}{current}\n"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_setup_code(&log, bootstrap.len() as u64).unwrap(),
+        Some(current.to_string())
+    );
+    assert_eq!(
+        read_setup_code(&log, fs::metadata(&log).unwrap().len()).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn setup_code_line_must_carry_a_whole_code() {
+    assert_eq!(
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P-M2X\r")),
+        Some("K7P-M2X")
+    );
+    assert_eq!(
+        parse_setup_code_line(&format!("#   {SETUP_CODE_PREFIX}K7P-M2X      #")),
+        Some("K7P-M2X")
+    );
+    assert_eq!(
+        parse_setup_code_line(&format!(
+            r#"{{"fields":{{"message":"ACTION REQUIRED: {SETUP_CODE_PREFIX}K7P-M2X. Open"}}}}"#
+        )),
+        Some("K7P-M2X")
+    );
+    assert_eq!(
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P")),
+        None
+    );
+    assert_eq!(
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7PM2X")),
+        None
+    );
+    assert_eq!(
+        parse_setup_code_line(&format!("{SETUP_CODE_PREFIX}K7P-M2XY")),
+        None
+    );
+    assert_eq!(parse_setup_code_line("INFO listening"), None);
 }

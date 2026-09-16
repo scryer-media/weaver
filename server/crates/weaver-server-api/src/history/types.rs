@@ -132,6 +132,14 @@ pub struct HistoryPageInput {
     pub page_size: u32,
     pub search: Option<String>,
     pub status: Option<HistoryStatusFilter>,
+    /// Keep only rows whose category is one of these; absent or empty keeps
+    /// every row.
+    ///
+    /// The list unions rather than intersects, so a caller offering categories
+    /// as facets widens the result with each one. The empty string selects rows
+    /// with no category at all, which is how "uncategorised" is asked for
+    /// without a second field.
+    pub categories: Option<Vec<String>>,
     pub sort_field: Option<HistorySortField>,
     pub sort_direction: Option<HistorySortDirection>,
 }
@@ -171,6 +179,14 @@ pub struct JobDetailSnapshot {
     pub history_item: Option<HistoryItem>,
     pub job_timeline: Option<JobTimeline>,
     pub job_events: Vec<JobEvent>,
+    /// Which servers served this job's articles, highest count first.
+    ///
+    /// Counted as articles land, so it covers only articles whose serving
+    /// server could be named: it understates rather than misattributes, and
+    /// the totals need not add up to the job's article count. Empty for jobs
+    /// that finished before the counters existed.
+    #[serde(default)]
+    pub server_attribution: Vec<crate::jobs::types::JobServerContribution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

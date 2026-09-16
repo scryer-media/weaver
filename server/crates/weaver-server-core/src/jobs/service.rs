@@ -10,7 +10,7 @@ use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
-use crate::jobs::working_dir::{compute_working_dir, working_dir_marker_path};
+use crate::jobs::working_dir::{compute_working_dir, stamp_working_dir};
 use crate::pipeline::{Pipeline, check_disk_space};
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
@@ -594,6 +594,21 @@ impl Pipeline {
         state.detected_archives = detected_archives.clone();
     }
 
+    pub(crate) fn check_job_memory_admission(
+        &mut self,
+        job_id: JobId,
+        spec: &JobSpec,
+    ) -> Result<crate::pipeline::ProcessMemoryPermit, crate::SchedulerError> {
+        self.process_memory_budget
+            .for_job(job_id.0)
+            .try_reserve_retained(spec.scheduling_memory_estimate())
+            .map_err(|error| {
+                crate::SchedulerError::InvalidInput(format!(
+                    "WEAVER_RESOURCE_LIMIT[nzb_metadata]: {error}"
+                ))
+            })
+    }
+
     pub(crate) async fn add_job(
         &mut self,
         job_id: JobId,
@@ -609,6 +624,7 @@ impl Pipeline {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
 
+        let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
         if let Some(generation) = options.semantic_materialization_generation {
             let db = self.db.clone();
             let current = tokio::task::spawn_blocking(move || {
@@ -644,7 +660,7 @@ impl Pipeline {
         tokio::fs::create_dir_all(&working_dir)
             .await
             .map_err(crate::SchedulerError::Io)?;
-        tokio::fs::write(working_dir_marker_path(&working_dir), [])
+        stamp_working_dir(&self.intermediate_dir, &working_dir, job_id)
             .await
             .map_err(crate::SchedulerError::Io)?;
         crate::runtime::perf_probe::record(
@@ -716,6 +732,7 @@ impl Pipeline {
             paused_resume_post_state: options
                 .initially_paused
                 .then_some(crate::jobs::model::PostState::Idle.as_str()),
+            password_override: Some(spec.password.clone().unwrap_or_default()),
         };
         // Biggest single write on the add-job path: keep it off the
         // orchestrator loop, but never create an in-memory job without durable
@@ -815,6 +832,7 @@ impl Pipeline {
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
             downloaded_wire_bytes: 0,
+            server_attribution: Default::default(),
             failed_bytes: 0,
             probe_projected_failed_bytes: 0,
             par2_bytes,
@@ -834,6 +852,8 @@ impl Pipeline {
             category_bytes: Some(category_bytes),
         };
         state.refresh_runtime_lanes_from_status();
+        self.install_repeated_articles(&state)?;
+        self.job_scheduling_memory.insert(job_id, scheduling_memory);
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
@@ -862,7 +882,9 @@ impl Pipeline {
         let mut download_queue = DownloadQueue::new();
         let mut recovery_queue = DownloadQueue::new();
         let mut has_par2_index = false;
-        let mut recovery_files: Vec<(u32, u64)> = Vec::new();
+        let mut has_par3_index = false;
+        let mut par2_files: Vec<(u32, u64)> = Vec::new();
+        let mut par3_files: Vec<(u32, u64)> = Vec::new();
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
             let file_id = NzbFileId {
@@ -879,11 +901,10 @@ impl Pipeline {
                 segment_sizes,
             );
 
-            if matches!(
-                file_spec.role,
-                weaver_model::files::FileRole::Par2 { is_index: true, .. }
-            ) {
-                has_par2_index = true;
+            match file_spec.role {
+                weaver_model::files::FileRole::Par2 { is_index: true, .. } => has_par2_index = true,
+                weaver_model::files::FileRole::Par3 { is_index: true } => has_par3_index = true,
+                _ => {}
             }
 
             let priority = file_spec.role.download_priority();
@@ -891,7 +912,11 @@ impl Pipeline {
 
             if is_recovery {
                 let total: u64 = file_spec.segments.iter().map(|s| s.bytes as u64).sum();
-                recovery_files.push((file_index as u32, total));
+                if matches!(file_spec.role, weaver_model::files::FileRole::Par2 { .. }) {
+                    par2_files.push((file_index as u32, total));
+                } else {
+                    par3_files.push((file_index as u32, total));
+                }
             }
 
             let target_queue = if is_recovery {
@@ -917,6 +942,7 @@ impl Pipeline {
                     | weaver_model::files::FileRole::SplitFile { .. }
                     | weaver_model::files::FileRole::SevenZipArchive
                     | weaver_model::files::FileRole::SevenZipSplit { .. }
+                    | weaver_model::files::FileRole::ZipArchive
             )
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
             .flatten();
@@ -939,6 +965,7 @@ impl Pipeline {
                 file_spec.role,
                 weaver_model::files::FileRole::SevenZipArchive
                     | weaver_model::files::FileRole::SevenZipSplit { .. }
+                    | weaver_model::files::FileRole::ZipArchive
             )
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).max())
             .flatten();
@@ -979,7 +1006,20 @@ impl Pipeline {
             assembly.add_file(file_assembly);
         }
 
-        if !has_par2_index && !recovery_files.is_empty() {
+        // PAR2 keeps its original indexless-volume promotion, regardless of
+        // PAR3 indexes or smaller PAR3 volumes in the same job.
+        let recovery_files = if !has_par2_index && !par2_files.is_empty() {
+            Some(&mut par2_files)
+        } else if !has_par2_index
+            && par2_files.is_empty()
+            && !has_par3_index
+            && !par3_files.is_empty()
+        {
+            Some(&mut par3_files)
+        } else {
+            None
+        };
+        if let Some(recovery_files) = recovery_files {
             recovery_files.sort_by_key(|&(_, size)| size);
             let promoted_file_index = recovery_files[0].0;
 
@@ -1090,6 +1130,7 @@ impl Pipeline {
                 };
 
             let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+            let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
 
             let working_dir = output_dir
                 .as_ref()
@@ -1098,7 +1139,7 @@ impl Pipeline {
             if working_dir.starts_with(&self.intermediate_dir)
                 && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
                 && let Err(error) =
-                    tokio::fs::write(working_dir_marker_path(&working_dir), []).await
+                    stamp_working_dir(&self.intermediate_dir, &working_dir, job_id).await
             {
                 warn!(
                     job_id = job_id.0,
@@ -1143,6 +1184,7 @@ impl Pipeline {
                 downloaded_bytes,
                 restored_download_floor_bytes: 0,
                 downloaded_wire_bytes: 0,
+                server_attribution: Default::default(),
                 failed_bytes: 0,
                 probe_projected_failed_bytes: 0,
                 par2_bytes,
@@ -1162,6 +1204,8 @@ impl Pipeline {
                 category_bytes: Some(category_bytes),
             };
             state.refresh_runtime_lanes_from_status();
+            self.install_repeated_articles(&state)?;
+            self.job_scheduling_memory.insert(job_id, scheduling_memory);
             self.jobs.insert(job_id, state);
             if let Some(file_identities) = self
                 .jobs
@@ -1534,6 +1578,7 @@ impl Pipeline {
             downloaded_bytes: 0,
             restored_download_floor_bytes: floor,
             downloaded_wire_bytes: 0,
+            server_attribution: Default::default(),
             failed_bytes: 0,
             probe_projected_failed_bytes: 0,
             par2_bytes: request.spec.par2_bytes(),
@@ -1662,9 +1707,11 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
+        let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
         if working_dir.starts_with(&self.intermediate_dir)
             && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
-            && let Err(error) = tokio::fs::write(working_dir_marker_path(&working_dir), []).await
+            && let Err(error) =
+                stamp_working_dir(&self.intermediate_dir, &working_dir, job_id).await
         {
             tracing::warn!(
                 job_id = job_id.0,
@@ -1713,6 +1760,8 @@ impl Pipeline {
                 .map_err(|e| crate::SchedulerError::Internal(e.to_string()))?
                 .map_err(crate::SchedulerError::Io)?;
         }
+        self.restore_pending_par3_content_names(job_id, &working_dir, &mut file_identities)
+            .map_err(crate::SchedulerError::Internal)?;
         let (stale_rar_sets, refreshed_rar_files) =
             Self::scrub_restored_par2_file_identities(&mut file_identities);
         let mut restore_skip_plan = Self::build_restore_skip_plan(
@@ -1746,8 +1795,21 @@ impl Pipeline {
                 .or_insert(*floor);
             *slot = (*slot).max(*floor);
         }
-        let (assembly, download_queue, recovery_queue) =
+        let (mut assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
+        let repair_outputs = self
+            .db
+            .load_repair_outputs(job_id)
+            .map_err(crate::SchedulerError::State)?;
+        let repair_output_indices = super::repair_outputs::restore_assembly(
+            job_id,
+            &repair_outputs,
+            &working_dir,
+            &mut assembly,
+            &mut file_identities,
+        )
+        .await
+        .map_err(crate::SchedulerError::Internal)?;
         // A restored job resumes mid-download; its unsplit archives are still
         // candidates, and their persisted floor is what they will arm from.
         self.register_direct_unpack_singles(job_id, &spec);
@@ -1903,6 +1965,7 @@ impl Pipeline {
             downloaded_bytes,
             restored_download_floor_bytes,
             downloaded_wire_bytes: 0,
+            server_attribution: Default::default(),
             failed_bytes: 0,
             probe_projected_failed_bytes: 0,
             par2_bytes,
@@ -1922,6 +1985,8 @@ impl Pipeline {
             category_bytes: Some(category_bytes),
         };
         state.refresh_runtime_lanes_from_status();
+        self.install_repeated_articles(&state)?;
+        self.job_scheduling_memory.insert(job_id, scheduling_memory);
         self.jobs.insert(job_id, state);
         // After the job state exists, and before anything can decode a segment
         // for it: `install_restored` marks the job examined, so the lazy
@@ -1965,6 +2030,7 @@ impl Pipeline {
         }
         self.reload_metadata_from_disk(job_id).await;
         let mut archive_refresh_file_indices = refreshed_rar_files;
+        archive_refresh_file_indices.extend(repair_output_indices);
         archive_refresh_file_indices.extend(
             complete_files
                 .iter()

@@ -333,6 +333,18 @@ metric_families! {
         "Maximum connections per server.");
     SERVER_CONNECTIONS_CONFIGURED = ("weaver_server_connections_configured", Gauge,
         ["server_id", "server"], "Operator-configured maximum connections per server.");
+    SERVER_SOCKETS = ("weaver_server_sockets", Gauge,
+        ["server_id", "server", "phase"], "Physical socket occupancy, including idle and closing transports.");
+    SERVER_LOCAL_ADMISSION_DENIALS = ("weaver_server_local_admission_denials_total", Counter,
+        ["server_id", "server"], "Physical socket acquisitions denied locally.");
+    SERVER_PROVIDER_REFUSALS = ("weaver_server_provider_refusals_total", Counter,
+        ["server_id", "server"], "Actual connection-capacity refusals received from the provider.");
+    SERVER_RECOVERY_EPOCH = ("weaver_server_recovery_epoch", Gauge,
+        ["server_id", "server"], "Current transport recovery epoch.");
+    SERVER_RECOVERY_PROBE = ("weaver_server_recovery_probe", Gauge,
+        ["server_id", "server"], "Whether a demanded transport recovery probe is owned.");
+    SERVER_RECOVERY_WAIT_SECONDS = ("weaver_server_recovery_wait_seconds", Gauge,
+        ["server_id", "server"], "Remaining delay before a fresh demanded recovery attempt.");
     SERVER_CAPACITY_PENALTY_MS = ("weaver_server_capacity_penalty_until_epoch_ms", Gauge,
         ["server_id", "server"],
         "Provider over-limit holdoff deadline in unix epoch milliseconds.",

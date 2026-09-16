@@ -411,6 +411,20 @@ pub struct SystemMetricsSnapshot {
     /// gauge the way the event-driven queue item, published at most once a
     /// second, always did.
     pub job_download_rates: Vec<JobDownloadRate>,
+    /// Connections each server has open right now, on the same cadence, so a
+    /// connection meter can follow the pool instead of waiting for the next
+    /// `serverHealth` read.
+    pub provider_connections: Vec<ProviderConnections>,
+}
+
+/// How many of a server's connections are in use at one instant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct ProviderConnections {
+    /// `host:port` label, matching `ServerHealth.label`.
+    pub label: String,
+    pub active: u32,
+    /// The server's connection limit.
+    pub max: u32,
 }
 
 /// The download-phase rate of one job, from the same estimator and the same
@@ -665,6 +679,16 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                     "verification found damage".into()
                 },
             },
+            PipelineEvent::Par3VerificationComplete { job_id, passed } => Self {
+                kind: EventKind::JobVerificationComplete,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: if *passed {
+                    "PAR3 verification passed".into()
+                } else {
+                    "PAR3 verification found incomplete protected data".into()
+                },
+            },
             PipelineEvent::RepairStarted { job_id } => Self {
                 kind: EventKind::RepairStarted,
                 job_id: Some(job_id.0),
@@ -679,6 +703,17 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 job_id: Some(job_id.0),
                 file_id: None,
                 message: format!("{slices_repaired} slices repaired"),
+            },
+            PipelineEvent::EmbeddedProtectionReplaced {
+                job_id,
+                blocks_repaired,
+            } => Self {
+                kind: EventKind::RepairComplete,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: format!(
+                    "{blocks_repaired} blocks repaired. Embedded PAR3 protection replaced after verified repair. Available authenticated packets were preserved; the original carrier could not be restored byte for byte."
+                ),
             },
             PipelineEvent::RepairFailed { job_id, error } => Self {
                 kind: EventKind::RepairFailed,
@@ -921,6 +956,45 @@ pub struct SystemComputeInfo {
     pub cgroup_limit: Option<f64>,
     pub decoder_tier: DecoderTierGql,
     pub simd_features: Vec<String>,
+    /// The kernel each hot-path library dispatches to on this host.
+    pub kernels: Vec<KernelSelectionInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum KernelComponentGql {
+    #[graphql(name = "YENC_DECODE")]
+    YencDecode,
+    #[graphql(name = "YENC_CRC32")]
+    YencCrc32,
+    #[graphql(name = "PAR2_REPAIR")]
+    Par2Repair,
+    #[graphql(name = "PAR2_MD5")]
+    Par2Md5,
+    #[graphql(name = "PAR2_CRC32")]
+    Par2Crc32,
+    #[graphql(name = "RAR_RECOVERY")]
+    RarRecovery,
+    #[graphql(name = "RAR_CRC32")]
+    RarCrc32,
+    #[graphql(name = "RAR_SHA1")]
+    RarSha1,
+    #[graphql(name = "RAR_AES")]
+    RarAes,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct KernelSelectionInfo {
+    pub component: KernelComponentGql,
+    /// The crate that owns the dispatch.
+    pub library: String,
+    /// Every kernel this build can select on this architecture, in the order
+    /// the dispatcher tries them.
+    pub ladder: Vec<String>,
+    /// The rung the dispatcher selected; always an entry of `ladder`.
+    pub kernel: String,
+    /// The environment variable that moved the selection off the rung the CPU
+    /// alone would have picked, when one did.
+    pub pinned_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, SimpleObject)]

@@ -21,6 +21,41 @@ fn add_file(
 }
 
 #[test]
+fn par3_recovery_is_optional_only_alongside_payload() {
+    let mut assembly = JobAssembly::new(JobId(42));
+    add_file(
+        &mut assembly,
+        0,
+        "set.par3",
+        FileRole::Par3 { is_index: true },
+        &[10],
+        1,
+    );
+    add_file(
+        &mut assembly,
+        1,
+        "set.vol0+2.par3",
+        FileRole::Par3 { is_index: false },
+        &[20, 30],
+        1,
+    );
+    assert_eq!(assembly.optional_recovery_bytes(), (0, 0));
+    assert_eq!(assembly.data_file_count(), 1);
+    assert_eq!(assembly.complete_data_file_count(), 1);
+    add_file(
+        &mut assembly,
+        2,
+        "data.bin",
+        FileRole::Standalone,
+        &[100],
+        0,
+    );
+    assert_eq!(assembly.optional_recovery_bytes(), (50, 20));
+    assert_eq!(assembly.data_file_count(), 2);
+    assert_eq!(assembly.complete_data_file_count(), 1);
+}
+
+#[test]
 fn optional_recovery_bytes_are_zero_when_not_present() {
     let mut assembly = JobAssembly::new(JobId(1));
     add_file(

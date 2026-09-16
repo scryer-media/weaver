@@ -132,8 +132,6 @@ impl Pipeline {
         let extraction_limits = Arc::new(ExtractionLimits::from_env(&complete_dir)?);
         let process_memory_budget =
             Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
-        let direct_unpack_process_memory =
-            Arc::new(ProcessMemoryBudget::new(extraction_limits.max_memory_bytes));
 
         let (download_done_tx, download_done_rx) = mpsc::channel(256);
         let (download_refill_tx, download_refill_rx) = mpsc::channel(256);
@@ -152,7 +150,7 @@ impl Pipeline {
             mpsc::channel(32);
         let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
-        let (par2_analysis_done_tx, par2_analysis_done_rx) = mpsc::channel(32);
+        let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
         let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
         let post_processing_settings = db.post_processing_settings().unwrap_or_else(|error| {
             warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
@@ -404,6 +402,8 @@ impl Pipeline {
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
+            par3_runtime: None,
+            par3_inside_probes: Default::default(),
             #[cfg(test)]
             par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
             block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
@@ -416,8 +416,9 @@ impl Pipeline {
                 ),
             extraction_limits,
             process_memory_budget,
+            job_scheduling_memory: HashMap::new(),
+            repeated_articles: HashMap::new(),
             chase_pool,
-            direct_unpack_process_memory,
             extraction_budgets: HashMap::new(),
             unacceptable_extension_policies: HashMap::new(),
             extracted_members: HashMap::new(),
@@ -448,8 +449,8 @@ impl Pipeline {
             next_par2_analysis_work_id: 0,
             par2_analysis_in_flight: HashMap::new(),
             par2_analysis_results: HashMap::new(),
-            par2_analysis_done_tx,
-            par2_analysis_done_rx,
+            repair_work_done_tx,
+            repair_work_done_rx,
             next_direct_demotion_work_id: 0,
             direct_demotion_in_flight: HashMap::new(),
             direct_demotion_done_tx,
@@ -1017,8 +1018,8 @@ impl Pipeline {
                     Some(done) = self.direct_tolerated_done_rx.recv() => {
                         self.handle_direct_tolerated_done(done).await;
                     }
-                    Some(done) = self.par2_analysis_done_rx.recv() => {
-                        self.handle_par2_analysis_done(done).await;
+                    Some(done) = self.repair_work_done_rx.recv() => {
+                        self.handle_repair_work_done(done).await;
                     }
                     Some(done) = self.direct_demotion_done_rx.recv() => {
                         self.handle_direct_demotion_done(done).await;
@@ -1418,15 +1419,32 @@ impl Pipeline {
         self.requeue_retry_work(work);
     }
 
+    /// Re-enters a retry that `note_retry_scheduled` booked, draining its
+    /// pending-retry counters before the work goes back on the queue.
     pub(crate) fn requeue_retry_work(&mut self, work: DownloadWork) {
+        self.note_retry_requeued(work.segment_id);
+        self.enqueue_download_work(work);
+    }
+
+    /// Queues download work that no scheduled retry stands behind.
+    ///
+    /// Leaves the pending-retry counters alone: those count retries still in
+    /// flight, and the pass-end gates read the job-wide one. Draining it here
+    /// for fresh work would cancel some other segment's real pending retry and
+    /// let the download pass end before that retry fires.
+    pub(crate) fn enqueue_download_work(&mut self, work: DownloadWork) {
         let job_id = work.segment_id.file_id.job_id;
         let segment_id = work.segment_id;
-        self.note_retry_requeued(segment_id);
         if self
             .jobs
             .get(&job_id)
             .is_none_or(|state| is_terminal_status(&state.status))
         {
+            debug!(
+                job_id = job_id.0,
+                segment = %segment_id,
+                "dropping download work for a job that is gone or terminal"
+            );
             return;
         }
         let completion_critical =
@@ -1851,9 +1869,8 @@ struct CachedDiskWriteHandle {
 ///
 /// The last close of a freshly written file is where the kernel flushes its
 /// dirty pages (tens of milliseconds for a large file on macOS), and an owner
-/// thread serves every file that hashes to it. SABnzbd and NZBGet both take
-/// that flush on the thread that wrote, but neither shares a writer across
-/// files; here the owner hands the handle off instead, so a completed file's
+/// thread serves every file that hashes to it. The owner hands the handle
+/// off so a completed file's
 /// flush never queues behind another file's writes. The closer is FIFO, so an
 /// `ack` is sent only once every close queued before it — including earlier
 /// fire-and-forget releases of the same path — has actually happened, which is

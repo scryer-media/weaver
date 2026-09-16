@@ -614,7 +614,7 @@ func TestArtifactTableIsClosedOverItsToolchains(t *testing.T) {
 		}
 	}
 	for _, id := range []string{RAR5Writer, RAR4Writer, DirectStoreRAR5Writer, DirectStoreRAR4Writer,
-		SevenZipToolchain, PAR2Toolchain, VideoToolchain} {
+		SevenZipToolchain, PAR2Toolchain, PAR3Toolchain, VideoToolchain} {
 		if _, ok := pinned[id]; !ok {
 			t.Errorf("the generator names %q, which the lock does not pin", id)
 		}

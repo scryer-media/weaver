@@ -1,5 +1,8 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+/* Design tokens for the Next UI (src/next). Namespaced `wv-`; nothing here
+   touches the classic palette below. */
+@import "./next/theme.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -231,10 +234,6 @@
     "Source Code Pro", Menlo, Consolas, monospace;
 }
 
-* {
-  border-color: var(--color-border);
-}
-
 h1,
 h2,
 h3,
@@ -266,6 +265,20 @@ h6 {
 
 @utility animate-status-pulse {
   animation: wv-pulse 1.5s ease-in-out infinite;
+}
+
+/* The loading mark's delayed entrance: a load that finishes first never shows it. */
+@keyframes weaver-loading-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@utility animate-loading-reveal {
+  animation: weaver-loading-reveal 200ms ease-out 400ms both;
 }
 
 @utility progress-indeterminate {

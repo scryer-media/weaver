@@ -1,0 +1,16 @@
+{
+  "slug": "par3-heavy-damage",
+  "title": "E2E.Test.PAR3.Heavy.Damage.Velvet.Basin.S02E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Forty of 92 blocks destroyed in five windows against 48 recovery blocks, so most of the recovery data is used and the decode matrix is large.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "velvet.basin.s02e02.mkv": "65c701b65f1b1ccd649696691d28605c6396c9869d49cf4713c1bb349f093092"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

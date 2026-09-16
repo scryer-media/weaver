@@ -348,6 +348,20 @@ impl Pipeline {
             )
         };
 
+        if health <= critical
+            && par2_bytes == 0
+            && self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| state.assembly.has_par3_candidates())
+        {
+            // PAR3 filenames carry no usable capacity proof. Let authenticated
+            // metadata and the finite recovery frontier decide the deficit,
+            // including when the first missing article beats index decoding.
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
+
         if health <= critical && par2_bytes > 0 {
             info!(
                 job_id = job_id.0,
@@ -585,6 +599,7 @@ impl Pipeline {
 
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
+        tracing::error!(job_id = job_id.0, reason = %error, "job failed");
         // Terminal transition: a job dying without a recovery set never had a
         // PAR2 verdict available to it. No-op when a pass already ruled.
         self.note_job_unverifiable_if_no_par2_set(job_id);

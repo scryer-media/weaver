@@ -29,6 +29,30 @@ impl SettingsQuery {
             .await,
         )
     }
+    /// Whether first-run setup is still owed to this install.
+    #[graphql(guard = "AdminGuard")]
+    async fn first_run_setup(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::first_run::FirstRunSetup> {
+        let db = ctx.data::<Database>()?;
+        let config = ctx.data::<SharedConfig>()?;
+        crate::settings::first_run::status(db, config).await
+    }
+
+    /// Whether this install is owed the notice about moving to the 0.12.0
+    /// access model, and what it needs to say where.
+    #[graphql(guard = "AdminGuard")]
+    async fn security_upgrade_notice(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::security_upgrade_notice::SecurityUpgradeNotice> {
+        let db = ctx.data::<Database>()?;
+        let security = ctx.data::<weaver_server_core::security::RuntimeSecurityConfig>()?;
+        let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?;
+        crate::settings::security_upgrade_notice::status(db, security, auth_cache).await
+    }
+
     #[graphql(guard = "AdminGuard")]
     async fn schedules(&self, ctx: &Context<'_>) -> Result<Vec<crate::settings::types::Schedule>> {
         let db = ctx.data::<Database>()?.clone();

@@ -172,6 +172,8 @@ export const PARSED_RELEASE_FIELDS = `
 
 const SERVER_FIELDS = `
   fragment ServerFields on Server {
+    routing { proxyIds allowDirect }
+    routingStatus { state selectedProxyId failures { proxyId message } }
     id
     host
     port
@@ -206,6 +208,8 @@ const SERVER_FIELDS = `
 
 const SERVER_DETAILS_FIELDS = `
   fragment ServerDetailsFields on ServerDetails {
+    routing { proxyIds allowDirect }
+    routingStatus { state selectedProxyId failures { proxyId message } }
     id
     host
     port
@@ -498,6 +502,8 @@ const RSS_RULE_FIELDS = `
 
 const RSS_FEED_FIELDS = `
   fragment RssFeedFields on RssFeed {
+    routing { proxyIds allowDirect }
+    routingStatus { state selectedProxyId failures { proxyId message } }
     id
     name
     url
@@ -600,6 +606,12 @@ export const JOB_QUERY = gql`
         message
         timestamp
       }
+      serverAttribution {
+        serverId
+        serverHost
+        articles
+        wireBytes
+      }
     }
   }
   ${JOB_TIMELINE_FIELDS}
@@ -681,6 +693,12 @@ export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
         message
         timestamp
       }
+      serverAttribution {
+        serverId
+        serverHost
+        articles
+        wireBytes
+      }
     }
   }
   ${JOB_TIMELINE_FIELDS}
@@ -721,6 +739,7 @@ export const LIVE_METRICS_QUERY = gql`
     }
     globalState: globalQueueState {
       isPaused
+      speedLimitBytesPerSec
       downloadBlock {
         ...DownloadBlockFields
       }
@@ -744,6 +763,13 @@ export const SYSTEM_INFO_QUERY = gql`
         cgroupLimit
         decoderTier
         simdFeatures
+        kernels {
+          component
+          library
+          ladder
+          kernel
+          pinnedBy
+        }
       }
       memory {
         totalBytes
@@ -765,6 +791,21 @@ export const SYSTEM_INFO_QUERY = gql`
           usedBytes
           freeBytes
         }
+      }
+    }
+  }
+`;
+
+export const PATH_STORAGE_QUERY = gql`
+  query PathStorage($path: String!) {
+    pathStorage(path: $path) {
+      labels
+      path
+      error
+      capacity {
+        totalBytes
+        usedBytes
+        freeBytes
       }
     }
   }
@@ -951,6 +992,7 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       }
       globalState {
         isPaused
+        speedLimitBytesPerSec
         downloadBlock {
           ...DownloadBlockFields
         }
@@ -962,6 +1004,11 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       jobDownloadRates {
         jobId
         rateBps
+      }
+      providerConnections {
+        label
+        active
+        max
       }
     }
   }
@@ -1136,6 +1183,7 @@ export const TEST_CONNECTION_MUTATION = gql`
       adoptableTlsNameMismatchCertificate {
         derBase64
         sha256Fingerprint
+        names
       }
     }
   }
@@ -1205,6 +1253,53 @@ export const UPDATE_SETTINGS_MUTATION = gql`
   }
   ${GENERAL_SETTINGS_FIELDS}
   ${ISP_BANDWIDTH_CAP_FIELDS}
+`;
+
+// --- First-run setup ---
+
+export const FIRST_RUN_SETUP_QUERY = gql`
+  query FirstRunSetup {
+    firstRunSetup {
+      pending
+    }
+  }
+`;
+
+export const BEGIN_FIRST_RUN_SETUP_MUTATION = gql`
+  mutation BeginFirstRunSetup {
+    beginFirstRunSetup {
+      pending
+    }
+  }
+`;
+
+export const FINISH_FIRST_RUN_SETUP_MUTATION = gql`
+  mutation FinishFirstRunSetup {
+    finishFirstRunSetup {
+      pending
+    }
+  }
+`;
+
+// --- Access-model notice ---
+
+export const SECURITY_UPGRADE_NOTICE_QUERY = gql`
+  query SecurityUpgradeNotice {
+    securityUpgradeNotice {
+      pending
+      deployment
+      operatingSystem
+      loginEnabled
+    }
+  }
+`;
+
+export const DISMISS_SECURITY_UPGRADE_NOTICE_MUTATION = gql`
+  mutation DismissSecurityUpgradeNotice {
+    dismissSecurityUpgradeNotice {
+      pending
+    }
+  }
 `;
 
 // --- API Keys ---
@@ -1284,6 +1379,68 @@ export const ACCESS_POLICY_QUERY = gql`
 export const SET_ACCESS_POLICY_MUTATION = gql`
   mutation SetAccessPolicy($mode: String!, $trustedNetworks: [String!]) {
     setAccessPolicy(mode: $mode, trustedNetworks: $trustedNetworks)
+  }
+`;
+
+export const NETWORK_ACCESS_QUERY = gql`
+  query NetworkAccess {
+    networkAccess {
+      authenticatedAccess
+      legacyCompatibility
+      trustedNetworks
+      trustedProxies
+      trustedNetworksSource
+      proxiesSource
+      editable
+      envPinned
+      proxiesEditable
+      proxiesEnvPinned
+      rememberedPolicyValid
+      currentClient {
+        available
+        peer
+        resolvedClient
+        forwardingHeadersIgnored
+        rememberedClientAllowed
+      }
+      bindAddress {
+        address
+        storedAddress
+        source
+        editable
+        exposedWithoutLogin
+        restartRequired
+        bindFallback
+      }
+    }
+  }
+`;
+
+export const UPDATE_NETWORK_ACCESS_MUTATION = gql`
+  mutation UpdateNetworkAccess($input: NetworkAccessInput!) {
+    updateNetworkAccess(input: $input) {
+      authenticatedAccess
+      trustedNetworks
+      trustedProxies
+      envPinned
+      bindAddress {
+        address
+        storedAddress
+        restartRequired
+      }
+    }
+  }
+`;
+
+export const PREVIEW_NETWORK_ACCESS_QUERY = gql`
+  query PreviewNetworkAccess($input: NetworkAccessInput!) {
+    previewNetworkAccess(input: $input) {
+      trustedNetworks
+      trustedProxies
+      bindAddress
+      restartRequired
+      currentClientAllowed
+    }
   }
 `;
 

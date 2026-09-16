@@ -1,0 +1,16 @@
+{
+  "slug": "par3-disguised-carrier",
+  "title": "E2E.Test.PAR3.Disguised.Carrier.Russet.Pylon.S01E03.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A damaged payload posted with exactly one PAR3 file: its first recovery volume under a `.bin` name. The name gives no hint of PAR3, so the carrier must be recognised from its packets.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "russet.pylon.s01e03.mkv": "06db71ef454cc41311ca52070d5de464f5e4703614923765589d1f3f8c00ab8a"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ]
+}

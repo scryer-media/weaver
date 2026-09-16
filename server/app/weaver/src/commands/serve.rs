@@ -49,17 +49,65 @@ pub(crate) async fn run(
         db.get_setting(weaver_server_core::security::SETTING_HTTP_BIND_ADDRESS)?
             .as_deref(),
     );
+    let stored_mode = db.get_setting(weaver_server_core::security::SETTING_ACCESS_MODE)?;
+    let stored_revision =
+        db.get_setting(weaver_server_core::security::SETTING_SECURITY_POLICY_REVISION)?;
+    let unconfigured_new_install = db.pre_migration_schema_version().is_none()
+        || (db
+            .get_setting(weaver_server_core::security::SETTING_INSTALL_GENERATION)?
+            .as_deref()
+            == Some(weaver_server_core::security::AUTHENTICATED_INSTALL_GENERATION)
+            && stored_revision.is_none()
+            && stored_mode.is_none());
+    security.apply_stored_access_policy_revision(
+        stored_mode.as_deref(),
+        stored_revision.as_deref(),
+        !unconfigured_new_install || security.trust_env_pinned,
+    );
     security.apply_stored_trust(
         db.get_setting(weaver_server_core::security::SETTING_ACCESS_MODE)?
             .as_deref(),
         db.get_setting(weaver_server_core::security::SETTING_TRUSTED_NETWORKS)?
             .as_deref(),
     );
+    security.apply_stored_proxies(
+        db.get_setting(weaver_server_core::security::SETTING_TRUSTED_PROXIES)?
+            .as_deref(),
+    );
     if let Some(reason) = security.bind_fallback.as_deref() {
         warn!(reason, "stored bind address could not be honored");
     }
     crate::bootstrap::bootstrap_login_if_needed(&db).await?;
-    if security.has_trusted_cidrs() {
+    if security.authenticated_access_mode() {
+        let has_credentials = db.get_auth_credentials()?.is_some();
+        let explicit_recovery =
+            std::env::var("WEAVER_RESET_LOGIN").is_ok_and(|value| value == "1" || value == "true");
+        if !has_credentials && (unconfigured_new_install || explicit_recovery) {
+            db.mark_initial_setup_pending()?;
+        } else if !has_credentials {
+            prepare_credentialless_legacy_migration(&db, security.access_mode_env_pinned())?;
+        } else {
+            // Bootstrap can complete a previously pending wizard. Clear its
+            // eligibility before serving so later credential damage cannot
+            // accidentally reopen first-run setup.
+            db.delete_setting(weaver_server_core::auth::repository::SETUP_PENDING_SETTING_KEY)?;
+            db.set_setting(
+                weaver_server_core::auth::repository::SETUP_COMPLETED_SETTING_KEY,
+                "configured",
+            )?;
+            db.set_setting(
+                weaver_server_core::security::SETTING_SECURITY_POLICY_REVISION,
+                weaver_server_core::security::AUTHENTICATED_POLICY_REVISION,
+            )?;
+        }
+    } else {
+        db.set_setting(
+            weaver_server_core::security::SETTING_SECURITY_POLICY_REVISION,
+            "legacy-v1",
+        )?;
+        security.mark_security_configured();
+    }
+    if security.has_trusted_cidrs() && !security.authenticated_access_mode() {
         warn!(
             trusted_cidrs = ?security.trusted_cidrs(),
             "trusted-network clients receive loginless full administrative browser access"
@@ -99,7 +147,13 @@ pub(crate) async fn run(
         .await??,
     );
     let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
-    let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy);
+    let proxy_db = db.clone();
+    let runtime_handle = tokio::runtime::Handle::current();
+    let proxies = tokio::task::spawn_blocking(move || {
+        weaver_server_core::proxies::ProxyRuntime::new(proxy_db, runtime_handle)
+    })
+    .await??;
+    let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy, &proxies)?;
     let total_connections: usize = config
         .servers
         .iter()
@@ -118,6 +172,7 @@ pub(crate) async fn run(
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
     let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
     handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
+    handle.set_proxy_runtime(proxies.clone());
     handle.set_nntp_pool(Arc::clone(nntp.pool()));
 
     let recovered_state =
@@ -426,6 +481,7 @@ pub(crate) async fn run(
         _ = shutdown::wait_for_shutdown() => ServeStop::Signal,
         _ = restart_controller.requested() => ServeStop::Restart,
         result = &mut pipeline_task => {
+            proxies.stop_all().await;
             let error = shutdown::pipeline_exit_error(result);
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
             server_task.abort();
@@ -444,7 +500,8 @@ pub(crate) async fn run(
             return Err(error.into());
         }
         result = &mut server_task => {
-            handle.shutdown().await.ok();
+            proxies.stop_all().await;
+    handle.shutdown().await.ok();
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during HTTP shutdown");
             }
@@ -474,6 +531,7 @@ pub(crate) async fn run(
         ServeStop::Restart => info!("restart requested, shutting down before starting again"),
     }
     update_check_task.abort();
+    proxies.stop_all().await;
     handle.shutdown().await.ok();
     if let Err(join_error) = pipeline_task.await {
         error!(error = %join_error, "pipeline task failed during shutdown");
@@ -497,6 +555,112 @@ pub(crate) async fn run(
         ServeStop::Signal => Ok(()),
         // Unix re-execs in place, so on success this never returns.
         ServeStop::Restart => restart::restart_now().map_err(Into::into),
+    }
+}
+
+/// An explicit legacy migration may establish its first login with the startup
+/// code. Never infer that permission from missing credentials alone: a completed
+/// or unrecognized authenticated policy must continue to require recovery.
+fn prepare_credentialless_legacy_migration(
+    db: &Database,
+    explicit_migration: bool,
+) -> Result<(), weaver_server_core::StateError> {
+    use weaver_server_core::auth::repository::SETUP_COMPLETED_SETTING_KEY;
+    use weaver_server_core::security::SETTING_SECURITY_POLICY_REVISION;
+
+    if explicit_migration
+        && matches!(
+            db.get_setting(SETTING_SECURITY_POLICY_REVISION)?.as_deref(),
+            None | Some("legacy-v1")
+        )
+        && db.get_setting(SETUP_COMPLETED_SETTING_KEY)?.is_none()
+        && db.get_auth_credentials()?.is_none()
+    {
+        // This persists the authenticated revision and pending claim together,
+        // so a restart resumes setup even after the migration override is removed.
+        db.mark_initial_setup_pending()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::prepare_credentialless_legacy_migration;
+    use weaver_server_core::Database;
+    use weaver_server_core::auth::repository::{
+        SETUP_COMPLETED_SETTING_KEY, SETUP_PENDING_SETTING_KEY,
+    };
+    use weaver_server_core::security::{
+        AUTHENTICATED_POLICY_REVISION, SETTING_SECURITY_POLICY_REVISION,
+    };
+
+    #[test]
+    fn credentialless_legacy_migration_resumes_after_restart_without_override() {
+        for revision in [None, Some("legacy-v1")] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("migration.db");
+            {
+                let db = Database::open(&path).unwrap();
+                if let Some(revision) = revision {
+                    db.set_setting(SETTING_SECURITY_POLICY_REVISION, revision)
+                        .unwrap();
+                }
+                prepare_credentialless_legacy_migration(&db, true).unwrap();
+                assert!(db.get_setting(SETUP_PENDING_SETTING_KEY).unwrap().is_some());
+                assert!(db.get_auth_credentials().unwrap().is_none());
+            }
+            let db = Database::open(&path).unwrap();
+            prepare_credentialless_legacy_migration(&db, false).unwrap();
+            assert!(db.get_setting(SETUP_PENDING_SETTING_KEY).unwrap().is_some());
+            assert_eq!(
+                db.get_setting(SETTING_SECURITY_POLICY_REVISION)
+                    .unwrap()
+                    .as_deref(),
+                Some(AUTHENTICATED_POLICY_REVISION),
+            );
+        }
+    }
+
+    #[test]
+    fn missing_credentials_do_not_reopen_established_or_unknown_policy() {
+        for revision in [
+            None,
+            Some("legacy-v1"),
+            Some(AUTHENTICATED_POLICY_REVISION),
+            Some("unknown"),
+        ] {
+            for completed in [false, true] {
+                for explicit in [false, true] {
+                    let db = Database::open_in_memory().unwrap();
+                    if let Some(revision) = revision {
+                        db.set_setting(SETTING_SECURITY_POLICY_REVISION, revision)
+                            .unwrap();
+                    }
+                    if completed {
+                        db.set_setting(SETUP_COMPLETED_SETTING_KEY, "configured")
+                            .unwrap();
+                    }
+                    prepare_credentialless_legacy_migration(&db, explicit).unwrap();
+                    assert_eq!(
+                        db.get_setting(SETUP_PENDING_SETTING_KEY).unwrap().is_some(),
+                        explicit && !completed && matches!(revision, None | Some("legacy-v1")),
+                        "revision={revision:?}, completed={completed}, explicit={explicit}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn migration_retains_existing_credentials_without_opening_setup() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_auth_credentials("admin", "existing-hash").unwrap();
+        prepare_credentialless_legacy_migration(&db, true).unwrap();
+        assert!(db.get_setting(SETUP_PENDING_SETTING_KEY).unwrap().is_none());
+        assert_eq!(
+            db.get_auth_credentials().unwrap().unwrap().password_hash,
+            "existing-hash"
+        );
     }
 }
 

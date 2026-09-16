@@ -313,6 +313,55 @@ impl CipherOverlayCounters {
 }
 
 impl VirtualVolume {
+    /// Conservative image charge for consumers without shared payload leases.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_payloads()
+            .fold(self.retained_metadata_bytes(), |total, bytes| {
+                total.saturating_add(bytes.len())
+            })
+    }
+
+    /// Metadata retained by an image. Payload allocations are separately leased
+    /// by consumers so readers of the same buffer do not multiply its charge.
+    pub(crate) fn retained_metadata_bytes(&self) -> usize {
+        let mut bytes = 4096usize
+            .saturating_add(self.envelope.capacity().saturating_mul(4))
+            .saturating_add(self.extents.capacity().saturating_mul(128))
+            .saturating_add(self.covered.ranges().len().saturating_mul(64))
+            .saturating_add(self.envelope_covered.ranges().len().saturating_mul(64));
+        for path in self.partials.values() {
+            bytes = bytes
+                .saturating_add(256)
+                .saturating_add(path.capacity().saturating_mul(4));
+        }
+        for cipher in self.ciphers.values() {
+            bytes = bytes.saturating_add(cipher.retained_bytes());
+        }
+        bytes.saturating_add(self.held.len().saturating_mul(256))
+    }
+
+    /// Even a short range can pin a whole allocation. Callers must lease the
+    /// allocation, not just the readable length, while any image retains it.
+    pub(crate) fn retained_payloads(&self) -> impl Iterator<Item = &Arc<[u8]>> {
+        self.held.iter().filter_map(|run| match &run.source {
+            HeldSource::Memory { bytes, .. } => Some(bytes),
+            HeldSource::Scratch { .. } => None,
+        })
+    }
+
+    /// Distinct pinned scratch handles retained by this image. The pins read
+    /// positionally from their existing handle; readers never reopen them.
+    pub(crate) fn retained_handles(&self) -> usize {
+        self.held
+            .iter()
+            .filter_map(|run| match &run.source {
+                HeldSource::Scratch { pin, .. } => Some(Arc::as_ptr(pin)),
+                HeldSource::Memory { .. } => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
     /// The physical ranges a [`VirtualVolumeReader`] can actually answer, in
     /// order: covered, inside the volume, and claimed by a source that holds
     /// them — a member extent, or an envelope write that really happened.
@@ -464,7 +513,9 @@ enum Source {
 /// sweep of a multi-member volume alternates between the envelope and each
 /// partial many times, and reopening per read would turn one pass into thousands
 /// of `open` calls.
-pub(crate) struct VirtualVolumeReader {
+/// The bounded specialization retains one partial handle and one cipher
+/// frontier. The default specialization preserves the existing PAR2 cache.
+pub(crate) struct VirtualVolumeReader<const BOUNDED: bool = false> {
     volume: VirtualVolume,
     position: u64,
     envelope_handle: Option<File>,
@@ -511,7 +562,7 @@ impl CipherChain {
     }
 }
 
-impl std::fmt::Debug for VirtualVolumeReader {
+impl<const BOUNDED: bool> std::fmt::Debug for VirtualVolumeReader<BOUNDED> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("VirtualVolumeReader")
@@ -522,7 +573,7 @@ impl std::fmt::Debug for VirtualVolumeReader {
     }
 }
 
-impl VirtualVolumeReader {
+impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
     pub(crate) fn new(volume: VirtualVolume, counters: Arc<CipherOverlayCounters>) -> Self {
         Self {
             volume,
@@ -683,6 +734,11 @@ impl VirtualVolumeReader {
         out: &mut [u8],
     ) -> std::io::Result<usize> {
         if !self.partial_handles.contains_key(&member_id) {
+            if BOUNDED {
+                // Evict before opening: only the envelope and this partial
+                // can be opened here. Scratch pins own separate shared handles.
+                self.partial_handles.clear();
+            }
             let path = self
                 .volume
                 .partials
@@ -898,6 +954,9 @@ impl VirtualVolumeReader {
             // One block: its predecessor is what this call was handed.
             false => preceding,
         };
+        if BOUNDED && !self.chains.contains_key(&member_id) {
+            self.chains.clear();
+        }
         self.chains.insert(
             member_id,
             CipherChain {
@@ -916,7 +975,7 @@ impl VirtualVolumeReader {
     }
 }
 
-impl Read for VirtualVolumeReader {
+impl<const BOUNDED: bool> Read for VirtualVolumeReader<BOUNDED> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() || self.position >= self.volume.len {
             return Ok(0);
@@ -928,6 +987,9 @@ impl Read for VirtualVolumeReader {
             return Err(hole(self.volume.volume_index, self.position));
         }
         let want = (run_end - self.position).min(out.len() as u64) as usize;
+        // Unaligned cipher reads allocate a block-rounded temporary. Keep it
+        // bounded independently of the engine caller's requested stripe size.
+        let want = if BOUNDED { want.min(64 << 10) } else { want };
         let source = self.source_at(self.position);
         let read = self.read_from(source, &mut out[..want])?;
         if read == 0 {
@@ -941,7 +1003,7 @@ impl Read for VirtualVolumeReader {
     }
 }
 
-impl Seek for VirtualVolumeReader {
+impl<const BOUNDED: bool> Seek for VirtualVolumeReader<BOUNDED> {
     fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
         // Unlike the router's in-memory image, a virtual volume has a real
         // length, so an End-relative seek means exactly what it does on a file.

@@ -1,8 +1,8 @@
 import type { ComponentType } from "react";
 import { createBrowserRouter, Navigate } from "react-router";
 import { Layout } from "@/components/Layout";
-import { RouteErrorPage } from "@/components/RouteErrorPage";
 import { RouteFallback } from "@/components/RouteFallback";
+import { RouteErrorPage } from "@/lib/error-page";
 
 const basename = window.__WEAVER_BASE__ || "/";
 
@@ -94,6 +94,7 @@ export const router = createBrowserRouter([
         ...lazyNamedRoute(() => import("@/pages/settings/SettingsLayout"), "SettingsLayout"),
         children: [
           { index: true, element: <Navigate to="general" replace /> },
+          { path: "proxies", ...lazyNamedRoute(() => import("@/pages/settings/ProxiesSettingsPage"), "ProxiesSettingsPage") },
           {
             path: "general",
             ...lazyNamedRoute(

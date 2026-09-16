@@ -968,6 +968,7 @@ mod tests {
             created_at: completed_at - 10,
             completed_at,
             metadata: None,
+            server_attribution: None,
         }
     }
 

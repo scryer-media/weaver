@@ -6,6 +6,7 @@ pub mod history;
 pub mod jobs;
 mod observability;
 pub mod post_processing;
+pub mod proxies;
 pub mod rss;
 pub mod scalars;
 pub mod schema;

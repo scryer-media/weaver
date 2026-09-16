@@ -1,7 +1,10 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { AppErrorBoundary } from "./lib/error-page";
+import { watchForSignOut } from "./lib/login-required";
 import "./fonts.css";
+import "./next/fonts.css";
 import "./globals.css";
 
 if (import.meta.env.DEV) {
@@ -19,8 +22,12 @@ if (import.meta.env.DEV) {
   }, 30_000);
 }
 
+watchForSignOut();
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
   </StrictMode>,
 );

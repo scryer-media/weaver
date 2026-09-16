@@ -106,6 +106,8 @@ pub(crate) async fn bootstrap_login_if_needed(
         BootstrapPasswordSource::Environment(password) => password,
         BootstrapPasswordSource::File(path) => read_bootstrap_password_file(&path)?,
     };
+    weaver_server_core::auth::check_password_length(&password)
+        .map_err(|error| BootstrapLoginError::new(format!("bootstrap login {error}")))?;
     let password_hash =
         tokio::task::spawn_blocking(move || weaver_server_core::auth::hash_password(&password))
             .await
@@ -174,7 +176,16 @@ fn read_bootstrap_password_file(path: &Path) -> Result<String, BootstrapLoginErr
 }
 
 pub(crate) fn open_database(config_path: &Path) -> Result<Database, Box<dyn std::error::Error>> {
-    weaver_server_core::persistence::open_database(config_path)
+    let db = weaver_server_core::persistence::open_database(config_path)?;
+    if db.pre_migration_schema_version().is_none() {
+        // Record generation before deployment/bootstrap validation can fail.
+        // A retry of a new install must not become a legacy no-code wizard.
+        db.set_setting(
+            weaver_server_core::security::SETTING_INSTALL_GENERATION,
+            weaver_server_core::security::AUTHENTICATED_INSTALL_GENERATION,
+        )?;
+    }
+    Ok(db)
 }
 
 pub(crate) fn finish_open_db_and_config(
@@ -452,5 +463,16 @@ mod tests {
             std::env::set_var(ENV_BOOTSTRAP_LOGIN_PASSWORD_FILE, "/does/not/exist");
         }
         assert!(bootstrap_login_if_needed(&db).await.is_err());
+
+        unsafe {
+            std::env::remove_var(ENV_BOOTSTRAP_LOGIN_PASSWORD_FILE);
+            std::env::set_var(ENV_BOOTSTRAP_LOGIN_PASSWORD, "short");
+        }
+        let error = bootstrap_login_if_needed(&db).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "bootstrap login password must be at least 8 characters"
+        );
+        assert!(db.get_auth_credentials().unwrap().is_none());
     }
 }

@@ -39,6 +39,8 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
             weaver_server_core::security::RuntimeSecurityConfig::default(),
         ))
         .layer(Extension(auth::LoginRateLimiter::default()))
+        .layer(Extension(ApiKeyCache::default()))
+        .layer(Extension(assets::BaseUrl(Arc::new("/".to_string()))))
         .layer(Extension(auth_cache))
 }
 
@@ -50,8 +52,21 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
 /// hashing or login sink, which is what a secret scanner reads as a hard-coded
 /// credential.
 fn test_password() -> String {
-    String::from_utf8(vec![b'h', b'u', b'n', b't', b'e', b'r', b'0' + 2])
-        .expect("the test credential is ASCII by construction")
+    String::from_utf8(vec![
+        b'h',
+        b'u',
+        b'n',
+        b't',
+        b'e',
+        b'r',
+        b'0' + 2,
+        b'-',
+        b'l',
+        b'o',
+        b'o',
+        b'm',
+    ])
+    .expect("the test credential is ASCII by construction")
 }
 
 /// A `/api/login` request body carrying a runtime-built credential, so the
@@ -142,6 +157,7 @@ fn nzbget_history_row(
         created_at: 1_700_000_000,
         completed_at,
         metadata,
+        server_attribution: None,
     }
 }
 
@@ -439,6 +455,7 @@ fn scheduler_handle_with_mock_commands_with_db(
                                 } else {
                                     serde_json::to_string(&job.metadata).ok()
                                 },
+                                server_attribution: None,
                             });
                         }
                         state.publish_jobs(jobs);
@@ -510,6 +527,7 @@ fn job_info_from_spec(job_id: JobId, spec: JobSpec) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
+        server_attribution: Vec::new(),
     }
 }
 
@@ -587,6 +605,7 @@ fn nzbget_test_job(
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
+        server_attribution: Vec::new(),
     }
 }
 
@@ -662,6 +681,7 @@ fn auth_status_test_router_from_peer(
         .layer(Extension(axum::extract::ConnectInfo(peer_addr)))
         .layer(Extension(db))
         .layer(Extension(security))
+        .layer(Extension(ApiKeyCache::default()))
         .layer(Extension(auth_cache))
 }
 
@@ -1075,6 +1095,7 @@ fn sample_job(job_id: u64, name: &str, status: JobStatus) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
+        server_attribution: Vec::new(),
     }
 }
 
@@ -1118,6 +1139,8 @@ fn sample_server_health() -> metrics::ServerHealthInfo {
         connections_configured: 80,
         capacity_penalty_until_epoch_ms: 0,
         premature_deaths: 0,
+        sockets: Default::default(),
+        recovery: Default::default(),
     }
 }
 
@@ -1431,6 +1454,7 @@ fn compress_request_body(encoding: &str, payload: &[u8]) -> Vec<u8> {
     }
 }
 
+mod graphql_socket_tests;
 mod nzbget_version_uses_jsonrpc;
 mod renders_prometheus_metrics_for;
 mod restart_handler_tests;

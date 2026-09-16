@@ -1,0 +1,18 @@
+{
+  "slug": "direct-store-encrypted-par3-repair",
+  "title": "Coral.Meridian.S02E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "RAR5 store-method set with data encryption and PAR3 recovery, damaged by deleting the tail articles of an interior volume. PAR3 covers the posted ciphertext, so repair needs no key, and extraction with the password proves the repaired bytes.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "coral.meridian.s02e02.mkv": "7bb8f7643d4c4807501746cf1968f6d319ab13a68fa84dc26caebb81da43fe9b"
+  },
+  "password": "weaver-e2e-direct-password",
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "deleteSubjectContains": [
+    "archive.part2.rar"
+  ],
+  "deleteSubjectTailArticles": 3
+}

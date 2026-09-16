@@ -1,8 +1,31 @@
-//! Continuation of the `impl Pipeline` block from `direct_store/wiring.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+//! Direct-store writes and finalization, including mixed-member chase handoff.
 
 use super::*;
+
+fn installed_tolerated_members(targets: &[ToleratedTarget]) -> Result<ToleratedExtraction, String> {
+    let mut result = ToleratedExtraction::default();
+    for target in targets {
+        if target.is_directory {
+            let metadata = std::fs::symlink_metadata(&target.destination)
+                .map_err(|error| error.to_string())?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "installed directory '{}' changed type",
+                    target.name
+                ));
+            }
+            result.directories.push((
+                ToleratedDirectoryMetadata::Installed {
+                    accessed: filetime::FileTime::from_last_access_time(&metadata),
+                    modified: filetime::FileTime::from_last_modification_time(&metadata),
+                },
+                target.destination.clone(),
+            ));
+        }
+        result.members.push(target.name.clone());
+    }
+    Ok(result)
+}
 
 impl Pipeline {
     /// The routing seam. Replaces the conventional write for one decoded
@@ -77,6 +100,7 @@ impl Pipeline {
             &segment.segments,
         )
         .await;
+        self.note_mixed_rar_commit(job_id, set_index);
         DirectRouteOutcome::Routed
     }
 
@@ -95,59 +119,83 @@ impl Pipeline {
         handoff: Option<SegmentId>,
         spans: &[RoutedSpan],
     ) -> bool {
-        if spans.is_empty() {
-            return true;
-        }
-        let batches = self.direct_write_batches(job_id, set_index, spans);
-        if let Err(path) = self.prepare_direct_destinations(job_id, &batches).await {
-            // A destination that could not be marked sparse is refused *before*
-            // it holds a hole, so nothing has been allocated for it yet. Demote
-            // and let the conventional path own the bytes.
-            warn!(
-                job_id = job_id.0,
-                path = %path.display(),
-                "could not mark a direct-store destination sparse; demoting the set"
-            );
-            self.demote_direct_set_with_handoff(
-                job_id,
-                set_index,
-                DemotionReason::SparseMarkFailed,
-                handoff,
-            )
-            .await;
-            return false;
-        }
-        if let Err(error) = crate::pipeline::orchestrator::write_direct_batches(batches).await {
-            // A destination write failure is a demotion, not a job failure: the
-            // conventional path writes the same bytes to a different file, and
-            // only if *that* also fails is the job genuinely unfinishable.
-            warn!(
-                job_id = job_id.0,
-                error = %error,
-                "direct-store destination write failed; demoting the set"
-            );
-            self.demote_direct_set_with_handoff(
-                job_id,
-                set_index,
-                DemotionReason::DestinationWriteFailed,
-                handoff,
-            )
-            .await;
-            if !self
-                .direct_store
-                .set(job_id, set_index)
-                .is_some_and(DirectSet::is_demoted)
-            {
-                self.fail_job(
-                    job_id,
-                    format!(
-                        "direct-store destination write failed for job {}: {error}",
-                        job_id.0
-                    ),
+        let failure = match self.try_place_direct_spans(job_id, set_index, spans).await {
+            Ok(()) => return true,
+            Err(failure) => failure,
+        };
+        match failure {
+            DirectPlacementError::Sparse { path, error } => {
+                // A destination that could not be marked sparse is refused *before*
+                // it holds a hole, so nothing has been allocated for it yet. Demote
+                // and let the conventional path own the bytes.
+                warn!(
+                    job_id = job_id.0,
+                    path = %path.display(),
+                    error = %error,
+                    "could not mark a direct-store destination sparse; demoting the set"
                 );
+                self.demote_direct_set_with_handoff(
+                    job_id,
+                    set_index,
+                    DemotionReason::SparseMarkFailed,
+                    handoff,
+                )
+                .await;
+                false
             }
-            return false;
+            DirectPlacementError::Write(error) => {
+                // A destination write failure is a demotion, not a job failure: the
+                // conventional path writes the same bytes to a different file, and
+                // only if *that* also fails is the job genuinely unfinishable.
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "direct-store destination write failed; demoting the set"
+                );
+                self.demote_direct_set_with_handoff(
+                    job_id,
+                    set_index,
+                    DemotionReason::DestinationWriteFailed,
+                    handoff,
+                )
+                .await;
+                if !self
+                    .direct_store
+                    .set(job_id, set_index)
+                    .is_some_and(DirectSet::is_demoted)
+                {
+                    self.fail_job(
+                        job_id,
+                        format!(
+                            "direct-store destination write failed for job {}: {error}",
+                            job_id.0
+                        ),
+                    );
+                }
+                false
+            }
         }
+    }
+
+    /// Places bytes and admits coverage only after every destination write
+    /// succeeds. It does not choose a demotion policy: a repair caller may
+    /// already own verified materialized outputs that reconstruction must not
+    /// overwrite. Filesystem errors retain their original error values.
+    pub(in crate::pipeline) async fn try_place_direct_spans(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+        spans: &[RoutedSpan],
+    ) -> Result<(), DirectPlacementError> {
+        if spans.is_empty() {
+            return Ok(());
+        }
+        self.invalidate_par3_direct_set(job_id, set_index);
+        let batches = self.direct_write_batches(job_id, set_index, spans);
+        self.prepare_direct_destinations(job_id, &batches).await?;
+        crate::pipeline::orchestrator::write_direct_batches(batches)
+            .await
+            .map_err(DirectPlacementError::Write)?;
         // Where the bytes went, split by destination kind. Two counters answer
         // the question the disk acceptance target is stated in: how much of
         // a set landed at its final offset versus how much rode the envelope
@@ -170,7 +218,7 @@ impl Pipeline {
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
             set.record_writes(spans, Instant::now());
         }
-        true
+        Ok(())
     }
 
     /// Caches whatever volume facts the set's parse just accepted, so a restart
@@ -182,7 +230,11 @@ impl Pipeline {
     /// to parse and it is suppressed for direct volumes, so for a live direct
     /// set this is the only writer, and after a demotion the conventional path
     /// upserts the same facts over the materialized volumes.
-    pub(super) async fn cache_direct_volume_facts(&mut self, job_id: JobId, set_index: usize) {
+    pub(in crate::pipeline) async fn cache_direct_volume_facts(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+    ) {
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
@@ -467,13 +519,13 @@ impl Pipeline {
         claimed
     }
 
-    /// `Err(path)` names the first destination that could not be marked. The
-    /// caller demotes; nothing has a hole yet.
+    /// A sparse-marking refusal includes its path and underlying I/O error.
+    /// The caller chooses how to handle it before any hole is introduced.
     pub(super) async fn prepare_direct_destinations(
         &mut self,
         job_id: JobId,
         batches: &crate::pipeline::orchestrator::DirectWriteBatches,
-    ) -> Result<(), PathBuf> {
+    ) -> Result<(), DirectPlacementError> {
         // The choke point every direct write passes through, and the one place
         // that reliably runs for a **restored** set as well as a freshly
         // admitted one (`install_restored` marks the job examined, so
@@ -531,14 +583,17 @@ impl Pipeline {
                     );
                     continue;
                 }
-                Ok(Err(error @ super::super::sparse::SparseCreateError::Mark(_))) => {
+                Ok(Err(super::super::sparse::SparseCreateError::Mark(error))) => {
                     warn!(
                         job_id = job_id.0,
                         path = %path.display(),
                         error = %error,
                         "a direct-store destination could not be marked sparse"
                     );
-                    return Err(path.clone());
+                    return Err(DirectPlacementError::Sparse {
+                        path: path.clone(),
+                        error,
+                    });
                 }
                 Err(error) => {
                     warn!(
@@ -547,7 +602,10 @@ impl Pipeline {
                         error = %error,
                         "the sparse-marking task did not complete"
                     );
-                    return Err(path.clone());
+                    return Err(DirectPlacementError::Sparse {
+                        path: path.clone(),
+                        error: std::io::Error::other(error),
+                    });
                 }
             }
             // Keyed on the destination itself rather than its directory: the
@@ -812,7 +870,8 @@ impl Pipeline {
         for set_index in seeded {
             self.rearm_restart_seeded_gates(job_id, set_index).await;
         }
-        if self.direct_finalization_waits_for_par2(job_id) {
+        if self.direct_finalization_waits_for_par2(job_id) || self.par3_verification_pending(job_id)
+        {
             return;
         }
         // Damage on record and no PAR2 verdict left to answer it.
@@ -834,6 +893,9 @@ impl Pipeline {
                 !set.is_demoted()
                     && !set.is_finalized()
                     && set.all_volumes_complete()
+                    // Native completion and router settlement are separate
+                    // actor steps. The latter still owns this damage verdict.
+                    && !set.router.awaits_par3_verdict()
                     && !set.router.damaged_volumes().is_empty()
             })
             .map(|(index, _)| index)
@@ -955,7 +1017,7 @@ impl Pipeline {
         }
     }
 
-    pub(super) async fn run_direct_barrier(
+    pub(in crate::pipeline) async fn run_direct_barrier(
         &mut self,
         job_id: JobId,
         set_index: usize,
@@ -964,6 +1026,9 @@ impl Pipeline {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
+        if set.router.repair_batch_in_progress() {
+            return;
+        }
         // Read before the barrier runs, which resets it. Two numbers, because
         // the interesting one is the second: the barrier's 256 MiB trigger is
         // checked per routed batch, so anything above it is the overshoot the
@@ -1206,9 +1271,7 @@ impl Pipeline {
         // timestamp is worth. The conventional path treats the same failure as
         // fatal to *that member*, which for a directory is the same nothing.
         for (info, path) in &tolerated_directories {
-            if let Err(error) =
-                crate::pipeline::extraction::apply_rar_member_filesystem_metadata(info, path)
-            {
+            if let Err(error) = info.apply(path) {
                 warn!(
                     job_id = job_id.0,
                     set_name = %set_name,
@@ -1471,16 +1534,11 @@ impl Pipeline {
     /// through the hybrid virtual-volume provider, straight to their
     /// destinations.
     ///
-    /// # This is the tolerance's whole remaining cost
-    ///
-    /// One blocking task, once, after the set's last article. Nothing here is
-    /// I/O amplification — the tolerated bytes are read once out of the
-    /// envelope they were routed to, and the stored members are not touched at
-    /// all — but it is a *serial tail*, and with the tolerance's size ceiling
-    /// gone the list it walks can be large. The conventional incremental
-    /// scheduler already runs the same decode volume by volume as chains close;
-    /// feeding it this provider instead of files is the seam that would retire
-    /// the tail, and it is not opened here.
+    /// The ticket first consumes an eligible virtual-volume chase, checking
+    /// its produced names against the final tolerated-member list. If no
+    /// usable chase exists, one blocking task decodes those members from their
+    /// envelopes after the last article. Stored members remain router-owned
+    /// on both paths.
     ///
     /// Returns the raw member names that were produced, for
     /// `extracted_members`. The distinction that separates this from the
@@ -1499,11 +1557,10 @@ impl Pipeline {
     /// `File::create`, which would leave an empty *file* named like the
     /// directory the archive describes.
     ///
-    /// Its **metadata** is not applied here: every later file that lands inside
-    /// it bumps its mtime, and the commit loop that renames this set's stored
-    /// members runs after this call. The [`unrar_rs::MemberInfo`] is carried
-    /// back to [`Self::finalize_direct_set`] instead, which applies it once
-    /// every member is at its destination.
+    /// Directory times are restored after the stored-member commit loop,
+    /// because each rename into a directory can change its mtime. Fallback
+    /// carries the parsed member metadata; installed chase output carries its
+    /// already-restored filesystem times and needs no second header walk.
     ///
     /// **Off the pipeline task.** The tolerance no longer caps a member's size,
     /// so this decode can run as long as a conventional extraction of the same
@@ -1707,8 +1764,30 @@ impl Pipeline {
             "submitting a direct tolerated-extraction ticket"
         );
         let done_tx = self.direct_tolerated_done_tx.clone();
+        self.update_mixed_rar_chase(job_id, set_index);
+        let disposition = self.take_direct_unpack_disposition(job_id, &set_name);
+        let install_root = staging.clone();
+        let expected_names: HashSet<_> = targets.iter().map(|target| target.name.clone()).collect();
         tokio::spawn(async move {
+            let chased = crate::pipeline::completion::finalize::extract::install_direct_unpack(
+                disposition,
+                install_root,
+                std::sync::Arc::new(crate::jobs::PhaseCounters::default()),
+                job_id,
+                &set_name,
+                None,
+                Some(&expected_names),
+            )
+            .await
+            .is_some();
             let joined = tokio::task::spawn_blocking(move || {
+                if chased {
+                    // The chase verified the member bytes, and installation
+                    // checked the final router manifest and destination paths.
+                    // Capture directory times before stored-member renames;
+                    // neither a second header walk nor decoder admission is needed.
+                    return installed_tolerated_members(&targets);
+                }
                 let reader = provider
                     .open(first_volume)
                     .ok_or_else(|| format!("virtual volume {first_volume} is not registered"))?;
@@ -1779,7 +1858,10 @@ impl Pipeline {
                         let info = archive.member_info(index).ok_or_else(|| {
                             format!("tolerated directory '{name}' has no member metadata")
                         })?;
-                        directories.push((info.clone(), target.destination.clone()));
+                        directories.push((
+                            ToleratedDirectoryMetadata::Parsed(Box::new(info)),
+                            target.destination.clone(),
+                        ));
                         produced.push(name.clone());
                         continue;
                     }
@@ -1877,5 +1959,41 @@ impl Pipeline {
             .insert(done.job_id, (done.set_index, done.result));
         self.finalize_ready_direct_sets(done.job_id).await;
         self.schedule_job_completion_check(done.job_id);
+    }
+}
+
+#[cfg(test)]
+mod installed_tests {
+    use super::*;
+
+    #[test]
+    fn installed_directory_times_survive_stored_member_commit_without_archive_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("folder");
+        std::fs::create_dir(&directory).unwrap();
+        let archived = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_times(&directory, archived, archived).unwrap();
+        let result = installed_tolerated_members(&[ToleratedTarget {
+            name: "folder".into(),
+            destination: directory.clone(),
+            relative: "folder".into(),
+            is_directory: true,
+        }])
+        .unwrap();
+        // There is no archive or virtual source in this fixture.
+        std::fs::write(directory.join("stored.bin"), b"committed").unwrap();
+        for (metadata, path) in result.directories {
+            metadata.apply(&path).unwrap();
+        }
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(
+                &std::fs::metadata(&directory).unwrap()
+            ),
+            archived
+        );
+        assert_eq!(
+            std::fs::read(directory.join("stored.bin")).unwrap(),
+            b"committed"
+        );
     }
 }

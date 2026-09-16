@@ -586,6 +586,57 @@ impl DirectSet {
         }
     }
 
+    pub(crate) fn begin_repair_transaction(
+        &mut self,
+        volumes: Vec<u32>,
+    ) -> Result<(), DemotionReason> {
+        self.router
+            .begin_repair_transaction(volumes)
+            .inspect_err(|reason| {
+                self.demote(*reason);
+            })
+    }
+
+    pub(crate) fn finish_repair_transaction(&mut self) -> Result<(), DemotionReason> {
+        self.router
+            .finish_repair_transaction()
+            .inspect_err(|reason| {
+                self.demote(*reason);
+            })
+    }
+
+    /// Apply one bounded replacement batch; the caller must place its spans
+    /// before advancing and retire the job on any placement failure.
+    pub(crate) fn route_repaired_batch(
+        &mut self,
+        volume: u32,
+        chunks: &[super::router::RepairedChunk],
+        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        finish: bool,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        match self
+            .router
+            .route_repaired_batch(volume, chunks, lead_in, finish, finish)
+        {
+            Ok(spans) => {
+                self.latched_direct |= !spans.is_empty();
+                Ok(spans)
+            }
+            Err(reason) => {
+                self.demote(reason);
+                Err(reason)
+            }
+        }
+    }
+
+    /// Replace article composition only after a complete verified image has
+    /// been routed and placed. Stripe boundaries are not article boundaries.
+    pub(crate) fn note_repaired_whole_volume_crc(&mut self, volume: u32, len: u64, crc: u32) {
+        let runs = self.volume_crcs.entry(volume).or_default();
+        *runs = CrcRuns::default();
+        runs.insert(0, len, crc);
+    }
+
     pub(crate) fn mark_finalized(&mut self) {
         if !self.is_demoted() {
             self.status = DirectSetStatus::Finalized;
@@ -615,12 +666,13 @@ impl DirectSet {
         }
     }
 
-    /// Every volume the set plans has completed and every member has passed the
-    /// whole-member gate.
+    /// Every volume has completed, every member has passed its archive gate,
+    /// and any deferred PAR3 verdict has been applied to the router.
     pub(crate) fn ready_to_finalize(&self) -> bool {
         !self.is_demoted()
             && !self.is_finalized()
             && self.all_volumes_complete()
+            && !self.router.awaits_par3_verdict()
             && self.router.all_members_verified()
     }
 
@@ -922,6 +974,11 @@ impl DirectSet {
         S: super::barrier::DestinationSync + ?Sized,
         P: CoveragePersist + ?Sized,
     {
+        // A repair deleted the old checkpoint before changing destinations.
+        // Do not recreate it from a mixture of old and replacement bytes.
+        if self.router.repair_batch_in_progress() {
+            return None;
+        }
         // Level the barrier with the router before it builds a snapshot: the
         // plan digest it stamps and the destinations it claims must both be the
         // ones the set is routing against *now*, not the ones it was built with.
