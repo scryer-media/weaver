@@ -1141,10 +1141,16 @@ fn release_notes_path_relative(tag_name: &str) -> String {
     format!("{RELEASE_NOTES_DIR}/{tag_name}.md")
 }
 
+/// Where the authoring context is written, relative to the repo and spelled
+/// with `/` on every platform, the way the instructions print it.
+fn release_notes_context_path_relative(tag_name: &str) -> String {
+    format!("tmp/xtask-release-notes/{tag_name}-context.md")
+}
+
 fn release_notes_context_path(ctx: &TaskContext, tag_name: &str) -> PathBuf {
-    ctx.path("tmp")
-        .join("xtask-release-notes")
-        .join(format!("{tag_name}-context.md"))
+    let mut path = ctx.repo_root.clone();
+    path.extend(release_notes_context_path_relative(tag_name).split('/'));
+    path
 }
 
 fn release_notes_sha256(path: &Path) -> Result<String> {
@@ -1366,12 +1372,7 @@ fn require_release_notes(
 
     let context_relative = write_release_notes_context(ctx, latest_tag, tag_name, next_version)
         .ok()
-        .map(|path| {
-            path.strip_prefix(&ctx.repo_root)
-                .unwrap_or(path.as_path())
-                .display()
-                .to_string()
-        });
+        .map(|_| release_notes_context_path_relative(tag_name));
     let instructions = release_notes_authoring_instructions(
         latest_tag,
         tag_name,
