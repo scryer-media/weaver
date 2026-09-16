@@ -17,7 +17,7 @@ weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false 
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
 weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
 par2-rs = { workspace = true, features = [
-    "native-crypto",
+    "crypto-aws-lc",
 ] }
 par3-rs = { workspace = true }
 # Already in the graph through par2-rs; named directly so System info can read

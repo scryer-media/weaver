@@ -114,7 +114,7 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.10", default-features = false, features = ["native-crypto"] }
+par2-rs = { version = "0.10.3", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -139,7 +139,9 @@ par3-rs = { version = "0.4.1", default-features = false }
 # from 3-4x the CPU of unrar to parity, and reopens the reconstructed last
 # volume for its padding trim instead of failing with EBADF.
 # 0.10.5 adds adaptive decoder selection and bounded parallel match replay.
-unrar-rs = { version = "0.10.5", default-features = false, features = ["crypto-aws-lc"] }
+# 0.10.7 stops hashing a split streaming member with BLAKE2sp unless its first
+# header names one, which is every store member weaver opens from volume one.
+unrar-rs = { version = "0.10.7", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

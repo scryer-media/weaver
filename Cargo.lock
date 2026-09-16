@@ -3458,9 +3458,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b37a1deb44b18a5ae7dffc595d342e4558ffb395441540a1e14b0946b7b22f"
+checksum = "3cf0b17f5e92cd2684a33fcc6b8745920f08387d95dcdcf83cb0184a76de9825"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -5219,7 +5219,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5725,9 +5725,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.10.5"
+version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcf5a0ba5a6c1afdac0d595af74cdb31195b7a4aaed3de0352b519b3b5dc92bb"
+checksum = "1e95765ade916897db5042eb0fc7d11df4e39447203e6ccaf04197e5679cecec"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
