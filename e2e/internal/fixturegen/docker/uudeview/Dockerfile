@@ -9,7 +9,7 @@
 # The source tarball's SHA-256 is verified before a single line of it is
 # compiled, so the image can only ever contain the release
 # test-corpus/toolchains.json pins.
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS build
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS build
 
 ARG UUDEVIEW_URL
 ARG UUDEVIEW_SHA256
@@ -26,7 +26,7 @@ RUN set -eux; \
     make -j"$(nproc)"; \
     make install
 
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 COPY --from=build /opt/uu/bin/uuenview /usr/local/bin/uuenview
 COPY --from=build /opt/uu/bin/uudeview /usr/local/bin/uudeview
