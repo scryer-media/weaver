@@ -25,3 +25,12 @@ par3 create -B<in> -s2000 -c2 -R -v -C"rarpar oracle" set.par3 a.bin b.txt sub
 Tests regenerate and damage protected inputs. They do not modify carrier bytes
 or construct packets. The second official recovery carrier is intentionally
 omitted so the test exercises a recovery deficit followed by one arrival.
+
+## `reserved_name/`
+
+A four-carrier set protecting `alpha.bin` (5,000 bytes; byte `i` is
+`(i * 11 + 5) & 255`) and a file named `CON`, holding ASCII `kestrel`, at block
+size 2,000 with four recovery blocks. It exists as stored bytes because a
+producer that refuses to protect a name the platform cannot write cannot make
+one on demand, and the test needs a genuine set rather than hand-built packets.
+Carrier bytes are never modified; only the protected payload is damaged.
