@@ -1086,10 +1086,6 @@ impl<W: Write> Write for BudgetedWriter<W> {
 }
 
 impl BudgetedWriter<cap_std::fs::File> {
-    pub(crate) fn sync_all(&self) -> io::Result<()> {
-        self.inner.sync_all()
-    }
-
     /// Stamp the archive's recorded times on the finished output.
     ///
     /// Called after the last byte is written: the write itself moves the

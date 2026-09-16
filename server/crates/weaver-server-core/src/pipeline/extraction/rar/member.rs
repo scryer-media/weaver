@@ -836,21 +836,30 @@ impl Pipeline {
             return Err(error);
         }
 
-        {
-            let mut shared_file = shared.borrow_mut();
-            shared_file.inner.flush().map_err(|e| {
-                format!(
-                    "failed to flush partial output {}: {e}",
-                    partial_path.display()
-                )
-            })?;
-            shared_file.inner.get_ref().sync_all().map_err(|e| {
-                format!(
-                    "failed to sync partial output {}: {e}",
-                    partial_path.display()
-                )
-            })?;
-        }
+        // Flush only: the buffered tail has to reach the file before finalize
+        // stats and renames it, but the member's bytes do not have to be on
+        // stable storage before this thread moves on to the next member.
+        //
+        // A restart never continues a partial output — the partial and its
+        // chunk directory are deleted at the top of this function — and the
+        // marker that says a member is already extracted is re-validated
+        // against the filesystem when the job is reloaded: a marker whose
+        // output is missing, is not a regular file, or no longer has the
+        // recorded size is discarded and the member is extracted again. So a
+        // torn member after a host crash costs a re-extraction, which is what
+        // the sync would have bought anyway: the rename that publishes the
+        // member is not made durable either, and the marker itself is written
+        // under weaver's `synchronous = NORMAL` / `synchronous_commit = off`
+        // posture, which already admits losing the last commits to a crash.
+        // Syncing here only stalls the extraction thread on a device flush per
+        // member while writeback of the previous member could have overlapped
+        // the next one.
+        shared.borrow_mut().inner.flush().map_err(|e| {
+            format!(
+                "failed to flush partial output {}: {e}",
+                partial_path.display()
+            )
+        })?;
         drop(shared);
 
         let bytes_written = match Self::finalize_member_output(FinalizeMemberContext {
