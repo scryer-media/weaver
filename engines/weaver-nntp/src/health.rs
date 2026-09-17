@@ -538,7 +538,7 @@ impl HealthTracker {
         auth: bool,
     ) {
         let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
-        let probing = ticket.probing();
+        let probing = !success && ticket.probing();
         let failures_before = self.servers[server_idx].failure_count;
         self.servers[server_idx].record_connection_outcome(ticket, success, auth, allow_ratio_trip);
         // A ticket reports only its first failure, so the count moves once.
