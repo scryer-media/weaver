@@ -22,4 +22,4 @@
 
 ### Dependencies
 
-- `lzma-turbo` 0.3.3 and `sevenz-turbo` 0.23.2.
+- `lzma-turbo` 0.3.3, `sevenz-turbo` 0.23.2 and `par2-rs` 0.10.5.
