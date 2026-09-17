@@ -315,6 +315,12 @@ jobs:
           WEAVER_DIRECT_UNPACK_E2E_BIN: ${{ github.workspace }}/target/debug/weaver
           TMPDIR: ${{ runner.temp }}
         run: go test ./internal/weaver -run '^TestDirectUnpackE2E$' -count=1 -v -timeout 10m
+      - name: Prove one article cannot stop a single-server setup
+        working-directory: e2e
+        env:
+          WEAVER_POISON_ARTICLE_E2E_BIN: ${{ github.workspace }}/target/debug/weaver
+          TMPDIR: ${{ runner.temp }}
+        run: go test ./internal/weaver -run '^TestPoisonArticleE2E$' -count=1 -v -timeout 25m
       - name: Upload archive e2e evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -323,6 +329,7 @@ jobs:
           if-no-files-found: ignore
           path: |
             ${{ runner.temp }}/weaver-direct-unpack-e2e-*/weaver.log
+            ${{ runner.temp }}/weaver-poison-article-e2e-*/weaver.log
             ${{ runner.temp }}/weaver-direct-unpack-e2e-*/fixtures/*/evidence.json
       - name: Show sccache stats
         if: always()
