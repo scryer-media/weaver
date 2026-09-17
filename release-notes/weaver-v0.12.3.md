@@ -37,8 +37,47 @@
   and the decoder footprint, so a dropped file cannot make Weaver allocate on
   its say-so.
 - **AES-256 7z archives** are decrypted through the same AWS-LC backend the
-  rest of Weaver's cryptography uses; the RustCrypto AES implementation is no
-  longer built in.
+  rest of Weaver's cryptography uses, instead of a separate pure-Rust AES.
+
+### Downloads
+
+- **One bad article can no longer stop a single-server setup.** An article
+  with junk between its yEnc trailer and the NNTP terminator failed every
+  fetch as a connection fault, which kept its retry budget, counted against
+  the server, and made it every recovery probe of that server: with one
+  server configured, downloads stopped until the job was removed. The junk
+  is now drained, and an article that keeps breaking connections while other
+  articles download pays for its retries and fails like any other bad
+  article. An outage, where nothing downloads, still spends no budget.
+- Failed recovery probes are logged, and pipeline diagnostics name each
+  job's worst transport-failure segment.
+
+### Direct unpack
+
+- **Damaged RAR sets no longer lose five minutes.** A chased RAR volume that
+  finished after its set armed never published what the recovery data said
+  about it, so the PAR2 pass that would have repaired it was not forced and
+  the chase waited out its consumption deadline.
+- **A job no longer sits in Extracting on bytes already on disk.** Extraction
+  could take over a running chase before the chase heard that its last part
+  had finished; the handoff now tells it first.
+
+### Extraction
+
+- **RAR extraction writes faster.** Chunk-sized writes go straight to the
+  file instead of through an 8 MiB copy, and each member is no longer synced
+  to the device on the extraction thread. A member whose output is missing
+  or the wrong size after a restart is extracted again, as before.
+
+### PAR3, setup and startup
+
+- A PAR3 recovery volume whose filename disagrees with its contents is
+  fetched last instead of dropped, so a renamed volume can still close a
+  deficit. The output space check counts each rebuilt file once.
+- Codeless first-run setup compares the origin's port with the request's,
+  so another page on the same host cannot create the administrator.
+- Servers seeded from the environment are probed concurrently under one
+  10-second deadline instead of holding startup one after another.
 
 ### Logs page
 
