@@ -77,7 +77,7 @@ memmap2 = { version = "0.9", default-features = false }
 zstd = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 sevenz-turbo = { version = "0.23.1", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
-lzma-turbo = { version = "0.3.1", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
+lzma-turbo = { version = "0.3.3", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd", "socks"] }
 semver = { version = "1.0", default-features = false, features = ["serde", "std"] }
 httpdate = { version = "1.0", default-features = false }
