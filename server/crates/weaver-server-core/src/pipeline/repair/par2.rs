@@ -1291,7 +1291,8 @@ impl Pipeline {
                             file.received_bytes() != desc.length
                         } else {
                             file.received_bytes() > desc.length
-                        } || declared_size.is_some_and(|size| size != desc.length);
+                        } || declared_size
+                            .is_some_and(|size| size != desc.length);
                         !contradicted
                     })
                 })
