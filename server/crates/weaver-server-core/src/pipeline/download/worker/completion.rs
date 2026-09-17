@@ -44,6 +44,39 @@ impl Pipeline {
         wait.pending_count += 1;
     }
 
+    /// Extends or ends `segment_id`'s run of established-transport failures,
+    /// returning the run when this failure belongs to one.
+    fn note_transport_failure_streak(
+        &mut self,
+        segment_id: SegmentId,
+        failure: &DownloadFailure,
+    ) -> Option<TransportFailureStreak> {
+        if failure.kind != DownloadFailureKind::EstablishedTransport {
+            self.transport_failure_streaks.remove(&segment_id);
+            return None;
+        }
+        let downloaded = self.metrics.segments_downloaded.load(Ordering::Relaxed);
+        let streak =
+            self.transport_failure_streaks
+                .entry(segment_id)
+                .or_insert(TransportFailureStreak {
+                    failures: 0,
+                    downloaded_at_start: downloaded,
+                });
+        streak.failures = streak.failures.saturating_add(1);
+        let streak = *streak;
+        if streak.failures == SEGMENT_TRANSPORT_STREAK_HOLD {
+            warn!(
+                segment = %segment_id,
+                error = %failure.message,
+                hold_secs = SEGMENT_TRANSPORT_HOLD_DELAY.as_secs(),
+                "segment keeps failing on an established connection; holding its retry \
+                 so other work reaches the server first"
+            );
+        }
+        Some(streak)
+    }
+
     pub(crate) fn note_retry_requeued(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
         if let Some(pending) = self.pending_retries_by_job.get_mut(&job_id) {
@@ -639,6 +672,10 @@ impl Pipeline {
 
         match result.data {
             Ok(DownloadPayload::Raw(raw)) => {
+                // Empty unless something is failing: skip the hash per article.
+                if !self.transport_failure_streaks.is_empty() {
+                    self.transport_failure_streaks.remove(&result.segment_id);
+                }
                 let raw_size_bytes = raw.len() as u64;
                 let raw_size = raw.len() as u32;
                 self.metrics
@@ -665,6 +702,10 @@ impl Pipeline {
                 self.pump_decode_queue();
             }
             Ok(DownloadPayload::Decoded(decoded)) => {
+                // Empty unless something is failing: skip the hash per article.
+                if !self.transport_failure_streaks.is_empty() {
+                    self.transport_failure_streaks.remove(&result.segment_id);
+                }
                 let raw_size_bytes = decoded.raw_size;
                 let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
                 {
@@ -1087,7 +1128,19 @@ impl Pipeline {
                 } else {
                     let seg_id = result.segment_id;
                     let completion_critical = self.segment_is_completion_critical(seg_id);
-                    let preserves_retry_budget = failure.kind.preserves_article_retry_budget();
+                    let transport_streak = self.note_transport_failure_streak(seg_id, &failure);
+                    // A transport fault normally says nothing about the
+                    // article. A run of them on one segment while other
+                    // segments keep downloading does: the article is what
+                    // breaks the connection, so it starts paying for retries
+                    // like any other bad article.
+                    let article_local_transport = transport_streak.is_some_and(|streak| {
+                        streak.failures >= SEGMENT_TRANSPORT_STREAK_ARTICLE_LOCAL
+                            && self.metrics.segments_downloaded.load(Ordering::Relaxed)
+                                > streak.downloaded_at_start
+                    });
+                    let preserves_retry_budget =
+                        failure.kind.preserves_article_retry_budget() && !article_local_transport;
                     let infrastructure_retry = failure.kind.infrastructure_wait_reason().is_some();
                     let next_retry = if preserves_retry_budget || source_not_found {
                         result.retry_count
@@ -1108,6 +1161,7 @@ impl Pipeline {
                         // Retry exhaustion is as terminal as a missing
                         // article: without this, health stays optimistic and
                         // recovery promotion waits for post-download verify.
+                        self.transport_failure_streaks.remove(&seg_id);
                         self.book_terminal_segment(seg_id, SegmentTerminalState::RetriesExhausted);
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
@@ -1133,7 +1187,17 @@ impl Pipeline {
                             self.metrics
                                 .segments_retried
                                 .fetch_add(1, Ordering::Relaxed);
-                            let delay = if infrastructure_retry {
+                            let delay = if transport_streak.is_some_and(|streak| {
+                                streak.failures >= SEGMENT_TRANSPORT_STREAK_HOLD
+                            }) {
+                                // The failure that quarantines a server is
+                                // followed by one probe, and the probe takes
+                                // the highest-priority work — this segment
+                                // again. Hold it past the recovery backoff so
+                                // the probe carries different work and a
+                                // healthy server can prove itself.
+                                SEGMENT_TRANSPORT_HOLD_DELAY
+                            } else if infrastructure_retry {
                                 std::time::Duration::from_secs(1)
                             } else if source_not_found {
                                 std::time::Duration::ZERO

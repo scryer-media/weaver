@@ -240,6 +240,7 @@ impl Pipeline {
             job_last_download_activity: HashMap::new(),
             pending_retries_by_job: HashMap::new(),
             pending_retries_by_segment: HashMap::new(),
+            transport_failure_streaks: HashMap::new(),
             download_wait_by_job: HashMap::new(),
             segment_terminal_states: HashMap::new(),
             foreign_layout_watches: HashMap::new(),

@@ -14,6 +14,8 @@ use crate::types::Response;
 use crate::uu::{self, UuDecoder, UuOutcome};
 
 const MAX_CONTROL_LINE: usize = 16 * 1024;
+/// Trailing bytes tolerated between the yEnc trailer and the NNTP terminator.
+const MAX_TRAILER_JUNK: u64 = 64 * 1024;
 const MAX_ARTICLE_RESERVE: usize = 16 * 1024 * 1024;
 const OUTPUT_BATCH_TARGET: usize = 512 * 1024;
 /// Wire bytes handed to the kernel once a sized batch is full. The truthful
@@ -194,6 +196,8 @@ pub struct FusedYencArticleStats {
     pub yenc_control_hits: u64,
     pub nntp_terminator_hits: u64,
     pub nntp_terminator_bytes: u64,
+    /// Bytes drained between the yEnc trailer and the NNTP terminator.
+    pub nntp_trailer_junk_bytes: u64,
     pub leftover_bytes_after_terminator: u64,
     pub buffer_compactions: u64,
     /// Times the output batch grew past its reservation: a header that lied,
@@ -585,7 +589,20 @@ impl FusedYencArticleDecoder {
                 continue;
             }
 
-            return Err(NntpError::MalformedMultilineTerminator.into());
+            // Anything else between the yEnc trailer and the dot terminator is
+            // poster junk: the decoded part and its CRC are already settled,
+            // and the dot line is still the only article boundary. Rejecting
+            // it would fail the same article on every fetch, so drain it, up
+            // to a bound that keeps a missing terminator from reading forever.
+            self.stats.nntp_trailer_junk_bytes += self.line_buf.len() as u64;
+            self.line_buf.clear();
+            if self.stats.nntp_trailer_junk_bytes > MAX_TRAILER_JUNK {
+                return Err(YencError::InvalidHeader {
+                    field: "=yend".to_string(),
+                    reason: "too much trailing data after the yEnc trailer".to_string(),
+                }
+                .into());
+            }
         }
     }
 
@@ -1845,14 +1862,48 @@ mod tests {
     }
 
     #[test]
-    fn fused_rejects_malformed_nntp_terminator() {
-        let original = b"bad terminator";
+    fn fused_drains_trailing_lines_before_nntp_terminator() {
+        let original = b"trailing junk after the trailer";
         let mut article = Vec::new();
-        encode(original, &mut article, 128, "bad.bin").unwrap();
+        encode(original, &mut article, 128, "junk.bin").unwrap();
 
         let mut bytes = b"222 <test@local> body follows\r\n".to_vec();
         bytes.extend_from_slice(&article);
-        bytes.extend_from_slice(b"..\r\n");
+        bytes.extend_from_slice(b"posted with some tool\r\n..\r\n");
+        let junk_len = b"posted with some tool\r\n..\r\n".len() as u64;
+
+        // Split inside the junk so the drain has to resume across reads.
+        let split = bytes.len() - 5;
+        let mut decoder = FusedYencArticleDecoder::new();
+        let mut src = BytesMut::from(&bytes[..split]);
+        assert!(decoder.decode_available(&mut src).unwrap().is_none());
+        src.extend_from_slice(&bytes[split..]);
+        assert!(
+            decoder.decode_available(&mut src).unwrap().is_none(),
+            "junk alone must not end the article"
+        );
+        src.extend_from_slice(b".\r\n222 next");
+
+        let actual = decoder.decode_available(&mut src).unwrap().unwrap();
+        assert_eq!(actual.to_data(), original);
+        assert_eq!(actual.stats.nntp_trailer_junk_bytes, junk_len);
+        assert_eq!(actual.stats.nntp_terminator_hits, 1);
+        assert_eq!(&src[..], b"222 next", "the next response stays unread");
+    }
+
+    #[test]
+    fn fused_bounds_trailing_data_without_a_terminator() {
+        let original = b"endless trailer";
+        let mut article = Vec::new();
+        encode(original, &mut article, 128, "endless.bin").unwrap();
+
+        let mut bytes = b"222 <test@local> body follows\r\n".to_vec();
+        bytes.extend_from_slice(&article);
+        let line = [b'x'; 1022];
+        for _ in 0..=(MAX_TRAILER_JUNK as usize / 1024) {
+            bytes.extend_from_slice(&line);
+            bytes.extend_from_slice(b"\r\n");
+        }
 
         let mut src = BytesMut::from(bytes.as_slice());
         let mut decoder = FusedYencArticleDecoder::new();
@@ -1860,7 +1911,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            FusedYencError::Nntp(NntpError::MalformedMultilineTerminator)
+            FusedYencError::Yenc(YencError::InvalidHeader { .. })
         ));
     }
 
