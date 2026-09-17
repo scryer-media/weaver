@@ -1,19 +1,15 @@
 use std::io::{self, Read, Seek, SeekFrom};
 
-use liblzma::read::XzDecoder;
-use liblzma::stream::{CONCATENATED, MtStreamBuilder, Stream};
+use lzma_fast::xz::{XzOptions, XzParallelReader, XzReader};
 
-/// Maximum memory liblzma may use while decoding an XZ input.
+/// Maximum memory the xz decoder may use while decoding an XZ input.
 ///
 /// This covers the attacker-controlled LZMA2 dictionary as well as decoder
 /// bookkeeping.  128 MiB accepts standard `xz -9` archives (64 MiB
 /// dictionary) without allowing a tiny archive to request multi-gigabyte
-/// allocations.
+/// allocations.  The parallel decoder degrades its thread count to fit under
+/// this figure rather than refusing the file.
 pub const XZ_DECODER_MEMORY_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
-
-const XZ_STREAM_HEADER_SIZE: u64 = 12;
-const XZ_STREAM_FOOTER_SIZE: u64 = 12;
-const MAX_XZ_INDEX_SIZE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum XzFilesystemDecoderKind {
@@ -23,34 +19,39 @@ pub(crate) enum XzFilesystemDecoderKind {
 
 /// Opens an integrity-checking, concatenated-stream XZ decoder with a hard
 /// decoder-memory limit.
+///
+/// Single-threaded by construction: the input only has to be readable, so this
+/// is the decoder for uploads, watch-folder intake and anything still arriving.
 pub fn xz_multistream_decoder<R: Read>(
     reader: R,
     memory_limit_bytes: u64,
-) -> io::Result<XzDecoder<R>> {
-    let memory_limit_bytes = memory_limit_bytes.max(1);
-    let stream =
-        Stream::new_stream_decoder(memory_limit_bytes, CONCATENATED).map_err(io::Error::other)?;
-    Ok(XzDecoder::new_stream(reader, stream))
+) -> io::Result<XzReader<R>> {
+    let options = XzOptions::default()
+        .with_memory_limit(memory_limit_bytes.max(1))
+        .with_concatenated(true);
+    Ok(XzReader::with_options(reader, options))
 }
 
-/// Opens a bounded multithreaded decoder for one XZ stream.
+/// Opens a bounded block-parallel decoder for one XZ stream already on disk.
+///
+/// The file's index is read first, so every block's offsets and sizes are
+/// known before a byte is decoded; the thread count is reduced until the
+/// workers' buffers fit under `memory_limit_bytes`, and
+/// [`XzParallelReader::memory_estimate`] then reports what the decode will
+/// actually cost so the caller can reserve exactly that.
 ///
 /// Callers must first use [`xz_filesystem_decoder_kind`] to keep concatenated
 /// streams on the sequential multistream decoder.
-pub(crate) fn xz_parallel_decoder<R: Read>(
+pub(crate) fn xz_parallel_decoder<R: Read + Seek>(
     reader: R,
     memory_limit_bytes: u64,
     worker_count: usize,
-) -> io::Result<XzDecoder<R>> {
-    let memory_limit_bytes = memory_limit_bytes.max(1);
-    let worker_count = u32::try_from(worker_count).unwrap_or(u32::MAX).max(1);
-    let mut builder = MtStreamBuilder::new();
-    builder
-        .threads(worker_count)
-        .memlimit_threading(memory_limit_bytes)
-        .memlimit_stop(memory_limit_bytes);
-    let stream = builder.decoder().map_err(io::Error::other)?;
-    Ok(XzDecoder::new_stream(reader, stream))
+) -> io::Result<XzParallelReader<R>> {
+    let options = XzOptions::default()
+        .with_memory_limit(memory_limit_bytes.max(1))
+        .with_threads(worker_count.max(1))
+        .with_concatenated(false);
+    XzParallelReader::with_options(reader, options).map_err(io::Error::from)
 }
 
 /// Selects the decoder for a completed XZ file without decompressing it.
@@ -63,7 +64,7 @@ pub(crate) fn xz_filesystem_decoder_kind<R: Read + Seek>(
     reader: &mut R,
 ) -> XzFilesystemDecoderKind {
     let initial_position = reader.stream_position().ok();
-    let block_count = xz_single_stream_block_count(reader);
+    let block_count = lzma_fast::xz::single_stream_block_count(reader);
     if let Some(position) = initial_position {
         let _ = reader.seek(SeekFrom::Start(position));
     }
@@ -72,87 +73,6 @@ pub(crate) fn xz_filesystem_decoder_kind<R: Read + Seek>(
         Some(count) if count > 1 => XzFilesystemDecoderKind::Parallel,
         _ => XzFilesystemDecoderKind::Sequential,
     }
-}
-
-fn xz_single_stream_block_count<R: Read + Seek>(reader: &mut R) -> Option<usize> {
-    let stream_len = reader.seek(SeekFrom::End(0)).ok()?;
-    if stream_len < XZ_STREAM_HEADER_SIZE + XZ_STREAM_FOOTER_SIZE {
-        return None;
-    }
-
-    let mut header_magic = [0_u8; 6];
-    reader.seek(SeekFrom::Start(0)).ok()?;
-    reader.read_exact(&mut header_magic).ok()?;
-    if header_magic != [0xFD, b'7', b'z', b'X', b'Z', 0x00] {
-        return None;
-    }
-
-    let footer_offset = stream_len.checked_sub(XZ_STREAM_FOOTER_SIZE)?;
-    let mut footer = [0_u8; XZ_STREAM_FOOTER_SIZE as usize];
-    reader.seek(SeekFrom::Start(footer_offset)).ok()?;
-    reader.read_exact(&mut footer).ok()?;
-    if footer[10..] != *b"YZ" {
-        return None;
-    }
-
-    let backward_size = u32::from_le_bytes(footer[4..8].try_into().ok()?) as u64;
-    let index_size = backward_size.checked_add(1)?.checked_mul(4)?;
-    if index_size > MAX_XZ_INDEX_SIZE_BYTES {
-        return None;
-    }
-    let index_offset = footer_offset.checked_sub(index_size)?;
-    if index_offset < XZ_STREAM_HEADER_SIZE {
-        return None;
-    }
-
-    let index_size = usize::try_from(index_size).ok()?;
-    let mut index = vec![0_u8; index_size];
-    reader.seek(SeekFrom::Start(index_offset)).ok()?;
-    reader.read_exact(&mut index).ok()?;
-    let index_body = index.get(..index.len().checked_sub(4)?)?;
-    if index_body.first().copied()? != 0x00 {
-        return None;
-    }
-
-    let mut offset = 1;
-    let record_count = usize::try_from(read_xz_vli(index_body, &mut offset)?).ok()?;
-    if record_count > index_body.len().saturating_sub(offset) / 2 {
-        return None;
-    }
-
-    let mut padded_block_bytes = 0_u64;
-    for _ in 0..record_count {
-        let unpadded_size = read_xz_vli(index_body, &mut offset)?;
-        if unpadded_size == 0 {
-            return None;
-        }
-        let _uncompressed_size = read_xz_vli(index_body, &mut offset)?;
-        let padded_size = unpadded_size.checked_add(3)? & !3;
-        padded_block_bytes = padded_block_bytes.checked_add(padded_size)?;
-    }
-    if index_body.get(offset..)?.iter().any(|byte| *byte != 0) {
-        return None;
-    }
-
-    let expected_index_offset = XZ_STREAM_HEADER_SIZE.checked_add(padded_block_bytes)?;
-    (expected_index_offset == index_offset).then_some(record_count)
-}
-
-fn read_xz_vli(bytes: &[u8], offset: &mut usize) -> Option<u64> {
-    let mut value = 0_u64;
-    for byte_index in 0..9 {
-        let byte = *bytes.get(*offset)?;
-        *offset = offset.checked_add(1)?;
-        let payload = u64::from(byte & 0x7F);
-        value |= payload.checked_shl(byte_index * 7)?;
-        if byte & 0x80 == 0 {
-            if byte_index > 0 && payload == 0 {
-                return None;
-            }
-            return Some(value);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -343,10 +263,12 @@ mod tests {
         let mut input = xz_compress_multiblock(&payload);
         corrupt_xz_index(&mut input);
 
-        let mut decoder =
-            xz_parallel_decoder(Cursor::new(input), XZ_DECODER_MEMORY_LIMIT_BYTES, 2).unwrap();
-        let mut output = Vec::new();
+        let result = xz_parallel_decoder(Cursor::new(input), XZ_DECODER_MEMORY_LIMIT_BYTES, 2)
+            .and_then(|mut decoder| {
+                let mut output = Vec::new();
+                decoder.read_to_end(&mut output)
+            });
 
-        assert!(decoder.read_to_end(&mut output).is_err());
+        assert!(result.is_err());
     }
 }

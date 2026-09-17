@@ -2833,27 +2833,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "liblzma"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fe0a34ca854fd4f20c07f696fc8675aec78f87d88d29f5e10257a7490a1b2e1"
-dependencies = [
- "liblzma-sys",
- "num_cpus",
-]
-
-[[package]]
-name = "liblzma-sys"
-version = "0.4.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c7e3581f367a78d7b7e7ae948d023310556f0cfc13156c2e4e00e25616492b9"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
-]
-
-[[package]]
 name = "libmimalloc-sys"
 version = "0.1.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2913,6 +2892,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "lzma-fast"
+version = "0.3.0"
+dependencies = [
+ "aws-lc-rs",
+ "crc-fast",
 ]
 
 [[package]]
@@ -3260,16 +3247,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi",
- "libc",
 ]
 
 [[package]]
@@ -4651,25 +4628,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "sevenz-rust2"
-version = "0.22.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb967eb8b29410e61e8c9005058fcfd5889d0b827856beb25529c73dfc86a98a"
+name = "sevenz-fast"
+version = "0.23.0"
 dependencies = [
  "aes",
+ "aws-lc-rs",
  "brotli",
  "bzip2",
  "cbc",
- "crc32fast",
  "flate2",
  "getrandom 0.4.3",
  "js-sys",
  "lz4_flex",
+ "lzma-fast",
  "lzma-rust2",
  "ppmd-rust",
- "sha2 0.11.0",
  "wasm-bindgen",
- "zstd 0.13.3",
+ "zstd 0.14.0",
 ]
 
 [[package]]
@@ -5956,7 +5931,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
- "sevenz-rust2",
+ "sevenz-fast",
  "tar",
  "tempfile",
  "tokio",
@@ -6088,7 +6063,7 @@ dependencies = [
  "keyring",
  "keyring-core",
  "libc",
- "liblzma",
+ "lzma-fast",
  "lzma-rust2",
  "notify",
  "par2-rs",
@@ -6105,7 +6080,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sevenz-rust2",
+ "sevenz-fast",
  "sha2 0.11.0",
  "sqlx",
  "tar",

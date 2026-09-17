@@ -41,8 +41,8 @@ fn collect_split_paths(prefix: &str) -> Vec<PathBuf> {
 fn extract_split(paths: &[PathBuf], password: Option<&str>) -> Vec<u8> {
     let out_dir = TempDir::new().unwrap();
     let reader = SplitFileReader::open(paths).unwrap();
-    let password = password.map_or_else(sevenz_rust2::Password::empty, sevenz_rust2::Password::new);
-    sevenz_rust2::decompress_with_password(reader, out_dir.path(), password).unwrap();
+    let password = password.map_or_else(sevenz_fast::Password::empty, sevenz_fast::Password::new);
+    sevenz_fast::decompress_with_password(reader, out_dir.path(), password).unwrap();
     fs::read(out_dir.path().join("generated_split_clip.mkv")).unwrap()
 }
 
@@ -77,10 +77,10 @@ fn fixture_splitfile_wrong_password_fails() {
     let out_dir = TempDir::new().unwrap();
     let paths = collect_split_paths("generated_split_store_enc.7z");
     let reader = SplitFileReader::open(&paths).unwrap();
-    let result = sevenz_rust2::decompress_with_password(
+    let result = sevenz_fast::decompress_with_password(
         reader,
         out_dir.path(),
-        sevenz_rust2::Password::new("WrongPassword"),
+        sevenz_fast::Password::new("WrongPassword"),
     );
     assert!(result.is_err(), "expected wrong-password failure");
 }

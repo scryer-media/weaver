@@ -22,7 +22,6 @@ fn lock_xz_mt_decoder_test() -> MutexGuard<'static, ()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     XZ_MT_DECODER_TEST_LOCK.clear_poison();
-    XZ_MT_DECODER_PERMIT.clear_poison();
     guard
 }
 
@@ -114,6 +113,13 @@ fn extract_with_weaver_zip(
 }
 
 fn test_extraction_security(output_dir: &Path) -> (ExtractionRoot, Arc<JobExtractionBudget>) {
+    test_extraction_security_with_memory(output_dir, 1024 * 1024 * 1024)
+}
+
+fn test_extraction_security_with_memory(
+    output_dir: &Path,
+    max_memory_bytes: u64,
+) -> (ExtractionRoot, Arc<JobExtractionBudget>) {
     let limits = Arc::new(ExtractionLimits {
         max_job_bytes: 2 * 1024 * 1024 * 1024 * 1024,
         max_member_bytes: 1024 * 1024 * 1024 * 1024,
@@ -121,13 +127,13 @@ fn test_extraction_security(output_dir: &Path) -> (ExtractionRoot, Arc<JobExtrac
         max_ratio: 100,
         max_seconds: 43_200,
         min_free_bytes: 1,
-        max_memory_bytes: 1024 * 1024 * 1024,
+        max_memory_bytes,
     });
     let root = ExtractionRoot::open(output_dir).unwrap();
     let budget = JobExtractionBudget::new(
         limits,
         output_dir.to_path_buf(),
-        1024 * 1024 * 1024,
+        max_memory_bytes,
         0,
         0,
         PipelineMetrics::new(),
@@ -666,8 +672,11 @@ fn filesystem_xz_decoder_uses_parallel_for_a_multiblock_single_stream() {
     assert_eq!(output, payload);
 }
 
+/// The parallel decoder is only taken when the job's memory budget can hold
+/// one worker; a budget one byte short of that goes to the sequential decoder,
+/// whose dictionary is bounded by the block it decodes and still fits.
 #[test]
-fn filesystem_xz_decoder_falls_back_to_sequential_when_mt_is_busy() {
+fn filesystem_xz_decoder_falls_back_to_sequential_when_a_worker_does_not_fit() {
     let _test_guard = lock_xz_mt_decoder_test();
     let temp = TempDir::new().unwrap();
     let archive_path = temp.path().join("payload.bin.xz");
@@ -678,10 +687,49 @@ fn filesystem_xz_decoder_falls_back_to_sequential_when_mt_is_busy() {
         .collect();
     fs::write(&archive_path, xz_compress_multiblock(&payload)).unwrap();
 
-    let (_root, budget) = test_extraction_security(&output_dir);
-    let _permit = XZ_MT_DECODER_PERMIT.lock().unwrap();
+    let one_worker = lzma_fast::xz::XzParallelReader::with_options(
+        fs::File::open(&archive_path).unwrap(),
+        lzma_fast::xz::XzOptions::default().with_threads(1),
+    )
+    .unwrap()
+    .memory_estimate();
+
+    let (_root, budget) = test_extraction_security_with_memory(&output_dir, one_worker - 1);
     let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 2).unwrap();
     assert!(matches!(&decoder, FilesystemXzDecoder::Sequential(_)));
+
+    let mut output = Vec::new();
+    decoder.read_to_end(&mut output).unwrap();
+    assert_eq!(output, payload);
+}
+
+/// A budget that holds exactly one worker gets the parallel decoder with its
+/// thread count trimmed to one, not the sequential fallback.
+#[test]
+fn filesystem_xz_decoder_trims_its_threads_to_the_memory_budget() {
+    let _test_guard = lock_xz_mt_decoder_test();
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("payload.bin.xz");
+    let output_dir = temp.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    let payload: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    fs::write(&archive_path, xz_compress_multiblock(&payload)).unwrap();
+
+    let one_worker = lzma_fast::xz::XzParallelReader::with_options(
+        fs::File::open(&archive_path).unwrap(),
+        lzma_fast::xz::XzOptions::default().with_threads(1),
+    )
+    .unwrap()
+    .memory_estimate();
+
+    let (_root, budget) = test_extraction_security_with_memory(&output_dir, one_worker);
+    let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 4).unwrap();
+    match &decoder {
+        FilesystemXzDecoder::Parallel { decoder, .. } => assert_eq!(decoder.threads(), 1),
+        FilesystemXzDecoder::Sequential(_) => panic!("expected the parallel decoder"),
+    }
 
     let mut output = Vec::new();
     decoder.read_to_end(&mut output).unwrap();
@@ -725,7 +773,7 @@ fn sevenz_archive_with_times_and_anti_item(
     file_time: std::time::SystemTime,
     access_time: std::time::SystemTime,
 ) -> Vec<u8> {
-    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, NtTime};
+    use sevenz_fast::{ArchiveEntry, ArchiveWriter, NtTime};
 
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
 
@@ -788,10 +836,11 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
         output_dir: out_dir.clone(),
         root: Arc::new(root),
         budget,
-        password: sevenz_rust2::Password::empty(),
+        password: sevenz_fast::Password::empty(),
         event_tx,
         phase_counters: Arc::new(PhaseCounters::default()),
         decode_memory: SevenZipDecodeMemory::HeldByCaller,
+        decode_threads: 1,
     };
     let outcome = extract_7z_stream(&context, || {
         fs::File::open(&archive_path).map_err(|error| error.to_string())
@@ -828,6 +877,132 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
     let directory = fs::metadata(out_dir.join("Silver.Horizon")).unwrap();
     assert!(directory.is_dir());
     assert_eq!(directory.modified().unwrap(), directory_time);
+}
+
+/// A 7z archive whose one LZMA2 block declares a `dictionary`-byte
+/// dictionary, holding `members` in order.
+fn sevenz_archive_with_dictionary(dictionary: u32, members: &[(&str, &[u8])]) -> Vec<u8> {
+    use sevenz_fast::encoder_options::Lzma2Options;
+    use sevenz_fast::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
+
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+    let mut options = Lzma2Options::from_level(1);
+    options.set_dictionary_size(dictionary);
+    writer.set_content_methods(vec![EncoderConfiguration::from(options)]);
+    for (name, bytes) in members {
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file(name),
+                Some(Cursor::new(bytes.to_vec())),
+            )
+            .expect("entry");
+    }
+    writer.finish().expect("finish").into_inner()
+}
+
+fn conventional_7z_context(
+    out_dir: &Path,
+    root: ExtractionRoot,
+    budget: Arc<JobExtractionBudget>,
+    decode_threads: u32,
+) -> SevenZipExtractionContext {
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    SevenZipExtractionContext {
+        job_id: JobId(41813),
+        set_name: "wide_dictionary.7z".to_string(),
+        output_dir: out_dir.to_path_buf(),
+        root: Arc::new(root),
+        budget,
+        password: sevenz_fast::Password::empty(),
+        event_tx,
+        phase_counters: Arc::new(PhaseCounters::default()),
+        decode_memory: SevenZipDecodeMemory::HeldByCaller,
+        decode_threads,
+    }
+}
+
+/// The dictionary an archive declares is allocated on the archive's say-so.
+/// One the job's memory ceiling cannot hold is refused when the archive is
+/// opened, before a decoder exists and before anything is created on disk.
+#[test]
+fn conventional_7z_extraction_refuses_a_dictionary_the_memory_ceiling_cannot_hold() {
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("wide_dictionary.7z");
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::write(
+        &archive_path,
+        sevenz_archive_with_dictionary(
+            16 * 1024 * 1024,
+            &[("Wide.Dictionary/episode.txt", b"wide dictionary")],
+        ),
+    )
+    .unwrap();
+
+    let (root, budget) = test_extraction_security_with_memory(&out_dir, 8 * 1024 * 1024);
+    let context = conventional_7z_context(&out_dir, root, budget, 1);
+    let error = match extract_7z_stream(&context, || {
+        fs::File::open(&archive_path).map_err(|error| error.to_string())
+    }) {
+        Ok(_) => panic!("a 16 MiB dictionary was decoded under an 8 MiB ceiling"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.contains("MemoryLimited"),
+        "the refusal names the memory limit: {error}"
+    );
+    assert!(
+        !out_dir.join("Wide.Dictionary").exists(),
+        "nothing is created for an archive that was refused at open"
+    );
+}
+
+/// The conventional path decodes with as many threads as it is given, and a
+/// thread count wider than the archive has runs to give it changes nothing
+/// about the output.
+#[test]
+fn conventional_7z_extraction_decodes_with_the_threads_it_is_given() {
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("wide_dictionary.7z");
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let first: Vec<u8> = (0..(256 * 1024)).map(|index| (index % 251) as u8).collect();
+    let second: Vec<u8> = (0..(128 * 1024)).map(|index| (index % 239) as u8).collect();
+    fs::write(
+        &archive_path,
+        sevenz_archive_with_dictionary(
+            1024 * 1024,
+            &[
+                ("Wide.Dictionary/first.bin", &first),
+                ("Wide.Dictionary/second.bin", &second),
+            ],
+        ),
+    )
+    .unwrap();
+
+    let (root, budget) = test_extraction_security(&out_dir);
+    let context = conventional_7z_context(&out_dir, root, budget, 4);
+    let outcome = extract_7z_stream(&context, || {
+        fs::File::open(&archive_path).map_err(|error| error.to_string())
+    })
+    .expect("7z extraction");
+
+    assert_eq!(
+        outcome.extracted,
+        vec![
+            "Wide.Dictionary/first.bin".to_string(),
+            "Wide.Dictionary/second.bin".to_string(),
+        ]
+    );
+    assert_eq!(
+        fs::read(out_dir.join("Wide.Dictionary/first.bin")).unwrap(),
+        first
+    );
+    assert_eq!(
+        fs::read(out_dir.join("Wide.Dictionary/second.bin")).unwrap(),
+        second
+    );
 }
 
 fn phase_counters(total_bytes: u64, completed_bytes: u64) -> Arc<PhaseCounters> {

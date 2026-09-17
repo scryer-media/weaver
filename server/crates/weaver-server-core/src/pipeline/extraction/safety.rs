@@ -644,6 +644,17 @@ impl JobExtractionBudget {
         self.decoder_memory_limit
     }
 
+    /// Entries the whole job may create, before anything already counted.
+    pub(crate) fn max_entries(&self) -> u64 {
+        self.limits.max_entries
+    }
+
+    /// Bytes the whole job may write: the configured job limit, or the ratio
+    /// limit derived from the declared archive size when that is smaller.
+    pub(crate) fn job_limit_bytes(&self) -> u64 {
+        self.effective_job_limit_bytes
+    }
+
     pub(crate) fn check_member_metadata(&self, member: &str, bytes: u64) -> Result<(), String> {
         self.check_active().map_err(|error| error.to_string())?;
         if bytes > self.limits.max_member_bytes {

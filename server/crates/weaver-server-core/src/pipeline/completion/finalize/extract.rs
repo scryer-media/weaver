@@ -1,24 +1,25 @@
 use super::rar::{ArchiveSetRetirement, UnmaterializedArchiveSet};
 use super::*;
-use crate::pipeline::extraction::{BudgetedReader, RarExtractionOpenRequest};
+use crate::pipeline::extraction::{BudgetedReader, MemoryPermit, RarExtractionOpenRequest};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 pub(in crate::pipeline) mod sequential;
 
-static XZ_MT_DECODER_PERMIT: Mutex<()> = Mutex::new(());
-
-enum FilesystemXzDecoder<R: std::io::Read> {
-    Sequential(liblzma::read::XzDecoder<R>),
+/// The decoder an xz file on disk gets: single-threaded over the whole file,
+/// or block-parallel with the job's memory budget charged for exactly what the
+/// workers will hold.
+enum FilesystemXzDecoder<R: std::io::Read + std::io::Seek> {
+    Sequential(Box<lzma_fast::xz::XzReader<R>>),
     Parallel {
-        decoder: liblzma::read::XzDecoder<R>,
-        _permit: MutexGuard<'static, ()>,
+        decoder: Box<lzma_fast::xz::XzParallelReader<R>>,
+        _memory: MemoryPermit,
     },
 }
 
-impl<R: std::io::Read> std::io::Read for FilesystemXzDecoder<R> {
+impl<R: std::io::Read + std::io::Seek> std::io::Read for FilesystemXzDecoder<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Sequential(decoder) => decoder.read(buffer),
@@ -67,7 +68,7 @@ impl<W> CountingWriter<W> {
 /// epoch on it would be an invention. Only the modification time is required
 /// for a stamp — that is the one every tool records and the one the user
 /// sees; the access time rides along when present.
-fn sevenz_entry_times(entry: &sevenz_rust2::ArchiveEntry) -> Option<SevenZipEntryTimes> {
+fn sevenz_entry_times(entry: &sevenz_fast::ArchiveEntry) -> Option<SevenZipEntryTimes> {
     if !entry.has_last_modified_date {
         return None;
     }
@@ -124,10 +125,15 @@ pub(in crate::pipeline) struct SevenZipExtractionContext {
     pub(in crate::pipeline) output_dir: PathBuf,
     pub(in crate::pipeline) root: Arc<ExtractionRoot>,
     pub(in crate::pipeline) budget: Arc<JobExtractionBudget>,
-    pub(in crate::pipeline) password: sevenz_rust2::Password,
+    pub(in crate::pipeline) password: sevenz_fast::Password,
     pub(in crate::pipeline) event_tx: broadcast::Sender<PipelineEvent>,
     pub(in crate::pipeline) phase_counters: Arc<PhaseCounters>,
     pub(in crate::pipeline) decode_memory: SevenZipDecodeMemory,
+    /// Threads the LZMA2 decoder may use for a block that was written with
+    /// dictionary resets. One for a chase, whose output must start before the
+    /// block has finished downloading; the post-processing pool's width for
+    /// the conventional path, which has every byte on disk.
+    pub(in crate::pipeline) decode_threads: u32,
 }
 
 /// Who accounts for decoder memory while [`extract_7z_stream`] runs.
@@ -178,6 +184,30 @@ fn chase_header_pass_memory_bytes(end_header_bytes: u64) -> u64 {
     end_header_bytes.saturating_add(CHASE_HEADER_PASS_ALLOWANCE_BYTES)
 }
 
+/// What the 7z reader may allocate on the strength of an archive's own
+/// header, expressed as the job's extraction limits.
+///
+/// Every number in a 7z header is written by whoever made the archive: the
+/// end header's size, an encoded header's unpacked size, the entry and coder
+/// counts, each block's dictionary. The reader refuses an archive that
+/// exceeds these *before* it allocates for it, which is the only time a
+/// bound on an allocation means anything. The memory limit is the job's
+/// decoder ceiling, so a dictionary the operator's ceiling cannot hold is
+/// refused rather than allocated under a permit that pretends otherwise; it
+/// also bounds what a parallel decode keeps in flight. Entry paths are left
+/// to the extraction root, which checks each one against the directory it
+/// actually extracts into and words the rejection itself.
+fn sevenz_archive_limits(budget: &JobExtractionBudget) -> sevenz_fast::ArchiveLimits {
+    sevenz_fast::ArchiveLimits {
+        memory_limit_bytes: budget.max_memory_bytes(),
+        max_end_header_bytes: budget.max_memory_bytes(),
+        max_entries: budget.max_entries(),
+        max_unpack_bytes: budget.job_limit_bytes(),
+        reject_unsafe_paths: false,
+        ..sevenz_fast::ArchiveLimits::default()
+    }
+}
+
 /// Bytes a chase reserves for its decode pass, from what the archive declares.
 ///
 /// Never more than the ceiling: an archive whose decoders need more than the
@@ -188,7 +218,7 @@ fn chase_header_pass_memory_bytes(end_header_bytes: u64) -> u64 {
 fn chase_decode_memory_bytes(
     job_id: JobId,
     set_name: &str,
-    archive: &sevenz_rust2::Archive,
+    archive: &sevenz_fast::Archive,
     end_header_bytes: u64,
     ceiling: u64,
 ) -> u64 {
@@ -230,8 +260,8 @@ fn chase_decode_memory_bytes(
     wanted
 }
 
-/// The chase's decode pass: the same entry walk as the library's helper, on
-/// one thread.
+/// The decode pass: the library helper's entry walk, opened under the job's
+/// limits and with an explicit thread count.
 ///
 /// `extract_fn` receives the output directory where the helper would pass a
 /// per-entry destination; the shared extraction body validates every entry
@@ -239,15 +269,17 @@ fn chase_decode_memory_bytes(
 fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
     reader: R,
     output_dir: &Path,
-    password: sevenz_rust2::Password,
+    password: sevenz_fast::Password,
+    limits: sevenz_fast::ArchiveLimits,
+    threads: u32,
     mut extract_fn: impl FnMut(
-        &sevenz_rust2::ArchiveEntry,
+        &sevenz_fast::ArchiveEntry,
         &mut dyn std::io::Read,
         &PathBuf,
-    ) -> Result<bool, sevenz_rust2::Error>,
-) -> Result<(), sevenz_rust2::Error> {
-    let mut archive_reader = sevenz_rust2::ArchiveReader::new(reader, password)?;
-    archive_reader.set_thread_count(1);
+    ) -> Result<bool, sevenz_fast::Error>,
+) -> Result<(), sevenz_fast::Error> {
+    let mut archive_reader = sevenz_fast::ArchiveReader::with_limits(reader, password, limits)?;
+    archive_reader.set_threads(threads);
     if !output_dir.exists() {
         std::fs::create_dir_all(output_dir)?;
     }
@@ -292,6 +324,7 @@ where
         event_tx,
         phase_counters,
         decode_memory,
+        decode_threads,
     } = context;
     let job_id = *job_id;
 
@@ -309,8 +342,12 @@ where
             ),
         };
         let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
-        let archive_reader = sevenz_rust2::ArchiveReader::new(reader, password.clone())
-            .map_err(|e| format!("failed to read 7z archive: {e}"))?;
+        let archive_reader = sevenz_fast::ArchiveReader::with_limits(
+            reader,
+            password.clone(),
+            sevenz_archive_limits(budget),
+        )
+        .map_err(|e| format!("failed to read 7z archive: {e}"))?;
         for entry in &archive_reader.archive().files {
             budget.check_member_metadata(entry.name(), entry.size())?;
             root.validate_relative_path(entry.name())
@@ -371,10 +408,10 @@ where
     let root_ref = root;
     let budget_ref = budget;
 
-    let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
+    let extract_fn = |entry: &sevenz_fast::ArchiveEntry,
                       reader: &mut dyn std::io::Read,
                       _dest: &PathBuf|
-     -> Result<bool, sevenz_rust2::Error> {
+     -> Result<bool, sevenz_fast::Error> {
         let safe_path = root_ref
             .validate_relative_path(entry.name())
             .map_err(|error| std::io::Error::other(budget_ref.reject_unsafe_path(error)))?;
@@ -465,21 +502,21 @@ where
     };
 
     let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
-    match decode_memory {
-        SevenZipDecodeMemory::HeldByCaller => {
-            sevenz_rust2::decompress_with_extract_fn_and_password(
-                reader,
-                output_dir,
-                password.clone(),
-                extract_fn,
-            )
-            .map_err(|e| format!("7z extraction failed: {e}"))?;
-        }
-        SevenZipDecodeMemory::ReservedPerPass { .. } => {
-            decode_7z_streaming(reader, output_dir, password.clone(), extract_fn)
-                .map_err(|e| format!("7z extraction failed: {e}"))?;
-        }
-    }
+    let threads = match decode_memory {
+        SevenZipDecodeMemory::HeldByCaller => *decode_threads,
+        // A parallel LZMA2 decode buffers a run of chunks before it decodes
+        // any of them, and a chase must emit output as the block arrives.
+        SevenZipDecodeMemory::ReservedPerPass { .. } => 1,
+    };
+    decode_7z_streaming(
+        reader,
+        output_dir,
+        password.clone(),
+        sevenz_archive_limits(budget),
+        threads,
+        extract_fn,
+    )
+    .map_err(|e| format!("7z extraction failed: {e}"))?;
 
     // Deepest directories first: a directory's own stamp is the last thing
     // to touch it, and nothing below it is touched afterwards.
@@ -1315,17 +1352,23 @@ fn open_filesystem_xz_decoder(
     if matches!(
         crate::ingest::xz_filesystem_decoder_kind(&mut probe),
         crate::ingest::XzFilesystemDecoderKind::Parallel
-    ) && let Ok(permit) = XZ_MT_DECODER_PERMIT.try_lock()
-    {
+    ) {
         let file = std::fs::File::open(archive_path)
             .map_err(|error| format!("failed to open xz: {error}"))?;
         let file = BudgetedReader::new(file, Arc::clone(budget));
+        // The parallel reader plans every block from the index before it
+        // decodes anything, and trims its thread count until the workers fit
+        // under `memory_limit`; what it then reports is what the decode will
+        // hold at its peak, and that is what the job is charged for. A file
+        // whose structure it refuses goes to the sequential decoder, which is
+        // the one that validates it properly.
         if let Ok(decoder) =
             crate::ingest::xz_parallel_decoder(file, memory_limit, xz_worker_threads)
         {
+            let memory = budget.reserve_memory_wait(decoder.memory_estimate())?;
             return Ok(FilesystemXzDecoder::Parallel {
-                decoder,
-                _permit: permit,
+                decoder: Box::new(decoder),
+                _memory: memory,
             });
         }
     }
@@ -1334,7 +1377,7 @@ fn open_filesystem_xz_decoder(
         std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
     let file = BudgetedReader::new(file, Arc::clone(budget));
     crate::ingest::xz_multistream_decoder(file, memory_limit)
-        .map(FilesystemXzDecoder::Sequential)
+        .map(|decoder| FilesystemXzDecoder::Sequential(Box::new(decoder)))
         .map_err(|error| format!("failed to open xz decoder: {error}"))
 }
 
@@ -1932,6 +1975,8 @@ impl Pipeline {
         let extract_done_tx = self.extract_done_tx.clone();
         let set_name_for_channel = set_name.to_string();
         let pp_pool = self.pp_pool.clone();
+        let sevenz_decode_threads =
+            u32::try_from(pp_pool.current_num_threads()).unwrap_or(u32::MAX);
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
 
         // Whatever the chase left behind. Taken here, on the orchestrator, but
@@ -1977,9 +2022,9 @@ impl Pipeline {
                     }
 
                     let pw = if let Some(ref p) = password {
-                        sevenz_rust2::Password::new(p)
+                        sevenz_fast::Password::new(p)
                     } else {
-                        sevenz_rust2::Password::empty()
+                        sevenz_fast::Password::empty()
                     };
 
                     let context = SevenZipExtractionContext {
@@ -1992,6 +2037,7 @@ impl Pipeline {
                         event_tx,
                         phase_counters,
                         decode_memory: SevenZipDecodeMemory::HeldByCaller,
+                        decode_threads: sevenz_decode_threads,
                     };
 
                     // A one-part set is a plain file; anything more is the
