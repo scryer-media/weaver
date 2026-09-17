@@ -13,11 +13,13 @@ use weaver_model::files::{
 
 const PAR2_REPAIR_MEMORY_LIMIT_ENV: &str = "WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTES";
 // Sizes the transient streaming repair buffers (the decode matrix has its own
-// budget floor inside par2-rs). 64 MiB measured within noise of far
-// larger budgets on heavily damaged sets once streaming repair got its
-// batched kernels, so the default stays small and repairs coexist with
-// concurrent downloads; the env override remains for tuning.
-const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+// budget floor inside par2-rs). The default stays small so repairs coexist
+// with concurrent downloads, but not so small that a set with tens of
+// thousands of slices and thousands of missing ones is cut into many passes:
+// every pass over the sources has a fixed cost, and at 64 MiB the x86
+// generated-code kernel could not keep its compiled state beside a usable
+// chunk. The env override remains for tuning.
+const DEFAULT_PAR2_REPAIR_MEMORY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 
 const PAR2_IGNORE_EXTENSIONS_ENV: &str = "WEAVER_PAR2_IGNORE_EXTENSIONS";
 // Metadata that travels with a post rather than being part of it. Damage to
