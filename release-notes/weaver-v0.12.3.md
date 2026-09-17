@@ -79,6 +79,15 @@
 - Servers seeded from the environment are probed concurrently under one
   10-second deadline instead of holding startup one after another.
 
+### SSH proxies
+
+- **SSH proxy profiles accept Ed25519 host keys only**, over
+  `curve25519-sha256` key exchange. ECDSA host keys were accepted before; a
+  profile whose server offers only RSA or ECDSA host keys now fails to connect
+  with "no matching host key algorithm" until the server is given an Ed25519
+  key. Private keys were already Ed25519 only. The RSA, NIST-curve and ML-KEM
+  code is no longer built in.
+
 ### Logs page
 
 - **The Logs page no longer freezes the app.** Only the rows on screen are
