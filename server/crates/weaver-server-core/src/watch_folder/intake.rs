@@ -437,14 +437,14 @@ fn extract_7z_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, 
     };
     let temp = TempDir::new()
         .map_err(|error| IntakeError::Transient(format!("failed to create temp dir: {error}")))?;
-    let password = sevenz_fast::Password::empty();
+    let password = sevenz_turbo::Password::empty();
     let mut output = IntakeOutput::default();
     let mut cap_reached = false;
 
-    let mut extract_fn = |entry: &sevenz_fast::ArchiveEntry,
+    let mut extract_fn = |entry: &sevenz_turbo::ArchiveEntry,
                           reader: &mut dyn Read,
                           _dest: &PathBuf|
-     -> Result<bool, sevenz_fast::Error> {
+     -> Result<bool, sevenz_turbo::Error> {
         // An anti-item is a deletion marker with no data; read as a member it
         // would be an empty NZB.
         if entry.is_directory() || entry.is_anti_item() {
@@ -492,13 +492,13 @@ fn extract_7z_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, 
 
     // Bounded before anything is allocated on the header's say-so: the
     // input came from a folder anyone with write access can drop into.
-    let limits = sevenz_fast::ArchiveLimits {
+    let limits = sevenz_turbo::ArchiveLimits {
         memory_limit_bytes: MAX_7Z_INPUT_DECODER_BYTES,
         max_end_header_bytes: MAX_7Z_INPUT_END_HEADER_BYTES,
-        ..sevenz_fast::ArchiveLimits::default()
+        ..sevenz_turbo::ArchiveLimits::default()
     };
     let destination = temp.path().to_path_buf();
-    let result = sevenz_fast::ArchiveReader::with_limits(reader, password, limits).and_then(
+    let result = sevenz_turbo::ArchiveReader::with_limits(reader, password, limits).and_then(
         |mut archive_reader| {
             archive_reader.for_each_entries(|entry, reader| extract_fn(entry, reader, &destination))
         },

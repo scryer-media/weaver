@@ -3,8 +3,8 @@
 ## Highlights
 
 - **7z and xz archives are decoded by Weaver's own decoders.** LZMA, LZMA2
-  and xz streams now go through `lzma-fast`, a Rust port of 7-Zip's
-  reference decoder, and 7z archives through `sevenz-fast`, which is built on
+  and xz streams now go through `lzma-turbo`, a Rust port of 7-Zip's
+  reference decoder, and 7z archives through `sevenz-turbo`, which is built on
   it. Single-threaded decoding runs at 7-Zip's speed, and multi-block xz
   streams and 7z archives written with several threads decode in parallel.
 - **7z archives are bounded before they are believed.** Every size a 7z
