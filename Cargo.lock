@@ -2796,22 +2796,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "lzma-fast"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2df0054110ace19920f0b9ce16915895400133fa27fadebfd31eba0b529cfaa"
-dependencies = [
- "aws-lc-rs",
- "crc-fast",
-]
-
-[[package]]
 name = "lzma-rust2"
 version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
 dependencies = [
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "lzma-turbo"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb9ddb5508e387c70d89bb5c3014d8f1240bc0a766a5ced923a629ef8ca2573e"
+dependencies = [
+ "aws-lc-rs",
+ "crc-fast",
 ]
 
 [[package]]
@@ -4379,10 +4379,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "sevenz-fast"
-version = "0.23.0"
+name = "sevenz-turbo"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d821d5336ce07f55e364aae4a0cca587a3bb6393b881cf5bc666ac87e79731b1"
+checksum = "d2c2bd41caa32666ab1e123b13c011f2be4467fbfe90e592ad12cbb17d8fddd5"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -4393,8 +4393,8 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "lz4_flex",
- "lzma-fast",
  "lzma-rust2",
+ "lzma-turbo",
  "ppmd-rust",
  "wasm-bindgen",
  "zstd 0.14.0",
@@ -5653,7 +5653,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
- "sevenz-fast",
+ "sevenz-turbo",
  "tar",
  "tempfile",
  "tokio",
@@ -5785,8 +5785,8 @@ dependencies = [
  "keyring",
  "keyring-core",
  "libc",
- "lzma-fast",
  "lzma-rust2",
+ "lzma-turbo",
  "notify",
  "par2-rs",
  "par3-rs",
@@ -5802,7 +5802,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sevenz-fast",
+ "sevenz-turbo",
  "sha2 0.11.0",
  "sqlx",
  "tar",
