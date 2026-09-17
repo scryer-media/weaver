@@ -547,8 +547,11 @@ fn extract_empty_archive() {
     // Also, if the archive exists but is empty/invalid, sevenz-rust2 may fail to parse it.
     if archive_path.exists() {
         let file = fs::File::open(&archive_path).unwrap();
-        match sevenz_turbo::decompress_with_password(file, &out_dir, sevenz_turbo::Password::empty())
-        {
+        match sevenz_turbo::decompress_with_password(
+            file,
+            &out_dir,
+            sevenz_turbo::Password::empty(),
+        ) {
             Ok(()) => {
                 let extracted = read_dir_contents(&out_dir);
                 assert!(extracted.is_empty() || extracted.values().all(|v| v.is_empty()));
