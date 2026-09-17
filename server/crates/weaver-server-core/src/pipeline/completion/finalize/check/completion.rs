@@ -370,10 +370,12 @@ impl Pipeline {
             && !self.par2_metadata_discovery_closed(job_id)
             && self.promote_par2_metadata(job_id)
         {
-            info!(
-                job_id = job_id.0,
-                "waiting for bounded PAR2 metadata discovery before finalization"
-            );
+            if self.par2_discovery_wait_logged.insert(job_id) {
+                info!(
+                    job_id = job_id.0,
+                    "waiting for bounded PAR2 metadata discovery before finalization"
+                );
+            }
             self.transition_postprocessing_status(
                 job_id,
                 JobStatus::Downloading,

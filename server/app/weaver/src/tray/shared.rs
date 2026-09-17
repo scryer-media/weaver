@@ -81,6 +81,26 @@ pub(crate) fn desktop_profile_dir_from(application_data: &Path) -> PathBuf {
     application_data.join("ScryerMedia").join("Weaver")
 }
 
+/// Holds the version of the wrapper that last ran against this profile.
+const LAST_RUN_VERSION_FILE: &str = "desktop-version";
+
+/// Record `version` as the wrapper that ran against this profile, and report
+/// whether a different one ran before it. A new profile has no earlier run to
+/// differ from. The answer is yes once per upgrade: a marker that cannot be
+/// written answers no, so the caller's work is never repeated on every start.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn note_version_change(profile_dir: &Path, version: &str) -> bool {
+    let marker = profile_dir.join(LAST_RUN_VERSION_FILE);
+    let previous = std::fs::read_to_string(&marker).ok();
+    if previous.as_deref().map(str::trim) == Some(version) {
+        return false;
+    }
+    // A profile that already has a server log was used by a wrapper too old
+    // to leave a marker, and that is an upgrade too.
+    let upgraded = previous.is_some() || profile_dir.join("logs").join("weaver.log").exists();
+    std::fs::write(&marker, version).is_ok() && upgraded
+}
+
 /// Whether a navigation the app window is about to perform belongs in the
 /// user's browser instead.
 ///
@@ -1079,9 +1099,9 @@ mod tests {
     use super::{
         HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
         decode_chunked, desktop_profile_dir_from, format_bytes, format_speed, http_origin,
-        is_weaver_document, last_logged_error, logged_error_message, opens_in_external_browser,
-        parse_http_response, parse_setup_code_line, popover_content_from_graphql,
-        remove_desktop_profile, row_detail, set_cookie_value,
+        is_weaver_document, last_logged_error, logged_error_message, note_version_change,
+        opens_in_external_browser, parse_http_response, parse_setup_code_line,
+        popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
     };
 
     #[test]
@@ -1225,6 +1245,32 @@ mod tests {
 
         assert!(!root.path().join("ScryerMedia").exists());
         assert!(root.path().is_dir());
+    }
+
+    #[test]
+    fn a_version_change_is_reported_once_per_upgrade() {
+        let profile = tempfile::tempdir().unwrap();
+        // A first run has nothing earlier to differ from.
+        assert!(!note_version_change(profile.path(), "1.0.0"));
+        assert!(!note_version_change(profile.path(), "1.0.0"));
+        assert!(note_version_change(profile.path(), "1.1.0"));
+        assert!(!note_version_change(profile.path(), "1.1.0"));
+    }
+
+    #[test]
+    fn a_profile_from_before_the_marker_counts_as_upgraded() {
+        let profile = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(profile.path().join("logs")).unwrap();
+        std::fs::write(profile.path().join("logs").join("weaver.log"), b"log").unwrap();
+        assert!(note_version_change(profile.path(), "1.1.0"));
+        assert!(!note_version_change(profile.path(), "1.1.0"));
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_reports_no_change() {
+        let profile = tempfile::tempdir().unwrap();
+        let missing = profile.path().join("absent");
+        assert!(!note_version_change(&missing, "1.1.0"));
     }
 
     #[test]
