@@ -1926,7 +1926,8 @@ async fn stream_yenc_article_batches_large_decoded_output() {
 }
 
 #[tokio::test]
-async fn stream_yenc_article_reports_malformed_terminator_and_poisons_connection() {
+async fn stream_yenc_article_drains_trailer_junk_and_keeps_the_connection() {
+    let original = b"junk after the trailer";
     let port = spawn_scripted_server(
         vec![
             ScriptStep {
@@ -1941,7 +1942,7 @@ async fn stream_yenc_article_reports_malformed_terminator_and_poisons_connection
             },
             ScriptStep {
                 expect_prefix: Some("BODY "),
-                response: yenc_body_response(b"bad terminator", b"..\r\n"),
+                response: yenc_body_response(original, b"posted with some tool\r\n.\r\n"),
                 delay: Duration::ZERO,
             },
         ],
@@ -1952,16 +1953,14 @@ async fn stream_yenc_article_reports_malformed_terminator_and_poisons_connection
     let mut conn = NntpConnection::connect(&scripted_plain_config(port))
         .await
         .unwrap();
-    let err = conn
+    let article = conn
         .stream_yenc_article("<test@example.com>", |_| Ok(()))
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(
-        err,
-        FusedYencError::Nntp(NntpError::MalformedMultilineTerminator)
-    ));
-    assert!(conn.is_poisoned());
+    assert_eq!(article.to_data(), original);
+    assert!(article.stats.nntp_trailer_junk_bytes > 0);
+    assert!(!conn.is_poisoned());
 }
 
 #[tokio::test]

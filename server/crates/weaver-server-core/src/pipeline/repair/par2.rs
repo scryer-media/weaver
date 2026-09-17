@@ -1271,6 +1271,40 @@ impl Pipeline {
                     .then_some(*par2_file_id)
             })
             .collect::<Vec<_>>();
+        // Two names, two descriptions: the posted name of a swapped pair
+        // answers to the partner's description, and once the canonical name is
+        // known the file answers to both. Length breaks that tie whenever the
+        // pair differ in it — the description the file has already
+        // contradicted is the partner's. Refusing instead left the file without
+        // in-stream verdicts and handed a pure placement problem to the damage
+        // path. Only a tie is broken this way: a lone name match keeps its
+        // binding whatever the lengths say, because a short file at its own
+        // name is damage, and damage is what the verdicts are for.
+        let candidates = if candidates.len() > 1 {
+            let declared_size = self.file_declared_size.get(&file_id).copied();
+            let possible = candidates
+                .iter()
+                .copied()
+                .filter(|par2_file_id| {
+                    set.file_description(par2_file_id).is_some_and(|desc| {
+                        let contradicted = if file.is_complete() {
+                            file.received_bytes() != desc.length
+                        } else {
+                            file.received_bytes() > desc.length
+                        } || declared_size
+                            .is_some_and(|size| size != desc.length);
+                        !contradicted
+                    })
+                })
+                .collect::<Vec<_>>();
+            if possible.len() == 1 {
+                possible
+            } else {
+                candidates
+            }
+        } else {
+            candidates
+        };
         let par2_file_id = match candidates.len() {
             // Name binding, unchanged, and it always wins.
             1 => candidates[0],

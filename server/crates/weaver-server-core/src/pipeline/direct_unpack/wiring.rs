@@ -1234,12 +1234,7 @@ impl Pipeline {
         };
 
         if file_asm.is_complete() {
-            let filename = self.current_filename_for_file(job_id, file_asm);
-            let received = file_asm.received_bytes();
-            self.direct_unpack_note_commit(file_id, &filename, received, true);
-            // Its grid verdicts are final now, so this is when damage becomes
-            // knowable — and when the frontier has to stop short of it.
-            self.refresh_chased_part_by_filename(file_id, &filename, false);
+            self.publish_completed_part_to_chase(job_id, file_id);
         }
 
         let Some(state) = self.jobs.get(&job_id) else {
@@ -1555,6 +1550,11 @@ impl Pipeline {
         // The chase's own pool, never the shared post-processing one: `install`
         // holds a worker for as long as the closure runs, and this closure parks.
         let pp_pool = self.chase_pool.clone();
+        // How wide a 7z chase may decode once complete runs have piled up
+        // behind its frontier: the same width the conventional pass gets from
+        // its pool. These threads are the decoder's own, not pool workers; the
+        // chase keeps the one worker it was admitted on.
+        let decode_threads = u32::try_from(pp_pool.current_num_threads()).unwrap_or(u32::MAX);
         let db = self.db.clone();
         let cached_policy = self.unacceptable_extension_policies.get(&job_id).cloned();
         coverage.yield_to_memory_pressure(Arc::clone(&self.process_memory_budget));
@@ -1724,8 +1724,8 @@ impl Pipeline {
                     // threads, and for the pool when their right-sized needs
                     // genuinely exceed it. The 30-second wait warn names that.
                     let pw = match password {
-                        Some(ref value) => sevenz_rust2::Password::new(value),
-                        None => sevenz_rust2::Password::empty(),
+                        Some(ref value) => sevenz_turbo::Password::new(value),
+                        None => sevenz_turbo::Password::empty(),
                     };
 
                     // The chase is invisible: its member events go to a channel
@@ -1743,6 +1743,7 @@ impl Pipeline {
                         event_tx: silent_events,
                         phase_counters: counters,
                         decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
+                        decode_threads,
                     };
 
                     extract_7z_stream(&context, || {
@@ -2470,6 +2471,10 @@ impl Pipeline {
             return ChaseDisposition::None;
         }
 
+        // The last notices this chase will ever get: once it leaves `armed`,
+        // commit notices for its parts have nowhere to go.
+        self.publish_finished_parts_before_handoff(job_id, set_name);
+
         // A tainted chase is never still armed: tainting ends it on the spot.
         let Some(armed) = self.direct_unpack.armed.remove(&key) else {
             return ChaseDisposition::None;
@@ -2493,6 +2498,86 @@ impl Pipeline {
             coverage: armed.coverage,
             set_name: set_name.to_string(),
         })
+    }
+
+    /// Tell an armed chase about every one of its parts that has finished.
+    ///
+    /// Extraction can take a chase before the chase hears that its last part
+    /// finished: the segment commit that completes a part can start extraction
+    /// before the part's completion seam has published its floor. A worker
+    /// that misses that notice parks on bytes that are already on disk until
+    /// the consumption deadline.
+    ///
+    /// Watermark and completion only — never evidence. The set leaves `armed`
+    /// the moment this returns, and every reader of a gate — the completion
+    /// check that forces the authoritative PAR2 pass, the release after a
+    /// clean verdict, the release after repair — looks only at armed sets. A
+    /// gate raised here has nobody to lift it, and the worker parks on a
+    /// vouched prefix of zero until the deadline. Damage is published where it
+    /// can still be seen: at part completion, by
+    /// [`Self::publish_completed_part_to_chase`].
+    fn publish_finished_parts_before_handoff(&mut self, job_id: JobId, set_name: &str) {
+        let Some(targets) = self.direct_unpack.watermark_targets.get(&job_id) else {
+            return;
+        };
+        let parts: HashSet<&str> = targets
+            .iter()
+            .filter(|(_, (target_set, _))| target_set == set_name)
+            .map(|(filename, _)| filename.as_str())
+            .collect();
+        if parts.is_empty() {
+            return;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let finished: Vec<_> = state
+            .assembly
+            .files()
+            .filter(|file| file.is_complete())
+            .filter_map(|file| {
+                let filename = self.current_filename_for_file(job_id, file);
+                parts
+                    .contains(filename.as_str())
+                    .then(|| (file.file_id(), filename, file.received_bytes()))
+            })
+            .collect();
+        for (file_id, filename, received) in finished {
+            self.direct_unpack_note_commit(file_id, &filename, received, true);
+        }
+    }
+
+    /// Publish a completed part to the chase that owns it: its final
+    /// watermark, its completion, and what the recovery data says about it.
+    ///
+    /// Every chased format's completion seam ends here. The part's grid
+    /// verdicts are final now, so this is when damage becomes knowable — and
+    /// when the frontier has to stop short of it. It has to happen while the
+    /// set is still armed and before the archive's topology can declare
+    /// extraction ready: the completion check reads the gate from armed sets
+    /// only, and a gate it sees is what turns a clean strong-decode claim into
+    /// the authoritative PAR2 pass that repairs the part and resumes the chase.
+    pub(in crate::pipeline) fn publish_completed_part_to_chase(
+        &mut self,
+        job_id: JobId,
+        file_id: crate::jobs::ids::NzbFileId,
+    ) {
+        if self.direct_unpack.idle() {
+            return;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let Some(file_asm) = state.assembly.file(file_id) else {
+            return;
+        };
+        if !file_asm.is_complete() {
+            return;
+        }
+        let filename = self.current_filename_for_file(job_id, file_asm);
+        let received = file_asm.received_bytes();
+        self.direct_unpack_note_commit(file_id, &filename, received, true);
+        self.refresh_chased_part_by_filename(file_id, &filename, false);
     }
 
     /// Mark a set's chase unusable because repair replaced bytes it read.

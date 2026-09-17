@@ -538,7 +538,23 @@ impl HealthTracker {
         auth: bool,
     ) {
         let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
+        let probing = !success && ticket.probing();
+        let failures_before = self.servers[server_idx].failure_count;
         self.servers[server_idx].record_connection_outcome(ticket, success, auth, allow_ratio_trip);
+        // A ticket reports only its first failure, so the count moves once.
+        if probing && self.servers[server_idx].failure_count != failures_before {
+            Self::warn_probe_failed(server_idx, &self.servers[server_idx]);
+        }
+    }
+
+    /// One line per failed recovery probe: a server that never leaves
+    /// quarantine is otherwise invisible between throttled fetch-failure logs.
+    fn warn_probe_failed(server_idx: usize, health: &ServerHealth) {
+        tracing::warn!(
+            server = server_idx,
+            recovery_attempts = health.recovery_attempts,
+            "recovery probe failed; server stays quarantined until the next probe"
+        );
     }
 
     pub(crate) fn record_connection_cooldown(
@@ -555,6 +571,7 @@ impl HealthTracker {
             return;
         }
         if ticket.probing() {
+            Self::warn_probe_failed(idx, &self.servers[idx]);
             self.servers[idx].recovery_pending = true;
             self.servers[idx].recovery_attempts = self.servers[idx].recovery_attempts.max(1);
             self.servers[idx].state = ServerState::Degraded {

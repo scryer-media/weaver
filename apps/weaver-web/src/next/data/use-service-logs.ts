@@ -2,6 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "urql";
 import { getGraphqlWsClient, useGraphqlClient } from "@/graphql/client";
 import { SERVICE_LOGS_QUERY } from "@/graphql/queries";
+import {
+  LOG_LEVELS,
+  mergeSnapshot,
+  parseLogLine,
+  type LogKeyValue,
+  type LogLevel,
+  type LogLine,
+} from "./service-log-buffer";
 
 /**
  * The service log tail.
@@ -17,68 +25,9 @@ const INGEST_BATCH_MS = 50;
 const RENDER_BATCH_MS = 150;
 const SERVICE_LOG_LINES_SUB = `subscription ServiceLogLines { serviceLogLines }`;
 
-export const LOG_LEVELS = ["error", "warn", "info", "debug", "trace"] as const;
-export type LogLevel = (typeof LOG_LEVELS)[number];
+export { LOG_LEVELS };
+export type { LogKeyValue, LogLevel, LogLine };
 export type LogLevelFilter = LogLevel | "all";
-
-export interface LogKeyValue {
-  key: string;
-  value: string;
-  start: number;
-  end: number;
-}
-
-export interface LogLine {
-  id: number;
-  raw: string;
-  level: LogLevel;
-  /** `HH:MM:SS.mmm`, or the empty string when the line has no parseable stamp. */
-  time: string;
-  target: string;
-  message: string;
-  kvPairs: LogKeyValue[];
-}
-
-// Tracing's default format: {timestamp} {LEVEL} {target}: {message} {k=v ...}
-const TRACING_LINE_RE =
-  /^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2}))\s+(ERROR|WARN|INFO|DEBUG|TRACE)\s+([\w:]+):\s+(.*)/;
-const KV_RE = /(\w+)=("(?:[^"\\]|\\.)*"|\S+)/g;
-const LEVEL_RE = /\b(ERROR|WARN|WARNING|INFO|DEBUG|TRACE)\b/i;
-
-function detectLevel(line: string): LogLevel {
-  const match = LEVEL_RE.exec(line);
-  if (!match) return "info";
-  const value = match[1]!.toLowerCase();
-  return (value === "warning" ? "warn" : value) as LogLevel;
-}
-
-function timeOf(timestamp: string): string {
-  const match = /T(\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?)/.exec(timestamp);
-  return match ? match[1]! : timestamp;
-}
-
-function parse(id: number, raw: string): LogLine {
-  const match = TRACING_LINE_RE.exec(raw);
-  if (!match) {
-    return { id, raw, level: detectLevel(raw), time: "", target: "", message: raw, kvPairs: [] };
-  }
-  const body = match[4]!;
-  const kvPairs: LogKeyValue[] = [];
-  KV_RE.lastIndex = 0;
-  let kv: RegExpExecArray | null;
-  while ((kv = KV_RE.exec(body)) !== null) {
-    kvPairs.push({ key: kv[1]!, value: kv[2]!, start: kv.index, end: kv.index + kv[0].length });
-  }
-  return {
-    id,
-    raw,
-    level: match[2]!.toLowerCase() as LogLevel,
-    time: timeOf(match[1]!),
-    target: match[3]!,
-    message: body,
-    kvPairs,
-  };
-}
 
 export interface ServiceLogs {
   /** Oldest first, so the tail grows at the bottom like a terminal. */
@@ -127,7 +76,7 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
     }
     const next = bufferRef.current.slice();
     for (const raw of pending) {
-      next.push(parse(nextIdRef.current, raw));
+      next.push(parseLogLine(nextIdRef.current, raw));
       nextIdRef.current += 1;
     }
     bufferRef.current = next.length > BUFFER_MAX ? next.slice(next.length - BUFFER_MAX) : next;
@@ -144,26 +93,16 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
     if (!seed) {
       return;
     }
-    const seeded = seed.map((raw) => {
-      const line = parse(nextIdRef.current, raw);
-      nextIdRef.current += 1;
-      return line;
-    });
-    // The snapshot holds every line up to its newest, so a buffered line at or
-    // before that one — a subscription line that landed before the query
-    // answered, or the previous snapshot on a re-seed — is already in it.
-    const newest = seed[seed.length - 1];
-    const buffered = bufferRef.current;
-    let overlap = -1;
-    for (let index = buffered.length - 1; index >= 0; index -= 1) {
-      if (buffered[index]!.raw === newest) {
-        overlap = index;
-        break;
-      }
+    // A re-seed — the app replaces its GraphQL client whenever the window
+    // comes back to the foreground — mostly repeats what is on screen, and
+    // must not rebuild it. See `mergeSnapshot`.
+    const merged = mergeSnapshot(bufferRef.current, seed, nextIdRef.current, BUFFER_MAX);
+    nextIdRef.current = merged.nextId;
+    if (!merged.changed) {
+      return;
     }
-    const merged = [...seeded, ...buffered.slice(overlap + 1)];
-    bufferRef.current = merged.slice(-BUFFER_MAX);
-    setBuffer(bufferRef.current.slice());
+    bufferRef.current = merged.lines;
+    setBuffer(merged.lines.slice());
   }, [data]);
 
   // The app replaces its GraphQL client, socket included, when the page comes
@@ -171,10 +110,15 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
   const graphqlClient = useGraphqlClient();
   useEffect(() => {
     const client = getGraphqlWsClient();
+    // graphql-ws completes a sink some time after it is unsubscribed, which
+    // by then is after the next subscription has reported itself connected.
+    // A replaced subscription has nothing more to say about the tail.
+    let current = true;
     const unsubscribe = client.subscribe(
       { query: SERVICE_LOG_LINES_SUB },
       {
         next(result: { data?: { serviceLogLines?: string } }) {
+          if (!current) return;
           setConnected(true);
           const line = result.data?.serviceLogLines;
           // A paused tail drops new lines rather than buffering them: the
@@ -188,15 +132,16 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
           }
         },
         error() {
-          setConnected(false);
+          if (current) setConnected(false);
         },
         complete() {
-          setConnected(false);
+          if (current) setConnected(false);
         },
       },
     );
     setConnected(true);
     return () => {
+      current = false;
       unsubscribe();
       setConnected(false);
     };

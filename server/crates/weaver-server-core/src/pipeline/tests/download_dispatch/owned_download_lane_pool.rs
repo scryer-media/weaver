@@ -1558,6 +1558,119 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
     );
 }
 
+/// Fails `segment_id` on an established connection and returns the delay its
+/// retry was parked for plus the retry count the requeued work carries.
+async fn fail_segment_on_transport(
+    pipeline: &mut Pipeline,
+    segment_id: SegmentId,
+    retry_count: u32,
+) -> (Duration, u32) {
+    let job_id = segment_id.file_id.job_id;
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    let before = tokio::time::Instant::now();
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            runtime_generation: 0,
+            segment_id,
+            data: Err(DownloadError::from_nntp(
+                weaver_nntp::NntpError::ServerDisconnectedMidBody,
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(0),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+    let deadline = pipeline
+        .infrastructure_retries
+        .iter_with_deadlines()
+        .find_map(|(deadline, retry)| (retry.work.segment_id == segment_id).then_some(deadline))
+        .expect("transport failure parks a retry")
+        .expect("the parked retry is timed");
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("transport retry should requeue");
+    (
+        deadline.saturating_duration_since(before),
+        retry.retry_count,
+    )
+}
+
+#[tokio::test]
+async fn a_segment_that_keeps_breaking_connections_is_held_back_then_pays_for_retries() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20031);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Poison article", "poison.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+
+    let (delay, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+    assert!(
+        delay < Duration::from_secs(5),
+        "a first fault retries promptly"
+    );
+    assert_eq!(retry_count, 0);
+
+    // The repeat is held past the server recovery backoff, so the recovery
+    // probe carries some other segment.
+    let (delay, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+    assert!(delay > Duration::from_secs(60), "held for {delay:?}");
+    assert_eq!(retry_count, 0);
+
+    // Other articles downloading meanwhile makes the fault this article's.
+    pipeline
+        .metrics
+        .segments_downloaded
+        .fetch_add(1, Ordering::Relaxed);
+    let (_, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+    assert_eq!(retry_count, 1, "the article now spends its retry budget");
+}
+
+#[tokio::test]
+async fn an_outage_never_spends_article_retry_budget() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20032);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Outage", "outage.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+
+    for _ in 0..6 {
+        let (_, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+        assert_eq!(retry_count, 0, "nothing downloads in an outage");
+    }
+}
+
 #[test]
 fn lane_acquire_failure_preserves_retry_semantics() {
     for error in [

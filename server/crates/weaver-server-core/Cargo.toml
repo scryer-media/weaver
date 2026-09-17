@@ -17,7 +17,7 @@ weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false 
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
 weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
 par2-rs = { workspace = true, features = [
-    "native-crypto",
+    "crypto-aws-lc",
 ] }
 par3-rs = { workspace = true }
 # Already in the graph through par2-rs; named directly so System info can read
@@ -61,14 +61,14 @@ cap-fs-ext = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }
 bzip2 = { workspace = true }
-liblzma = { workspace = true }
 sqlx = { workspace = true }
 rmp-serde = { workspace = true, default-features = false }
 tempfile = { workspace = true }
 filetime = { workspace = true }
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
-sevenz-rust2 = { workspace = true }
+sevenz-turbo = { workspace = true }
+lzma-turbo = { workspace = true }
 argon2 = { workspace = true }
 getrandom = { workspace = true, default-features = false }
 hex = { workspace = true }
@@ -95,7 +95,7 @@ tempfile = { workspace = true }
 # tests need: they build their codec-matrix archives in-process rather than
 # checking in a fixture per chain. Test-only on purpose — the shipped binary
 # never encodes 7z.
-sevenz-rust2 = { workspace = true, features = ["compress"] }
+sevenz-turbo = { workspace = true, features = ["compress"] }
 axum = { workspace = true }
 criterion = "0.8"
 lzma-rust2 = { workspace = true, features = ["encoder"] }

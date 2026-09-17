@@ -644,6 +644,23 @@ impl JobExtractionBudget {
         self.decoder_memory_limit
     }
 
+    /// Decoder bytes this job holds right now.
+    #[cfg(test)]
+    pub(crate) fn memory_reserved_bytes(&self) -> u64 {
+        self.memory_reserved.load(Ordering::Acquire)
+    }
+
+    /// Entries the whole job may create, before anything already counted.
+    pub(crate) fn max_entries(&self) -> u64 {
+        self.limits.max_entries
+    }
+
+    /// Bytes the whole job may write: the configured job limit, or the ratio
+    /// limit derived from the declared archive size when that is smaller.
+    pub(crate) fn job_limit_bytes(&self) -> u64 {
+        self.effective_job_limit_bytes
+    }
+
     pub(crate) fn check_member_metadata(&self, member: &str, bytes: u64) -> Result<(), String> {
         self.check_active().map_err(|error| error.to_string())?;
         if bytes > self.limits.max_member_bytes {
@@ -1086,10 +1103,6 @@ impl<W: Write> Write for BudgetedWriter<W> {
 }
 
 impl BudgetedWriter<cap_std::fs::File> {
-    pub(crate) fn sync_all(&self) -> io::Result<()> {
-        self.inner.sync_all()
-    }
-
     /// Stamp the archive's recorded times on the finished output.
     ///
     /// Called after the last byte is written: the write itself moves the

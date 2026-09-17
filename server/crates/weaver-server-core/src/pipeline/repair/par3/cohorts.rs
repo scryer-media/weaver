@@ -5,8 +5,8 @@
 //! losses, so a window that fetches "any recovery article" can spend the whole
 //! byte budget on parity that will never be used. Everything here works from
 //! the engine's own `RecoveryRequirement` values; nothing infers capacity from
-//! a name, and a name is only ever used to *exclude* a carrier whose advertised
-//! span provably holds no admissible index.
+//! a name, and a name only ever orders carriers: one whose advertised span
+//! holds no admissible index is fetched after the rest, never dropped.
 
 use super::outcome::CohortDeficit;
 use par3_rs::session::RecoveryRequirement;

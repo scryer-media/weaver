@@ -69,6 +69,24 @@ use self::extraction::{
 
 /// Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
+/// Consecutive established-transport failures of one segment before its retry
+/// is held back past the server recovery backoff, so the next recovery probe
+/// carries different work.
+const SEGMENT_TRANSPORT_STREAK_HOLD: u32 = 2;
+/// Consecutive established-transport failures of one segment after which the
+/// fault is the article's, provided other segments downloaded meanwhile.
+const SEGMENT_TRANSPORT_STREAK_ARTICLE_LOCAL: u32 = 3;
+/// Longer than the longest server recovery backoff.
+const SEGMENT_TRANSPORT_HOLD_DELAY: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// A segment's run of established-transport failures.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TransportFailureStreak {
+    pub(super) failures: u32,
+    /// `segments_downloaded` when the run began; any advance since proves the
+    /// servers were serving other articles while this one kept failing.
+    pub(super) downloaded_at_start: u64,
+}
 const DOWNLOAD_RESTART_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
 const DOWNLOAD_RESTART_MAX_DURABLE_LEAD_MULTIPLIER: u64 = 4;
 const STALLED_DOWNLOAD_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -2846,6 +2864,11 @@ pub struct Pipeline {
     pub(super) pending_retries_by_job: HashMap<JobId, usize>,
     /// Delayed retry tasks by exact segment.
     pub(super) pending_retries_by_segment: HashMap<SegmentId, usize>,
+    /// Runs of established-transport failures by exact segment. Transport
+    /// faults keep the article retry budget, so an article that breaks every
+    /// connection it is fetched on would otherwise retry forever — and, as the
+    /// highest-priority work, be every recovery probe of its server.
+    pub(super) transport_failure_streaks: HashMap<SegmentId, TransportFailureStreak>,
     pub(super) download_wait_by_job: HashMap<JobId, DownloadWaitStatus>,
     /// The one terminal state each segment reached, and the only thing the
     /// per-job failed-byte ledger is derived from.
@@ -3389,6 +3412,10 @@ pub struct Pipeline {
     /// Jobs where all archive members extracted with CRC pass — PAR2
     /// verification/repair is unnecessary.
     pub(super) par2_bypassed: HashSet<JobId>,
+    /// Jobs whose wait for PAR2 metadata discovery has been logged. The
+    /// completion check comes round again for as long as discovery is open,
+    /// and the wait is news once.
+    pub(super) par2_discovery_wait_logged: HashSet<JobId>,
     /// Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
     /// Split sets a recovery set has already answered for, keyed by set name,

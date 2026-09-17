@@ -115,6 +115,12 @@ pub struct JobPipelineDiagnostics {
     pub infrastructure_retries_indefinite: Option<usize>,
     #[serde(default)]
     pub infrastructure_retry_next_deadline_epoch_ms: Option<f64>,
+    /// The segment with the longest run of established-transport failures, and
+    /// the run's length: the article to suspect when a server never recovers.
+    #[serde(default)]
+    pub worst_transport_failure_segment: Option<String>,
+    #[serde(default)]
+    pub worst_transport_failure_streak: Option<u32>,
 }
 
 /// Direct-store admission state for one job.
@@ -205,6 +211,16 @@ impl Pipeline {
             }
         }
 
+        let mut transport_streaks = std::collections::HashMap::new();
+        for (segment_id, streak) in &self.transport_failure_streaks {
+            let worst = transport_streaks
+                .entry(segment_id.file_id.job_id)
+                .or_insert((*segment_id, streak.failures));
+            if streak.failures > worst.1 {
+                *worst = (*segment_id, streak.failures);
+            }
+        }
+
         let mut jobs: Vec<JobPipelineDiagnostics> = self
             .jobs
             .iter()
@@ -267,6 +283,12 @@ impl Pipeline {
                         })
                         .to_string(),
                     ),
+                    worst_transport_failure_segment: transport_streaks
+                        .get(job_id)
+                        .map(|(segment_id, _)| segment_id.to_string()),
+                    worst_transport_failure_streak: transport_streaks
+                        .get(job_id)
+                        .map(|(_, failures)| *failures),
                     infrastructure_retries_timed: Some(timed),
                     infrastructure_retries_indefinite: Some(indefinite),
                     infrastructure_retry_next_deadline_epoch_ms: deadline.map(|deadline| {

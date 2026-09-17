@@ -10,6 +10,8 @@ direct access disabled is blocked.
 Profiles can be disabled without removing their assignments. Referenced
 profiles cannot be deleted. SSH requires an Ed25519 private key, including
 encrypted keys with passphrases. Password authentication is not supported.
+The server must offer an Ed25519 host key and `curve25519-sha256` key
+exchange; RSA and ECDSA host keys are not accepted.
 Successful authentication persists the first host-key fingerprint. Configured
 pins are checked during key exchange, and persisted trust is authorized again
 before every forwarded channel, including channels on cached sessions.

@@ -16,7 +16,7 @@
 //! meant to be exact to the byte; each entry is the decoder's dominant
 //! allocation plus a margin that covers its state and buffers.
 
-use sevenz_rust2::{Archive, EncoderMethod};
+use sevenz_turbo::{Archive, EncoderMethod};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -190,10 +190,10 @@ fn ppmd_model_bytes(method_id: &[u8], properties: &[u8]) -> Result<u64, UnsizedC
 mod tests {
     use std::io;
 
-    use sevenz_rust2::encoder_options::{
+    use sevenz_turbo::encoder_options::{
         AesEncoderOptions, EncoderOptions, Lzma2Options, PpmdOptions,
     };
-    use sevenz_rust2::{
+    use sevenz_turbo::{
         ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password,
         SourceReader,
     };

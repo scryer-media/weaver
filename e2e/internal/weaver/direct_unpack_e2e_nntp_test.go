@@ -20,6 +20,8 @@ type unpackArticle struct {
 	body    []byte
 	gate    *unpackGate
 	missing bool
+	// The connection ends partway through the body, on every request.
+	breaksConnection bool
 }
 
 type unpackGate struct {
@@ -150,6 +152,12 @@ func (s *unpackNNTP) serve(conn net.Conn) {
 				code = 220
 			}
 			if err = w.PrintfLine("%d 0 <%s>", code, id); err != nil {
+				return
+			}
+			if article.breaksConnection {
+				half := article.body[:len(article.body)/2]
+				_, _ = w.W.Write(bytes.ReplaceAll(half, []byte("\n"), []byte("\r\n")))
+				_ = w.W.Flush()
 				return
 			}
 			dot := w.DotWriter()

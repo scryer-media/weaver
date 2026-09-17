@@ -59,7 +59,7 @@ fn extract_with_sevenz(
     source: impl std::io::Read + std::io::Seek,
     dest: &Path,
 ) -> HashMap<String, Vec<u8>> {
-    sevenz_rust2::decompress_with_password(source, dest, sevenz_rust2::Password::empty()).unwrap();
+    sevenz_turbo::decompress_with_password(source, dest, sevenz_turbo::Password::empty()).unwrap();
     read_dir_contents(dest)
 }
 
@@ -445,10 +445,10 @@ fn extract_encrypted_7z() {
     ]);
 
     let file = fs::File::open(&archive_path).unwrap();
-    sevenz_rust2::decompress_with_password(
+    sevenz_turbo::decompress_with_password(
         file,
         &out_dir,
-        sevenz_rust2::Password::new("TestPass123"),
+        sevenz_turbo::Password::new("TestPass123"),
     )
     .unwrap();
 
@@ -476,10 +476,10 @@ fn extract_encrypted_7z_wrong_password_fails() {
     ]);
 
     let file = fs::File::open(&archive_path).unwrap();
-    let result = sevenz_rust2::decompress_with_password(
+    let result = sevenz_turbo::decompress_with_password(
         file,
         &out_dir,
-        sevenz_rust2::Password::new("WrongPassword"),
+        sevenz_turbo::Password::new("WrongPassword"),
     );
     assert!(result.is_err(), "should fail with wrong password");
 }
@@ -547,10 +547,10 @@ fn extract_empty_archive() {
     // Also, if the archive exists but is empty/invalid, sevenz-rust2 may fail to parse it.
     if archive_path.exists() {
         let file = fs::File::open(&archive_path).unwrap();
-        match sevenz_rust2::decompress_with_password(
+        match sevenz_turbo::decompress_with_password(
             file,
             &out_dir,
-            sevenz_rust2::Password::empty(),
+            sevenz_turbo::Password::empty(),
         ) {
             Ok(()) => {
                 let extracted = read_dir_contents(&out_dir);
@@ -590,11 +590,11 @@ fn extract_with_callback_pattern() {
     let mut extracted_count = 0u32;
     let out = out_dir.clone();
 
-    sevenz_rust2::decompress_with_extract_fn_and_password(
+    sevenz_turbo::decompress_with_extract_fn_and_password(
         file,
         &out_dir,
-        sevenz_rust2::Password::empty(),
-        |entry: &sevenz_rust2::ArchiveEntry, reader: &mut dyn Read, _dest: &PathBuf| {
+        sevenz_turbo::Password::empty(),
+        |entry: &sevenz_turbo::ArchiveEntry, reader: &mut dyn Read, _dest: &PathBuf| {
             if entry.is_directory() {
                 fs::create_dir_all(out.join(entry.name()))?;
                 return Ok(true);

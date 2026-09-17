@@ -1935,7 +1935,9 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
 
 async fn settle_inflight_moves(pipeline: &mut Pipeline) {
     while !pipeline.inflight_moves.is_empty() {
-        let done = tokio::time::timeout(Duration::from_secs(5), pipeline.move_done_rx.recv())
+        // The same bound the terminal-state driver gives a move: a loaded
+        // Windows runner can take seconds to close handles and scan the tree.
+        let done = tokio::time::timeout(Duration::from_secs(180), pipeline.move_done_rx.recv())
             .await
             .expect("final move result should arrive")
             .expect("move channel should stay open");

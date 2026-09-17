@@ -651,3 +651,44 @@ async fn codeless_setup_refuses_an_origin_from_another_host() {
     assert_eq!(outcome.payload["code"], "SETUP_LOCAL_ONLY");
     assert!(db.get_auth_credentials().unwrap().is_none());
 }
+
+#[tokio::test]
+async fn codeless_setup_refuses_another_port_on_the_same_host() {
+    let (db, app) = authenticated_setup_router(setup_code::SetupChallenge::open());
+    let outcome = post_setup_with_headers(
+        app,
+        administrator(),
+        &[
+            ("host", "127.0.0.1:9090"),
+            ("origin", "http://127.0.0.1:3000"),
+        ],
+    )
+    .await;
+
+    assert_eq!(outcome.status, StatusCode::FORBIDDEN, "{}", outcome.payload);
+    assert_eq!(outcome.payload["code"], "SETUP_LOCAL_ONLY");
+    assert!(db.get_auth_credentials().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn codeless_setup_matches_a_default_port_written_on_either_side() {
+    for (host, origin) in [
+        ("localhost", "http://localhost:80"),
+        ("localhost:80", "http://localhost"),
+        ("localhost", "https://localhost"),
+        ("[::1]:443", "https://[::1]"),
+    ] {
+        let (db, app) = authenticated_setup_router(setup_code::SetupChallenge::open());
+        let outcome =
+            post_setup_with_headers(app, administrator(), &[("host", host), ("origin", origin)])
+                .await;
+
+        assert_eq!(
+            outcome.status,
+            StatusCode::OK,
+            "{host} {origin}: {}",
+            outcome.payload
+        );
+        assert!(db.get_auth_credentials().unwrap().is_some());
+    }
+}

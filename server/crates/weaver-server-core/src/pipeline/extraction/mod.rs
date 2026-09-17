@@ -6,7 +6,7 @@ pub(crate) mod safety;
 pub(crate) use rar::{RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest};
 pub(crate) use safety::{
     BudgetedReader, BudgetedWriter, ExtractionLimits, ExtractionRoot, JobExtractionBudget,
-    ProcessMemoryBudget,
+    MemoryPermit, ProcessMemoryBudget,
 };
 
 /// Re-exported so the direct-store coverage snapshot gates its destination

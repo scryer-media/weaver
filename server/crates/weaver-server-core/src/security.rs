@@ -329,6 +329,11 @@ impl HttpAuthority {
         &self.host
     }
 
+    /// The port the authority names, if it names one.
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
     /// Whether the host is a literal address rather than a name, which is the
     /// part a DNS answer cannot repoint at a different machine.
     pub fn is_ip_literal(&self) -> bool {
