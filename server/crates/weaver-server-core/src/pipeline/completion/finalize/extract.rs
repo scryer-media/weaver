@@ -362,6 +362,7 @@ pub(in crate::pipeline) struct SevenZipDecodeReport {
 /// calls for; the decoder applies it at its next run boundary. It is scoped
 /// to the walk, so it is gone before this returns, whatever the walk's
 /// outcome.
+#[allow(clippy::too_many_arguments)]
 fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
     job_id: JobId,
     set_name: &str,
