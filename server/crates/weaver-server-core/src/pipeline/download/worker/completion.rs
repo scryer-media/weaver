@@ -672,7 +672,10 @@ impl Pipeline {
 
         match result.data {
             Ok(DownloadPayload::Raw(raw)) => {
-                self.transport_failure_streaks.remove(&result.segment_id);
+                // Empty unless something is failing: skip the hash per article.
+                if !self.transport_failure_streaks.is_empty() {
+                    self.transport_failure_streaks.remove(&result.segment_id);
+                }
                 let raw_size_bytes = raw.len() as u64;
                 let raw_size = raw.len() as u32;
                 self.metrics
@@ -699,7 +702,10 @@ impl Pipeline {
                 self.pump_decode_queue();
             }
             Ok(DownloadPayload::Decoded(decoded)) => {
-                self.transport_failure_streaks.remove(&result.segment_id);
+                // Empty unless something is failing: skip the hash per article.
+                if !self.transport_failure_streaks.is_empty() {
+                    self.transport_failure_streaks.remove(&result.segment_id);
+                }
                 let raw_size_bytes = decoded.raw_size;
                 let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
                 {
