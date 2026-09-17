@@ -4380,9 +4380,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.23.1"
+version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2c2bd41caa32666ab1e123b13c011f2be4467fbfe90e592ad12cbb17d8fddd5"
+checksum = "75881e12a7898d350b5accf0faf44ba6e0b25de1b2bb8c1623b298a26afbe926"
 dependencies = [
  "aes",
  "aws-lc-rs",
