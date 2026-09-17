@@ -2897,6 +2897,8 @@ dependencies = [
 [[package]]
 name = "lzma-fast"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2df0054110ace19920f0b9ce16915895400133fa27fadebfd31eba0b529cfaa"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -4630,6 +4632,8 @@ dependencies = [
 [[package]]
 name = "sevenz-fast"
 version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d821d5336ce07f55e364aae4a0cca587a3bb6393b881cf5bc666ac87e79731b1"
 dependencies = [
  "aes",
  "aws-lc-rs",
