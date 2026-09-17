@@ -3412,6 +3412,10 @@ pub struct Pipeline {
     /// Jobs where all archive members extracted with CRC pass — PAR2
     /// verification/repair is unnecessary.
     pub(super) par2_bypassed: HashSet<JobId>,
+    /// Jobs whose wait for PAR2 metadata discovery has been logged. The
+    /// completion check comes round again for as long as discovery is open,
+    /// and the wait is news once.
+    pub(super) par2_discovery_wait_logged: HashSet<JobId>,
     /// Jobs whose PAR2 set has already validated the current payload bytes.
     pub(super) par2_verified: HashSet<JobId>,
     /// Split sets a recovery set has already answered for, keyed by set name,

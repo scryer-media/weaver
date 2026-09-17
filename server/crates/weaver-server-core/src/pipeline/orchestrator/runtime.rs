@@ -472,6 +472,7 @@ impl Pipeline {
             normalization_retried: HashSet::new(),
             pending_concat: HashMap::new(),
             par2_bypassed: HashSet::new(),
+            par2_discovery_wait_logged: HashSet::new(),
             par2_verified: HashSet::new(),
             par2_joined_split_sets: HashMap::new(),
             par2_pre_repair_dir_entries: HashMap::new(),

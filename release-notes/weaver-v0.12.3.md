@@ -39,3 +39,21 @@
 - **AES-256 7z archives** are decrypted through the same AWS-LC backend the
   rest of Weaver's cryptography uses; the RustCrypto AES implementation is no
   longer built in.
+
+### Logs page
+
+- **The Logs page no longer freezes the app.** Only the rows on screen are
+  rendered, so a full 2000-line buffer costs what a screenful does. Bringing
+  the window back to the foreground used to re-number and redraw every line
+  and could leave the tail marked disconnected while it was connected; a
+  line now keeps its number for as long as it is buffered, and a refresh
+  that brings nothing new redraws nothing.
+- **A job waiting on PAR2 metadata says so once**, not every time its
+  completion check comes round.
+
+### Windows
+
+- **The new icon shows after an upgrade.** Windows caches an application's
+  icon by path, so an upgraded install could keep showing the previous
+  icon on the Start menu, taskbar and shortcut. The tray asks the shell to
+  read its icons again the first time it runs after a version change.

@@ -58,7 +58,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIN_POPUPCLOSE,
     NIN_POPUPOPEN, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
-    Shell_NotifyIconGetRect, Shell_NotifyIconW, ShellExecuteW,
+    SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, Shell_NotifyIconGetRect, Shell_NotifyIconW,
+    ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -207,8 +208,11 @@ pub(super) fn run() -> Result<(), String> {
     }
 
     let profile_dir = shared::desktop_profile_dir()?;
-    let supervisor = ServerSupervisor::new(profile_dir, DEFAULT_PORT);
+    let supervisor = ServerSupervisor::new(profile_dir.clone(), DEFAULT_PORT);
     supervisor.ensure_profile_dirs()?;
+    if shared::note_version_change(&profile_dir, env!("CARGO_PKG_VERSION")) {
+        refresh_shell_icons();
+    }
 
     // WebView2 is a COM API and this is the thread that will own it. The tray
     // works without it — the fallback is the user's browser — so a failure
@@ -320,6 +324,24 @@ fn launch_mode() -> Result<LaunchMode, String> {
             value.to_string_lossy()
         )),
     }
+}
+
+/// Have the shell read its icons again.
+///
+/// An upgrade replaces the executable in place, and the shell keys its icon
+/// cache on the path: the Start menu, the taskbar and the shortcut go on
+/// showing the icon the previous version carried until something says icons
+/// changed. Asked for once per upgrade, since every shell window redraws.
+fn refresh_shell_icons() {
+    // SAFETY: This event takes no items, so both item pointers are null.
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
 }
 
 /// Put this thread into a single-threaded apartment for WebView2.

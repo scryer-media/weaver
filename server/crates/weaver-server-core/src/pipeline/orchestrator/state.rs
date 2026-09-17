@@ -252,6 +252,7 @@ impl Pipeline {
         self.known_damaged_archive_sets.remove(&job_id);
         self.pending_concat.remove(&job_id);
         self.par2_bypassed.remove(&job_id);
+        self.par2_discovery_wait_logged.remove(&job_id);
         self.par2_verified.remove(&job_id);
         // The verdict that retired them is gone, so a reprocessed job rebuilds
         // its split topologies and asks the recovery set again.

@@ -1,4 +1,5 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { memo, useLayoutEffect, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { EmptyState } from "../components/chrome";
@@ -21,6 +22,9 @@ const CHIP_OFF = "#3a414f";
 /** How close to the bottom still counts as following the tail. */
 const TAIL_SLACK_PX = 24;
 
+/** A line that does not wrap. Wrapped lines are measured once they render. */
+const ROW_ESTIMATE_PX = 31;
+
 const FILTERS: LogLevelFilter[] = ["all", ...LOG_LEVELS];
 
 /** Split the message so its `key=value` tail can be tinted separately. */
@@ -40,6 +44,33 @@ function messageFragments(line: LogLine) {
   return fragments;
 }
 
+/**
+ * One line of the log. A buffered line is never edited, so a row renders once
+ * for as long as its line stays in view.
+ */
+const LogRow = memo(function LogRow({ line }: { line: LogLine }) {
+  return (
+    <div className="flex flex-wrap gap-x-[14px] gap-y-0.5 border-b border-wv-log-line px-4 sm:px-6 py-1.5 font-wv-mono text-[11.5px] leading-[1.55] sm:flex-nowrap">
+      <span className="w-[34px] flex-none text-right text-wv-dim">{line.id + 1}</span>
+      <span className="flex-none text-wv-faint">{line.time}</span>
+      <span
+        className="w-[44px] flex-none font-semibold uppercase"
+        style={{ color: LOG_LEVEL_COLORS[line.level] }}
+      >
+        {line.level}
+      </span>
+      <span className="min-w-0 flex-1 truncate text-wv-slate sm:flex-none">{line.target}</span>
+      <span className="w-full min-w-0 break-words text-wv-secondary sm:w-auto sm:flex-1">
+        {messageFragments(line).map((fragment, index) => (
+          <span key={index} className={fragment.kv ? "text-wv-info" : undefined}>
+            {fragment.text}
+          </span>
+        ))}
+      </span>
+    </div>
+  );
+});
+
 export function LogsPage() {
   const t = useTranslate();
   const [level, setLevel] = useState<LogLevelFilter>("all");
@@ -50,17 +81,34 @@ export function LogsPage() {
   // there as lines arrive — unless someone has scrolled up to read, in which
   // case new lines must not pull the text out from under them. A new filter is
   // a new view, and starts at its own tail.
+  //
+  // The buffer holds thousands of lines and grows several times a second, so
+  // only the lines in view are in the document: a row per buffered line meant
+  // a page-sized layout on every batch, which is enough to stall the window.
   const scrollerRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
+  const lines = logs.lines;
+  const virtualizer = useVirtualizer({
+    count: lines.length,
+    getScrollElement: () => scrollerRef.current,
+    getItemKey: (index) => lines[index]?.id ?? index,
+    estimateSize: () => ROW_ESTIMATE_PX,
+    overscan: 20,
+    useFlushSync: false,
+  });
+  const totalSize = virtualizer.getTotalSize();
   useLayoutEffect(() => {
     followingRef.current = true;
   }, [level, query]);
+  // Pinned again whenever the height changes as well as when lines arrive:
+  // the rows at the tail are measured after they render, and a wrapped one is
+  // taller than its estimate.
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;
     if (scroller && followingRef.current) {
       scroller.scrollTop = scroller.scrollHeight;
     }
-  }, [logs.lines]);
+  }, [lines, totalSize, level, query]);
   const onScroll = () => {
     const scroller = scrollerRef.current;
     if (scroller) {
@@ -146,31 +194,19 @@ export function LogsPage() {
             body={t("next.logs.noMatchBody")}
           />
         ) : (
-          logs.lines.map((line) => (
-            <div
-              key={line.id}
-              className="flex flex-wrap gap-x-[14px] gap-y-0.5 border-b border-wv-log-line px-4 sm:px-6 py-1.5 font-wv-mono text-[11.5px] leading-[1.55] sm:flex-nowrap"
-            >
-              <span className="w-[34px] flex-none text-right text-wv-dim">{line.id + 1}</span>
-              <span className="flex-none text-wv-faint">{line.time}</span>
-              <span
-                className="w-[44px] flex-none font-semibold uppercase"
-                style={{ color: LOG_LEVEL_COLORS[line.level] }}
+          <div className="relative w-full flex-none" style={{ height: totalSize }}>
+            {virtualizer.getVirtualItems().map((item) => (
+              <div
+                key={item.key}
+                ref={virtualizer.measureElement}
+                data-index={item.index}
+                className="absolute top-0 left-0 w-full"
+                style={{ transform: `translateY(${item.start}px)` }}
               >
-                {line.level}
-              </span>
-              <span className="min-w-0 flex-1 truncate text-wv-slate sm:flex-none">
-                {line.target}
-              </span>
-              <span className="w-full min-w-0 break-words text-wv-secondary sm:w-auto sm:flex-1">
-                {messageFragments(line).map((fragment, index) => (
-                  <span key={index} className={fragment.kv ? "text-wv-info" : undefined}>
-                    {fragment.text}
-                  </span>
-                ))}
-              </span>
-            </div>
-          ))
+                <LogRow line={lines[item.index]!} />
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </NextShell>
