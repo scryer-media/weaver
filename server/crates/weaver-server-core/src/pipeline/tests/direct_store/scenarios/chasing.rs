@@ -179,6 +179,23 @@ async fn rar_chase_settle_ignores_partial_topology_but_fences_reordered_parts() 
     );
 }
 
+/// Land one article's bytes at their offset, as the decode path does: a
+/// positioned write into the volume, never a truncating rewrite of it. The
+/// chase worker is already reading the first article's bytes, and a truncate
+/// under it hands it an empty header.
+fn write_article_in_place(path: &Path, offset: usize, article: &[u8]) {
+    use std::io::{Seek, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    file.seek(std::io::SeekFrom::Start(offset as u64)).unwrap();
+    file.write_all(article).unwrap();
+    file.sync_data().unwrap();
+}
+
 /// Extraction can take a chase before the chase hears that its last part
 /// finished: the commit that completes a part can start extraction before it
 /// publishes the part's floor. The handoff has to tell the chase, or the
@@ -209,8 +226,8 @@ async fn handing_a_chase_to_extraction_publishes_parts_that_finished_unheard() {
 
     // The last article reaches the disk and the assembly, and its notice
     // never reaches the chase.
-    std::fs::write(working_dir.join("mixed.rar"), &bytes).unwrap();
     let (start, end) = article_extent(bytes.len(), 1, 2);
+    write_article_in_place(&working_dir.join("mixed.rar"), start, &bytes[start..end]);
     let file = pipeline
         .jobs
         .get_mut(&job_id)
@@ -587,4 +604,188 @@ async fn a_demotion_refetch_keeps_another_articles_scheduled_retry_pending() {
     assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
     assert!(!pipeline.pending_retries_by_segment.contains_key(&retrying));
     assert!(peek_queued_segments(&mut pipeline, job_id).contains(&(2, 0)));
+}
+
+/// The block size the recovery set below describes its volume on: two blocks
+/// over the fixture, so damage in the first leaves a second the set could
+/// still vouch for.
+const DAMAGE_SLICE: u64 = 128;
+
+/// A single-volume RAR chase armed on its first article, then completed by a
+/// second article the chase never hears about, with a real recovery set whose
+/// grid holds a Damaged verdict for the volume's first block.
+///
+/// Returns the pipeline, the working directory and the volume bytes. The
+/// chase is still armed and still ungated: what happens next is the test.
+async fn armed_chase_completed_with_damaged_block_zero(
+    temp_dir: &tempfile::TempDir,
+    job_id: JobId,
+) -> (Pipeline, std::path::PathBuf, Vec<u8>) {
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Disabled);
+    pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+        gate: DirectUnpackGate::Enabled,
+    });
+    let bytes = rar5_fixture_bytes("rar5_multifile_lz.rar");
+    let volumes = vec![("mixed.rar".to_string(), bytes.clone())];
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        direct_store_job_spec("Damaged first block", &volumes),
+    )
+    .await;
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, "mixed")
+        .expect("armed on the first article");
+    assert!(!coverage.part_is_complete(0));
+
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set_for_files(&[("mixed.rar", &bytes)], DAMAGE_SLICE, 1),
+        &[],
+    );
+
+    // The last article reaches the disk and the assembly, and its notice
+    // never reaches the chase.
+    let (start, end) = article_extent(bytes.len(), 1, 2);
+    write_article_in_place(&working_dir.join("mixed.rar"), start, &bytes[start..end]);
+    let file = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .file_mut(file_id)
+        .unwrap();
+    file.commit_segment(1, (end - start) as u32).unwrap();
+    assert!(file.is_complete());
+
+    // The grid's verdicts, cut on the recovery set's own blocks: the first
+    // block's bytes do not match what the set describes, the rest do.
+    let plan = pipeline.par2_checkpoint_plan(job_id);
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let end = (offset + DAMAGE_SLICE as usize).min(bytes.len());
+        let chunk = &bytes[offset..end];
+        let mut crc32 = par2_rs::checksum::crc32(chunk);
+        if offset == 0 {
+            crc32 = !crc32;
+        }
+        pipeline.note_block_crc_segments_for_plan(
+            file_id,
+            &plan,
+            offset as u64,
+            chunk.len() as u64,
+            crc32,
+            true,
+            false,
+            &[weaver_yenc::Segment {
+                file_offset: offset as u64,
+                len: chunk.len() as u64,
+                crc32,
+            }],
+        );
+        offset = end;
+    }
+    pipeline
+        .block_crcs
+        .note_file_len(file_id, bytes.len() as u64);
+    assert_eq!(
+        pipeline.in_stream_chase_evidence(file_id),
+        Some((Some(0), 0)),
+        "non-vacuity: the recovery data has to report damage at byte zero"
+    );
+    assert!(!coverage.is_gated(), "nothing has published the damage yet");
+    assert!(pipeline.direct_unpack_gated_sets(job_id).is_empty());
+    (pipeline, working_dir, bytes)
+}
+
+/// A RAR volume that completes after its chase armed publishes what the
+/// recovery data says about it at the completion seam — while the set is still
+/// armed, so the completion check can see the gate, force the authoritative
+/// PAR2 pass, and let the repair resume the chase.
+#[tokio::test]
+async fn a_rar_part_completing_after_arming_gates_the_chase_where_finalize_can_see_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41956);
+    let (mut pipeline, _, _) =
+        armed_chase_completed_with_damaged_block_zero(&temp_dir, job_id).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, "mixed")
+        .unwrap();
+
+    pipeline
+        .refresh_archive_state_for_completed_file(job_id, file_id, false)
+        .await;
+
+    assert!(
+        coverage.part_is_complete(0),
+        "the seam publishes completion"
+    );
+    assert!(
+        coverage.is_gated(),
+        "the seam publishes the damage the recovery data reports"
+    );
+    assert!(
+        pipeline.direct_unpack.is_armed(job_id, "mixed"),
+        "and the set is still armed, so the gate can be seen"
+    );
+    assert_eq!(
+        pipeline.direct_unpack_gated_sets(job_id),
+        vec!["mixed".to_string()],
+        "finalize reads the gate from armed sets"
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// The handoff to extraction publishes completion, never a gate. A gate raised
+/// as the set leaves `armed` has nobody to lift it: the completion check and
+/// both release paths read gates from armed sets only, and the worker would
+/// park on a vouched prefix of zero until the consumption deadline.
+#[tokio::test]
+async fn handing_a_chase_to_extraction_never_raises_a_gate() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41957);
+    let (mut pipeline, _, bytes) =
+        armed_chase_completed_with_damaged_block_zero(&temp_dir, job_id).await;
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, "mixed")
+        .unwrap();
+
+    let disposition = pipeline.take_direct_unpack_disposition(job_id, "mixed");
+    let crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) = disposition
+    else {
+        panic!("the armed chase must be handed over while it runs");
+    };
+    assert!(
+        coverage.part_is_complete(0),
+        "the handoff publishes completion"
+    );
+    assert!(
+        !coverage.is_gated(),
+        "a gate raised at handoff can never be lifted; the handoff must not raise one"
+    );
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(20), pending.handle)
+        .await
+        .expect("the chase must finish once the handoff publishes the finished part");
+    let outcome = joined.unwrap().unwrap();
+    assert_eq!(
+        outcome.extracted.len(),
+        unrar_rs::RarArchive::open(std::io::Cursor::new(bytes))
+            .unwrap()
+            .len()
+    );
 }

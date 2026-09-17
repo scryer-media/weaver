@@ -209,6 +209,10 @@ impl Pipeline {
 
         match self.classified_role_for_file(job_id, file) {
             FileRole::RarVolume { .. } => {
+                // Before the topology: a volume completing can make the set
+                // ready, and the completion check that follows must already
+                // see any gate the volume's recovery verdicts raise.
+                self.publish_completed_part_to_chase(job_id, file_id);
                 self.try_update_archive_topology(job_id, file_id).await;
             }
             FileRole::SevenZipArchive
