@@ -243,6 +243,8 @@ impl Pipeline {
         self.pending_retries_by_job.remove(&job_id);
         self.pending_retries_by_segment
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        self.transport_failure_streaks
+            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.cancel_infrastructure_retries_for_job(job_id);
         self.download_wait_by_job.remove(&job_id);
         self.clear_terminal_segment_failures(job_id);
