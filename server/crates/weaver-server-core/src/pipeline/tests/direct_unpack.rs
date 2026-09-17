@@ -2892,8 +2892,8 @@ async fn consumption_gives_up_on_a_chase_that_never_finishes() {
 /// An in-process LZMA2 archive with a known dictionary, so the reservation a
 /// chase takes for it can be computed and compared exactly.
 fn sized_lzma2_archive(dictionary: u32, members: &[(String, Vec<u8>)]) -> Vec<u8> {
-    use sevenz_rust2::encoder_options::Lzma2Options;
-    use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
+    use sevenz_fast::encoder_options::Lzma2Options;
+    use sevenz_fast::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
 
     let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).expect("writer");
     let mut options = Lzma2Options::from_level(5);
@@ -3006,10 +3006,11 @@ fn chase_context(
         ),
         output_dir,
         budget,
-        password: sevenz_rust2::Password::empty(),
+        password: sevenz_fast::Password::empty(),
         event_tx: events,
         phase_counters: std::sync::Arc::new(crate::jobs::PhaseCounters::default()),
         decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
+        decode_threads: 1,
     }
 }
 
@@ -3050,9 +3051,9 @@ async fn a_chase_reserves_its_decoders_not_the_ceiling() {
     ];
     let archive = sized_lzma2_archive(dictionary, &members);
     let header = StartHeader::parse(&archive[..32]).expect("signature header");
-    let parsed = sevenz_rust2::ArchiveReader::new(
+    let parsed = sevenz_fast::ArchiveReader::new(
         std::io::Cursor::new(archive.clone()),
-        sevenz_rust2::Password::empty(),
+        sevenz_fast::Password::empty(),
     )
     .expect("parse");
     let decoders =

@@ -35,8 +35,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use sevenz_rust2::encoder_options::{AesEncoderOptions, DeltaOptions, EncoderOptions};
-use sevenz_rust2::{
+use sevenz_fast::encoder_options::{AesEncoderOptions, DeltaOptions, EncoderOptions};
+use sevenz_fast::{
     ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password, SourceReader,
 };
 
@@ -243,7 +243,7 @@ fn extract_members<R: Read + Seek>(reader: R, password: Password) -> BTreeMap<St
     let extracted = Arc::new(Mutex::new(BTreeMap::new()));
     let sink = Arc::clone(&extracted);
 
-    sevenz_rust2::decompress_with_extract_fn_and_password(
+    sevenz_fast::decompress_with_extract_fn_and_password(
         reader,
         dest.path(),
         password,

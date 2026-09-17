@@ -1550,6 +1550,11 @@ impl Pipeline {
         // The chase's own pool, never the shared post-processing one: `install`
         // holds a worker for as long as the closure runs, and this closure parks.
         let pp_pool = self.chase_pool.clone();
+        // How wide a 7z chase may decode once complete runs have piled up
+        // behind its frontier: the same width the conventional pass gets from
+        // its pool. These threads are the decoder's own, not pool workers; the
+        // chase keeps the one worker it was admitted on.
+        let decode_threads = u32::try_from(pp_pool.current_num_threads()).unwrap_or(u32::MAX);
         let db = self.db.clone();
         let cached_policy = self.unacceptable_extension_policies.get(&job_id).cloned();
         coverage.yield_to_memory_pressure(Arc::clone(&self.process_memory_budget));
@@ -1719,8 +1724,8 @@ impl Pipeline {
                     // threads, and for the pool when their right-sized needs
                     // genuinely exceed it. The 30-second wait warn names that.
                     let pw = match password {
-                        Some(ref value) => sevenz_rust2::Password::new(value),
-                        None => sevenz_rust2::Password::empty(),
+                        Some(ref value) => sevenz_fast::Password::new(value),
+                        None => sevenz_fast::Password::empty(),
                     };
 
                     // The chase is invisible: its member events go to a channel
@@ -1738,6 +1743,7 @@ impl Pipeline {
                         event_tx: silent_events,
                         phase_counters: counters,
                         decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
+                        decode_threads,
                     };
 
                     extract_7z_stream(&context, || {

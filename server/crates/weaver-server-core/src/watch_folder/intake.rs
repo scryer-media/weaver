@@ -9,6 +9,14 @@ use crate::security::RuntimeSecurityConfig;
 
 const MAX_NZB_MEMBERS_PER_INPUT: usize = 256;
 const MAX_TOTAL_NZB_BYTES_PER_INPUT: u64 = 512 * 1024 * 1024;
+/// Largest end header a 7z input dropped into a watch folder may declare.
+/// The header is buffered whole before it can be parsed, and an input that
+/// carries NZBs describes at most a few hundred members.
+const MAX_7Z_INPUT_END_HEADER_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest decoder footprint a 7z input may ask for. 7-Zip's own `-mx9`
+/// writes a 64 MiB dictionary; this leaves room for an operator's hand-set
+/// one without letting a header allocate gigabytes.
+const MAX_7Z_INPUT_DECODER_BYTES: u64 = 512 * 1024 * 1024;
 
 trait ReadSeek: Read + Seek + Send {}
 impl<T: Read + Seek + Send> ReadSeek for T {}
@@ -429,14 +437,14 @@ fn extract_7z_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, 
     };
     let temp = TempDir::new()
         .map_err(|error| IntakeError::Transient(format!("failed to create temp dir: {error}")))?;
-    let password = sevenz_rust2::Password::empty();
+    let password = sevenz_fast::Password::empty();
     let mut output = IntakeOutput::default();
     let mut cap_reached = false;
 
-    let extract_fn = |entry: &sevenz_rust2::ArchiveEntry,
-                      reader: &mut dyn Read,
-                      _dest: &PathBuf|
-     -> Result<bool, sevenz_rust2::Error> {
+    let mut extract_fn = |entry: &sevenz_fast::ArchiveEntry,
+                          reader: &mut dyn Read,
+                          _dest: &PathBuf|
+     -> Result<bool, sevenz_fast::Error> {
         // An anti-item is a deletion marker with no data; read as a member it
         // would be an empty NZB.
         if entry.is_directory() || entry.is_anti_item() {
@@ -482,11 +490,18 @@ fn extract_7z_nzbs(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, 
         Ok(true)
     };
 
-    let result = sevenz_rust2::decompress_with_extract_fn_and_password(
-        reader,
-        temp.path(),
-        password,
-        extract_fn,
+    // Bounded before anything is allocated on the header's say-so: the
+    // input came from a folder anyone with write access can drop into.
+    let limits = sevenz_fast::ArchiveLimits {
+        memory_limit_bytes: MAX_7Z_INPUT_DECODER_BYTES,
+        max_end_header_bytes: MAX_7Z_INPUT_END_HEADER_BYTES,
+        ..sevenz_fast::ArchiveLimits::default()
+    };
+    let destination = temp.path().to_path_buf();
+    let result = sevenz_fast::ArchiveReader::with_limits(reader, password, limits).and_then(
+        |mut archive_reader| {
+            archive_reader.for_each_entries(|entry, reader| extract_fn(entry, reader, &destination))
+        },
     );
     if let Err(error) = result {
         let reason = format!("7z extraction failed: {error}");

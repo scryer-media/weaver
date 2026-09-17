@@ -70,7 +70,9 @@ fn fixture(kind: SimpleArchiveKind) -> (String, Vec<u8>, MemberFiles) {
             )
         }
         SimpleArchiveKind::TarXz | SimpleArchiveKind::Xz => {
-            let mut encoder = liblzma::write::XzEncoder::new(Vec::new(), 0);
+            let mut encoder =
+                lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(0))
+                    .unwrap();
             encoder.write_all(&input).unwrap();
             (
                 if tar { "tar.xz" } else { "bin.xz" },
