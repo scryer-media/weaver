@@ -50,7 +50,7 @@ rust-embed = { workspace = true, default-features = false }
 mime_guess = { workspace = true }
 tokio-util = { workspace = true, features = ["io"] }
 zstd = { workspace = true }
-sevenz-fast = { workspace = true }
+sevenz-turbo = { workspace = true }
 zip = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }

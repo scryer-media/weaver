@@ -1724,8 +1724,8 @@ impl Pipeline {
                     // threads, and for the pool when their right-sized needs
                     // genuinely exceed it. The 30-second wait warn names that.
                     let pw = match password {
-                        Some(ref value) => sevenz_fast::Password::new(value),
-                        None => sevenz_fast::Password::empty(),
+                        Some(ref value) => sevenz_turbo::Password::new(value),
+                        None => sevenz_turbo::Password::empty(),
                     };
 
                     // The chase is invisible: its member events go to a channel

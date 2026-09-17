@@ -14,9 +14,9 @@ pub(in crate::pipeline) mod sequential;
 /// or block-parallel with the job's memory budget charged for exactly what the
 /// workers will hold.
 enum FilesystemXzDecoder<R: std::io::Read + std::io::Seek> {
-    Sequential(Box<lzma_fast::xz::XzReader<R>>),
+    Sequential(Box<lzma_turbo::xz::XzReader<R>>),
     Parallel {
-        decoder: Box<lzma_fast::xz::XzParallelReader<R>>,
+        decoder: Box<lzma_turbo::xz::XzParallelReader<R>>,
         _memory: MemoryPermit,
     },
 }
@@ -70,7 +70,7 @@ impl<W> CountingWriter<W> {
 /// epoch on it would be an invention. Only the modification time is required
 /// for a stamp — that is the one every tool records and the one the user
 /// sees; the access time rides along when present.
-fn sevenz_entry_times(entry: &sevenz_fast::ArchiveEntry) -> Option<SevenZipEntryTimes> {
+fn sevenz_entry_times(entry: &sevenz_turbo::ArchiveEntry) -> Option<SevenZipEntryTimes> {
     if !entry.has_last_modified_date {
         return None;
     }
@@ -127,7 +127,7 @@ pub(in crate::pipeline) struct SevenZipExtractionContext {
     pub(in crate::pipeline) output_dir: PathBuf,
     pub(in crate::pipeline) root: Arc<ExtractionRoot>,
     pub(in crate::pipeline) budget: Arc<JobExtractionBudget>,
-    pub(in crate::pipeline) password: sevenz_fast::Password,
+    pub(in crate::pipeline) password: sevenz_turbo::Password,
     pub(in crate::pipeline) event_tx: broadcast::Sender<PipelineEvent>,
     pub(in crate::pipeline) phase_counters: Arc<PhaseCounters>,
     pub(in crate::pipeline) decode_memory: SevenZipDecodeMemory,
@@ -238,14 +238,14 @@ fn chase_header_pass_memory_bytes(end_header_bytes: u64) -> u64 {
 /// also bounds what a parallel decode keeps in flight. Entry paths are left
 /// to the extraction root, which checks each one against the directory it
 /// actually extracts into and words the rejection itself.
-fn sevenz_archive_limits(budget: &JobExtractionBudget) -> sevenz_fast::ArchiveLimits {
-    sevenz_fast::ArchiveLimits {
+fn sevenz_archive_limits(budget: &JobExtractionBudget) -> sevenz_turbo::ArchiveLimits {
+    sevenz_turbo::ArchiveLimits {
         memory_limit_bytes: budget.max_memory_bytes(),
         max_end_header_bytes: budget.max_memory_bytes(),
         max_entries: budget.max_entries(),
         max_unpack_bytes: budget.job_limit_bytes(),
         reject_unsafe_paths: false,
-        ..sevenz_fast::ArchiveLimits::default()
+        ..sevenz_turbo::ArchiveLimits::default()
     }
 }
 
@@ -262,7 +262,7 @@ fn sevenz_archive_limits(budget: &JobExtractionBudget) -> sevenz_fast::ArchiveLi
 fn chase_decode_memory_bytes(
     job_id: JobId,
     set_name: &str,
-    archive: &sevenz_fast::Archive,
+    archive: &sevenz_turbo::Archive,
     end_header_bytes: u64,
     decode_threads: u32,
     ceiling: u64,
@@ -368,22 +368,22 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
     set_name: &str,
     reader: R,
     output_dir: &Path,
-    password: sevenz_fast::Password,
-    limits: sevenz_fast::ArchiveLimits,
+    password: sevenz_turbo::Password,
+    limits: sevenz_turbo::ArchiveLimits,
     threads: SevenZipDecodeThreads,
     mut extract_fn: impl FnMut(
-        &sevenz_fast::ArchiveEntry,
+        &sevenz_turbo::ArchiveEntry,
         &mut dyn std::io::Read,
         &PathBuf,
-    ) -> Result<bool, sevenz_fast::Error>,
-) -> Result<SevenZipDecodeReport, sevenz_fast::Error> {
-    let mut archive_reader = sevenz_fast::ArchiveReader::with_limits(reader, password, limits)?;
+    ) -> Result<bool, sevenz_turbo::Error>,
+) -> Result<SevenZipDecodeReport, sevenz_turbo::Error> {
+    let mut archive_reader = sevenz_turbo::ArchiveReader::with_limits(reader, password, limits)?;
     if !output_dir.exists() {
         std::fs::create_dir_all(output_dir)?;
     }
     let destination = output_dir.to_path_buf();
     let mut walk =
-        |archive_reader: &mut sevenz_fast::ArchiveReader<R>| -> Result<(), sevenz_fast::Error> {
+        |archive_reader: &mut sevenz_turbo::ArchiveReader<R>| -> Result<(), sevenz_turbo::Error> {
             archive_reader.for_each_entries(|entry, reader| extract_fn(entry, reader, &destination))
         };
 
@@ -503,7 +503,7 @@ where
             ),
         };
         let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
-        let archive_reader = sevenz_fast::ArchiveReader::with_limits(
+        let archive_reader = sevenz_turbo::ArchiveReader::with_limits(
             reader,
             password.clone(),
             sevenz_archive_limits(budget),
@@ -570,10 +570,10 @@ where
     let root_ref = root;
     let budget_ref = budget;
 
-    let extract_fn = |entry: &sevenz_fast::ArchiveEntry,
+    let extract_fn = |entry: &sevenz_turbo::ArchiveEntry,
                       reader: &mut dyn std::io::Read,
                       _dest: &PathBuf|
-     -> Result<bool, sevenz_fast::Error> {
+     -> Result<bool, sevenz_turbo::Error> {
         let safe_path = root_ref
             .validate_relative_path(entry.name())
             .map_err(|error| std::io::Error::other(budget_ref.reject_unsafe_path(error)))?;
@@ -2196,9 +2196,9 @@ impl Pipeline {
                     }
 
                     let pw = if let Some(ref p) = password {
-                        sevenz_fast::Password::new(p)
+                        sevenz_turbo::Password::new(p)
                     } else {
-                        sevenz_fast::Password::empty()
+                        sevenz_turbo::Password::empty()
                     };
 
                     let context = SevenZipExtractionContext {

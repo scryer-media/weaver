@@ -1,6 +1,6 @@
 use std::io::{self, Read, Seek, SeekFrom};
 
-use lzma_fast::xz::{XzOptions, XzParallelReader, XzReader};
+use lzma_turbo::xz::{XzOptions, XzParallelReader, XzReader};
 
 /// Maximum memory the xz decoder may use while decoding an XZ input.
 ///
@@ -64,7 +64,7 @@ pub(crate) fn xz_filesystem_decoder_kind<R: Read + Seek>(
     reader: &mut R,
 ) -> XzFilesystemDecoderKind {
     let initial_position = reader.stream_position().ok();
-    let block_count = lzma_fast::xz::single_stream_block_count(reader);
+    let block_count = lzma_turbo::xz::single_stream_block_count(reader);
     if let Some(position) = initial_position {
         let _ = reader.seek(SeekFrom::Start(position));
     }

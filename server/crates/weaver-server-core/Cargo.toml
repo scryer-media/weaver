@@ -67,8 +67,8 @@ tempfile = { workspace = true }
 filetime = { workspace = true }
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
-sevenz-fast = { workspace = true }
-lzma-fast = { workspace = true }
+sevenz-turbo = { workspace = true }
+lzma-turbo = { workspace = true }
 argon2 = { workspace = true }
 getrandom = { workspace = true, default-features = false }
 hex = { workspace = true }
@@ -95,7 +95,7 @@ tempfile = { workspace = true }
 # tests need: they build their codec-matrix archives in-process rather than
 # checking in a fixture per chain. Test-only on purpose — the shipped binary
 # never encodes 7z.
-sevenz-fast = { workspace = true, features = ["compress"] }
+sevenz-turbo = { workspace = true, features = ["compress"] }
 axum = { workspace = true }
 criterion = "0.8"
 lzma-rust2 = { workspace = true, features = ["encoder"] }

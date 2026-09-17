@@ -687,9 +687,9 @@ fn filesystem_xz_decoder_falls_back_to_sequential_when_a_worker_does_not_fit() {
         .collect();
     fs::write(&archive_path, xz_compress_multiblock(&payload)).unwrap();
 
-    let one_worker = lzma_fast::xz::XzParallelReader::with_options(
+    let one_worker = lzma_turbo::xz::XzParallelReader::with_options(
         fs::File::open(&archive_path).unwrap(),
-        lzma_fast::xz::XzOptions::default().with_threads(1),
+        lzma_turbo::xz::XzOptions::default().with_threads(1),
     )
     .unwrap()
     .memory_estimate();
@@ -717,9 +717,9 @@ fn filesystem_xz_decoder_trims_its_threads_to_the_memory_budget() {
         .collect();
     fs::write(&archive_path, xz_compress_multiblock(&payload)).unwrap();
 
-    let one_worker = lzma_fast::xz::XzParallelReader::with_options(
+    let one_worker = lzma_turbo::xz::XzParallelReader::with_options(
         fs::File::open(&archive_path).unwrap(),
-        lzma_fast::xz::XzOptions::default().with_threads(1),
+        lzma_turbo::xz::XzOptions::default().with_threads(1),
     )
     .unwrap()
     .memory_estimate();
@@ -773,7 +773,7 @@ fn sevenz_archive_with_times_and_anti_item(
     file_time: std::time::SystemTime,
     access_time: std::time::SystemTime,
 ) -> Vec<u8> {
-    use sevenz_fast::{ArchiveEntry, ArchiveWriter, NtTime};
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter, NtTime};
 
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
 
@@ -836,7 +836,7 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
         output_dir: out_dir.clone(),
         root: Arc::new(root),
         budget,
-        password: sevenz_fast::Password::empty(),
+        password: sevenz_turbo::Password::empty(),
         event_tx,
         phase_counters: Arc::new(PhaseCounters::default()),
         decode_memory: SevenZipDecodeMemory::HeldByCaller,
@@ -882,8 +882,8 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
 /// A 7z archive whose one LZMA2 block declares a `dictionary`-byte
 /// dictionary, holding `members` in order.
 fn sevenz_archive_with_dictionary(dictionary: u32, members: &[(&str, &[u8])]) -> Vec<u8> {
-    use sevenz_fast::encoder_options::Lzma2Options;
-    use sevenz_fast::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
+    use sevenz_turbo::encoder_options::Lzma2Options;
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
 
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
     let mut options = Lzma2Options::from_level(1);
@@ -913,7 +913,7 @@ fn conventional_7z_context(
         output_dir: out_dir.to_path_buf(),
         root: Arc::new(root),
         budget,
-        password: sevenz_fast::Password::empty(),
+        password: sevenz_turbo::Password::empty(),
         event_tx,
         phase_counters: Arc::new(PhaseCounters::default()),
         decode_memory: SevenZipDecodeMemory::HeldByCaller,
@@ -1041,8 +1041,8 @@ fn word_salad(bytes: usize, seed: u64) -> Vec<u8> {
 /// dictionary reset: the shape `7zz -mmt=on` writes, and the only one a
 /// decoder can widen on.
 fn sevenz_multi_run_archive(chunk: u64, members: &[(&str, &[u8])]) -> Vec<u8> {
-    use sevenz_fast::encoder_options::Lzma2Options;
-    use sevenz_fast::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
+    use sevenz_turbo::encoder_options::Lzma2Options;
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
 
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
     writer.set_content_methods(vec![EncoderConfiguration::from(
@@ -1093,9 +1093,9 @@ fn chase_decode_reservation_adds_widening_room_and_trims_it_first() {
         4 * 1024 * 1024,
         &[("Wide.Dictionary/episode.txt", b"wide dictionary")],
     );
-    let parsed = sevenz_fast::ArchiveReader::new(
+    let parsed = sevenz_turbo::ArchiveReader::new(
         Cursor::new(archive.clone()),
-        sevenz_fast::Password::empty(),
+        sevenz_turbo::Password::empty(),
     )
     .expect("parse");
     let end_header = sevenz_end_header_bytes(&archive);
@@ -1149,7 +1149,7 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
         "silver_horizon.7z",
         Cursor::new(archive.clone()),
         &out_dir,
-        sevenz_fast::Password::empty(),
+        sevenz_turbo::Password::empty(),
         sevenz_archive_limits(&budget),
         SevenZipDecodeThreads::Adaptive {
             ceiling: 4,
@@ -1204,7 +1204,7 @@ fn chase_7z_extraction_decodes_a_multi_run_block_adaptively() {
         output_dir: out_dir.clone(),
         root: Arc::new(root),
         budget: Arc::clone(&budget),
-        password: sevenz_fast::Password::empty(),
+        password: sevenz_turbo::Password::empty(),
         event_tx,
         phase_counters: Arc::new(PhaseCounters::default()),
         decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
