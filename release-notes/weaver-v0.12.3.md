@@ -79,6 +79,14 @@
 - Servers seeded from the environment are probed concurrently under one
   10-second deadline instead of holding startup one after another.
 
+### PAR2 repair
+
+- **PAR2 repair works in 128 MiB by default, up from 64 MiB.** A set with
+  tens of thousands of blocks and a few thousand missing was cut into many
+  small passes at 64 MiB, and each pass has a fixed cost, so a heavily damaged
+  large job could take many minutes. `WEAVER_PAR2_REPAIR_MEMORY_LIMIT_BYTES`
+  still overrides it.
+
 ### SSH proxies
 
 - **SSH proxy profiles accept Ed25519 host keys only**, over

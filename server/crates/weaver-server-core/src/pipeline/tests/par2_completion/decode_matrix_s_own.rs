@@ -15,7 +15,7 @@ use super::*;
 /// The differential is the whole test: the same bytes, the same damage, the
 /// same recovery — only the limit moves. That is what makes the refusal
 /// actionable rather than a dead end, and it also settles what weaver's own
-/// 64 MiB default has to do with it: nothing. The default is far below the
+/// 128 MiB default has to do with it: nothing. The default is far below the
 /// budget's floor, so the floor is what ruled, and only an explicitly larger
 /// limit changes the answer.
 #[test]
