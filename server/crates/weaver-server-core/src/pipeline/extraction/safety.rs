@@ -644,6 +644,12 @@ impl JobExtractionBudget {
         self.decoder_memory_limit
     }
 
+    /// Decoder bytes this job holds right now.
+    #[cfg(test)]
+    pub(crate) fn memory_reserved_bytes(&self) -> u64 {
+        self.memory_reserved.load(Ordering::Acquire)
+    }
+
     /// Entries the whole job may create, before anything already counted.
     pub(crate) fn max_entries(&self) -> u64 {
         self.limits.max_entries

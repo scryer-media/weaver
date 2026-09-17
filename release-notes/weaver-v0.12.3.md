@@ -26,9 +26,13 @@
   parallel decoder.
 - **7z.** Conventional extraction decodes LZMA2 blocks with as many threads
   as the post-processing pool has, bounded by the job's memory ceiling.
-  Direct unpack still decodes with one thread, because it must produce
-  output while the block is arriving. Header checksums are verified as
-  before.
+  Direct unpack chases the download on one thread, so output starts while
+  the block is still arriving, and widens to the same thread count whenever
+  complete runs have piled up behind it — after a park, or when the
+  download outruns one thread — narrowing again once the backlog is gone.
+  Its decode reservation includes the room to widen, and a job whose memory
+  ceiling leaves no such room keeps decoding on one thread. Header
+  checksums are verified as before.
 - **Watch-folder 7z inputs** are opened under fixed bounds on the end header
   and the decoder footprint, so a dropped file cannot make Weaver allocate on
   its say-so.

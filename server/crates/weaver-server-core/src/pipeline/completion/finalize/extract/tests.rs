@@ -1005,6 +1005,238 @@ fn conventional_7z_extraction_decodes_with_the_threads_it_is_given() {
     );
 }
 
+/// `bytes` of word salad: compressible enough that decoding it takes real
+/// time per byte, varied enough that no two runs are alike.
+fn word_salad(bytes: usize, seed: u64) -> Vec<u8> {
+    const WORDS: [&str; 12] = [
+        "silver",
+        "horizon",
+        "reel",
+        "episode",
+        "chase",
+        "frontier",
+        "widen",
+        "backlog",
+        "run",
+        "dictionary",
+        "stream",
+        "member",
+    ];
+    let mut state = seed.max(1);
+    let mut out = Vec::with_capacity(bytes + 16);
+    while out.len() < bytes {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let word = WORDS[(state >> 33) as usize % WORDS.len()];
+        out.extend_from_slice(word.as_bytes());
+        out.push(if (state >> 20) & 7 == 0 { b'\n' } else { b' ' });
+    }
+    out.truncate(bytes);
+    out
+}
+
+/// A 7z archive whose one LZMA2 block was written by the multi-threaded
+/// encoder in independent `chunk`-byte pieces, each starting with a
+/// dictionary reset: the shape `7zz -mmt=on` writes, and the only one a
+/// decoder can widen on.
+fn sevenz_multi_run_archive(chunk: u64, members: &[(&str, &[u8])]) -> Vec<u8> {
+    use sevenz_fast::encoder_options::Lzma2Options;
+    use sevenz_fast::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
+
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+    writer.set_content_methods(vec![EncoderConfiguration::from(
+        Lzma2Options::from_level_mt(1, 4, chunk),
+    )]);
+    for (name, bytes) in members {
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file(name),
+                Some(Cursor::new(bytes.to_vec())),
+            )
+            .expect("entry");
+    }
+    writer.finish().expect("finish").into_inner()
+}
+
+/// `next_header_size` from a 7z signature header: what a chase declares as
+/// its end header.
+fn sevenz_end_header_bytes(archive: &[u8]) -> u64 {
+    u64::from_le_bytes(archive[20..28].try_into().unwrap())
+}
+
+/// One thread while the decoder is at the frontier, one more per complete
+/// run waiting behind it, never past the ceiling, and back to one once the
+/// backlog is gone.
+#[test]
+fn chase_decode_threads_follow_the_backlog_under_the_ceiling() {
+    assert_eq!(chase_decode_thread_target(0, 8), 1);
+    assert_eq!(chase_decode_thread_target(1, 8), 2);
+    assert_eq!(chase_decode_thread_target(3, 8), 4);
+    assert_eq!(chase_decode_thread_target(7, 8), 8);
+    assert_eq!(chase_decode_thread_target(500, 8), 8);
+    assert_eq!(chase_decode_thread_target(0, 1), 1);
+    assert_eq!(chase_decode_thread_target(9, 1), 1);
+    assert_eq!(
+        chase_decode_thread_target(9, 0),
+        1,
+        "a ceiling of zero is one"
+    );
+    assert_eq!(chase_decode_thread_target(usize::MAX, 16), 16);
+}
+
+/// A chase's decode reservation is its decoders plus room to widen, and the
+/// widening room is what gives way to the ceiling before the decoders do.
+#[test]
+fn chase_decode_reservation_adds_widening_room_and_trims_it_first() {
+    let archive = sevenz_archive_with_dictionary(
+        4 * 1024 * 1024,
+        &[("Wide.Dictionary/episode.txt", b"wide dictionary")],
+    );
+    let parsed = sevenz_fast::ArchiveReader::new(
+        Cursor::new(archive.clone()),
+        sevenz_fast::Password::empty(),
+    )
+    .expect("parse");
+    let end_header = sevenz_end_header_bytes(&archive);
+    let decoders =
+        crate::pipeline::direct_unpack::decode_memory::decoder_memory_bytes(parsed.archive())
+            .expect("sized");
+    let needed = decoders + end_header + CHASE_DECODE_ALLOWANCE_BYTES;
+    let job_id = JobId(41814);
+    let ceiling = 4 * 1024 * 1024 * 1024;
+
+    assert_eq!(
+        chase_decode_memory_bytes(job_id, "wide", parsed.archive(), end_header, 1, ceiling),
+        needed,
+        "a chase that may not widen reserves exactly what it did before"
+    );
+    assert_eq!(
+        chase_decode_memory_bytes(job_id, "wide", parsed.archive(), end_header, 4, ceiling),
+        needed + 4 * CHASE_WIDENING_BYTES_PER_THREAD,
+        "one widening allowance per thread of the ceiling"
+    );
+    let tight = needed + CHASE_WIDENING_BYTES_PER_THREAD;
+    assert_eq!(
+        chase_decode_memory_bytes(job_id, "wide", parsed.archive(), end_header, 4, tight),
+        tight,
+        "widening room is trimmed to the ceiling"
+    );
+    assert_eq!(
+        chase_decode_memory_bytes(job_id, "wide", parsed.archive(), end_header, 4, needed - 1),
+        needed - 1,
+        "decoders past the ceiling take the ceiling, as before"
+    );
+}
+
+/// An adaptive decode starts on one thread and widens while complete runs
+/// wait behind it. Fed a whole multi-run block at once — every run already
+/// downloaded, which is the backlog a chase finds after a park — the governor
+/// sees runs waiting and widens; the bytes come out identical either way.
+#[test]
+fn chase_decode_widens_on_a_backlog_of_complete_runs() {
+    let temp = TempDir::new().unwrap();
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let reel = word_salad(12 * 1024 * 1024, 7);
+    let archive = sevenz_multi_run_archive(1024 * 1024, &[("Silver.Horizon/reel.txt", &reel)]);
+
+    let (root, budget) = test_extraction_security_with_memory(&out_dir, 256 * 1024 * 1024);
+    let root = Arc::new(root);
+    let mut written = Vec::new();
+    let report = decode_7z_streaming(
+        JobId(41815),
+        "silver_horizon.7z",
+        Cursor::new(archive.clone()),
+        &out_dir,
+        sevenz_fast::Password::empty(),
+        sevenz_archive_limits(&budget),
+        SevenZipDecodeThreads::Adaptive {
+            ceiling: 4,
+            poll: std::time::Duration::from_millis(1),
+        },
+        |entry, reader, _dest| {
+            assert_eq!(entry.name(), "Silver.Horizon/reel.txt");
+            reader.read_to_end(&mut written)?;
+            Ok(true)
+        },
+    )
+    .expect("adaptive decode");
+
+    assert_eq!(written, reel, "a widened decode produces the same bytes");
+    assert!(
+        report.widest_threads > 1,
+        "twelve complete runs fed at once are a backlog the chase widens on: {report:?}"
+    );
+    assert!(
+        report.widest_threads <= 4,
+        "never past the ceiling: {report:?}"
+    );
+    drop(root);
+}
+
+/// The chase's own path through `extract_7z_stream`: a per-pass reservation
+/// sized with widening room, handed to the reader as its memory limit, and
+/// the output identical to a conventional decode.
+#[test]
+fn chase_7z_extraction_decodes_a_multi_run_block_adaptively() {
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("silver_horizon.7z");
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let first = word_salad(6 * 1024 * 1024, 11);
+    let second = word_salad(3 * 1024 * 1024, 13);
+    let archive = sevenz_multi_run_archive(
+        1024 * 1024,
+        &[
+            ("Silver.Horizon/first.txt", &first),
+            ("Silver.Horizon/second.txt", &second),
+        ],
+    );
+    let end_header_bytes = sevenz_end_header_bytes(&archive);
+    fs::write(&archive_path, &archive).unwrap();
+
+    let (root, budget) = test_extraction_security_with_memory(&out_dir, 256 * 1024 * 1024);
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+    let context = SevenZipExtractionContext {
+        job_id: JobId(41816),
+        set_name: "silver_horizon.7z".to_string(),
+        output_dir: out_dir.clone(),
+        root: Arc::new(root),
+        budget: Arc::clone(&budget),
+        password: sevenz_fast::Password::empty(),
+        event_tx,
+        phase_counters: Arc::new(PhaseCounters::default()),
+        decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
+        decode_threads: 4,
+    };
+    let outcome = extract_7z_stream(&context, || {
+        fs::File::open(&archive_path).map_err(|error| error.to_string())
+    })
+    .expect("7z chase extraction");
+
+    assert_eq!(
+        outcome.extracted,
+        vec![
+            "Silver.Horizon/first.txt".to_string(),
+            "Silver.Horizon/second.txt".to_string(),
+        ]
+    );
+    assert_eq!(
+        fs::read(out_dir.join("Silver.Horizon/first.txt")).unwrap(),
+        first
+    );
+    assert_eq!(
+        fs::read(out_dir.join("Silver.Horizon/second.txt")).unwrap(),
+        second
+    );
+    assert_eq!(
+        budget.memory_reserved_bytes(),
+        0,
+        "the decode pass gives its reservation back"
+    );
+}
+
 fn phase_counters(total_bytes: u64, completed_bytes: u64) -> Arc<PhaseCounters> {
     let counters = Arc::new(PhaseCounters::default());
     counters.total_bytes.store(total_bytes, Ordering::Relaxed);
