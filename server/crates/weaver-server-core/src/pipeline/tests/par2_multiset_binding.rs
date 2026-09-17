@@ -664,3 +664,64 @@ async fn par2_extra_scan_keeps_a_posted_file_that_only_looks_like_a_repair_lefto
         );
     }
 }
+
+#[tokio::test]
+async fn a_swapped_pair_of_unequal_length_binds_by_the_length_each_file_has() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30911);
+    let body = fixture_bytes(43, 128);
+    let tail = fixture_bytes(47, 40);
+    // Posted with the tail pair's names exchanged.
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec(
+            "Amber Lantern Swapped Tail",
+            &[
+                ("archive.part3.rar".to_string(), tail.len() as u32),
+                ("archive.part4.rar".to_string(), body.len() as u32),
+            ],
+        ),
+    )
+    .await;
+    let set = build_repairable_par2_set_for_files(
+        &[
+            ("archive.part3.rar", body.as_slice()),
+            ("archive.part4.rar", tail.as_slice()),
+        ],
+        SLICE_SIZE,
+        1,
+    );
+    let described = |name: &str| {
+        set.files
+            .iter()
+            .find(|(_, desc)| desc.filename == name)
+            .map(|(file_id, _)| *file_id)
+            .unwrap()
+    };
+    let body_description = described("archive.part3.rar");
+    let tail_description = described("archive.part4.rar");
+    install_test_par2_runtime(&mut pipeline, job_id, set, &[]);
+
+    // The canonical names are known, the files have not moved: each file now
+    // answers to both descriptions by name.
+    for (file_index, canonical, length) in [
+        (0, "archive.part4.rar", tail.len() as u64),
+        (1, "archive.part3.rar", body.len() as u64),
+    ] {
+        let file_id = NzbFileId { job_id, file_index };
+        let mut identity = pipeline.effective_file_identity(job_id, file_id).unwrap();
+        identity.canonical_filename = Some(canonical.to_string());
+        pipeline.set_file_identity(job_id, identity).unwrap();
+        pipeline.file_declared_size.insert(file_id, length);
+    }
+
+    let bound = |file_index| {
+        pipeline
+            .resolve_par2_file_binding(NzbFileId { job_id, file_index })
+            .map(|binding| binding.par2_file_id)
+    };
+    assert_eq!(bound(0), Some(tail_description));
+    assert_eq!(bound(1), Some(body_description));
+}
