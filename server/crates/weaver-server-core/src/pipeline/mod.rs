@@ -3275,6 +3275,14 @@ pub struct Pipeline {
     pub(super) uu_spool_max_bytes: usize,
     /// Aggregate ahead-of-cursor UU entry admission limit.
     pub(super) uu_spool_max_segments: usize,
+    /// Per-file bound on the uuencode reorder park. A uuencode file is placed
+    /// strictly in ordinal order, and with several lanes each fetching its
+    /// own run of the file the parts furthest from the cursor arrive first
+    /// and stay parked until every lane behind them has drained. That is the
+    /// aggregate spool's budget to hold, so the bound is the same number; it
+    /// must never be the yEnc reorder depth, which is sized for a window of a
+    /// few articles and displaces a long file's tail on every pass.
+    pub(super) uu_park_max_segments: usize,
     /// Free space preserved on the intermediate filesystem while spilling UU.
     pub(super) uu_spool_min_free_bytes: u64,
     /// Rate-limited free-space readings for the spool filesystem. Admitted
@@ -3306,10 +3314,13 @@ pub struct Pipeline {
     /// uuencode part of a file and dropped with that file's write buffer.
     pub(super) uu_files: HashMap<NzbFileId, UuFileAssembly>,
     /// How often each uuencode segment has been displaced by park pressure and
-    /// requeued. Purely a livelock bound — deliberately NOT the decode-failure
-    /// counter, because park pressure is an ordering condition and must never
-    /// spend a segment's retry budget.
-    pub(super) uu_park_requeues: HashMap<SegmentId, u32>,
+    /// requeued while its file's cursor stood still, paired with the cursor
+    /// position that count was taken at. Purely a livelock bound — deliberately
+    /// NOT the decode-failure counter, because park pressure is an ordering
+    /// condition and must never spend a segment's retry budget; and the count
+    /// restarts whenever the cursor has moved, because a displacement behind a
+    /// moving cursor is progress, not a cycle.
+    pub(super) uu_park_requeues: HashMap<SegmentId, (u32, u32)>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.

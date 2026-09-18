@@ -499,7 +499,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.write_backlog_budget_bytes = 1;
-    pipeline.write_buf_max_pending = 2;
+    pipeline.uu_park_max_segments = 2;
     let job_id = JobId(20171);
     let parts: Vec<Vec<u8>> = vec![vec![b'a'; 100], vec![b'b'; 110], vec![b'c'; 120]];
     insert_active_job(
@@ -551,7 +551,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
 
     // Lower the bound in an independent job. Parking ordinal 1 after ordinal
     // 2 evicts the farthest entry and removes its TempPath immediately.
-    pipeline.write_buf_max_pending = 1;
+    pipeline.uu_park_max_segments = 1;
     let displaced_job_id = JobId(20172);
     insert_active_job(
         &mut pipeline,
@@ -929,7 +929,7 @@ async fn uu_park_displacement_requeues_instead_of_losing_the_segment() {
     // ordinal. The displacement must put it back on the queue.
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    pipeline.write_buf_max_pending = 1; // force displacement on the second park
+    pipeline.uu_park_max_segments = 1; // force displacement on the second park
     let job_id = JobId(20068);
     let parts: Vec<Vec<u8>> = (0..4u8).map(|i| vec![b'a' + i; 120 + i as usize]).collect();
     let working_dir = insert_active_job(
@@ -998,7 +998,7 @@ async fn uu_park_pressure_storm_fails_nothing() {
     // failure, and the file must still assemble byte-identically.
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    pipeline.write_buf_max_pending = 2;
+    pipeline.uu_park_max_segments = 2;
     let job_id = JobId(20069);
     let parts: Vec<Vec<u8>> = (0..12u8).map(|i| vec![b'a' + i; 60 + i as usize]).collect();
     let working_dir = insert_active_job(
@@ -1044,6 +1044,83 @@ async fn uu_park_pressure_storm_fails_nothing() {
         )
         .await;
     }
+
+    let written = tokio::fs::read(working_dir.join("silver-horizon.bin"))
+        .await
+        .unwrap();
+    assert_eq!(written, parts.concat());
+}
+
+#[tokio::test]
+async fn uu_park_tail_bounces_behind_a_moving_cursor_without_failing() {
+    // A long file fetched by several lanes at once delivers its tail long
+    // before the cursor can reach it. With a park smaller than the file, the
+    // tail is displaced on every pass and only stops bouncing once the cursor
+    // has drained everything below it. Each bounce follows cursor progress, so
+    // none of them may count toward the livelock bound: the file must complete
+    // without a single charged retry, however many passes it takes.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.uu_park_max_segments = 2;
+    let job_id = JobId(20073);
+    let parts: Vec<Vec<u8>> = (0..12u8).map(|i| vec![b'a' + i; 60 + i as usize]).collect();
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        uu_job_spec(&parts.iter().map(|p| p.len()).collect::<Vec<_>>()),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    // Every step: the whole tail above the cursor arrives, three times over,
+    // then the cursor's own part lands and the park drains what it can. The
+    // last ordinal is displaced on every step until the cursor reaches it,
+    // far past the per-cursor bound of eight.
+    let mut steps = 0;
+    loop {
+        let cursor = pipeline
+            .uu_files
+            .get(&file_id)
+            .map_or(0, |uu| uu.next_index);
+        if cursor as usize >= parts.len() {
+            break;
+        }
+        for _ in 0..3 {
+            for index in (cursor + 1..parts.len() as u32).rev() {
+                submit_uu_segment(
+                    &mut pipeline,
+                    file_id,
+                    index,
+                    &parts[index as usize],
+                    false,
+                    index as usize == parts.len() - 1,
+                )
+                .await;
+            }
+        }
+        submit_uu_segment(
+            &mut pipeline,
+            file_id,
+            cursor,
+            &parts[cursor as usize],
+            false,
+            cursor as usize == parts.len() - 1,
+        )
+        .await;
+        assert!(
+            pipeline.decode_retries.is_empty(),
+            "a tail displaced behind a moving cursor must never charge retry budget (cursor {cursor})"
+        );
+        steps += 1;
+        assert!(steps <= parts.len(), "the cursor must advance every step");
+    }
+    assert!(
+        steps > 3,
+        "the bound must have been crossed for the tail to prove anything"
+    );
 
     let written = tokio::fs::read(working_dir.join("silver-horizon.bin"))
         .await

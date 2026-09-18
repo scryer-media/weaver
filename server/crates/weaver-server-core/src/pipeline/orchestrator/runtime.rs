@@ -260,6 +260,7 @@ impl Pipeline {
             uu_spool_root,
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
+            uu_park_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,

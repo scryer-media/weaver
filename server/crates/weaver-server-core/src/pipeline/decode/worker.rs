@@ -2081,7 +2081,7 @@ impl Pipeline {
         decoded_len: usize,
         _data: &DecodedChunk,
     ) -> UuPlacement {
-        let max_pending = self.write_buf_max_pending;
+        let max_pending = self.uu_park_max_segments;
         let already_placed = self
             .jobs
             .get(&file_id.job_id)
@@ -2195,10 +2195,15 @@ impl Pipeline {
         segment_number: u32,
         data: DecodedChunk,
     ) -> Result<Vec<u32>, SegmentWriteError> {
-        let max_pending = self.write_buf_max_pending;
+        let max_pending = self.uu_park_max_segments;
         let decoded_bytes = data.len_bytes();
         let projected_resident = self.write_buffered_bytes.saturating_add(decoded_bytes);
-        let spills = projected_resident >= self.write_backlog_budget_bytes;
+        // Resident parked bytes only drain when the cursor's own part arrives,
+        // so the park spills at the soft write threshold rather than the hard
+        // one: a park that filled the whole budget would latch hard write
+        // pressure, pause dispatch, and wait on a fetch that pressure holds.
+        let (_, _, write_soft, _) = self.download_pressure_limits();
+        let spills = projected_resident as u64 >= write_soft;
         if self.uu_spool_admission_capped(0) || (spills && !self.admit_uu_spill(decoded_bytes)) {
             // The part is already decoded, but holding it would exceed the
             // aggregate cache cap or consume the intermediate filesystem's
@@ -2261,12 +2266,12 @@ impl Pipeline {
     /// this mirrors the zero-burn requeue the 430-exclusion path uses.
     ///
     /// The per-segment counter here exists only to bound livelock, and is
-    /// deliberately not the decode-failure counter. It should be unreachable in
-    /// practice: the park holds `write_buf_max_pending` segments, so a segment
-    /// can only be displaced repeatedly if that many *lower* ordinals keep
-    /// overtaking it, and each pass moves the cursor closer to it. Outside a
-    /// test that shrinks the park to a handful of slots, exhausting this is not
-    /// an ordering the download scheduler can produce.
+    /// deliberately not the decode-failure counter. It counts displacements
+    /// seen while the file's cursor stood at one ordinal, and starts over once
+    /// the cursor has moved: a part of a long file legitimately bounces many
+    /// times while lanes ahead of the cursor drain, and each of those bounces
+    /// follows cursor progress. Only a run of displacements with no progress
+    /// between them is a cycle, and that is what the bound catches.
     /// Return a park-displaced segment to the download queue, falling back to
     /// the counted failure path only if it has been displaced implausibly often.
     fn requeue_displaced_uu_segment(&mut self, segment_id: SegmentId) {
@@ -2288,7 +2293,19 @@ impl Pipeline {
     fn requeue_uu_segment_for_ordering(&mut self, segment_id: SegmentId) -> bool {
         const MAX_UU_PARK_REQUEUES: u32 = 8;
 
-        let attempts = self.uu_park_requeues.entry(segment_id).or_insert(0);
+        let cursor = self
+            .uu_files
+            .get(&segment_id.file_id)
+            .map(|uu| uu.next_index)
+            .unwrap_or(0);
+        let (attempts, seen_at) = self
+            .uu_park_requeues
+            .entry(segment_id)
+            .or_insert((0, cursor));
+        if *seen_at != cursor {
+            *seen_at = cursor;
+            *attempts = 0;
+        }
         *attempts += 1;
         if *attempts > MAX_UU_PARK_REQUEUES {
             return false;
