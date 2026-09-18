@@ -67,10 +67,7 @@ async fn scripts_directory_is_admin_owned_and_clears_assignments_when_changed() 
     assert_no_errors(&response);
     let settings = &response_data(&response)["setPostProcessingScriptDirectory"];
     let canonical = std::fs::canonicalize(&requested).unwrap();
-    assert_eq!(
-        settings["scriptDirectory"],
-        &*canonical.to_string_lossy()
-    );
+    assert_eq!(settings["scriptDirectory"], &*canonical.to_string_lossy());
     assert!(settings["lists"]["global"].as_array().unwrap().is_empty());
 
     std::fs::write(

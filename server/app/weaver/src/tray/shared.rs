@@ -815,14 +815,8 @@ impl ServerSupervisor {
         let server_executable = self.server_executable()?;
         let log_file = self.log_file();
         self.log_offset = std::fs::metadata(&log_file).map_or(0, |metadata| metadata.len());
-        let mut command = Command::new(&server_executable);
-        command
-            .arg("--config")
-            .arg(&self.profile_dir)
-            .arg("--log-file")
-            .arg(&log_file)
-            .args(["serve", "--port", &self.port.to_string()]);
-        command.stderr(Stdio::piped());
+        let mut command =
+            build_server_command(&server_executable, &self.profile_dir, &log_file, self.port);
         configure_server_command(&mut command);
         self.setup_code = Arc::new(Mutex::new(None));
         let mut child = command.spawn().map_err(|error| {
@@ -1070,6 +1064,33 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Build the command that starts the supervised server.
+///
+/// Separate from `start` so a test can read the environment back: the
+/// supervision marker is what tells the server it may hand a bundle upgrade to
+/// the wrapper, so losing it would silently make in-app upgrades ineligible
+/// rather than fail loudly.
+fn build_server_command(
+    server_executable: &Path,
+    profile_dir: &Path,
+    log_file: &Path,
+    port: u16,
+) -> Command {
+    let mut command = Command::new(server_executable);
+    command
+        .arg("--config")
+        .arg(profile_dir)
+        .arg("--log-file")
+        .arg(log_file)
+        .args(["serve", "--port", &port.to_string()])
+        .env(
+            weaver_server_core::application_upgrade::WEAVER_PRODUCT.tray_supervised_env,
+            "1",
+        )
+        .stderr(Stdio::piped());
+    command
+}
+
 /// Keep the server out of the user's face. On Windows a console subsystem
 /// child would flash a window on every start; on macOS the child inherits the
 /// wrapper's already-windowless session and needs nothing.
@@ -1165,11 +1186,31 @@ mod tests {
 
     use super::{
         HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
-        decode_chunked, desktop_profile_dir_from, format_bytes, format_speed, http_origin,
-        is_weaver_document, last_logged_error, logged_error_message, note_version_change,
-        opens_in_external_browser, parse_http_response, parse_setup_code_line,
+        build_server_command, decode_chunked, desktop_profile_dir_from, format_bytes, format_speed,
+        http_origin, is_weaver_document, last_logged_error, logged_error_message,
+        note_version_change, opens_in_external_browser, parse_http_response, parse_setup_code_line,
         popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
     };
+
+    #[test]
+    fn the_spawn_command_marks_the_server_as_tray_supervised() {
+        let command = build_server_command(
+            Path::new("/opt/weaver/weaver"),
+            Path::new("/opt/weaver/profile"),
+            Path::new("/opt/weaver/profile/logs/weaver.log"),
+            8080,
+        );
+        let marker = weaver_server_core::application_upgrade::WEAVER_PRODUCT.tray_supervised_env;
+        let supervised = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(marker))
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            supervised,
+            Some(std::ffi::OsStr::new("1")),
+            "the supervised server must see {marker}=1, or bundle upgrades are never eligible"
+        );
+    }
 
     #[test]
     fn setup_code_parser_accepts_only_the_exact_marker() {
