@@ -176,11 +176,14 @@ impl Pipeline {
     /// an idle connection or a free permit beyond what this pass has already
     /// sent it. Without that, a pass that opens several lanes would send two
     /// dials at a server with one free permit, and the second would sit in
-    /// the pool's contention loop instead of fetching.
+    /// the pool's contention loop instead of fetching. The seat count is the
+    /// one the pass started with, not a fresh reading — see the retain below.
     fn dispatch_one_download_lane(
         &mut self,
         pressure: DownloadPressure,
         sent_this_pass: &mut HashMap<usize, usize>,
+        headroom_at_pass_start: &mut HashMap<usize, usize>,
+        ranked_this_pass: &mut Option<Vec<usize>>,
     ) -> DispatchAttempt {
         let mut idle_by_server: HashMap<usize, usize> = HashMap::new();
         for server in self
@@ -193,10 +196,22 @@ impl Pipeline {
         }
         let backfill_flags = self.nntp.pool().server_backfill_flags();
         let mut servers: Vec<usize> = match self.nntp.blocking_body_server_order(&[]) {
-            Some(order) => order.into_iter().map(|server| server.0).collect(),
-            // The ranking is contended right now; the idle connections are
-            // still worth a lease, and the next pass ranks again.
-            None => idle_by_server.keys().copied().collect(),
+            Some(order) => {
+                let order: Vec<usize> = order.into_iter().map(|server| server.0).collect();
+                *ranked_this_pass = Some(order.clone());
+                order
+            }
+            // The ranking is contended right now, most likely by the lane
+            // workers this very pass just started, which take the same health
+            // lock as they dial. The order the pass last ranked is still good
+            // for the seats it started with; only a pass that never ranked
+            // falls back to the idle connections, and the next pass ranks
+            // again. Giving up here instead cut a pass short at whatever
+            // point the contention landed, and at a different one each run.
+            None => match ranked_this_pass {
+                Some(order) => order.clone(),
+                None => idle_by_server.keys().copied().collect(),
+            },
         };
         servers.sort_by_key(|server| !idle_by_server.contains_key(server));
         // The backfill tier comes last, and only for what the fill tier has
@@ -217,8 +232,19 @@ impl Pipeline {
         servers.retain(|server| {
             let idle = idle_by_server.get(server).copied().unwrap_or(0);
             let (available, _) = self.nntp.pool().server_load(*server);
+            // The seat count is read once per server per pass, the first time
+            // the pass looks at it and so before it has sent anything there.
+            // Re-reading it would charge each lease twice: once as a lease in
+            // `sent`, and again as the permit its lane has meanwhile taken —
+            // the lane worker runs on its own thread, so how much of that has
+            // happened by the next iteration is a matter of thread scheduling.
+            // A pass that measured itself that way stopped around half its
+            // configured capacity, and stopped at a different place each run.
+            let seats = *headroom_at_pass_start
+                .entry(*server)
+                .or_insert(idle + available);
             let sent = sent_this_pass.get(server).copied().unwrap_or(0);
-            idle + available > sent
+            seats > sent
         });
         for server_idx in servers {
             let spill_in_flight = self.spill_job_in_flight_on(server_idx);
@@ -560,11 +586,18 @@ impl Pipeline {
         };
         let active_connections_before_dispatch = self.active_download_connections;
         let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
+        let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
+        let mut ranked_this_pass: Option<Vec<usize>> = None;
         while self.active_download_connections < max
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
         {
-            match self.dispatch_one_download_lane(pressure, &mut sent_this_pass) {
+            match self.dispatch_one_download_lane(
+                pressure,
+                &mut sent_this_pass,
+                &mut headroom_at_pass_start,
+                &mut ranked_this_pass,
+            ) {
                 DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => return,
