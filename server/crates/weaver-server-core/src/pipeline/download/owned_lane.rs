@@ -408,6 +408,13 @@ enum OwnedLanePoolCommand {
     },
 }
 
+/// A probe a worker has taken up mid-lease: the ids to look for, and the
+/// channel its verdict is owed on once the lane's ring has drained.
+type PendingProbe = (
+    Arc<[String]>,
+    oneshot::Sender<Option<weaver_nntp::client::ProbeBatchResult>>,
+);
+
 struct CachedOwnedLane {
     nntp: Arc<weaver_nntp::NntpClient>,
     lane: weaver_nntp::blocking::BlockingBodyLane,
@@ -1249,10 +1256,7 @@ fn run_owned_blocking_download_lane(
     }
     let mut inflight: VecDeque<(DownloadWork, Arc<LaneLeaseContext>)> = VecDeque::new();
     // Probes taken up mid-lease, answered together once the ring is dry.
-    let mut probes: VecDeque<(
-        Arc<[String]>,
-        oneshot::Sender<Option<weaver_nntp::client::ProbeBatchResult>>,
-    )> = VecDeque::new();
+    let mut probes: VecDeque<PendingProbe> = VecDeque::new();
     let mut pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>> = None;
     let mut refill_denied = false;
     let mut stop: Option<LaneStop> = None;
