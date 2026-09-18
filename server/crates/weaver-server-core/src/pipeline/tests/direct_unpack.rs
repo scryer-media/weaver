@@ -721,12 +721,7 @@ async fn conventional_split_7z_jobs_finish_after_peer_metadata_grows() {
     }
     let mut completed = std::collections::HashSet::new();
     for _ in jobs {
-        let done = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            next_extraction_done(&mut pipeline),
-        )
-        .await
-        .expect("decoder admission must progress");
+        let done = next_extraction_done(&mut pipeline).await;
         let ExtractionDone::FullSet { job_id, result, .. } = done else {
             panic!("full set required")
         };

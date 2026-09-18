@@ -65,9 +65,7 @@ async fn an_admin_key_and_a_trusted_browser_may_restart() {
 
     // The response has to reach the browser before the process goes away,
     // so the request is made after a short grace period.
-    tokio::time::timeout(std::time::Duration::from_secs(5), controller.requested())
-        .await
-        .expect("an accepted restart reaches the serve loop");
+    controller.requested().await;
 
     let (status, _) = post_restart(
         app,

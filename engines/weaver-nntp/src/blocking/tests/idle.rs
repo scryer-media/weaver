@@ -63,19 +63,19 @@ fn idle_tls_fixture() -> IdleTlsFixture {
 }
 
 fn inspect_fragmented_shutdown(mut inspect: impl FnMut() -> bool, fixture: IdleTlsFixture) {
-    fixture.ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    fixture.ready.recv().unwrap();
     assert!(
         !inspect(),
         "TLS session tickets are not terminal application data"
     );
     fixture.advance.send(()).unwrap();
-    fixture.ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    fixture.ready.recv().unwrap();
     for _ in 0..5 {
         assert!(!inspect(), "a fragmented record must retain its TLS state");
         std::thread::sleep(Duration::from_millis(2));
     }
     fixture.advance.send(()).unwrap();
-    fixture.ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    fixture.ready.recv().unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while !inspect() {
         assert!(Instant::now() < deadline, "close-notify was not detected");

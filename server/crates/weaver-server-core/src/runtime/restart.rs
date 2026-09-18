@@ -389,12 +389,7 @@ mod tests {
             let controller = RestartController::new();
             request(&controller);
             controller.request_restart();
-            assert_eq!(
-                tokio::time::timeout(std::time::Duration::from_secs(5), controller.requested())
-                    .await
-                    .expect("a stored request is delivered"),
-                expected
-            );
+            assert_eq!(controller.requested().await, expected);
         }
     }
 
@@ -406,10 +401,7 @@ mod tests {
 
         controller.request_restart();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), serve_loop)
-            .await
-            .expect("a requested restart wakes the serve loop")
-            .expect("the waiting task completes");
+        serve_loop.await.expect("the waiting task completes");
     }
 
     #[tokio::test]
@@ -417,8 +409,6 @@ mod tests {
         let controller = RestartController::new();
         controller.request_restart();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), controller.requested())
-            .await
-            .expect("a stored request is delivered to the first waiter");
+        controller.requested().await;
     }
 }

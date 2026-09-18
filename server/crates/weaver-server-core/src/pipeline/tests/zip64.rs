@@ -216,10 +216,7 @@ async fn zip64_direct_unpack_finishes_a_member_before_middle_articles_arrive() {
             "tail must be persisted, not parked in write backlog"
         );
         assert_eq!(pipeline.direct_unpack.counters().consumed, 1);
-        let done = tokio::time::timeout(Duration::from_secs(30), pipeline.extract_done_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let done = pipeline.extract_done_rx.recv().await.unwrap();
         let ExtractionDone::FullSet { result, .. } = done else {
             panic!("full ZIP set expected")
         };
@@ -302,10 +299,7 @@ async fn zip64_par2_repairs_payload_directory_and_missing_articles() {
             .extract_simple_archive(job_id, ARCHIVE_NAME, SimpleArchiveKind::Zip)
             .await
             .unwrap();
-        let done = tokio::time::timeout(Duration::from_secs(30), pipeline.extract_done_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let done = pipeline.extract_done_rx.recv().await.unwrap();
         let ExtractionDone::FullSet { result, .. } = done else {
             panic!("full ZIP set expected")
         };

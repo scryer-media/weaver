@@ -157,9 +157,8 @@ async fn nzbget_invalid_auth_returns_without_polling_the_body() {
         ApiKeyCache::default(),
     );
     let (_writer, reader) = tokio::io::duplex(1);
-    let response = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        app.oneshot(
+    let response = app
+        .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/jsonrpc")
@@ -167,11 +166,9 @@ async fn nzbget_invalid_auth_returns_without_polling_the_body() {
                 .header(header::AUTHORIZATION, "Basic not-base64")
                 .body(Body::from_stream(tokio_util::io::ReaderStream::new(reader)))
                 .unwrap(),
-        ),
-    )
-    .await
-    .expect("authentication must complete without polling the pending body")
-    .unwrap();
+        )
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 

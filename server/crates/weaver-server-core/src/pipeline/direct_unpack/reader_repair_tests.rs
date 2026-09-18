@@ -1,7 +1,6 @@
 use super::*;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
 
 fn reader_for(paths: &[PathBuf], sequential: bool) -> (GatedSplitReader, Arc<SetCoverage>) {
     let coverage = Arc::new(SetCoverage::new(paths.len()));

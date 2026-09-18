@@ -13,7 +13,7 @@ async fn idle_inspection_has_a_hard_input_budget_and_restores_normal_reads() {
     route.begin_inspection();
     let mut bytes = vec![0; 128 * 1024];
     let mut read = 0;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    async {
         while read < 64 * 1024 {
             match route.try_read(&mut bytes[read..]) {
                 Ok(n) => {
@@ -26,9 +26,8 @@ async fn idle_inspection_has_a_hard_input_budget_and_restores_normal_reads() {
                 Err(error) => panic!("inspection failed: {error}"),
             }
         }
-    })
-    .await
-    .unwrap();
+    }
+    .await;
     assert_eq!(read, 64 * 1024);
     assert_eq!(
         route.try_read(&mut bytes[read..]).unwrap_err().kind(),

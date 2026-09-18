@@ -145,10 +145,7 @@ async fn queue_snapshots_keep_cached_speed_on_unrelated_events() {
     .data(CallerScope::Read);
     let mut stream = h.schema.execute_stream(request);
 
-    let first = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("subscription should emit an initial snapshot")
-        .expect("stream should stay open");
+    let first = stream.next().await.expect("stream should stay open");
     assert!(first.errors.is_empty());
     let first_data = first.data.into_json().unwrap();
     assert_eq!(
@@ -163,10 +160,7 @@ async fn queue_snapshots_keep_cached_speed_on_unrelated_events() {
         .await;
     assert!(pause.errors.is_empty());
 
-    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("subscription should emit after pause")
-        .expect("stream should stay open");
+    let second = stream.next().await.expect("stream should stay open");
     assert!(second.errors.is_empty());
     let second_data = second.data.into_json().unwrap();
     assert_eq!(
@@ -195,10 +189,7 @@ async fn queue_snapshots_drop_cancelled_job_while_globally_paused() {
             .data(CallerScope::Read);
     let mut stream = h.schema.execute_stream(request);
 
-    let first = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("subscription should emit an initial snapshot")
-        .expect("stream should stay open");
+    let first = stream.next().await.expect("stream should stay open");
     assert!(first.errors.is_empty());
     let first_data = first.data.into_json().unwrap();
     assert!(
@@ -219,10 +210,7 @@ async fn queue_snapshots_drop_cancelled_job_while_globally_paused() {
         .await;
     assert!(cancel.errors.is_empty());
 
-    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("subscription should emit after cancellation")
-        .expect("stream should stay open");
+    let second = stream.next().await.expect("stream should stay open");
     assert!(second.errors.is_empty());
     let second_data = second.data.into_json().unwrap();
     assert!(
@@ -303,10 +291,7 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
     .data(CallerScope::Read);
     let mut stream = h.schema.execute_stream(request);
 
-    let first = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("metrics subscription should emit an initial snapshot")
-        .expect("stream should stay open");
+    let first = stream.next().await.expect("stream should stay open");
     assert!(first.errors.is_empty());
     let first_data = first.data.into_json().unwrap();
     assert!(
@@ -335,10 +320,7 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     h.shared_state.refresh_metrics_snapshot();
 
-    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("metrics subscription should emit refreshed snapshot speed")
-        .expect("stream should stay open");
+    let second = stream.next().await.expect("stream should stay open");
     assert!(second.errors.is_empty());
     let second_data = second.data.into_json().unwrap();
     assert!(
@@ -356,10 +338,7 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
     let pause = h.execute("mutation { pauseQueue { success } }").await;
     assert!(pause.errors.is_empty());
 
-    let third = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("metrics subscription should emit after cadence tick")
-        .expect("stream should stay open");
+    let third = stream.next().await.expect("stream should stay open");
     assert!(third.errors.is_empty());
     let third_data = third.data.into_json().unwrap();
     assert!(
@@ -380,14 +359,14 @@ async fn system_metrics_updates_share_metrics_snapshot_speed() {
         .schema
         .execute_stream(Request::new(query).data(CallerScope::Read));
 
-    let first_a = tokio::time::timeout(Duration::from_secs(3), stream_a.next())
+    let first_a = stream_a
+        .next()
         .await
-        .expect("first subscriber should emit an initial snapshot")
         .expect("first stream should stay open");
     assert!(first_a.errors.is_empty());
-    let first_b = tokio::time::timeout(Duration::from_secs(3), stream_b.next())
+    let first_b = stream_b
+        .next()
         .await
-        .expect("second subscriber should emit an initial snapshot")
         .expect("second stream should stay open");
     assert!(first_b.errors.is_empty());
 
@@ -522,9 +501,9 @@ async fn queue_events_enrich_live_item_without_erasing_duplicate_summary() {
     let mut stream = schema.execute_stream(request);
 
     let next_event = async {
-        tokio::time::timeout(Duration::from_secs(3), stream.next())
+        stream
+            .next()
             .await
-            .expect("queueEvents should emit a live state change")
             .expect("queueEvents stream should stay open")
     };
     let pause = async {
@@ -562,9 +541,9 @@ async fn queue_events_reject_malformed_cursor() {
     .data(CallerScope::Read);
 
     let mut stream = h.schema.execute_stream(request);
-    let response = tokio::time::timeout(Duration::from_secs(3), stream.next())
+    let response = stream
+        .next()
         .await
-        .expect("subscription should fail immediately")
         .expect("stream should yield an error response");
 
     assert!(!response.errors.is_empty());
@@ -589,10 +568,7 @@ async fn job_detail_updates_emit_live_state_changes() {
     .data(CallerScope::Read);
     let mut stream = h.schema.execute_stream(request);
 
-    let first = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("subscription should emit an initial snapshot")
-        .expect("stream should stay open");
+    let first = stream.next().await.expect("stream should stay open");
     assert!(first.errors.is_empty());
     let first_data = first.data.into_json().unwrap();
     assert_eq!(
@@ -614,10 +590,7 @@ async fn job_detail_updates_emit_live_state_changes() {
         .await;
     assert!(pause.errors.is_empty());
 
-    let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
-        .await
-        .expect("subscription should emit after pause")
-        .expect("stream should stay open");
+    let second = stream.next().await.expect("stream should stay open");
     assert!(second.errors.is_empty());
     let second_data = second.data.into_json().unwrap();
     assert_eq!(

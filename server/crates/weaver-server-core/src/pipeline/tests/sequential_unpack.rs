@@ -156,10 +156,7 @@ async fn finish(pipeline: &mut Pipeline, job: JobId, set: &str) {
 }
 
 async fn extracted(pipeline: &mut Pipeline, job: JobId, expected: &[(String, Vec<u8>)]) {
-    let done = tokio::time::timeout(Duration::from_secs(20), pipeline.extract_done_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let done = pipeline.extract_done_rx.recv().await.unwrap();
     let ExtractionDone::FullSet { result, .. } = done else {
         panic!("expected full set")
     };

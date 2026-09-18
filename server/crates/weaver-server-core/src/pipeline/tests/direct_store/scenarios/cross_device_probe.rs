@@ -215,13 +215,11 @@ async fn a_post_repair_pass_without_a_surviving_carry_still_reads_every_volume()
         ) {
             break resolution;
         }
-        let done = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            pipeline.direct_post_repair_done_rx.recv(),
-        )
-        .await
-        .expect("the post-repair read-back should finish")
-        .expect("the post-repair completion channel stays open");
+        let done = pipeline
+            .direct_post_repair_done_rx
+            .recv()
+            .await
+            .expect("the post-repair completion channel stays open");
         pipeline.handle_direct_post_repair_done(done);
     };
 
@@ -749,13 +747,11 @@ async fn a_ticket_parked_against_a_stale_recovery_set_is_dropped_for_a_fresh_one
     // And the job actually finishes — the permanent-park bug's whole
     // signature was that nothing downstream of the stale entry ever ran
     // again.
-    let done = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        pipeline.direct_post_repair_done_rx.recv(),
-    )
-    .await
-    .expect("the fresh ticket's read-back should finish")
-    .expect("the post-repair completion channel stays open");
+    let done = pipeline
+        .direct_post_repair_done_rx
+        .recv()
+        .await
+        .expect("the post-repair completion channel stays open");
     assert_eq!(
         done.recovery_set_id, par2_set.recovery_set_id,
         "the result that lands must be the fresh ticket's, not a stale one"

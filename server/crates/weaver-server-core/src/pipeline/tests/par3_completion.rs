@@ -879,11 +879,7 @@ async fn par3_recovery_window_fetches_a_carrier_whose_name_misstates_its_span() 
 
 async fn settle_par3(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline.par3_runtime.as_ref().unwrap().has_work(job_id) {
-        let done =
-            tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let done = pipeline.repair_work_done_rx.recv().await.unwrap();
         pipeline.handle_repair_work_done(done).await;
     }
 }
@@ -1350,11 +1346,7 @@ async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
                 .await;
         }
         while pipeline.par3_runtime.as_ref().unwrap().has_work(job_id) {
-            let done =
-                tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let done = pipeline.repair_work_done_rx.recv().await.unwrap();
             pipeline.handle_repair_work_done(done).await;
         }
         // No recovery candidates remain in this fixture. The scheduler can now
@@ -1438,11 +1430,7 @@ async fn late_metadata_assesses_committed_files_and_exposes_native_damage() {
             .unwrap();
         pipeline.try_load_par3_metadata(job_id, source).await;
         while pipeline.par3_runtime.as_ref().unwrap().has_work(job_id) {
-            let done =
-                tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let done = pipeline.repair_work_done_rx.recv().await.unwrap();
             pipeline.handle_repair_work_done(done).await;
         }
         let (_, view) = pipeline
@@ -1545,11 +1533,7 @@ async fn completion_waits_for_authenticated_carrier_worker_including_renamed_inp
         assert!(!visible.finalizing_download);
         assert!(!visible.fetching_repair_data);
         assert!(working.join(filename).exists());
-        let done =
-            tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let done = pipeline.repair_work_done_rx.recv().await.unwrap();
         pipeline.handle_repair_work_done(done).await;
         let coordinator = pipeline.par3_runtime.as_ref().unwrap();
         assert!(!coordinator.has_work(job_id));

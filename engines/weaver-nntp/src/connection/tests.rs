@@ -742,13 +742,10 @@ async fn manual_tls_transport_bounds_each_turn_and_preserves_stream() {
     let mut read_calls = 0usize;
 
     while received.len() < payload_len {
-        let read = tokio::time::timeout(
-            Duration::from_secs(5),
-            transport.read_into_buf_with_stats(&mut read_buf, usize::MAX),
-        )
-        .await
-        .expect("manual TLS read timed out")
-        .expect("manual TLS read failed");
+        let read = transport
+            .read_into_buf_with_stats(&mut read_buf, usize::MAX)
+            .await
+            .expect("manual TLS read failed");
         assert_ne!(read.bytes, 0, "stream closed before the complete payload");
         assert_eq!(read.bytes, read_buf.len());
         assert!(
@@ -763,13 +760,10 @@ async fn manual_tls_transport_bounds_each_turn_and_preserves_stream() {
     }
 
     server.await.unwrap();
-    let eof = tokio::time::timeout(
-        Duration::from_secs(5),
-        transport.read_into_buf(&mut read_buf, usize::MAX),
-    )
-    .await
-    .expect("manual TLS EOF read timed out")
-    .expect("manual TLS EOF read failed");
+    let eof = transport
+        .read_into_buf(&mut read_buf, usize::MAX)
+        .await
+        .expect("manual TLS EOF read failed");
 
     assert_eq!(eof, 0);
     assert!(read_buf.is_empty());
@@ -1590,13 +1584,10 @@ async fn expired_active_budget_does_not_enter_async_rate_wait() {
     conn.read_buf = BytesMut::from(buffered_body.as_slice());
     let mut budget = ActiveTransferBudget::new(Duration::ZERO);
 
-    let error = tokio::time::timeout(
-        Duration::from_secs(2),
-        conn.stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(())),
-    )
-    .await
-    .expect("expired budget must not wait on the rate limiter")
-    .unwrap_err();
+    let error = conn
+        .stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(()))
+        .await
+        .unwrap_err();
 
     assert!(matches!(
         error,

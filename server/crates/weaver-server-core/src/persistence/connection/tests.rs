@@ -1860,10 +1860,7 @@ async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
     lock_tx.commit().await.unwrap();
     lock_pool.close().await;
 
-    done_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
+    done_rx.recv().unwrap().unwrap();
     assert_eq!(
         fetch_i64(
             &db,
@@ -1932,10 +1929,7 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
 
         lock_tx.commit().await.unwrap();
         lock_pool.close().await;
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        done_rx.recv().unwrap().unwrap();
 
         assert_eq!(
             fetch_i64(

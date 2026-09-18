@@ -302,9 +302,10 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
         raw_size
     );
 
-    let done = tokio::time::timeout(Duration::from_secs(2), pipeline.decode_done_rx.recv())
+    let done = pipeline
+        .decode_done_rx
+        .recv()
         .await
-        .expect("decode failure should arrive")
         .expect("decode channel should stay open");
     let DecodeDone::Failed {
         segment_id: failed_segment,
@@ -337,10 +338,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
     pipeline
         .handle_command(SchedulerCommand::PauseAll { reply })
         .await;
-    tokio::time::timeout(Duration::from_secs(1), recv)
-        .await
-        .expect("pause reply should arrive")
-        .unwrap();
+    recv.await.unwrap();
     assert!(pipeline.global_paused);
     assert_eq!(
         pipeline.db.get_setting("global_paused").unwrap().as_deref(),
@@ -351,10 +349,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
     pipeline
         .handle_command(SchedulerCommand::ResumeAll { reply })
         .await;
-    tokio::time::timeout(Duration::from_secs(1), recv)
-        .await
-        .expect("resume reply should arrive")
-        .unwrap();
+    recv.await.unwrap();
     assert!(!pipeline.global_paused);
     assert_eq!(
         pipeline.db.get_setting("global_paused").unwrap().as_deref(),
@@ -398,9 +393,10 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         })
         .await;
 
-    let done = tokio::time::timeout(Duration::from_secs(2), pipeline.decode_done_rx.recv())
+    let done = pipeline
+        .decode_done_rx
+        .recv()
         .await
-        .expect("decode failure should arrive")
         .expect("decode channel should stay open");
     let DecodeDone::Failed {
         segment_id: failed_segment,

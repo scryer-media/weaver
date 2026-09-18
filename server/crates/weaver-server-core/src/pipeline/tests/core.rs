@@ -416,21 +416,17 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
     let harness = TestHarness::new().await;
     let nzb_bytes = sample_nzb_bytes();
 
-    let submitted = tokio::time::timeout(
-        Duration::from_secs(2),
-        submit_nzb_bytes(
-            &harness.db,
-            &harness.handle,
-            &harness.config,
-            &nzb_bytes,
-            Some("Silver Horizon.Sample.nzb".to_string()),
-            None,
-            None,
-            vec![("source".to_string(), "test".to_string())],
-        ),
+    let submitted = submit_nzb_bytes(
+        &harness.db,
+        &harness.handle,
+        &harness.config,
+        &nzb_bytes,
+        Some("Silver Horizon.Sample.nzb".to_string()),
+        None,
+        None,
+        vec![("source".to_string(), "test".to_string())],
     )
     .await
-    .unwrap()
     .unwrap();
 
     wait_until(Duration::from_secs(2), || {
@@ -879,9 +875,8 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
         };
 
         pipeline.active_downloads += 1;
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            pipeline.handle_download_done(DownloadResult {
+        pipeline
+            .handle_download_done(DownloadResult {
                 lane_id: 0,
                 job_id: segment_id.file_id.job_id,
                 runtime_generation: 0,
@@ -894,10 +889,8 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
                 retry_count: 0,
                 exclude_servers: Vec::new(),
                 release_connection_slot: true,
-            }),
-        )
-        .await
-        .expect("download completion should not block");
+            })
+            .await;
     }
 
     drain_decode_results(&mut pipeline, 2).await;

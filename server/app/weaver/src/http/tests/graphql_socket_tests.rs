@@ -4,7 +4,6 @@
 use super::*;
 use async_graphql::futures_util::{SinkExt, StreamExt};
 use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
-use std::time::Duration;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as SocketError, Message};
@@ -26,7 +25,6 @@ type Client =
 
 const USERNAME: &str = "admin";
 const SESSION_TOKEN: &str = "browser-session-token";
-const SOCKET_WAIT: Duration = Duration::from_secs(5);
 
 struct SocketServer {
     addr: SocketAddr,
@@ -121,11 +119,7 @@ async fn send(client: &mut Client, message: serde_json::Value) {
 
 async fn receive(client: &mut Client) -> serde_json::Value {
     loop {
-        let message = tokio::time::timeout(SOCKET_WAIT, client.next())
-            .await
-            .expect("socket answered in time")
-            .expect("socket still open")
-            .unwrap();
+        let message = client.next().await.expect("socket still open").unwrap();
         match message {
             Message::Text(text) => return serde_json::from_str(&text).unwrap(),
             Message::Ping(_) | Message::Pong(_) => {}
@@ -148,9 +142,9 @@ async fn assert_answers(client: &mut Client, id: &str) {
 
 /// The socket is closed with `4403 Forbidden` without the client doing anything.
 async fn assert_closed_forbidden(client: &mut Client) {
-    let message = tokio::time::timeout(SOCKET_WAIT, client.next())
+    let message = client
+        .next()
         .await
-        .expect("socket was closed in time")
         .expect("a close frame precedes the end of the stream")
         .unwrap();
     let Message::Close(Some(frame)) = message else {
@@ -199,9 +193,9 @@ async fn changing_the_password_closes_sockets_opened_with_the_old_login() {
         serde_json::json!({ "type": "connection_init", "payload": {} }),
     )
     .await;
-    let refused = tokio::time::timeout(SOCKET_WAIT, retry.next())
+    let refused = retry
+        .next()
         .await
-        .expect("refused in time")
         .expect("a close frame precedes the end of the stream")
         .unwrap();
     let Message::Close(Some(frame)) = refused else {

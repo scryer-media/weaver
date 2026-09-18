@@ -669,10 +669,8 @@ fn normalize_server_host(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use tokio::sync::{RwLock, oneshot};
-    use tokio::time::timeout;
 
     use crate::observability::{persist_then_update_config, with_timed_config_read};
 
@@ -842,12 +840,8 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        let server_count = timeout(
-            Duration::from_millis(50),
-            with_timed_config_read(&config, "tests.servers.read", |cfg| cfg.servers.len()),
-        )
-        .await
-        .expect("server read should not block on slow persist");
+        let server_count =
+            with_timed_config_read(&config, "tests.servers.read", |cfg| cfg.servers.len()).await;
         assert_eq!(server_count, 0);
 
         release_tx

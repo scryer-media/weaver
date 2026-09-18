@@ -2690,7 +2690,7 @@ mod probe_tests {
                     })
                     .is_ok()
             );
-            tokio::time::timeout(Duration::from_secs(10), async {
+            async {
                 picked_up_rx.await.expect("worker picked up startup probe");
                 assert!(
                     reply_rx
@@ -2698,9 +2698,8 @@ mod probe_tests {
                         .expect("worker answered startup probe")
                         .is_none()
                 );
-            })
-            .await
-            .expect("worker reached its idle command loop");
+            }
+            .await;
         }
         let mut shared = lock_pool(&pool.shared);
         for index in 0..shared.workers.len() {
@@ -2783,9 +2782,7 @@ mod probe_tests {
         exists: Vec<bool>,
     ) -> tokio::task::JoinHandle<std_mpsc::Receiver<OwnedLanePoolCommand>> {
         tokio::task::spawn_blocking(move || {
-            let command = receiver
-                .recv_timeout(Duration::from_secs(10))
-                .expect("probe routed to this worker");
+            let command = receiver.recv().expect("probe routed to this worker");
             let OwnedLanePoolCommand::Probe {
                 picked_up, reply, ..
             } = command
@@ -2833,13 +2830,10 @@ mod probe_tests {
         let idle = answer_probe(idle_answering, vec![true]);
         let busy = answer_probe(busy_answering, vec![false]);
 
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            handle.probe(&["<probe@silver.horizon>".to_string()]),
-        )
-        .await
-        .expect("probe completes")
-        .expect("two lanes answered");
+        let outcome = handle
+            .probe(&["<probe@silver.horizon>".to_string()])
+            .await
+            .expect("two lanes answered");
 
         let mut settled = outcome.servers_settled.clone();
         settled.sort_unstable();

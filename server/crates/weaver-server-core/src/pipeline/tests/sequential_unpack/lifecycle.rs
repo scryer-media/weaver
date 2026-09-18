@@ -170,10 +170,7 @@ async fn truncated_compression_streams_fail_without_repair_data() {
             land(&mut pipeline, id, &name, &bytes, number).await;
         }
         finish(&mut pipeline, job, &name).await;
-        let done = tokio::time::timeout(Duration::from_secs(20), pipeline.extract_done_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let done = pipeline.extract_done_rx.recv().await.unwrap();
         let ExtractionDone::FullSet { result, .. } = done else {
             panic!("expected full set")
         };
@@ -206,10 +203,7 @@ async fn bad_compression_trailers_fail_without_repair_data() {
             land(&mut pipeline, id, &name, &bytes, number).await;
         }
         finish(&mut pipeline, job, &name).await;
-        let done = tokio::time::timeout(Duration::from_secs(20), pipeline.extract_done_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let done = pipeline.extract_done_rx.recv().await.unwrap();
         let ExtractionDone::FullSet { result, .. } = done else {
             panic!("expected full set")
         };

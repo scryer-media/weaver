@@ -1414,8 +1414,6 @@ mod tests {
     use std::fs;
     use std::future::Future;
     use std::pin::Pin;
-    #[cfg(unix)]
-    use std::time::Duration;
 
     const TEST_TAG: &str = "weaver-v99.0.0";
     const TEST_VERSION: &str = "99.0.0";
@@ -1786,9 +1784,7 @@ mod tests {
         assert!(!journal.macos_bundle_upgrade);
         // A portable promotion re-execs in place; it is not a bundle relaunch.
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), restart.requested())
-                .await
-                .expect("the pipeline asked the serve loop to restart"),
+            restart.requested().await,
             crate::runtime::restart::RestartAction::Restart
         );
     }

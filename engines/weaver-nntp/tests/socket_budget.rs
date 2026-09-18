@@ -52,10 +52,7 @@ async fn async_idle_socket_is_closed_before_blocking_slot_is_reassigned() {
     let permit = replacement
         .try_acquire_blocking_permit(ServerId(0))
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), closed_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    closed_rx.recv().await.unwrap();
     assert_eq!(old.socket_budget_snapshot(0).physical, 1);
     assert_eq!(old.socket_budget_snapshot(0).async_idle, 0);
     assert!(old.try_acquire_blocking_permit(ServerId(0)).is_err());
@@ -83,25 +80,15 @@ async fn async_idle_socket_is_closed_before_blocking_slot_is_reassigned() {
         recall_tx.send(id).unwrap();
     }));
     let owner = std::thread::spawn(move || {
-        assert_eq!(
-            recall_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            socket_id
-        );
+        assert_eq!(recall_rx.recv().unwrap(), socket_id);
         drop(lane);
     });
     // Reverse backend handoff must wake on both the owned dispatch permit
     // and the physical-slot acknowledgement, without a lost wakeup.
-    let async_again =
-        tokio::time::timeout(Duration::from_secs(2), replacement.acquire(ServerId(0)))
-            .await
-            .unwrap()
-            .unwrap();
+    let async_again = replacement.acquire(ServerId(0)).await.unwrap();
     owner.join().unwrap();
     assert_eq!(old.socket_budget_snapshot(0).physical, 1);
-    tokio::time::timeout(Duration::from_secs(2), closed_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    closed_rx.recv().await.unwrap();
     drop(async_again);
     replacement.drain_all_idle().await;
     assert_eq!(old.socket_budget_snapshot(0).physical, 0);

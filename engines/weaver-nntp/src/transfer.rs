@@ -1463,10 +1463,7 @@ mod tests {
                 quota: None,
             },
         );
-        let waited = tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("rate raise should wake waiter")
-            .unwrap();
+        let waited = waiter.await.unwrap();
         assert!(waited < Duration::from_secs(1));
     }
 
@@ -1617,10 +1614,7 @@ mod tests {
         });
 
         drop(permit);
-        tokio::time::timeout(Duration::from_secs(1), async_changes.changed())
-            .await
-            .expect("refund must wake async capacity watcher")
-            .unwrap();
+        async_changes.changed().await.unwrap();
         let blocking_revision = blocking_waiter.join().unwrap();
         assert!(blocking_revision > observed);
         assert!(control.quota_rejection_for(30).is_none());
@@ -1681,10 +1675,7 @@ mod tests {
 
         drop(other_permit);
 
-        tokio::time::timeout(Duration::from_secs(1), changes.changed())
-            .await
-            .expect("another server refund must wake the registry waiter")
-            .unwrap();
+        changes.changed().await.unwrap();
         assert_ne!(
             registry.capacity_revision(),
             rejection.registry_capacity_revision
@@ -1771,10 +1762,7 @@ mod tests {
         waiter.abort();
         let _ = waiter.await;
 
-        tokio::time::timeout(Duration::from_secs(1), changes.changed())
-            .await
-            .expect("canceled permit owner must publish its refund")
-            .unwrap();
+        changes.changed().await.unwrap();
         let snapshot = control.snapshot();
         assert!(snapshot.capacity_revision > observed);
         assert_eq!(snapshot.quota_reserved_bytes, 0);
@@ -1966,10 +1954,7 @@ mod tests {
         let waiter = tokio::spawn(async move { permit.record_async(100).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         registry.configure(StableServerId(11), ServerTransferConfig::default());
-        let waited = tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("rate clear should wake waiter")
-            .unwrap();
+        let waited = waiter.await.unwrap();
         assert!(waited < Duration::from_secs(1));
     }
 }

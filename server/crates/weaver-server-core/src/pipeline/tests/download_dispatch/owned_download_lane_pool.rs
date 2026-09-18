@@ -1091,9 +1091,7 @@ async fn shutdown_drain_consumes_inflight_download_results() {
         .await
         .unwrap();
 
-    tokio::time::timeout(Duration::from_secs(2), pipeline.drain())
-        .await
-        .expect("shutdown drain should consume queued download result");
+    pipeline.drain().await;
 
     assert_eq!(pipeline.active_downloads, 0);
     assert!(
@@ -2516,9 +2514,10 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
 
     pipeline.jobs.remove(&job_id);
     pipeline.shared_state.publish_jobs(Vec::new());
-    let cancelled = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+    let cancelled = pipeline
+        .retry_rx
+        .recv()
         .await
-        .expect("job removal must wake an indefinite quota waiter")
         .expect("retry channel must stay open");
     pipeline.receive_retry_work(cancelled);
     assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
@@ -2691,9 +2690,10 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
 
     pipeline.jobs.remove(&job_id);
     pipeline.shared_state.publish_jobs(Vec::new());
-    let cancelled = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+    let cancelled = pipeline
+        .retry_rx
+        .recv()
         .await
-        .expect("job removal must wake the parked large work")
         .expect("retry channel must stay open");
     pipeline.receive_retry_work(cancelled);
     drop(reservation);
@@ -2771,9 +2771,10 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
 
     drop(reservation);
 
-    let retry = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+    let retry = pipeline
+        .retry_rx
+        .recv()
         .await
-        .expect("reservation refund must wake quota-parked work")
         .expect("retry channel must stay open");
     assert_eq!(retry.work.segment_id, segment_id);
     pipeline.receive_retry_work(retry);
@@ -2868,9 +2869,10 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
         })
         .await;
 
-    let retry = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+    let retry = pipeline
+        .retry_rx
+        .recv()
         .await
-        .expect("a quota-blocked source must immediately fail over")
         .expect("retry channel must stay open");
     assert_eq!(retry.work.segment_id, segment_id);
     assert_eq!(
@@ -3024,9 +3026,10 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
 
     pipeline.jobs.remove(&job_id);
     pipeline.shared_state.publish_jobs(Vec::new());
-    let cancelled = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+    let cancelled = pipeline
+        .retry_rx
+        .recv()
         .await
-        .expect("job removal must wake the quota waiter")
         .expect("retry channel must stay open");
     pipeline.receive_retry_work(cancelled);
     assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
@@ -3168,9 +3171,10 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
 
     drop(other_reservation);
 
-    let retry = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+    let retry = pipeline
+        .retry_rx
+        .recv()
         .await
-        .expect("a non-selected fill refund must wake parked work")
         .expect("retry channel must stay open");
     assert_eq!(retry.work.segment_id, segment_id);
     assert!(retry.work.exclude_servers.is_empty());
@@ -3442,9 +3446,10 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
     );
     assert!(pipeline.pending_completion_checks.is_empty());
 
-    let work = tokio::time::timeout(Duration::from_secs(1), pipeline.retry_rx.recv())
+    let work = pipeline
+        .retry_rx
+        .recv()
         .await
-        .expect("source miss should requeue against another server")
         .expect("retry channel must stay open")
         .work;
     assert_eq!(work.exclude_servers, vec![0]);

@@ -61,7 +61,7 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
             None,
         );
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
+    async {
         let request = refills.recv().await.expect("the first article prefetches its successor");
         close_tx.send(()).unwrap();
         // Let the socket failure reach the worker while the refill remains
@@ -93,7 +93,8 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
                 }
             }
         }
-    }).await.expect("faulted worker must return work and park");
+    }
+    .await;
     worker.await.unwrap();
     server.await.unwrap();
     assert_eq!(
@@ -209,7 +210,7 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
     });
     let (picked_up_tx, picked_up_rx) = oneshot::channel();
     let (reply_tx, reply_rx) = oneshot::channel();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    async {
         bodies_seen_rx.await.expect("three BODYs pipelined before any answer");
         assert_eq!(
             lock_pool(&shared).workers[0].busy_server,
@@ -250,9 +251,8 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
             }
         }
         assert_eq!(results, 3, "every BODY on the ring is still reported");
-    })
-    .await
-    .expect("busy lane answers the probe and parks");
+    }
+    .await;
     let deferred = worker.await.unwrap();
     assert!(
         deferred.is_empty(),

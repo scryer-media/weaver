@@ -130,7 +130,6 @@ impl Seek for RarVolumeReader {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
     use unrar_rs::VolumeProvider;
 
     fn input(bytes: &[u8]) -> (tempfile::TempDir, RarVolumeProvider) {
@@ -165,10 +164,7 @@ mod tests {
         wait_for_park(&provider.coverage);
         assert!(rx.try_recv().is_err());
         provider.coverage.note_committed_range(0, 3, 5);
-        assert_eq!(
-            rx.recv().unwrap().unwrap(),
-            *b"abcdefgh"
-        );
+        assert_eq!(rx.recv().unwrap().unwrap(), *b"abcdefgh");
         worker.join().unwrap();
     }
 

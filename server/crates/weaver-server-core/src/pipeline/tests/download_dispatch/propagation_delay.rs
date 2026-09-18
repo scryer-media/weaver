@@ -647,6 +647,7 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     )
     .await;
 
+    let first_pass_started = Instant::now();
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 1);
@@ -677,8 +678,18 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
             .load(Ordering::Relaxed),
         DownloadPressureState::Soft.as_code()
     );
-    assert!(pipeline.download_pressure_soft_dispatch_after.is_some());
+    assert!(
+        pipeline
+            .download_pressure_soft_dispatch_after
+            .is_some_and(|ready_at| ready_at > first_pass_started),
+        "a soft-pressure pass must hold the next one back"
+    );
 
+    // The hold lasts a fraction of a second; a pass that arrives inside it is
+    // the case under test, so the test puts the next pass inside it rather
+    // than racing the clock to get there.
+    pipeline.download_pressure_soft_dispatch_after =
+        Some(Instant::now() + Duration::from_secs(3600));
     pipeline.dispatch_downloads();
     assert_eq!(pipeline.active_downloads, 1);
     assert_eq!(pipeline.active_download_connections, 1);
@@ -856,7 +867,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .len(),
         1
     );
-    settle_lane_dials(&pipeline).await;
+    settle_lane_dials(&mut pipeline).await;
 
     pipeline.active_downloads = 0;
     pipeline.active_download_connections = 0;

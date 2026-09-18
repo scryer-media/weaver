@@ -750,11 +750,7 @@ async fn delete_history_removes_intermediate_output_dir() {
             reply,
         })
         .await;
-    tokio::time::timeout(Duration::from_secs(1), recv)
-        .await
-        .expect("delete history reply should arrive")
-        .unwrap()
-        .unwrap();
+    recv.await.unwrap().unwrap();
 
     assert!(!output_dir.exists());
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
@@ -785,11 +781,7 @@ async fn delete_history_removes_db_only_history_row() {
             reply,
         })
         .await;
-    tokio::time::timeout(Duration::from_secs(1), recv)
-        .await
-        .expect("delete history reply should arrive")
-        .unwrap()
-        .unwrap();
+    recv.await.unwrap().unwrap();
 
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
 }
@@ -846,11 +838,7 @@ async fn delete_all_history_keeps_complete_output_dir() {
             reply,
         })
         .await;
-    tokio::time::timeout(Duration::from_secs(1), recv)
-        .await
-        .expect("delete all history reply should arrive")
-        .unwrap()
-        .unwrap();
+    recv.await.unwrap().unwrap();
 
     assert!(!failed_output_dir.exists());
     assert!(complete_output_dir.exists());
@@ -1037,16 +1025,15 @@ async fn wait_for_job_event(
     events: &mut broadcast::Receiver<PipelineEvent>,
     is_expected: impl Fn(&PipelineEvent) -> bool,
 ) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    async {
         loop {
             let event = events.recv().await.expect("pipeline event channel closed");
             if is_expected(&event) {
                 return;
             }
         }
-    })
-    .await
-    .expect("timed out waiting for pipeline event");
+    }
+    .await;
 }
 
 #[tokio::test]

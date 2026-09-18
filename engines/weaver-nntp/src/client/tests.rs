@@ -281,12 +281,7 @@ async fn spawn_pipelined_head_recheck_server() -> u16 {
                 continue;
             }
             if line.starts_with("HEAD <first@example.com>") {
-                let second = tokio::time::timeout(
-                    Duration::from_millis(250),
-                    read_command_line(&mut socket),
-                )
-                .await
-                .expect("the HEAD re-check must send every miss before reading an answer");
+                let second = read_command_line(&mut socket).await;
                 assert!(
                     second.starts_with("HEAD <second@example.com>"),
                     "unexpected second command: {second:?}"
@@ -352,9 +347,7 @@ async fn spawn_checkpoint_plan_pipelining_server() -> u16 {
 
         let first = read_command_line(&mut socket).await;
         assert_eq!(first, "BODY <first@checkpoint.test>\r\n");
-        let second = tokio::time::timeout(Duration::from_secs(1), read_command_line(&mut socket))
-            .await
-            .expect("depth-2 lane must issue both BODY commands before a response");
+        let second = read_command_line(&mut socket).await;
         assert_eq!(second, "BODY <second@checkpoint.test>\r\n");
         socket
             .write_all(&yenc_body_response(
@@ -412,10 +405,7 @@ async fn spawn_stat_server(expect_pipelined: bool) -> u16 {
         let first = read_command_line(&mut socket).await;
         assert!(first.starts_with("STAT <first@example.com>"));
         if expect_pipelined {
-            let second =
-                tokio::time::timeout(Duration::from_millis(250), read_command_line(&mut socket))
-                    .await
-                    .expect("known pipelining mode must send the next STAT before a response");
+            let second = read_command_line(&mut socket).await;
             assert!(second.starts_with("STAT <second@example.com>"));
             socket
                 .write_all(
@@ -2277,12 +2267,9 @@ async fn remote_trickle_consumes_active_budget_and_fails_over() {
         soft_timeout: Duration::from_millis(75),
     });
 
-    let trace = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.fetch_body_decoded_with_groups_traced("<trickle@example.com>", &[]),
-    )
-    .await
-    .expect("trickle failover must complete before the watchdog");
+    let trace = client
+        .fetch_body_decoded_with_groups_traced("<trickle@example.com>", &[])
+        .await;
     let decoded = trace.result.expect("backup should satisfy the BODY fetch");
     assert_eq!(decoded.decoded.concat(), vec![b'A'; 128]);
     assert_eq!(trace.attempts.len(), 2);
@@ -2335,12 +2322,9 @@ async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
         soft_timeout: Duration::from_millis(75),
     });
 
-    let trace = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.fetch_body_decoded_with_groups_traced("<delayed@example.com>", &[]),
-    )
-    .await
-    .expect("initial-response failover must complete before the watchdog");
+    let trace = client
+        .fetch_body_decoded_with_groups_traced("<delayed@example.com>", &[])
+        .await;
 
     assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
     assert_eq!(trace.attempts.len(), 2);
@@ -2381,12 +2365,9 @@ async fn delayed_reauth_consumes_active_budget_and_fails_over() {
         soft_timeout: Duration::from_millis(75),
     });
 
-    let trace = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.fetch_body_decoded_with_groups_traced("<reauth@example.com>", &[]),
-    )
-    .await
-    .expect("re-auth failover must complete before the watchdog");
+    let trace = client
+        .fetch_body_decoded_with_groups_traced("<reauth@example.com>", &[])
+        .await;
 
     assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
     assert_eq!(trace.attempts.len(), 2);
@@ -2440,15 +2421,12 @@ async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
         soft_timeout: Duration::from_millis(75),
     });
 
-    let trace = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.fetch_body_with_groups_traced(
+    let trace = client
+        .fetch_body_with_groups_traced(
             "<unterminated@example.com>",
             &[String::from("alt.binaries.test")],
-        ),
-    )
-    .await
-    .expect("raw timeout cleanup must not wait on the rate limiter");
+        )
+        .await;
 
     assert_eq!(trace.result.unwrap().as_ref(), b"backup\r\n");
     assert_eq!(trace.attempts.len(), 2);

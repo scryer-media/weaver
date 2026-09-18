@@ -2104,7 +2104,7 @@ mod tests {
         waiting_budget.cancel();
 
         let error = done_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv()
             .expect("cancelled job should leave the shared-memory wait")
             .unwrap_err();
         assert!(error.contains("job extraction was cancelled"));

@@ -273,6 +273,7 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
     pipeline.active_decodes_by_job.insert(job_id, 1);
     assert!(!pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
 
+    let blocked_pass_started = Instant::now();
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 0);
@@ -295,13 +296,21 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
         pipeline
             .download_restart_durable_lead_retry_after
             .get(&job_id)
-            .is_some_and(|ready_at| *ready_at > Instant::now())
+            .is_some_and(|ready_at| *ready_at > blocked_pass_started)
     );
     let retry_delay = pipeline
         .next_restart_durable_lead_retry_delay()
         .expect("durable lead block should expose a retry wakeup");
     assert!(retry_delay <= Duration::from_millis(250));
 
+    // The block holds for a fraction of a second. A pass inside it is the case
+    // under test, so the test keeps the hold open rather than racing the
+    // clock to arrive in time.
+    *pipeline
+        .download_restart_durable_lead_retry_after
+        .get_mut(&job_id)
+        .expect("the blocked job keeps its retry time") =
+        Instant::now() + Duration::from_secs(3600);
     pipeline.dispatch_downloads();
     assert_eq!(
         pipeline
@@ -1308,7 +1317,7 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
         normal_queued_before_priority_update > 0,
         "the retained Normal job must still have queued ordinary work"
     );
-    settle_lane_dials(&pipeline).await;
+    settle_lane_dials(&mut pipeline).await;
 
     // One lane is free while the prior completion-critical body remains active.
     // Existing work keeps running; the priority update owns only the new lane.

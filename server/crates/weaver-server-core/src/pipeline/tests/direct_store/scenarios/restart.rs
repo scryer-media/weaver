@@ -2490,13 +2490,11 @@ async fn a_second_damage_verdict_after_a_repair_demotes_instead_of_repairing_aga
                 "a stale ticket must not publish a verdict"
             );
         }
-        let done = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            pipeline.direct_post_repair_done_rx.recv(),
-        )
-        .await
-        .expect("the post-repair read-back should finish")
-        .expect("the post-repair completion channel stays open");
+        let done = pipeline
+            .direct_post_repair_done_rx
+            .recv()
+            .await
+            .expect("the post-repair completion channel stays open");
         pipeline.handle_direct_post_repair_done(done);
     };
 

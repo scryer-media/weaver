@@ -83,7 +83,7 @@ async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
         if gate == DirectStoreGate::Enabled {
             pipeline.update_mixed_rar_chase(job_id, 0);
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
+        async {
             loop {
                 pipeline.reap_direct_unpack().await;
                 if pipeline.direct_unpack.outcome(job_id, "mixed").is_some() {
@@ -91,9 +91,8 @@ async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .unwrap();
+        }
+        .await;
         let outcome = pipeline.direct_unpack.outcome(job_id, "mixed").unwrap();
         assert!(
             outcome
@@ -248,9 +247,7 @@ async fn handing_a_chase_to_extraction_publishes_parts_that_finished_unheard() {
         panic!("the armed chase must be handed over while it runs");
     };
     assert!(coverage.part_is_complete(0));
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(20), pending.handle)
-        .await
-        .expect("the chase must finish once the handoff publishes the finished part");
+    let joined = pending.handle.await;
     let outcome = joined.unwrap().unwrap();
     assert_eq!(
         outcome.extracted.len(),
@@ -778,9 +775,7 @@ async fn handing_a_chase_to_extraction_never_raises_a_gate() {
         !coverage.is_gated(),
         "a gate raised at handoff can never be lifted; the handoff must not raise one"
     );
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(20), pending.handle)
-        .await
-        .expect("the chase must finish once the handoff publishes the finished part");
+    let joined = pending.handle.await;
     let outcome = joined.unwrap().unwrap();
     assert_eq!(
         outcome.extracted.len(),

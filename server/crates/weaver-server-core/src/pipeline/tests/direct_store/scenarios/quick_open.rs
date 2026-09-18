@@ -2456,13 +2456,11 @@ async fn job_teardown_forgets_an_outstanding_demotion_sweep() {
     // The detached worker still runs to its end and still posts its result. It
     // has to find no taker: the fence is what stops it applying floors, rows and
     // requeues to a job that no longer has the state they describe.
-    let done = tokio::time::timeout(
-        Duration::from_secs(10),
-        pipeline.direct_demotion_done_rx.recv(),
-    )
-    .await
-    .expect("the forgotten sweep still finishes")
-    .expect("the demotion completion channel should stay open");
+    let done = pipeline
+        .direct_demotion_done_rx
+        .recv()
+        .await
+        .expect("the demotion completion channel should stay open");
     pipeline.handle_direct_demotion_done(done).await;
 
     assert!(pipeline.direct_demotion_in_flight.is_empty());

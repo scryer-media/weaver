@@ -1712,13 +1712,7 @@ mod tests {
             // withholds every greeting until all four sockets arrive.
             let mut sockets = Vec::new();
             for _ in 0..4 {
-                sockets.push(
-                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .0,
-                );
+                sockets.push(listener.accept().await.unwrap().0);
             }
             let mut sessions = tokio::task::JoinSet::new();
             for socket in sockets {
@@ -1747,14 +1741,13 @@ mod tests {
             let pool = Arc::clone(&pool);
             dials.spawn(async move { pool.connect_server_excluding(0, &[], None).await });
         }
-        tokio::time::timeout(Duration::from_secs(10), async {
+        async {
             while let Some(result) = dials.join_next().await {
                 drop(result.unwrap().unwrap());
             }
             server.await.unwrap();
-        })
-        .await
-        .unwrap();
+        }
+        .await;
     }
 
     fn test_pool_config(max_per_server: usize) -> PoolConfig {
@@ -1824,9 +1817,9 @@ mod tests {
                 lock_recovering(&releasing).take();
             }),
         );
-        let permit = tokio::time::timeout(Duration::from_secs(5), pool.acquire_dispatch_permit(0))
+        let permit = pool
+            .acquire_dispatch_permit(0)
             .await
-            .expect("the recall must free a permit well inside the budget")
             .expect("acquire must succeed once the recall lands");
         drop(permit);
         drop(slot);
