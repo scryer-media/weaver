@@ -1304,14 +1304,19 @@ pub(super) struct ProbeUpdate {
     /// `activate_health_probes`. A result whose round the job is no longer
     /// waiting on is dropped.
     pub(super) probe_round: u32,
-    /// Total probes attempted so far.
+    /// Probes answered authoritatively so far. The verdict is read over this
+    /// figure, not over the number of segments the round set out to sample.
     pub(super) total: usize,
     /// Number of missing articles found so far.
     pub(super) missed: usize,
+    /// Probes a non-authoritative batch left unanswered. Coverage the round
+    /// lost, which qualifies the verdict without discarding it.
+    pub(super) unverified: usize,
     /// True when the probe is complete (final update).
     pub(super) done: bool,
-    /// True when probe confirmation hit a non-authoritative transport/protocol
-    /// failure and the round should be discarded.
+    /// True when probe confirmation answered for nothing at all and the round
+    /// has to be discarded. A round that answered for part of its sample is
+    /// conclusive over that part.
     pub(super) inconclusive: bool,
 }
 
