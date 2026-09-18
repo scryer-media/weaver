@@ -310,14 +310,6 @@ impl Pipeline {
     }
 
     pub(crate) fn release_download_result(&mut self, result: &DownloadResult) -> bool {
-        // Job attribution below comes from the result alone. While a lane is
-        // still booked to one job, the two must agree.
-        debug_assert!(
-            self.download_lane_owners
-                .get(&result.lane_id)
-                .is_none_or(|owner| owner.job_id == result.job_id),
-            "download result job disagrees with the lane owner still booked for its lane"
-        );
         if !self.accept_lane_work(result.lane_id, result.segment_id) {
             let bytes = match &result.data {
                 Ok(DownloadPayload::Raw(raw)) => raw.len() as u64,
@@ -385,7 +377,6 @@ impl Pipeline {
                     }
                 }
             }
-            self.clear_spillover_loan_if_idle();
         }
         if result.origin.is_recovery() {
             self.active_recovery = self.active_recovery.saturating_sub(1);

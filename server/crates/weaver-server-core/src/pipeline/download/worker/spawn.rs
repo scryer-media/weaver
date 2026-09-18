@@ -347,12 +347,6 @@ impl Pipeline {
             return;
         }
 
-        debug_assert!(
-            initial_lease
-                .works
-                .iter()
-                .all(|work| initial_lease.compatibility.matches(work))
-        );
 
         if !self.repeated_articles.is_empty()
             && let Some(cache) = self.repeated_articles.get(&initial_lease.job_id)
@@ -367,7 +361,6 @@ impl Pipeline {
                 self.owned_download_lane_event_tx.clone(),
                 self.download_refill_tx.clone(),
                 self.download_lane_parked_tx.clone(),
-                Arc::clone(&self.hot_share_yield_signal),
                 initial_lease,
             ) {
                 warn!("owned blocking lane pool stopped; falling back to async download lane");
@@ -403,7 +396,6 @@ impl Pipeline {
             let lane_id = initial_lease.lane_id;
             let mut lease = initial_lease;
             let mut recorded_mode = lease.lane_mode;
-            let mut current_spillover_loan_kind: Option<SpilloverLoanKind>;
             let mut current_completion_critical: bool;
             let mut current_job_id: JobId;
             let park_reason: LaneParkReason;
@@ -431,7 +423,7 @@ impl Pipeline {
             };
             for server in selection.eligible {
                 match nntp
-                    .acquire_body_lane(server, &lease.compatibility.groups)
+                    .acquire_body_lane(server, &[])
                     .await
                 {
                     Ok(acquired) => {
@@ -445,11 +437,8 @@ impl Pipeline {
             let Some(mut lane) = lane else {
                 let failure = DownloadFailure::from_lane_acquire_failure(acquire_error.as_ref());
                 let policy_blocked = failure.kind == DownloadFailureKind::ServerQuota;
-                let is_recovery = lease.compatibility.is_recovery;
-                let completion_critical = lease.compatibility.completion_critical;
-                let exclude_servers = lease.compatibility.exclude_servers.clone();
+                let completion_critical = lease.completion_critical;
                 let mode = lease.lane_mode;
-                let spillover_loan_kind = lease.spillover_loan_kind;
                 let job_id = lease.job_id;
                 let runtime_generation = lease.runtime_generation;
                 for (work_index, work) in lease.works.into_iter().enumerate() {
@@ -482,11 +471,11 @@ impl Pipeline {
                             }),
                             source_server_idx: None,
                             origin: DownloadResultOrigin::from_work(
-                                is_recovery,
+                                work.is_recovery,
                                 work.completion_critical,
                             ),
                             retry_count: work.retry_count,
-                            exclude_servers: exclude_servers.clone(),
+                            exclude_servers: work.exclude_servers.clone(),
                             release_connection_slot: false,
                         })
                         .await;
@@ -496,7 +485,6 @@ impl Pipeline {
                         lane_id,
                         job_id,
                         mode,
-                        spillover_loan_kind,
                         completion_critical,
                         reason: if policy_blocked {
                             LaneParkReason::ServerQuota
@@ -517,17 +505,15 @@ impl Pipeline {
                     job_id,
                     runtime_generation,
                     lane_mode,
-                    spillover_loan_kind,
                     server_modes,
-                    compatibility,
+                    completion_critical,
                     effective_exclude_servers: _,
                     checkpoint_plan,
                     pressure_clear,
                     works,
                 } = lease;
                 current_job_id = job_id;
-                current_spillover_loan_kind = spillover_loan_kind;
-                current_completion_critical = compatibility.completion_critical;
+                current_completion_critical = completion_critical;
                 let server_idx = lane.server_id().0;
                 let supports_pipelining = lane.supports_pipelining();
                 let actual_mode = Self::actual_download_lane_mode(
@@ -536,8 +522,6 @@ impl Pipeline {
                     server_idx,
                     supports_pipelining,
                 );
-                let is_recovery = compatibility.is_recovery;
-                let exclude_servers = compatibility.exclude_servers.clone();
                 // Every lease reapplies its immutable plan, including `None`,
                 // so pooled responses cannot retain a prior job's geometry.
                 lane.set_checkpoint_plan(checkpoint_plan);
@@ -631,11 +615,11 @@ impl Pipeline {
                                         lane_observation: Some(observation),
                                         source_server_idx,
                                         origin: DownloadResultOrigin::from_work(
-                                            is_recovery,
+                                            work.is_recovery,
                                             work.completion_critical,
                                         ),
                                         retry_count,
-                                        exclude_servers: exclude_servers.clone(),
+                                        exclude_servers: work.exclude_servers.clone(),
                                         release_connection_slot: false,
                                     })
                                     .await;
@@ -643,7 +627,6 @@ impl Pipeline {
                         }
                         DownloadLaneMode::Pipelined { depth } => {
                             let tx_for_trace = tx.clone();
-                            let exclude_servers_for_trace = exclude_servers.clone();
                             let estimated_body_bytes = works_by_index
                                 .iter()
                                 .map(|work| {
@@ -701,7 +684,7 @@ impl Pipeline {
                                             connection_discarded: meta.connection_discarded,
                                         };
                                         let tx = tx_for_trace.clone();
-                                        let exclude_servers = exclude_servers_for_trace.clone();
+                                        let exclude_servers = work.exclude_servers.clone();
                                         async move {
                                             let _ = tx
                                                 .send(DownloadResult {
@@ -714,7 +697,7 @@ impl Pipeline {
                                                     lane_observation: Some(observation),
                                                     source_server_idx,
                                                     origin: DownloadResultOrigin::from_work(
-                                                        is_recovery,
+                                                        work.is_recovery,
                                                         work.completion_critical,
                                                     ),
                                                     retry_count,
@@ -766,11 +749,11 @@ impl Pipeline {
                                 }),
                                 source_server_idx: None,
                                 origin: DownloadResultOrigin::from_work(
-                                    is_recovery,
+                                    work.is_recovery,
                                     work.completion_critical,
                                 ),
                                 retry_count: work.retry_count,
-                                exclude_servers: exclude_servers.clone(),
+                                exclude_servers: work.exclude_servers.clone(),
                                 release_connection_slot: false,
                             })
                             .await;
@@ -812,11 +795,11 @@ impl Pipeline {
                                 }),
                                 source_server_idx: None,
                                 origin: DownloadResultOrigin::from_work(
-                                    is_recovery,
+                                    work.is_recovery,
                                     work.completion_critical,
                                 ),
                                 retry_count: work.retry_count,
-                                exclude_servers: exclude_servers.clone(),
+                                exclude_servers: work.exclude_servers.clone(),
                                 release_connection_slot: false,
                             })
                             .await;
@@ -839,8 +822,6 @@ impl Pipeline {
                         remote_ip: lane.remote_ip(),
                         supports_pipelining,
                         current_mode: recorded_mode,
-                        spillover_loan_kind,
-                        compatibility,
                         response_tx,
                     })
                     .await
@@ -880,7 +861,6 @@ impl Pipeline {
                     lane_id,
                     job_id: current_job_id,
                     mode: recorded_mode,
-                    spillover_loan_kind: current_spillover_loan_kind,
                     completion_critical: current_completion_critical,
                     reason: park_reason,
                     release_connection_slot: true,

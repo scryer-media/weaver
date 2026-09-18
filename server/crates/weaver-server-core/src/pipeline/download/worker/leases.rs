@@ -1006,7 +1006,8 @@ impl Pipeline {
         self.book_download_lane_owner(lease, starts_connection);
         self.activate_download_batch(
             lease.job_id,
-            DownloadBatchClass::from(&lease.compatibility),
+            lease.works.iter().filter(|work| work.is_recovery).count(),
+            lease.completion_critical,
             lease.lane_mode,
             lease.works.len(),
             activation_items,
@@ -1014,10 +1015,11 @@ impl Pipeline {
         );
     }
 
-    pub(in crate::pipeline::download::worker) fn activate_download_batch(
+    pub(in crate::pipeline) fn activate_download_batch(
         &mut self,
         job_id: JobId,
-        batch_class: DownloadBatchClass,
+        recovery_count: usize,
+        completion_critical: bool,
         lane_mode: DownloadLaneMode,
         work_count: usize,
         activation_items: &[(SegmentId, NzbFileId, u64)],
@@ -1032,29 +1034,17 @@ impl Pipeline {
             .download_lane_lease_items_total
             .fetch_add(work_count as u64, Ordering::Relaxed);
         if starts_connection {
-            if self.hot_dispatch_job == Some(job_id) {
-                let now = Instant::now();
-                let speed = self.hot_dispatch_speed_bps(now);
-                self.hot_dispatch_expansion_window
-                    .record(now, HotExpansionKind::LaneStart, speed);
-            }
             self.active_download_connections += 1;
             self.note_download_lane_started(lane_mode);
             *self
                 .active_download_connections_by_job
                 .entry(job_id)
                 .or_default() += 1;
-            if batch_class.completion_critical {
-                self.active_completion_critical_connections += 1;
-                *self
-                    .active_completion_critical_connections_by_job
-                    .entry(job_id)
-                    .or_default() += 1;
+            if completion_critical {
+                self.book_completion_critical_connection(job_id);
             }
         }
-        if batch_class.is_recovery {
-            self.active_recovery += work_count;
-        }
+        self.active_recovery += recovery_count;
         *self.active_downloads_by_job.entry(job_id).or_default() += work_count;
         for (segment_id, file_id, estimate) in activation_items {
             *self.active_downloads_by_file.entry(*file_id).or_default() += 1;

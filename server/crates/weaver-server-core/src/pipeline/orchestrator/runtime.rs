@@ -208,6 +208,7 @@ impl Pipeline {
             active_completion_critical_connections: 0,
             active_recovery: 0,
             download_lane_runtime: DownloadLaneRuntimeState::default(),
+            held_download_refills: Vec::new(),
             download_dispatch_wake: false,
             nntp_handoff_draining: false,
             ip_replacement_trial_extra_connections,

@@ -483,7 +483,6 @@ impl Pipeline {
                     lane_id,
                     job_id,
                     mode,
-                    spillover_loan_kind: None,
                     completion_critical: false,
                     reason: if policy_parked {
                         LaneParkReason::ServerQuota

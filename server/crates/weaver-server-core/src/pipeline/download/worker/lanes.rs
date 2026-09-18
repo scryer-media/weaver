@@ -780,8 +780,7 @@ impl Pipeline {
                 lane_id: lease.lane_id,
                 job_id: lease.job_id,
                 mode: lease.lane_mode,
-                spillover_loan_kind: lease.spillover_loan_kind,
-                completion_critical: lease.compatibility.completion_critical,
+                completion_critical: lease.completion_critical,
                 reason: LaneParkReason::Error,
                 release_connection_slot: true,
                 release_ip_replacement_burst: false,
@@ -810,8 +809,7 @@ impl Pipeline {
                         lane_id,
                         job_id,
                         lane_mode,
-                        spillover_loan_kind,
-                        compatibility,
+                        completion_critical,
                         works,
                         ..
                     } = lease;
@@ -833,8 +831,7 @@ impl Pipeline {
                         lane_id,
                         job_id,
                         mode: lane_mode,
-                        spillover_loan_kind,
-                        completion_critical: compatibility.completion_critical,
+                        completion_critical,
                         reason: LaneParkReason::Capacity,
                         release_connection_slot: true,
                         release_ip_replacement_burst: false,
@@ -1073,9 +1070,11 @@ impl Pipeline {
             return;
         }
         if let Some(owner) = self.download_lane_owners.get_mut(&parked.lane_id) {
+            // The owner is the booked truth: a refill may have moved the lane
+            // to another job or class after the worker last looked.
+            parked.job_id = owner.job_id;
             parked.mode = owner.mode;
             parked.completion_critical = owner.completion_critical;
-            parked.spillover_loan_kind = owner.spillover_loan_kind;
             parked.release_connection_slot = std::mem::take(&mut owner.connection);
             parked.release_ip_replacement_burst = std::mem::take(&mut owner.ip_replacement);
             if owner.outstanding.is_empty() {
@@ -1121,7 +1120,6 @@ impl Pipeline {
                     }
                 }
             }
-            self.clear_spillover_loan_if_idle();
         }
         if parked.release_ip_replacement_burst {
             self.ip_replacement_burst_active = false;

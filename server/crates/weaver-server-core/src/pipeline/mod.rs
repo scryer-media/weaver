@@ -2324,6 +2324,9 @@ pub struct Pipeline {
     /// Runtime-only per-server BODY depth explorers. Seeded from the persisted
     /// depth on first observation; the measurements themselves never persist.
     pub(super) download_lane_runtime: DownloadLaneRuntimeState,
+    /// Refill requests the scheduler had nothing for yet, waiting for the
+    /// next wake or for their hold to run out.
+    pub(super) held_download_refills: Vec<HeldDownloadRefill>,
     /// A lane parked and its connection slot came back; the run loop owes a
     /// dispatch pass.
     ///

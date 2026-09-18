@@ -243,6 +243,15 @@ impl OwnedLaneProbeHandle {
 
     /// Every worker that is currently idle, with the server index of the
     /// connection it kept — `None` when it sits idle without one.
+    /// The servers of the connections idle workers are keeping, one entry
+    /// per idle worker; `None` for a worker idle without a connection.
+    pub(crate) fn idle_lane_servers(&self) -> Vec<Option<usize>> {
+        self.idle_workers()
+            .into_iter()
+            .map(|(server, _)| server)
+            .collect()
+    }
+
     fn idle_workers(&self) -> Vec<(Option<usize>, std_mpsc::Sender<OwnedLanePoolCommand>)> {
         let shared = lock_pool(&self.shared);
         shared
@@ -377,7 +386,6 @@ struct CachedOwnedLane {
 /// asked for.
 pub(crate) struct OwnedLaneWarm {
     nntp: Arc<weaver_nntp::NntpClient>,
-    groups: Arc<[String]>,
     exclude_servers: Arc<[usize]>,
     byte_estimate: u64,
 }
@@ -583,7 +591,6 @@ impl OwnedDownloadLanePool {
     pub(crate) fn warm(
         &self,
         nntp: &Arc<weaver_nntp::NntpClient>,
-        groups: Arc<[String]>,
         exclude_servers: Arc<[usize]>,
         byte_estimate: u64,
         limit: usize,
@@ -596,7 +603,6 @@ impl OwnedDownloadLanePool {
         for sender in senders {
             let warm = Box::new(OwnedLaneWarm {
                 nntp: Arc::clone(nntp),
-                groups: Arc::clone(&groups),
                 exclude_servers: Arc::clone(&exclude_servers),
                 byte_estimate,
             });
@@ -752,7 +758,7 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
         .copied()
         .chain((0..nntp.pool().server_count()).filter(|&idx| nntp.pool().requires_recovery(idx)))
         .collect();
-    match nntp.try_warm_blocking_body_lane(&groups, &exclude_servers, byte_estimate) {
+    match nntp.try_warm_blocking_body_lane(&[], &exclude_servers, byte_estimate) {
         Ok(lane) => {
             *cached_lane = Some(CachedOwnedLane { nntp, lane });
         }
