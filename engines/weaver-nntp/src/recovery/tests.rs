@@ -48,7 +48,7 @@ fn healthy_and_recovered_connections_do_not_wait_for_the_policy_mutex() {
         tx.send(()).unwrap();
         (healthy, recovered)
     });
-    let result = rx.recv_timeout(Duration::from_secs(1));
+    let result = rx.recv();
     drop(guard);
     drop(worker.join().unwrap());
     result.expect("healthy article checks must not wait for policy updates");

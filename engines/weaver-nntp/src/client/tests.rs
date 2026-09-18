@@ -49,20 +49,22 @@ async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
             .unwrap();
         socket.flush().await.unwrap();
 
-        for _ in 0..20 {
+        // The body never ends: only the client's soft timeout can end the
+        // read, however slowly the client runs.
+        loop {
             tokio::time::sleep(line_delay).await;
             if socket.write_all(LINE).await.is_err() || socket.flush().await.is_err() {
                 return;
             }
         }
-        let _ = socket.write_all(b"=yend size=2560\r\n.\r\n").await;
-        let _ = socket.flush().await;
     });
 
     port
 }
 
-async fn spawn_delayed_body_initial_server(delay: Duration) -> u16 {
+/// Answers a BODY with nothing at all, holding the session open until the
+/// client gives up on it.
+async fn spawn_delayed_body_initial_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -79,19 +81,15 @@ async fn spawn_delayed_body_initial_server(delay: Duration) -> u16 {
 
         let body = read_command_line(&mut socket).await;
         assert!(body.starts_with("BODY "));
-        tokio::time::sleep(delay).await;
-        let _ = socket
-            .write_all(
-                b"222 1 <delayed@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-            )
-            .await;
-        let _ = socket.flush().await;
+        let _ = socket.read_to_end(&mut Vec::new()).await;
     });
 
     port
 }
 
-async fn spawn_delayed_reauth_server(delay: Duration) -> u16 {
+/// Asks for re-authentication mid-session, then never answers the AUTHINFO,
+/// holding the session open until the client gives up on it.
+async fn spawn_delayed_reauth_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -122,9 +120,7 @@ async fn spawn_delayed_reauth_server(delay: Duration) -> u16 {
 
         let user = read_command_line(&mut socket).await;
         assert!(user.starts_with("AUTHINFO USER "));
-        tokio::time::sleep(delay).await;
-        let _ = socket.write_all(b"381 password required\r\n").await;
-        let _ = socket.flush().await;
+        let _ = socket.read_to_end(&mut Vec::new()).await;
     });
 
     port
@@ -160,7 +156,7 @@ async fn spawn_unterminated_body_server() -> u16 {
             .unwrap();
         socket.write_all(&vec![b'x'; 64 * 1024]).await.unwrap();
         socket.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = socket.read_to_end(&mut Vec::new()).await;
     });
 
     port
@@ -190,8 +186,7 @@ async fn spawn_probe_confirmation_server(head_response: &'static [u8]) -> u16 {
 
     tokio::spawn(async move {
         loop {
-            let accept = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
-            let Ok(Ok((mut socket, _))) = accept else {
+            let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
 
@@ -302,14 +297,19 @@ async fn spawn_pipelined_head_recheck_server() -> u16 {
     port
 }
 
+/// Longer than any test runs. A script answers, closes or deliberately goes
+/// silent, so a connection's own timeouts only decide a test that sets them
+/// itself, never a slow runner.
+const UNREACHED_TIMEOUT: Duration = Duration::from_secs(3600);
+
 fn scripted_server(port: u16, group: usize) -> ServerPoolConfig {
     ServerPoolConfig {
         server: ServerConfig {
             host: "127.0.0.1".into(),
             port,
             tls: false,
-            connect_timeout: Duration::from_secs(1),
-            command_timeout: Duration::from_secs(1),
+            connect_timeout: UNREACHED_TIMEOUT,
+            command_timeout: UNREACHED_TIMEOUT,
             ..Default::default()
         },
         max_connections: 2,
@@ -923,7 +923,7 @@ async fn stat_batch_that_stalls_mid_command_still_cools_the_server_down() {
             },
         ],
         // Keep the socket open but silent so the STAT reply never arrives.
-        Duration::from_secs(3),
+        UNREACHED_TIMEOUT,
     )
     .await;
 
@@ -1324,7 +1324,7 @@ fn quota_selection_client(
         servers,
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     })
 }
 
@@ -1374,7 +1374,7 @@ async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_movi
         ],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
 
     let large = client.body_server_selection_with_estimate(&[], 41).await;
@@ -1456,7 +1456,7 @@ async fn pipelined_article_not_found_keeps_the_batch_and_connection_clean() {
         servers: vec![scripted_server(port, 0)],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(2),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
     let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
     let message_ids = ["<one@miss-batch>", "<two@miss-batch>", "<three@miss-batch>"];
@@ -1535,7 +1535,7 @@ async fn quota_stopped_pipeline_reports_every_unissued_item_without_poisoning_la
         servers: vec![server],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
     let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
     let message_ids = [
@@ -2082,7 +2082,7 @@ async fn decoded_quota_rejection_fails_over_to_another_fill_server() {
         servers: vec![capped, healthy],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
 
     let trace = client
@@ -2150,7 +2150,7 @@ async fn decoded_quota_rejection_does_not_unlock_backfill() {
         servers: vec![capped, backfill],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
 
     let trace = client
@@ -2296,7 +2296,7 @@ async fn remote_trickle_consumes_active_budget_and_fails_over() {
 
 #[tokio::test]
 async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
-    let primary_port = spawn_delayed_body_initial_server(Duration::from_millis(300)).await;
+    let primary_port = spawn_delayed_body_initial_server().await;
     let backup_port = spawn_scripted_server(vec![
         ScriptStep {
             expect_prefix: None,
@@ -2339,7 +2339,7 @@ async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
 
 #[tokio::test]
 async fn delayed_reauth_consumes_active_budget_and_fails_over() {
-    let primary_port = spawn_delayed_reauth_server(Duration::from_millis(300)).await;
+    let primary_port = spawn_delayed_reauth_server().await;
     let backup_port = spawn_scripted_server(vec![
         ScriptStep {
             expect_prefix: None,
@@ -2651,7 +2651,6 @@ async fn parked_extra_body_lane_is_not_returned_to_normal_idle_pool() {
         .await
         .expect("extra BODY lane should acquire");
     extra.park();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let normal = client
         .acquire_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
@@ -3321,7 +3320,7 @@ fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
         ],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
 
     // A dispatch that skips the limited server for headroom is the server

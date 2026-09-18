@@ -28,7 +28,6 @@ fn idle_tls_fixture() -> IdleTlsFixture {
     let server = std::thread::spawn(move || {
         let (mut tcp, _) = listener.accept().unwrap();
         tcp.set_nodelay(true).unwrap();
-        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut tls = tokio_rustls::rustls::ServerConnection::new(Arc::new(config)).unwrap();
         while tls.is_handshaking() {
             tls.complete_io(&mut tcp).unwrap();
@@ -37,7 +36,7 @@ fn idle_tls_fixture() -> IdleTlsFixture {
             tls.write_tls(&mut tcp).unwrap();
         }
         stages.send(()).unwrap();
-        if commands.recv_timeout(Duration::from_secs(5)).is_err() {
+        if commands.recv().is_err() {
             return;
         }
         tls.send_close_notify();
@@ -45,13 +44,13 @@ fn idle_tls_fixture() -> IdleTlsFixture {
         tls.write_tls(&mut record).unwrap();
         tcp.write_all(&record[..3]).unwrap();
         stages.send(()).unwrap();
-        if commands.recv_timeout(Duration::from_secs(5)).is_err() {
+        if commands.recv().is_err() {
             return;
         }
         tcp.write_all(&record[3..]).unwrap();
         stages.send(()).unwrap();
         // Keep TCP open so the client must interpret TLS, not just TCP FIN.
-        let _ = commands.recv_timeout(Duration::from_secs(5));
+        let _ = commands.recv();
     });
     IdleTlsFixture {
         port,
@@ -76,10 +75,8 @@ fn inspect_fragmented_shutdown(mut inspect: impl FnMut() -> bool, fixture: IdleT
     }
     fixture.advance.send(()).unwrap();
     fixture.ready.recv().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
     while !inspect() {
-        assert!(Instant::now() < deadline, "close-notify was not detected");
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::yield_now();
     }
     fixture.advance.send(()).unwrap();
     fixture.server.join().unwrap();

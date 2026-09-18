@@ -98,7 +98,8 @@ async fn spawn_tls_drain_server(
         }
 
         let _ = flushed_tx.send(());
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Hold the session open until the client is done with it.
+        let _ = tls.read_to_end(&mut Vec::new()).await;
     });
 
     (addr, flushed_rx)
@@ -775,13 +776,17 @@ async fn spawn_scripted_server(steps: Vec<ScriptStep>, hold_open_after_last: Dur
     spawn_shared_scripted_server(steps, hold_open_after_last).await
 }
 
+/// Longer than any test runs. A script answers or closes, so a connection's
+/// own timeouts only decide a test that sets them itself, never a slow runner.
+const UNREACHED_TIMEOUT: Duration = Duration::from_secs(3600);
+
 fn scripted_plain_config(port: u16) -> ServerConfig {
     ServerConfig {
         host: "127.0.0.1".into(),
         port,
         tls: false,
-        connect_timeout: Duration::from_secs(1),
-        command_timeout: Duration::from_millis(100),
+        connect_timeout: UNREACHED_TIMEOUT,
+        command_timeout: UNREACHED_TIMEOUT,
         ..Default::default()
     }
 }
@@ -809,17 +814,12 @@ async fn spawn_pipelined_setup_server(
             socket.write_all(response).await.unwrap();
             socket.flush().await.unwrap();
         }
+        // A client that does not pipeline waits for an answer here instead,
+        // and the test never finishes.
         let mut lines = Vec::new();
-        let wait = tokio::time::timeout(Duration::from_secs(2), async {
-            while lines.len() < expected.len() {
-                lines.push(crate::test_support::read_command_line(&mut socket).await);
-            }
-        })
-        .await;
-        assert!(
-            wait.is_ok(),
-            "client did not pipeline MODE READER and GROUP; received {lines:?}"
-        );
+        while lines.len() < expected.len() {
+            lines.push(crate::test_support::read_command_line(&mut socket).await);
+        }
         for (line, prefix) in lines.iter().zip(&expected) {
             assert!(
                 line.starts_with(prefix),
@@ -828,7 +828,8 @@ async fn spawn_pipelined_setup_server(
         }
         socket.write_all(responses).await.unwrap();
         socket.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Hold the session open until the client is done with it.
+        let _ = socket.read_to_end(&mut Vec::new()).await;
     });
     port
 }
@@ -838,7 +839,6 @@ fn pipelined_setup_config(port: u16) -> ServerConfig {
         username: Some("user".into()),
         password: Some("pass".into()),
         pipelining: PipeliningCapability::Known(true),
-        command_timeout: Duration::from_secs(1),
         ..scripted_plain_config(port)
     }
 }
@@ -1693,7 +1693,9 @@ async fn body_by_id_reports_truncated_multiline_body_on_timeout() {
                 delay: Duration::ZERO,
             },
         ],
-        Duration::from_millis(1500),
+        // The server never closes, so only the command timeout can end the
+        // read.
+        UNREACHED_TIMEOUT,
     )
     .await;
 

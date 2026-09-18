@@ -78,9 +78,11 @@ fn failed_probe_is_bounded_and_cancellation_is_not_failure() {
     health.record_connection_outcome(&late, true, false, false);
     assert!(probe.0.probing());
     assert_eq!(health.failure_count, 1);
+    let before = Instant::now();
     health.record_connection_outcome(&probe.0, false, false, false);
-    let wait = deadline(&health).duration_since(Instant::now());
-    assert!(wait <= Duration::from_secs(60) && wait > Duration::from_secs(59));
+    let after = Instant::now();
+    let holdoff = Duration::from_secs(60);
+    assert!(deadline(&health) >= before + holdoff && deadline(&health) <= after + holdoff);
     for _ in 0..8 {
         ready(&mut health);
         let probe = gate.admit(true).unwrap();
@@ -114,8 +116,9 @@ fn a_failed_probe_does_not_depend_on_a_health_reenable_poll() {
     );
     assert_eq!(gate.snapshot().epoch, snapshot.epoch);
     assert!(!old.0.complete_recovery());
+    let before = Instant::now();
     health.record_connection_outcome(&probe.0, false, false, false);
     assert_eq!(health.disable_count, 2);
-    assert!(deadline(&health).duration_since(Instant::now()) > Duration::from_secs(59));
+    assert!(deadline(&health) >= before + Duration::from_secs(60));
     assert!(gate.admit(true).is_none());
 }

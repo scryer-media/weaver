@@ -1665,9 +1665,7 @@ mod tests {
                     assert!(matches!(result, Err(NntpError::AuthenticationRejected)));
                 });
             }
-            let concurrent = (0..4)
-                .take_while(|_| starts.recv_timeout(Duration::from_secs(5)).is_ok())
-                .count();
+            let concurrent = (0..4).take_while(|_| starts.recv().is_ok()).count();
             *release.0.lock().unwrap() = true;
             release.1.notify_all();
             assert_eq!(
@@ -1785,17 +1783,20 @@ mod tests {
     /// An async caller must not queue behind download lanes that are
     /// mid-transfer: nothing can be recalled, and nothing frees up until a
     /// whole article has moved.
-    #[tokio::test]
+    ///
+    /// The clock is paused, so any timer the call waited on would show as
+    /// elapsed time; a call that never waited leaves it where it was.
+    #[tokio::test(start_paused = true)]
     async fn dispatch_permit_fails_fast_when_lanes_hold_every_connection() {
         let pool = NntpPool::new(lane_pool_config(2));
         let held = (0..2)
             .map(|_| pool.semaphores[0].clone().try_acquire_owned().unwrap())
             .collect::<Vec<_>>();
-        let started = Instant::now();
+        let started = TokioInstant::now();
         let error = pool.acquire_dispatch_permit(0).await.unwrap_err();
         let waited = started.elapsed();
         assert!(matches!(error, NntpError::AcquireTimeout(0)), "{error:?}");
-        assert!(waited < Duration::from_secs(1), "must not wait: {waited:?}");
+        assert_eq!(waited, Duration::ZERO, "must not wait");
         drop(held);
     }
 
@@ -1982,6 +1983,11 @@ mod tests {
         // but it will record the failure timestamp.
         let result1 = pool.acquire(ServerId(0)).await;
         assert!(result1.is_err());
+        // However long that took, the next acquire must still find the
+        // throttle active: date the failure where the clock cannot pass it,
+        // so the acquire waits the whole delay.
+        *pool.last_connect_failure[0].lock().await =
+            Some(Instant::now() + Duration::from_secs(3600));
 
         // Second acquire should sleep through the throttle, then attempt
         // a real connection (which also fails — but NOT with ServiceUnavailable).
@@ -1992,9 +1998,8 @@ mod tests {
             !matches!(result2, Err(NntpError::ServiceUnavailable)),
             "pool should sleep through throttle, not return ServiceUnavailable"
         );
-        // Should have waited at least most of the reconnect delay.
         assert!(
-            start.elapsed() >= Duration::from_millis(100),
+            start.elapsed() >= Duration::from_millis(200),
             "expected throttle to delay the acquire"
         );
     }
@@ -2024,8 +2029,12 @@ mod tests {
         // First acquire fails and records timestamp.
         let _ = pool.acquire(ServerId(0)).await;
 
-        // Wait for the reconnect delay to pass.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Date the failure a full delay back rather than waiting it out.
+        let recorded = pool.last_connect_failure[0]
+            .lock()
+            .await
+            .expect("the failed acquire records its failure");
+        *pool.last_connect_failure[0].lock().await = Some(recorded - Duration::from_millis(50));
 
         // Should now attempt a real connection again (will fail, but NOT with ServiceUnavailable).
         let result = pool.acquire(ServerId(0)).await;
