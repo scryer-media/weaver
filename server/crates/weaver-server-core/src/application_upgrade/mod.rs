@@ -11,6 +11,7 @@ mod error;
 pub mod manifest;
 mod product;
 mod service;
+pub(crate) mod trust;
 
 pub use error::{
     ApplicationUpgradeError, ApplicationUpgradeResult, map_updater_error, to_updater_error,
@@ -19,6 +20,8 @@ pub use product::{
     APPLICATION_UPGRADE_HELPER_PLAN_SCHEMA, JOURNAL_SCHEMA, UPGRADE_MANIFEST_SCHEMA_VERSION,
     UPGRADE_MANIFEST_V2_SCHEMA_VERSION, WEAVER_PRODUCT,
 };
+pub use trust::{install_default_rustls_provider, spawn_sigstore_trust_root_priming};
+
 pub use service::{
     ApplicationUpgradeRun, ApplicationUpgradeRunStatus, ApplicationUpgradeService,
     ApplicationUpgradeSnapshot, ApplicationUpgradeStartRequest,

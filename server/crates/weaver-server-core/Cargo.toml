@@ -17,9 +17,12 @@ async-trait = "0.1"
 # durable journal and the Windows helper handoff. Pinned to a signed tag rather
 # than a branch, because everything in it is release-critical.
 application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.0" }
-# Only the signer-policy types are used here; `application-updater` turns on the
-# verification feature it needs for the Sigstore check itself.
-artifact-trust = { git = "https://github.com/scryer-media/artifact-trust", tag = "v0.1.2", default-features = false }
+# The signer-policy types, plus the Sigstore trust-root refresh Weaver primes at
+# startup. `verification` is named explicitly rather than left to feature
+# unification through `application-updater`.
+artifact-trust = { git = "https://github.com/scryer-media/artifact-trust", tag = "v0.1.2", default-features = false, features = [
+    "verification",
+] }
 weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
@@ -46,6 +49,9 @@ http = { workspace = true }
 crossbeam-queue = { workspace = true }
 bitvec = { workspace = true }
 tokio = { workspace = true }
+# Named for `rustls` itself: the upgrade downloader and the Sigstore trust-root
+# refresh both need the process default crypto provider installed.
+tokio-rustls = { workspace = true }
 toml = { workspace = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }

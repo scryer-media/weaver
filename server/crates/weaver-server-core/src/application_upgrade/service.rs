@@ -1721,6 +1721,82 @@ mod tests {
         );
     }
 
+    /// Trust-root priming talks to the Sigstore TUF repository, so it may never
+    /// finish on an offline host. The upgrade must not wait for it: verification
+    /// falls back to the trust snapshot the build embeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_pipeline_does_not_wait_for_sigstore_trust_root_priming() {
+        let priming = crate::application_upgrade::trust::spawn_trust_root_priming_for_test(|| {
+            std::future::pending::<Result<(), String>>()
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let executable_path = temp.path().join("bin/weaver");
+        fs::create_dir_all(executable_path.parent().expect("executable parent"))
+            .expect("create executable directory");
+        fs::write(&executable_path, b"old executable").expect("write old executable");
+        let new_binary = b"new executable";
+        let archive = tar_gz(&[("weaver", new_binary, 0o755)]);
+        let manifest = portable_manifest(
+            &archive,
+            vec![UpgradeArtifactMember {
+                path: "weaver".to_string(),
+                size: new_binary.len() as u64,
+                executable: true,
+            }],
+        );
+        let served = archive.clone();
+        let base = local_server(axum::Router::new().route(
+            "/artifact",
+            axum::routing::get(move || {
+                let served = served.clone();
+                async move { served }
+            }),
+        ))
+        .await;
+
+        let profile_dir = temp.path().join("profile");
+        let service = service_with_update(
+            &profile_dir,
+            Some(TEST_VERSION),
+            portable_assessment(),
+            Some(executable_path.clone()),
+        )
+        .await;
+        service
+            .set_restart_controller(RestartController::new())
+            .await;
+
+        let request = test_request(executable_path.clone());
+        let run = ApplicationUpgradeRun::checking("test-run".to_string(), &request);
+        let client = test_http_client();
+        service
+            .run_pipeline_with_dependencies(
+                &run,
+                &request,
+                &manifest,
+                UpgradePipelineDependencies {
+                    client: &client,
+                    artifact_url_override: Some(&format!("{base}/artifact")),
+                    ensure_available_space,
+                    rename: rename_path,
+                },
+            )
+            .await
+            .expect("the pipeline finishes while priming is still pending");
+
+        assert_eq!(
+            fs::read(&executable_path).expect("replacement executable"),
+            new_binary
+        );
+        assert!(
+            !priming.is_finished(),
+            "the priming task must still be pending, proving nothing awaited it"
+        );
+        priming.abort();
+    }
+
     /// A pipeline whose manifest disagrees with the admitted request stops before
     /// anything is downloaded: the signed manifest and the request must name the
     /// same release.
