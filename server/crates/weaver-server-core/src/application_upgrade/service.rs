@@ -359,6 +359,22 @@ impl ApplicationUpgradeService {
             ));
         }
 
+        // A run that survived a restart — one still waiting on a reboot, or
+        // one rehydrated from its journal — holds no admission lock in this
+        // process, so it is refused on its published state instead.
+        let carried_over = self
+            .inner
+            .state
+            .borrow()
+            .as_ref()
+            .filter(|run| !run.status.is_terminal())
+            .map(|run| (run.run_id.clone(), run.phase.clone()));
+        if let Some((run_id, phase)) = carried_over {
+            return Err(ApplicationUpgradeError::Validation(format!(
+                "an application upgrade is already running (run {run_id}, phase {phase})"
+            )));
+        }
+
         // Held for the whole run. A refusal here is the single-flight answer:
         // nothing is queued behind an upgrade.
         let guard = Arc::clone(&self.inner.admission)
@@ -395,6 +411,7 @@ impl ApplicationUpgradeService {
     ) {
         if let Err(error) = self.execute(&run, &request).await {
             self.cleanup_staging();
+            self.cleanup_bundle_staging(&request);
             self.fail_run(&run, error.to_string());
         }
     }
@@ -822,6 +839,57 @@ impl ApplicationUpgradeService {
         }
     }
 
+    /// A bundle upgrade stages beside the installed bundle rather than under
+    /// the profile directory, so a failure before promotion would otherwise
+    /// leave a full staged copy next to the application. Once promotion has
+    /// begun the backup exists, the path computation refuses, and the journal
+    /// owns whatever is left.
+    fn cleanup_bundle_staging(&self, request: &UpgradeJobRequest) {
+        if request.installation_kind != InstallationKind::MacosAppBundle {
+            return;
+        }
+        let Ok(paths) = macos_bundle_upgrade_paths(
+            request.installation_kind,
+            request.executable_path.as_deref(),
+            WEAVER_VERSION,
+            &request.expected_version,
+        ) else {
+            return;
+        };
+        if let Err(error) = remove_upgrade_owned_directory(&paths.staging_dir) {
+            warn!(
+                error = %error,
+                path = %paths.staging_dir.display(),
+                "failed to clean the staged application bundle"
+            );
+        }
+    }
+
+    /// Fail a run this process inherited as `running` but has no journal for.
+    ///
+    /// Such a run never reached promotion: the process it ran in went away
+    /// while it was still downloading, verifying or staging, and nothing was
+    /// replaced. Left alone it would sit in the UI as running forever and,
+    /// through [`Self::start`], refuse every later attempt.
+    fn fail_interrupted_run(&self, journaled_run_id: Option<&str>) {
+        let interrupted = self.inner.state.borrow().clone().filter(|run| {
+            !run.status.is_terminal() && journaled_run_id != Some(run.run_id.as_str())
+        });
+        let Some(run) = interrupted else {
+            return;
+        };
+        warn!(
+            run_id = %run.run_id,
+            phase = %run.phase,
+            "application upgrade was interrupted by a restart before it was applied"
+        );
+        self.fail_run(
+            &run,
+            "the upgrade was interrupted by a restart before it was applied".to_string(),
+        );
+        self.cleanup_staging();
+    }
+
     // -- journal recovery ---------------------------------------------------
 
     /// Finalize the journal an upgrade wrote before it restarted this process.
@@ -841,8 +909,10 @@ impl ApplicationUpgradeService {
     ) -> ApplicationUpgradeResult<Vec<String>> {
         let journal_path = self.journal_path();
         let Some(journal) = load_journal(&journal_path)? else {
+            self.fail_interrupted_run(None);
             return Ok(Vec::new());
         };
+        self.fail_interrupted_run(Some(&journal.run_id));
         if journal.schema != JOURNAL_SCHEMA {
             return Err(ApplicationUpgradeError::Validation(format!(
                 "unsupported application upgrade journal schema '{}'",
@@ -2166,6 +2236,65 @@ mod tests {
             service_with_update(temp.path(), Some(TEST_VERSION), portable_assessment(), None).await;
         assert!(service.finalize_journal().expect("finalize").is_empty());
         assert!(service.snapshot().latest_run.is_none());
+    }
+
+    /// A run that was still downloading when the process went away has no
+    /// journal, because nothing was promoted. The next boot fails it outright:
+    /// it must neither show as running forever nor block the next attempt.
+    #[tokio::test]
+    async fn a_running_run_with_no_journal_is_failed_on_the_next_boot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service =
+            service_with_update(temp.path(), Some(TEST_VERSION), portable_assessment(), None).await;
+        let request = test_request(temp.path().join("weaver"));
+        let mut run = ApplicationUpgradeRun::checking("interrupted-run".to_string(), &request);
+        run.phase = phases::DOWNLOADING.to_string();
+        service.publish(run);
+        let staging = service.staging_dir();
+        fs::create_dir_all(&staging).expect("staging dir");
+        fs::write(staging.join("artifact"), b"partial").expect("partial download");
+
+        assert!(service.finalize_journal().expect("finalize").is_empty());
+        let snapshot = service.snapshot();
+        let failed = snapshot.latest_run.expect("the run is still published");
+        assert_eq!(failed.run_id, "interrupted-run");
+        assert_eq!(failed.status, ApplicationUpgradeRunStatus::Failed);
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("interrupted by a restart")),
+            "{:?} names the interruption",
+            failed.error
+        );
+        assert!(snapshot.active_run.is_none(), "a failed run is not active");
+        assert!(!staging.exists(), "the partial download is removed");
+    }
+
+    /// A run carried over from the previous process — rehydrated from a journal
+    /// that is waiting on a reboot — holds no admission lock here, so the
+    /// single-flight rule has to come from the published state.
+    #[tokio::test]
+    async fn a_second_upgrade_is_refused_while_a_carried_over_run_is_still_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service =
+            service_with_update(temp.path(), Some(TEST_VERSION), portable_assessment(), None).await;
+        let request = test_request(temp.path().join("weaver"));
+        let mut run = ApplicationUpgradeRun::checking("carried-over".to_string(), &request);
+        run.phase = phases::REBOOT_REQUIRED.to_string();
+        service.publish(run);
+
+        let error = service
+            .start(ApplicationUpgradeStartRequest {
+                expected_tag: TEST_TAG.to_string(),
+                expected_version: TEST_VERSION.to_string(),
+            })
+            .await
+            .expect_err("a carried-over running run refuses a second start");
+        assert_eq!(
+            error.to_string(),
+            "an application upgrade is already running (run carried-over, phase reboot_required)"
+        );
     }
 
     /// The run survives a restart through the settings row, so the UI that

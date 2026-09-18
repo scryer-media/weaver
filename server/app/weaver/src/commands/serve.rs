@@ -359,9 +359,13 @@ pub(crate) async fn run(
     }
     // TLS for the upgrade download, and fresher Sigstore trust roots than the
     // build's embedded snapshot. The refresh is detached: it talks to the
-    // network, and an upgrade must stay installable when that fails.
+    // network, and an upgrade must stay installable when that fails. With
+    // release checks turned off no upgrade can ever start, so the refresh is
+    // not started either: the opt-out means no upgrade traffic at all.
     weaver_server_core::application_upgrade::install_default_rustls_provider();
-    weaver_server_core::application_upgrade::spawn_sigstore_trust_root_priming();
+    if update_check.enabled() {
+        weaver_server_core::application_upgrade::spawn_sigstore_trust_root_priming();
+    }
 
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
     let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {

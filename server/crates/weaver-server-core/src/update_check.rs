@@ -245,6 +245,14 @@ impl UpdateCheckService {
         self.inner.status.subscribe()
     }
 
+    /// Whether this process polls for releases at all.
+    ///
+    /// An operator who turned the check off gets nothing that exists only to
+    /// serve it — no release polling, and no upgrade-related network traffic.
+    pub fn enabled(&self) -> bool {
+        self.inner.enabled
+    }
+
     pub fn start_background_loop(&self) -> JoinHandle<()> {
         let service = self.clone();
         tokio::spawn(async move {
