@@ -78,12 +78,24 @@ windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
-  # `CreateMutexW` and `RegCreateKeyExW` take `SECURITY_ATTRIBUTES`, whose type
-  # this feature defines. Another crate in the graph currently enables it too,
-  # but this crate must not compile only by that accident of feature
-  # unification.
+  # `CreateMutexW`, `RegCreateKeyExW` and `CreateFileW` take
+  # `SECURITY_ATTRIBUTES`, whose type this feature defines. Another crate in
+  # the graph currently enables it too, but this crate must not compile only by
+  # that accident of feature unification.
   "Win32_Security",
+  # `CreateFileW`, which opens the crash dump file.
+  "Win32_Storage_FileSystem",
+  # `SetUnhandledExceptionFilter` and `MiniDumpWriteDump`.
+  "Win32_System_Diagnostics_Debug",
+  # `CONTEXT`, which `EXCEPTION_POINTERS` and `MINIDUMP_EXCEPTION_INFORMATION`
+  # are declared behind. Both minidump entry points are gated on it.
+  "Win32_System_Kernel",
   "Win32_System_LibraryLoader",
+  # Another gate on `MiniDumpWriteDump`, for the memory-range types in its
+  # callback structures.
+  "Win32_System_Memory",
+  # `GetProcessMemoryInfo`, which the heartbeat reads the working set from.
+  "Win32_System_ProcessStatus",
   "Win32_System_Registry",
     "Win32_System_Threading",
     # `WM_MOUSELEAVE`, which the tray flyout tracks the pointer with. The
