@@ -1229,6 +1229,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 work,
                 work_context.runtime_generation,
                 work_context.lane_id,
+                work_context.job_id,
                 *trace,
                 DownloadLaneObservation {
                     server_idx: Some(server_idx),
@@ -1377,6 +1378,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             work,
             work_context.runtime_generation,
             work_context.lane_id,
+            work_context.job_id,
             trace,
             DownloadLaneObservation {
                 server_idx: Some(server_idx),
@@ -1421,6 +1423,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     work,
                     work_context.runtime_generation,
                     work_context.lane_id,
+                    work_context.job_id,
                     server_idx,
                     work_context.mode,
                     supports_pipelining,
@@ -1604,6 +1607,7 @@ fn result_from_trace(
     work: DownloadWork,
     runtime_generation: u64,
     lane_id: u64,
+    job_id: JobId,
     trace: weaver_nntp::client::DecodedBodyTrace,
     mut observation: DownloadLaneObservation,
     exclude_servers: &[usize],
@@ -1626,6 +1630,7 @@ fn result_from_trace(
     }
     DownloadResult {
         lane_id,
+        job_id,
         segment_id,
         runtime_generation,
         data,
@@ -1644,6 +1649,7 @@ fn unresolved_result(
     work: DownloadWork,
     runtime_generation: u64,
     lane_id: u64,
+    job_id: JobId,
     server_idx: usize,
     mode: DownloadLaneMode,
     supports_pipelining: bool,
@@ -1658,6 +1664,7 @@ fn unresolved_result(
     let completion_critical = work.completion_critical;
     DownloadResult {
         lane_id,
+        job_id,
         segment_id: work.segment_id,
         runtime_generation,
         data: Err(DownloadError::Fetch(DownloadFailure::new(
@@ -1872,6 +1879,7 @@ mod tests {
             tail_work(1, 0),
             old.runtime_generation,
             0,
+            JobId(42),
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: Vec::new(),
                 result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
@@ -1908,6 +1916,7 @@ mod tests {
                     tail_work(segment_number, 0),
                     9,
                     0,
+                    JobId(42),
                     0,
                     DownloadLaneMode::Sequential,
                     false,
@@ -2070,6 +2079,7 @@ mod tests {
             tail_work(9, 0),
             0,
             0,
+            JobId(42),
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: vec![weaver_nntp::client::FetchAttemptTrace {
                     connection_health: None,
@@ -2178,6 +2188,7 @@ mod tests {
             tail_work(6, 0),
             0,
             0,
+            JobId(42),
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: Vec::new(),
                 result: Err(weaver_nntp::client::DecodedBodyError::Nntp(

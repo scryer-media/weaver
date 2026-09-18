@@ -930,7 +930,7 @@ impl Pipeline {
                         continue;
                     }
                     self.note_released_download_result_pending(
-                        result.segment_id.file_id.job_id,
+                        result.job_id,
                         Self::released_download_result_lead_bytes(&result),
                     );
                     pending.push_back(result);

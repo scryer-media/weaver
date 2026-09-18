@@ -1001,6 +1001,9 @@ impl DownloadResultOrigin {
 /// Result of a download task.
 pub(super) struct DownloadResult {
     pub(super) lane_id: u64,
+    /// Job this article belongs to. Carried on the result itself so the
+    /// completion path never has to ask which job owns the lane it arrived on.
+    pub(super) job_id: JobId,
     pub(super) segment_id: SegmentId,
     pub(super) runtime_generation: u64,
     pub(super) data: std::result::Result<DownloadPayload, DownloadError>,

@@ -193,6 +193,7 @@ async fn metrics_refresh_advances_during_continuous_download_result_turns() {
     for segment_number in 0..160 {
         pending.push_back(DownloadResult {
             lane_id: 0,
+            job_id: JobId(991),
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -882,6 +883,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
             Duration::from_secs(1),
             pipeline.handle_download_done(DownloadResult {
                 lane_id: 0,
+                job_id: segment_id.file_id.job_id,
                 runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
@@ -937,6 +939,7 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1037,6 +1040,7 @@ async fn in_order_segments_keep_write_cursor_until_file_completes() {
         pipeline
             .handle_download_done(DownloadResult {
                 lane_id: 0,
+                job_id: segment_id.file_id.job_id,
                 runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Raw(raw)),
@@ -1127,6 +1131,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
         pipeline
             .handle_download_done(DownloadResult {
                 lane_id: 0,
+                job_id,
                 runtime_generation: 0,
                 segment_id: SegmentId {
                     file_id: NzbFileId {

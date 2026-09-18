@@ -352,6 +352,7 @@ impl Pipeline {
                 let _ = tx
                     .send(DownloadResult {
                         lane_id,
+                        job_id,
                         segment_id,
                         runtime_generation,
                         data,
@@ -369,7 +370,8 @@ impl Pipeline {
                     for unrequested in works.by_ref() {
                         let _ = tx
                             .send(DownloadResult {
-                        lane_id,
+                                lane_id,
+                                job_id,
                                 segment_id: unrequested.segment_id,
                                 runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(
