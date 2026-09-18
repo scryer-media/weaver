@@ -359,41 +359,17 @@ fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
 
 /// Whether an owned blocking BODY lane can serve this server.
 ///
-/// Owned lanes are the download fast path and every server gets one, plaintext
-/// included: a single lane pool per server is what lets one warm connection
-/// serve BODY, PAR2 recovery and the existence probe alike, instead of the
-/// probe having to reclaim a permit and cold-dial its own socket.
+/// It always can. Owned lanes are the only download engine, and the blocking
+/// transport carries every arrangement a server config can describe:
+/// plaintext, implicit TLS, and the in-band STARTTLS upgrade. A TLS backend
+/// that cannot build trust for a given config — the s2n lane without a pinned
+/// CA PEM — yields to the rustls lane rather than leaving the server unserved.
 ///
-/// The one arrangement still left out is STARTTLS, whose in-band upgrade the
-/// blocking transport does not implement.
-fn supports_blocking_body_lane(config: &ServerConfig) -> bool {
-    if config.starttls {
-        return false;
-    }
-    if !config.tls {
-        // Plain TCP needs no trust material and no backend selection.
-        return true;
-    }
-    if config.tls_name_mismatch_certificate_der.is_some() {
-        return blocking_lane_tls_eligible(config, crate::tls::NntpTlsBackend::ManualRustls);
-    }
-    match crate::tls::selected_blocking_tls_backend() {
-        Ok(backend) => blocking_lane_tls_eligible(config, backend),
-        Err(_) => false,
-    }
-}
-
-fn blocking_lane_tls_eligible(config: &ServerConfig, backend: crate::tls::NntpTlsBackend) -> bool {
-    if !config.tls || config.starttls {
-        return false;
-    }
-    match backend {
-        // The rustls lane trusts webpki roots, so a pinned CA is optional.
-        crate::tls::NntpTlsBackend::ManualRustls => true,
-        // The s2n lane builds trust exclusively from a pinned CA PEM.
-        #[cfg(not(windows))]
-        crate::tls::NntpTlsBackend::S2n => config.tls_ca_cert.is_some(),
-    }
+/// The predicate is kept because its callers read as a question about one
+/// server, and because a transport that genuinely could not be lane-served
+/// would have to answer here.
+fn supports_blocking_body_lane(_config: &ServerConfig) -> bool {
+    true
 }
 
 #[derive(Debug, Default, Clone)]
