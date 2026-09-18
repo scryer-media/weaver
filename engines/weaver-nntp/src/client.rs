@@ -108,6 +108,16 @@ impl BlockingBodyLaneAcquireError {
         matches!(self, Self::ProviderCapacity(_) | Self::LocalCapacity)
     }
 
+    /// The transport error behind this refusal, where there is one. Local
+    /// capacity, selection contention and an empty candidate list are the
+    /// lane's own bookkeeping and carry no server answer to report.
+    pub fn nntp_error(&self) -> Option<&NntpError> {
+        match self {
+            Self::ProviderCapacity(error) | Self::Other(error) => Some(error),
+            Self::LocalCapacity | Self::NoEligibleServer | Self::SelectionContended => None,
+        }
+    }
+
     /// Whether the leased work should be handed straight back to the scheduler
     /// and retried on the owned fast path, rather than falling back to an
     /// async lane. Capacity admission and selection contention are both

@@ -131,8 +131,9 @@ impl Pipeline {
         held_since: Option<Instant>,
     ) {
         if request.response_tx.is_closed() {
-            // The worker stopped waiting (an async lane's grace ran out, or
-            // the lane died); nothing to answer and nothing was booked.
+            // The lane stopped waiting for an answer (it died, or its own
+            // refill deadline ran out); nothing to answer and nothing was
+            // booked.
             return;
         }
         let lane_id = request.lane_id;
