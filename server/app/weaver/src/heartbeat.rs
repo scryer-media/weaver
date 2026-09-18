@@ -129,7 +129,7 @@ fn resident_set_bytes() -> Option<u64> {
     // The working set is Windows' nearest equivalent of a resident set: the
     // pages of this process currently backed by physical memory.
     let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
-    (ok != 0).then(|| counters.WorkingSetSize as u64)
+    (ok != 0).then_some(counters.WorkingSetSize as u64)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
