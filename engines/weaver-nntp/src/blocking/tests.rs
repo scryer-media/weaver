@@ -80,6 +80,30 @@ fn spawn_tls_nntp_server(
     std::thread::JoinHandle<()>,
     std::path::PathBuf,
 ) {
+    spawn_tls_nntp_server_with_upgrade(articles, false)
+}
+
+/// The same fixture reached the other way round: the greeting arrives in
+/// plaintext, the client asks for `STARTTLS`, and the handshake runs on the
+/// socket that already carried the greeting.
+fn spawn_starttls_nntp_server(
+    articles: Vec<(&'static str, TestArticle)>,
+) -> (
+    ServerConfig,
+    std::thread::JoinHandle<()>,
+    std::path::PathBuf,
+) {
+    spawn_tls_nntp_server_with_upgrade(articles, true)
+}
+
+fn spawn_tls_nntp_server_with_upgrade(
+    articles: Vec<(&'static str, TestArticle)>,
+    starttls: bool,
+) -> (
+    ServerConfig,
+    std::thread::JoinHandle<()>,
+    std::path::PathBuf,
+) {
     let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("generate test cert");
     let cert_der = certified_key.cert.der().clone();
@@ -116,14 +140,41 @@ fn spawn_tls_nntp_server(
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             let (socket, _) = listener.accept().await.unwrap();
             let acceptor = TlsAcceptor::from(Arc::new(server_config));
-            let tls = acceptor.accept(socket).await.unwrap();
-            let mut stream = BufReader::new(tls);
-            stream
-                .get_mut()
-                .write_all(b"200 test server ready\r\n")
-                .await
-                .unwrap();
-            stream.get_mut().flush().await.unwrap();
+            let mut stream = if starttls {
+                let mut plain = BufReader::new(socket);
+                plain
+                    .get_mut()
+                    .write_all(b"200 test server ready\r\n")
+                    .await
+                    .unwrap();
+                plain.get_mut().flush().await.unwrap();
+                let mut request = String::new();
+                plain.read_line(&mut request).await.unwrap();
+                assert_eq!(
+                    request.trim_end_matches(['\r', '\n']).to_ascii_uppercase(),
+                    "STARTTLS",
+                    "the upgrade must be the first command on the plaintext socket"
+                );
+                plain
+                    .get_mut()
+                    .write_all(b"382 continue with TLS negotiation\r\n")
+                    .await
+                    .unwrap();
+                plain.get_mut().flush().await.unwrap();
+                // No second greeting: the session resumes where it left off,
+                // encrypted.
+                BufReader::new(acceptor.accept(plain.into_inner()).await.unwrap())
+            } else {
+                let tls = acceptor.accept(socket).await.unwrap();
+                let mut stream = BufReader::new(tls);
+                stream
+                    .get_mut()
+                    .write_all(b"200 test server ready\r\n")
+                    .await
+                    .unwrap();
+                stream.get_mut().flush().await.unwrap();
+                stream
+            };
 
             let mut line = String::new();
             let mut close_after_next_request = false;
@@ -254,8 +305,8 @@ fn spawn_tls_nntp_server(
         revocation: None,
         host: "localhost".to_string(),
         port,
-        tls: true,
-        starttls: false,
+        tls: !starttls,
+        starttls,
         username: None,
         password: None,
         connect_timeout: Duration::from_secs(5),
@@ -1136,6 +1187,91 @@ fn blocking_known_pipelining_skips_capabilities_probe() {
 #[test]
 fn blocking_known_non_pipelining_skips_capabilities_probe() {
     assert_blocking_known_pipelining_skips_capabilities_probe(false);
+}
+
+fn starttls_lane_reads_a_body_after_the_upgrade(backend: NntpTlsBackend) {
+    let (config, handle, ca_path) = spawn_starttls_nntp_server(vec![(
+        "<upgraded@test>",
+        TestArticle::Body(b"body carried after the in-band upgrade".to_vec()),
+    )]);
+    assert!(!config.tls, "the dial itself is plaintext");
+    let mut conn = connect_with_backend(&config, backend);
+    conn.select_group("alt.test").unwrap();
+
+    let article = conn.stream_yenc_article("<upgraded@test>").unwrap();
+
+    assert_eq!(
+        article.into_data(),
+        b"body carried after the in-band upgrade"
+    );
+    conn.quit().unwrap();
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(ca_path);
+}
+
+/// A STARTTLS server is lane-served like any other: the greeting arrives in
+/// plaintext, the upgrade runs in band, and the rest of the session — group
+/// selection and BODY included — is encrypted on the same socket.
+#[test]
+fn blocking_starttls_rustls_reads_a_body_after_the_upgrade() {
+    starttls_lane_reads_a_body_after_the_upgrade(NntpTlsBackend::ManualRustls);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn blocking_starttls_s2n_reads_a_body_after_the_upgrade() {
+    let _guard = s2n_test_guard();
+    starttls_lane_reads_a_body_after_the_upgrade(NntpTlsBackend::S2n);
+}
+
+/// A server that refuses the upgrade must fail the connect rather than carry
+/// on in plaintext: the credentials and the article both come after this
+/// point, and the config asked for them to be encrypted.
+#[test]
+fn blocking_starttls_refusal_fails_the_connect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(b"200 test server ready\r\n").unwrap();
+        socket.flush().unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        assert_eq!(request.trim_end_matches(['\r', '\n']), "STARTTLS");
+        socket
+            .write_all(b"580 can not initiate TLS now\r\n")
+            .unwrap();
+        socket.flush().unwrap();
+    });
+
+    let config = ServerConfig {
+        host: "127.0.0.1".to_string(),
+        port,
+        tls: false,
+        starttls: true,
+        connect_timeout: Duration::from_secs(5),
+        command_timeout: Duration::from_secs(5),
+        ..ServerConfig::default()
+    };
+    let Err(error) = BlockingNntpConnection::connect_with_ip_policy_with_backend(
+        &config,
+        &[],
+        0,
+        Some(NntpTlsBackend::ManualRustls),
+        None,
+    ) else {
+        panic!("a refused upgrade must not yield a usable connection");
+    };
+
+    assert!(
+        matches!(
+            error,
+            NntpError::UnexpectedResponse { code, .. } if code.raw() == 580
+        ),
+        "{error:?}"
+    );
+    handle.join().unwrap();
 }
 
 #[test]

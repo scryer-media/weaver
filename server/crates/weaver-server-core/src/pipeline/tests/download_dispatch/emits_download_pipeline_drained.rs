@@ -1308,6 +1308,7 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
         normal_queued_before_priority_update > 0,
         "the retained Normal job must still have queued ordinary work"
     );
+    settle_lane_dials(&pipeline).await;
 
     // One lane is free while the prior completion-critical body remains active.
     // Existing work keeps running; the priority update owns only the new lane.

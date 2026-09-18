@@ -1,9 +1,10 @@
 //! A lane that cannot be acquired must be visible, and must be retried.
 //!
-//! Both arms of the acquire-failure handler keep the download running — the
-//! work is requeued or handed to an async lane — so the failure itself has to
-//! announce that it happened. Nothing above debug did, which made a job running
-//! on a fraction of its lanes look exactly like a slow server.
+//! The acquire-failure handler keeps the download running either way — the
+//! work is requeued, or the leased articles take the failure and are retried
+//! through the ordinary result path — so the failure itself has to announce
+//! that it happened. Nothing above debug did, which made a job running on a
+//! fraction of its lanes look exactly like a slow server.
 
 use super::*;
 

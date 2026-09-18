@@ -1052,12 +1052,6 @@ impl BlockingNntpConnection {
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
-        if config.starttls {
-            return Err(NntpError::MalformedResponse(
-                "blocking owned lane does not support STARTTLS".to_string(),
-            ));
-        }
-
         if let Some(registry) = &config.revocation {
             registry.check()?;
         }
@@ -1102,6 +1096,63 @@ impl BlockingNntpConnection {
         })))
     }
 
+    /// The TLS backend that carries this server's bytes on an owned lane.
+    ///
+    /// Total by construction, because every server is lane-served: a backend
+    /// that cannot build trust for this config yields to the rustls lane,
+    /// which verifies against the platform's webpki roots and so needs no
+    /// per-server trust material. That covers the s2n lane without a pinned
+    /// CA PEM and an environment override that does not parse. An explicit
+    /// `backend_override` is honoured as given — it exists so a test can pin
+    /// one transport, and silently swapping it would make the test meaningless.
+    fn blocking_tls_backend(
+        config: &ServerConfig,
+        backend_override: Option<NntpTlsBackend>,
+    ) -> NntpTlsBackend {
+        if config.tls_name_mismatch_certificate_der.is_some() {
+            return NntpTlsBackend::ManualRustls;
+        }
+        if let Some(backend) = backend_override {
+            return backend;
+        }
+        let selected = selected_blocking_tls_backend().unwrap_or(NntpTlsBackend::ManualRustls);
+        let backend = tls_backend_for_preference(selected, config.tls_cipher_preference);
+        #[cfg(not(windows))]
+        if backend == NntpTlsBackend::S2n && config.tls_ca_cert.is_none() {
+            return NntpTlsBackend::ManualRustls;
+        }
+        backend
+    }
+
+    /// Hand a connected socket to the TLS backend. The same wrapping serves
+    /// the implicit-TLS dial and the STARTTLS upgrade: both arrive here with a
+    /// socket whose next byte is the start of a handshake.
+    fn wrap_tls(
+        config: &ServerConfig,
+        tcp: BlockingSocket,
+        backend_override: Option<NntpTlsBackend>,
+    ) -> Result<BlockingTransport> {
+        Ok(match Self::blocking_tls_backend(config, backend_override) {
+            NntpTlsBackend::ManualRustls => {
+                BlockingTransport::Rustls(Box::new(BlockingManualTlsStream::connect(
+                    tcp,
+                    &config.host,
+                    config.tls_ca_cert.as_deref(),
+                    config.tls_name_mismatch_certificate_der.as_deref(),
+                    config.tls_cipher_preference,
+                    config.command_timeout.max(MIN_TIMEOUT),
+                )?))
+            }
+            #[cfg(not(windows))]
+            NntpTlsBackend::S2n => BlockingTransport::S2n(BlockingS2nStream::connect(
+                tcp,
+                &config.host,
+                config.tls_ca_cert.as_deref(),
+                config.command_timeout.max(MIN_TIMEOUT),
+            )?),
+        })
+    }
+
     fn from_tcp(
         config: &ServerConfig,
         tcp: impl Into<BlockingSocket>,
@@ -1117,37 +1168,11 @@ impl BlockingNntpConnection {
             .zip(tcp.tcp())
             .map(|(r, tcp)| r.track(socket2::SockRef::from(tcp)))
             .transpose()?;
+        // Implicit TLS handshakes before the greeting is read; STARTTLS keeps
+        // the socket plain until the greeting has arrived and the server has
+        // answered 382, and is upgraded below.
         let transport = if config.tls {
-            let backend = if config.tls_name_mismatch_certificate_der.is_some() {
-                NntpTlsBackend::ManualRustls
-            } else {
-                match backend_override {
-                    Some(backend) => backend,
-                    None => tls_backend_for_preference(
-                        selected_blocking_tls_backend()?,
-                        config.tls_cipher_preference,
-                    ),
-                }
-            };
-            match backend {
-                NntpTlsBackend::ManualRustls => {
-                    BlockingTransport::Rustls(Box::new(BlockingManualTlsStream::connect(
-                        tcp,
-                        &config.host,
-                        config.tls_ca_cert.as_deref(),
-                        config.tls_name_mismatch_certificate_der.as_deref(),
-                        config.tls_cipher_preference,
-                        config.command_timeout.max(MIN_TIMEOUT),
-                    )?))
-                }
-                #[cfg(not(windows))]
-                NntpTlsBackend::S2n => BlockingTransport::S2n(BlockingS2nStream::connect(
-                    tcp,
-                    &config.host,
-                    config.tls_ca_cert.as_deref(),
-                    config.command_timeout.max(MIN_TIMEOUT),
-                )?),
-            }
+            Self::wrap_tls(config, tcp, backend_override)?
         } else {
             BlockingTransport::Plain(tcp)
         };
@@ -1188,6 +1213,37 @@ impl BlockingNntpConnection {
             400 => return Err(NntpError::ServiceUnavailable),
             502 => return Err(NntpError::from_status(greeting.code, &greeting.message)),
             _ => return Err(NntpError::unexpected(greeting.code, &greeting.message)),
+        }
+
+        // In-band TLS upgrade, before anything that could carry credentials.
+        // A 382 is the server's undertaking that the next byte it reads is a
+        // ClientHello, so the plain socket moves straight into the TLS
+        // backend and the framing state starts again on the other side of the
+        // handshake. Everything after this — CAPABILITIES, AUTHINFO, GROUP —
+        // is the ordinary post-greeting session setup, now encrypted.
+        if config.starttls && matches!(conn.transport, BlockingTransport::Plain(_)) {
+            let response = conn.send_command(&Command::StartTls)?;
+            if response.code.raw() != 382 {
+                conn.poisoned = true;
+                return Err(NntpError::unexpected(response.code, &response.message));
+            }
+            conn.transport = match conn.transport {
+                BlockingTransport::Plain(tcp) => {
+                    match Self::wrap_tls(config, tcp, backend_override) {
+                        Ok(transport) => transport,
+                        Err(error) => {
+                            // The socket went into the handshake and did not
+                            // come back out; there is no plaintext session to
+                            // return to.
+                            return Err(error);
+                        }
+                    }
+                }
+                encrypted => encrypted,
+            };
+            conn.codec = NntpCodec::new();
+            conn.read_buf.clear();
+            debug!(host = %config.host, "blocking STARTTLS upgrade complete");
         }
 
         // Session setup: authentication and nothing else, unless this server

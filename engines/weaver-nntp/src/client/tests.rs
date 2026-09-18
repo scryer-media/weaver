@@ -608,16 +608,13 @@ fn blocking_body_lane_candidate_survives_the_over_limit_holdoff() {
 
 #[test]
 fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
-    // The fill server negotiates STARTTLS, which an owned lane cannot do, so
-    // the only lane candidate is a backfill server — and that must stay
-    // unreachable for ordinary work.
+    // The fill server is allowed no connections at all, so the only lane
+    // candidate is a backfill server — and that must stay unreachable for
+    // ordinary work.
     let client = NntpClient::new(NntpClientConfig {
         servers: vec![
             ServerPoolConfig {
-                server: ServerConfig {
-                    starttls: true,
-                    ..scripted_server(1, 0).server
-                },
+                max_connections: 0,
                 ..scripted_server(1, 0)
             },
             ServerPoolConfig {
@@ -1144,6 +1141,11 @@ fn acquire_timeout_is_capacity_not_transport() {
     assert_eq!(
         NntpError::AcquireTimeout(15).to_string(),
         "no connection available within 15s"
+    );
+    // Zero is not a duration: it is the pool declining to wait at all.
+    assert_eq!(
+        NntpError::AcquireTimeout(0).to_string(),
+        "no connection available; did not wait"
     );
 }
 
@@ -3162,70 +3164,30 @@ fn lane_config(tls: bool, starttls: bool, pinned_ca: bool) -> ServerConfig {
     }
 }
 
-/// Owned lanes are the one download path, so a plaintext server gets one too:
-/// its lane is what serves BODY, PAR2 recovery and the existence probe from a
-/// single warm connection. Only STARTTLS is left out, because the blocking
-/// transport has no in-band upgrade.
+/// Owned lanes are the one download engine, so every server gets one: there is
+/// no second path left for a config to fall to. Plaintext, implicit TLS with
+/// and without a pinned CA, STARTTLS, and an adopted name-mismatch certificate
+/// are all lane-served.
 #[test]
-fn a_plaintext_server_gets_an_owned_lane_and_a_starttls_one_does_not() {
-    assert!(supports_blocking_body_lane(&lane_config(
-        false, false, false
-    )));
-    assert!(!supports_blocking_body_lane(&lane_config(true, true, true)));
-    assert!(!supports_blocking_body_lane(&lane_config(
-        false, true, false
-    )));
+fn every_server_arrangement_gets_an_owned_lane() {
+    for tls in [false, true] {
+        for starttls in [false, true] {
+            for pinned_ca in [false, true] {
+                assert!(
+                    supports_blocking_body_lane(&lane_config(tls, starttls, pinned_ca)),
+                    "tls={tls} starttls={starttls} pinned_ca={pinned_ca}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn blocking_tls_lane_eligibility_rejects_plain_and_starttls() {
-    use crate::tls::NntpTlsBackend;
-
-    assert!(!blocking_lane_tls_eligible(
-        &lane_config(false, false, true),
-        NntpTlsBackend::ManualRustls
-    ));
-    assert!(!blocking_lane_tls_eligible(
-        &lane_config(true, true, true),
-        NntpTlsBackend::ManualRustls
-    ));
-}
-
-#[test]
-fn blocking_tls_lane_eligibility_rustls_works_without_pinned_ca() {
-    use crate::tls::NntpTlsBackend;
-
-    assert!(blocking_lane_tls_eligible(
-        &lane_config(true, false, false),
-        NntpTlsBackend::ManualRustls
-    ));
-    assert!(blocking_lane_tls_eligible(
-        &lane_config(true, false, true),
-        NntpTlsBackend::ManualRustls
-    ));
-}
-
-#[test]
-fn adopted_name_mismatch_certificate_forces_the_rustls_body_lane() {
+fn adopted_name_mismatch_certificate_still_gets_an_owned_lane() {
     let mut config = lane_config(true, false, false);
     config.tls_name_mismatch_certificate_der = Some(vec![0x30, 0x82, 0x01, 0x0a]);
 
     assert!(supports_blocking_body_lane(&config));
-}
-
-#[cfg(not(windows))]
-#[test]
-fn blocking_tls_lane_eligibility_s2n_requires_pinned_ca() {
-    use crate::tls::NntpTlsBackend;
-
-    assert!(!blocking_lane_tls_eligible(
-        &lane_config(true, false, false),
-        NntpTlsBackend::S2n
-    ));
-    assert!(blocking_lane_tls_eligible(
-        &lane_config(true, false, true),
-        NntpTlsBackend::S2n
-    ));
 }
 
 /// A 501 is a syntax error in the one request, not a server without STAT.

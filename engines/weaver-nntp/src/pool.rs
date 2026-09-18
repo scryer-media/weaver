@@ -28,9 +28,12 @@ async fn acquisition_budget<T>(
     future: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     if let Some(deadline) = deadline {
+        // Report the wait we actually served, rounded up to a second: a zero
+        // in this error is reserved for acquires that never waited at all.
+        let started = tokio::time::Instant::now();
         tokio::time::timeout_at(*deadline, future)
             .await
-            .map_err(|_| NntpError::AcquireTimeout(0))?
+            .map_err(|_| NntpError::AcquireTimeout(started.elapsed().as_secs().max(1)))?
     } else {
         future.await
     }
@@ -520,7 +523,23 @@ impl NntpPool {
             if let Ok(permit) = semaphore.clone().try_acquire_owned() {
                 return Ok(permit);
             }
-            self.socket_budgets[idx].recall_idle();
+            // Nothing idle to call back, and every permit belongs to a
+            // download lane that is mid-transfer: the owned lanes serve every
+            // server, so an async caller that finds the permits all taken is
+            // queued behind whole article transfers, not behind a request
+            // that finishes in milliseconds. Waiting here can only spend the
+            // caller's whole budget and then fail anyway. Say so now instead.
+            // This is the ordinary state of a saturated server, and the
+            // caller's requeue answers it, so it is not worth a warning per
+            // attempt.
+            if !self.socket_budgets[idx].recall_idle() {
+                debug!(
+                    server = idx,
+                    max_connections = self.max_connections[idx],
+                    "every connection is held by a busy download lane; not waiting"
+                );
+                return Err(NntpError::AcquireTimeout(0));
+            }
             tokio::select! {
                 _ = self.shutdown.cancelled() => return Err(NntpError::PoolShutdown),
                 permit = semaphore.clone().acquire_owned() => return permit.map_err(|_| NntpError::PoolShutdown),
@@ -1762,6 +1781,55 @@ mod tests {
     fn pool_creation() {
         let pool = NntpPool::new(test_pool_config(10));
         assert_eq!(pool.server_count(), 1);
+    }
+
+    fn lane_pool_config(max_per_server: usize) -> PoolConfig {
+        let mut config = test_pool_config(max_per_server);
+        config.servers[0].server.tls = false;
+        config
+    }
+
+    /// An async caller must not queue behind download lanes that are
+    /// mid-transfer: nothing can be recalled, and nothing frees up until a
+    /// whole article has moved.
+    #[tokio::test]
+    async fn dispatch_permit_fails_fast_when_lanes_hold_every_connection() {
+        let pool = NntpPool::new(lane_pool_config(2));
+        let held = (0..2)
+            .map(|_| pool.semaphores[0].clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let error = pool.acquire_dispatch_permit(0).await.unwrap_err();
+        let waited = started.elapsed();
+        assert!(matches!(error, NntpError::AcquireTimeout(0)), "{error:?}");
+        assert!(waited < Duration::from_secs(1), "must not wait: {waited:?}");
+        drop(held);
+    }
+
+    /// An idle lane that can hand its socket back is still recalled, and the
+    /// permit that recall releases is the one the acquire takes.
+    #[tokio::test]
+    async fn dispatch_permit_takes_the_permit_a_recall_releases() {
+        let pool = NntpPool::new(lane_pool_config(1));
+        let held = Arc::new(SyncMutex::new(Some(
+            pool.semaphores[0].clone().try_acquire_owned().unwrap(),
+        )));
+        let slot = pool.socket_budgets[0]
+            .try_acquire()
+            .expect("a fresh budget has a free slot");
+        let releasing = Arc::clone(&held);
+        slot.idle(
+            crate::socket_budget::SocketPhase::OwnedIdle,
+            Arc::new(move |_| {
+                lock_recovering(&releasing).take();
+            }),
+        );
+        let permit = tokio::time::timeout(Duration::from_secs(5), pool.acquire_dispatch_permit(0))
+            .await
+            .expect("the recall must free a permit well inside the budget")
+            .expect("acquire must succeed once the recall lands");
+        drop(permit);
+        drop(slot);
     }
 
     #[test]

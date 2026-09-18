@@ -1753,9 +1753,7 @@ mod tests {
     #[test]
     fn a_preference_leads_with_its_first_family_only() {
         assert!(TlsCipherPreference::AesFirst.leads_with("TLS_AES_128_GCM_SHA256"));
-        assert!(
-            TlsCipherPreference::AesFirst.leads_with("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
-        );
+        assert!(TlsCipherPreference::AesFirst.leads_with("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"));
         assert!(!TlsCipherPreference::AesFirst.leads_with("TLS_AES_256_GCM_SHA384"));
         assert!(!TlsCipherPreference::AesFirst.leads_with("TLS_CHACHA20_POLY1305_SHA256"));
         assert!(TlsCipherPreference::ChaChaFirst.leads_with("TLS_CHACHA20_POLY1305_SHA256"));
