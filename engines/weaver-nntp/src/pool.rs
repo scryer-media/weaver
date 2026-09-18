@@ -537,9 +537,11 @@ impl NntpPool {
             }
             // Nothing idle to call back, and every permit belongs to a lane
             // that is mid-transfer: waiting here can only spend the caller's
-            // whole budget and then fail anyway. Say so now instead.
+            // whole budget and then fail anyway. Say so now instead. This is
+            // the ordinary state of a saturated server, and the caller's
+            // requeue answers it, so it is not worth a warning per attempt.
             if !self.socket_budgets[idx].recall_idle() && self.lane_served(idx) {
-                warn!(
+                debug!(
                     server = idx,
                     max_connections = self.max_connections[idx],
                     "every connection is held by a busy download lane; not waiting"
