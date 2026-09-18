@@ -1,0 +1,141 @@
+{
+  "schema": "weaver.upgrade.manifest.v1",
+  "tag": "weaver-v9.8.7",
+  "version": "9.8.7",
+  "artifacts": [
+    {
+      "platform": "darwin",
+      "arch": "arm64",
+      "channel": "portable",
+      "asset_name": "weaver-darwin-arm64-portable.tar.gz",
+      "url": "https://github.com/scryer-media/weaver/releases/download/weaver-v9.8.7/weaver-darwin-arm64-portable.tar.gz",
+      "size": 119,
+      "blake3": "ffcda8d70e977e972548367990846144ac751ffbd2d54a7422af6394022cb210",
+      "archive": "tar.gz",
+      "members": [
+        {
+          "path": "weaver",
+          "size": 54,
+          "executable": true
+        }
+      ]
+    },
+    {
+      "platform": "darwin",
+      "arch": "x86_64",
+      "channel": "portable",
+      "asset_name": "weaver-darwin-x86_64-portable.tar.gz",
+      "url": "https://github.com/scryer-media/weaver/releases/download/weaver-v9.8.7/weaver-darwin-x86_64-portable.tar.gz",
+      "size": 121,
+      "blake3": "8dd52409300301122536a99a552bf702630c7330e4af4937ad259c2a3bd7470d",
+      "archive": "tar.gz",
+      "members": [
+        {
+          "path": "weaver",
+          "size": 55,
+          "executable": true
+        }
+      ]
+    },
+    {
+      "platform": "linux",
+      "arch": "arm64",
+      "channel": "portable",
+      "asset_name": "weaver-linux-arm64-portable.tar.gz",
+      "url": "https://github.com/scryer-media/weaver/releases/download/weaver-v9.8.7/weaver-linux-arm64-portable.tar.gz",
+      "size": 119,
+      "blake3": "2e3292e4ff8bc1b594e55e4317fe43d8399472c0be3d7c36fcb414a74544514a",
+      "archive": "tar.gz",
+      "members": [
+        {
+          "path": "weaver",
+          "size": 53,
+          "executable": true
+        }
+      ]
+    },
+    {
+      "platform": "linux",
+      "arch": "x86_64",
+      "channel": "portable",
+      "asset_name": "weaver-linux-x86_64-portable.tar.gz",
+      "url": "https://github.com/scryer-media/weaver/releases/download/weaver-v9.8.7/weaver-linux-x86_64-portable.tar.gz",
+      "size": 122,
+      "blake3": "b699deda7e73209bce227a93199aa0a3b89730e2b6e39e617c06d5a586c4c468",
+      "archive": "tar.gz",
+      "members": [
+        {
+          "path": "weaver",
+          "size": 54,
+          "executable": true
+        }
+      ]
+    },
+    {
+      "platform": "windows",
+      "arch": "arm64",
+      "channel": "msi",
+      "asset_name": "weaver-windows-arm64.msi",
+      "url": "https://github.com/scryer-media/weaver/releases/download/weaver-v9.8.7/weaver-windows-arm64.msi",
+      "size": 40,
+      "blake3": "86b93c3cb1f65737edfc92d40ed242f9528ad16695d3bf3b872b57d4273e2ead",
+      "archive": "msi",
+      "members": []
+    },
+    {
+      "platform": "windows",
+      "arch": "arm64",
+      "channel": "portable",
+      "asset_name": "weaver-windows-arm64-portable.tar.gz",
+      "url": "https://github.com/scryer-media/weaver/releases/download/weaver-v9.8.7/weaver-windows-arm64-portable.tar.gz",
+      "size": 158,
+      "blake3": "c94759765735a6b562c11d1c0ff668bf521e8c5948bd00ede25dd6bbe6cbc38f",
+      "archive": "tar.gz",
+      "members": [
+        {
+          "path": "weaver-tray.exe",
+          "size": 64,
+          "executable": true
+        },
+        {
+          "path": "weaver.exe",
+          "size": 59,
+          "executable": true
+        }
+      ]
+    },
+    {
+      "platform": "windows",
+      "arch": "x86_64",
+      "channel": "msi",
+      "asset_name": "weaver-windows-x86_64.msi",
+      "url": "https://github.com/scryer-media/weaver/releases/download/weaver-v9.8.7/weaver-windows-x86_64.msi",
+      "size": 41,
+      "blake3": "77467e0e82c82dcbcba5122e882b5d85e9601f5a2704e65591d9ae7f0f1c3a2d",
+      "archive": "msi",
+      "members": []
+    },
+    {
+      "platform": "windows",
+      "arch": "x86_64",
+      "channel": "portable",
+      "asset_name": "weaver-windows-x86_64-portable.tar.gz",
+      "url": "https://github.com/scryer-media/weaver/releases/download/weaver-v9.8.7/weaver-windows-x86_64-portable.tar.gz",
+      "size": 159,
+      "blake3": "de612a0594fe82416997a538e331e7f3bcbffd365c10b0c730d8c6925cbb1c36",
+      "archive": "tar.gz",
+      "members": [
+        {
+          "path": "weaver-tray.exe",
+          "size": 65,
+          "executable": true
+        },
+        {
+          "path": "weaver.exe",
+          "size": 60,
+          "executable": true
+        }
+      ]
+    }
+  ]
+}

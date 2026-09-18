@@ -69,6 +69,133 @@ enum ApiKeyScope {
 	ADMIN
 }
 
+"""
+Installation layout identified for the in-app upgrade surface.
+"""
+enum ApplicationInstallationKindValue {
+	"""
+	A writable standalone installation.
+	"""
+	PORTABLE
+	"""
+	A directly installed Windows MSI package.
+	"""
+	DIRECT_MSI
+	"""
+	A macOS application bundle, upgraded by replacing the bundle in place.
+	"""
+	MACOS_APP_BUNDLE
+	"""
+	A container-managed installation.
+	"""
+	DOCKER
+	"""
+	A Homebrew-managed installation.
+	"""
+	HOMEBREW
+	"""
+	A winget-managed Windows installation.
+	"""
+	WINGET
+	"""
+	A Windows service or session-zero installation.
+	"""
+	WINDOWS_SUPERVISED
+	"""
+	In-app upgrades turned off by the operator.
+	"""
+	DISABLED
+	"""
+	A layout that is not supported for in-app upgrades.
+	"""
+	UNSUPPORTED
+}
+
+"""
+Who is responsible for upgrading this installation.
+"""
+enum ApplicationUpgradeOwnerValue {
+	"""
+	Weaver can upgrade itself.
+	"""
+	IN_APP
+	"""
+	The operator or an external package manager owns upgrades.
+	"""
+	OPERATOR
+}
+
+"""
+One upgrade attempt, as the UI follows it.
+"""
+type ApplicationUpgradeRunPayload {
+	runId: String!
+	status: ApplicationUpgradeRunStatusValue!
+	"""
+	Stable phase name: checking, downloading, verifying, staging, applying,
+	awaiting_elevation, restarting or reboot_required.
+	"""
+	phase: String!
+	downloadedBytes: Int!
+	totalBytes: Int!
+	targetVersion: String!
+	targetTag: String!
+	fromVersion: String!
+	error: String
+	startedAtEpochMs: Int!
+	completedAtEpochMs: Int
+}
+
+"""
+How an upgrade attempt ended, or that it is still going.
+"""
+enum ApplicationUpgradeRunStatusValue {
+	RUNNING
+	COMPLETED
+	FAILED
+}
+
+"""
+The accepted upgrade run.
+"""
+type ApplicationUpgradeStartPayload {
+	run: ApplicationUpgradeRunPayload!
+}
+
+"""
+Update availability and installation eligibility in one read.
+"""
+type ApplicationUpgradeStatus {
+	currentVersion: String!
+	"""
+	The available version, or null when no update notice exists.
+	"""
+	updateVersion: String
+	"""
+	The available release tag, or null when no update notice exists.
+	"""
+	updateTag: String
+	updateAvailable: Boolean!
+	"""
+	The layout classified at startup, from the running process.
+	"""
+	installationKind: ApplicationInstallationKindValue!
+	managementOwner: ApplicationUpgradeOwnerValue!
+	eligible: Boolean!
+	"""
+	Stable snake_case code explaining the eligibility verdict.
+	"""
+	eligibilityReason: String!
+	"""
+	The run in flight, if one is.
+	"""
+	activeRun: ApplicationUpgradeRunPayload
+	"""
+	The newest run, in flight or finished.
+	"""
+	latestRun: ApplicationUpgradeRunPayload
+}
+
 type Attribute {
 	key: String!
 	value: String!
@@ -1259,6 +1386,13 @@ type MutationRoot {
 	deleteSchedule(id: String!): [Schedule!]!
 	toggleSchedule(id: String!, enabled: Boolean!): [Schedule!]!
 	createDirectory(path: String!, name: String!): DirectoryBrowseResult!
+	"""
+	Install the release the checker is currently advertising.
+
+	Admin-only, and the input has to echo the notice the UI displayed: the
+	server installs the release it already found, never one the caller names.
+	"""
+	startApplicationUpgrade(input: StartApplicationUpgradeInput!): ApplicationUpgradeStartPayload!
 }
 
 """
@@ -1703,6 +1837,10 @@ type QueryRoot {
 	Latest stable Weaver release information observed by the background checker.
 	"""
 	updateStatus: UpdateStatus!
+	"""
+	In-application upgrade availability and this installation's eligibility.
+	"""
+	applicationUpgradeStatus: ApplicationUpgradeStatus!
 	"""
 	Safe runtime and storage facts for the built-in troubleshooting UI.
 	"""
@@ -2582,6 +2720,18 @@ type StagedNzbUploadResult {
 	error: String
 }
 
+"""
+The exact update notice the operator pressed Install on.
+
+Echoing the notice back is what keeps the mutation from being a "install
+whatever the server likes" trigger: the release checker must already have
+found this tag and version, or the request is refused.
+"""
+input StartApplicationUpgradeInput {
+	expectedTag: String!
+	expectedVersion: String!
+}
+
 type SubmissionResult {
 	accepted: Boolean!
 	status: SubmissionStatus!
@@ -2680,6 +2830,10 @@ type SubscriptionRoot {
 	Subscribe to release-check state changes, including the initial snapshot.
 	"""
 	updateStatusUpdates: UpdateStatus!
+	"""
+	Subscribe to upgrade progress, including the current snapshot.
+	"""
+	applicationUpgradeUpdates: ApplicationUpgradeStatus!
 	"""
 	Subscribe to cadence-driven system metrics and global queue state.
 	"""

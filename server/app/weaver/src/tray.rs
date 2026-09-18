@@ -8,9 +8,17 @@
 //! system integration each platform requires.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+// The server→wrapper relaunch signal. Both binaries compile the same file, so
+// the two halves of the protocol cannot drift apart.
+mod bundle_relaunch;
+
 #[cfg(windows)]
 #[path = "tray_ipc.rs"]
 mod tray_ipc;
+
+// The startup registration the tray owns and the upgrade helper restores.
+#[cfg(windows)]
+mod windows_startup;
 
 // Only the desktop platforms link the shared wrapper. It reaches into
 // weaver-server-core, and on Linux that drags in C libraries built as GCC LTO

@@ -28,6 +28,7 @@ mod par2_kit;
 mod perf;
 mod pgo;
 mod profile_local;
+mod upgrade_manifest;
 
 const BLUE: &str = "\x1b[0;34m";
 const GREEN: &str = "\x1b[0;32m";
@@ -140,6 +141,8 @@ enum CiCommand {
     Audit,
     Clippy(ClippyArgs),
     Winget(WingetArgs),
+    /// Write a release's signed upgrade manifest for one schema generation.
+    UpgradeManifest(upgrade_manifest::UpgradeManifestArgs),
 }
 
 #[derive(Args)]
@@ -445,6 +448,7 @@ fn main() -> Result<()> {
             CiCommand::Audit => run_cargo_audit_validation(&ctx, "ci-audit"),
             CiCommand::Clippy(args) => run_clippy_ci(&ctx, args),
             CiCommand::Winget(args) => run_ci_winget(&ctx, args),
+            CiCommand::UpgradeManifest(args) => upgrade_manifest::run_upgrade_manifest(args),
         },
         Commands::Serve(args) => run_serve(&ctx, args),
         Commands::Deploy(args) => match args.command {

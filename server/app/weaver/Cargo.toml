@@ -26,6 +26,10 @@ unrar-rs = { workspace = true, features = [
     "crypto-aws-lc",
 ] }
 weaver-server-api = { path = "../../crates/weaver-server-api", default-features = false }
+# The tray resolves the running `.app` bundle with the shared classifier, and
+# the Windows upgrade helper runs from a copy of this binary. Pinned to the same
+# signed tag the server core uses, so one version lands in the lock file.
+application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.0" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

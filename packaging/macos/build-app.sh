@@ -87,4 +87,14 @@ install -m 0644 "$icon_source" "$bundle/Contents/Resources/weaver.icns"
 sed -e "s/@VERSION@/$version/g" "$script_dir/Info.plist" > "$bundle/Contents/Info.plist"
 plutil -lint "$bundle/Contents/Info.plist"
 
+# The in-application upgrade replaces this bundle by extracting a tarball of it,
+# and its extractor accepts regular files only. A symlink, a hard link or any
+# other special file here would produce a release that cannot install itself, so
+# the bundle is refused at build time instead.
+if find "$bundle" ! -type d ! -type f | grep -q .; then
+  echo "bundle contains non-regular files, which the upgrade extractor rejects:" >&2
+  find "$bundle" ! -type d ! -type f >&2
+  exit 1
+fi
+
 echo "built $bundle"

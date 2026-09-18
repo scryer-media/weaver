@@ -35,6 +35,24 @@ impl SystemSubscription {
         })
     }
 
+    /// Subscribe to upgrade progress, including the current snapshot.
+    #[graphql(guard = "ReadGuard")]
+    async fn application_upgrade_updates(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<impl Stream<Item = crate::system::types::ApplicationUpgradeStatus>> {
+        let service = ctx
+            .data::<weaver_server_core::application_upgrade::ApplicationUpgradeService>()?
+            .clone();
+        let mut receiver = service.subscribe();
+        Ok(async_stream::stream! {
+            yield service.snapshot().into();
+            while receiver.changed().await.is_ok() {
+                yield service.snapshot().into();
+            }
+        })
+    }
+
     /// Subscribe to cadence-driven system metrics and global queue state.
     #[graphql(guard = "ReadGuard")]
     async fn system_metrics_updates(

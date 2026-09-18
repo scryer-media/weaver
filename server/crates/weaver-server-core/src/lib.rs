@@ -1,3 +1,4 @@
+pub mod application_upgrade;
 pub mod auth;
 pub mod bandwidth;
 pub mod categories;

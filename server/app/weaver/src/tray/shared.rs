@@ -654,6 +654,56 @@ pub(crate) fn row_detail(row: &QueueRow) -> String {
     format!("{} · {}%", row.state, row.progress_percent.round())
 }
 
+use crate::bundle_relaunch::is_bundle_relaunch_exit;
+
+/// What one poll of the supervised server found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SupervisedServer {
+    /// Still running, or never owned by this wrapper.
+    Running,
+    /// The server applied an application-bundle upgrade and asked the wrapper
+    /// to relaunch the app from the replaced bundle.
+    RelaunchRequested,
+    /// The server exited for some other reason.
+    Exited(ExitStatus),
+}
+
+/// The `.app` bundle the running wrapper was launched from, if it was.
+///
+/// Derived from this process's own path rather than anything the server said,
+/// so a relaunch can only ever target the bundle the user actually started.
+#[cfg(target_os = "macos")]
+pub(crate) fn running_app_bundle() -> Option<PathBuf> {
+    let wrapper = std::env::current_exe().ok()?;
+    let resolved = std::fs::canonicalize(&wrapper).unwrap_or(wrapper);
+    application_updater::installation::macos_app_bundle_path(&resolved).map(Path::to_path_buf)
+}
+
+/// Start the updated bundle once this wrapper has exited.
+///
+/// The wrapper holds the single-instance lock until its process ends, and a
+/// second instance that finds the lock taken hands off to the first and exits.
+/// Opening the bundle directly would race this wrapper's own shutdown and, when
+/// it lost, leave nothing running. So a detached shell waits for this process
+/// to go, then opens the bundle. The bundle path travels as an argument, never
+/// as script text.
+#[cfg(target_os = "macos")]
+pub(crate) fn relaunch_app_bundle(bundle: &Path) -> Result<(), String> {
+    const WAIT_THEN_OPEN: &str = "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.2; done; exec /usr/bin/open -n \"$2\"";
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(WAIT_THEN_OPEN)
+        .arg("weaver-relaunch")
+        .arg(std::process::id().to_string())
+        .arg(bundle)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to relaunch {}: {error}", bundle.display()))
+}
+
 /// The `weaver` server process the wrapper owns.
 ///
 /// The wrapper is the parent of the server it started, so this is also what
@@ -841,6 +891,23 @@ impl ServerSupervisor {
                 ));
             }
             thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// What the supervised server is doing right now.
+    ///
+    /// This is the whole of the server→wrapper channel for a bundle upgrade.
+    /// It is deliberately not a socket, a port or a file: the only thing read
+    /// here is the exit status of a child *this process started*, which cannot
+    /// be produced by anything else on the machine, needs no authentication of
+    /// its own, and adds no listening surface.
+    pub(crate) fn poll_supervised_server(&mut self) -> Result<SupervisedServer, String> {
+        match self.exited_server()? {
+            None => Ok(SupervisedServer::Running),
+            Some(status) if is_bundle_relaunch_exit(status) => {
+                Ok(SupervisedServer::RelaunchRequested)
+            }
+            Some(status) => Ok(SupervisedServer::Exited(status)),
         }
     }
 
@@ -1656,5 +1723,31 @@ mod tests {
             progress_percent: 42.5,
         };
         assert_eq!(row_detail(&row), "Downloading · 43%");
+    }
+
+    // -- the server's relaunch request ---------------------------------------
+
+    /// The request is a specific exit code and nothing else. An ordinary
+    /// failure, a panic, a clean exit and a signal must all stay ordinary
+    /// exits, or a crashing server would relaunch the app in a loop.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_relaunch_exit_code_asks_the_wrapper_to_relaunch() {
+        use std::os::unix::process::ExitStatusExt;
+
+        use crate::bundle_relaunch::{BUNDLE_RELAUNCH_EXIT_CODE, is_bundle_relaunch_exit};
+
+        let exited = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        assert!(is_bundle_relaunch_exit(exited(BUNDLE_RELAUNCH_EXIT_CODE)));
+        for code in [0, 1, 2, 70, 86, 88, 101, 255] {
+            assert!(
+                !is_bundle_relaunch_exit(exited(code)),
+                "exit code {code} must not be read as a relaunch request"
+            );
+        }
+        // Killed by signal 87: no exit code at all.
+        assert!(!is_bundle_relaunch_exit(
+            std::process::ExitStatus::from_raw(BUNDLE_RELAUNCH_EXIT_CODE)
+        ));
     }
 }

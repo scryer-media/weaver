@@ -180,10 +180,11 @@ mod tests {
 
         let listing = create_directory(tempdir.path(), "alpha").expect("folder should be created");
 
-        assert_eq!(
-            listing.current_path,
-            tempdir.path().join("alpha").to_string_lossy().as_ref()
-        );
+        // Annotated because two `typed-path` versions in the graph make a bare
+        // `as_ref()` ambiguous here.
+        let expected_dir = tempdir.path().join("alpha");
+        let expected_path: &str = &expected_dir.to_string_lossy();
+        assert_eq!(listing.current_path, expected_path);
         assert!(tempdir.path().join("alpha").is_dir());
     }
 

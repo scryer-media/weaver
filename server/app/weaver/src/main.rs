@@ -1,5 +1,9 @@
+mod application_upgrade_helper;
 mod args;
 mod bootstrap;
+// The server→wrapper relaunch signal. Both binaries compile the same file, so
+// the two halves of the protocol cannot drift apart.
+mod bundle_relaunch;
 mod commands;
 mod http;
 mod logging;
@@ -7,6 +11,10 @@ mod restart;
 mod shutdown;
 #[cfg(windows)]
 mod tray_ipc;
+// The startup registration the tray owns and the upgrade helper restores; the
+// helper runs from a copy of this binary, so this binary carries it too.
+#[cfg(windows)]
+mod windows_startup;
 mod wiring;
 
 use std::io::IsTerminal;
@@ -35,6 +43,18 @@ const DOTENV_FILE: &str = ".env";
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    // The Windows upgrade helper is this binary run with `--upgrade-helper`: it
+    // replaces the installation the server it was copied from is still holding
+    // open. Checked before anything else, because a helper must never start a
+    // server, read a config, or touch the database.
+    match application_upgrade_helper::maybe_run_upgrade_helper() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("upgrade helper failed: {error}");
+            std::process::exit(1);
+        }
+    }
     if let Some(code) =
         weaver_server_core::post_processing::runner::maybe_run_supervisor_from_process_args()
     {

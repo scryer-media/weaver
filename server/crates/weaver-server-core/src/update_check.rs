@@ -195,7 +195,11 @@ impl UpdateCheckService {
         Self::with_fetcher_enabled(db, fetcher, release_checks_enabled())
     }
 
-    fn with_fetcher_enabled(db: Database, fetcher: Arc<dyn ReleaseFetcher>, enabled: bool) -> Self {
+    pub(crate) fn with_fetcher_enabled(
+        db: Database,
+        fetcher: Arc<dyn ReleaseFetcher>,
+        enabled: bool,
+    ) -> Self {
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         let persisted = load_persisted_state(&db);
         let mut status = UpdateStatus::initial(current_version);
@@ -413,6 +417,15 @@ fn epoch_ms_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// The release tag that carries `version`'s assets.
+///
+/// The in-application upgrade needs the tag, not just the version: every release
+/// asset URL is built from it. One function so the tag the upgrade asks for and
+/// the tag the release was cut as cannot drift apart.
+pub fn release_tag_for_version(version: &str) -> String {
+    format!("{RELEASE_TAG_PREFIX}{version}")
 }
 
 /// Parse a release tag into a comparable stable version.

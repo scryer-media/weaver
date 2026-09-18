@@ -49,7 +49,7 @@ use objc2_web_kit::{
 
 use super::shared::{
     self, DEFAULT_PORT, POPOVER_WIDTH, PopoverContent, SERVER_READY_TIMEOUT, SMOKE_SUCCESS_LINE,
-    SMOKE_TIMEOUT, ServerSupervisor,
+    SMOKE_TIMEOUT, ServerSupervisor, SupervisedServer,
 };
 
 /// The notification a second invocation posts so the running instance shows
@@ -63,6 +63,13 @@ const INSTANCE_LOCK_FILE: &str = "weaver-tray.lock";
 
 /// How often the wrapper checks whether the server has come up.
 const READY_POLL_INTERVAL: f64 = 0.25;
+
+/// How often the wrapper checks on the server it started.
+///
+/// This only has to notice a bundle upgrade's relaunch request promptly enough
+/// that the user does not sit looking at a stopped app; a second is well inside
+/// that and costs a `waitpid` poll.
+const SUPERVISION_POLL_INTERVAL: f64 = 1.0;
 
 fn copy_setup_code_to_clipboard(code: &str) -> std::io::Result<()> {
     let mut child = Command::new("/usr/bin/pbcopy")
@@ -262,6 +269,8 @@ struct DelegateState {
     status_item: RefCell<Option<Retained<NSStatusItem>>>,
     ready_timer: RefCell<Option<Retained<NSTimer>>>,
     ready_probe: RefCell<Option<Arc<AtomicU8>>>,
+    /// Watches the supervised server for the bundle-upgrade relaunch request.
+    supervision_timer: RefCell<Option<Retained<NSTimer>>>,
     popover: RefCell<Option<Retained<NSPopover>>>,
     popover_views: RefCell<Option<PopoverViews>>,
     popover_timer: RefCell<Option<Retained<NSTimer>>>,
@@ -394,6 +403,22 @@ define_class!(
             self.hide_popover();
         }
 
+        /// Timer callback: has the server asked for the app to be relaunched?
+        ///
+        /// A bundle upgrade replaces this wrapper's own binary, so the running
+        /// wrapper cannot become the new build. When its server reports the
+        /// swap succeeded, the wrapper hands off to a fresh instance launched
+        /// from the replaced bundle and quits.
+        #[unsafe(method(pollSupervisedServer:))]
+        fn poll_supervised_server(&self, _timer: &NSTimer) {
+            let observed = self.ivars().supervisor.borrow_mut().poll_supervised_server();
+            match observed {
+                Ok(SupervisedServer::RelaunchRequested) => self.relaunch_after_bundle_upgrade(),
+                Ok(_) => {}
+                Err(error) => eprintln!("failed to check the Weaver server: {error}"),
+            }
+        }
+
         /// Timer callback: draw whatever the fetch thread has left, and start
         /// the next fetch once the current answer is stale.
         #[unsafe(method(refreshPopover:))]
@@ -436,6 +461,7 @@ define_class!(
             install_main_menu(self.mtm());
             self.install_status_item();
             self.observe_open_notifications();
+            self.begin_supervision_polling();
             self.report(self.open_weaver());
         }
 
@@ -500,6 +526,7 @@ define_class!(
         #[unsafe(method(applicationWillTerminate:))]
         fn application_will_terminate(&self, _notification: &NSNotification) {
             self.stop_ready_polling();
+            self.stop_supervision_polling();
             self.hide_popover();
             let _ = self.ivars().supervisor.borrow_mut().stop();
         }
@@ -603,6 +630,7 @@ impl WeaverDelegate {
             status_item: RefCell::new(None),
             ready_timer: RefCell::new(None),
             ready_probe: RefCell::new(None),
+            supervision_timer: RefCell::new(None),
             popover: RefCell::new(None),
             popover_views: RefCell::new(None),
             popover_timer: RefCell::new(None),
@@ -854,6 +882,67 @@ impl WeaverDelegate {
             timer.invalidate();
         }
         *self.ivars().ready_probe.borrow_mut() = None;
+    }
+
+    /// Watch the supervised server for the whole run.
+    ///
+    /// Unlike the readiness poll this never stops on its own: the request it
+    /// waits for can arrive at any point in a session, hours after the window
+    /// came up.
+    fn begin_supervision_polling(&self) {
+        if self.ivars().supervision_timer.borrow().is_some() {
+            return;
+        }
+        // SAFETY: The selector is implemented by this class, and the timer is
+        // invalidated before the delegate could go away.
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                SUPERVISION_POLL_INTERVAL,
+                self.as_any(),
+                sel!(pollSupervisedServer:),
+                None,
+                true,
+            )
+        };
+        *self.ivars().supervision_timer.borrow_mut() = Some(timer);
+    }
+
+    fn stop_supervision_polling(&self) {
+        if let Some(timer) = self.ivars().supervision_timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+    }
+
+    /// Hand off to a fresh instance of the replaced bundle, and quit.
+    ///
+    /// The server has already exited by the time this runs — that exit *is* the
+    /// request — so `stop` here only reaps the bookkeeping. The bundle path
+    /// comes from this process's own location, never from the server, so the
+    /// relaunch can only target the application the user started.
+    fn relaunch_after_bundle_upgrade(&self) {
+        self.stop_supervision_polling();
+        self.stop_ready_polling();
+        self.hide_popover();
+        let _ = self.ivars().supervisor.borrow_mut().stop();
+
+        let Some(bundle) = shared::running_app_bundle() else {
+            // Not running from a bundle: there is nothing to relaunch, and the
+            // server should never have asked. Start it again so the user is not
+            // left with a wrapper supervising nothing.
+            self.report(self.ivars().supervisor.borrow_mut().start());
+            self.begin_supervision_polling();
+            return;
+        };
+        if let Err(error) = shared::relaunch_app_bundle(&bundle) {
+            self.report(Err(format!(
+                "Weaver was updated, but the updated app could not be started: {error}\n\n\
+                 Open {} yourself to finish.",
+                bundle.display()
+            )));
+            return;
+        }
+        self.ivars().quit_confirmed.set(true);
+        NSApplication::sharedApplication(self.mtm()).terminate(None);
     }
 
     // -- the hover popover ---------------------------------------------------
