@@ -56,7 +56,6 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
                 event_tx,
                 refill_tx,
                 parked_tx,
-                hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
                 initial_lease: test_lease(JobId(42), 0, vec![], vec![tail_work(0, 0)]),
             },
         );
@@ -75,8 +74,7 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
         work.is_recovery = true;
         work.completion_critical = true;
         let mut next = test_lease(JobId(42), 0, vec![], vec![work]);
-        next.compatibility.is_recovery = true;
-        next.compatibility.completion_critical = true;
+        next.completion_critical = true;
         assert!(request.response_tx.send(DownloadLaneRefillResponse { lease: Some(next), park_reason: LaneParkReason::NoWork }).is_ok());
         let mut returned = 0;
         loop {

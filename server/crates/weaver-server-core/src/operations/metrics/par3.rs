@@ -382,8 +382,8 @@ impl Par3OutcomeClass {
     }
 }
 
-/// One PAR3 work slot's live phase, mirroring the `hot_dispatch_job_id` /
-/// `hot_dispatch_mode` pair: an opaque owner id beside an encoded state.
+/// One PAR3 work slot's live phase: an opaque owner id beside an encoded
+/// state.
 #[derive(Debug, Default)]
 pub struct Par3Slot {
     /// Owning job id, or zero when the slot is free.

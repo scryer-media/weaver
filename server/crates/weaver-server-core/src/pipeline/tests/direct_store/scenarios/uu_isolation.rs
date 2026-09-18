@@ -261,8 +261,8 @@ async fn mixed_uu_and_yenc_archives_complete_with_uu_admission_capped() {
 }
 
 #[tokio::test]
-async fn capped_uu_keeps_yenc_batches_and_trials_while_restricting_its_own_tail() {
-    for (trial, unknown_capacity) in [(false, false), (true, false), (false, true), (true, true)] {
+async fn capped_uu_keeps_yenc_handouts_while_restricting_its_own_tail() {
+    for unknown_capacity in [false, true] {
         let temp_dir = tempfile::tempdir().unwrap();
         let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
             &temp_dir,
@@ -275,7 +275,7 @@ async fn capped_uu_keeps_yenc_batches_and_trials_while_restricting_its_own_tail(
         )
         .await;
         let job_id = JobId(58011);
-        // Enough work for multi-article leases after the ordinary 30-lane fair share.
+        // Enough work that a handout is several articles wide.
         let mut spec = segmented_job_spec("Mixed leases", "yenc.bin", &[100; 128]);
         let mut uu_spec = segmented_job_spec("UU", "uu.txt", &[100; 3]);
         spec.total_bytes += uu_spec.total_bytes;
@@ -314,21 +314,17 @@ async fn capped_uu_keeps_yenc_batches_and_trials_while_restricting_its_own_tail(
         } else {
             pipeline.uu_spool_max_segments = 0;
         }
-        pipeline.hot_dispatch_job = Some(job_id);
+        assert_eq!(pipeline.current_hot_job(), Some(job_id));
         assert!(
             pipeline.job_has_dispatchable_work_for_test(job_id),
             "a blocked UU head must not hide queued yEnc from hot scheduling"
         );
-        let pressure = pipeline.refresh_download_pressure();
-        let lease = if trial {
-            pipeline.try_lease_ip_replacement_trial_batch_for_test(job_id, 0)
-        } else {
-            pipeline.try_lease_initial_download_batch_for_test(job_id, pressure)
-        }
-        .expect("UU admission must leave yEnc work leasable");
+        let lease = pipeline
+            .lease_for_server_for_test(0)
+            .expect("UU admission must leave yEnc work leasable");
         assert!(
             lease.works.len() > 1,
-            "UU must not clamp unrelated batches to one"
+            "UU must not clamp unrelated handouts to one"
         );
         assert!(
             lease
@@ -349,28 +345,27 @@ async fn capped_uu_keeps_yenc_batches_and_trials_while_restricting_its_own_tail(
                 .all(|work| work.segment_id.file_id != uu_file
                     || work.segment_id.segment_number == 1)
         );
-        if !trial {
-            let compatibility = lease.compatibility.clone();
-            for work in lease.works {
-                pipeline
-                    .jobs
-                    .get_mut(&job_id)
-                    .unwrap()
-                    .download_queue
-                    .push(work);
-            }
-            let refill = pipeline
-                .try_lease_refill_download_batch_for_test(job_id, compatibility, pressure)
-                .expect("UU admission must leave yEnc refills leasable");
-            assert!(refill.works.len() > 1);
-            assert!(
-                refill
-                    .works
-                    .iter()
-                    .all(|work| work.segment_id.file_id != uu_file
-                        || work.segment_id.segment_number == 1)
-            );
+        // A lane already on this server asks again the same way; the cap is a
+        // property of the queue, not of the first handout.
+        for work in lease.works {
+            pipeline
+                .jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .download_queue
+                .push(work);
         }
+        let refill = pipeline
+            .lease_for_server_for_test(0)
+            .expect("UU admission must leave yEnc refills leasable");
+        assert!(refill.works.len() > 1);
+        assert!(
+            refill
+                .works
+                .iter()
+                .all(|work| work.segment_id.file_id != uu_file
+                    || work.segment_id.segment_number == 1)
+        );
     }
 }
 
@@ -429,9 +424,7 @@ async fn capped_uu_hot_job_leaves_idle_capacity_for_a_yenc_peer() {
     pipeline.active_download_connections_by_job.insert(hot, 1);
     pipeline.active_downloads = 1;
     pipeline.active_downloads_by_job.insert(hot, 1);
-    pipeline.hot_dispatch_job = Some(hot);
-    pipeline.hot_dispatch_started_at = Some(Instant::now() - Duration::from_secs(60));
-    pipeline.hot_dispatch_underfill_since = Some(Instant::now() - Duration::from_secs(60));
+    assert_eq!(pipeline.current_hot_job(), Some(hot));
     pipeline.dispatch_downloads();
     assert_eq!(
         pipeline.active_download_connections_by_job.get(&peer),

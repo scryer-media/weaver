@@ -84,7 +84,7 @@ impl Pipeline {
         }
 
         self.last_download_dispatch_stall_log_at = Some(now);
-        let hot_job_id = self.hot_dispatch_job.map(|id| id.0).unwrap_or_default();
+        let hot_job_id = self.current_hot_job().map(|id| id.0).unwrap_or_default();
         if let Some(job_id) = self.job_order.iter().copied().find(|job_id| {
             self.jobs.get(job_id).is_some_and(|state| {
                 !state.download_queue.is_empty() || !state.recovery_queue.is_empty()

@@ -5,6 +5,7 @@ pub mod queue;
 mod rar_unlock;
 pub(crate) mod repeated;
 mod retention;
+pub(in crate::pipeline) mod scheduler;
 pub(crate) mod transport;
 mod worker;
 
@@ -14,6 +15,7 @@ pub(in crate::pipeline) use worker::{
     should_neutrally_park_ip_replacement,
 };
 
+pub(super) use worker::HeldDownloadRefill;
 pub(crate) use worker::JobLogThrottle;
 
 pub use queue::{DownloadQueue, DownloadWork};

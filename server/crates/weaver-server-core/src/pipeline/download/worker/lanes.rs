@@ -72,22 +72,6 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_probe_yield_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::HotReclaim => self
-                .metrics
-                .download_lane_parks_hot_reclaim_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::HotShareYield => self
-                .metrics
-                .download_lane_parks_hot_share_yield_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::SpilloverWithdraw => self
-                .metrics
-                .download_lane_parks_spillover_withdraw_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::SpilloverSpeedHarm => self
-                .metrics
-                .download_lane_parks_spillover_speed_harm_total
-                .fetch_add(1, Ordering::Relaxed),
             LaneParkReason::IpReplacementRetired => self
                 .metrics
                 .download_lane_parks_ip_replacement_retired_total
@@ -715,7 +699,7 @@ impl Pipeline {
     ) -> bool {
         !matches!(
             self.nntp
-                .blocking_body_lane_candidacy(&lease.effective_exclude_servers),
+                .blocking_body_lane_candidacy(&lease.dial_exclude_servers),
             weaver_nntp::client::BlockingBodyLaneCandidacy::None
         )
     }
@@ -734,43 +718,6 @@ impl Pipeline {
         }
     }
 
-    /// The depth a new lease is dispatched at.
-    ///
-    /// Recovery is no longer singled out for sequential mode. It rides the
-    /// same owned lanes as everything else now, and a lane whose depth is
-    /// pinned to one gives back the round trip the pipeline exists to hide —
-    /// on exactly the work a job is waiting on to finish.
-    pub(in crate::pipeline) fn choose_download_lane_mode(
-        &mut self,
-        job_id: JobId,
-        is_recovery: bool,
-        pressure: DownloadPressure,
-    ) -> DownloadLaneMode {
-        let _ = (job_id, is_recovery);
-        let pressure_clear = pressure.state == DownloadPressureState::Clear;
-        self.download_lane_runtime
-            .servers
-            .values()
-            .map(|explorer| explorer.choose_mode(pressure_clear))
-            .max_by_key(|mode| mode.max_depth())
-            .unwrap_or(DownloadLaneMode::Sequential)
-    }
-
-    pub(in crate::pipeline) fn download_lane_server_modes(
-        &mut self,
-        job_id: JobId,
-        is_recovery: bool,
-        pressure: DownloadPressure,
-    ) -> Vec<(usize, DownloadLaneMode)> {
-        let _ = (job_id, is_recovery);
-        let pressure_clear = pressure.state == DownloadPressureState::Clear;
-        self.download_lane_runtime
-            .servers
-            .iter()
-            .map(|(server_idx, explorer)| (*server_idx, explorer.choose_mode(pressure_clear)))
-            .collect()
-    }
-
     pub(in crate::pipeline) fn note_download_lane_mode_changed(
         &mut self,
         previous: DownloadLaneMode,
@@ -778,16 +725,6 @@ impl Pipeline {
     ) {
         if previous == next {
             return;
-        }
-
-        if next.max_depth() > previous.max_depth() {
-            let now = Instant::now();
-            let speed = self.hot_dispatch_speed_bps(now);
-            self.hot_dispatch_expansion_window.record(
-                now,
-                HotExpansionKind::PipelinePromotion,
-                speed,
-            );
         }
 
         Self::release_lane_gauge(self.lane_depth_gauge(previous));
@@ -806,8 +743,7 @@ impl Pipeline {
                 lane_id: lease.lane_id,
                 job_id: lease.job_id,
                 mode: lease.lane_mode,
-                spillover_loan_kind: lease.spillover_loan_kind,
-                completion_critical: lease.compatibility.completion_critical,
+                completion_critical: lease.completion_critical,
                 reason: LaneParkReason::Error,
                 release_connection_slot: true,
                 release_ip_replacement_burst: false,
@@ -836,8 +772,7 @@ impl Pipeline {
                         lane_id,
                         job_id,
                         lane_mode,
-                        spillover_loan_kind,
-                        compatibility,
+                        completion_critical,
                         works,
                         ..
                     } = lease;
@@ -859,8 +794,7 @@ impl Pipeline {
                         lane_id,
                         job_id,
                         mode: lane_mode,
-                        spillover_loan_kind,
-                        completion_critical: compatibility.completion_critical,
+                        completion_critical,
                         reason: LaneParkReason::Capacity,
                         release_connection_slot: true,
                         release_ip_replacement_burst: false,
@@ -930,7 +864,7 @@ impl Pipeline {
                         continue;
                     }
                     self.note_released_download_result_pending(
-                        result.segment_id.file_id.job_id,
+                        result.job_id,
                         Self::released_download_result_lead_bytes(&result),
                     );
                     pending.push_back(result);
@@ -988,7 +922,7 @@ impl Pipeline {
             requeue = error.should_requeue_owned_work(),
             suppressed_since_last,
             candidate_servers = ?servers,
-            excluded_servers = ?lease.effective_exclude_servers,
+            excluded_servers = ?lease.dial_exclude_servers,
             "owned blocking download lane could not be acquired"
         );
     }
@@ -1043,7 +977,6 @@ impl Pipeline {
         }
         self.update_queue_metrics();
         self.publish_active_stage_metrics();
-        self.publish_hot_dispatch_metrics(Instant::now());
     }
 
     /// Whether a lane park has left the run loop owing a dispatch pass, and
@@ -1053,56 +986,16 @@ impl Pipeline {
         std::mem::take(&mut self.download_dispatch_wake)
     }
 
-    /// Move an established connection's class booking when a refill hands it
-    /// the other class's work.
-    ///
-    /// The connection itself is counted once, at dispatch, under the class its
-    /// first batch carried, and released at park under the class of its last.
-    /// A lane that changes class in between has to move that booking with it,
-    /// or the two ends disagree: the critical spread in
-    /// `dispatch_completion_critical_work` would keep sending demand to a job
-    /// whose lane is already serving it, and the eventual park would decrement
-    /// a count this lane was never added to.
-    pub(in crate::pipeline::download::worker) fn rebook_download_lane_class(
-        &mut self,
-        job_id: JobId,
-        from: DownloadBatchClass,
-        to: DownloadBatchClass,
-    ) {
-        if from.completion_critical == to.completion_critical {
-            return;
-        }
-        if to.completion_critical {
-            self.active_completion_critical_connections += 1;
-            *self
-                .active_completion_critical_connections_by_job
-                .entry(job_id)
-                .or_default() += 1;
-        } else {
-            self.active_completion_critical_connections = self
-                .active_completion_critical_connections
-                .saturating_sub(1);
-            if let Some(in_flight) = self
-                .active_completion_critical_connections_by_job
-                .get_mut(&job_id)
-            {
-                *in_flight = in_flight.saturating_sub(1);
-                if *in_flight == 0 {
-                    self.active_completion_critical_connections_by_job
-                        .remove(&job_id);
-                }
-            }
-        }
-    }
-
     pub(crate) fn handle_download_lane_parked(&mut self, mut parked: DownloadLaneParked) {
         if !self.download_lane_is_live(parked.lane_id) {
             return;
         }
         if let Some(owner) = self.download_lane_owners.get_mut(&parked.lane_id) {
+            // The owner is the booked truth: a refill may have moved the lane
+            // to another job or class after the worker last looked.
+            parked.job_id = owner.job_id;
             parked.mode = owner.mode;
             parked.completion_critical = owner.completion_critical;
-            parked.spillover_loan_kind = owner.spillover_loan_kind;
             parked.release_connection_slot = std::mem::take(&mut owner.connection);
             parked.release_ip_replacement_burst = std::mem::take(&mut owner.ip_replacement);
             if owner.outstanding.is_empty() {
@@ -1123,10 +1016,6 @@ impl Pipeline {
             self.download_dispatch_wake = true;
             self.note_download_lane_released(parked.mode, parked.reason);
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
-            if let Some(kind) = parked.spillover_loan_kind {
-                self.hot_dispatch_spillover_loans
-                    .release_one(parked.job_id, kind);
-            }
             if let Some(in_flight) = self
                 .active_download_connections_by_job
                 .get_mut(&parked.job_id)
@@ -1152,13 +1041,11 @@ impl Pipeline {
                     }
                 }
             }
-            self.clear_spillover_loan_if_idle();
         }
         if parked.release_ip_replacement_burst {
             self.ip_replacement_burst_active = false;
             self.metrics.set_ip_replacement_burst_active(false);
         }
         self.publish_active_stage_metrics();
-        self.publish_hot_dispatch_metrics(Instant::now());
     }
 }

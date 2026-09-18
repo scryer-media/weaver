@@ -14,14 +14,12 @@ use weaver_server_core::operations::instrumentation::{
     ServerMetricsSnapshot,
 };
 use weaver_server_core::operations::metrics_store::JOB_STATUS_KEYS;
-use weaver_server_core::pipeline::{HOT_BEST_MODE_BLOCK_REASON_LABELS, HOT_EXPANSION_KIND_LABELS};
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::settings::PerJobSeries;
 use weaver_server_core::{
-    DispatchShareMode, DownloadPressureReason, DownloadPressureState, JobInfo, JobStatus,
-    MetricsSnapshot, PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3EngineNarrowing,
-    Par3EngineRefusal, Par3MetricsSnapshot, Par3OutcomeClass, Par3Phase, Par3Stage,
-    SpilloverDecision, par3_memory_category_names,
+    DownloadPressureReason, DownloadPressureState, JobInfo, JobStatus, MetricsSnapshot,
+    PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3EngineNarrowing, Par3EngineRefusal,
+    Par3MetricsSnapshot, Par3OutcomeClass, Par3Phase, Par3Stage, par3_memory_category_names,
 };
 
 use super::catalog as f;
@@ -180,7 +178,6 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     render_gate(&mut out, pipeline_paused, download_block);
     render_pipeline_totals(&mut out, snapshot);
     render_queues(&mut out, snapshot);
-    render_hot_dispatch(&mut out, snapshot);
     render_lanes(&mut out, snapshot);
     render_ip_replacement(&mut out, snapshot);
 
@@ -741,150 +738,6 @@ fn render_par3(out: &mut Encoder, par3: &Par3MetricsSnapshot) {
     );
 }
 
-/// Cumulative counter behind each spillover decision.
-///
-/// `None` is a resting state, not an event, so it has no counter. The
-/// exhaustive match is the point: a new [`SpilloverDecision`] variant fails to
-/// compile here instead of quietly vanishing from the exposition.
-fn spillover_decision_total(
-    snapshot: &MetricsSnapshot,
-    decision: SpilloverDecision,
-) -> Option<u64> {
-    match decision {
-        SpilloverDecision::None => None,
-        SpilloverDecision::BlockedPressure => {
-            Some(snapshot.hot_dispatch_spillover_blocked_pressure_total)
-        }
-        SpilloverDecision::BlockedNearCap => {
-            Some(snapshot.hot_dispatch_spillover_blocked_near_cap_total)
-        }
-        SpilloverDecision::BlockedHotCanUseCapacity => {
-            Some(snapshot.hot_dispatch_spillover_blocked_hot_can_use_capacity_total)
-        }
-        SpilloverDecision::AllowedUnderfill => {
-            Some(snapshot.hot_dispatch_spillover_allowed_underfill_total)
-        }
-        SpilloverDecision::Reclaimed => Some(snapshot.hot_dispatch_spillover_reclaimed_total),
-        SpilloverDecision::BlockedBestModePending => {
-            Some(snapshot.hot_dispatch_spillover_blocked_best_mode_pending_total)
-        }
-        SpilloverDecision::BlockedCapSpeed => {
-            Some(snapshot.hot_dispatch_spillover_blocked_cap_speed_total)
-        }
-        SpilloverDecision::AllowedMeasuredUnderfill => {
-            Some(snapshot.hot_dispatch_spillover_allowed_measured_underfill_total)
-        }
-        SpilloverDecision::ReclaimedSpeedHarm => {
-            Some(snapshot.hot_dispatch_spillover_reclaimed_speed_harm_total)
-        }
-    }
-}
-
-fn render_hot_dispatch(out: &mut Encoder, snapshot: &MetricsSnapshot) {
-    out.sample(&f::HOT_JOB_ID, &[], snapshot.hot_dispatch_job_id);
-    for mode in DispatchShareMode::ALL {
-        out.sample(
-            &f::HOT_MODE,
-            &[("mode", mode.as_str())],
-            u8::from(snapshot.hot_dispatch_mode == mode),
-        );
-    }
-    out.sample(
-        &f::HOT_UNDERFILL_MS,
-        &[],
-        snapshot.hot_dispatch_underfill_ms,
-    );
-    out.sample_f64(
-        &f::HOT_UNDERFILL_SECONDS,
-        &[],
-        snapshot.hot_dispatch_underfill_ms as f64 / 1000.0,
-    );
-    out.sample(
-        &f::HOT_LENT_CONNECTIONS,
-        &[],
-        snapshot.hot_dispatch_lent_connections,
-    );
-
-    // One pass per family: the exposition format wants every sample of a
-    // family together, so the two decision families cannot share a loop.
-    for decision in SpilloverDecision::ALL {
-        out.sample(
-            &f::HOT_LAST_SPILLOVER_DECISION,
-            &[("decision", decision.as_str())],
-            u8::from(snapshot.hot_dispatch_last_spillover_decision == decision),
-        );
-    }
-    for decision in SpilloverDecision::ALL {
-        if let Some(value) = spillover_decision_total(snapshot, decision) {
-            out.sample(
-                &f::HOT_SPILLOVER_DECISIONS,
-                &[("decision", decision.as_str())],
-                value,
-            );
-        }
-    }
-
-    out.sample(&f::HOT_SPEED, &[], snapshot.hot_dispatch_hot_speed_bps);
-    out.sample(
-        &f::HOT_LAST_EXPANSION_KIND_CODE,
-        &[],
-        snapshot.hot_dispatch_last_expansion_kind,
-    );
-    let expansion_kind = snapshot.hot_dispatch_last_expansion_kind;
-    for (code, kind) in HOT_EXPANSION_KIND_LABELS.into_iter().enumerate() {
-        out.sample(
-            &f::HOT_EXPANSION_KIND,
-            &[("kind", kind)],
-            u8::from(code == expansion_kind),
-        );
-    }
-    for (phase, value) in [
-        ("before", snapshot.hot_dispatch_last_expansion_before_bps),
-        ("after", snapshot.hot_dispatch_last_expansion_after_bps),
-    ] {
-        out.sample(&f::HOT_LAST_EXPANSION_SPEED, &[("phase", phase)], value);
-    }
-    out.sample(
-        &f::HOT_EXCLUSIVE_PEAK,
-        &[],
-        snapshot.hot_dispatch_exclusive_peak_bps,
-    );
-    for (phase, value) in [
-        ("pre_lend", snapshot.hot_dispatch_spillover_pre_speed_bps),
-        ("post_lend", snapshot.hot_dispatch_spillover_post_speed_bps),
-    ] {
-        out.sample(&f::HOT_SPILLOVER_SPEED, &[("phase", phase)], value);
-    }
-    out.sample(
-        &f::HOT_SPILLOVER_ACTIVE_LOANS,
-        &[],
-        snapshot.hot_dispatch_spillover_active_loans,
-    );
-    out.sample(
-        &f::HOT_EXPANSION_IMPROVEMENT_PCT,
-        &[],
-        snapshot.hot_dispatch_recent_expansion_improvement_pct,
-    );
-    out.sample_f64(
-        &f::HOT_EXPANSION_IMPROVEMENT_RATIO,
-        &[],
-        snapshot.hot_dispatch_recent_expansion_improvement_pct as f64 / 100.0,
-    );
-    out.sample(
-        &f::HOT_BEST_MODE_BLOCK_CODE,
-        &[],
-        snapshot.hot_dispatch_best_mode_block_reason,
-    );
-    let block_reason = snapshot.hot_dispatch_best_mode_block_reason;
-    for (code, reason) in HOT_BEST_MODE_BLOCK_REASON_LABELS.into_iter().enumerate() {
-        out.sample(
-            &f::HOT_BEST_MODE_BLOCK,
-            &[("reason", reason)],
-            u8::from(code == block_reason),
-        );
-    }
-}
-
 fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     for (mode, value) in [
         ("sequential", snapshot.download_lanes_sequential_active),
@@ -927,22 +780,6 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
             snapshot.download_lane_parks_probe_yield_total,
         ),
         (
-            "hot_reclaim",
-            snapshot.download_lane_parks_hot_reclaim_total,
-        ),
-        (
-            "hot_share_yield",
-            snapshot.download_lane_parks_hot_share_yield_total,
-        ),
-        (
-            "spillover_withdraw",
-            snapshot.download_lane_parks_spillover_withdraw_total,
-        ),
-        (
-            "spillover_speed_harm",
-            snapshot.download_lane_parks_spillover_speed_harm_total,
-        ),
-        (
             "ip_replacement_retired",
             snapshot.download_lane_parks_ip_replacement_retired_total,
         ),
@@ -967,6 +804,18 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     ] {
         out.sample(&f::LANE_REFILLS, &[("result", result)], value);
     }
+    for (kind, value) in [
+        ("hot", snapshot.download_scheduler_handouts_total_hot),
+        ("spill", snapshot.download_scheduler_handouts_total_spill),
+        ("probe", snapshot.download_scheduler_handouts_total_probe),
+    ] {
+        out.sample(&f::SCHEDULER_HANDOUTS, &[("kind", kind)], value);
+    }
+    out.sample(
+        &f::SCHEDULER_IDLE_WITH_SERVABLE,
+        &[],
+        snapshot.download_scheduler_idle_with_servable_total,
+    );
 
     for (event, value) in [
         (

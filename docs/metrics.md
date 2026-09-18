@@ -319,12 +319,8 @@ release** — migrate dashboards and alerts now.
 | `weaver_server_latency_ms` | `weaver_server_latency_seconds` | base units are seconds |
 | `weaver_ip_rtt_ewma_slowest_ms` | `weaver_ip_rtt_ewma_slowest_seconds` | base units are seconds |
 | `weaver_pipeline_disk_write_latency_microseconds` | `weaver_pipeline_disk_write_latency_seconds` | base units are seconds |
-| `weaver_pipeline_hot_dispatch_underfill_milliseconds` | `weaver_pipeline_hot_dispatch_underfill_seconds` | base units are seconds |
 | `weaver_server_capacity_penalty_until_epoch_ms` | `weaver_server_capacity_penalty_until_seconds` | timestamps are unix seconds |
 | `weaver_pipeline_decode_rate_mebibytes_per_second` | `weaver_pipeline_decode_rate_bytes_per_second` | base units are bytes |
-| `weaver_pipeline_hot_dispatch_recent_expansion_improvement_percent` | `weaver_pipeline_hot_dispatch_recent_expansion_improvement_ratio` | ratios are 0–1, not percent |
-| `weaver_pipeline_hot_dispatch_last_expansion_kind` | `weaver_pipeline_hot_dispatch_expansion_kind` | opaque code replaced by a state-set |
-| `weaver_pipeline_hot_dispatch_best_mode_block_reason` | `weaver_pipeline_hot_dispatch_best_mode_block` | opaque code replaced by a state-set |
 
 ### Breaking change: `weaver_server_state`
 
@@ -406,24 +402,6 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_pipeline_write_pressure_hard_limit_bytes` | gauge | — | Write hard pressure limit in bytes. |
 | `weaver_pipeline_download_pressure_state` | gauge | `state` | Download backpressure state; exactly one state is 1. |
 | `weaver_pipeline_download_pressure_reason` | gauge | `reason` | Download backpressure reason; exactly one reason is 1. |
-| `weaver_pipeline_hot_dispatch_job_id` | gauge | — | Current hot-dispatch job id, or 0 when no job owns hot dispatch. |
-| `weaver_pipeline_hot_dispatch_mode` | gauge | `mode` | Current hot-dispatch sharing mode; exactly one mode is 1. |
-| `weaver_pipeline_hot_dispatch_underfill_milliseconds` | gauge | — | Current hot-job unused-capacity underfill window age in milliseconds. **Deprecated — use `weaver_pipeline_hot_dispatch_underfill_seconds`.** |
-| `weaver_pipeline_hot_dispatch_underfill_seconds` | gauge | — | Current hot-job unused-capacity underfill window age. |
-| `weaver_pipeline_hot_dispatch_lent_connections` | gauge | — | Active NNTP connection tasks lent to spillover jobs. |
-| `weaver_pipeline_hot_dispatch_last_spillover_decision` | gauge | `decision` | Last hot-dispatch spillover decision; exactly one decision is 1. |
-| `weaver_pipeline_hot_dispatch_spillover_decisions_total` | counter | `decision` | Hot-dispatch spillover decisions by reason. |
-| `weaver_pipeline_hot_dispatch_speed_bytes_per_second` | gauge | — | Two-second hot-job BODY throughput. |
-| `weaver_pipeline_hot_dispatch_last_expansion_kind` | gauge | — | Last hot-job expansion event kind, as an opaque numeric code. **Deprecated — use `weaver_pipeline_hot_dispatch_expansion_kind`.** |
-| `weaver_pipeline_hot_dispatch_expansion_kind` | gauge | `kind` | Last hot-job expansion event kind; exactly one kind is 1. |
-| `weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second` | gauge | `phase` | Last hot-job expansion before/after speeds. |
-| `weaver_pipeline_hot_dispatch_exclusive_peak_bytes_per_second` | gauge | — | Peak hot-job speed observed while exclusive. |
-| `weaver_pipeline_hot_dispatch_spillover_speed_bytes_per_second` | gauge | `phase` | Hot-job speed before and after the current spillover loan. |
-| `weaver_pipeline_hot_dispatch_spillover_active_loans` | gauge | — | Active measured spillover loans. |
-| `weaver_pipeline_hot_dispatch_recent_expansion_improvement_percent` | gauge | — | Best recent lane/pipeline expansion improvement, in percent. **Deprecated — use `weaver_pipeline_hot_dispatch_recent_expansion_improvement_ratio`.** |
-| `weaver_pipeline_hot_dispatch_recent_expansion_improvement_ratio` | gauge | — | Best recent lane/pipeline expansion improvement as a ratio, where 0.1 is a 10% gain. |
-| `weaver_pipeline_hot_dispatch_best_mode_block_reason` | gauge | — | Last best-mode spillover block reason, as an opaque numeric code. **Deprecated — use `weaver_pipeline_hot_dispatch_best_mode_block`.** |
-| `weaver_pipeline_hot_dispatch_best_mode_block` | gauge | `reason` | Last best-mode spillover block reason; exactly one reason is 1. |
 | `weaver_pipeline_download_lanes_active` | gauge | `mode` | Active article download lanes by pipelining mode. |
 | `weaver_pipeline_download_lane_states_active` | gauge | `state` | Active article download lanes by scheduler state. |
 | `weaver_pipeline_download_lanes_active_total` | gauge | — | Total active article download lanes. **Deprecated — use `weaver_pipeline_download_lanes`.** |
@@ -431,6 +409,8 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_pipeline_download_lane_parks_total` | counter | `reason` | Article download lane parks by reason. |
 | `weaver_pipeline_download_lane_lease_items_total` | counter | — | Article work items leased to download lanes. |
 | `weaver_pipeline_download_lane_refills_total` | counter | `result` | Lane refill scheduler decisions. |
+| `weaver_pipeline_download_scheduler_handouts_total` | counter | `kind` | Article handouts cut by the per-server scheduler, by kind. |
+| `weaver_pipeline_download_scheduler_idle_with_servable_total` | counter | — | Scheduler answered idle while a job still had a servable article on that server; always zero when the scheduler is correct. |
 | `weaver_pipeline_body_proof_events_total` | counter | `event` | BODY pipelining proof events. |
 | `weaver_pipeline_body_replay_items_total` | counter | — | BODY items returned unresolved after a lane reset or failure. |
 | `weaver_ip_replacement_trial_extra_connections` | gauge | — | Configured over-max IP replacement trial burst budget. |

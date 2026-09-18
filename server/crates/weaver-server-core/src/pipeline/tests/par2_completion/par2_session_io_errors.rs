@@ -99,6 +99,7 @@ async fn admitted_job_reconstructs_an_entirely_missing_payload() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -355,9 +356,8 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
         restored_state.status,
         restored_state.recovery_queue.len()
     );
-    let pressure = restored.refresh_download_pressure();
     let payload_lease = restored
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .lease_for_server_for_test(0)
         .expect("restored parsed index must not leave payload blocked");
     assert!(matches!(
         payload_lease.checkpoint_plan,

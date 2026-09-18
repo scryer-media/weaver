@@ -437,8 +437,23 @@ async fn new_direct_pipeline_at_roots(
     let (_cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
     let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    // Dispatch asks the pool which server a new lane should try, so a harness
+    // that is given connections needs a server to rank; nothing is dialed
+    // here. A harness with no connections keeps its empty pool.
+    let harness_servers = if total_connections == 0 {
+        Vec::new()
+    } else {
+        vec![weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "harness.example.com".to_string(),
+                ..Default::default()
+            },
+            max_connections: total_connections,
+            ..weaver_nntp::pool::ServerPoolConfig::default()
+        }]
+    };
     let nntp = NntpClient::new(NntpClientConfig {
-        servers: vec![],
+        servers: harness_servers,
         max_idle_age: Duration::from_secs(1),
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
@@ -1081,9 +1096,6 @@ fn many_standalone_files(prefix: &str, count: usize) -> Vec<(String, u32)> {
         .map(|idx| (format!("{prefix}-{idx}.bin"), 512u32))
         .collect()
 }
-
-const TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
-const TEST_HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
 
 fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes: u32) -> JobSpec {
     JobSpec {

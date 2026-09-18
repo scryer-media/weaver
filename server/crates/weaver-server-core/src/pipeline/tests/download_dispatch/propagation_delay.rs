@@ -21,16 +21,15 @@ async fn owned_download_lane_capacity_failure_requeues_without_async_fallback() 
         .pop()
         .unwrap();
     let segment_id = work.segment_id;
-    let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
         lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         server_modes: Vec::new(),
-        compatibility,
+        completion_critical: false,
         effective_exclude_servers: Vec::new(),
+        dial_exclude_servers: Vec::new(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -109,16 +108,15 @@ async fn owned_download_lane_selection_contention_requeues_without_async_fallbac
         .pop()
         .unwrap();
     let segment_id = work.segment_id;
-    let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
         lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         server_modes: Vec::new(),
-        compatibility,
+        completion_critical: false,
         effective_exclude_servers: Vec::new(),
+        dial_exclude_servers: Vec::new(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -180,112 +178,6 @@ async fn owned_download_lane_selection_contention_requeues_without_async_fallbac
         "contention must not consume a download retry"
     );
 }
-
-#[test]
-fn hot_throughput_window_uses_fixed_two_second_bucketed_rate() {
-    let now = Instant::now();
-    let mut window = HotJobThroughputWindow::default();
-
-    window.record(now, 2_000);
-
-    assert_eq!(window.bps(now), 1_000);
-    assert_eq!(window.bps(now + Duration::from_millis(199)), 1_000);
-
-    window.record(now + Duration::from_millis(250), 2_000);
-
-    assert_eq!(window.bps(now + Duration::from_secs(1)), 2_000);
-    assert_eq!(window.bps(now + Duration::from_millis(2_201)), 0);
-}
-
-#[test]
-fn spillover_loan_book_tracks_multiple_jobs_and_reclaims_independently() {
-    let now = Instant::now();
-    let mut loans = SpilloverLoanBook::default();
-    let first_job = JobId(21001);
-    let second_job = JobId(21002);
-
-    loans.start_or_extend(first_job, now, 10_000, SpilloverLoanKind::MeasuredUnderfill);
-    loans.start_or_extend(first_job, now, 10_000, SpilloverLoanKind::MeasuredUnderfill);
-    loans.start_or_extend(
-        second_job,
-        now,
-        12_000,
-        SpilloverLoanKind::MeasuredUnderfill,
-    );
-
-    assert_eq!(loans.active_lent_connections(), 3);
-    assert_eq!(loans.active_loan_count(), 2);
-    assert_eq!(loans.speed_snapshot(), (10_000, 0, 2));
-    assert!(!loans.update_speed_harm(now + Duration::from_millis(1_999), 8_000, 7));
-    assert!(!loans.reclaim_pending_for(first_job));
-    assert!(!loans.reclaim_pending_for(second_job));
-
-    assert!(loans.update_speed_harm(now + Duration::from_secs(2), 8_000, 7));
-    assert!(loans.reclaim_pending_for(first_job));
-    assert!(loans.reclaim_pending_for(second_job));
-    assert_eq!(loans.speed_snapshot(), (10_000, 8_000, 2));
-
-    loans.release_one(first_job, SpilloverLoanKind::MeasuredUnderfill);
-    assert!(loans.reclaim_pending_for(first_job));
-    loans.release_one(first_job, SpilloverLoanKind::MeasuredUnderfill);
-    assert!(!loans.reclaim_pending_for(first_job));
-    assert!(loans.reclaim_pending_for(second_job));
-    assert_eq!(loans.active_lent_connections(), 1);
-    assert_eq!(loans.active_loan_count(), 1);
-}
-
-/// New-contract test: `distinct_loan_jobs`/`holds_loan` are what the dispatch
-/// arm's two-job cap is built on — extending an existing job's loan never
-/// grows the distinct count, and it always agrees with `active_loan_count`.
-#[test]
-fn spillover_loan_book_distinct_jobs_tracks_active_loan_count() {
-    let now = Instant::now();
-    let mut loans = SpilloverLoanBook::default();
-    let first_job = JobId(21003);
-    let second_job = JobId(21004);
-
-    assert_eq!(loans.distinct_loan_jobs(), 0);
-    assert!(!loans.holds_loan(first_job));
-
-    loans.start_or_extend(first_job, now, 10_000, SpilloverLoanKind::MeasuredUnderfill);
-    assert_eq!(loans.distinct_loan_jobs(), 1);
-    assert!(loans.holds_loan(first_job));
-    assert!(!loans.holds_loan(second_job));
-
-    // A second connection for the same job does not grow the distinct count.
-    loans.start_or_extend(first_job, now, 10_000, SpilloverLoanKind::MeasuredUnderfill);
-    assert_eq!(loans.distinct_loan_jobs(), 1);
-    assert_eq!(loans.active_lent_connections(), 2);
-
-    loans.start_or_extend(
-        second_job,
-        now,
-        10_000,
-        SpilloverLoanKind::MeasuredUnderfill,
-    );
-    assert_eq!(loans.distinct_loan_jobs(), 2);
-    assert_eq!(loans.distinct_loan_jobs(), loans.active_loan_count());
-    assert!(loans.holds_loan(second_job));
-
-    loans.release_one(first_job, SpilloverLoanKind::MeasuredUnderfill);
-    assert_eq!(loans.distinct_loan_jobs(), 2);
-    assert!(loans.holds_loan(first_job));
-    loans.release_one(first_job, SpilloverLoanKind::MeasuredUnderfill);
-    assert_eq!(loans.distinct_loan_jobs(), 1);
-    assert!(!loans.holds_loan(first_job));
-}
-
-// bounded_same_band_does_not_reclaim_on_hot_only_speed_drop and
-// spillover_loan_book_releases_mixed_kinds_independently removed:
-// `SpilloverLoanKind::BoundedSameBand` no longer exists — the loan book
-// tracks only `MeasuredUnderfill` loans now, so there is no second kind left
-// to mix or to exempt from speed-harm reclaim. Per-job tracking, release,
-// and reclaim independence with the sole remaining kind are still covered by
-// `spillover_loan_book_tracks_multiple_jobs_and_reclaims_independently`, and
-// `spillover_loan_book_distinct_jobs_tracks_active_loan_count` above covers
-// the replacement for bounded sharing: a hard cap on distinct spilled-to jobs
-// (see `spillover_caps_distinct_jobs_at_two_even_with_capacity_to_spare`
-// for the dispatch-level enforcement) instead of a per-kind connection share.
 
 #[tokio::test]
 async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
@@ -360,6 +252,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: first_segment.file_id.job_id,
             runtime_generation: 0,
             segment_id: first_segment,
             data: quota_data,
@@ -375,6 +268,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: tail_segment.file_id.job_id,
             runtime_generation: 0,
             segment_id: tail_segment,
             data: unrequested_data,
@@ -409,7 +303,6 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
         lane_id: 0,
         job_id,
         mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         completion_critical: false,
         reason: LaneParkReason::ServerQuota,
         release_connection_slot: false,
@@ -436,50 +329,6 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
             .download_lane_parks_error_total
             .load(Ordering::Relaxed),
         errors_before
-    );
-}
-
-#[tokio::test]
-async fn release_download_result_excludes_ip_replacement_trial_from_hot_success_and_speed() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(21003);
-    let segment_id = SegmentId {
-        file_id: NzbFileId {
-            job_id,
-            file_index: 0,
-        },
-        segment_number: 0,
-    };
-
-    pipeline.hot_dispatch_job = Some(job_id);
-    pipeline.hot_dispatch_started_at = Some(Instant::now() - Duration::from_secs(2));
-    pipeline.active_downloads = 1;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(segment_id.file_id, 1);
-
-    pipeline.release_download_result(&DownloadResult {
-        lane_id: 0,
-        runtime_generation: 0,
-        segment_id,
-        data: Ok(DownloadPayload::Raw(Bytes::from_static(b"trial-article"))),
-        attempts: vec![],
-        lane_observation: None,
-        source_server_idx: None,
-        origin: DownloadResultOrigin::IpReplacementTrial,
-        retry_count: 0,
-        exclude_servers: vec![],
-        release_connection_slot: false,
-    });
-
-    assert_eq!(
-        pipeline
-            .metrics
-            .hot_dispatch_hot_speed_bps
-            .load(Ordering::Relaxed),
-        0
     );
 }
 
@@ -585,20 +434,10 @@ async fn retired_ip_replacement_lane_parks_at_refill_boundary() {
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
         lane_id: 0,
         runtime_generation: 0,
-        job_id: JobId(21004),
         server_idx: old_key.server_idx,
         remote_ip: Some(old_key.ip),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
-        compatibility: DownloadBatchCompatibility {
-            priority: 3,
-            is_recovery: false,
-            completion_critical: false,
-            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
-            exclude_servers: Vec::new(),
-            avoid_server: None,
-        },
         response_tx,
     });
 
@@ -689,7 +528,7 @@ async fn ip_replacement_trial_starts_when_every_connection_is_busy() {
 }
 
 #[tokio::test]
-async fn dispatch_downloads_leases_hot_job_batch_before_same_band_spillover() {
+async fn dispatch_downloads_fills_the_second_lane_from_the_next_job_once_the_hot_job_is_drained() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -733,11 +572,10 @@ async fn dispatch_downloads_leases_hot_job_batch_before_same_band_spillover() {
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 3);
-    // Both of the hot job's own lanes carry its three articles: a lease is
-    // bounded by one lane's fair share of the job's remainder, so the tail
-    // never lands on a single connection while a second one sits idle.
+    assert_eq!(pipeline.active_downloads, 4);
     assert_eq!(pipeline.active_download_connections, 2);
+    // The hot job's whole queue fits in one handout, so the second lane would
+    // have nothing to do; rather than sit idle it takes the next job.
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
         0
@@ -749,13 +587,12 @@ async fn dispatch_downloads_leases_hot_job_batch_before_same_band_spillover() {
             .unwrap()
             .download_queue
             .len(),
-        1
+        0
     );
     assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
-    assert!(
-        !pipeline
-            .active_downloads_by_job
-            .contains_key(&secondary_job_id)
+    assert_eq!(
+        pipeline.active_downloads_by_job.get(&secondary_job_id),
+        Some(&1)
     );
 }
 
@@ -863,7 +700,7 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
 }
 
 #[tokio::test]
-async fn dispatch_downloads_suppresses_spillover_under_soft_byte_pressure() {
+async fn dispatch_downloads_suppresses_the_spill_under_soft_byte_pressure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -997,7 +834,10 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 
     pipeline.dispatch_downloads();
 
-    // 65 queued articles minus the 16-article cold-start first-wave lease.
+    // 65 queued articles minus the one handout the single lane was given.
+    let pressure = pipeline.refresh_download_pressure();
+    let want =
+        pipeline.download_refill_want(pipeline.download_lane_mode_for_server(0, pressure, true));
     assert_eq!(
         pipeline
             .jobs
@@ -1005,7 +845,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        49
+        65 - want
     );
     assert_eq!(
         pipeline
@@ -1039,7 +879,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .unwrap()
             .download_queue
             .len(),
-        49
+        65 - want
     );
     assert_eq!(
         pipeline
@@ -1507,6 +1347,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Decoded(DecodeResult {
@@ -2577,6 +2418,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 500]))),
@@ -2615,6 +2457,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 1_600]))),
@@ -2661,8 +2504,8 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
         DownloadLaneOwner {
             job_id,
             mode: DownloadLaneMode::Sequential,
-            spillover_loan_kind: None,
             completion_critical: false,
+            server_idx: Some(0),
             connection: false,
             ip_replacement: false,
             outstanding: HashMap::from([(

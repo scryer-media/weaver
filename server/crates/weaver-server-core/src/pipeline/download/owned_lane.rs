@@ -8,8 +8,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
-const HOT_SHARE_YIELD_CHECK_ARTICLES: usize = 4;
-
 /// How long a lane-side probe waits for a worker to pick its request up.
 ///
 /// An idle worker picks up immediately. This only bounds the case where the
@@ -95,7 +93,7 @@ impl IdleOwnedLane {
             .is_some_and(|client| Arc::ptr_eq(&client, &run.nntp))
             && !run
                 .initial_lease
-                .effective_exclude_servers
+                .dial_exclude_servers
                 .contains(&self.server.0)
     }
 }
@@ -337,7 +335,6 @@ struct OwnedLaneRun {
     event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
     refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
     parked_tx: mpsc::Sender<DownloadLaneParked>,
-    hot_share_yield_signal: Arc<HotShareYieldSignal>,
     initial_lease: DownloadBatchLease,
 }
 
@@ -379,7 +376,6 @@ struct CachedOwnedLane {
 /// asked for.
 pub(crate) struct OwnedLaneWarm {
     nntp: Arc<weaver_nntp::NntpClient>,
-    groups: Arc<[String]>,
     exclude_servers: Arc<[usize]>,
     byte_estimate: u64,
 }
@@ -507,6 +503,20 @@ impl OwnedDownloadLanePool {
         }
     }
 
+    /// The servers of the connections idle workers are keeping, one entry
+    /// per idle worker; `None` for a worker idle without a connection.
+    pub(crate) fn idle_lane_servers(&self) -> Vec<Option<usize>> {
+        let shared = lock_pool(&self.shared);
+        shared
+            .workers
+            .iter()
+            .filter_map(|worker| {
+                let idle = worker.idle.as_ref()?;
+                Some(idle.lane.as_ref().map(|lane| lane.server.0))
+            })
+            .collect()
+    }
+
     pub(crate) fn worker_count(&self) -> usize {
         lock_pool(&self.shared).workers.len()
     }
@@ -542,7 +552,6 @@ impl OwnedDownloadLanePool {
         event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
         refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
         parked_tx: mpsc::Sender<DownloadLaneParked>,
-        hot_share_yield_signal: Arc<HotShareYieldSignal>,
         initial_lease: DownloadBatchLease,
     ) -> Result<(), DownloadBatchLease> {
         let run = Box::new(OwnedLaneRun {
@@ -550,7 +559,6 @@ impl OwnedDownloadLanePool {
             event_tx,
             refill_tx,
             parked_tx,
-            hot_share_yield_signal,
             initial_lease,
         });
         let mut shared = lock_pool(&self.shared);
@@ -587,7 +595,6 @@ impl OwnedDownloadLanePool {
     pub(crate) fn warm(
         &self,
         nntp: &Arc<weaver_nntp::NntpClient>,
-        groups: Arc<[String]>,
         exclude_servers: Arc<[usize]>,
         byte_estimate: u64,
         limit: usize,
@@ -600,7 +607,6 @@ impl OwnedDownloadLanePool {
         for sender in senders {
             let warm = Box::new(OwnedLaneWarm {
                 nntp: Arc::clone(nntp),
-                groups: Arc::clone(&groups),
                 exclude_servers: Arc::clone(&exclude_servers),
                 byte_estimate,
             });
@@ -747,7 +753,6 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
     }
     let OwnedLaneWarm {
         nntp,
-        groups,
         mut exclude_servers,
         byte_estimate,
     } = warm;
@@ -756,7 +761,7 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
         .copied()
         .chain((0..nntp.pool().server_count()).filter(|&idx| nntp.pool().requires_recovery(idx)))
         .collect();
-    match nntp.try_warm_blocking_body_lane(&groups, &exclude_servers, byte_estimate) {
+    match nntp.try_warm_blocking_body_lane(&[], &exclude_servers, byte_estimate) {
         Ok(lane) => {
             *cached_lane = Some(CachedOwnedLane { nntp, lane });
         }
@@ -778,7 +783,7 @@ impl CachedOwnedLane {
     /// new sockets into a stall of every lane.
     fn matches(&self, nntp: &Arc<weaver_nntp::NntpClient>, lease: &DownloadBatchLease) -> bool {
         let server = self.lane.server_id();
-        if !Arc::ptr_eq(&self.nntp, nntp) || lease.effective_exclude_servers.contains(&server.0) {
+        if !Arc::ptr_eq(&self.nntp, nntp) || lease.dial_exclude_servers.contains(&server.0) {
             return false;
         }
 
@@ -798,7 +803,7 @@ impl CachedOwnedLane {
         // quota question; when it cannot be taken, the established connection
         // stands rather than being parked and redialled for nothing.
         let Some(selection) = nntp.try_blocking_body_server_selection_with_estimate(
-            &lease.effective_exclude_servers,
+            &lease.dial_exclude_servers,
             estimate,
         ) else {
             return true;
@@ -870,13 +875,11 @@ struct LaneLeaseContext {
     lane_id: u64,
     job_id: JobId,
     runtime_generation: u64,
-    spillover_loan_kind: Option<SpilloverLoanKind>,
     completion_critical: bool,
     exclude_servers: Vec<usize>,
     pressure_clear: bool,
     mode: DownloadLaneMode,
     checkpoint_plan: weaver_yenc::CheckpointPlan,
-    compatibility: DownloadBatchCompatibility,
 }
 
 impl LaneLeaseContext {
@@ -889,9 +892,8 @@ impl LaneLeaseContext {
             lane_id: lease.lane_id,
             job_id: lease.job_id,
             runtime_generation: lease.runtime_generation,
-            spillover_loan_kind: lease.spillover_loan_kind,
-            completion_critical: lease.compatibility.completion_critical,
-            exclude_servers: lease.compatibility.exclude_servers.clone(),
+            completion_critical: lease.completion_critical,
+            exclude_servers: lease.effective_exclude_servers.clone(),
             pressure_clear: lease.pressure_clear,
             mode: Pipeline::actual_download_lane_mode(
                 lease.lane_mode,
@@ -900,7 +902,6 @@ impl LaneLeaseContext {
                 supports_pipelining,
             ),
             checkpoint_plan: lease.checkpoint_plan.clone(),
-            compatibility: lease.compatibility.clone(),
         }
     }
 
@@ -921,8 +922,6 @@ enum LaneStop {
     PolicyBlocked,
     RecoveryYield,
     Quarantined,
-    /// The hot job asked for this connection back.
-    HotShareYield,
     /// The result or refill channel is gone; the orchestrator is shutting down.
     Error,
 }
@@ -935,10 +934,6 @@ fn lane_stop_park(stop: Option<LaneStop>) -> Option<(LaneParkReason, bool)> {
         LaneStop::PolicyBlocked => (
             LaneParkReason::ServerQuota,
             keep_cached_lane_after_park(LaneParkReason::ServerQuota),
-        ),
-        LaneStop::HotShareYield => (
-            LaneParkReason::HotShareYield,
-            keep_cached_lane_after_park(LaneParkReason::HotShareYield),
         ),
     })
 }
@@ -1032,7 +1027,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         event_tx,
         refill_tx,
         parked_tx,
-        hot_share_yield_signal,
         initial_lease,
     } = run;
     let lease = initial_lease;
@@ -1053,7 +1047,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     // rather than redialled; only a socket that cannot be re-pointed is let
     // go, and the dial below then replaces it.
     if let Some(cached) = cached_lane.as_mut()
-        && let Err(error) = cached.adopt_groups(&lease.compatibility.groups)
+        && let Err(error) = cached.adopt_groups(&[])
     {
         debug!(
             server = cached.lane.server_id().0,
@@ -1073,8 +1067,8 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         );
         match acquire_owned_lane_through_contention(
             &nntp,
-            &lease.compatibility.groups,
-            &lease.effective_exclude_servers,
+            &[],
+            &lease.dial_exclude_servers,
             initial_estimate,
         ) {
             Ok(lane) => {
@@ -1146,7 +1140,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     let mut refill_denied = false;
     let mut stop: Option<LaneStop> = None;
     let mut stats_mark = lane.stats();
-    let mut completed_since_yield_check = 0usize;
 
     let (park_reason, keep_cached_lane) = loop {
         // Adopt an answered refill without waiting for it. Taking it here is
@@ -1229,6 +1222,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 work,
                 work_context.runtime_generation,
                 work_context.lane_id,
+                work_context.job_id,
                 *trace,
                 DownloadLaneObservation {
                     server_idx: Some(server_idx),
@@ -1264,14 +1258,11 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             if refill_tx
                 .blocking_send(DownloadLaneRefillRequest {
                     lane_id: context.lane_id,
-                    job_id: context.job_id,
                     runtime_generation: context.runtime_generation,
                     server_idx,
                     remote_ip: lane.remote_ip(),
                     supports_pipelining,
                     current_mode: booked_mode,
-                    spillover_loan_kind: context.spillover_loan_kind,
-                    compatibility: context.compatibility.clone(),
                     response_tx,
                 })
                 .is_ok()
@@ -1308,14 +1299,11 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 if refill_tx
                     .blocking_send(DownloadLaneRefillRequest {
                         lane_id: context.lane_id,
-                        job_id: context.job_id,
                         runtime_generation: context.runtime_generation,
                         server_idx,
                         remote_ip: lane.remote_ip(),
                         supports_pipelining,
                         current_mode: booked_mode,
-                        spillover_loan_kind: context.spillover_loan_kind,
-                        compatibility: context.compatibility.clone(),
                         response_tx: retry_tx,
                     })
                     .is_err()
@@ -1372,11 +1360,11 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         };
         nntp.record_blocking_attempts(&trace.attempts);
         let (payload_bytes, policy_elapsed) = Pipeline::decoded_trace_throughput_sample(&trace);
-        let completion_critical = work_context.completion_critical;
         let result = result_from_trace(
             work,
             work_context.runtime_generation,
             work_context.lane_id,
+            work_context.job_id,
             trace,
             DownloadLaneObservation {
                 server_idx: Some(server_idx),
@@ -1421,6 +1409,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     work,
                     work_context.runtime_generation,
                     work_context.lane_id,
+                    work_context.job_id,
                     server_idx,
                     work_context.mode,
                     supports_pipelining,
@@ -1435,16 +1424,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     stop = Some(LaneStop::Error);
                     break;
                 }
-            }
-        }
-
-        completed_since_yield_check = completed_since_yield_check.saturating_add(1);
-        if completed_since_yield_check >= HOT_SHARE_YIELD_CHECK_ARTICLES {
-            completed_since_yield_check = 0;
-            // Completion-critical work never yields here — it is what the
-            // signal exists to make room for.
-            if !completion_critical && hot_share_yield_signal.is_requested() {
-                stop.get_or_insert(LaneStop::HotShareYield);
             }
         }
     };
@@ -1484,7 +1463,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         lane_id: park_context.lane_id,
         job_id: park_context.job_id,
         mode: booked_mode,
-        spillover_loan_kind: park_context.spillover_loan_kind,
         completion_critical: park_context.completion_critical,
         reason: park_reason,
         release_connection_slot: true,
@@ -1537,10 +1515,6 @@ fn keep_cached_lane_after_park(reason: LaneParkReason) -> bool {
         LaneParkReason::NoWork
             | LaneParkReason::Pressure
             | LaneParkReason::ProbeYield
-            | LaneParkReason::HotReclaim
-            | LaneParkReason::HotShareYield
-            | LaneParkReason::SpilloverWithdraw
-            | LaneParkReason::SpilloverSpeedHarm
             | LaneParkReason::ServerQuota
     )
 }
@@ -1604,6 +1578,7 @@ fn result_from_trace(
     work: DownloadWork,
     runtime_generation: u64,
     lane_id: u64,
+    job_id: JobId,
     trace: weaver_nntp::client::DecodedBodyTrace,
     mut observation: DownloadLaneObservation,
     exclude_servers: &[usize],
@@ -1626,6 +1601,7 @@ fn result_from_trace(
     }
     DownloadResult {
         lane_id,
+        job_id,
         segment_id,
         runtime_generation,
         data,
@@ -1644,6 +1620,7 @@ fn unresolved_result(
     work: DownloadWork,
     runtime_generation: u64,
     lane_id: u64,
+    job_id: JobId,
     server_idx: usize,
     mode: DownloadLaneMode,
     supports_pipelining: bool,
@@ -1658,6 +1635,7 @@ fn unresolved_result(
     let completion_critical = work.completion_critical;
     DownloadResult {
         lane_id,
+        job_id,
         segment_id: work.segment_id,
         runtime_generation,
         data: Err(DownloadError::Fetch(DownloadFailure::new(
@@ -1724,17 +1702,10 @@ fn test_lease(
         job_id,
         runtime_generation,
         lane_mode: DownloadLaneMode::Pipelined { depth: 4 },
-        spillover_loan_kind: None,
         server_modes: vec![(0, DownloadLaneMode::Pipelined { depth: 4 })],
-        compatibility: DownloadBatchCompatibility {
-            priority: 10,
-            is_recovery: false,
-            completion_critical: false,
-            groups: Arc::from(vec!["alt.binaries.test".to_string()]),
-            exclude_servers,
-            avoid_server: None,
-        },
-        effective_exclude_servers: Vec::new(),
+        completion_critical: false,
+        effective_exclude_servers: exclude_servers.clone(),
+        dial_exclude_servers: exclude_servers,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works,
@@ -1872,6 +1843,7 @@ mod tests {
             tail_work(1, 0),
             old.runtime_generation,
             0,
+            JobId(42),
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: Vec::new(),
                 result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
@@ -1908,6 +1880,7 @@ mod tests {
                     tail_work(segment_number, 0),
                     9,
                     0,
+                    JobId(42),
                     0,
                     DownloadLaneMode::Sequential,
                     false,
@@ -1987,32 +1960,6 @@ mod tests {
     }
 
     #[test]
-    fn owned_hot_lane_yield_keeps_the_socket_and_its_retry_counts() {
-        // A yield hands back the *scheduling* of this connection, not the
-        // connection. The socket stays cached and the worker sits idle
-        // holding it, which is precisely the state the completion-critical
-        // lease that asked for the yield wants to be routed to; dropping it
-        // made that lease pay a fresh handshake for a connection it had just
-        // been given. The works that were never issued go back to the queue
-        // untouched, which is what keeps a yield from spending a retry.
-        let (reason, keep_cached_lane) =
-            lane_stop_park(Some(LaneStop::HotShareYield)).expect("a stop always parks");
-
-        assert_eq!(reason, LaneParkReason::HotShareYield);
-        assert!(keep_cached_lane);
-
-        let pending = VecDeque::from([(tail_work(2, 4), ()), (tail_work(3, 7), ())]);
-        let returned = pending
-            .into_iter()
-            .map(|(work, ())| work)
-            .collect::<Vec<_>>();
-        assert_eq!(returned[0].segment_id.segment_number, 2);
-        assert_eq!(returned[0].retry_count, 4);
-        assert_eq!(returned[1].segment_id.segment_number, 3);
-        assert_eq!(returned[1].retry_count, 7);
-    }
-
-    #[test]
     fn owned_quota_park_keeps_the_cached_lane() {
         // A quota refusal never reaches the wire, so the socket is clean and
         // the lane is worth keeping for the next fill.
@@ -2070,6 +2017,7 @@ mod tests {
             tail_work(9, 0),
             0,
             0,
+            JobId(42),
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: vec![weaver_nntp::client::FetchAttemptTrace {
                     connection_health: None,
@@ -2178,6 +2126,7 @@ mod tests {
             tail_work(6, 0),
             0,
             0,
+            JobId(42),
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: Vec::new(),
                 result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
@@ -2294,13 +2243,12 @@ mod routing_tests {
         let (parked_tx, _parked_rx) = mpsc::channel(4);
         // The receivers are dropped with the run; routing never sends on them.
         let mut lease = test_lease(JobId(7), 1, Vec::new(), vec![tail_work(1, 0)]);
-        lease.effective_exclude_servers = exclude_servers;
+        lease.dial_exclude_servers = exclude_servers;
         Box::new(OwnedLaneRun {
             nntp: Arc::clone(nntp),
             event_tx,
             refill_tx,
             parked_tx,
-            hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             initial_lease: lease,
         })
     }
@@ -2404,8 +2352,7 @@ mod routing_tests {
     #[test]
     fn a_connection_opened_for_other_newsgroups_still_serves() {
         let nntp = test_client();
-        let mut run = test_run(&nntp, Vec::new());
-        run.initial_lease.compatibility.groups = Arc::from(vec!["alt.binaries.other".to_string()]);
+        let run = test_run(&nntp, Vec::new());
 
         assert!(idle_lane(&nntp, 0).serves(&run));
         let mut shared = shared_with(vec![idle_with(None), idle_with(Some(idle_lane(&nntp, 0)))]);

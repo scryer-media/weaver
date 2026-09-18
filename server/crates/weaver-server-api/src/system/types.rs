@@ -142,30 +142,6 @@ pub struct Metrics {
     pub download_pressure_stalls_total: u64,
     pub download_pressure_stall_duration_ms: u64,
     pub download_pressure_current_stall_ms: u64,
-    pub hot_dispatch_job_id: u64,
-    pub hot_dispatch_mode: String,
-    pub hot_dispatch_underfill_ms: u64,
-    pub hot_dispatch_lent_connections: u32,
-    pub hot_dispatch_last_spillover_decision: String,
-    pub hot_dispatch_spillover_blocked_pressure_total: u64,
-    pub hot_dispatch_spillover_blocked_near_cap_total: u64,
-    pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: u64,
-    pub hot_dispatch_spillover_blocked_best_mode_pending_total: u64,
-    pub hot_dispatch_spillover_blocked_cap_speed_total: u64,
-    pub hot_dispatch_spillover_allowed_underfill_total: u64,
-    pub hot_dispatch_spillover_allowed_measured_underfill_total: u64,
-    pub hot_dispatch_spillover_reclaimed_total: u64,
-    pub hot_dispatch_hot_speed_bps: u64,
-    pub hot_dispatch_exclusive_peak_bps: u64,
-    pub hot_dispatch_spillover_pre_speed_bps: u64,
-    pub hot_dispatch_spillover_post_speed_bps: u64,
-    pub hot_dispatch_spillover_active_loans: u32,
-    pub hot_dispatch_spillover_reclaimed_speed_harm_total: u64,
-    pub hot_dispatch_recent_expansion_improvement_pct: u64,
-    pub hot_dispatch_best_mode_block_reason: u32,
-    pub hot_dispatch_last_expansion_kind: u32,
-    pub hot_dispatch_last_expansion_before_bps: u64,
-    pub hot_dispatch_last_expansion_after_bps: u64,
     pub download_lanes_active: u32,
     pub download_lanes_sequential_active: u32,
     pub download_lanes_depth2_active: u32,
@@ -181,7 +157,6 @@ pub struct Metrics {
     pub download_lanes_parking_active: u32,
     pub download_lanes_recovering_active: u32,
     pub download_lane_parks_no_work_total: u64,
-    pub download_lane_parks_spillover_speed_harm_total: u64,
     pub download_lane_parks_ip_replacement_retired_total: u64,
     pub download_lane_parks_error_total: u64,
     pub download_lane_lease_items_total: u64,
@@ -294,42 +269,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_pressure_stalls_total: m.download_pressure_stalls_total,
             download_pressure_stall_duration_ms: m.download_pressure_stall_duration_ms,
             download_pressure_current_stall_ms: m.download_pressure_current_stall_ms,
-            hot_dispatch_job_id: m.hot_dispatch_job_id,
-            hot_dispatch_mode: m.hot_dispatch_mode.as_str().to_string(),
-            hot_dispatch_underfill_ms: m.hot_dispatch_underfill_ms,
-            hot_dispatch_lent_connections: m.hot_dispatch_lent_connections as u32,
-            hot_dispatch_last_spillover_decision: m
-                .hot_dispatch_last_spillover_decision
-                .as_str()
-                .to_string(),
-            hot_dispatch_spillover_blocked_pressure_total: m
-                .hot_dispatch_spillover_blocked_pressure_total,
-            hot_dispatch_spillover_blocked_near_cap_total: m
-                .hot_dispatch_spillover_blocked_near_cap_total,
-            hot_dispatch_spillover_blocked_hot_can_use_capacity_total: m
-                .hot_dispatch_spillover_blocked_hot_can_use_capacity_total,
-            hot_dispatch_spillover_blocked_best_mode_pending_total: m
-                .hot_dispatch_spillover_blocked_best_mode_pending_total,
-            hot_dispatch_spillover_blocked_cap_speed_total: m
-                .hot_dispatch_spillover_blocked_cap_speed_total,
-            hot_dispatch_spillover_allowed_underfill_total: m
-                .hot_dispatch_spillover_allowed_underfill_total,
-            hot_dispatch_spillover_allowed_measured_underfill_total: m
-                .hot_dispatch_spillover_allowed_measured_underfill_total,
-            hot_dispatch_spillover_reclaimed_total: m.hot_dispatch_spillover_reclaimed_total,
-            hot_dispatch_hot_speed_bps: m.hot_dispatch_hot_speed_bps,
-            hot_dispatch_exclusive_peak_bps: m.hot_dispatch_exclusive_peak_bps,
-            hot_dispatch_spillover_pre_speed_bps: m.hot_dispatch_spillover_pre_speed_bps,
-            hot_dispatch_spillover_post_speed_bps: m.hot_dispatch_spillover_post_speed_bps,
-            hot_dispatch_spillover_active_loans: m.hot_dispatch_spillover_active_loans as u32,
-            hot_dispatch_spillover_reclaimed_speed_harm_total: m
-                .hot_dispatch_spillover_reclaimed_speed_harm_total,
-            hot_dispatch_recent_expansion_improvement_pct: m
-                .hot_dispatch_recent_expansion_improvement_pct,
-            hot_dispatch_best_mode_block_reason: m.hot_dispatch_best_mode_block_reason as u32,
-            hot_dispatch_last_expansion_kind: m.hot_dispatch_last_expansion_kind as u32,
-            hot_dispatch_last_expansion_before_bps: m.hot_dispatch_last_expansion_before_bps,
-            hot_dispatch_last_expansion_after_bps: m.hot_dispatch_last_expansion_after_bps,
             download_lanes_active: m.download_lanes_active as u32,
             download_lanes_sequential_active: m.download_lanes_sequential_active as u32,
             download_lanes_depth2_active: m.download_lanes_depth2_active as u32,
@@ -346,8 +285,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_lanes_parking_active: m.download_lanes_parking_active as u32,
             download_lanes_recovering_active: m.download_lanes_recovering_active as u32,
             download_lane_parks_no_work_total: m.download_lane_parks_no_work_total,
-            download_lane_parks_spillover_speed_harm_total: m
-                .download_lane_parks_spillover_speed_harm_total,
             download_lane_parks_ip_replacement_retired_total: m
                 .download_lane_parks_ip_replacement_retired_total,
             download_lane_parks_error_total: m.download_lane_parks_error_total,

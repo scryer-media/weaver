@@ -27,11 +27,7 @@ async fn check_blocked_header_probe(earlier_confirmed_retry: bool) {
     pipeline
         .rate_limit_reservations
         .insert(header.segment_id, header.byte_estimate as u64);
-    loop {
-        let pressure = pipeline.refresh_download_pressure();
-        let Some(lease) = pipeline.try_lease_initial_download_batch_for_test(JOB, pressure) else {
-            break;
-        };
+    while let Some(lease) = pipeline.lease_for_server_for_test(0) {
         for work in lease.works {
             let id = work.segment_id;
             submit_volume_article(
@@ -46,11 +42,7 @@ async fn check_blocked_header_probe(earlier_confirmed_retry: bool) {
     }
     pipeline.rate_limit_reservations.remove(&header.segment_id);
     pipeline.note_retry_scheduled(header.segment_id);
-    loop {
-        let pressure = pipeline.refresh_download_pressure();
-        let Some(lease) = pipeline.try_lease_initial_download_batch_for_test(JOB, pressure) else {
-            break;
-        };
+    while let Some(lease) = pipeline.lease_for_server_for_test(0) {
         for work in lease.works {
             let id = work.segment_id;
             submit_volume_article(
@@ -89,8 +81,7 @@ async fn check_blocked_header_probe(earlier_confirmed_retry: bool) {
         // missing header behind this parked retry instead.
         pipeline.note_retry_scheduled(segment(64, 1));
     }
-    let pressure = pipeline.refresh_download_pressure();
-    let probe = pipeline.try_lease_initial_download_batch_for_test(JOB, pressure);
+    let probe = pipeline.lease_for_server_for_test(0);
     assert!(
         probe.is_some(),
         "queued delayed header must remain admissible behind a blocked critical head"
@@ -141,7 +132,6 @@ async fn prepared(temp: &TempDir, volumes: &[(String, Vec<u8>)]) -> Pipeline {
         take_queued_segment(&mut pipeline, JOB, segment(file, article));
         submit_volume_article(&mut pipeline, JOB, volumes, file, article).await;
     }
-    pipeline.hot_dispatch_job = Some(JOB);
     pipeline
 }
 
@@ -163,9 +153,11 @@ async fn delayed_header_admission_prevents_valid_archive_demotion_and_reopens() 
         .insert(header.segment_id, header.byte_estimate as u64);
     let mut later = 0;
     loop {
-        let pressure = pipeline.refresh_download_pressure();
-        assert_eq!(pressure.state, DownloadPressureState::Clear);
-        let Some(lease) = pipeline.try_lease_initial_download_batch_for_test(JOB, pressure) else {
+        assert_eq!(
+            pipeline.refresh_download_pressure().state,
+            DownloadPressureState::Clear
+        );
+        let Some(lease) = pipeline.lease_for_server_for_test(0) else {
             break;
         };
         let set = pipeline.direct_store.set(JOB, 0).unwrap();
@@ -200,29 +192,13 @@ async fn delayed_header_admission_prevents_valid_archive_demotion_and_reopens() 
     assert!(!pipeline.job_has_dispatchable_work_for_test(JOB));
     assert!(!pipeline.direct_store.set(JOB, 0).unwrap().is_demoted());
 
-    // Existing sockets and IP replacement trials cannot bypass this cap,
-    // including the refill fallback which changes compatibility class.
-    let next = pipeline
-        .jobs
-        .get(&JOB)
-        .unwrap()
-        .download_queue
-        .peek_next_matching(|_| true)
-        .unwrap();
-    let mut compatibility = DownloadBatchCompatibility::from_work(next);
-    compatibility.completion_critical = !compatibility.completion_critical;
-    let pressure = pipeline.refresh_download_pressure();
-    assert!(
-        pipeline
-            .try_lease_refill_download_batch_for_test(JOB, compatibility, pressure)
-            .is_none()
-    );
-    assert!(
-        pipeline
-            .try_lease_ip_replacement_trial_batch_for_test(JOB, 0)
-            .is_none()
-    );
+    // The cap holds against the queue itself, not against one caller: the
+    // scheduler has nothing left for this server while the set is full.
+    assert!(pipeline.lease_for_server_for_test(0).is_none());
 
+    // A blocked set must not idle the link. The set's job is still first in
+    // dispatch order, so the only way the next job can be served is the spill
+    // walk stepping past it.
     let other = JobId(48003);
     insert_active_job(
         &mut pipeline,
@@ -231,12 +207,19 @@ async fn delayed_header_admission_prevents_valid_archive_demotion_and_reopens() 
     )
     .await;
     assert!(pipeline.job_has_dispatchable_work_for_test(other));
-    assert!(
-        pipeline
-            .try_lease_initial_download_batch_for_test(other, pressure)
-            .is_some(),
-        "a blocked set must leave unrelated jobs leasable"
+    assert_eq!(
+        pipeline.current_hot_job(),
+        Some(JOB),
+        "the blocked set's job is still the hot one"
     );
+    let spill = pipeline
+        .lease_for_server_for_test(0)
+        .expect("a blocked set must leave unrelated jobs leasable");
+    assert_eq!(spill.job_id, other);
+    // The peer job has served its purpose; the rest of this test is about the
+    // set's own queue, which the hot-job rule would otherwise let it share.
+    pipeline.jobs.remove(&other);
+    pipeline.job_order.retain(|job_id| *job_id != other);
 
     // Model a retry returning the delayed header to the queue. With all prior
     // arrivals drained, the probe must get through as a single article.
@@ -247,9 +230,7 @@ async fn delayed_header_admission_prevents_valid_archive_demotion_and_reopens() 
         .unwrap()
         .download_queue
         .push(header);
-    let probe = pipeline
-        .try_lease_initial_download_batch_for_test(JOB, pressure)
-        .unwrap();
+    let probe = pipeline.lease_for_server_for_test(0).unwrap();
     assert_eq!(probe.works.len(), 1);
     assert_eq!(probe.works[0].segment_id, segment(65, 0));
     submit_volume_article(&mut pipeline, JOB, &volumes, 65, 0).await;
@@ -264,9 +245,8 @@ async fn delayed_header_admission_prevents_valid_archive_demotion_and_reopens() 
     );
 
     while !pipeline.jobs.get(&JOB).unwrap().download_queue.is_empty() {
-        let pressure = pipeline.refresh_download_pressure();
         let lease = pipeline
-            .try_lease_initial_download_batch_for_test(JOB, pressure)
+            .lease_for_server_for_test(0)
             .expect("routing the header must reopen ordinary work");
         for work in lease.works {
             let id = work.segment_id;
@@ -329,12 +309,7 @@ async fn delayed_header_admission_counts_each_arrival_stage() {
             !pipeline.job_has_dispatchable_work_for_test(JOB),
             "stage {stage} must retain its reservation"
         );
-        let pressure = pipeline.refresh_download_pressure();
-        assert!(
-            pipeline
-                .try_lease_initial_download_batch_for_test(JOB, pressure)
-                .is_none()
-        );
+        assert!(pipeline.lease_for_server_for_test(0).is_none());
         pipeline.rate_limit_reservations.clear();
         pipeline.pending_decode.clear();
         pipeline.active_decode_bytes.clear();
@@ -376,7 +351,7 @@ async fn delayed_header_uncontrolled_arrivals_still_reproduce_scratch_demotion()
 }
 
 #[tokio::test]
-async fn delayed_header_admission_lends_connections_but_obeys_global_hard_pressure() {
+async fn delayed_header_admission_spills_to_a_peer_job_but_obeys_global_hard_pressure() {
     let temp = tempfile::tempdir().unwrap();
     let (_, volumes) = fixture();
     let mut pipeline = prepared(&temp, &volumes).await;
@@ -404,9 +379,6 @@ async fn delayed_header_admission_lends_connections_but_obeys_global_hard_pressu
         segmented_job_spec("Peer", "peer.bin", &[100; 64]),
     )
     .await;
-    let now = Instant::now();
-    pipeline.hot_dispatch_started_at = Some(now - Duration::from_secs(5));
-    pipeline.hot_dispatch_underfill_since = Some(now - Duration::from_secs(2));
 
     pipeline
         .metrics
@@ -427,7 +399,6 @@ async fn delayed_header_admission_lends_connections_but_obeys_global_hard_pressu
         .metrics
         .write_buffered_bytes
         .store(0, Ordering::Relaxed);
-    pipeline.hot_dispatch_underfill_since = Some(now - Duration::from_secs(2));
     pipeline.dispatch_downloads();
     assert_eq!(
         pipeline.active_download_connections_by_job.get(&JOB),
@@ -440,6 +411,6 @@ async fn delayed_header_admission_lends_connections_but_obeys_global_hard_pressu
             .copied()
             .unwrap_or(0)
             > 0,
-        "the actual dispatcher must lend free connections past a capped hot queue"
+        "the dispatcher must walk past a capped hot queue rather than idle the link"
     );
 }

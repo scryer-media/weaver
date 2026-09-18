@@ -2543,6 +2543,14 @@ impl NntpClient {
     /// sends the work to the asynchronous lanes, which then queue for the very
     /// connection permits the idle owned lanes are holding and wait out the
     /// whole acquire deadline for it.
+    /// The servers a new owned lane would try, in the order the pool ranks
+    /// them right now. A question, not a dispatch: it reserves nothing and
+    /// clears no quota latch. `None` while the health state is contended.
+    pub fn blocking_body_server_order(&self, exclude: &[usize]) -> Option<Vec<ServerId>> {
+        self.try_blocking_body_server_selection(exclude, 0, QuotaCheck::ReadOnly)
+            .map(|selection| selection.eligible)
+    }
+
     pub fn blocking_body_lane_candidacy(&self, exclude: &[usize]) -> BlockingBodyLaneCandidacy {
         // A question, not a dispatch: it asks for no bytes, so every server
         // with any headroom "fits", and letting that fit clear a server's
