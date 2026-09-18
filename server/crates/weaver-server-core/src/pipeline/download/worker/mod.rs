@@ -180,31 +180,56 @@ impl Pipeline {
     ///
     /// The server comes first because the scheduler's answer is per server:
     /// the hot job may have nothing left that server A may fetch while server
-    /// B could still carry it. Connections idle workers are already holding
-    /// are tried before a fresh dial, in the pool's own ranking after that.
-    fn dispatch_one_download_lane(&mut self, pressure: DownloadPressure) -> DispatchAttempt {
-        let mut servers: Vec<usize> = Vec::new();
+    /// B could still carry it. Servers are tried in the pool's own ranking,
+    /// those where an idle worker already holds a connection ahead of the
+    /// rest, and a server is only asked while it can still seat the lease:
+    /// an idle connection or a free permit beyond what this pass has already
+    /// sent it. Without that, a pass that opens several lanes would send two
+    /// dials at a server with one free permit, and the second would sit in
+    /// the pool's contention loop instead of fetching.
+    fn dispatch_one_download_lane(
+        &mut self,
+        pressure: DownloadPressure,
+        sent_this_pass: &mut HashMap<usize, usize>,
+    ) -> DispatchAttempt {
+        let mut idle_by_server: HashMap<usize, usize> = HashMap::new();
         for server in self
             .owned_download_lane_pool
             .idle_lane_servers()
             .into_iter()
             .flatten()
         {
-            if !servers.contains(&server) {
-                servers.push(server);
-            }
+            *idle_by_server.entry(server).or_default() += 1;
         }
-        if let Some(order) = self.nntp.blocking_body_server_order(&[]) {
-            for server in order {
-                // A cached connection already holds its permit; a dial needs
-                // one free, or the worker would sit in the pool's contention
-                // loop instead of fetching.
-                let (available, _) = self.nntp.pool().server_load(server.0);
-                if available > 0 && !servers.contains(&server.0) {
-                    servers.push(server.0);
+        let backfill_flags = self.nntp.pool().server_backfill_flags();
+        let mut servers: Vec<usize> = match self.nntp.blocking_body_server_order(&[]) {
+            Some(order) => order.into_iter().map(|server| server.0).collect(),
+            // The ranking is contended right now; the idle connections are
+            // still worth a lease, and the next pass ranks again.
+            None => idle_by_server.keys().copied().collect(),
+        };
+        servers.sort_by_key(|server| !idle_by_server.contains_key(server));
+        // The backfill tier comes last, and only for what the fill tier has
+        // given up on: the scheduler's filter holds a backfill server to
+        // articles every available fill server is excluded from.
+        if !servers.iter().any(|server| backfill_flags[*server]) {
+            let fill: Vec<usize> = (0..backfill_flags.len())
+                .filter(|idx| !backfill_flags[*idx])
+                .collect();
+            if let Some(order) = self.nntp.blocking_body_server_order(&fill) {
+                for server in order {
+                    if backfill_flags[server.0] && !servers.contains(&server.0) {
+                        servers.push(server.0);
+                    }
                 }
             }
         }
+        servers.retain(|server| {
+            let idle = idle_by_server.get(server).copied().unwrap_or(0);
+            let (available, _) = self.nntp.pool().server_load(*server);
+            let sent = sent_this_pass.get(server).copied().unwrap_or(0);
+            idle + available > sent
+        });
         for server_idx in servers {
             let spill_in_flight = self.spill_job_in_flight_on(server_idx);
             let lane_mode = self.download_lane_mode_for_server(server_idx, pressure, true);
@@ -227,6 +252,7 @@ impl Pipeline {
                 owner.server_idx = Some(server_idx);
             }
             self.spawn_download_batch(lease);
+            *sent_this_pass.entry(server_idx).or_default() += 1;
             self.warm_idle_download_lanes_for_barrier(job_id);
             return DispatchAttempt::Dispatched;
         }
@@ -543,11 +569,12 @@ impl Pipeline {
             return;
         };
         let active_connections_before_dispatch = self.active_download_connections;
+        let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
         while self.active_download_connections < max
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
         {
-            match self.dispatch_one_download_lane(pressure) {
+            match self.dispatch_one_download_lane(pressure, &mut sent_this_pass) {
                 DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => return,

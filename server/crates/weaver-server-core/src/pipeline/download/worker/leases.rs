@@ -8,6 +8,13 @@ use super::*;
 /// are written down.
 pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     server_idx: usize,
+    /// Set when `server_idx` is a backfill server: the fill servers that are
+    /// available right now. A backfill server only takes an article every one
+    /// of those cannot fetch — by the job's retention, the article's own
+    /// exclusions, or its rotation hint — which is what keeps backfill traffic
+    /// to what the fill tier has already given up on.
+    fill_servers: Option<Vec<usize>>,
+    retention_excludes: Arc<Vec<usize>>,
     bootstrap_files: Option<&'a [u32]>,
     uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
     leased: &'a [DownloadWork],
@@ -30,6 +37,13 @@ impl ServableWorkFilter<'_> {
                 .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
             && !work.exclude_servers.contains(&self.server_idx)
             && work.avoid_server != Some(self.server_idx)
+            && self.fill_servers.as_deref().is_none_or(|fill| {
+                fill.iter().all(|server| {
+                    self.retention_excludes.contains(server)
+                        || work.exclude_servers.contains(server)
+                        || work.avoid_server == Some(*server)
+                })
+            })
             && self
                 .bootstrap_files
                 .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
@@ -215,11 +229,14 @@ impl Pipeline {
         uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
         leased: &'a [DownloadWork],
     ) -> Option<ServableWorkFilter<'a>> {
-        if self.job_retention_excludes(job_id).contains(&server_idx) {
+        let retention_excludes = self.job_retention_excludes(job_id);
+        if retention_excludes.contains(&server_idx) {
             return None;
         }
         Some(ServableWorkFilter {
             server_idx,
+            fill_servers: self.backfill_fill_gate(server_idx),
+            retention_excludes,
             bootstrap_files,
             uu_cursor_ordinals,
             leased,
@@ -228,6 +245,29 @@ impl Pipeline {
             checkpoint: self.checkpoint_admission(job_id),
             checkpoint_blocked: std::cell::Cell::new(false),
         })
+    }
+
+    /// The fill servers a backfill server must see exhausted before it takes
+    /// an article; `None` for a fill server, and for a backfill server once
+    /// the pool has already unlocked the backfill tier for everyone.
+    fn backfill_fill_gate(&self, server_idx: usize) -> Option<Vec<usize>> {
+        let flags = self.nntp.pool().server_backfill_flags();
+        if !flags.get(server_idx).copied().unwrap_or(false) {
+            return None;
+        }
+        match self.nntp.blocking_body_server_order(&[]) {
+            Some(order) => {
+                if order.iter().any(|server| flags[server.0]) {
+                    // The fill tier is exhausted or auth-disabled for the
+                    // whole pool; backfill serves everything.
+                    return None;
+                }
+                Some(order.into_iter().map(|server| server.0).collect())
+            }
+            // The ranking is contended: gate on every fill server, which is
+            // the strict answer and costs at most one pass.
+            None => Some((0..flags.len()).filter(|idx| !flags[*idx]).collect()),
+        }
     }
 
     /// The UU spool cursors a selection pass must respect, sampled once.
