@@ -137,7 +137,6 @@ impl Pipeline {
                         self.hot_best_mode_block_reason(hot_job_id, effective_capacity);
                     let can_keep_lent_lane = requested_priority.is_some_and(|request_priority| {
                         spillover_loan_kind == Some(SpilloverLoanKind::MeasuredUnderfill)
-                            && self.hot_dispatch_mode == DispatchShareMode::Shared
                             && request_priority >= hot_priority
                             && best_mode_block_reason == HotBestModeBlockReason::None
                             && !self.hot_spillover_reclaim_pending_for(job_id)
@@ -147,30 +146,18 @@ impl Pipeline {
                     {
                         allow_refill = false;
                         park_reason = LaneParkReason::SpilloverSpeedHarm;
-                        self.block_or_reclaim_spillover(SpilloverDecision::ReclaimedSpeedHarm);
                     } else if can_keep_lent_lane {
                         self.hot_dispatch_last_lend_at = Some(now);
                     } else {
                         allow_refill = false;
-                        if best_mode_block_reason == HotBestModeBlockReason::HotHasQueuedPrimary {
-                            self.set_hot_best_mode_block_reason(best_mode_block_reason);
-                            self.block_or_reclaim_spillover(
-                                SpilloverDecision::BlockedHotCanUseCapacity,
-                            );
-                            park_reason = LaneParkReason::SpilloverWithdraw;
-                        } else if best_mode_block_reason
-                            == HotBestModeBlockReason::LaneCapacityAvailable
+                        if best_mode_block_reason == HotBestModeBlockReason::HotHasQueuedPrimary
+                            || best_mode_block_reason
+                                == HotBestModeBlockReason::LaneCapacityAvailable
                         {
-                            self.set_hot_best_mode_block_reason(best_mode_block_reason);
-                            self.block_or_reclaim_spillover(
-                                SpilloverDecision::BlockedBestModePending,
-                            );
                             park_reason = LaneParkReason::SpilloverWithdraw;
                         } else if requested_priority.is_none() {
-                            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
                             park_reason = LaneParkReason::NoWork;
                         } else {
-                            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
                             park_reason = LaneParkReason::HotReclaim;
                         }
                     }
@@ -250,7 +237,7 @@ impl Pipeline {
                 park_reason,
             });
             self.update_queue_metrics();
-            self.publish_hot_dispatch_metrics(now);
+            self.refresh_hot_dispatch_loans(now);
             return;
         };
 
@@ -306,6 +293,6 @@ impl Pipeline {
             }
         }
         self.update_queue_metrics();
-        self.publish_hot_dispatch_metrics(now);
+        self.refresh_hot_dispatch_loans(now);
     }
 }

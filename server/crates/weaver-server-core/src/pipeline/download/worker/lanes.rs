@@ -72,22 +72,6 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_probe_yield_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::HotReclaim => self
-                .metrics
-                .download_lane_parks_hot_reclaim_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::HotShareYield => self
-                .metrics
-                .download_lane_parks_hot_share_yield_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::SpilloverWithdraw => self
-                .metrics
-                .download_lane_parks_spillover_withdraw_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::SpilloverSpeedHarm => self
-                .metrics
-                .download_lane_parks_spillover_speed_harm_total
-                .fetch_add(1, Ordering::Relaxed),
             LaneParkReason::IpReplacementRetired => self
                 .metrics
                 .download_lane_parks_ip_replacement_retired_total
@@ -96,7 +80,12 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_proof_failure_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::Capacity | LaneParkReason::ServerQuota => 0,
+            LaneParkReason::HotReclaim
+            | LaneParkReason::HotShareYield
+            | LaneParkReason::SpilloverWithdraw
+            | LaneParkReason::SpilloverSpeedHarm
+            | LaneParkReason::Capacity
+            | LaneParkReason::ServerQuota => 0,
             LaneParkReason::Error => self
                 .metrics
                 .download_lane_parks_error_total
@@ -780,16 +769,6 @@ impl Pipeline {
             return;
         }
 
-        if next.max_depth() > previous.max_depth() {
-            let now = Instant::now();
-            let speed = self.hot_dispatch_speed_bps(now);
-            self.hot_dispatch_expansion_window.record(
-                now,
-                HotExpansionKind::PipelinePromotion,
-                speed,
-            );
-        }
-
         Self::release_lane_gauge(self.lane_depth_gauge(previous));
         self.lane_depth_gauge(next).fetch_add(1, Ordering::Relaxed);
     }
@@ -1043,7 +1022,7 @@ impl Pipeline {
         }
         self.update_queue_metrics();
         self.publish_active_stage_metrics();
-        self.publish_hot_dispatch_metrics(Instant::now());
+        self.refresh_hot_dispatch_loans(Instant::now());
     }
 
     /// Whether a lane park has left the run loop owing a dispatch pass, and
@@ -1159,6 +1138,6 @@ impl Pipeline {
             self.metrics.set_ip_replacement_burst_active(false);
         }
         self.publish_active_stage_metrics();
-        self.publish_hot_dispatch_metrics(Instant::now());
+        self.refresh_hot_dispatch_loans(Instant::now());
     }
 }

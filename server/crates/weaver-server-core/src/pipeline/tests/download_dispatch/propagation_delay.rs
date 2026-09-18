@@ -215,7 +215,6 @@ fn spillover_loan_book_tracks_multiple_jobs_and_reclaims_independently() {
 
     assert_eq!(loans.active_lent_connections(), 3);
     assert_eq!(loans.active_loan_count(), 2);
-    assert_eq!(loans.speed_snapshot(), (10_000, 0, 2));
     assert!(!loans.update_speed_harm(now + Duration::from_millis(1_999), 8_000, 7));
     assert!(!loans.reclaim_pending_for(first_job));
     assert!(!loans.reclaim_pending_for(second_job));
@@ -223,7 +222,6 @@ fn spillover_loan_book_tracks_multiple_jobs_and_reclaims_independently() {
     assert!(loans.update_speed_harm(now + Duration::from_secs(2), 8_000, 7));
     assert!(loans.reclaim_pending_for(first_job));
     assert!(loans.reclaim_pending_for(second_job));
-    assert_eq!(loans.speed_snapshot(), (10_000, 8_000, 2));
 
     loans.release_one(first_job, SpilloverLoanKind::MeasuredUnderfill);
     assert!(loans.reclaim_pending_for(first_job));
@@ -475,10 +473,7 @@ async fn release_download_result_excludes_ip_replacement_trial_from_hot_success_
     });
 
     assert_eq!(
-        pipeline
-            .metrics
-            .hot_dispatch_hot_speed_bps
-            .load(Ordering::Relaxed),
+        pipeline.hot_dispatch_throughput_window.bps(Instant::now()),
         0
     );
 }

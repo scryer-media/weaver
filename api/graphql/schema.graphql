@@ -1000,30 +1000,6 @@ type Metrics {
 	downloadPressureStallsTotal: Int!
 	downloadPressureStallDurationMs: Int!
 	downloadPressureCurrentStallMs: Int!
-	hotDispatchJobId: Int!
-	hotDispatchMode: String!
-	hotDispatchUnderfillMs: Int!
-	hotDispatchLentConnections: Int!
-	hotDispatchLastSpilloverDecision: String!
-	hotDispatchSpilloverBlockedPressureTotal: Int!
-	hotDispatchSpilloverBlockedNearCapTotal: Int!
-	hotDispatchSpilloverBlockedHotCanUseCapacityTotal: Int!
-	hotDispatchSpilloverBlockedBestModePendingTotal: Int!
-	hotDispatchSpilloverBlockedCapSpeedTotal: Int!
-	hotDispatchSpilloverAllowedUnderfillTotal: Int!
-	hotDispatchSpilloverAllowedMeasuredUnderfillTotal: Int!
-	hotDispatchSpilloverReclaimedTotal: Int!
-	hotDispatchHotSpeedBps: Int!
-	hotDispatchExclusivePeakBps: Int!
-	hotDispatchSpilloverPreSpeedBps: Int!
-	hotDispatchSpilloverPostSpeedBps: Int!
-	hotDispatchSpilloverActiveLoans: Int!
-	hotDispatchSpilloverReclaimedSpeedHarmTotal: Int!
-	hotDispatchRecentExpansionImprovementPct: Int!
-	hotDispatchBestModeBlockReason: Int!
-	hotDispatchLastExpansionKind: Int!
-	hotDispatchLastExpansionBeforeBps: Int!
-	hotDispatchLastExpansionAfterBps: Int!
 	downloadLanesActive: Int!
 	downloadLanesSequentialActive: Int!
 	downloadLanesDepth2Active: Int!
@@ -1039,7 +1015,6 @@ type Metrics {
 	downloadLanesParkingActive: Int!
 	downloadLanesRecoveringActive: Int!
 	downloadLaneParksNoWorkTotal: Int!
-	downloadLaneParksSpilloverSpeedHarmTotal: Int!
 	downloadLaneParksIpReplacementRetiredTotal: Int!
 	downloadLaneParksErrorTotal: Int!
 	downloadLaneLeaseItemsTotal: Int!

@@ -2016,14 +2016,7 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
     // not engage on the very first pass. There is no warmup gate anymore —
     // this window is the only reason a first pass ever holds capacity back.
     assert!(pipeline.hot_dispatch_underfill_since.is_some());
-    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Exclusive);
-    assert!(
-        pipeline
-            .metrics
-            .hot_dispatch_spillover_blocked_hot_can_use_capacity_total
-            .load(Ordering::Relaxed)
-            >= 1
-    );
+    assert_eq!(pipeline.hot_dispatch_spillover_loans.active_loan_count(), 0);
 
     pipeline.hot_dispatch_underfill_since = Some(Instant::now() - Duration::from_secs(2));
 
@@ -2057,14 +2050,6 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
         pipeline.active_downloads_by_job.get(&later_job_id),
         Some(&1)
     );
-    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
-    assert!(
-        pipeline
-            .metrics
-            .hot_dispatch_spillover_allowed_measured_underfill_total
-            .load(Ordering::Relaxed)
-            >= 1
-    );
     assert_eq!(pipeline.hot_dispatch_spillover_loans.active_loan_count(), 1);
     assert_eq!(
         pipeline
@@ -2076,7 +2061,6 @@ async fn dispatch_downloads_shares_slots_after_hot_job_underfills() {
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_download_connections, 2);
-    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
     assert_eq!(
         pipeline
             .hot_dispatch_spillover_loans
@@ -2402,11 +2386,7 @@ async fn hot_job_with_queued_primary_never_spills_regardless_of_underfill_durati
             .get(&peer_job_id),
         None
     );
-    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Exclusive);
-    assert_eq!(
-        pipeline.hot_dispatch_last_spillover_decision,
-        SpilloverDecision::BlockedHotCanUseCapacity
-    );
+    assert_eq!(pipeline.hot_dispatch_spillover_loans.active_loan_count(), 0);
 }
 
 /// New-contract test: once the hot job is genuinely idle, spillover engages,
@@ -2469,7 +2449,6 @@ async fn spillover_caps_distinct_jobs_at_two_even_with_capacity_to_spare() {
     let now = Instant::now();
     pipeline.hot_dispatch_job = Some(hot_job_id);
     pipeline.hot_dispatch_started_at = Some(now - Duration::from_secs(5));
-    pipeline.hot_dispatch_mode = DispatchShareMode::Shared;
     pipeline.hot_dispatch_underfill_since = Some(now - Duration::from_secs(2));
     pipeline.active_download_connections = 3;
     pipeline
@@ -2566,7 +2545,6 @@ async fn lane_refill_reclaims_spillover_when_hot_regains_queued_work() {
     let now = Instant::now();
     pipeline.hot_dispatch_job = Some(hot_job_id);
     pipeline.hot_dispatch_started_at = Some(now - Duration::from_secs(5));
-    pipeline.hot_dispatch_mode = DispatchShareMode::Shared;
     pipeline.active_download_connections = 2;
     pipeline
         .active_download_connections_by_job
@@ -2638,15 +2616,6 @@ async fn lane_refill_reclaims_spillover_when_hot_regains_queued_work() {
     let response = response_rx.await.unwrap();
     assert!(response.lease.is_none());
     assert_eq!(response.park_reason, LaneParkReason::SpilloverWithdraw);
-    // Reclaiming out of an already-`Shared` period records the general
-    // `Reclaimed` decision (mirroring the speed-harm reclaim path); the
-    // specific `BlockedHotCanUseCapacity` reason still drives it, visible in
-    // the best-mode-block-reason gauge the refill call also set.
-    assert_eq!(
-        pipeline.hot_dispatch_last_spillover_decision,
-        SpilloverDecision::Reclaimed
-    );
-    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Exclusive);
 }
 
 /// New-contract test: with no connection ramp, the very first dispatch pass
@@ -2957,7 +2926,6 @@ async fn lane_refill_preserves_same_band_spillover_after_underfill() {
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
-    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline
@@ -2995,7 +2963,6 @@ async fn lane_refill_preserves_same_band_spillover_after_underfill() {
     assert_eq!(lease.job_id, spillover_job_id);
     assert_eq!(lease.works.len(), 1);
     assert_eq!(pipeline.hot_dispatch_job, Some(hot_job_id));
-    assert_eq!(pipeline.hot_dispatch_mode, DispatchShareMode::Shared);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
         pipeline

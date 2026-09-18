@@ -434,7 +434,7 @@ impl Pipeline {
                 "failed to record ISP bandwidth usage"
             );
         }
-        self.publish_hot_dispatch_metrics(Instant::now());
+        self.refresh_hot_dispatch_loans(Instant::now());
         true
     }
 

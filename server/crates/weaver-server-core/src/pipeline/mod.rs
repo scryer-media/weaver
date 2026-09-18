@@ -51,9 +51,9 @@ use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
-    DispatchShareMode, DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork,
-    JobInfo, JobSpec, JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner,
-    SchedulerCommand, SchedulerError, SharedPipelineState, SpilloverDecision, TokenBucket,
+    DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork, JobInfo, JobSpec,
+    JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner, SchedulerCommand,
+    SchedulerError, SharedPipelineState, TokenBucket,
 };
 #[cfg(test)]
 use par2_rs::checksum;
@@ -442,8 +442,6 @@ pub(super) struct DownloadLaneRefillResponse {
 const HOT_THROUGHPUT_WINDOW: Duration = Duration::from_secs(2);
 const HOT_THROUGHPUT_BUCKET_WIDTH: Duration = Duration::from_millis(200);
 const HOT_THROUGHPUT_BUCKETS: usize = 10;
-const HOT_EXPANSION_AFTER_WINDOW: Duration = Duration::from_secs(2);
-const HOT_EXPANSION_LOOKBACK: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Default)]
 pub(super) struct HotJobThroughputWindow {
@@ -504,109 +502,6 @@ impl HotJobThroughputWindow {
             while self.buckets.len() > HOT_THROUGHPUT_BUCKETS {
                 self.buckets.pop_front();
             }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub(super) struct HotExclusiveWindow {
-    peak_bps: u64,
-}
-
-impl HotExclusiveWindow {
-    pub(super) fn clear(&mut self) {
-        self.peak_bps = 0;
-    }
-
-    pub(super) fn record(&mut self, bps: u64) {
-        self.peak_bps = self.peak_bps.max(bps);
-    }
-
-    pub(super) fn peak_bps(&self) -> u64 {
-        self.peak_bps
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HotExpansionKind {
-    LaneStart,
-    PipelinePromotion,
-}
-
-impl HotExpansionKind {
-    pub(super) fn as_code(self) -> usize {
-        match self {
-            Self::LaneStart => 1,
-            Self::PipelinePromotion => 2,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct HotExpansionEvent {
-    pub(super) at: Instant,
-    pub(super) kind: HotExpansionKind,
-    pub(super) before_bps: u64,
-    pub(super) after_bps: Option<u64>,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct HotExpansionWindow {
-    events: VecDeque<HotExpansionEvent>,
-}
-
-impl HotExpansionWindow {
-    pub(super) fn clear(&mut self) {
-        self.events.clear();
-    }
-
-    pub(super) fn record(&mut self, now: Instant, kind: HotExpansionKind, before_bps: u64) {
-        self.events.push_back(HotExpansionEvent {
-            at: now,
-            kind,
-            before_bps,
-            after_bps: None,
-        });
-        self.prune(now);
-    }
-
-    pub(super) fn refresh(&mut self, now: Instant, current_bps: u64) {
-        for event in &mut self.events {
-            if event.after_bps.is_none()
-                && now.saturating_duration_since(event.at) >= HOT_EXPANSION_AFTER_WINDOW
-            {
-                event.after_bps = Some(current_bps);
-            }
-        }
-        self.prune(now);
-    }
-
-    pub(super) fn recent_improvement_pct(&mut self, now: Instant) -> u64 {
-        self.prune(now);
-        self.events
-            .iter()
-            .filter_map(|event| {
-                let after = event.after_bps?;
-                if event.before_bps == 0 || after <= event.before_bps {
-                    return Some(0);
-                }
-                Some(((after - event.before_bps) * 100) / event.before_bps)
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub(super) fn last_event(&self) -> Option<HotExpansionEvent> {
-        self.events.back().copied()
-    }
-
-    fn prune(&mut self, now: Instant) {
-        while self
-            .events
-            .front()
-            .is_some_and(|event| now.saturating_duration_since(event.at) > HOT_EXPANSION_LOOKBACK)
-        {
-            self.events.pop_front();
         }
     }
 }
@@ -702,6 +597,9 @@ impl SpilloverLoanBook {
             .is_some_and(|loan| loan.measured_reclaim_reason.is_some())
     }
 
+    /// Total connections currently lent out. Kept for the loan-book tests:
+    /// dispatch no longer branches on the count.
+    #[cfg(test)]
     pub(super) fn active_lent_connections(&self) -> usize {
         self.loans
             .values()
@@ -734,12 +632,6 @@ impl SpilloverLoanBook {
     /// admitting a fresh job while under the distinct-job cap.
     pub(super) fn holds_loan(&self, job_id: JobId) -> bool {
         self.loans.contains_key(&job_id)
-    }
-
-    pub(super) fn speed_snapshot(&self) -> (u64, u64, usize) {
-        let pre = self.aggregate_pre_lend_bps.unwrap_or(0);
-        let post = self.aggregate_post_lend_bps.unwrap_or(0);
-        (pre, post, self.active_loan_count())
     }
 
     pub(super) fn update_speed_harm(
@@ -841,73 +733,6 @@ pub(super) enum HotBestModeBlockReason {
     None,
     HotHasQueuedPrimary,
     LaneCapacityAvailable,
-}
-
-impl HotBestModeBlockReason {
-    pub(super) fn as_code(self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::HotHasQueuedPrimary => 1,
-            Self::LaneCapacityAvailable => 2,
-        }
-    }
-}
-
-/// Labels for the `hot_dispatch_best_mode_block_reason` snapshot code, in code
-/// order. The metrics snapshot carries the raw integer; exposing the mapping
-/// lets the Prometheus exporter render a state-set rather than an opaque gauge.
-pub const HOT_BEST_MODE_BLOCK_REASON_LABELS: [&str; 3] =
-    ["none", "hot_has_queued_primary", "lane_capacity_available"];
-
-/// Labels for the `hot_dispatch_last_expansion_kind` snapshot code, in code
-/// order. Code 0 means "no expansion has been recorded yet".
-pub const HOT_EXPANSION_KIND_LABELS: [&str; 3] = ["none", "lane_start", "pipeline_promotion"];
-
-/// Resolve a `hot_dispatch_best_mode_block_reason` code to its label, falling
-/// back to `unknown` so an unmapped code stays visible instead of panicking a
-/// scrape.
-pub fn hot_best_mode_block_reason_label(code: usize) -> &'static str {
-    HOT_BEST_MODE_BLOCK_REASON_LABELS
-        .get(code)
-        .copied()
-        .unwrap_or("unknown")
-}
-
-/// Resolve a `hot_dispatch_last_expansion_kind` code to its label.
-pub fn hot_expansion_kind_label(code: usize) -> &'static str {
-    HOT_EXPANSION_KIND_LABELS
-        .get(code)
-        .copied()
-        .unwrap_or("unknown")
-}
-
-#[cfg(test)]
-mod hot_dispatch_label_tests {
-    use super::*;
-
-    #[test]
-    fn labels_line_up_with_snapshot_codes() {
-        for reason in [
-            HotBestModeBlockReason::None,
-            HotBestModeBlockReason::HotHasQueuedPrimary,
-            HotBestModeBlockReason::LaneCapacityAvailable,
-        ] {
-            assert_ne!(
-                hot_best_mode_block_reason_label(reason.as_code()),
-                "unknown"
-            );
-        }
-        assert_eq!(hot_best_mode_block_reason_label(99), "unknown");
-
-        for kind in [
-            HotExpansionKind::LaneStart,
-            HotExpansionKind::PipelinePromotion,
-        ] {
-            assert_ne!(hot_expansion_kind_label(kind.as_code()), "unknown");
-        }
-        assert_eq!(hot_expansion_kind_label(0), "none");
-        assert_eq!(hot_expansion_kind_label(99), "unknown");
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2793,22 +2618,12 @@ pub struct Pipeline {
     pub(super) hot_dispatch_job: Option<JobId>,
     /// When the current hot-dispatch ownership period began.
     pub(super) hot_dispatch_started_at: Option<Instant>,
-    /// Best observed speed while the current hot job was exclusive.
-    pub(super) hot_dispatch_exclusive_peak_bps: u64,
     /// Last time dispatch lent a reclaimable connection to spillover work.
     pub(super) hot_dispatch_last_lend_at: Option<Instant>,
-    /// Current scheduler share mode.
-    pub(super) hot_dispatch_mode: DispatchShareMode,
     /// Start of the current unused-capacity underfill window.
     pub(super) hot_dispatch_underfill_since: Option<Instant>,
-    /// Most recent spillover decision, for tick logging.
-    pub(super) hot_dispatch_last_spillover_decision: SpilloverDecision,
     /// Two-second measured throughput for successful hot-job primary BODY results.
     pub(super) hot_dispatch_throughput_window: HotJobThroughputWindow,
-    /// Peak measured hot-job speed while no spillover lanes are active.
-    pub(super) hot_dispatch_exclusive_window: HotExclusiveWindow,
-    /// Recent lane expansion and pipeline promotion outcomes.
-    pub(super) hot_dispatch_expansion_window: HotExpansionWindow,
     /// Active reclaimable spillover loans keyed by lent job.
     pub(super) hot_dispatch_spillover_loans: SpilloverLoanBook,
     /// Cooperative signal asking owned hot lanes to return their unrequested tail.

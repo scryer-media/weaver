@@ -209,14 +209,9 @@ impl Pipeline {
             active_recovery: 0,
             hot_dispatch_job: None,
             hot_dispatch_started_at: None,
-            hot_dispatch_exclusive_peak_bps: 0,
             hot_dispatch_last_lend_at: None,
-            hot_dispatch_mode: DispatchShareMode::Exclusive,
             hot_dispatch_underfill_since: None,
-            hot_dispatch_last_spillover_decision: SpilloverDecision::None,
             hot_dispatch_throughput_window: HotJobThroughputWindow::default(),
-            hot_dispatch_exclusive_window: HotExclusiveWindow::default(),
-            hot_dispatch_expansion_window: HotExpansionWindow::default(),
             hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
             hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
@@ -1081,32 +1076,6 @@ impl Pipeline {
                             pressure_state = snapshot.download_pressure_state.as_str(),
                             pressure_reason = snapshot.download_pressure_reason.as_str(),
                             direct_write_evictions = snapshot.direct_write_evictions,
-                            hot_dispatch_job_id = snapshot.hot_dispatch_job_id,
-                            hot_dispatch_mode = snapshot.hot_dispatch_mode.as_str(),
-                            hot_dispatch_lent_connections = snapshot.hot_dispatch_lent_connections,
-                            hot_dispatch_underfill_ms = snapshot.hot_dispatch_underfill_ms,
-                            hot_dispatch_speed_bps = snapshot.hot_dispatch_hot_speed_bps,
-                            hot_dispatch_exclusive_peak_bps =
-                                snapshot.hot_dispatch_exclusive_peak_bps,
-                            hot_dispatch_spillover_pre_speed_bps =
-                                snapshot.hot_dispatch_spillover_pre_speed_bps,
-                            hot_dispatch_spillover_post_speed_bps =
-                                snapshot.hot_dispatch_spillover_post_speed_bps,
-                            hot_dispatch_spillover_active_loans =
-                                snapshot.hot_dispatch_spillover_active_loans,
-                            hot_dispatch_recent_expansion_improvement_pct =
-                                snapshot.hot_dispatch_recent_expansion_improvement_pct,
-                            hot_dispatch_best_mode_block_reason =
-                                snapshot.hot_dispatch_best_mode_block_reason,
-                            hot_dispatch_last_expansion_kind =
-                                snapshot.hot_dispatch_last_expansion_kind,
-                            hot_dispatch_last_expansion_before_bps =
-                                snapshot.hot_dispatch_last_expansion_before_bps,
-                            hot_dispatch_last_expansion_after_bps =
-                                snapshot.hot_dispatch_last_expansion_after_bps,
-                            hot_dispatch_last_spillover_decision = snapshot
-                                .hot_dispatch_last_spillover_decision
-                                .as_str(),
                             not_found,
                             health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                             "pipeline tick"

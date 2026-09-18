@@ -3,13 +3,6 @@ use std::sync::atomic::Ordering;
 use super::*;
 
 #[test]
-fn spillover_decision_codes_round_trip() {
-    for decision in SpilloverDecision::ALL {
-        assert_eq!(SpilloverDecision::from_code(decision.as_code()), decision);
-    }
-}
-
-#[test]
 fn metrics_snapshot() {
     let m = PipelineMetrics::new();
     m.bytes_downloaded.store(1024, Ordering::Relaxed);
@@ -22,17 +15,6 @@ fn metrics_snapshot() {
     m.download_failures_capacity_unavailable
         .store(3, Ordering::Relaxed);
     m.download_failures_transient.store(4, Ordering::Relaxed);
-    m.hot_dispatch_job_id.store(42, Ordering::Relaxed);
-    m.hot_dispatch_mode
-        .store(DispatchShareMode::Shared.as_code(), Ordering::Relaxed);
-    m.hot_dispatch_underfill_ms.store(2500, Ordering::Relaxed);
-    m.hot_dispatch_lent_connections.store(2, Ordering::Relaxed);
-    m.hot_dispatch_last_spillover_decision.store(
-        SpilloverDecision::AllowedUnderfill.as_code(),
-        Ordering::Relaxed,
-    );
-    m.hot_dispatch_spillover_allowed_underfill_total
-        .store(7, Ordering::Relaxed);
 
     let snap = m.snapshot();
     assert_eq!(snap.bytes_downloaded, 1024);
@@ -45,15 +27,6 @@ fn metrics_snapshot() {
     assert_eq!(snap.download_failures_capacity_unavailable, 3);
     assert_eq!(snap.download_failures_transient, 4);
     assert_eq!(snap.bytes_decoded, 0);
-    assert_eq!(snap.hot_dispatch_job_id, 42);
-    assert_eq!(snap.hot_dispatch_mode, DispatchShareMode::Shared);
-    assert_eq!(snap.hot_dispatch_underfill_ms, 2500);
-    assert_eq!(snap.hot_dispatch_lent_connections, 2);
-    assert_eq!(
-        snap.hot_dispatch_last_spillover_decision,
-        SpilloverDecision::AllowedUnderfill
-    );
-    assert_eq!(snap.hot_dispatch_spillover_allowed_underfill_total, 7);
 }
 
 #[test]
@@ -223,24 +196,10 @@ fn instrumentation_registries_are_reachable_from_the_shared_metrics_handle() {
 /// the dense code space every variant already round-trips through.
 #[test]
 fn variant_lists_cover_every_code() {
-    for decision in SpilloverDecision::ALL {
-        assert_eq!(SpilloverDecision::from_code(decision.as_code()), decision);
-        assert!(!decision.as_str().is_empty());
-    }
-    let mut codes: Vec<usize> = SpilloverDecision::ALL
-        .iter()
-        .map(|decision| decision.as_code())
-        .collect();
-    codes.sort_unstable();
-    assert_eq!(codes, (0..SpilloverDecision::ALL.len()).collect::<Vec<_>>());
-
     for state in DownloadPressureState::ALL {
         assert_eq!(DownloadPressureState::from_code(state.as_code()), state);
     }
     for reason in DownloadPressureReason::ALL {
         assert_eq!(DownloadPressureReason::from_code(reason.as_code()), reason);
-    }
-    for mode in DispatchShareMode::ALL {
-        assert_eq!(DispatchShareMode::from_code(mode.as_code()), mode);
     }
 }

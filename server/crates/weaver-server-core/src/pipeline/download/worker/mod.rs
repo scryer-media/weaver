@@ -465,7 +465,7 @@ impl Pipeline {
                     "dispatch blocked: paused/rate"
                 );
             }
-            self.publish_hot_dispatch_metrics(now);
+            self.refresh_hot_dispatch_loans(now);
             return;
         }
         if self.nntp_handoff_draining {
@@ -473,13 +473,13 @@ impl Pipeline {
             // dial now competes with them for the same allowance. The drain
             // completion dispatches (see `handle_nntp_handoff_drained`).
             self.hot_share_yield_signal.clear();
-            self.publish_hot_dispatch_metrics(now);
+            self.refresh_hot_dispatch_loans(now);
             return;
         }
         if let Err(error) = self.refresh_bandwidth_cap_window() {
             error!(error = %error, "failed to refresh ISP bandwidth cap state");
             self.hot_share_yield_signal.clear();
-            self.publish_hot_dispatch_metrics(now);
+            self.refresh_hot_dispatch_loans(now);
             return;
         }
         if self.bandwidth_cap.cap_enabled() && self.bandwidth_cap.remaining_bytes() == 0 {
@@ -488,7 +488,7 @@ impl Pipeline {
             if self.active_downloads == 0 {
                 debug!("dispatch blocked: bandwidth cap exhausted");
             }
-            self.publish_hot_dispatch_metrics(now);
+            self.refresh_hot_dispatch_loans(now);
             return;
         }
 
@@ -507,8 +507,7 @@ impl Pipeline {
                     "dispatch blocked: byte pressure"
                 );
             }
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
-            self.publish_hot_dispatch_metrics(now);
+            self.refresh_hot_dispatch_loans(now);
             return;
         }
         let soft_dispatch_delay = self.soft_pressure_dispatch_delay(pressure);
@@ -529,8 +528,7 @@ impl Pipeline {
                         "dispatch delayed: soft byte pressure"
                     );
                 }
-                self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
-                self.publish_hot_dispatch_metrics(now);
+                self.refresh_hot_dispatch_loans(now);
                 return;
             }
             self.download_pressure_soft_dispatch_after = Some(now + delay);
@@ -695,7 +693,7 @@ impl Pipeline {
             &mut dispatch_budget,
         ) {
             CriticalDispatchPhase::StopAll => {
-                self.publish_hot_dispatch_metrics(now);
+                self.refresh_hot_dispatch_loans(now);
                 return;
             }
             CriticalDispatchPhase::CapacityStarved => true,
@@ -724,7 +722,7 @@ impl Pipeline {
                 DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => {
-                    self.publish_hot_dispatch_metrics(now);
+                    self.refresh_hot_dispatch_loans(now);
                     return;
                 }
             }
@@ -746,44 +744,22 @@ impl Pipeline {
                 self.hot_share_yield_signal.clear();
             }
             self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
             false
         } else if bandwidth_cap_tight {
             if !critical_capacity_starved {
                 self.hot_share_yield_signal.clear();
             }
             self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedNearCap);
             false
-        } else if best_mode_block_reason == HotBestModeBlockReason::HotHasQueuedPrimary {
+        } else if best_mode_block_reason == HotBestModeBlockReason::HotHasQueuedPrimary
+            || best_mode_block_reason == HotBestModeBlockReason::LaneCapacityAvailable
+            || !has_unused_capacity
+        {
             self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(best_mode_block_reason);
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedHotCanUseCapacity);
-            false
-        } else if best_mode_block_reason == HotBestModeBlockReason::LaneCapacityAvailable {
-            self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(best_mode_block_reason);
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedBestModePending);
-            false
-        } else if !has_unused_capacity {
-            self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
-            if self.hot_dispatch_spillover_loans.active_lent_connections() == 0 {
-                self.hot_dispatch_mode = DispatchShareMode::Exclusive;
-            }
             false
         } else {
-            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
             let underfill_started_at = *self.hot_dispatch_underfill_since.get_or_insert(now);
-            if now.saturating_duration_since(underfill_started_at) >= HOT_DISPATCH_SLOWNESS_WINDOW {
-                self.hot_dispatch_mode = DispatchShareMode::Shared;
-                true
-            } else {
-                self.block_or_reclaim_spillover(SpilloverDecision::BlockedHotCanUseCapacity);
-                false
-            }
+            now.saturating_duration_since(underfill_started_at) >= HOT_DISPATCH_SLOWNESS_WINDOW
         };
 
         if spillover_allowed {
@@ -840,14 +816,11 @@ impl Pipeline {
                                 hot_speed_bps,
                                 SpilloverLoanKind::MeasuredUnderfill,
                             );
-                            self.record_spillover_decision(
-                                SpilloverDecision::AllowedMeasuredUnderfill,
-                            );
                             dispatch_budget = dispatch_budget.saturating_sub(1)
                         }
                         DispatchAttempt::NoWork => break,
                         DispatchAttempt::StopAll => {
-                            self.publish_hot_dispatch_metrics(now);
+                            self.refresh_hot_dispatch_loans(now);
                             return;
                         }
                     }
@@ -862,7 +835,7 @@ impl Pipeline {
 
         self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();
-        self.publish_hot_dispatch_metrics(now);
+        self.refresh_hot_dispatch_loans(now);
     }
 }
 

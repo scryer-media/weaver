@@ -109,15 +109,6 @@ impl Pipeline {
         })
     }
 
-    pub(in crate::pipeline::download::worker) fn set_hot_best_mode_block_reason(
-        &self,
-        reason: HotBestModeBlockReason,
-    ) {
-        self.metrics
-            .hot_dispatch_best_mode_block_reason
-            .store(reason.as_code(), Ordering::Relaxed);
-    }
-
     pub(in crate::pipeline::download::worker) fn job_has_active_download_work(
         &self,
         job_id: JobId,
@@ -156,34 +147,22 @@ impl Pipeline {
 
         self.hot_dispatch_job = Some(job_id);
         self.hot_dispatch_started_at = Some(now);
-        self.hot_dispatch_exclusive_peak_bps = 0;
         self.hot_dispatch_last_lend_at = None;
-        self.hot_dispatch_mode = DispatchShareMode::Exclusive;
         self.hot_dispatch_underfill_since = None;
-        self.hot_dispatch_last_spillover_decision = SpilloverDecision::None;
         self.hot_dispatch_throughput_window.clear();
-        self.hot_dispatch_exclusive_window.clear();
-        self.hot_dispatch_expansion_window.clear();
         self.hot_dispatch_spillover_loans.clear();
         self.hot_share_yield_signal.clear();
-        self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
     }
 
     pub(in crate::pipeline::download::worker) fn clear_hot_dispatch_period(&mut self) {
         self.hot_dispatch_job = None;
         self.hot_dispatch_started_at = None;
-        self.hot_dispatch_exclusive_peak_bps = 0;
         self.hot_dispatch_last_lend_at = None;
-        self.hot_dispatch_mode = DispatchShareMode::Exclusive;
         self.hot_dispatch_underfill_since = None;
-        self.hot_dispatch_last_spillover_decision = SpilloverDecision::None;
         self.hot_dispatch_throughput_window.clear();
-        self.hot_dispatch_exclusive_window.clear();
-        self.hot_dispatch_expansion_window.clear();
         self.hot_dispatch_spillover_loans.clear();
         self.hot_share_yield_signal.clear();
-        self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
-        self.publish_hot_dispatch_metrics(Instant::now());
+        self.refresh_hot_dispatch_loans(Instant::now());
     }
 
     pub(in crate::pipeline::download::worker) fn active_spillover_connections(&self) -> usize {
@@ -211,13 +190,11 @@ impl Pipeline {
         now: Instant,
         hot_speed_bps: u64,
     ) {
-        if self.hot_dispatch_spillover_loans.update_speed_harm(
+        self.hot_dispatch_spillover_loans.update_speed_harm(
             now,
             hot_speed_bps,
             HOT_DISPATCH_SPILLOVER_HARM_PERCENT,
-        ) {
-            self.record_spillover_decision(SpilloverDecision::ReclaimedSpeedHarm);
-        }
+        );
     }
 
     pub(in crate::pipeline::download::worker) fn hot_spillover_reclaim_pending_for(
@@ -234,172 +211,15 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline::download::worker) fn publish_hot_dispatch_metrics(
+    /// Advance the hot job's throughput estimate and re-judge the outstanding
+    /// spillover loans against it, so a loan that is costing the hot job speed
+    /// is marked for reclaim before the next refill decides.
+    pub(in crate::pipeline::download::worker) fn refresh_hot_dispatch_loans(
         &mut self,
         now: Instant,
     ) {
-        let hot_job_id = self.hot_dispatch_job.map(|id| id.0).unwrap_or(0);
-        let active_non_hot_connections = self.active_spillover_connections();
-        let active_lent_connections = self.hot_dispatch_spillover_loans.active_lent_connections();
-        let published_mode = if active_non_hot_connections > 0 {
-            DispatchShareMode::Shared
-        } else {
-            self.hot_dispatch_mode
-        };
-        let underfill_ms = self
-            .hot_dispatch_underfill_since
-            .map(|started_at| {
-                now.saturating_duration_since(started_at)
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64
-            })
-            .unwrap_or(0);
         let hot_speed_bps = self.hot_dispatch_speed_bps(now);
-        self.hot_dispatch_expansion_window
-            .refresh(now, hot_speed_bps);
-        let recent_expansion_improvement_pct = self
-            .hot_dispatch_expansion_window
-            .recent_improvement_pct(now);
         self.update_spillover_loan_measurement(now, hot_speed_bps);
-
-        if hot_job_id != 0 && published_mode == DispatchShareMode::Exclusive {
-            self.hot_dispatch_exclusive_peak_bps =
-                self.hot_dispatch_exclusive_peak_bps.max(hot_speed_bps);
-            self.hot_dispatch_exclusive_window.record(hot_speed_bps);
-        }
-
-        self.metrics
-            .hot_dispatch_job_id
-            .store(hot_job_id, Ordering::Relaxed);
-        self.metrics
-            .hot_dispatch_mode
-            .store(published_mode.as_code(), Ordering::Relaxed);
-        self.metrics
-            .hot_dispatch_underfill_ms
-            .store(underfill_ms, Ordering::Relaxed);
-        self.metrics
-            .hot_dispatch_lent_connections
-            .store(active_lent_connections, Ordering::Relaxed);
-        self.metrics.hot_dispatch_last_spillover_decision.store(
-            self.hot_dispatch_last_spillover_decision.as_code(),
-            Ordering::Relaxed,
-        );
-        self.metrics
-            .hot_dispatch_hot_speed_bps
-            .store(hot_speed_bps, Ordering::Relaxed);
-        self.metrics.hot_dispatch_exclusive_peak_bps.store(
-            self.hot_dispatch_exclusive_window.peak_bps(),
-            Ordering::Relaxed,
-        );
-        let (pre_lend, post_lend, active_loans) =
-            self.hot_dispatch_spillover_loans.speed_snapshot();
-        self.metrics
-            .hot_dispatch_spillover_pre_speed_bps
-            .store(pre_lend, Ordering::Relaxed);
-        self.metrics
-            .hot_dispatch_spillover_post_speed_bps
-            .store(post_lend, Ordering::Relaxed);
-        self.metrics
-            .hot_dispatch_spillover_active_loans
-            .store(active_loans, Ordering::Relaxed);
-        self.metrics
-            .hot_dispatch_recent_expansion_improvement_pct
-            .store(recent_expansion_improvement_pct, Ordering::Relaxed);
-        if let Some(event) = self.hot_dispatch_expansion_window.last_event() {
-            self.metrics
-                .hot_dispatch_last_expansion_kind
-                .store(event.kind.as_code(), Ordering::Relaxed);
-            self.metrics
-                .hot_dispatch_last_expansion_before_bps
-                .store(event.before_bps, Ordering::Relaxed);
-            self.metrics
-                .hot_dispatch_last_expansion_after_bps
-                .store(event.after_bps.unwrap_or(0), Ordering::Relaxed);
-        } else {
-            self.metrics
-                .hot_dispatch_last_expansion_kind
-                .store(0, Ordering::Relaxed);
-            self.metrics
-                .hot_dispatch_last_expansion_before_bps
-                .store(0, Ordering::Relaxed);
-            self.metrics
-                .hot_dispatch_last_expansion_after_bps
-                .store(0, Ordering::Relaxed);
-        }
-    }
-
-    pub(in crate::pipeline::download::worker) fn record_spillover_decision(
-        &mut self,
-        decision: SpilloverDecision,
-    ) {
-        self.hot_dispatch_last_spillover_decision = decision;
-        self.metrics
-            .hot_dispatch_last_spillover_decision
-            .store(decision.as_code(), Ordering::Relaxed);
-        match decision {
-            SpilloverDecision::None => {}
-            SpilloverDecision::BlockedPressure => {
-                self.metrics
-                    .hot_dispatch_spillover_blocked_pressure_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SpilloverDecision::BlockedNearCap => {
-                self.metrics
-                    .hot_dispatch_spillover_blocked_near_cap_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SpilloverDecision::BlockedHotCanUseCapacity => {
-                self.metrics
-                    .hot_dispatch_spillover_blocked_hot_can_use_capacity_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SpilloverDecision::AllowedUnderfill => {
-                self.metrics
-                    .hot_dispatch_spillover_allowed_underfill_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SpilloverDecision::AllowedMeasuredUnderfill => {
-                self.metrics
-                    .hot_dispatch_spillover_allowed_measured_underfill_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SpilloverDecision::Reclaimed => {
-                self.metrics
-                    .hot_dispatch_spillover_reclaimed_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SpilloverDecision::ReclaimedSpeedHarm => {
-                self.metrics
-                    .hot_dispatch_spillover_reclaimed_speed_harm_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SpilloverDecision::BlockedBestModePending => {
-                self.metrics
-                    .hot_dispatch_spillover_blocked_best_mode_pending_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            SpilloverDecision::BlockedCapSpeed => {
-                self.metrics
-                    .hot_dispatch_spillover_blocked_cap_speed_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    pub(in crate::pipeline::download::worker) fn block_or_reclaim_spillover(
-        &mut self,
-        decision: SpilloverDecision,
-    ) {
-        if self.hot_dispatch_mode == DispatchShareMode::Shared {
-            let reclaim_decision = match decision {
-                SpilloverDecision::ReclaimedSpeedHarm => SpilloverDecision::ReclaimedSpeedHarm,
-                _ => SpilloverDecision::Reclaimed,
-            };
-            self.record_spillover_decision(reclaim_decision);
-        } else {
-            self.record_spillover_decision(decision);
-        }
-        self.hot_dispatch_mode = DispatchShareMode::Exclusive;
     }
 
     pub(in crate::pipeline::download) fn job_dispatch_priority(state: &JobState) -> u8 {

@@ -46,16 +46,6 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"gated\"} 1"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_stalls_total 24"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_stall_duration_seconds 1.5"));
-    assert!(rendered.contains("weaver_pipeline_hot_dispatch_job_id 42"));
-    assert!(rendered.contains("weaver_pipeline_hot_dispatch_mode{mode=\"shared\"} 1"));
-    assert!(rendered.contains("weaver_pipeline_hot_dispatch_underfill_milliseconds 2500"));
-    assert!(rendered.contains("weaver_pipeline_hot_dispatch_lent_connections 2"));
-    assert!(rendered.contains(
-        "weaver_pipeline_hot_dispatch_last_spillover_decision{decision=\"allowed_underfill\"} 1"
-    ));
-    assert!(rendered.contains(
-        "weaver_pipeline_hot_dispatch_spillover_decisions_total{decision=\"allowed_underfill\"} 33"
-    ));
     assert!(rendered.contains("weaver_pipeline_download_lanes_active{mode=\"sequential\"} 1"));
     assert!(rendered.contains("weaver_pipeline_download_lanes_active{mode=\"pipeline_depth2\"} 2"));
     assert!(rendered.contains("weaver_pipeline_download_lane_states_active{state=\"issuing\"} 3"));
@@ -67,14 +57,6 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"pressure\"} 36"));
     assert!(
         rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"probe_yield\"} 37")
-    );
-    assert!(
-        rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"hot_reclaim\"} 38")
-    );
-    assert!(
-        rendered.contains(
-            "weaver_pipeline_download_lane_parks_total{reason=\"spillover_withdraw\"} 39"
-        )
     );
     assert!(
         rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"proof_failure\"} 41")
@@ -120,16 +102,12 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_jobs{status=\"post_processing\"} 0"));
 
     // Fixed units and dual-emitted renames.
-    assert!(rendered.contains("weaver_pipeline_hot_dispatch_underfill_seconds 2.5"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_stall_seconds_total 1.5"));
     assert!(rendered.contains("weaver_pipeline_disk_write_latency_microseconds 16"));
     assert!(rendered.contains("weaver_pipeline_disk_write_latency_seconds 0.000016"));
     assert!(rendered.contains("weaver_ip_rtt_ewma_slowest_ms 123"));
     assert!(rendered.contains("weaver_ip_rtt_ewma_slowest_seconds 0.123"));
     assert!(rendered.contains("weaver_pipeline_download_lanes 3"));
-    assert!(
-        rendered.contains("weaver_pipeline_hot_dispatch_recent_expansion_improvement_ratio 0.05")
-    );
     assert!(rendered.contains("weaver_pipeline_decode_rate_mebibytes_per_second 23.5"));
     assert!(rendered.contains("weaver_pipeline_decode_rate_bytes_per_second 24641536"));
     assert!(rendered.contains("weaver_pipeline_scheduled_speed_limit_bytes_per_second 4096"));
@@ -244,30 +222,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_pressure_stall_duration_ms: 0,
         download_pressure_current_stall_ms: 0,
         download_restart_durable_lead_blocked_total: 0,
-        hot_dispatch_job_id: 0,
-        hot_dispatch_mode: weaver_server_core::DispatchShareMode::Exclusive,
-        hot_dispatch_underfill_ms: 0,
-        hot_dispatch_lent_connections: 0,
-        hot_dispatch_last_spillover_decision: weaver_server_core::SpilloverDecision::None,
-        hot_dispatch_spillover_blocked_pressure_total: 0,
-        hot_dispatch_spillover_blocked_near_cap_total: 0,
-        hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
-        hot_dispatch_spillover_blocked_best_mode_pending_total: 0,
-        hot_dispatch_spillover_blocked_cap_speed_total: 0,
-        hot_dispatch_spillover_allowed_underfill_total: 0,
-        hot_dispatch_spillover_allowed_measured_underfill_total: 0,
-        hot_dispatch_spillover_reclaimed_total: 0,
-        hot_dispatch_hot_speed_bps: 0,
-        hot_dispatch_exclusive_peak_bps: 0,
-        hot_dispatch_spillover_pre_speed_bps: 0,
-        hot_dispatch_spillover_post_speed_bps: 0,
-        hot_dispatch_spillover_active_loans: 0,
-        hot_dispatch_spillover_reclaimed_speed_harm_total: 0,
-        hot_dispatch_recent_expansion_improvement_pct: 0,
-        hot_dispatch_best_mode_block_reason: 0,
-        hot_dispatch_last_expansion_kind: 0,
-        hot_dispatch_last_expansion_before_bps: 0,
-        hot_dispatch_last_expansion_after_bps: 0,
         download_scheduler_idle_with_servable_total: 0,
         download_scheduler_handouts_total_hot: 0,
         download_scheduler_handouts_total_spill: 0,
@@ -289,10 +243,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_lane_parks_no_work_total: 0,
         download_lane_parks_pressure_total: 0,
         download_lane_parks_probe_yield_total: 0,
-        download_lane_parks_hot_reclaim_total: 0,
-        download_lane_parks_hot_share_yield_total: 0,
-        download_lane_parks_spillover_withdraw_total: 0,
-        download_lane_parks_spillover_speed_harm_total: 0,
         download_lane_parks_ip_replacement_retired_total: 0,
         download_lane_parks_proof_failure_total: 0,
         download_lane_parks_error_total: 0,
@@ -511,7 +461,6 @@ fn escapes_prometheus_label_values() {
 
 /// The regression that motivated the descriptor rewrite: label sets were
 /// restated by hand next to the enum they mirrored, so `Scheduled`,
-/// a spillover-decision variant since removed, `hot_share_yield`, `deferred`,
 /// `queued_post_processing` and `post_processing` were all collected by the
 /// runtime and then dropped on the floor at scrape time.
 #[test]
@@ -562,41 +511,6 @@ fn rendered_label_sets_cover_every_enum_variant() {
         "reason",
         &pressure_reasons,
     );
-
-    let modes: Vec<&str> = weaver_server_core::DispatchShareMode::ALL
-        .iter()
-        .map(|mode| mode.as_str())
-        .collect();
-    assert_label_set(
-        &rendered,
-        "weaver_pipeline_hot_dispatch_mode",
-        "mode",
-        &modes,
-    );
-
-    let decisions: Vec<&str> = weaver_server_core::SpilloverDecision::ALL
-        .iter()
-        .map(|decision| decision.as_str())
-        .collect();
-    assert_label_set(
-        &rendered,
-        "weaver_pipeline_hot_dispatch_last_spillover_decision",
-        "decision",
-        &decisions,
-    );
-    // The totals family has no counter for the resting `none` state.
-    let counted_decisions: Vec<&str> = decisions
-        .iter()
-        .copied()
-        .filter(|decision| *decision != "none")
-        .collect();
-    assert_label_set(
-        &rendered,
-        "weaver_pipeline_hot_dispatch_spillover_decisions_total",
-        "decision",
-        &counted_decisions,
-    );
-    assert!(counted_decisions.contains(&"allowed_measured_underfill"));
 
     assert_label_set(
         &rendered,
@@ -655,10 +569,6 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
             "no_work",
             "pressure",
             "probe_yield",
-            "hot_reclaim",
-            "hot_share_yield",
-            "spillover_withdraw",
-            "spillover_speed_harm",
             "ip_replacement_retired",
             "proof_failure",
             "error",
