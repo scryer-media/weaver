@@ -131,14 +131,21 @@ impl HistoryQuery {
         filter: Option<QueueFilterInput>,
     ) -> Result<u32> {
         let db = ctx.data::<Database>()?.clone();
+        let live_jobs = live_job_ids(ctx.data::<SchedulerHandle>()?);
         let plan = history_query_plan(filter.as_ref(), None, None);
         let HistoryQueryPlan::Query(history_filter) = plan else {
             return Ok(0);
         };
-        let count = tokio::task::spawn_blocking(move || db.count_job_history(&history_filter))
-            .await
-            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
-            .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
+        // The count answers for the same rows the list returns, so the rows the
+        // list excludes as still-live are taken off it too.
+        let count = tokio::task::spawn_blocking(move || {
+            let counted = db.count_job_history(&history_filter)?;
+            let live = count_live_rows_matching(&db, &history_filter, &live_jobs)?;
+            Ok::<_, weaver_server_core::StateError>(counted.saturating_sub(live))
+        })
+        .await
+        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
+        .map_err(|e| graphql_error("INTERNAL", e.to_string()))?;
         Ok(count)
     }
     /// Compatibility facade for recent queue lifecycle history.
@@ -631,6 +638,37 @@ fn live_jobs_in_history(
         .into_iter()
         .map(|row| row.job_id)
         .collect())
+}
+
+/// How many of the rows `filter` counts belong to jobs the scheduler still
+/// owns (see [`live_job_ids`]). A point lookup over the live ids, narrowed to
+/// the filter's own id list when it has one.
+fn count_live_rows_matching(
+    db: &Database,
+    filter: &weaver_server_core::HistoryFilter,
+    live_jobs: &HashSet<u64>,
+) -> Result<u32, weaver_server_core::StateError> {
+    if live_jobs.is_empty() {
+        return Ok(0);
+    }
+    let item_ids: Vec<u64> = match &filter.item_ids {
+        Some(ids) => ids
+            .iter()
+            .copied()
+            .filter(|id| live_jobs.contains(id))
+            .collect(),
+        None => live_jobs.iter().copied().collect(),
+    };
+    if item_ids.is_empty() {
+        return Ok(0);
+    }
+    let filter = weaver_server_core::HistoryFilter {
+        item_ids: Some(item_ids),
+        limit: None,
+        offset: None,
+        ..filter.clone()
+    };
+    db.count_job_history(&filter)
 }
 
 fn load_history_delete_states(
@@ -1219,6 +1257,23 @@ mod tests {
             .map(|row| row.job_id)
             .collect();
         assert!(!list_ids.contains(&3));
+        // And so does the count: the live row comes off it, but only when the
+        // filter would have counted that row in the first place.
+        let all = weaver_server_core::HistoryFilter::default();
+        assert_eq!(count_live_rows_matching(&db, &all, &live).unwrap(), 1);
+        assert_eq!(
+            db.count_job_history(&all).unwrap()
+                - count_live_rows_matching(&db, &all, &live).unwrap(),
+            6
+        );
+        let failed_only = weaver_server_core::HistoryFilter {
+            statuses: Some(vec!["failed".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            count_live_rows_matching(&db, &failed_only, &live).unwrap(),
+            0
+        );
 
         // Once the scheduler reports it terminal, the same row is history again.
         let handle = scheduler_with_jobs(vec![resident_job(
