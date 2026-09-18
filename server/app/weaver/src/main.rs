@@ -1,3 +1,5 @@
+#[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
+mod allocator;
 mod application_upgrade_helper;
 mod args;
 mod bootstrap;
@@ -39,11 +41,11 @@ const DOTENV_FILE: &str = ".env";
 // musl's bundled allocator serializes multi-threaded allocation heavily
 // (measured −18% CPU on the container download benchmark when replaced), and
 // the Windows system heap has the same reputation under threaded load, so
-// both build targets swap in mimalloc. glibc/macOS builds keep the system
-// allocator.
+// both build targets swap in mimalloc, tuned for the pipeline's cross-thread
+// article buffers (see `allocator`). glibc builds keep the system allocator.
 #[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
 #[global_allocator]
-static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL_ALLOC: allocator::TunedMiMalloc = allocator::TunedMiMalloc;
 
 fn main() {
     // The Windows upgrade helper is this binary run with `--upgrade-helper`: it
