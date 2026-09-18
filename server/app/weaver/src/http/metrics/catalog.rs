@@ -151,50 +151,6 @@ metric_families! {
     PRESSURE_REASON = ("weaver_pipeline_download_pressure_reason", Gauge, ["reason"],
         "Download backpressure reason; exactly one reason is 1.");
 
-    // ---- hot dispatch ----------------------------------------------------
-    HOT_JOB_ID = ("weaver_pipeline_hot_dispatch_job_id", Gauge, [],
-        "Current hot-dispatch job id, or 0 when no job owns hot dispatch.");
-    HOT_MODE = ("weaver_pipeline_hot_dispatch_mode", Gauge, ["mode"],
-        "Current hot-dispatch sharing mode; exactly one mode is 1.");
-    HOT_UNDERFILL_MS = ("weaver_pipeline_hot_dispatch_underfill_milliseconds", Gauge, [],
-        "Current hot-job unused-capacity underfill window age in milliseconds.",
-        deprecated_by = "weaver_pipeline_hot_dispatch_underfill_seconds");
-    HOT_UNDERFILL_SECONDS = ("weaver_pipeline_hot_dispatch_underfill_seconds", Gauge, [],
-        "Current hot-job unused-capacity underfill window age.");
-    HOT_LENT_CONNECTIONS = ("weaver_pipeline_hot_dispatch_lent_connections", Gauge, [],
-        "Active NNTP connection tasks lent to spillover jobs.");
-    HOT_LAST_SPILLOVER_DECISION = ("weaver_pipeline_hot_dispatch_last_spillover_decision", Gauge,
-        ["decision"], "Last hot-dispatch spillover decision; exactly one decision is 1.");
-    HOT_SPILLOVER_DECISIONS = ("weaver_pipeline_hot_dispatch_spillover_decisions_total", Counter,
-        ["decision"], "Hot-dispatch spillover decisions by reason.");
-    HOT_SPEED = ("weaver_pipeline_hot_dispatch_speed_bytes_per_second", Gauge, [],
-        "Two-second hot-job BODY throughput.");
-    HOT_LAST_EXPANSION_KIND_CODE = ("weaver_pipeline_hot_dispatch_last_expansion_kind", Gauge, [],
-        "Last hot-job expansion event kind, as an opaque numeric code.",
-        deprecated_by = "weaver_pipeline_hot_dispatch_expansion_kind");
-    HOT_EXPANSION_KIND = ("weaver_pipeline_hot_dispatch_expansion_kind", Gauge, ["kind"],
-        "Last hot-job expansion event kind; exactly one kind is 1.");
-    HOT_LAST_EXPANSION_SPEED = ("weaver_pipeline_hot_dispatch_last_expansion_speed_bytes_per_second",
-        Gauge, ["phase"], "Last hot-job expansion before/after speeds.");
-    HOT_EXCLUSIVE_PEAK = ("weaver_pipeline_hot_dispatch_exclusive_peak_bytes_per_second", Gauge, [],
-        "Peak hot-job speed observed while exclusive.");
-    HOT_SPILLOVER_SPEED = ("weaver_pipeline_hot_dispatch_spillover_speed_bytes_per_second", Gauge,
-        ["phase"], "Hot-job speed before and after the current spillover loan.");
-    HOT_SPILLOVER_ACTIVE_LOANS = ("weaver_pipeline_hot_dispatch_spillover_active_loans", Gauge, [],
-        "Active measured spillover loans.");
-    HOT_EXPANSION_IMPROVEMENT_PCT =
-        ("weaver_pipeline_hot_dispatch_recent_expansion_improvement_percent", Gauge, [],
-        "Best recent lane/pipeline expansion improvement, in percent.",
-        deprecated_by = "weaver_pipeline_hot_dispatch_recent_expansion_improvement_ratio");
-    HOT_EXPANSION_IMPROVEMENT_RATIO =
-        ("weaver_pipeline_hot_dispatch_recent_expansion_improvement_ratio", Gauge, [],
-        "Best recent lane/pipeline expansion improvement as a ratio, where 0.1 is a 10% gain.");
-    HOT_BEST_MODE_BLOCK_CODE = ("weaver_pipeline_hot_dispatch_best_mode_block_reason", Gauge, [],
-        "Last best-mode spillover block reason, as an opaque numeric code.",
-        deprecated_by = "weaver_pipeline_hot_dispatch_best_mode_block");
-    HOT_BEST_MODE_BLOCK = ("weaver_pipeline_hot_dispatch_best_mode_block", Gauge, ["reason"],
-        "Last best-mode spillover block reason; exactly one reason is 1.");
-
     // ---- download lanes --------------------------------------------------
     LANES_ACTIVE_BY_MODE = ("weaver_pipeline_download_lanes_active", Gauge, ["mode"],
         "Active article download lanes by pipelining mode.");

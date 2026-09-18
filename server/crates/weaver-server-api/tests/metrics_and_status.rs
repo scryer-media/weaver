@@ -45,30 +45,10 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         download_pressure_stall_duration_ms: 0,
         download_pressure_current_stall_ms: 0,
         download_restart_durable_lead_blocked_total: 0,
-        hot_dispatch_job_id: 0,
-        hot_dispatch_mode: weaver_server_core::DispatchShareMode::Exclusive,
-        hot_dispatch_underfill_ms: 0,
-        hot_dispatch_lent_connections: 0,
-        hot_dispatch_last_spillover_decision: weaver_server_core::SpilloverDecision::None,
-        hot_dispatch_spillover_blocked_pressure_total: 0,
-        hot_dispatch_spillover_blocked_near_cap_total: 0,
-        hot_dispatch_spillover_blocked_hot_can_use_capacity_total: 0,
-        hot_dispatch_spillover_blocked_best_mode_pending_total: 0,
-        hot_dispatch_spillover_blocked_cap_speed_total: 0,
-        hot_dispatch_spillover_allowed_underfill_total: 0,
-        hot_dispatch_spillover_allowed_measured_underfill_total: 0,
-        hot_dispatch_spillover_reclaimed_total: 0,
-        hot_dispatch_hot_speed_bps: 0,
-        hot_dispatch_exclusive_peak_bps: 0,
-        hot_dispatch_spillover_pre_speed_bps: 0,
-        hot_dispatch_spillover_post_speed_bps: 0,
-        hot_dispatch_spillover_active_loans: 0,
-        hot_dispatch_spillover_reclaimed_speed_harm_total: 0,
-        hot_dispatch_recent_expansion_improvement_pct: 0,
-        hot_dispatch_best_mode_block_reason: 0,
-        hot_dispatch_last_expansion_kind: 0,
-        hot_dispatch_last_expansion_before_bps: 0,
-        hot_dispatch_last_expansion_after_bps: 0,
+        download_scheduler_idle_with_servable_total: 0,
+        download_scheduler_handouts_total_hot: 0,
+        download_scheduler_handouts_total_spill: 0,
+        download_scheduler_handouts_total_probe: 0,
         download_lanes_active: 0,
         download_lanes_sequential_active: 0,
         download_lanes_depth2_active: 0,
@@ -86,10 +66,6 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         download_lane_parks_no_work_total: 0,
         download_lane_parks_pressure_total: 0,
         download_lane_parks_probe_yield_total: 0,
-        download_lane_parks_hot_reclaim_total: 0,
-        download_lane_parks_hot_share_yield_total: 0,
-        download_lane_parks_spillover_withdraw_total: 0,
-        download_lane_parks_spillover_speed_harm_total: 0,
         download_lane_parks_ip_replacement_retired_total: 0,
         download_lane_parks_proof_failure_total: 0,
         download_lane_parks_error_total: 0,
@@ -294,7 +270,7 @@ async fn metrics_has_expected_fields() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed hotDispatchJobId hotDispatchMode hotDispatchUnderfillMs hotDispatchLentConnections hotDispatchLastSpilloverDecision hotDispatchSpilloverBlockedNearCapTotal hotDispatchSpilloverAllowedUnderfillTotal downloadLanesActive downloadLanesDepth2Active downloadLanesIssuingActive downloadLanesAwaitingWorkActive downloadLaneParksNoWorkTotal downloadPipelineProofPassTotal downloadPipelineReplayItemsTotal } }",
+            "{ metrics { bytesDownloaded bytesDecoded bytesCommitted downloadQueueDepth segmentsDownloaded currentDownloadSpeed downloadLanesActive downloadLanesDepth2Active downloadLanesIssuingActive downloadLanesAwaitingWorkActive downloadLaneParksNoWorkTotal downloadPipelineProofPassTotal downloadPipelineReplayItemsTotal } }",
         )
         .await;
     assert_no_errors(&resp);
@@ -304,13 +280,6 @@ async fn metrics_has_expected_fields() {
     assert!(m["bytesDecoded"].is_number());
     assert!(m["downloadQueueDepth"].is_number());
     assert!(m["currentDownloadSpeed"].is_number());
-    assert!(m["hotDispatchJobId"].is_number());
-    assert!(m["hotDispatchMode"].is_string());
-    assert!(m["hotDispatchUnderfillMs"].is_number());
-    assert!(m["hotDispatchLentConnections"].is_number());
-    assert!(m["hotDispatchLastSpilloverDecision"].is_string());
-    assert!(m["hotDispatchSpilloverBlockedNearCapTotal"].is_number());
-    assert!(m["hotDispatchSpilloverAllowedUnderfillTotal"].is_number());
     assert!(m["downloadLanesActive"].is_number());
     assert!(m["downloadLanesDepth2Active"].is_number());
     assert!(m["downloadLanesIssuingActive"].is_number());

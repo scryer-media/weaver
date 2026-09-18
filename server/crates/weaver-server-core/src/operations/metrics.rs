@@ -93,100 +93,6 @@ impl DownloadPressureReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DispatchShareMode {
-    #[default]
-    Exclusive,
-    Shared,
-}
-
-impl DispatchShareMode {
-    pub const fn as_code(self) -> usize {
-        match self {
-            Self::Exclusive => 0,
-            Self::Shared => 1,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Exclusive => "exclusive",
-            Self::Shared => "shared",
-        }
-    }
-
-    pub const fn from_code(code: usize) -> Self {
-        match code {
-            1 => Self::Shared,
-            _ => Self::Exclusive,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpilloverDecision {
-    #[default]
-    None,
-    BlockedPressure,
-    BlockedNearCap,
-    BlockedHotCanUseCapacity,
-    AllowedUnderfill,
-    Reclaimed,
-    BlockedBestModePending,
-    BlockedCapSpeed,
-    AllowedMeasuredUnderfill,
-    ReclaimedSpeedHarm,
-}
-
-impl SpilloverDecision {
-    pub const fn as_code(self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::BlockedPressure => 1,
-            Self::BlockedNearCap => 2,
-            Self::BlockedHotCanUseCapacity => 3,
-            Self::AllowedUnderfill => 4,
-            Self::Reclaimed => 5,
-            Self::BlockedBestModePending => 6,
-            Self::BlockedCapSpeed => 7,
-            Self::AllowedMeasuredUnderfill => 8,
-            Self::ReclaimedSpeedHarm => 9,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::BlockedPressure => "blocked_pressure",
-            Self::BlockedNearCap => "blocked_near_cap",
-            Self::BlockedHotCanUseCapacity => "blocked_hot_can_use_capacity",
-            Self::AllowedUnderfill => "allowed_underfill",
-            Self::Reclaimed => "reclaimed",
-            Self::BlockedBestModePending => "blocked_best_mode_pending",
-            Self::BlockedCapSpeed => "blocked_cap_speed",
-            Self::AllowedMeasuredUnderfill => "allowed_measured_underfill",
-            Self::ReclaimedSpeedHarm => "reclaimed_speed_harm",
-        }
-    }
-
-    pub const fn from_code(code: usize) -> Self {
-        match code {
-            1 => Self::BlockedPressure,
-            2 => Self::BlockedNearCap,
-            3 => Self::BlockedHotCanUseCapacity,
-            4 => Self::AllowedUnderfill,
-            5 => Self::Reclaimed,
-            6 => Self::BlockedBestModePending,
-            7 => Self::BlockedCapSpeed,
-            8 => Self::AllowedMeasuredUnderfill,
-            9 => Self::ReclaimedSpeedHarm,
-            _ => Self::None,
-        }
-    }
-}
-
 // Exhaustive variant lists for the label sets these enums drive. The
 // Prometheus exporter renders one series per variant, so a variant added
 // without a matching label silently disappears from `/metrics`; deriving the
@@ -198,25 +104,6 @@ impl DownloadPressureState {
 
 impl DownloadPressureReason {
     pub const ALL: [Self; 4] = [Self::None, Self::Decode, Self::Write, Self::DecodeAndWrite];
-}
-
-impl DispatchShareMode {
-    pub const ALL: [Self; 2] = [Self::Exclusive, Self::Shared];
-}
-
-impl SpilloverDecision {
-    pub const ALL: [Self; 10] = [
-        Self::None,
-        Self::BlockedPressure,
-        Self::BlockedNearCap,
-        Self::BlockedHotCanUseCapacity,
-        Self::AllowedUnderfill,
-        Self::Reclaimed,
-        Self::BlockedBestModePending,
-        Self::BlockedCapSpeed,
-        Self::AllowedMeasuredUnderfill,
-        Self::ReclaimedSpeedHarm,
-    ];
 }
 
 /// Short-window rate for one monotonically increasing counter.
@@ -423,30 +310,6 @@ pub struct PipelineMetrics {
     pub download_pressure_stall_duration_ms: AtomicU64,
     pub download_pressure_current_stall_ms: AtomicU64,
     pub download_restart_durable_lead_blocked_total: AtomicU64,
-    pub hot_dispatch_job_id: AtomicU64,
-    pub hot_dispatch_mode: AtomicUsize,
-    pub hot_dispatch_underfill_ms: AtomicU64,
-    pub hot_dispatch_lent_connections: AtomicUsize,
-    pub hot_dispatch_last_spillover_decision: AtomicUsize,
-    pub hot_dispatch_spillover_blocked_pressure_total: AtomicU64,
-    pub hot_dispatch_spillover_blocked_near_cap_total: AtomicU64,
-    pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64,
-    pub hot_dispatch_spillover_blocked_best_mode_pending_total: AtomicU64,
-    pub hot_dispatch_spillover_blocked_cap_speed_total: AtomicU64,
-    pub hot_dispatch_spillover_allowed_underfill_total: AtomicU64,
-    pub hot_dispatch_spillover_allowed_measured_underfill_total: AtomicU64,
-    pub hot_dispatch_spillover_reclaimed_total: AtomicU64,
-    pub hot_dispatch_hot_speed_bps: AtomicU64,
-    pub hot_dispatch_exclusive_peak_bps: AtomicU64,
-    pub hot_dispatch_spillover_pre_speed_bps: AtomicU64,
-    pub hot_dispatch_spillover_post_speed_bps: AtomicU64,
-    pub hot_dispatch_spillover_active_loans: AtomicUsize,
-    pub hot_dispatch_spillover_reclaimed_speed_harm_total: AtomicU64,
-    pub hot_dispatch_recent_expansion_improvement_pct: AtomicU64,
-    pub hot_dispatch_best_mode_block_reason: AtomicUsize,
-    pub hot_dispatch_last_expansion_kind: AtomicUsize,
-    pub hot_dispatch_last_expansion_before_bps: AtomicU64,
-    pub hot_dispatch_last_expansion_after_bps: AtomicU64,
     /// Article-scheduler guard: the scheduler answered "nothing to hand out"
     /// for a server while an eligible job still held an article that server
     /// was allowed to fetch. The scheduler's own rule forbids that, so any
@@ -476,10 +339,6 @@ pub struct PipelineMetrics {
     pub download_lane_parks_no_work_total: AtomicU64,
     pub download_lane_parks_pressure_total: AtomicU64,
     pub download_lane_parks_probe_yield_total: AtomicU64,
-    pub download_lane_parks_hot_reclaim_total: AtomicU64,
-    pub download_lane_parks_hot_share_yield_total: AtomicU64,
-    pub download_lane_parks_spillover_withdraw_total: AtomicU64,
-    pub download_lane_parks_spillover_speed_harm_total: AtomicU64,
     pub download_lane_parks_ip_replacement_retired_total: AtomicU64,
     pub download_lane_parks_proof_failure_total: AtomicU64,
     pub download_lane_parks_error_total: AtomicU64,
@@ -593,32 +452,6 @@ impl PipelineMetrics {
             download_pressure_stall_duration_ms: AtomicU64::new(0),
             download_pressure_current_stall_ms: AtomicU64::new(0),
             download_restart_durable_lead_blocked_total: AtomicU64::new(0),
-            hot_dispatch_job_id: AtomicU64::new(0),
-            hot_dispatch_mode: AtomicUsize::new(DispatchShareMode::Exclusive.as_code()),
-            hot_dispatch_underfill_ms: AtomicU64::new(0),
-            hot_dispatch_lent_connections: AtomicUsize::new(0),
-            hot_dispatch_last_spillover_decision: AtomicUsize::new(
-                SpilloverDecision::None.as_code(),
-            ),
-            hot_dispatch_spillover_blocked_pressure_total: AtomicU64::new(0),
-            hot_dispatch_spillover_blocked_near_cap_total: AtomicU64::new(0),
-            hot_dispatch_spillover_blocked_hot_can_use_capacity_total: AtomicU64::new(0),
-            hot_dispatch_spillover_blocked_best_mode_pending_total: AtomicU64::new(0),
-            hot_dispatch_spillover_blocked_cap_speed_total: AtomicU64::new(0),
-            hot_dispatch_spillover_allowed_underfill_total: AtomicU64::new(0),
-            hot_dispatch_spillover_allowed_measured_underfill_total: AtomicU64::new(0),
-            hot_dispatch_spillover_reclaimed_total: AtomicU64::new(0),
-            hot_dispatch_hot_speed_bps: AtomicU64::new(0),
-            hot_dispatch_exclusive_peak_bps: AtomicU64::new(0),
-            hot_dispatch_spillover_pre_speed_bps: AtomicU64::new(0),
-            hot_dispatch_spillover_post_speed_bps: AtomicU64::new(0),
-            hot_dispatch_spillover_active_loans: AtomicUsize::new(0),
-            hot_dispatch_spillover_reclaimed_speed_harm_total: AtomicU64::new(0),
-            hot_dispatch_recent_expansion_improvement_pct: AtomicU64::new(0),
-            hot_dispatch_best_mode_block_reason: AtomicUsize::new(0),
-            hot_dispatch_last_expansion_kind: AtomicUsize::new(0),
-            hot_dispatch_last_expansion_before_bps: AtomicU64::new(0),
-            hot_dispatch_last_expansion_after_bps: AtomicU64::new(0),
             download_scheduler_idle_with_servable_total: AtomicU64::new(0),
             download_scheduler_handouts_total_hot: AtomicU64::new(0),
             download_scheduler_handouts_total_spill: AtomicU64::new(0),
@@ -640,10 +473,6 @@ impl PipelineMetrics {
             download_lane_parks_no_work_total: AtomicU64::new(0),
             download_lane_parks_pressure_total: AtomicU64::new(0),
             download_lane_parks_probe_yield_total: AtomicU64::new(0),
-            download_lane_parks_hot_reclaim_total: AtomicU64::new(0),
-            download_lane_parks_hot_share_yield_total: AtomicU64::new(0),
-            download_lane_parks_spillover_withdraw_total: AtomicU64::new(0),
-            download_lane_parks_spillover_speed_harm_total: AtomicU64::new(0),
             download_lane_parks_ip_replacement_retired_total: AtomicU64::new(0),
             download_lane_parks_proof_failure_total: AtomicU64::new(0),
             download_lane_parks_error_total: AtomicU64::new(0),
@@ -877,73 +706,6 @@ impl PipelineMetrics {
             download_restart_durable_lead_blocked_total: self
                 .download_restart_durable_lead_blocked_total
                 .load(Ordering::Relaxed),
-            hot_dispatch_job_id: self.hot_dispatch_job_id.load(Ordering::Relaxed),
-            hot_dispatch_mode: DispatchShareMode::from_code(
-                self.hot_dispatch_mode.load(Ordering::Relaxed),
-            ),
-            hot_dispatch_underfill_ms: self.hot_dispatch_underfill_ms.load(Ordering::Relaxed),
-            hot_dispatch_lent_connections: self
-                .hot_dispatch_lent_connections
-                .load(Ordering::Relaxed),
-            hot_dispatch_last_spillover_decision: SpilloverDecision::from_code(
-                self.hot_dispatch_last_spillover_decision
-                    .load(Ordering::Relaxed),
-            ),
-            hot_dispatch_spillover_blocked_pressure_total: self
-                .hot_dispatch_spillover_blocked_pressure_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_blocked_near_cap_total: self
-                .hot_dispatch_spillover_blocked_near_cap_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_blocked_hot_can_use_capacity_total: self
-                .hot_dispatch_spillover_blocked_hot_can_use_capacity_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_blocked_best_mode_pending_total: self
-                .hot_dispatch_spillover_blocked_best_mode_pending_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_blocked_cap_speed_total: self
-                .hot_dispatch_spillover_blocked_cap_speed_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_allowed_underfill_total: self
-                .hot_dispatch_spillover_allowed_underfill_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_allowed_measured_underfill_total: self
-                .hot_dispatch_spillover_allowed_measured_underfill_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_reclaimed_total: self
-                .hot_dispatch_spillover_reclaimed_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_hot_speed_bps: self.hot_dispatch_hot_speed_bps.load(Ordering::Relaxed),
-            hot_dispatch_exclusive_peak_bps: self
-                .hot_dispatch_exclusive_peak_bps
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_pre_speed_bps: self
-                .hot_dispatch_spillover_pre_speed_bps
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_post_speed_bps: self
-                .hot_dispatch_spillover_post_speed_bps
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_active_loans: self
-                .hot_dispatch_spillover_active_loans
-                .load(Ordering::Relaxed),
-            hot_dispatch_spillover_reclaimed_speed_harm_total: self
-                .hot_dispatch_spillover_reclaimed_speed_harm_total
-                .load(Ordering::Relaxed),
-            hot_dispatch_recent_expansion_improvement_pct: self
-                .hot_dispatch_recent_expansion_improvement_pct
-                .load(Ordering::Relaxed),
-            hot_dispatch_best_mode_block_reason: self
-                .hot_dispatch_best_mode_block_reason
-                .load(Ordering::Relaxed),
-            hot_dispatch_last_expansion_kind: self
-                .hot_dispatch_last_expansion_kind
-                .load(Ordering::Relaxed),
-            hot_dispatch_last_expansion_before_bps: self
-                .hot_dispatch_last_expansion_before_bps
-                .load(Ordering::Relaxed),
-            hot_dispatch_last_expansion_after_bps: self
-                .hot_dispatch_last_expansion_after_bps
-                .load(Ordering::Relaxed),
             download_scheduler_idle_with_servable_total: self
                 .download_scheduler_idle_with_servable_total
                 .load(Ordering::Relaxed),
@@ -996,18 +758,6 @@ impl PipelineMetrics {
                 .load(Ordering::Relaxed),
             download_lane_parks_probe_yield_total: self
                 .download_lane_parks_probe_yield_total
-                .load(Ordering::Relaxed),
-            download_lane_parks_hot_reclaim_total: self
-                .download_lane_parks_hot_reclaim_total
-                .load(Ordering::Relaxed),
-            download_lane_parks_hot_share_yield_total: self
-                .download_lane_parks_hot_share_yield_total
-                .load(Ordering::Relaxed),
-            download_lane_parks_spillover_withdraw_total: self
-                .download_lane_parks_spillover_withdraw_total
-                .load(Ordering::Relaxed),
-            download_lane_parks_spillover_speed_harm_total: self
-                .download_lane_parks_spillover_speed_harm_total
                 .load(Ordering::Relaxed),
             download_lane_parks_ip_replacement_retired_total: self
                 .download_lane_parks_ip_replacement_retired_total
@@ -1177,30 +927,6 @@ pub struct MetricsSnapshot {
     pub download_pressure_stall_duration_ms: u64,
     pub download_pressure_current_stall_ms: u64,
     pub download_restart_durable_lead_blocked_total: u64,
-    pub hot_dispatch_job_id: u64,
-    pub hot_dispatch_mode: DispatchShareMode,
-    pub hot_dispatch_underfill_ms: u64,
-    pub hot_dispatch_lent_connections: usize,
-    pub hot_dispatch_last_spillover_decision: SpilloverDecision,
-    pub hot_dispatch_spillover_blocked_pressure_total: u64,
-    pub hot_dispatch_spillover_blocked_near_cap_total: u64,
-    pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: u64,
-    pub hot_dispatch_spillover_blocked_best_mode_pending_total: u64,
-    pub hot_dispatch_spillover_blocked_cap_speed_total: u64,
-    pub hot_dispatch_spillover_allowed_underfill_total: u64,
-    pub hot_dispatch_spillover_allowed_measured_underfill_total: u64,
-    pub hot_dispatch_spillover_reclaimed_total: u64,
-    pub hot_dispatch_hot_speed_bps: u64,
-    pub hot_dispatch_exclusive_peak_bps: u64,
-    pub hot_dispatch_spillover_pre_speed_bps: u64,
-    pub hot_dispatch_spillover_post_speed_bps: u64,
-    pub hot_dispatch_spillover_active_loans: usize,
-    pub hot_dispatch_spillover_reclaimed_speed_harm_total: u64,
-    pub hot_dispatch_recent_expansion_improvement_pct: u64,
-    pub hot_dispatch_best_mode_block_reason: usize,
-    pub hot_dispatch_last_expansion_kind: usize,
-    pub hot_dispatch_last_expansion_before_bps: u64,
-    pub hot_dispatch_last_expansion_after_bps: u64,
     pub download_scheduler_idle_with_servable_total: u64,
     pub download_scheduler_handouts_total_hot: u64,
     pub download_scheduler_handouts_total_spill: u64,
@@ -1222,10 +948,6 @@ pub struct MetricsSnapshot {
     pub download_lane_parks_no_work_total: u64,
     pub download_lane_parks_pressure_total: u64,
     pub download_lane_parks_probe_yield_total: u64,
-    pub download_lane_parks_hot_reclaim_total: u64,
-    pub download_lane_parks_hot_share_yield_total: u64,
-    pub download_lane_parks_spillover_withdraw_total: u64,
-    pub download_lane_parks_spillover_speed_harm_total: u64,
     pub download_lane_parks_ip_replacement_retired_total: u64,
     pub download_lane_parks_proof_failure_total: u64,
     pub download_lane_parks_error_total: u64,
