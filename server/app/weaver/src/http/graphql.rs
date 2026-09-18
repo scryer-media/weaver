@@ -568,7 +568,13 @@ mod tests {
         security.apply_stored_access_policy_revision(None, None, false);
         let token = "expired-subscription-token";
         let csrf = "expired-subscription-csrf";
-        db.create_browser_session(&browser_session(token, csrf, epoch_seconds() + 1))
+        // The session has to outlive its own opening: what is under test is an
+        // expiry that arrives while a subscription is already up, not a race
+        // between the clock and the setup. A second was not enough - a loaded
+        // machine can spend that long getting the socket authorized, and then
+        // the open fails and the test never reaches what it is here for.
+        let expires_at = epoch_seconds() + 4;
+        db.create_browser_session(&browser_session(token, csrf, expires_at))
             .unwrap();
         let request_auth = request_auth(db.clone(), security);
         let peer = Some("127.0.0.1:49152".parse().unwrap());
@@ -580,8 +586,15 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            authorization.remains_active(&request_auth, peer).await,
+            "the subscription must be open before its expiry can close it"
+        );
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Wait out whatever is left of the session rather than a fixed span, so
+        // a slow open shortens the wait instead of leaving it short.
+        let remaining = (expires_at - epoch_seconds()).max(0);
+        tokio::time::sleep(Duration::from_secs(remaining as u64 + 1)).await;
         assert!(
             !authorization.remains_active(&request_auth, peer).await,
             "the live transport check must close an existing subscription after expiry"
