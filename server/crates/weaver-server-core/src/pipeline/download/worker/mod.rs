@@ -96,8 +96,86 @@ const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
 const HOT_LEASE_TARGET_RUNWAY_SECS: u64 = 2;
 const HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
 const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
+const BODY_LANE_CAPACITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_FETCH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many jobs may hold a throttle window at once.
+///
+/// Nothing is asked to tidy up after a job that leaves, so the map bounds
+/// itself: expired windows go first, and if every window is still live the
+/// whole map goes. Losing a window costs one extra log line, nothing more.
+const JOB_LOG_THROTTLE_MAX_JOBS: usize = 256;
+
+/// One log-rate window per job.
+///
+/// These throttles used to share a single instant across the worker, so the
+/// one job failing in a loop spent the window and every other job's *first*
+/// line was dropped along with it — silently, which also left the real rate
+/// unreadable from the log. Each job gets its own window here, and whatever a
+/// closed window swallowed is counted and reported by the next line that gets
+/// through it.
+#[derive(Debug, Default)]
+pub(crate) struct JobLogThrottle {
+    windows: HashMap<JobId, JobLogWindow>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JobLogWindow {
+    emitted_at: Instant,
+    suppressed: u64,
+}
+
+impl JobLogThrottle {
+    /// Whether this job may log now, and how many of its emissions the closed
+    /// window swallowed since the last one that got through.
+    pub(crate) fn admit(&mut self, job_id: JobId, interval: Duration) -> Option<u64> {
+        self.admit_at(job_id, interval, Instant::now())
+    }
+
+    fn admit_at(&mut self, job_id: JobId, interval: Duration, now: Instant) -> Option<u64> {
+        match self.windows.get_mut(&job_id) {
+            Some(window) if now.duration_since(window.emitted_at) < interval => {
+                window.suppressed = window.suppressed.saturating_add(1);
+                None
+            }
+            Some(window) => {
+                let suppressed = window.suppressed;
+                window.emitted_at = now;
+                window.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                self.bound_windows(interval, now);
+                self.windows.insert(
+                    job_id,
+                    JobLogWindow {
+                        emitted_at: now,
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
+    }
+
+    fn bound_windows(&mut self, interval: Duration, now: Instant) {
+        if self.windows.len() < JOB_LOG_THROTTLE_MAX_JOBS {
+            return;
+        }
+        self.windows
+            .retain(|_, window| now.duration_since(window.emitted_at) < interval);
+        if self.windows.len() >= JOB_LOG_THROTTLE_MAX_JOBS {
+            self.windows.clear();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_emitted_at(&self, job_id: JobId) -> Option<Instant> {
+        self.windows.get(&job_id).map(|window| window.emitted_at)
+    }
+}
+
 /// How long the servers must stay below their connection cap, with work
 /// queued, before that is reported. Short enough to catch a lane that never
 /// opens, long enough that ordinary refill gaps between batches say nothing.
@@ -541,6 +619,24 @@ impl Pipeline {
                             status_allows_dispatch,
                             "dispatch idle: download pipeline draining"
                         );
+                    } else if matches!(
+                        s.status,
+                        JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                    ) {
+                        // A job someone paused, or one that is already over, is
+                        // not dispatching because it was told not to. Warning
+                        // about it once per job per pass is how a single paused
+                        // job fills a log.
+                        debug!(
+                            job_id = jid.0,
+                            idx = i,
+                            status = ?s.status,
+                            queue_len = s.download_queue.len(),
+                            recovery_len = s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                            "dispatch idle: job not eligible by status"
+                        );
                     } else {
                         warn!(
                             job_id = jid.0,
@@ -767,5 +863,64 @@ impl Pipeline {
         self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();
         self.publish_hot_dispatch_metrics(now);
+    }
+}
+
+#[cfg(test)]
+mod job_log_throttle_tests {
+    use super::*;
+
+    const WINDOW: Duration = Duration::from_secs(60);
+
+    /// A job failing in a loop must not spend another job's first line, and
+    /// what its own window swallowed must be readable from the next line.
+    #[test]
+    fn a_noisy_job_does_not_throttle_a_quiet_one() {
+        let mut throttle = JobLogThrottle::default();
+        let noisy = JobId(9001);
+        let quiet = JobId(9002);
+        let start = Instant::now();
+
+        assert_eq!(
+            throttle.admit_at(noisy, WINDOW, start),
+            Some(0),
+            "the first emission of a window always gets through"
+        );
+        for _ in 0..500 {
+            assert_eq!(
+                throttle.admit_at(noisy, WINDOW, start),
+                None,
+                "repeats inside the window are counted, not emitted"
+            );
+        }
+
+        assert_eq!(
+            throttle.admit_at(quiet, WINDOW, start),
+            Some(0),
+            "another job's first emission is its own window, not the noisy job's"
+        );
+
+        assert_eq!(
+            throttle.admit_at(noisy, WINDOW, start + WINDOW),
+            Some(500),
+            "the next line that gets through reports what the window swallowed"
+        );
+        assert_eq!(
+            throttle.admit_at(noisy, WINDOW, start + WINDOW * 2),
+            Some(0),
+            "and the count starts again from the line that reported it"
+        );
+    }
+
+    /// The map is bounded, so a long-lived worker cannot accumulate a window
+    /// for every job it has ever seen.
+    #[test]
+    fn the_throttle_bounds_the_jobs_it_remembers() {
+        let mut throttle = JobLogThrottle::default();
+        let start = Instant::now();
+        for job in 0..(JOB_LOG_THROTTLE_MAX_JOBS as u64 * 2) {
+            throttle.admit_at(JobId(job), WINDOW, start);
+        }
+        assert!(throttle.windows.len() <= JOB_LOG_THROTTLE_MAX_JOBS);
     }
 }

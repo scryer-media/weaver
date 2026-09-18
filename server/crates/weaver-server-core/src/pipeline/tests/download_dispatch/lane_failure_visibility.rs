@@ -80,7 +80,10 @@ async fn a_contended_acquire_requeues_its_work_and_asks_for_another_pass() {
          opened"
     );
     assert!(
-        pipeline.last_owned_lane_acquire_failure_log_at.is_some(),
+        pipeline
+            .owned_lane_acquire_failure_log_throttle
+            .last_emitted_at(job_id)
+            .is_some(),
         "the failure must be reported rather than swallowed"
     );
 }
@@ -109,7 +112,8 @@ async fn repeated_acquire_failures_report_at_most_once_a_window() {
         &mut pending,
     );
     let first = pipeline
-        .last_owned_lane_acquire_failure_log_at
+        .owned_lane_acquire_failure_log_throttle
+        .last_emitted_at(job_id)
         .expect("the first failure of a window reports itself");
 
     let lease = lease_for(&mut pipeline, job_id);
@@ -121,7 +125,9 @@ async fn repeated_acquire_failures_report_at_most_once_a_window() {
         &mut pending,
     );
     assert_eq!(
-        pipeline.last_owned_lane_acquire_failure_log_at,
+        pipeline
+            .owned_lane_acquire_failure_log_throttle
+            .last_emitted_at(job_id),
         Some(first),
         "the second failure inside the window is counted, not logged again"
     );

@@ -783,11 +783,10 @@ impl Pipeline {
                         | DownloadFailureKind::EstablishedTransport
                         | DownloadFailureKind::Auth
                         | DownloadFailureKind::ContentOrProtocol
-                ) && self
-                    .last_body_fetch_failure_log_at
-                    .is_none_or(|at| at.elapsed() >= BODY_FETCH_FAILURE_LOG_INTERVAL)
+                ) && let Some(suppressed_since_last) = self
+                    .body_fetch_failure_log_throttle
+                    .admit(job_id, BODY_FETCH_FAILURE_LOG_INTERVAL)
                 {
-                    self.last_body_fetch_failure_log_at = Some(Instant::now());
                     info!(
                         job_id = job_id.0,
                         segment = %result.segment_id,
@@ -795,6 +794,7 @@ impl Pipeline {
                         retry_count = result.retry_count,
                         attempt_count = result.attempts.len(),
                         source_server_idx = ?source_server_idx,
+                        suppressed_since_last,
                         error = %failure.message,
                         "NNTP BODY fetch failed"
                     );
@@ -946,34 +946,46 @@ impl Pipeline {
                             Some(BODY_SERVER_BLOCKED_RECHECK_DELAY)
                         }
                     };
-                    if self
-                        .last_no_eligible_server_warn
-                        .is_none_or(|at| at.elapsed() >= NO_ELIGIBLE_SERVER_WARN_INTERVAL)
-                    {
-                        self.last_no_eligible_server_warn = Some(Instant::now());
-                        if !matches!(
-                            availability,
-                            weaver_nntp::pool::BodyServerAvailability::Eligible
-                        ) {
-                            warn!(
-                                job_id = job_id.0,
-                                segment = %result.segment_id,
-                                configured_server_count = server_count,
-                                excluded_server_count = unavailable_server_count,
-                                error = %failure.message,
-                                "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
-                            );
-                        } else {
+                    // An eligible server means nothing about the *servers*
+                    // turned this work away: the lane was not opened because
+                    // local lane capacity was spent. That is self-clearing and
+                    // has nothing to do with server health or credentials, so
+                    // it neither warns nor sends anyone to their account page.
+                    if matches!(
+                        availability,
+                        weaver_nntp::pool::BodyServerAvailability::Eligible
+                    ) {
+                        if let Some(suppressed_since_last) = self
+                            .body_lane_capacity_log_throttle
+                            .admit(job_id, BODY_LANE_CAPACITY_LOG_INTERVAL)
+                        {
                             info!(
                                 job_id = job_id.0,
                                 segment = %result.segment_id,
                                 configured_server_count = server_count,
                                 excluded_server_count = unavailable_server_count,
                                 retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
+                                failure_kind = ?failure.kind,
+                                suppressed_since_last,
                                 error = %failure.message,
-                                "BODY lane acquisition failed; download work will retry"
+                                "downloads waiting: local BODY lane capacity is saturated; a server is eligible and the work retries as lanes free"
                             );
                         }
+                    } else if let Some(suppressed_since_last) = self
+                        .no_eligible_server_warn_throttle
+                        .admit(job_id, NO_ELIGIBLE_SERVER_WARN_INTERVAL)
+                    {
+                        warn!(
+                            job_id = job_id.0,
+                            segment = %result.segment_id,
+                            configured_server_count = server_count,
+                            excluded_server_count = unavailable_server_count,
+                            availability = ?availability,
+                            failure_kind = ?failure.kind,
+                            suppressed_since_last,
+                            error = %failure.message,
+                            "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
+                        );
                     }
                     self.metrics
                         .download_failures_capacity_unavailable

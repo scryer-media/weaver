@@ -3239,8 +3239,8 @@ pub struct Pipeline {
     pub(super) propagation_delay_forced: Option<Duration>,
     /// Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
-    /// Last time we warned that an owned blocking lane could not be acquired.
-    pub(super) last_owned_lane_acquire_failure_log_at: Option<Instant>,
+    /// Rate limiter, per job, for the owned blocking lane acquire warning.
+    pub(super) owned_lane_acquire_failure_log_throttle: download::JobLogThrottle,
     /// Last time an owned blocking lane failed to be acquired at all, warned
     /// about or not. The under-cap report below is gated on it: lanes below
     /// their cap are only a fault when a lane actually failed to open.
@@ -3353,10 +3353,17 @@ pub struct Pipeline {
     /// retention window is older than the job). TTL'd; cleared on NNTP
     /// client rebuilds and job removal.
     pub(super) job_retention_exclude_cache: HashMap<JobId, (Instant, Arc<Vec<usize>>)>,
-    /// Rate limiter for the "no eligible news server" warning.
-    pub(super) last_no_eligible_server_warn: Option<Instant>,
-    /// Rate limiter for representative NNTP BODY fetch failures at info level.
-    pub(super) last_body_fetch_failure_log_at: Option<Instant>,
+    /// Rate limiter, per job, for the "no eligible news server" warning.
+    pub(super) no_eligible_server_warn_throttle: download::JobLogThrottle,
+    /// Rate limiter, per job, for BODY work waiting on local lane capacity.
+    ///
+    /// Kept apart from the warning above: the two answer different questions,
+    /// and one window shared between them let the benign report hide the one
+    /// that says the servers are unusable.
+    pub(super) body_lane_capacity_log_throttle: download::JobLogThrottle,
+    /// Rate limiter, per job, for representative NNTP BODY fetch failures at
+    /// info level.
+    pub(super) body_fetch_failure_log_throttle: download::JobLogThrottle,
     /// Jobs currently performing their final move into the complete directory.
     pub(super) inflight_moves: HashSet<JobId>,
     /// Complete destinations reserved for in-flight moves so concurrent jobs do not collide.

@@ -546,6 +546,37 @@ pub fn runtime_lanes_from_status_snapshot(
     }
 }
 
+/// Why a job's health failure is being held back rather than acted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthDeferralKind {
+    /// A loaded recovery set may still cover the damage.
+    Par2Recovery,
+    /// A probe round is still running and may yet revise the estimate.
+    ProbeConfirmation,
+}
+
+impl HealthDeferralKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Par2Recovery => "par2_recovery",
+            Self::ProbeConfirmation => "probe_confirmation",
+        }
+    }
+}
+
+/// A spell of deferring a job's health failure, and how long it ran for.
+///
+/// The condition holds for as long as a damaged job keeps booking terminal
+/// segments, so a line per deferral is a line per failed segment — on a badly
+/// damaged release, hundreds of thousands of them. The spell announces itself
+/// once when it starts and once when it ends, carrying the count it swallowed
+/// in between.
+#[derive(Debug, Clone, Default)]
+pub struct HealthDeferral {
+    pub kind: Option<HealthDeferralKind>,
+    pub deferrals: u64,
+}
+
 /// Internal state for a running job.
 pub struct JobState {
     pub job_id: JobId,
@@ -614,6 +645,9 @@ pub struct JobState {
     pub par2_bytes: u64,
     /// Whether health probes have been dispatched for this job.
     pub health_probing: bool,
+    /// The health-failure deferral currently in force, if any, and how many
+    /// times it has deferred since it began.
+    pub health_deferral: HealthDeferral,
     /// Probe activation counter used to rotate sampled segments across rounds.
     pub health_probe_round: u32,
     /// How many files had already lost a segment when the last probe round was
