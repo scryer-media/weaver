@@ -319,7 +319,6 @@ impl Pipeline {
             lease.works.iter().filter(|work| work.is_recovery).count(),
             lease.completion_critical,
             lease.lane_mode,
-            lease.works.len(),
             activation_items,
             starts_connection,
         );
@@ -331,10 +330,10 @@ impl Pipeline {
         recovery_count: usize,
         completion_critical: bool,
         lane_mode: DownloadLaneMode,
-        work_count: usize,
         activation_items: &[(SegmentId, NzbFileId, u64)],
         starts_connection: bool,
     ) {
+        let work_count = activation_items.len();
         if work_count == 0 {
             return;
         }

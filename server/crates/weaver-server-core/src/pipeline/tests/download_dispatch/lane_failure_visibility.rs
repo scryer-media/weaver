@@ -13,16 +13,16 @@ fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let works = state.download_queue.drain_all();
     assert!(!works.is_empty(), "the fixture job has queued work");
-    let compatibility = DownloadBatchCompatibility::from_work(&works[0]);
+    let completion_critical = works.iter().any(|work| work.completion_critical);
     DownloadBatchLease {
         lane_id: 0,
         job_id,
         runtime_generation: 0,
         lane_mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         server_modes: vec![(0, DownloadLaneMode::Sequential)],
-        compatibility,
+        completion_critical,
         effective_exclude_servers: Vec::new(),
+        dial_exclude_servers: Vec::new(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works,

@@ -1,22 +1,22 @@
 //! Lanes must not idle while a job still has work they could serve.
 //!
-//! Direct-store binding gives every RAR volume its own queue priority, so a
-//! refill rule that required the queue head to match the lane's current batch
-//! could only ever refill inside one volume. On a long link that parked every
-//! lane at every volume boundary and left the connections idle a quarter of
-//! the run with thousands of articles queued.
+//! An established connection asking for its next articles is the cheapest
+//! fetch a link has. Nothing about the articles a lane was carrying before may
+//! refuse it work the scheduler still holds for its server: not a priority
+//! boundary, not another server's failures, not the class the lane happens to
+//! be booked under.
 
 use super::*;
 
-/// Retag the whole queue so its head is priority `head_priority` and nothing
-/// matches `lane_priority`, then return a compatibility cut from a work item
-/// at `lane_priority` — the batch a lane established before the boundary.
+/// Retag the queue so every remaining item sits at `head_priority`, and drop
+/// one item at `lane_priority` — the shape a direct-store volume boundary
+/// leaves behind when a lane's batch ends one volume short of the head.
 fn split_queue_priorities(
     pipeline: &mut Pipeline,
     job_id: JobId,
     lane_priority: u32,
     head_priority: u32,
-) -> DownloadBatchCompatibility {
+) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let mut works = state.download_queue.drain_all();
     assert!(
@@ -25,33 +25,61 @@ fn split_queue_priorities(
     );
     let mut lane_sample = works.pop().unwrap();
     lane_sample.priority = lane_priority;
-    let compatibility = DownloadBatchCompatibility::from_work(&lane_sample);
     for work in &mut works {
         work.priority = head_priority;
     }
     for work in works {
         state.download_queue.push(work);
     }
-    compatibility
 }
 
 fn refill_request(
-    job_id: JobId,
-    compatibility: DownloadBatchCompatibility,
+    response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
+) -> DownloadLaneRefillRequest {
+    refill_request_on(0, 0, response_tx)
+}
+
+fn refill_request_on(
+    lane_id: u64,
+    server_idx: usize,
     response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
 ) -> DownloadLaneRefillRequest {
     DownloadLaneRefillRequest {
-        lane_id: 0,
+        lane_id,
         runtime_generation: 0,
-        job_id,
-        server_idx: 0,
+        server_idx,
         remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: false,
         current_mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
-        compatibility,
         response_tx,
     }
+}
+
+/// A lane booked as `job_id`'s, holding a connection, so the refill has an
+/// owner entry to re-book and the connection gauges have something to move.
+fn book_connected_lane(pipeline: &mut Pipeline, job_id: JobId, completion_critical: bool) -> u64 {
+    let lane_id = Pipeline::next_download_lane_id();
+    pipeline.download_lane_owners.insert(
+        lane_id,
+        DownloadLaneOwner {
+            job_id,
+            mode: DownloadLaneMode::Sequential,
+            completion_critical,
+            server_idx: Some(0),
+            connection: true,
+            ip_replacement: false,
+            outstanding: HashMap::new(),
+        },
+    );
+    pipeline.active_download_connections = 1;
+    *pipeline
+        .active_download_connections_by_job
+        .entry(job_id)
+        .or_default() = 1;
+    if completion_critical {
+        pipeline.book_completion_critical_connection(job_id);
+    }
+    lane_id
 }
 
 /// The park this whole change exists to remove: the queue head is one volume
@@ -72,7 +100,7 @@ async fn lane_refill_crosses_a_priority_boundary_instead_of_parking() {
     )
     .await;
 
-    let compatibility = split_queue_priorities(&mut pipeline, job_id, 10, 11);
+    split_queue_priorities(&mut pipeline, job_id, 10, 11);
     let queued_before = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
     let parked_before = pipeline
         .metrics
@@ -80,11 +108,7 @@ async fn lane_refill_crosses_a_priority_boundary_instead_of_parking() {
         .load(Ordering::Relaxed);
 
     let (response_tx, response_rx) = oneshot::channel();
-    pipeline.handle_download_lane_refill_request(refill_request(
-        job_id,
-        compatibility,
-        response_tx,
-    ));
+    pipeline.handle_download_lane_refill_request(refill_request(response_tx));
 
     let response = response_rx.await.unwrap();
     let lease = response
@@ -106,13 +130,31 @@ async fn lane_refill_crosses_a_priority_boundary_instead_of_parking() {
     assert!(pipeline.jobs.get(&job_id).unwrap().download_queue.len() < queued_before);
 }
 
-/// Stage two: the head's exclude set differs from the lane's batch, but this
-/// lane's own server is not in it, so the lane can serve the work and the
-/// lease is re-cut around it rather than refused.
+/// Work another server failed is still this lane's to fetch, and the lease it
+/// comes back in says so in two separate places: the failure ledger sees only
+/// the job's retention exclusions, while the lane's dial is pinned to the one
+/// server the handout was cut for.
 #[tokio::test]
 async fn lane_refill_takes_head_work_its_own_server_can_serve() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(NntpClient::new(NntpClientConfig {
+        servers: (0..3)
+            .map(|idx| weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    host: format!("server{idx}.example.invalid"),
+                    port: 119,
+                    tls: false,
+                    ..Default::default()
+                },
+                max_connections: 2,
+                ..Default::default()
+            })
+            .collect(),
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(1),
+    }));
     let job_id = JobId(41002);
     insert_active_job(
         &mut pipeline,
@@ -124,11 +166,10 @@ async fn lane_refill_takes_head_work_its_own_server_can_serve() {
     )
     .await;
 
-    let compatibility = {
+    {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         let mut works = state.download_queue.drain_all();
-        let lane_sample = works.pop().unwrap();
-        let compatibility = DownloadBatchCompatibility::from_work(&lane_sample);
+        works.pop().unwrap();
         for work in &mut works {
             // Another server failed these; server 0 — this lane — still may.
             work.exclude_servers = vec![1];
@@ -136,34 +177,33 @@ async fn lane_refill_takes_head_work_its_own_server_can_serve() {
         for work in works {
             state.download_queue.push(work);
         }
-        compatibility
-    };
-    assert!(compatibility.exclude_servers.is_empty());
+    }
 
     let (response_tx, response_rx) = oneshot::channel();
-    pipeline.handle_download_lane_refill_request(refill_request(
-        job_id,
-        compatibility,
-        response_tx,
-    ));
+    pipeline.handle_download_lane_refill_request(refill_request(response_tx));
 
     let response = response_rx.await.unwrap();
     let lease = response
         .lease
         .expect("work this lane's server can fetch must not park it");
     assert!(!lease.works.is_empty());
-    assert_eq!(
-        lease.compatibility.exclude_servers,
-        vec![1],
-        "the lease is re-cut around the work it actually carries, so results \
-         book their failures against the right exclude set"
-    );
     assert!(
         !lease
             .works
             .iter()
             .any(|work| work.exclude_servers.contains(&0))
     );
+    assert!(
+        lease.effective_exclude_servers.is_empty(),
+        "the ledger's exclusions are the job's retention rules, and this job \
+         has none; one server's failures belong to the works that carry them"
+    );
+    assert_eq!(
+        lease.dial_exclude_servers,
+        vec![1, 2],
+        "the handout was cut for server 0, so the lane may dial nowhere else"
+    );
+    assert_eq!(lease.server_modes, vec![(0, DownloadLaneMode::Sequential)]);
 }
 
 /// A park frees a connection immediately. Dispatch has to see that in the same
@@ -197,7 +237,6 @@ async fn a_parked_lane_wakes_dispatch_without_a_loop_turn() {
         lane_id: 0,
         job_id,
         mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         completion_critical: false,
         reason: LaneParkReason::NoWork,
         release_connection_slot: true,
@@ -218,7 +257,6 @@ async fn a_parked_lane_wakes_dispatch_without_a_loop_turn() {
         lane_id: 0,
         job_id,
         mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         completion_critical: false,
         reason: LaneParkReason::NoWork,
         release_connection_slot: false,
@@ -287,97 +325,28 @@ async fn lane_depth_gauges_never_wrap_below_zero() {
     );
 }
 
-/// A refill ignores the group a lane was leased for only while the server has
-/// not proven it needs one selected. Once it has, the connection was opened
-/// with GROUP and may not be handed an article the selection does not cover.
-#[tokio::test]
-async fn refill_asks_about_groups_only_on_a_server_that_needs_a_selected_group() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(41005);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec("Group Gate", &many_standalone_files("group-gate", 2)),
-    )
-    .await;
-
-    let mut works = pipeline
-        .jobs
-        .get_mut(&job_id)
-        .unwrap()
-        .download_queue
-        .drain_all();
-    let lane_sample = works.pop().unwrap();
-    let compatibility = DownloadBatchCompatibility::from_work(&lane_sample);
-    let mut other_group = works.pop().unwrap();
-    other_group.priority = lane_sample.priority + 1;
-    other_group.groups = Arc::from(vec!["alt.binaries.elsewhere".to_string()]);
-    assert_ne!(other_group.groups, compatibility.groups);
-
-    let free = DownloadBatchSelector::new(
-        &compatibility,
-        DownloadBatchRule::Refill {
-            match_groups: false,
-        },
-    );
-    assert!(
-        free.matches(&other_group),
-        "a message-id fetch needs no group, so an ordinary server refills across them"
-    );
-
-    let gated = DownloadBatchSelector::new(
-        &compatibility,
-        DownloadBatchRule::Refill { match_groups: true },
-    );
-    assert!(
-        !gated.matches(&other_group),
-        "a server that needs GROUP keeps the refill inside the selected group"
-    );
-    let mut same_group = other_group;
-    same_group.groups = compatibility.groups.clone();
-    assert!(
-        gated.matches(&same_group),
-        "priority still does not gate the refill even when groups do"
-    );
-    assert!(
-        !DownloadBatchSelector::initial(&compatibility).matches(&same_group),
-        "the initial rule is the one that still asks about priority"
-    );
-}
-
 /// Splits the queue so the completion-critical heap holds `critical` items and
-/// the ordinary heap the rest, and returns the compatibility of an ordinary
-/// work item — the batch a payload lane is carrying.
-fn split_queue_classes(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    critical: usize,
-) -> DownloadBatchCompatibility {
+/// the ordinary heap the rest.
+fn split_queue_classes(pipeline: &mut Pipeline, job_id: JobId, critical: usize) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let mut works = state.download_queue.drain_all();
     assert!(
         works.len() > critical,
         "the class split needs work left over for the payload lane"
     );
-    let lane_sample = works.pop().unwrap();
-    let compatibility = DownloadBatchCompatibility::from_work(&lane_sample);
-    assert!(!compatibility.completion_critical);
     for work in works.iter_mut().take(critical) {
         work.completion_critical = true;
     }
-    works.push(lane_sample);
     for work in works {
         state.download_queue.push(work);
     }
-    compatibility
 }
 
 /// An established connection changes class rather than parking.
 ///
-/// Completion-critical work leads the queue because something downstream is
-/// waiting on it, and a lane that already holds an authenticated connection is
-/// the cheapest way to fetch it — cheaper than the park, the dropped socket
+/// Completion-critical work leads its job's queue because something downstream
+/// is waiting on it, and a lane that already holds an authenticated connection
+/// is the cheapest way to fetch it — cheaper than the park, the dropped socket
 /// and the fresh handshake the class split used to force.
 #[tokio::test]
 async fn lane_refill_changes_class_to_take_completion_critical_work() {
@@ -394,30 +363,34 @@ async fn lane_refill_changes_class_to_take_completion_critical_work() {
     )
     .await;
 
-    let compatibility = split_queue_classes(&mut pipeline, job_id, 2);
+    split_queue_classes(&mut pipeline, job_id, 2);
     // The lane is booked as a payload connection, exactly as dispatch left it.
-    pipeline.active_download_connections = 1;
-    *pipeline
-        .active_download_connections_by_job
-        .entry(job_id)
-        .or_default() = 1;
+    let lane_id = book_connected_lane(&mut pipeline, job_id, false);
 
     let (response_tx, response_rx) = oneshot::channel();
-    pipeline.handle_download_lane_refill_request(refill_request(
-        job_id,
-        compatibility,
-        response_tx,
-    ));
+    pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
 
     let response = response_rx.await.unwrap();
     let lease = response
         .lease
         .expect("critical work this lane can serve must not park it");
     assert!(
-        lease.compatibility.completion_critical,
+        lease.completion_critical,
         "the critical heap leads, so the refill re-opens the lease around it"
     );
-    assert!(lease.works.iter().all(|work| work.completion_critical));
+    assert_eq!(
+        lease
+            .works
+            .iter()
+            .filter(|work| work.completion_critical)
+            .count(),
+        2,
+        "the job's whole critical heap comes out in this handout"
+    );
+    assert!(
+        lease.works[..2].iter().all(|work| work.completion_critical),
+        "and it leads: no ordinary article is handed out ahead of it"
+    );
     assert_eq!(
         pipeline.active_completion_critical_connections, 1,
         "the connection is now counted under the class it is running"
@@ -453,23 +426,17 @@ async fn a_lane_that_changes_class_back_releases_the_critical_booking() {
     )
     .await;
 
-    let mut critical = split_queue_classes(&mut pipeline, job_id, 0);
-    critical.completion_critical = true;
-    pipeline.active_download_connections = 1;
-    pipeline.active_completion_critical_connections = 1;
-    *pipeline
-        .active_completion_critical_connections_by_job
-        .entry(job_id)
-        .or_default() = 1;
+    split_queue_classes(&mut pipeline, job_id, 0);
+    let lane_id = book_connected_lane(&mut pipeline, job_id, true);
 
     let (response_tx, response_rx) = oneshot::channel();
-    pipeline.handle_download_lane_refill_request(refill_request(job_id, critical, response_tx));
+    pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
 
     let response = response_rx.await.unwrap();
     let lease = response
         .lease
         .expect("the job still has ordinary payload for this lane");
-    assert!(!lease.compatibility.completion_critical);
+    assert!(!lease.completion_critical);
     assert_eq!(pipeline.active_completion_critical_connections, 0);
     assert!(
         !pipeline
@@ -478,99 +445,12 @@ async fn a_lane_that_changes_class_back_releases_the_critical_booking() {
     );
 }
 
-/// The yield exists to get a connection to completion-critical work. When the
-/// lane asking for a refill can serve that work itself, the demand is met here
-/// and there is nothing to yield — no park, no dropped socket, no redial.
+/// A lane belongs to a server, not to the job it last carried. When the job it
+/// was leased for is behind another in dispatch order, its next articles come
+/// from the hot job: the alternative is an authenticated connection sitting
+/// idle beside a queue it is allowed to fetch from.
 #[tokio::test]
-async fn a_requested_yield_hands_the_lane_critical_work_instead_of_parking_it() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(41012);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec("Yield To Critical", &many_standalone_files("yield-crit", 6)),
-    )
-    .await;
-
-    let compatibility = split_queue_classes(&mut pipeline, job_id, 2);
-    // The signal belongs to a running dispatch period: opening a new one is
-    // what clears it, so the lane must arrive while this job is already hot.
-    pipeline.hot_dispatch_job = Some(job_id);
-    pipeline.hot_share_yield_signal.request();
-    let parked_before = pipeline
-        .metrics
-        .download_lane_refill_parked_total
-        .load(Ordering::Relaxed);
-
-    let (response_tx, response_rx) = oneshot::channel();
-    pipeline.handle_download_lane_refill_request(refill_request(
-        job_id,
-        compatibility,
-        response_tx,
-    ));
-
-    let response = response_rx.await.unwrap();
-    let lease = response.lease.expect("the yield is served by this lane");
-    assert!(lease.compatibility.completion_critical);
-    assert_eq!(
-        pipeline
-            .metrics
-            .download_lane_refill_parked_total
-            .load(Ordering::Relaxed),
-        parked_before,
-        "a lane that can serve the critical demand must not park to make room \
-         for itself"
-    );
-}
-
-/// With no critical work for this lane to take, the yield still does what it
-/// says: the ordinary payload goes back to the queue untouched and the
-/// connection is returned to the dispatcher.
-#[tokio::test]
-async fn a_requested_yield_still_parks_when_no_critical_work_is_servable() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(41013);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec(
-            "Yield Without Critical",
-            &many_standalone_files("yield-none", 5),
-        ),
-    )
-    .await;
-
-    let compatibility = split_queue_classes(&mut pipeline, job_id, 0);
-    pipeline.hot_dispatch_job = Some(job_id);
-    pipeline.hot_share_yield_signal.request();
-    let queued_before = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
-
-    let (response_tx, response_rx) = oneshot::channel();
-    pipeline.handle_download_lane_refill_request(refill_request(
-        job_id,
-        compatibility,
-        response_tx,
-    ));
-
-    let response = response_rx.await.unwrap();
-    assert!(response.lease.is_none());
-    assert_eq!(response.park_reason, LaneParkReason::HotShareYield);
-    assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
-        queued_before,
-        "the payload the refill had taken goes back to the queue whole"
-    );
-}
-
-/// Changing down is the hot job's privilege. A critical lane belongs to no
-/// job's share while it carries critical work; the moment it would carry
-/// ordinary payload it is a payload lane of that job, and a job that is not
-/// hot gets its payload lanes from the dispatch pass's spillover rules, never
-/// by keeping a connection it was handed for something else.
-#[tokio::test]
-async fn a_critical_lane_of_a_job_that_is_not_hot_parks_instead_of_changing_down() {
+async fn a_refill_on_a_lane_of_a_job_that_is_not_hot_is_answered_from_the_hot_job() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let hot_job_id = JobId(41014);
@@ -590,17 +470,9 @@ async fn a_critical_lane_of_a_job_that_is_not_hot_parks_instead_of_changing_down
         ),
     )
     .await;
+    assert_eq!(pipeline.current_hot_job(), Some(hot_job_id));
 
-    // The other job's critical heap has drained; only its payload is queued.
-    let mut critical = split_queue_classes(&mut pipeline, other_job_id, 0);
-    critical.completion_critical = true;
-    pipeline.hot_dispatch_job = Some(hot_job_id);
-    pipeline.active_download_connections = 1;
-    pipeline.active_completion_critical_connections = 1;
-    *pipeline
-        .active_completion_critical_connections_by_job
-        .entry(other_job_id)
-        .or_default() = 1;
+    let lane_id = book_connected_lane(&mut pipeline, other_job_id, true);
     let queued_before = pipeline
         .jobs
         .get(&other_job_id)
@@ -609,18 +481,16 @@ async fn a_critical_lane_of_a_job_that_is_not_hot_parks_instead_of_changing_down
         .len();
 
     let (response_tx, response_rx) = oneshot::channel();
-    pipeline.handle_download_lane_refill_request(refill_request(
-        other_job_id,
-        critical,
-        response_tx,
-    ));
+    pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
 
     let response = response_rx.await.unwrap();
-    assert!(
-        response.lease.is_none(),
-        "a job that is not hot must not keep a payload lane the dispatch pass never lent it"
+    let lease = response
+        .lease
+        .expect("an established connection is never sent away while work is queued");
+    assert_eq!(
+        lease.job_id, hot_job_id,
+        "the hot job takes every handout on a server it can serve"
     );
-    assert_eq!(response.park_reason, LaneParkReason::NoWork);
     assert_eq!(
         pipeline
             .jobs
@@ -629,11 +499,22 @@ async fn a_critical_lane_of_a_job_that_is_not_hot_parks_instead_of_changing_down
             .download_queue
             .len(),
         queued_before,
-        "its payload stays queued for the spillover rules to place"
+        "and the job the lane came from keeps its queue whole"
     );
     assert_eq!(
-        pipeline.hot_dispatch_job,
-        Some(hot_job_id),
-        "and the hot job keeps the period"
+        pipeline.download_lane_owners[&lane_id].job_id, hot_job_id,
+        "the lane is re-booked against the job it is now carrying"
+    );
+    assert_eq!(
+        pipeline
+            .active_download_connections_by_job
+            .get(&hot_job_id)
+            .copied(),
+        Some(1)
+    );
+    assert!(
+        !pipeline
+            .active_download_connections_by_job
+            .contains_key(&other_job_id)
     );
 }

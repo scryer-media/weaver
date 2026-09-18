@@ -37,10 +37,7 @@ impl Pipeline {
     /// (see `refill_deadline` beside the ring), so one more than that keeps
     /// the cadence at one refill per ring turn without pre-leasing articles
     /// that other lanes of the same job could be fetching now.
-    pub(in crate::pipeline::download::worker) fn download_refill_want(
-        &self,
-        lane_mode: DownloadLaneMode,
-    ) -> usize {
+    pub(in crate::pipeline) fn download_refill_want(&self, lane_mode: DownloadLaneMode) -> usize {
         // A limited link activates its reservations after the lease is
         // finalized; single-article leases let every refill see the updated
         // token balance instead of pre-leasing past it.
@@ -51,7 +48,7 @@ impl Pipeline {
     }
 
     /// The depth a lane on `server_idx` should run at for its next batch.
-    pub(in crate::pipeline::download::worker) fn download_lane_mode_for_server(
+    pub(in crate::pipeline) fn download_lane_mode_for_server(
         &self,
         server_idx: usize,
         pressure: DownloadPressure,
@@ -223,7 +220,6 @@ impl Pipeline {
         let completion_critical = lease.completion_critical;
         let activation_items = Self::activation_items(&lease);
         let progress_article = self.checkpoint_progress_article_for_lease(&lease);
-        let work_count = lease.works.len();
         let recovery_count = lease.works.iter().filter(|work| work.is_recovery).count();
         let booked_works = lease.works.clone();
         match response_tx.send(DownloadLaneRefillResponse {
@@ -251,7 +247,6 @@ impl Pipeline {
                     recovery_count,
                     completion_critical,
                     lane_mode,
-                    work_count,
                     &activation_items,
                     false,
                 );

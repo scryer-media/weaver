@@ -49,11 +49,9 @@ async fn the_first_lease_on_a_pipelining_server_is_already_pipelined() {
     pipeline.seed_download_lane_explorers();
     let pressure = pipeline.refresh_download_pressure();
 
-    let mode = pipeline.choose_download_lane_mode(JobId(1), false, pressure);
-    assert_eq!(mode, DownloadLaneMode::Pipelined { depth: 2 });
     assert_eq!(
-        pipeline.download_lane_server_modes(JobId(1), false, pressure,),
-        vec![(0, DownloadLaneMode::Pipelined { depth: 2 })]
+        pipeline.download_lane_mode_for_server(0, pressure, true),
+        DownloadLaneMode::Pipelined { depth: 2 }
     );
 }
 
@@ -71,7 +69,7 @@ async fn a_proven_depth_seeds_the_first_lease() {
     let pressure = pipeline.refresh_download_pressure();
 
     assert_eq!(
-        pipeline.choose_download_lane_mode(JobId(1), false, pressure,),
+        pipeline.download_lane_mode_for_server(0, pressure, true),
         DownloadLaneMode::Pipelined { depth: 8 }
     );
 }
@@ -103,9 +101,14 @@ async fn a_server_without_a_known_capability_is_seeded_sequential() {
     pipeline.seed_download_lane_explorers();
     let pressure = pipeline.refresh_download_pressure();
 
-    let modes = pipeline.download_lane_server_modes(JobId(1), false, pressure);
-    let mut modes = modes;
-    modes.sort_by_key(|(server_idx, _)| *server_idx);
+    let modes: Vec<(usize, DownloadLaneMode)> = (0..3)
+        .map(|server_idx| {
+            (
+                server_idx,
+                pipeline.download_lane_mode_for_server(server_idx, pressure, true),
+            )
+        })
+        .collect();
     assert_eq!(
         modes,
         vec![
@@ -114,11 +117,11 @@ async fn a_server_without_a_known_capability_is_seeded_sequential() {
             (2, DownloadLaneMode::Pipelined { depth: 4 }),
         ]
     );
-    // The lease mode is the deepest any server can run; the per-server lookup
-    // is what holds the other two down.
+    // A lane whose own connection never negotiated pipelining runs sequential
+    // whatever its server's explorer says.
     assert_eq!(
-        pipeline.choose_download_lane_mode(JobId(1), false, pressure,),
-        DownloadLaneMode::Pipelined { depth: 4 }
+        pipeline.download_lane_mode_for_server(2, pressure, false),
+        DownloadLaneMode::Sequential
     );
 }
 
@@ -164,10 +167,9 @@ async fn reseeding_carries_a_surviving_servers_measurements_across() {
     pipeline.seed_download_lane_explorers();
     let pressure = pipeline.refresh_download_pressure();
 
-    let modes = pipeline.download_lane_server_modes(JobId(1), false, pressure);
-    let by_stable_id: std::collections::HashMap<u32, DownloadLaneMode> = modes
-        .into_iter()
-        .map(|(server_idx, mode)| {
+    let by_stable_id: std::collections::HashMap<u32, DownloadLaneMode> = (0..2)
+        .map(|server_idx| {
+            let mode = pipeline.download_lane_mode_for_server(server_idx, pressure, true);
             let stable_id = pipeline
                 .nntp
                 .pool()

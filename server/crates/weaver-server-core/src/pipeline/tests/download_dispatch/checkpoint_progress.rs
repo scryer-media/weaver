@@ -11,7 +11,6 @@ async fn checkpoint_deadline_is_consumed_when_capacity_pressure_or_pause_bypasse
     )
     .await;
     pipeline.dispatch_downloads();
-    pipeline.hot_dispatch_underfill_since = Some(Instant::now() - Duration::from_secs(30));
     for _ in 0..4 {
         pipeline.dispatch_downloads();
     }
@@ -148,14 +147,11 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     let (response_tx, response_rx) = oneshot::channel();
     pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
         lane_id: old_id,
-        job_id: HOT,
         runtime_generation: pipeline.pool_generation,
         server_idx: 0,
         remote_ip: Some("127.0.0.1".parse().unwrap()),
         supports_pipelining: true,
         current_mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
-        compatibility: DownloadBatchCompatibility::from_work(&original),
         response_tx,
     });
     assert!(response_rx.await.unwrap().lease.is_none());
@@ -173,7 +169,6 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
         lane_id: old_id,
         job_id: HOT,
         mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         completion_critical: false,
         reason: LaneParkReason::Error,
         release_connection_slot: true,
@@ -272,14 +267,11 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
         let (response_tx, response_rx) = oneshot::channel();
         pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
             lane_id,
-            job_id: HOT,
             runtime_generation: pipeline.pool_generation,
             server_idx: 0,
             remote_ip: Some("127.0.0.1".parse().unwrap()),
             supports_pipelining: true,
             current_mode: DownloadLaneMode::Sequential,
-            spillover_loan_kind: None,
-            compatibility: DownloadBatchCompatibility::from_work(&original),
             response_tx,
         });
         assert!(response_rx.await.unwrap().lease.is_none());
@@ -297,7 +289,6 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
             lane_id,
             job_id: HOT,
             mode: DownloadLaneMode::Sequential,
-            spillover_loan_kind: None,
             completion_critical: false,
             reason: LaneParkReason::Error,
             release_connection_slot: true,
@@ -403,8 +394,6 @@ async fn restored_with_parked_retries(temp: &TempDir) -> Pipeline {
     for _ in 0..130 {
         park_one(&mut pipeline, None);
     }
-    pipeline.hot_dispatch_job = Some(HOT);
-    pipeline.hot_dispatch_started_at = Some(Instant::now() - Duration::from_secs(30));
     pipeline
 }
 
@@ -428,7 +417,7 @@ fn park_one(pipeline: &mut Pipeline, delay: Option<Duration>) {
 }
 
 #[tokio::test]
-async fn checkpoint_progress_breaks_parked_retry_cycle_and_lends_connections() {
+async fn checkpoint_progress_breaks_parked_retry_cycle_and_spills_to_a_peer() {
     let temp = tempfile::tempdir().unwrap();
     let mut pipeline = restored_with_parked_retries(&temp).await;
     insert_active_job(
@@ -443,7 +432,6 @@ async fn checkpoint_progress_breaks_parked_retry_cycle_and_lends_connections() {
     assert_eq!(pipeline.infrastructure_retries.len(), 130);
     assert_eq!(pipeline.infrastructure_retries.next_deadline(), None);
     assert!(!pipeline.job_has_dispatchable_work_for_test(HOT));
-    pipeline.hot_dispatch_underfill_since = Some(Instant::now() - Duration::from_secs(30));
     for _ in 0..3 {
         pipeline.dispatch_downloads();
     }
@@ -465,35 +453,21 @@ async fn checkpoint_progress_breaks_parked_retry_cycle_and_lends_connections() {
 }
 
 #[tokio::test]
-async fn checkpoint_progress_is_single_article_on_initial_refill_and_trial_paths() {
+async fn checkpoint_progress_is_single_article_on_every_handout() {
     let temp = tempfile::tempdir().unwrap();
     let mut pipeline = restored_with_parked_retries(&temp).await;
-    let pressure = pipeline.refresh_download_pressure();
     let queued = pipeline.jobs[&HOT].download_queue.len();
-    // Trials need multiple samples. A failed trial must return its one allowed
-    // article, rather than spending or multiplying the progress allowance.
-    assert!(
-        pipeline
-            .try_lease_ip_replacement_trial_batch_for_test(HOT, 0)
-            .is_none()
-    );
-    assert_eq!(pipeline.jobs[&HOT].download_queue.len(), queued);
-    let mut lease = pipeline
-        .try_lease_initial_download_batch_for_test(HOT, pressure)
-        .unwrap();
+    let mut lease = pipeline.lease_for_server_for_test(0).unwrap();
     assert_eq!(lease.works.len(), 1);
     let work = lease.works.pop().unwrap();
     let initial_id = work.segment_id;
-    let compatibility = DownloadBatchCompatibility::from_work(&work);
     pipeline
         .jobs
         .get_mut(&HOT)
         .unwrap()
         .download_queue
         .push(work);
-    let mut refill = pipeline
-        .try_lease_refill_download_batch_for_test(HOT, compatibility, pressure)
-        .unwrap();
+    let mut refill = pipeline.lease_for_server_for_test(0).unwrap();
     assert_eq!(refill.works.len(), 1);
     let work = refill.works.pop().unwrap();
     let id = work.segment_id;
@@ -505,7 +479,6 @@ async fn checkpoint_progress_is_single_article_on_initial_refill_and_trial_paths
         1,
         "the initial article is preserved across rollback and refill"
     );
-    let compatibility = DownloadBatchCompatibility::from_work(&work);
     let remaining = pipeline.jobs[&HOT].download_queue.len();
 
     // Every stage between activation and actor consumption must reserve the
@@ -535,21 +508,7 @@ async fn checkpoint_progress_is_single_article_on_initial_refill_and_trial_paths
             !pipeline.job_has_dispatchable_work_for_test(HOT),
             "stage {stage}"
         );
-        assert!(
-            pipeline
-                .try_lease_initial_download_batch_for_test(HOT, pressure)
-                .is_none()
-        );
-        assert!(
-            pipeline
-                .try_lease_refill_download_batch_for_test(HOT, compatibility.clone(), pressure)
-                .is_none()
-        );
-        assert!(
-            pipeline
-                .try_lease_ip_replacement_trial_batch_for_test(HOT, 0)
-                .is_none()
-        );
+        assert!(pipeline.lease_for_server_for_test(0).is_none());
         assert_eq!(pipeline.jobs[&HOT].download_queue.len(), remaining);
         let snapshot = pipeline.diagnostics_snapshot();
         assert_eq!(
@@ -574,9 +533,7 @@ async fn checkpoint_progress_is_single_article_on_initial_refill_and_trial_paths
     // connection ownership and parked retries do not advance durability.
     pipeline.active_download_connections = 4;
     pipeline.active_download_connections_by_job.insert(HOT, 4);
-    let cached_refill = pipeline
-        .try_lease_refill_download_batch_for_test(HOT, compatibility, pressure)
-        .unwrap();
+    let cached_refill = pipeline.lease_for_server_for_test(0).unwrap();
     assert_eq!(cached_refill.works.len(), 1);
     for work in cached_refill.works {
         pipeline
@@ -597,12 +554,10 @@ async fn checkpoint_progress_is_single_article_on_initial_refill_and_trial_paths
     pipeline
         .persisted_file_progress
         .insert(id.file_id, pipeline.jobs[&HOT].downloaded_bytes);
-    let normal = pipeline
-        .try_lease_initial_download_batch_for_test(HOT, pressure)
-        .unwrap();
+    let normal = pipeline.lease_for_server_for_test(0).unwrap();
     assert!(
         normal.works.len() > 1,
-        "durability catch-up restores ordinary batching"
+        "durability catch-up restores ordinary handouts"
     );
     assert!(normal.works.iter().all(|work| work.retry_count == 0));
     assert_eq!(pipeline.pending_retries_by_job.get(&HOT), Some(&130));
@@ -626,11 +581,10 @@ async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
         .metrics
         .write_buffered_bytes
         .store(0, Ordering::Relaxed);
-    let pressure = pipeline.refresh_download_pressure();
     pipeline.active_decodes_by_job.insert(HOT, 1);
     assert!(!pipeline.job_has_dispatchable_work_for_test(HOT));
     // Model promoted recovery behind a blocked critical primary article.
-    // Recovery is exempt from the durable-lead gate, including on refill class changes.
+    // Recovery is exempt from the durable-lead gate.
     let mut recovery = pipeline
         .jobs
         .get_mut(&HOT)
@@ -638,7 +592,6 @@ async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
         .download_queue
         .pop_first_matching(|_| true)
         .unwrap();
-    let payload_compatibility = DownloadBatchCompatibility::from_work(&recovery);
     recovery.is_recovery = true;
     recovery.completion_critical = true;
     let queue = &mut pipeline.jobs.get_mut(&HOT).unwrap().download_queue;
@@ -659,9 +612,7 @@ async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
         "blocked payload remains ahead of recovery in the queue"
     );
     assert!(pipeline.job_has_dispatchable_work_for_test(HOT));
-    let lease = pipeline
-        .try_lease_refill_download_batch_for_test(HOT, payload_compatibility, pressure)
-        .unwrap();
+    let lease = pipeline.lease_for_server_for_test(0).unwrap();
     assert_eq!(lease.works.len(), 1);
     assert!(lease.works[0].is_recovery);
     assert!(lease.works[0].completion_critical);
@@ -792,17 +743,10 @@ async fn checkpoint_progress_waits_for_result_even_when_durability_catches_up() 
     };
     pipeline.release_download_result(&result);
     pipeline.note_released_download_result_pending(HOT, 0);
-    let pressure = pipeline.refresh_download_pressure();
-    assert!(
-        pipeline
-            .try_lease_initial_download_batch_for_test(HOT, pressure)
-            .is_none()
-    );
+    assert!(pipeline.lease_for_server_for_test(0).is_none());
     pipeline.process_released_download_done(result).await;
     assert!(!pipeline.checkpoint_progress_articles.contains_key(&HOT));
-    let lease = pipeline
-        .try_lease_initial_download_batch_for_test(HOT, pressure)
-        .unwrap();
+    let lease = pipeline.lease_for_server_for_test(0).unwrap();
     assert!(lease.works.len() > 1);
     assert_eq!(pipeline.pending_retries_by_job[&HOT], 131);
     assert_eq!(

@@ -114,7 +114,6 @@ async fn par2_metadata_bootstrap_defers_payload_until_checkpoint_plan_is_known()
         ],
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
-    let pressure = pipeline.refresh_download_pressure();
     let grid64_id = grid64.recovery_set_id;
     let grid96_id = grid96.recovery_set_id;
     let index64_priority = pipeline
@@ -126,26 +125,26 @@ async fn par2_metadata_bootstrap_defers_payload_until_checkpoint_plan_is_known()
         .expect("the first explicit index must be the ordinary queue head")
         .priority;
 
-    let index64_lease = pipeline
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
-        .expect("the first explicit index must lease first");
-    assert_eq!(index64_lease.works.len(), 1);
+    let index_lease = pipeline
+        .lease_for_server_for_test(0)
+        .expect("the explicit indexes must lease first");
+    assert_eq!(index_lease.works.len(), 2);
     assert!(matches!(
-        index64_lease.checkpoint_plan,
+        index_lease.checkpoint_plan,
         weaver_yenc::CheckpointPlan::None
     ));
     assert!(
-        index64_lease
+        index_lease
             .works
             .iter()
-            .all(|work| work.segment_id.file_id.file_index == 0)
+            .all(|work| work.segment_id.file_id.file_index < 2),
+        "the bootstrap claims the indexes, never the payload"
     );
     assert!(
-        !index64_lease.compatibility.is_recovery
-            && index64_lease
-                .works
-                .iter()
-                .all(|work| !work.is_recovery && work.priority == index64_priority),
+        index_lease
+            .works
+            .iter()
+            .all(|work| !work.is_recovery && work.priority == index64_priority),
         "explicit indexes must retain primary lane and accounting classification"
     );
 
@@ -175,41 +174,10 @@ async fn par2_metadata_bootstrap_defers_payload_until_checkpoint_plan_is_known()
             }),
             7
         );
-        assert_eq!(
-            state
-                .download_queue
-                .peek_next_matching(|_| true)
-                .map(|work| work.segment_id.file_id.file_index),
-            Some(1),
-            "metadata promotion must preserve the explicit index's primary priority"
-        );
     }
 
-    let index96_lease = pipeline
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
-        .expect("the second explicit index must lease before the payload");
-    assert_eq!(index96_lease.works.len(), 1);
-    assert!(matches!(
-        index96_lease.checkpoint_plan,
-        weaver_yenc::CheckpointPlan::Single(_)
-    ));
     assert!(
-        index96_lease
-            .works
-            .iter()
-            .all(|work| work.segment_id.file_id.file_index == 1)
-    );
-    assert!(
-        index96_lease
-            .works
-            .iter()
-            .all(|work| !work.is_recovery && work.priority == index64_priority)
-    );
-
-    assert!(
-        pipeline
-            .try_lease_initial_download_batch_for_test(job_id, pressure)
-            .is_none(),
+        pipeline.lease_for_server_for_test(0).is_none(),
         "payload work must wait for PAR2 metadata instead of receiving a stale None plan"
     );
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 7);
@@ -230,7 +198,7 @@ async fn par2_metadata_bootstrap_defers_payload_until_checkpoint_plan_is_known()
     assert!(pipeline.par2_metadata_discovery_closed(job_id));
 
     let payload_lease = pipeline
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .lease_for_server_for_test(0)
         .expect("payload work must lease after both grids are known");
     assert!(
         !payload_lease.works.is_empty(),
@@ -334,11 +302,10 @@ async fn par2_metadata_bootstrap_claims_every_explicit_index_in_one_primary_batc
             state.download_queue.push(work);
         }
     }
-    pipeline.hot_dispatch_job = Some(job_id);
-    let pressure = pipeline.refresh_download_pressure();
+    assert_eq!(pipeline.current_hot_job(), Some(job_id));
 
     let lease = pipeline
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .lease_for_server_for_test(0)
         .expect("same-priority explicit indexes must batch");
     assert_eq!(lease.works.len(), 2);
     assert!(
@@ -370,9 +337,7 @@ async fn par2_metadata_bootstrap_claims_every_explicit_index_in_one_primary_batc
         .unwrap();
     for _ in 0..2 {
         assert!(
-            pipeline
-                .try_lease_initial_download_batch_for_test(job_id, pressure)
-                .is_none(),
+            pipeline.lease_for_server_for_test(0).is_none(),
             "in-flight indexes keep compatible payload work behind the gate"
         );
     }
@@ -487,11 +452,9 @@ async fn par2_metadata_bootstrap_blocks_compatible_payload_refill_until_plan_is_
             state.download_queue.push(work);
         }
     }
-    let pressure = pipeline.refresh_download_pressure();
-
     let index_lease = pipeline
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
-        .expect("the explicit index must establish the primary compatibility");
+        .lease_for_server_for_test(0)
+        .expect("the explicit index leads its job's queue");
     assert!(
         index_lease
             .works
@@ -499,14 +462,8 @@ async fn par2_metadata_bootstrap_blocks_compatible_payload_refill_until_plan_is_
             .all(|work| work.segment_id.file_id.file_index == 0)
     );
     assert!(
-        pipeline
-            .try_lease_refill_download_batch_for_test(
-                job_id,
-                index_lease.compatibility.clone(),
-                pressure,
-            )
-            .is_none(),
-        "an open bootstrap must requeue a compatible payload refill"
+        pipeline.lease_for_server_for_test(0).is_none(),
+        "an open bootstrap must leave the payload behind it"
     );
     assert_eq!(
         pipeline
@@ -537,7 +494,7 @@ async fn par2_metadata_bootstrap_blocks_compatible_payload_refill_until_plan_is_
     pipeline.refresh_par2_checkpoint_plan(job_id);
 
     let payload_refill = pipeline
-        .try_lease_refill_download_batch_for_test(job_id, index_lease.compatibility, pressure)
+        .lease_for_server_for_test(0)
         .expect("the payload refill must resume once the plan is published");
     assert!(
         payload_refill
@@ -552,7 +509,7 @@ async fn par2_metadata_bootstrap_blocks_compatible_payload_refill_until_plan_is_
 }
 
 #[tokio::test]
-async fn par2_metadata_bootstrap_blocks_compatible_ip_replacement_trial_payloads() {
+async fn par2_metadata_bootstrap_keeps_equal_priority_payload_out_of_the_handout() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -621,11 +578,15 @@ async fn par2_metadata_bootstrap_blocks_compatible_ip_replacement_trial_payloads
         }
     }
 
+    let lease = pipeline
+        .lease_for_server_for_test(0)
+        .expect("the index itself is servable while its bootstrap is open");
     assert!(
-        pipeline
-            .try_lease_ip_replacement_trial_batch_for_test(job_id, 0)
-            .is_none(),
-        "an IP trial must not build its sample from an open index plus ordinary payloads"
+        lease
+            .works
+            .iter()
+            .all(|work| work.segment_id.file_id.file_index == 0),
+        "the bootstrap claims the queue, so no payload rides out beside the index"
     );
     assert_eq!(
         pipeline
@@ -635,7 +596,7 @@ async fn par2_metadata_bootstrap_blocks_compatible_ip_replacement_trial_payloads
             .download_queue
             .count_matching(|work| work.segment_id.file_id.file_index == 1),
         4,
-        "all compatible payload samples must remain queued"
+        "every equal-priority payload article stays queued"
     );
     assert!(matches!(
         pipeline.par2_discovery_state_for_candidate(job_id, 0),
@@ -692,20 +653,18 @@ async fn par2_metadata_bootstrap_releases_payload_after_an_explicit_index_is_una
         ],
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
-    let pressure = pipeline.refresh_download_pressure();
 
     let index_lease = pipeline
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .lease_for_server_for_test(0)
         .expect("the explicit index must lease before the payload");
     assert!(
-        !index_lease.compatibility.is_recovery
-            && index_lease.works.iter().all(|work| !work.is_recovery),
+        index_lease.works.iter().all(|work| !work.is_recovery),
         "the unavailable callback must track an explicit primary index"
     );
     pipeline.mark_promoted_recovery_segment_unavailable(index_lease.works[0].segment_id);
 
     let payload_lease = pipeline
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .lease_for_server_for_test(0)
         .expect("terminally unavailable metadata must not leave payload blocked forever");
     assert!(
         payload_lease
@@ -783,10 +742,9 @@ async fn par2_metadata_bootstrap_does_not_hold_payload_for_late_indexless_discov
         ],
     };
     insert_active_job(&mut pipeline, job_id, spec).await;
-    let pressure = pipeline.refresh_download_pressure();
 
     let index_lease = pipeline
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .lease_for_server_for_test(0)
         .expect("the explicit index must lease first");
     assert!(
         index_lease
@@ -814,14 +772,13 @@ async fn par2_metadata_bootstrap_does_not_hold_payload_for_late_indexless_discov
     pipeline.refresh_par2_checkpoint_plan(job_id);
 
     let payload_lease = pipeline
-        .try_lease_initial_download_batch_for_test(job_id, pressure)
+        .lease_for_server_for_test(0)
         .expect("a late indexless candidate must not become a payload barrier");
     assert!(
-        !payload_lease.compatibility.is_recovery
-            && payload_lease
-                .works
-                .iter()
-                .all(|work| { work.segment_id.file_id.file_index == 2 && !work.is_recovery }),
+        payload_lease
+            .works
+            .iter()
+            .all(|work| { work.segment_id.file_id.file_index == 2 && !work.is_recovery }),
         "the known explicit grid must flow into the payload lease"
     );
     assert!(matches!(
@@ -849,9 +806,10 @@ async fn par2_metadata_bootstrap_does_not_hold_payload_for_late_indexless_discov
 /// Recovery used to be pushed onto the async pool and pinned to sequential
 /// mode: the work a job is *waiting on* to finish paid a cold dial and gave
 /// back the round trip pipelining exists to hide. A recovery lease is now an
-/// ordinary lease as far as lane selection and depth are concerned.
+/// ordinary lease as far as lane selection and depth are concerned: depth is a
+/// property of the server the lane sits on, and nothing reads the class.
 #[tokio::test]
-async fn a_recovery_lease_takes_an_owned_lane_at_the_ordinary_depth() {
+async fn a_recovery_lease_takes_an_owned_lane() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(40143);
@@ -889,16 +847,15 @@ async fn a_recovery_lease_takes_an_owned_lane_at_the_ordinary_depth() {
         exclude_servers: Vec::new(),
         avoid_server: None,
     };
-    let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
         lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         server_modes: Vec::new(),
-        compatibility,
+        completion_critical: work.completion_critical,
         effective_exclude_servers: Vec::new(),
+        dial_exclude_servers: Vec::new(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -907,15 +864,6 @@ async fn a_recovery_lease_takes_an_owned_lane_at_the_ordinary_depth() {
     assert!(
         pipeline.should_use_owned_blocking_lane(&lease),
         "a recovery lease must be eligible for a cached owned lane"
-    );
-
-    let pressure = pipeline.refresh_download_pressure();
-    let ordinary = pipeline.choose_download_lane_mode(job_id, false, pressure);
-    let pressure = pipeline.refresh_download_pressure();
-    let recovery = pipeline.choose_download_lane_mode(job_id, true, pressure);
-    assert_eq!(
-        recovery, ordinary,
-        "recovery must not be pinned to a shallower lane than ordinary work"
     );
 }
 
@@ -941,16 +889,15 @@ async fn recovery_async_handoff_keeps_owned_lane_caches() {
         exclude_servers: Vec::new(),
         avoid_server: None,
     };
-    let compatibility = DownloadBatchCompatibility::from_work(&work);
     let lease = DownloadBatchLease {
         lane_id: 0,
         job_id: work.segment_id.file_id.job_id,
         runtime_generation: pipeline.pool_generation,
         lane_mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         server_modes: Vec::new(),
-        compatibility,
+        completion_critical: work.completion_critical,
         effective_exclude_servers: Vec::new(),
+        dial_exclude_servers: Vec::new(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works: vec![work],
@@ -965,101 +912,44 @@ async fn recovery_async_handoff_keeps_owned_lane_caches() {
     );
 }
 
+/// One refill carries a lane two ring turns, and no more.
+///
+/// The worker asks again once its pending tail falls to `2 * depth + 1`, so a
+/// handout one deeper than that keeps the cadence at one refill per turn. A
+/// wider handout would pre-lease articles the job's other lanes could be
+/// fetching now, and leave the last lane draining a long tail alone.
 #[tokio::test]
-async fn hot_lease_work_limit_scales_with_lane_throughput() {
+async fn a_refill_handout_is_two_ring_turns_deep() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(40142);
-    let article_bytes: u32 = 768 * 1024;
 
-    // No measured throughput yet: cold-start batch, not the full 64 — the
-    // first dispatch wave must not blind-lease several volumes on a slow link.
     assert_eq!(
-        pipeline.hot_lease_work_limit(
-            job_id,
-            DownloadLaneMode::Pipelined { depth: 4 },
-            article_bytes
-        ),
-        16
-    );
-
-    // 120MB/s across 10 lanes -> 12MB/s per lane -> 2s runway is ~30 articles.
-    pipeline
-        .active_download_connections_by_job
-        .insert(job_id, 10);
-    pipeline
-        .hot_dispatch_throughput_window
-        .record(Instant::now(), 240_000_000);
-    assert_eq!(
-        pipeline.hot_lease_work_limit(
-            job_id,
-            DownloadLaneMode::Pipelined { depth: 4 },
-            article_bytes
-        ),
-        30
-    );
-
-    // 7.5MB/s across 10 lanes -> under one article of runway -> clamp to the
-    // lane's pipeline depth so slow links cycle back to the queue head.
-    pipeline.hot_dispatch_throughput_window.clear();
-    pipeline
-        .hot_dispatch_throughput_window
-        .record(Instant::now(), 15_000_000);
-    assert_eq!(
-        pipeline.hot_lease_work_limit(
-            job_id,
-            DownloadLaneMode::Pipelined { depth: 4 },
-            article_bytes
-        ),
+        pipeline.download_refill_want(DownloadLaneMode::Sequential),
         4
     );
-
-    // The floor is the lane's own depth, so a deeper rung never leases less
-    // than one full pipeline's worth of work.
     assert_eq!(
-        pipeline.hot_lease_work_limit(
-            job_id,
-            DownloadLaneMode::Pipelined { depth: 8 },
-            article_bytes
-        ),
-        8
+        pipeline.download_refill_want(DownloadLaneMode::Pipelined { depth: 4 }),
+        10
     );
     assert_eq!(
-        pipeline.hot_lease_work_limit(job_id, DownloadLaneMode::Sequential, article_bytes),
+        pipeline.download_refill_want(DownloadLaneMode::Pipelined { depth: 8 }),
+        18
+    );
+
+    // A limited link activates its reservations after the lease is finalized,
+    // so every refill has to see the balance the last one left behind.
+    pipeline.rate_limiter.set_rate(1);
+    assert!(pipeline.rate_limiter.is_limited());
+    assert_eq!(
+        pipeline.download_refill_want(DownloadLaneMode::Pipelined { depth: 8 }),
         1
     );
 }
 
-/// Lease one batch per lane the way a dispatch wave does, keeping the two
-/// connection counters the fair-share divisor reads in step with it.
-fn lease_one_wave(pipeline: &mut Pipeline, job_id: JobId, lanes: usize) -> Vec<usize> {
-    let mut leased = Vec::new();
-    for _ in 0..lanes {
-        let pressure = pipeline.refresh_download_pressure();
-        let Some(lease) = pipeline.try_lease_initial_download_batch_for_test(job_id, pressure)
-        else {
-            break;
-        };
-        leased.push(lease.works.len());
-        pipeline.active_download_connections += 1;
-        *pipeline
-            .active_download_connections_by_job
-            .entry(job_id)
-            .or_default() += 1;
-    }
-    leased
-}
-
-/// A job's tail must be split across every lane instead of being handed to
-/// whichever lane leases first.
-///
-/// With a full runway the first lane used to take the whole remainder (up to
-/// 64 articles), so the last lane drained its batch alone at one article per
-/// round trip while the rest of the fleet had already finished. That tail is
-/// invisible at zero latency and costs a large fraction of a second per job
-/// at 100 ms.
+/// A handout is exactly what the lane asked for while the queue can fill it,
+/// and never more — the queue's remainder is left for the other lanes.
 #[tokio::test]
-async fn hot_lease_splits_a_job_tail_across_every_lane() {
+async fn a_handout_is_bounded_by_the_want_not_by_the_queue() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -1080,41 +970,25 @@ async fn hot_lease_splits_a_job_tail_across_every_lane() {
         standalone_job_spec("Lane Tail", &files),
     )
     .await;
-    pipeline.hot_dispatch_job = Some(job_id);
-    // Measured throughput, so the runway limit is the full 64-article batch:
-    // the bound under test must be the fair share, not the cold-start clamp.
-    pipeline
-        .hot_dispatch_throughput_window
-        .record(Instant::now(), 240_000_000);
+    assert_eq!(pipeline.current_hot_job(), Some(job_id));
 
-    let leased = lease_one_wave(&mut pipeline, job_id, 8);
-
-    assert_eq!(leased.len(), 8, "every lane must get work: {leased:?}");
-    assert!(
-        leased.iter().all(|count| *count >= 1),
-        "no lane may lease an empty batch: {leased:?}"
-    );
-    let fair_share = 33usize.div_ceil(8);
-    assert!(
-        leased.iter().all(|count| *count <= fair_share),
-        "no lane may take more than one lane's share of the remainder: {leased:?}"
-    );
-    assert!(
-        leased.iter().sum::<usize>() <= 33,
-        "a wave cannot lease more than the queue holds: {leased:?}"
+    let want = pipeline.download_refill_want(DownloadLaneMode::Sequential);
+    let lease = pipeline
+        .lease_for_server_for_test(0)
+        .expect("the hot job can serve this server");
+    assert_eq!(lease.works.len(), want);
+    assert_eq!(
+        pipeline.jobs[&job_id].download_queue.len(),
+        33 - want,
+        "the rest of the tail stays queued for the lanes behind this one"
     );
 }
 
-/// Promoted work is drained by every parked lane, not by whichever lane the
-/// next dispatch pass happens to start first.
-///
-/// A targeted recovery promotion lands as one burst of completion-critical
-/// work while every lane of the job is parked on `NoWork`. Sized by the
-/// runway alone, the first lane leased the entire promoted set and fetched it
-/// serially; the fair share splits it so the whole fleet drains it in
-/// parallel.
+/// Promoted completion-critical work leads its own job's queue, and is handed
+/// out under the same bound as anything else: a promotion is not a licence for
+/// one lane to take the whole burst.
 #[tokio::test]
-async fn promoted_completion_critical_work_spreads_across_parked_lanes() {
+async fn promoted_completion_critical_work_leads_the_queue_under_the_ordinary_bound() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -1142,25 +1016,28 @@ async fn promoted_completion_critical_work_spreads_across_parked_lanes() {
         .download_queue
         .promote_matching_to_completion_critical_with_rank(|_| Some((0, None)));
     assert_eq!(promoted, 45);
-    pipeline.hot_dispatch_job = Some(job_id);
-    pipeline
-        .hot_dispatch_throughput_window
-        .record(Instant::now(), 240_000_000);
 
     // Every lane of the job is parked: this is the state a promotion wakes.
     assert!(pipeline.active_download_connections_by_job.is_empty());
     assert_eq!(pipeline.active_download_connections, 0);
 
-    let leased = lease_one_wave(&mut pipeline, job_id, 8);
-
+    let want = pipeline.download_refill_want(DownloadLaneMode::Sequential);
+    let mut leased = Vec::new();
+    for _ in 0..8 {
+        let Some(lease) = pipeline.lease_for_server_for_test(0) else {
+            break;
+        };
+        assert!(lease.completion_critical);
+        assert!(lease.works.iter().all(|work| work.completion_critical));
+        leased.push(lease.works.len());
+    }
     assert_eq!(
         leased.len(),
         8,
-        "the promoted set must reach every lane: {leased:?}"
+        "the promoted set reaches every lane: {leased:?}"
     );
-    let fair_share = 45usize.div_ceil(8);
     assert!(
-        leased.iter().all(|count| (1..=fair_share).contains(count)),
+        leased.iter().all(|count| *count == want),
         "no lane may take the whole promoted set: {leased:?}"
     );
 }
@@ -3815,8 +3692,8 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
         DownloadLaneOwner {
             job_id,
             mode: DownloadLaneMode::Sequential,
-            spillover_loan_kind: None,
             completion_critical: false,
+            server_idx: Some(0),
             connection: true,
             ip_replacement: false,
             outstanding: HashMap::from([(
