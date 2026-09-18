@@ -842,7 +842,7 @@ async fn backup_waits_for_queued_database_writes_before_opening_its_snapshot() {
             )
         })
         .unwrap();
-    tokio::task::spawn_blocking(move || started_rx.recv_timeout(std::time::Duration::from_secs(2)))
+    tokio::task::spawn_blocking(move || started_rx.recv())
         .await
         .unwrap()
         .unwrap();

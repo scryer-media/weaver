@@ -82,6 +82,10 @@ impl TunnelProvider for NntpFixture {
         "NNTP review fixture".into()
     }
 }
+/// Route and NNTP timeouts that a test does not exercise, set out of reach of a
+/// slow runner so only the behavior under test can decide the outcome.
+const NOT_UNDER_TEST: Duration = Duration::from_secs(3600);
+
 fn route(modes: &[Mode], timeout: Duration) -> Arc<ConsumerRoute> {
     let runtime = ProxyRuntime::new(
         Database::open_in_memory().unwrap(),
@@ -115,8 +119,8 @@ fn config(route: &Arc<ConsumerRoute>) -> ServerConfig {
         port: 119,
         tls: false,
         proxy: Some(route.bridge().unwrap()),
-        connect_timeout: Duration::from_secs(2),
-        command_timeout: Duration::from_secs(2),
+        connect_timeout: NOT_UNDER_TEST,
+        command_timeout: NOT_UNDER_TEST,
         ..Default::default()
     }
 }
@@ -124,7 +128,7 @@ fn config(route: &Arc<ConsumerRoute>) -> ServerConfig {
 #[tokio::test]
 async fn quit_and_auth_rejection_do_not_cool_a_healthy_route() {
     for mode in [Mode::Healthy, Mode::AuthRejected] {
-        let route = route(&[mode], Duration::from_secs(1));
+        let route = route(&[mode], NOT_UNDER_TEST);
         let mut cfg = config(&route);
         if matches!(mode, Mode::AuthRejected) {
             cfg.username = Some("fixture".into());
@@ -146,7 +150,7 @@ async fn quit_and_auth_rejection_do_not_cool_a_healthy_route() {
 
 #[tokio::test]
 async fn unexpected_nntp_eof_cools_only_the_connection_route_and_retries() {
-    let route = route(&[Mode::Truncated, Mode::Healthy], Duration::from_secs(1));
+    let route = route(&[Mode::Truncated, Mode::Healthy], NOT_UNDER_TEST);
     let mut cfg = NntpClientConfig::single(config(&route), 1);
     cfg.max_retries_per_server = 1;
     let client = NntpClient::new(cfg);
@@ -203,7 +207,7 @@ async fn fallback_establishment_preserves_article_and_lane_soft_budgets() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocking_nntp_reports_unexpected_eof_but_not_quit_or_auth_rejection() {
     for mode in [Mode::Healthy, Mode::AuthRejected, Mode::NoResponse] {
-        let route = route(&[mode], Duration::from_secs(1));
+        let route = route(&[mode], NOT_UNDER_TEST);
         let mut cfg = config(&route);
         if matches!(mode, Mode::AuthRejected) {
             cfg.username = Some("fixture".into());
@@ -236,18 +240,19 @@ async fn blocking_nntp_reports_unexpected_eof_but_not_quit_or_auth_rejection() {
 
 #[tokio::test]
 async fn proxy_budget_does_not_extend_waiting_for_pool_capacity() {
-    let route = route(&[Mode::Healthy], Duration::from_secs(1));
+    let route = route(&[Mode::Healthy], NOT_UNDER_TEST);
     let mut cfg = NntpClientConfig::single(config(&route), 1);
     cfg.soft_timeout = Duration::from_millis(50);
     let client = NntpClient::new(cfg);
     let lease = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
-    let start = Instant::now();
+    // The route budget is an hour, so a pool wait that borrowed it would hang
+    // until the runner ends the test; only the 50 ms soft budget can end this
+    // wait with an acquire timeout.
     let result = client.acquire_body_lane(ServerId(0), &[]).await;
     assert!(matches!(
         result,
         Err(weaver_nntp::NntpError::AcquireTimeout(_))
     ));
-    assert!(start.elapsed() < Duration::from_millis(500));
     drop(lease);
     client.shutdown().await;
     route.revoke().await;
@@ -255,8 +260,8 @@ async fn proxy_budget_does_not_extend_waiting_for_pool_capacity() {
 
 #[tokio::test]
 async fn bridges_have_distinct_secrets_and_cannot_authenticate_each_other() {
-    let first = route(&[Mode::Healthy], Duration::from_secs(1));
-    let second = route(&[Mode::Healthy], Duration::from_secs(1));
+    let first = route(&[Mode::Healthy], NOT_UNDER_TEST);
+    let second = route(&[Mode::Healthy], NOT_UNDER_TEST);
     let a = first.bridge().unwrap();
     let b = second.bridge().unwrap();
     assert_ne!(a.credentials(), b.credentials());

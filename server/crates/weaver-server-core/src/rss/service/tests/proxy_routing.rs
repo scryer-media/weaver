@@ -46,7 +46,9 @@ impl Fixture {
             peer_public_key: None,
             mtu: 1280,
             keepalive_seconds: None,
-            timeout_seconds: 3,
+            // Hop timeouts are not under test here; keep them out of reach of a
+            // slow runner (300 s is the largest a profile accepts).
+            timeout_seconds: 300,
             host_key_fingerprint: None,
             revision: 1,
             secrets: ProxySecrets::default(),

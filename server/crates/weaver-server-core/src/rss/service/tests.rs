@@ -29,11 +29,19 @@ struct TestHttpState {
     nzb_body: Vec<u8>,
     etag: Option<String>,
     require_auth: bool,
-    feed_delay_ms: u64,
+    feed_hold: Option<Arc<FeedHold>>,
     feed_requests: Arc<AtomicUsize>,
     nzb_requests: Arc<AtomicUsize>,
     auth_failures: Arc<AtomicUsize>,
     conditional_hits: Arc<AtomicUsize>,
+}
+
+/// Parks the feed response until the test releases it, so a test can act while
+/// a sync is known to be mid-request.
+#[derive(Default)]
+struct FeedHold {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[derive(Clone)]
@@ -140,7 +148,7 @@ async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
         nzb_body: sample_nzb_bytes(),
         etag: None,
         require_auth: false,
-        feed_delay_ms: 0,
+        feed_hold: None,
         feed_requests: Arc::new(AtomicUsize::new(0)),
         nzb_requests: Arc::new(AtomicUsize::new(0)),
         auth_failures: Arc::new(AtomicUsize::new(0)),
@@ -221,7 +229,7 @@ async fn run_sync_uses_conditional_get_and_basic_auth() {
         nzb_body: sample_nzb_bytes(),
         etag: Some("v1".to_string()),
         require_auth: true,
-        feed_delay_ms: 0,
+        feed_hold: None,
         feed_requests: Arc::new(AtomicUsize::new(0)),
         nzb_requests: Arc::new(AtomicUsize::new(0)),
         auth_failures: Arc::new(AtomicUsize::new(0)),
@@ -282,7 +290,7 @@ async fn failed_fetch_is_marked_seen_and_not_retried_immediately() {
         nzb_body: b"not an nzb".to_vec(),
         etag: None,
         require_auth: false,
-        feed_delay_ms: 0,
+        feed_hold: None,
         feed_requests: Arc::new(AtomicUsize::new(0)),
         nzb_requests: Arc::new(AtomicUsize::new(0)),
         auth_failures: Arc::new(AtomicUsize::new(0)),
@@ -339,12 +347,13 @@ async fn failed_fetch_is_marked_seen_and_not_retried_immediately() {
 async fn background_due_sync_skips_when_manual_sync_is_active() {
     let temp = TempDir::new().unwrap();
     let db = Database::open(&temp.path().join("rss-due.sqlite")).unwrap();
+    let hold = Arc::new(FeedHold::default());
     let state = TestHttpState {
         feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
         nzb_body: sample_nzb_bytes(),
         etag: None,
         require_auth: false,
-        feed_delay_ms: 250,
+        feed_hold: Some(hold.clone()),
         feed_requests: Arc::new(AtomicUsize::new(0)),
         nzb_requests: Arc::new(AtomicUsize::new(0)),
         auth_failures: Arc::new(AtomicUsize::new(0)),
@@ -389,11 +398,14 @@ async fn background_due_sync_skips_when_manual_sync_is_active() {
         let service = service.clone();
         tokio::spawn(async move { service.run_all_sync().await.unwrap() })
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The feed request only goes out under the sync lock, and the held
+    // response keeps that sync running until the probe below has run.
+    hold.arrived.notified().await;
     assert!(matches!(
         service.try_run_due_sync().await.unwrap(),
         DueSyncOutcome::SkippedActiveSync
     ));
+    hold.release.notify_one();
     let _ = running.await.unwrap();
     server_task.abort();
 }
@@ -797,8 +809,9 @@ async fn feed_handler(State(state): State<TestHttpState>, headers: HeaderMap) ->
         state.auth_failures.fetch_add(1, Ordering::SeqCst);
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if state.feed_delay_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(state.feed_delay_ms)).await;
+    if let Some(hold) = &state.feed_hold {
+        hold.arrived.notify_one();
+        hold.release.notified().await;
     }
     if let Some(etag) = &state.etag
         && headers

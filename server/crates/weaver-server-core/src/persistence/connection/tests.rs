@@ -2,7 +2,7 @@ use super::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
 use crate::categories::CategoryConfig;
@@ -1993,8 +1993,29 @@ async fn postgres_executor_runs_sync_calls_concurrently_when_configured() {
         return;
     }
 
+    // Prove concurrency with a barrier rather than a stopwatch: the test holds
+    // an exclusive advisory lock, and each call blocks on the shared form of
+    // it. All four calls only show up as waiters at once when the executor
+    // runs them concurrently; a serialized executor never gets there.
+    let barrier_key = schema
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        }) as i64
+        & 0x7fff_ffff;
+    let lock_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&target_url)
+        .await
+        .unwrap();
+    let mut lock_tx = lock_pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(barrier_key)
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
+
     let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
-    let started = Instant::now();
     let handles = (0..4)
         .map(|_| {
             let db = db.clone();
@@ -2003,8 +2024,8 @@ async fn postgres_executor_runs_sync_calls_concurrently_when_configured() {
                 db.run_sql_blocking(async move {
                     SqlRuntime::fetch_optional(
                         datastore.read_exec(),
-                        "SELECT pg_sleep({})",
-                        &[SqlArg::F64(0.5)],
+                        "SELECT pg_advisory_xact_lock_shared({})",
+                        &[SqlArg::I64(barrier_key)],
                     )
                     .await?;
                     Ok(())
@@ -2014,20 +2035,34 @@ async fn postgres_executor_runs_sync_calls_concurrently_when_configured() {
         })
         .collect::<Vec<_>>();
 
+    // Wait for all four calls to be parked on the lock at the same time. The
+    // runner bounds this wait if the executor serializes them.
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks \
+             WHERE locktype = 'advisory' AND NOT granted \
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+               AND classid = 0 AND objid::bigint = $1 AND objsubid = 1",
+        )
+        .bind(barrier_key)
+        .fetch_one(&admin_pool)
+        .await
+        .unwrap();
+        if waiting == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    lock_tx.commit().await.unwrap();
+    lock_pool.close().await;
     for handle in handles {
         handle.join().unwrap();
     }
 
-    let elapsed = started.elapsed();
-
     drop(db);
     execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
-
-    assert!(
-        elapsed < Duration::from_millis(1500),
-        "Postgres DB calls appear serialized; elapsed = {elapsed:?}"
-    );
 }
 
 #[tokio::test]
