@@ -27,14 +27,14 @@ impl Pipeline {
             .or_insert_with(|| DownloadLaneOwner {
                 job_id: lease.job_id,
                 mode: lease.lane_mode,
-                spillover_loan_kind: lease.spillover_loan_kind,
-                completion_critical: lease.compatibility.completion_critical,
+                completion_critical: lease.completion_critical,
+                server_idx: None,
                 connection,
                 ip_replacement: !connection,
                 outstanding: HashMap::new(),
             });
         owner.mode = lease.lane_mode;
-        owner.completion_critical = lease.compatibility.completion_critical;
+        owner.completion_critical = lease.completion_critical;
         owner.outstanding.extend(
             lease
                 .works

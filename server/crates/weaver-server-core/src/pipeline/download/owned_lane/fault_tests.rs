@@ -56,7 +56,6 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
                 event_tx,
                 refill_tx,
                 parked_tx,
-                hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
                 initial_lease: test_lease(JobId(42), 0, vec![], vec![tail_work(0, 0)]),
             },
         );

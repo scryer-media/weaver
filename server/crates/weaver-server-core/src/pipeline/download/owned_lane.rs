@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
-const HOT_SHARE_YIELD_CHECK_ARTICLES: usize = 4;
 
 /// How long a lane-side probe waits for a worker to pick its request up.
 ///
@@ -337,7 +336,6 @@ struct OwnedLaneRun {
     event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
     refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
     parked_tx: mpsc::Sender<DownloadLaneParked>,
-    hot_share_yield_signal: Arc<HotShareYieldSignal>,
     initial_lease: DownloadBatchLease,
 }
 
@@ -542,7 +540,6 @@ impl OwnedDownloadLanePool {
         event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
         refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
         parked_tx: mpsc::Sender<DownloadLaneParked>,
-        hot_share_yield_signal: Arc<HotShareYieldSignal>,
         initial_lease: DownloadBatchLease,
     ) -> Result<(), DownloadBatchLease> {
         let run = Box::new(OwnedLaneRun {
@@ -550,7 +547,6 @@ impl OwnedDownloadLanePool {
             event_tx,
             refill_tx,
             parked_tx,
-            hot_share_yield_signal,
             initial_lease,
         });
         let mut shared = lock_pool(&self.shared);
@@ -870,13 +866,11 @@ struct LaneLeaseContext {
     lane_id: u64,
     job_id: JobId,
     runtime_generation: u64,
-    spillover_loan_kind: Option<SpilloverLoanKind>,
     completion_critical: bool,
     exclude_servers: Vec<usize>,
     pressure_clear: bool,
     mode: DownloadLaneMode,
     checkpoint_plan: weaver_yenc::CheckpointPlan,
-    compatibility: DownloadBatchCompatibility,
 }
 
 impl LaneLeaseContext {
@@ -889,9 +883,8 @@ impl LaneLeaseContext {
             lane_id: lease.lane_id,
             job_id: lease.job_id,
             runtime_generation: lease.runtime_generation,
-            spillover_loan_kind: lease.spillover_loan_kind,
-            completion_critical: lease.compatibility.completion_critical,
-            exclude_servers: lease.compatibility.exclude_servers.clone(),
+            completion_critical: lease.completion_critical,
+            exclude_servers: lease.effective_exclude_servers.clone(),
             pressure_clear: lease.pressure_clear,
             mode: Pipeline::actual_download_lane_mode(
                 lease.lane_mode,
@@ -900,7 +893,6 @@ impl LaneLeaseContext {
                 supports_pipelining,
             ),
             checkpoint_plan: lease.checkpoint_plan.clone(),
-            compatibility: lease.compatibility.clone(),
         }
     }
 
@@ -921,8 +913,6 @@ enum LaneStop {
     PolicyBlocked,
     RecoveryYield,
     Quarantined,
-    /// The hot job asked for this connection back.
-    HotShareYield,
     /// The result or refill channel is gone; the orchestrator is shutting down.
     Error,
 }
@@ -935,10 +925,6 @@ fn lane_stop_park(stop: Option<LaneStop>) -> Option<(LaneParkReason, bool)> {
         LaneStop::PolicyBlocked => (
             LaneParkReason::ServerQuota,
             keep_cached_lane_after_park(LaneParkReason::ServerQuota),
-        ),
-        LaneStop::HotShareYield => (
-            LaneParkReason::HotShareYield,
-            keep_cached_lane_after_park(LaneParkReason::HotShareYield),
         ),
     })
 }
@@ -1032,7 +1018,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         event_tx,
         refill_tx,
         parked_tx,
-        hot_share_yield_signal,
         initial_lease,
     } = run;
     let lease = initial_lease;
@@ -1053,7 +1038,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     // rather than redialled; only a socket that cannot be re-pointed is let
     // go, and the dial below then replaces it.
     if let Some(cached) = cached_lane.as_mut()
-        && let Err(error) = cached.adopt_groups(&lease.compatibility.groups)
+        && let Err(error) = cached.adopt_groups(&[])
     {
         debug!(
             server = cached.lane.server_id().0,
@@ -1073,7 +1058,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         );
         match acquire_owned_lane_through_contention(
             &nntp,
-            &lease.compatibility.groups,
+            &[],
             &lease.effective_exclude_servers,
             initial_estimate,
         ) {
@@ -1146,7 +1131,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     let mut refill_denied = false;
     let mut stop: Option<LaneStop> = None;
     let mut stats_mark = lane.stats();
-    let mut completed_since_yield_check = 0usize;
 
     let (park_reason, keep_cached_lane) = loop {
         // Adopt an answered refill without waiting for it. Taking it here is
@@ -1264,14 +1248,11 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             if refill_tx
                 .blocking_send(DownloadLaneRefillRequest {
                     lane_id: context.lane_id,
-                    job_id: context.job_id,
                     runtime_generation: context.runtime_generation,
                     server_idx,
                     remote_ip: lane.remote_ip(),
                     supports_pipelining,
                     current_mode: booked_mode,
-                    spillover_loan_kind: context.spillover_loan_kind,
-                    compatibility: context.compatibility.clone(),
                     response_tx,
                 })
                 .is_ok()
@@ -1308,14 +1289,11 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 if refill_tx
                     .blocking_send(DownloadLaneRefillRequest {
                         lane_id: context.lane_id,
-                        job_id: context.job_id,
                         runtime_generation: context.runtime_generation,
                         server_idx,
                         remote_ip: lane.remote_ip(),
                         supports_pipelining,
                         current_mode: booked_mode,
-                        spillover_loan_kind: context.spillover_loan_kind,
-                        compatibility: context.compatibility.clone(),
                         response_tx: retry_tx,
                     })
                     .is_err()
@@ -1372,7 +1350,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         };
         nntp.record_blocking_attempts(&trace.attempts);
         let (payload_bytes, policy_elapsed) = Pipeline::decoded_trace_throughput_sample(&trace);
-        let completion_critical = work_context.completion_critical;
         let result = result_from_trace(
             work,
             work_context.runtime_generation,
@@ -1437,16 +1414,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 }
             }
         }
-
-        completed_since_yield_check = completed_since_yield_check.saturating_add(1);
-        if completed_since_yield_check >= HOT_SHARE_YIELD_CHECK_ARTICLES {
-            completed_since_yield_check = 0;
-            // Completion-critical work never yields here — it is what the
-            // signal exists to make room for.
-            if !completion_critical && hot_share_yield_signal.is_requested() {
-                stop.get_or_insert(LaneStop::HotShareYield);
-            }
-        }
     };
 
     if let Some(granted_context) = drain_pending_refill(
@@ -1484,7 +1451,6 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         lane_id: park_context.lane_id,
         job_id: park_context.job_id,
         mode: booked_mode,
-        spillover_loan_kind: park_context.spillover_loan_kind,
         completion_critical: park_context.completion_critical,
         reason: park_reason,
         release_connection_slot: true,
@@ -1537,10 +1503,6 @@ fn keep_cached_lane_after_park(reason: LaneParkReason) -> bool {
         LaneParkReason::NoWork
             | LaneParkReason::Pressure
             | LaneParkReason::ProbeYield
-            | LaneParkReason::HotReclaim
-            | LaneParkReason::HotShareYield
-            | LaneParkReason::SpilloverWithdraw
-            | LaneParkReason::SpilloverSpeedHarm
             | LaneParkReason::ServerQuota
     )
 }
@@ -1724,17 +1686,9 @@ fn test_lease(
         job_id,
         runtime_generation,
         lane_mode: DownloadLaneMode::Pipelined { depth: 4 },
-        spillover_loan_kind: None,
         server_modes: vec![(0, DownloadLaneMode::Pipelined { depth: 4 })],
-        compatibility: DownloadBatchCompatibility {
-            priority: 10,
-            is_recovery: false,
-            completion_critical: false,
-            groups: Arc::from(vec!["alt.binaries.test".to_string()]),
-            exclude_servers,
-            avoid_server: None,
-        },
-        effective_exclude_servers: Vec::new(),
+        completion_critical: false,
+        effective_exclude_servers: exclude_servers,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works,
@@ -1984,32 +1938,6 @@ mod tests {
             !works[0].message_id.0.starts_with('<'),
             "the stored id is bare, which is exactly why the wire form is needed"
         );
-    }
-
-    #[test]
-    fn owned_hot_lane_yield_keeps_the_socket_and_its_retry_counts() {
-        // A yield hands back the *scheduling* of this connection, not the
-        // connection. The socket stays cached and the worker sits idle
-        // holding it, which is precisely the state the completion-critical
-        // lease that asked for the yield wants to be routed to; dropping it
-        // made that lease pay a fresh handshake for a connection it had just
-        // been given. The works that were never issued go back to the queue
-        // untouched, which is what keeps a yield from spending a retry.
-        let (reason, keep_cached_lane) =
-            lane_stop_park(Some(LaneStop::HotShareYield)).expect("a stop always parks");
-
-        assert_eq!(reason, LaneParkReason::HotShareYield);
-        assert!(keep_cached_lane);
-
-        let pending = VecDeque::from([(tail_work(2, 4), ()), (tail_work(3, 7), ())]);
-        let returned = pending
-            .into_iter()
-            .map(|(work, ())| work)
-            .collect::<Vec<_>>();
-        assert_eq!(returned[0].segment_id.segment_number, 2);
-        assert_eq!(returned[0].retry_count, 4);
-        assert_eq!(returned[1].segment_id.segment_number, 3);
-        assert_eq!(returned[1].retry_count, 7);
     }
 
     #[test]
@@ -2300,7 +2228,6 @@ mod routing_tests {
             event_tx,
             refill_tx,
             parked_tx,
-            hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             initial_lease: lease,
         })
     }
@@ -2404,8 +2331,7 @@ mod routing_tests {
     #[test]
     fn a_connection_opened_for_other_newsgroups_still_serves() {
         let nntp = test_client();
-        let mut run = test_run(&nntp, Vec::new());
-        run.initial_lease.compatibility.groups = Arc::from(vec!["alt.binaries.other".to_string()]);
+        let run = test_run(&nntp, Vec::new());
 
         assert!(idle_lane(&nntp, 0).serves(&run));
         let mut shared = shared_with(vec![idle_with(None), idle_with(Some(idle_lane(&nntp, 0)))]);

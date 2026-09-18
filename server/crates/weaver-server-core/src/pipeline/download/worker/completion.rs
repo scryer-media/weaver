@@ -413,17 +413,6 @@ impl Pipeline {
             }
             Err(_) => None,
         };
-        if result.origin.counts_for_hot_primary()
-            && self.hot_dispatch_job == Some(job_id)
-            && let Ok(payload) = &result.data
-        {
-            let raw_bytes = match payload {
-                DownloadPayload::Raw(raw) => raw.len() as u64,
-                DownloadPayload::Decoded(decoded) => decoded.raw_size,
-            };
-            self.hot_dispatch_throughput_window
-                .record(Instant::now(), raw_bytes);
-        }
         self.reconcile_rate_limit_for_download(result.segment_id, actual_raw_bytes);
         if let Some(raw_bytes) = actual_raw_bytes
             && let Err(error) = self.record_download_bandwidth_usage(raw_bytes)
@@ -434,7 +423,6 @@ impl Pipeline {
                 "failed to record ISP bandwidth usage"
             );
         }
-        self.publish_hot_dispatch_metrics(Instant::now());
         true
     }
 

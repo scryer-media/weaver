@@ -72,22 +72,6 @@ impl Pipeline {
                 .metrics
                 .download_lane_parks_probe_yield_total
                 .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::HotReclaim => self
-                .metrics
-                .download_lane_parks_hot_reclaim_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::HotShareYield => self
-                .metrics
-                .download_lane_parks_hot_share_yield_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::SpilloverWithdraw => self
-                .metrics
-                .download_lane_parks_spillover_withdraw_total
-                .fetch_add(1, Ordering::Relaxed),
-            LaneParkReason::SpilloverSpeedHarm => self
-                .metrics
-                .download_lane_parks_spillover_speed_harm_total
-                .fetch_add(1, Ordering::Relaxed),
             LaneParkReason::IpReplacementRetired => self
                 .metrics
                 .download_lane_parks_ip_replacement_retired_total
@@ -780,16 +764,6 @@ impl Pipeline {
             return;
         }
 
-        if next.max_depth() > previous.max_depth() {
-            let now = Instant::now();
-            let speed = self.hot_dispatch_speed_bps(now);
-            self.hot_dispatch_expansion_window.record(
-                now,
-                HotExpansionKind::PipelinePromotion,
-                speed,
-            );
-        }
-
         Self::release_lane_gauge(self.lane_depth_gauge(previous));
         self.lane_depth_gauge(next).fetch_add(1, Ordering::Relaxed);
     }
@@ -1043,7 +1017,6 @@ impl Pipeline {
         }
         self.update_queue_metrics();
         self.publish_active_stage_metrics();
-        self.publish_hot_dispatch_metrics(Instant::now());
     }
 
     /// Whether a lane park has left the run loop owing a dispatch pass, and
@@ -1123,10 +1096,6 @@ impl Pipeline {
             self.download_dispatch_wake = true;
             self.note_download_lane_released(parked.mode, parked.reason);
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
-            if let Some(kind) = parked.spillover_loan_kind {
-                self.hot_dispatch_spillover_loans
-                    .release_one(parked.job_id, kind);
-            }
             if let Some(in_flight) = self
                 .active_download_connections_by_job
                 .get_mut(&parked.job_id)
@@ -1159,6 +1128,5 @@ impl Pipeline {
             self.metrics.set_ip_replacement_burst_active(false);
         }
         self.publish_active_stage_metrics();
-        self.publish_hot_dispatch_metrics(Instant::now());
     }
 }

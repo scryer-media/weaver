@@ -385,8 +385,10 @@ impl<'a> DownloadBatchSelector<'a> {
 pub(super) struct DownloadLaneOwner {
     job_id: JobId,
     mode: DownloadLaneMode,
-    spillover_loan_kind: Option<SpilloverLoanKind>,
     completion_critical: bool,
+    /// The server this lane is connected to, once a refill has told the
+    /// scheduler where the lane lives. `None` until the first refill.
+    server_idx: Option<usize>,
     connection: bool,
     ip_replacement: bool,
     outstanding: HashMap<SegmentId, DownloadWork>,
@@ -397,12 +399,14 @@ pub(super) struct DownloadBatchLease {
     pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) lane_mode: DownloadLaneMode,
-    pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) server_modes: Vec<(usize, DownloadLaneMode)>,
-    pub(super) compatibility: DownloadBatchCompatibility,
-    /// Compatibility excludes plus the job's retention exclusions — the set
-    /// server ordering and lane acquisition use. Results keep reporting the
-    /// compatibility (failure-only) excludes; retention stays job-derived.
+    /// The class every work in this batch is counted under. A batch is cut
+    /// from one job and one class; the worker reports it back on park so the
+    /// class gauges are released against what was booked.
+    pub(super) completion_critical: bool,
+    /// The job's retention exclusions — the set server ordering and lane
+    /// acquisition use. Each result reports its own work's failure-only
+    /// excludes; retention stays job-derived.
     pub(super) effective_exclude_servers: Vec<usize>,
     /// Immutable common-refinement geometry captured when this batch was
     /// leased. Each response carries this same snapshot through durable commit
@@ -416,7 +420,6 @@ pub(super) struct DownloadBatchLease {
 
 pub(super) struct DownloadLaneRefillRequest {
     pub(super) lane_id: u64,
-    pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
     pub(super) remote_ip: Option<IpAddr>,
@@ -429,485 +432,12 @@ pub(super) struct DownloadLaneRefillRequest {
     /// `download_lanes_active{mode="sequential"}`. Lanes therefore carry the
     /// booked mode forward and update it from each granted lease.
     pub(super) current_mode: DownloadLaneMode,
-    pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
-    pub(super) compatibility: DownloadBatchCompatibility,
     pub(super) response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
 }
 
 pub(super) struct DownloadLaneRefillResponse {
     pub(super) lease: Option<DownloadBatchLease>,
     pub(super) park_reason: LaneParkReason,
-}
-
-const HOT_THROUGHPUT_WINDOW: Duration = Duration::from_secs(2);
-const HOT_THROUGHPUT_BUCKET_WIDTH: Duration = Duration::from_millis(200);
-const HOT_THROUGHPUT_BUCKETS: usize = 10;
-const HOT_EXPANSION_AFTER_WINDOW: Duration = Duration::from_secs(2);
-const HOT_EXPANSION_LOOKBACK: Duration = Duration::from_secs(4);
-
-#[derive(Debug, Default)]
-pub(super) struct HotJobThroughputWindow {
-    buckets: VecDeque<HotThroughputBucket>,
-}
-
-#[derive(Debug)]
-struct HotThroughputBucket {
-    started_at: Instant,
-    bytes: u64,
-}
-
-impl HotJobThroughputWindow {
-    pub(super) fn clear(&mut self) {
-        self.buckets.clear();
-    }
-
-    pub(super) fn record(&mut self, now: Instant, bytes: u64) {
-        self.advance_to(now);
-        if let Some(bucket) = self.buckets.back_mut() {
-            bucket.bytes = bucket.bytes.saturating_add(bytes);
-        }
-    }
-
-    pub(super) fn bps(&mut self, now: Instant) -> u64 {
-        self.advance_to(now);
-        let bytes = self.buckets.iter().map(|bucket| bucket.bytes).sum::<u64>();
-        (bytes as f64 / HOT_THROUGHPUT_WINDOW.as_secs_f64()).round() as u64
-    }
-
-    fn advance_to(&mut self, now: Instant) {
-        if self.buckets.back().is_some_and(|bucket| {
-            now.saturating_duration_since(bucket.started_at) >= HOT_THROUGHPUT_WINDOW
-        }) {
-            self.buckets.clear();
-        }
-
-        if self.buckets.is_empty() {
-            self.buckets.push_back(HotThroughputBucket {
-                started_at: now,
-                bytes: 0,
-            });
-            return;
-        }
-
-        while self.buckets.back().is_some_and(|bucket| {
-            now.saturating_duration_since(bucket.started_at) >= HOT_THROUGHPUT_BUCKET_WIDTH
-        }) {
-            let next_started_at = self
-                .buckets
-                .back()
-                .map(|bucket| bucket.started_at + HOT_THROUGHPUT_BUCKET_WIDTH)
-                .unwrap_or(now);
-            self.buckets.push_back(HotThroughputBucket {
-                started_at: next_started_at,
-                bytes: 0,
-            });
-            while self.buckets.len() > HOT_THROUGHPUT_BUCKETS {
-                self.buckets.pop_front();
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub(super) struct HotExclusiveWindow {
-    peak_bps: u64,
-}
-
-impl HotExclusiveWindow {
-    pub(super) fn clear(&mut self) {
-        self.peak_bps = 0;
-    }
-
-    pub(super) fn record(&mut self, bps: u64) {
-        self.peak_bps = self.peak_bps.max(bps);
-    }
-
-    pub(super) fn peak_bps(&self) -> u64 {
-        self.peak_bps
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HotExpansionKind {
-    LaneStart,
-    PipelinePromotion,
-}
-
-impl HotExpansionKind {
-    pub(super) fn as_code(self) -> usize {
-        match self {
-            Self::LaneStart => 1,
-            Self::PipelinePromotion => 2,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct HotExpansionEvent {
-    pub(super) at: Instant,
-    pub(super) kind: HotExpansionKind,
-    pub(super) before_bps: u64,
-    pub(super) after_bps: Option<u64>,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct HotExpansionWindow {
-    events: VecDeque<HotExpansionEvent>,
-}
-
-impl HotExpansionWindow {
-    pub(super) fn clear(&mut self) {
-        self.events.clear();
-    }
-
-    pub(super) fn record(&mut self, now: Instant, kind: HotExpansionKind, before_bps: u64) {
-        self.events.push_back(HotExpansionEvent {
-            at: now,
-            kind,
-            before_bps,
-            after_bps: None,
-        });
-        self.prune(now);
-    }
-
-    pub(super) fn refresh(&mut self, now: Instant, current_bps: u64) {
-        for event in &mut self.events {
-            if event.after_bps.is_none()
-                && now.saturating_duration_since(event.at) >= HOT_EXPANSION_AFTER_WINDOW
-            {
-                event.after_bps = Some(current_bps);
-            }
-        }
-        self.prune(now);
-    }
-
-    pub(super) fn recent_improvement_pct(&mut self, now: Instant) -> u64 {
-        self.prune(now);
-        self.events
-            .iter()
-            .filter_map(|event| {
-                let after = event.after_bps?;
-                if event.before_bps == 0 || after <= event.before_bps {
-                    return Some(0);
-                }
-                Some(((after - event.before_bps) * 100) / event.before_bps)
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub(super) fn last_event(&self) -> Option<HotExpansionEvent> {
-        self.events.back().copied()
-    }
-
-    fn prune(&mut self, now: Instant) {
-        while self
-            .events
-            .front()
-            .is_some_and(|event| now.saturating_duration_since(event.at) > HOT_EXPANSION_LOOKBACK)
-        {
-            self.events.pop_front();
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) enum SpilloverReclaimReason {
-    SpeedHarm,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SpilloverLoanKind {
-    MeasuredUnderfill,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct SpilloverLoanState {
-    pub(super) measured_lent_connections: usize,
-    pub(super) measured_post_lend_bps: Option<u64>,
-    pub(super) measured_reclaim_reason: Option<SpilloverReclaimReason>,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct SpilloverLoanBook {
-    loans: HashMap<JobId, SpilloverLoanState>,
-    aggregate_pre_lend_bps: Option<u64>,
-    aggregate_lent_at: Option<Instant>,
-    aggregate_post_lend_bps: Option<u64>,
-}
-
-impl SpilloverLoanBook {
-    pub(super) fn clear(&mut self) {
-        self.loans.clear();
-        self.aggregate_pre_lend_bps = None;
-        self.aggregate_lent_at = None;
-        self.aggregate_post_lend_bps = None;
-    }
-
-    pub(super) fn start_or_extend(
-        &mut self,
-        job_id: JobId,
-        now: Instant,
-        hot_speed_bps: u64,
-        kind: SpilloverLoanKind,
-    ) {
-        if self.measured_lent_connections() == 0 {
-            self.aggregate_pre_lend_bps = Some(hot_speed_bps);
-            self.aggregate_lent_at = Some(now);
-            self.aggregate_post_lend_bps = None;
-        }
-        self.loans
-            .entry(job_id)
-            .and_modify(|loan| {
-                loan.increment(kind);
-            })
-            .or_insert(SpilloverLoanState {
-                measured_lent_connections: 1,
-                measured_post_lend_bps: None,
-                measured_reclaim_reason: None,
-            });
-    }
-
-    pub(super) fn release_one(&mut self, job_id: JobId, kind: SpilloverLoanKind) {
-        let Some(loan) = self.loans.get_mut(&job_id) else {
-            return;
-        };
-        loan.decrement(kind);
-        if loan.total_lent_connections() == 0 {
-            self.loans.remove(&job_id);
-        }
-        if self.measured_lent_connections() == 0 {
-            self.aggregate_pre_lend_bps = None;
-            self.aggregate_lent_at = None;
-            self.aggregate_post_lend_bps = None;
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn mark_reclaim_for_test(
-        &mut self,
-        job_id: JobId,
-        post_lend_bps: Option<u64>,
-        reason: SpilloverReclaimReason,
-    ) {
-        if let Some(loan) = self.loans.get_mut(&job_id) {
-            loan.measured_post_lend_bps = post_lend_bps;
-            loan.measured_reclaim_reason = Some(reason);
-        }
-    }
-
-    pub(super) fn reclaim_pending_for(&self, job_id: JobId) -> bool {
-        self.loans
-            .get(&job_id)
-            .is_some_and(|loan| loan.measured_reclaim_reason.is_some())
-    }
-
-    pub(super) fn active_lent_connections(&self) -> usize {
-        self.loans
-            .values()
-            .map(SpilloverLoanState::total_lent_connections)
-            .sum()
-    }
-
-    fn measured_lent_connections(&self) -> usize {
-        self.loans
-            .values()
-            .map(|loan| loan.measured_lent_connections)
-            .sum()
-    }
-
-    pub(super) fn active_loan_count(&self) -> usize {
-        self.loans.len()
-    }
-
-    /// Number of distinct jobs currently holding a spillover loan. Same
-    /// value as `active_loan_count` (loans are keyed one-per-job); named for
-    /// the dispatch-side cap check against `HOT_DISPATCH_SPILLOVER_MAX_JOBS`,
-    /// so that call site reads as what it is instead of what it happens to
-    /// share a value with.
-    pub(super) fn distinct_loan_jobs(&self) -> usize {
-        self.active_loan_count()
-    }
-
-    /// Whether `job_id` already holds a spillover loan — used to prefer
-    /// concentrating new lanes onto jobs already spilling to, rather than
-    /// admitting a fresh job while under the distinct-job cap.
-    pub(super) fn holds_loan(&self, job_id: JobId) -> bool {
-        self.loans.contains_key(&job_id)
-    }
-
-    pub(super) fn speed_snapshot(&self) -> (u64, u64, usize) {
-        let pre = self.aggregate_pre_lend_bps.unwrap_or(0);
-        let post = self.aggregate_post_lend_bps.unwrap_or(0);
-        (pre, post, self.active_loan_count())
-    }
-
-    pub(super) fn update_speed_harm(
-        &mut self,
-        now: Instant,
-        hot_speed_bps: u64,
-        harm_percent: u64,
-    ) -> bool {
-        if self.measured_lent_connections() == 0 || hot_speed_bps == 0 {
-            return false;
-        }
-
-        let Some(lent_at) = self.aggregate_lent_at else {
-            return false;
-        };
-        let Some(pre_lend_bps) = self.aggregate_pre_lend_bps else {
-            return false;
-        };
-        if now.saturating_duration_since(lent_at) < Duration::from_secs(2) || pre_lend_bps == 0 {
-            return false;
-        }
-
-        self.aggregate_post_lend_bps = Some(hot_speed_bps);
-        for loan in self.loans.values_mut() {
-            if loan.measured_lent_connections == 0 {
-                continue;
-            }
-            loan.measured_post_lend_bps = Some(hot_speed_bps);
-        }
-
-        let harm_threshold = pre_lend_bps.saturating_mul(100 - harm_percent) / 100;
-        if hot_speed_bps >= harm_threshold {
-            return false;
-        }
-
-        let mut newly_reclaimed = false;
-        for loan in self.loans.values_mut() {
-            if loan.measured_lent_connections == 0 {
-                continue;
-            }
-            if loan.measured_reclaim_reason.is_none() {
-                loan.measured_reclaim_reason = Some(SpilloverReclaimReason::SpeedHarm);
-                newly_reclaimed = true;
-            }
-        }
-        newly_reclaimed
-    }
-}
-
-impl SpilloverLoanState {
-    fn increment(&mut self, kind: SpilloverLoanKind) {
-        match kind {
-            SpilloverLoanKind::MeasuredUnderfill => {
-                self.measured_lent_connections = self.measured_lent_connections.saturating_add(1)
-            }
-        }
-    }
-
-    fn decrement(&mut self, kind: SpilloverLoanKind) {
-        match kind {
-            SpilloverLoanKind::MeasuredUnderfill => {
-                self.measured_lent_connections = self.measured_lent_connections.saturating_sub(1)
-            }
-        }
-    }
-
-    fn total_lent_connections(&self) -> usize {
-        self.measured_lent_connections
-    }
-}
-
-/// Cooperative signal asking every non-critical lane to return its
-/// unrequested tail so the dispatcher can hand the freed connection to
-/// completion-critical work on the next pass. A plain flag rather than a
-/// targeted job id: once completion-critical demand goes unmet, ANY lane
-/// running regular bytes — the hot job's own included — is fair game to
-/// yield, not just one designated job's.
-#[derive(Debug, Default)]
-pub(super) struct HotShareYieldSignal {
-    requested: AtomicBool,
-}
-
-impl HotShareYieldSignal {
-    pub(super) fn request(&self) {
-        self.requested.store(true, Ordering::Relaxed);
-    }
-
-    pub(super) fn clear(&self) {
-        self.requested.store(false, Ordering::Relaxed);
-    }
-
-    pub(super) fn is_requested(&self) -> bool {
-        self.requested.load(Ordering::Relaxed)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HotBestModeBlockReason {
-    None,
-    HotHasQueuedPrimary,
-    LaneCapacityAvailable,
-}
-
-impl HotBestModeBlockReason {
-    pub(super) fn as_code(self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::HotHasQueuedPrimary => 1,
-            Self::LaneCapacityAvailable => 2,
-        }
-    }
-}
-
-/// Labels for the `hot_dispatch_best_mode_block_reason` snapshot code, in code
-/// order. The metrics snapshot carries the raw integer; exposing the mapping
-/// lets the Prometheus exporter render a state-set rather than an opaque gauge.
-pub const HOT_BEST_MODE_BLOCK_REASON_LABELS: [&str; 3] =
-    ["none", "hot_has_queued_primary", "lane_capacity_available"];
-
-/// Labels for the `hot_dispatch_last_expansion_kind` snapshot code, in code
-/// order. Code 0 means "no expansion has been recorded yet".
-pub const HOT_EXPANSION_KIND_LABELS: [&str; 3] = ["none", "lane_start", "pipeline_promotion"];
-
-/// Resolve a `hot_dispatch_best_mode_block_reason` code to its label, falling
-/// back to `unknown` so an unmapped code stays visible instead of panicking a
-/// scrape.
-pub fn hot_best_mode_block_reason_label(code: usize) -> &'static str {
-    HOT_BEST_MODE_BLOCK_REASON_LABELS
-        .get(code)
-        .copied()
-        .unwrap_or("unknown")
-}
-
-/// Resolve a `hot_dispatch_last_expansion_kind` code to its label.
-pub fn hot_expansion_kind_label(code: usize) -> &'static str {
-    HOT_EXPANSION_KIND_LABELS
-        .get(code)
-        .copied()
-        .unwrap_or("unknown")
-}
-
-#[cfg(test)]
-mod hot_dispatch_label_tests {
-    use super::*;
-
-    #[test]
-    fn labels_line_up_with_snapshot_codes() {
-        for reason in [
-            HotBestModeBlockReason::None,
-            HotBestModeBlockReason::HotHasQueuedPrimary,
-            HotBestModeBlockReason::LaneCapacityAvailable,
-        ] {
-            assert_ne!(
-                hot_best_mode_block_reason_label(reason.as_code()),
-                "unknown"
-            );
-        }
-        assert_eq!(hot_best_mode_block_reason_label(99), "unknown");
-
-        for kind in [
-            HotExpansionKind::LaneStart,
-            HotExpansionKind::PipelinePromotion,
-        ] {
-            assert_ne!(hot_expansion_kind_label(kind.as_code()), "unknown");
-        }
-        assert_eq!(hot_expansion_kind_label(0), "none");
-        assert_eq!(hot_expansion_kind_label(99), "unknown");
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -938,7 +468,6 @@ pub(super) struct DownloadLaneParked {
     pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) mode: DownloadLaneMode,
-    pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) completion_critical: bool,
     pub(super) reason: LaneParkReason,
     pub(super) release_connection_slot: bool,
@@ -2789,30 +2318,6 @@ pub struct Pipeline {
     pub(super) active_completion_critical_connections: usize,
     /// Number of in-flight recovery downloads (subset of active_downloads).
     pub(super) active_recovery: usize,
-    /// Current hot job receiving exclusive article-dispatch preference.
-    pub(super) hot_dispatch_job: Option<JobId>,
-    /// When the current hot-dispatch ownership period began.
-    pub(super) hot_dispatch_started_at: Option<Instant>,
-    /// Best observed speed while the current hot job was exclusive.
-    pub(super) hot_dispatch_exclusive_peak_bps: u64,
-    /// Last time dispatch lent a reclaimable connection to spillover work.
-    pub(super) hot_dispatch_last_lend_at: Option<Instant>,
-    /// Current scheduler share mode.
-    pub(super) hot_dispatch_mode: DispatchShareMode,
-    /// Start of the current unused-capacity underfill window.
-    pub(super) hot_dispatch_underfill_since: Option<Instant>,
-    /// Most recent spillover decision, for tick logging.
-    pub(super) hot_dispatch_last_spillover_decision: SpilloverDecision,
-    /// Two-second measured throughput for successful hot-job primary BODY results.
-    pub(super) hot_dispatch_throughput_window: HotJobThroughputWindow,
-    /// Peak measured hot-job speed while no spillover lanes are active.
-    pub(super) hot_dispatch_exclusive_window: HotExclusiveWindow,
-    /// Recent lane expansion and pipeline promotion outcomes.
-    pub(super) hot_dispatch_expansion_window: HotExpansionWindow,
-    /// Active reclaimable spillover loans keyed by lent job.
-    pub(super) hot_dispatch_spillover_loans: SpilloverLoanBook,
-    /// Cooperative signal asking owned hot lanes to return their unrequested tail.
-    pub(super) hot_share_yield_signal: Arc<HotShareYieldSignal>,
     /// Runtime-only per-server BODY depth explorers. Seeded from the persisted
     /// depth on first observation; the measurements themselves never persist.
     pub(super) download_lane_runtime: DownloadLaneRuntimeState,
