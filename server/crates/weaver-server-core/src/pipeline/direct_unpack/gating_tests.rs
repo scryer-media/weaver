@@ -21,6 +21,15 @@ use super::reader::GatedSplitReader;
 /// thousands of times before it elapses.
 const SETTLE: Duration = Duration::from_millis(250);
 
+/// Blocks until the reader has parked more than `previous` times. The park is
+/// counted under the coverage lock before the reader waits, so once this
+/// returns, anything the test does to the coverage reaches a parked reader.
+fn wait_for_park(coverage: &SetCoverage, previous: u64) {
+    while coverage.park_count() <= previous {
+        thread::yield_now();
+    }
+}
+
 struct SplitFixture {
     _dir: TempDir,
     paths: Vec<PathBuf>,
@@ -141,23 +150,20 @@ fn reads_park_until_the_watermark_advances() {
     });
 
     // Let the reader consume the committed prefix and park on the rest.
-    thread::sleep(SETTLE);
-    let parked_at = coverage.park_count();
-    assert!(
-        parked_at > 0,
-        "reader should have parked past the watermark"
-    );
+    wait_for_park(&coverage, 0);
 
-    // Drip the rest of the set in.
+    // Drip the rest of the set in, each step waiting for the reader to catch
+    // up and park again on the next uncommitted byte.
     for watermark in [20_000u64, 60_000, fixture.part_lens[0]] {
+        let parked = coverage.park_count();
         coverage.advance_watermark(0, watermark);
-        thread::sleep(Duration::from_millis(10));
+        wait_for_park(&coverage, parked);
     }
     coverage.mark_part_complete(0);
-    for watermark in [10_000u64, fixture.part_lens[1]] {
-        coverage.advance_watermark(1, watermark);
-        thread::sleep(Duration::from_millis(10));
-    }
+    let parked = coverage.park_count();
+    coverage.advance_watermark(1, 10_000);
+    wait_for_park(&coverage, parked);
+    coverage.advance_watermark(1, fixture.part_lens[1]);
     coverage.mark_part_complete(1);
 
     assert_eq!(worker.join().expect("reader thread"), fixture.bytes);
@@ -179,13 +185,14 @@ fn a_parked_reader_waits_instead_of_spinning() {
         reader.read(&mut buf).map(|read| read > 0)
     });
 
-    thread::sleep(SETTLE);
+    wait_for_park(&coverage, 0);
     let first = coverage.park_count();
     thread::sleep(SETTLE);
     let second = coverage.park_count();
 
-    // A spinning reader would climb without bound across two settle windows; a
-    // parked one is asleep on the condvar and cannot move at all.
+    // A spinning reader would climb without bound across the settle window; a
+    // parked one is asleep on the condvar and cannot move at all. The window
+    // only ever hides a spin on a slow machine, never invents one.
     assert_eq!(
         first, second,
         "park count grew from {first} to {second} while nothing changed"
@@ -212,8 +219,7 @@ fn abort_unblocks_a_parked_reader_with_its_reason() {
         reader.read(&mut buf).expect_err("aborted mid-read")
     });
 
-    thread::sleep(SETTLE);
-    assert!(coverage.park_count() > 0, "reader should be parked");
+    wait_for_park(&coverage, 0);
 
     coverage.abort("article 42 unavailable on every server");
 
@@ -251,11 +257,7 @@ fn an_unknown_middle_part_length_parks_rather_than_guessing() {
         buf
     });
 
-    thread::sleep(SETTLE);
-    assert!(
-        coverage.park_count() > 0,
-        "an unknown middle length must park the mapping"
-    );
+    wait_for_park(&coverage, 0);
 
     coverage.note_part_len(1, fixture.part_lens[1]);
 
@@ -354,8 +356,7 @@ fn a_far_forward_read_parks_then_a_backward_read_is_served_immediately() {
         (tail, head, parks_before, reader.coverage().park_count())
     });
 
-    thread::sleep(SETTLE);
-    assert!(coverage.park_count() > 0, "far-forward read should park");
+    wait_for_park(&coverage, 0);
 
     coverage.advance_watermark(1, fixture.part_lens[1]);
     coverage.advance_watermark(2, fixture.part_lens[2]);
@@ -399,11 +400,7 @@ fn a_part_absent_at_open_is_opened_once_coverage_reaches_it() {
         tail
     });
 
-    thread::sleep(SETTLE);
-    assert!(
-        reader_coverage.park_count() > 0,
-        "should park on the absent part"
-    );
+    wait_for_park(&reader_coverage, 0);
 
     std::fs::write(&second, &bytes[4_000..]).expect("write part 2");
     reader_coverage.advance_watermark(1, 4_000);
@@ -486,11 +483,7 @@ fn a_capped_part_parks_rather_than_reporting_end_of_part() {
         reader.read_exact(&mut buf).map(|()| buf)
     });
 
-    thread::sleep(SETTLE);
-    assert!(
-        coverage.park_count() > 0,
-        "a read at the damage cap must park, not report end of part"
-    );
+    wait_for_park(&coverage, 0);
 
     // Repair lands: the cap goes, the frontier opens, the reader finishes.
     coverage.release_after_repair(0, 60_000);
@@ -568,11 +561,7 @@ fn abort_unblocks_a_reader_parked_under_a_damage_cap() {
             .expect_err("aborted while parked")
     });
 
-    thread::sleep(SETTLE);
-    assert!(
-        coverage.park_count() > 0,
-        "the reader should be parked under the cap"
-    );
+    wait_for_park(&coverage, 0);
 
     coverage.abort("PAR2 repair failed");
 
@@ -659,11 +648,7 @@ fn a_parked_chase_resumes_over_repaired_bytes_and_reads_the_whole_stream() {
         read
     });
 
-    thread::sleep(SETTLE);
-    assert!(
-        coverage.park_count() > 0,
-        "the chase must park at the damage cap, not read the damaged bytes"
-    );
+    wait_for_park(&coverage, 0);
     assert!(
         coverage.consumed_high_water(0) <= 40_000,
         "nothing past the cap may have been consumed"
@@ -719,8 +704,7 @@ fn a_parked_chase_reopens_a_part_the_repair_replaced() {
         read
     });
 
-    thread::sleep(SETTLE);
-    assert!(coverage.park_count() > 0, "the chase must park at the cap");
+    wait_for_park(&coverage, 0);
     assert_eq!(
         coverage.consumed_high_water(1),
         40_000,
@@ -897,11 +881,7 @@ fn a_gated_complete_but_unvouched_part_parks_at_its_edge() {
         reader.read_exact(&mut buf).map(|()| buf)
     });
 
-    thread::sleep(SETTLE);
-    assert!(
-        coverage.park_count() > 0,
-        "a complete-but-unvouched part must park at its vouched edge"
-    );
+    wait_for_park(&coverage, 0);
 
     coverage.release_after_repair(0, 60_000);
     let read = worker.join().expect("reader thread").expect("read");
@@ -949,8 +929,7 @@ fn abort_unblocks_a_reader_parked_under_the_gate() {
             .expect_err("aborted under the gate")
     });
 
-    thread::sleep(SETTLE);
-    assert!(coverage.park_count() > 0, "the reader must be parked");
+    wait_for_park(&coverage, 0);
 
     coverage.abort("gated chase stalled: no vouching evidence after repair");
 
