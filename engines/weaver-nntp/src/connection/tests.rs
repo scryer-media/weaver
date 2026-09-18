@@ -151,6 +151,7 @@ async fn connect_tls_drain_client(
         health_lease: None,
         checkpoint_plan: CheckpointPlan::None,
         last_response_line_wait: Duration::ZERO,
+        capabilities_round_trip: None,
         group_probe_armed: false,
     }
 }

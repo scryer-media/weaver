@@ -360,6 +360,10 @@ pub struct NntpConnection {
     /// How long the last decoded article waited for its status line. The lane
     /// takes this to separate distance from transfer cost.
     last_response_line_wait: Duration,
+    /// How long the CAPABILITIES command waited for its status line, when
+    /// setup sent one. The command is already part of setup, so timing it
+    /// costs nothing and gives a distance figure without a dedicated ping.
+    capabilities_round_trip: Option<Duration>,
     /// Armed when session setup declined to select a group this caller
     /// offered, because the server has never been shown to need one. The first
     /// response afterwards either clears it or teaches the process that this
@@ -510,6 +514,7 @@ impl NntpConnection {
             health_lease: None,
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
+            capabilities_round_trip: None,
             group_probe_armed: false,
         };
 
@@ -616,7 +621,9 @@ impl NntpConnection {
 
     /// Fetch and parse server capabilities.
     async fn fetch_capabilities(&mut self) -> Result<()> {
+        let started = Instant::now();
         let resp = self.send_command(&Command::Capabilities).await?;
+        self.capabilities_round_trip = Some(started.elapsed());
         if resp.code.raw() == 101 {
             let data = self.read_multiline_data().await?;
             self.capabilities = Capabilities::parse(&data);
@@ -2050,6 +2057,12 @@ impl NntpConnection {
     /// The server's advertised capabilities.
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    /// How long setup's CAPABILITIES command waited for its status line, or
+    /// `None` when setup did not ask (the capability was already known).
+    pub fn capabilities_round_trip(&self) -> Option<Duration> {
+        self.capabilities_round_trip
     }
 
     /// IANA name of the negotiated TLS cipher suite, if the transport is TLS.

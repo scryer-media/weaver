@@ -962,14 +962,13 @@ impl TlsCipherPreference {
         }
     }
 
-    /// The explicit preference whose first family differs from an already
-    /// negotiated suite, so a second handshake reveals whether the server
-    /// follows the client's order.
-    pub fn opposing(negotiated_suite: &str) -> Self {
-        if negotiated_suite.contains("CHACHA20") {
-            Self::AesFirst
-        } else {
-            Self::ChaChaFirst
+    /// Whether a negotiated suite is the family this preference offers
+    /// first. A server that answers with anything else did not follow the
+    /// client's order; one that answers with the first offer is taken to.
+    pub fn leads_with(self, negotiated_suite: &str) -> bool {
+        match self.resolve() {
+            Self::ChaChaFirst => negotiated_suite.contains("CHACHA20"),
+            _ => negotiated_suite.contains("AES_128_GCM"),
         }
     }
 
@@ -1752,15 +1751,15 @@ mod tests {
     }
 
     #[test]
-    fn opposing_preference_flips_the_negotiated_family() {
-        assert_eq!(
-            TlsCipherPreference::opposing("TLS_CHACHA20_POLY1305_SHA256"),
-            TlsCipherPreference::AesFirst
+    fn a_preference_leads_with_its_first_family_only() {
+        assert!(TlsCipherPreference::AesFirst.leads_with("TLS_AES_128_GCM_SHA256"));
+        assert!(
+            TlsCipherPreference::AesFirst.leads_with("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
         );
-        assert_eq!(
-            TlsCipherPreference::opposing("TLS_AES_128_GCM_SHA256"),
-            TlsCipherPreference::ChaChaFirst
-        );
+        assert!(!TlsCipherPreference::AesFirst.leads_with("TLS_AES_256_GCM_SHA384"));
+        assert!(!TlsCipherPreference::AesFirst.leads_with("TLS_CHACHA20_POLY1305_SHA256"));
+        assert!(TlsCipherPreference::ChaChaFirst.leads_with("TLS_CHACHA20_POLY1305_SHA256"));
+        assert!(!TlsCipherPreference::ChaChaFirst.leads_with("TLS_AES_128_GCM_SHA256"));
     }
 
     #[test]
