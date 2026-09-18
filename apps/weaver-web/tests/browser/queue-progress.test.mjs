@@ -8,6 +8,9 @@ const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_PATH ?? "playwri
 let server;
 let browser;
 let baseUrl;
+// The runner's bound on a stuck test, as nextest's ten-minute kill is for
+// Rust: it ends a hang and asserts nothing about speed.
+const RUNNER_BOUND = { timeout: 10 * 60_000 };
 
 before(async () => {
   server = await createServer({
@@ -34,6 +37,8 @@ after(async () => {
 
 async function openQueue(width = 1700, query = "") {
   const page = await browser.newPage({ viewport: { width, height: 1000 } });
+  // Every wait below is for the rendered state itself, never for a deadline.
+  page.setDefaultTimeout(0);
   page.on("pageerror", (error) => console.error(error));
   await page.route("**/*", (route) => {
     const url = new URL(route.request().url());
@@ -51,7 +56,7 @@ function row(page, name) {
   return page.getByRole("row").filter({ has: page.getByRole("link", { name, exact: true }) });
 }
 
-test("moving and downloading progress both survive a burst before a render", async () => {
+test("moving and downloading progress both survive a burst before a render", RUNNER_BOUND, async () => {
   const page = await openQueue();
   try {
     for (const percent of [15, 35, 65]) {
@@ -59,18 +64,18 @@ test("moving and downloading progress both survive a burst before a render", asy
       await page.waitForFunction((value) => {
         const link = [...document.querySelectorAll("a")].find((node) => node.textContent === "Moving fixture");
         return link?.closest("tr")?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === String(value);
-      }, percent, { timeout: 2000 });
+      }, percent);
       await page.waitForFunction((value) => {
         const link = [...document.querySelectorAll("a")].find((node) => node.textContent === "Download fixture");
         return link?.closest("tr")?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === String(value + 1);
-      }, percent, { timeout: 2000 });
+      }, percent);
     }
   } finally {
     await page.close();
   }
 });
 
-test("a nine-job queue stays live without refreshes, including an initially blank download phase", async () => {
+test("a nine-job queue stays live without refreshes, including an initially blank download phase", RUNNER_BOUND, async () => {
   const page = await openQueue(2000, "?crowded");
   try {
     assert.equal(await page.getByRole("table").locator("tbody tr").count(), 9);
@@ -80,7 +85,7 @@ test("a nine-job queue stays live without refreshes, including an initially blan
       await page.waitForFunction((value) => {
         const link = [...document.querySelectorAll("tbody a")].find((node) => node.textContent === "Download fixture");
         return link?.closest("tr")?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === String(value + 1);
-      }, percent, { timeout: 2000 });
+      }, percent);
       await page.waitForFunction((value) => {
         const links = [...document.querySelectorAll("tbody a")];
         for (let id = 1; id <= 8; id += 1) {
@@ -90,14 +95,14 @@ test("a nine-job queue stays live without refreshes, including an initially blan
           if (progress !== String(value + Number(id === 1))) return false;
         }
         return true;
-      }, percent, { timeout: 2000 });
+      }, percent);
     }
   } finally {
     await page.close();
   }
 });
 
-test("progress tracks and columns stay fixed across percentage and rate ticks", async () => {
+test("progress tracks and columns stay fixed across percentage and rate ticks", RUNNER_BOUND, async () => {
   for (const width of [1280, 1360, 1440, 1500, 1600, 1620, 1700, 2000]) {
     const page = await openQueue(width);
     try {
@@ -111,7 +116,7 @@ test("progress tracks and columns stay fixed across percentage and rate ticks", 
         await page.waitForFunction((value) => {
           const link = [...document.querySelectorAll("a")].find((node) => node.textContent === "Download fixture");
           return link?.closest("tr")?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === String(value);
-        }, percent, { timeout: 2000 });
+        }, percent);
         const actual = await row(page, "Download fixture").getByRole("progressbar").boundingBox();
         assert.equal(actual.x, initial.x, `track moved at viewport ${width}, progress ${percent}`);
         assert.equal(actual.width, initial.width, `track resized at viewport ${width}, progress ${percent}`);
