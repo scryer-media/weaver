@@ -856,6 +856,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .len(),
         1
     );
+    settle_lane_dials(&pipeline).await;
 
     pipeline.active_downloads = 0;
     pipeline.active_download_connections = 0;

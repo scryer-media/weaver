@@ -354,6 +354,64 @@ fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, n
     .unwrap();
 }
 
+/// The one server every harness pool points at.
+///
+/// It answers each dial with a greeting the lane refuses, so a worker that
+/// was handed a lease fails its dial at once and gives the permit back, and
+/// the refusal is a protocol answer rather than a transport fault: it records
+/// no cooldown, so the server stays eligible for the next pass. A name that
+/// does not resolve did the first half of that and not the second, and left
+/// each test racing the worker's health bookkeeping.
+fn refusing_harness_server_port() -> u16 {
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind the refusing harness server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::Builder::new()
+            .name("refusing-harness-server".into())
+            .spawn(move || {
+                for socket in listener.incoming().flatten() {
+                    let _ = std::io::Write::write_all(
+                        &mut &socket,
+                        b"555 harness server takes no session\r\n",
+                    );
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                }
+            })
+            .expect("spawn the refusing harness server");
+        port
+    })
+}
+
+/// Wait until every worker thread the last pass handed a lease to has given
+/// its dial up and returned the server's permit.
+///
+/// The harness server refuses every session, so a worker fails its dial
+/// within milliseconds; but the pass that leased it returns before that, with
+/// the permit still on the thread. A test that then describes one of those lanes
+/// as finished, by rewinding the pipeline's counters, must wait for the seat
+/// to be real: the dispatcher measures a server by the permits it can see,
+/// not by the counters.
+async fn settle_lane_dials(pipeline: &Pipeline) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let pool = pipeline.nntp.pool();
+        let all_back = (0..pool.server_count()).all(|idx| {
+            let (available, max) = pool.server_load(idx);
+            available == max
+        });
+        if all_back {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lane dials did not settle"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 async fn new_direct_pipeline_with_buffers(
     temp_dir: &TempDir,
     buffer_config: BufferPoolConfig,
@@ -438,14 +496,17 @@ async fn new_direct_pipeline_at_roots(
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
     let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
     // Dispatch asks the pool which server a new lane should try, so a harness
-    // that is given connections needs a server to rank; nothing is dialed
-    // here. A harness with no connections keeps its empty pool.
+    // that is given connections needs a server to rank, and the lane workers
+    // those leases go to will dial it. A harness with no connections keeps
+    // its empty pool.
     let harness_servers = if total_connections == 0 {
         Vec::new()
     } else {
         vec![weaver_nntp::pool::ServerPoolConfig {
             server: weaver_nntp::ServerConfig {
-                host: "harness.example.com".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: refusing_harness_server_port(),
+                tls: false,
                 ..Default::default()
             },
             max_connections: total_connections,
