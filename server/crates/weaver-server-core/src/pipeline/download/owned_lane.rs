@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
-
 /// How long a lane-side probe waits for a worker to pick its request up.
 ///
 /// An idle worker picks up immediately. This only bounds the case where the
@@ -94,7 +93,7 @@ impl IdleOwnedLane {
             .is_some_and(|client| Arc::ptr_eq(&client, &run.nntp))
             && !run
                 .initial_lease
-                .effective_exclude_servers
+                .dial_exclude_servers
                 .contains(&self.server.0)
     }
 }
@@ -243,15 +242,6 @@ impl OwnedLaneProbeHandle {
 
     /// Every worker that is currently idle, with the server index of the
     /// connection it kept — `None` when it sits idle without one.
-    /// The servers of the connections idle workers are keeping, one entry
-    /// per idle worker; `None` for a worker idle without a connection.
-    pub(crate) fn idle_lane_servers(&self) -> Vec<Option<usize>> {
-        self.idle_workers()
-            .into_iter()
-            .map(|(server, _)| server)
-            .collect()
-    }
-
     fn idle_workers(&self) -> Vec<(Option<usize>, std_mpsc::Sender<OwnedLanePoolCommand>)> {
         let shared = lock_pool(&self.shared);
         shared
@@ -513,6 +503,20 @@ impl OwnedDownloadLanePool {
         }
     }
 
+    /// The servers of the connections idle workers are keeping, one entry
+    /// per idle worker; `None` for a worker idle without a connection.
+    pub(crate) fn idle_lane_servers(&self) -> Vec<Option<usize>> {
+        let shared = lock_pool(&self.shared);
+        shared
+            .workers
+            .iter()
+            .filter_map(|worker| {
+                let idle = worker.idle.as_ref()?;
+                Some(idle.lane.as_ref().map(|lane| lane.server.0))
+            })
+            .collect()
+    }
+
     pub(crate) fn worker_count(&self) -> usize {
         lock_pool(&self.shared).workers.len()
     }
@@ -749,7 +753,6 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
     }
     let OwnedLaneWarm {
         nntp,
-        groups,
         mut exclude_servers,
         byte_estimate,
     } = warm;
@@ -780,7 +783,7 @@ impl CachedOwnedLane {
     /// new sockets into a stall of every lane.
     fn matches(&self, nntp: &Arc<weaver_nntp::NntpClient>, lease: &DownloadBatchLease) -> bool {
         let server = self.lane.server_id();
-        if !Arc::ptr_eq(&self.nntp, nntp) || lease.effective_exclude_servers.contains(&server.0) {
+        if !Arc::ptr_eq(&self.nntp, nntp) || lease.dial_exclude_servers.contains(&server.0) {
             return false;
         }
 
@@ -800,7 +803,7 @@ impl CachedOwnedLane {
         // quota question; when it cannot be taken, the established connection
         // stands rather than being parked and redialled for nothing.
         let Some(selection) = nntp.try_blocking_body_server_selection_with_estimate(
-            &lease.effective_exclude_servers,
+            &lease.dial_exclude_servers,
             estimate,
         ) else {
             return true;
@@ -1065,7 +1068,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         match acquire_owned_lane_through_contention(
             &nntp,
             &[],
-            &lease.effective_exclude_servers,
+            &lease.dial_exclude_servers,
             initial_estimate,
         ) {
             Ok(lane) => {
@@ -1701,7 +1704,8 @@ fn test_lease(
         lane_mode: DownloadLaneMode::Pipelined { depth: 4 },
         server_modes: vec![(0, DownloadLaneMode::Pipelined { depth: 4 })],
         completion_critical: false,
-        effective_exclude_servers: exclude_servers,
+        effective_exclude_servers: exclude_servers.clone(),
+        dial_exclude_servers: exclude_servers,
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works,
@@ -2239,7 +2243,7 @@ mod routing_tests {
         let (parked_tx, _parked_rx) = mpsc::channel(4);
         // The receivers are dropped with the run; routing never sends on them.
         let mut lease = test_lease(JobId(7), 1, Vec::new(), vec![tail_work(1, 0)]);
-        lease.effective_exclude_servers = exclude_servers;
+        lease.dial_exclude_servers = exclude_servers;
         Box::new(OwnedLaneRun {
             nntp: Arc::clone(nntp),
             event_tx,

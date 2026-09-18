@@ -347,7 +347,6 @@ impl Pipeline {
             return;
         }
 
-
         if !self.repeated_articles.is_empty()
             && let Some(cache) = self.repeated_articles.get(&initial_lease.job_id)
         {
@@ -409,10 +408,7 @@ impl Pipeline {
                     .byte_estimate,
             );
             let selection = nntp
-                .body_server_selection_with_estimate(
-                    &lease.effective_exclude_servers,
-                    initial_estimate,
-                )
+                .body_server_selection_with_estimate(&lease.dial_exclude_servers, initial_estimate)
                 .await;
             let mut acquire_error = if selection.eligible.is_empty() {
                 selection
@@ -422,10 +418,7 @@ impl Pipeline {
                 None
             };
             for server in selection.eligible {
-                match nntp
-                    .acquire_body_lane(server, &[])
-                    .await
-                {
+                match nntp.acquire_body_lane(server, &[]).await {
                     Ok(acquired) => {
                         lane = Some(acquired);
                         break;
@@ -508,6 +501,7 @@ impl Pipeline {
                     server_modes,
                     completion_critical,
                     effective_exclude_servers: _,
+                    dial_exclude_servers: _,
                     checkpoint_plan,
                     pressure_clear,
                     works,
@@ -816,7 +810,6 @@ impl Pipeline {
                 if refill_tx
                     .send(DownloadLaneRefillRequest {
                         lane_id,
-                        job_id,
                         runtime_generation,
                         server_idx,
                         remote_ip: lane.remote_ip(),

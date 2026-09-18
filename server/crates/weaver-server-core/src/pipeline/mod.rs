@@ -27,7 +27,9 @@ use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+
+use crate::pipeline::download::HeldDownloadRefill;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -51,9 +53,9 @@ use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
-    DispatchShareMode, DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork,
-    JobInfo, JobSpec, JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner,
-    SchedulerCommand, SchedulerError, SharedPipelineState, SpilloverDecision, TokenBucket,
+    DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork, JobInfo, JobSpec,
+    JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner, SchedulerCommand,
+    SchedulerError, SharedPipelineState, TokenBucket,
 };
 #[cfg(test)]
 use par2_rs::checksum;
@@ -242,146 +244,6 @@ impl Pipeline {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct DownloadBatchCompatibility {
-    pub(super) priority: u32,
-    pub(super) is_recovery: bool,
-    pub(super) completion_critical: bool,
-    pub(super) groups: std::sync::Arc<[String]>,
-    pub(super) exclude_servers: Vec<usize>,
-    /// Transport-rotation hint carried from [`DownloadWork::avoid_server`].
-    /// Batched works share one effective exclude set, so works with different
-    /// avoid hints must not share a lease.
-    pub(super) avoid_server: Option<usize>,
-}
-
-impl DownloadBatchCompatibility {
-    fn from_work(work: &DownloadWork) -> Self {
-        Self {
-            priority: work.priority,
-            is_recovery: work.is_recovery,
-            completion_critical: work.completion_critical,
-            groups: work.groups.clone(),
-            exclude_servers: work.exclude_servers.clone(),
-            avoid_server: work.avoid_server,
-        }
-    }
-
-    /// Whether `work` may join the batch this compatibility was cut from at
-    /// **initial dispatch**.
-    ///
-    /// A first lease also decides the connection: the lane is acquired for
-    /// `groups`, and `priority` is what the initial batch was sized around. Two
-    /// works only share that decision when they agree on all of it.
-    fn matches(&self, work: &DownloadWork) -> bool {
-        work.priority == self.priority && self.refill_matches(work, true)
-    }
-
-    /// Whether `work` may join a **refill** of an already-established lane.
-    ///
-    /// A refill inherits a live connection, so the only question it may ask is
-    /// what that connection can serve:
-    ///
-    /// * `exclude_servers` / `avoid_server` — every work in a lease shares one
-    ///   effective exclude set, and each result reports the batch's excludes
-    ///   back into the segment's failure ledger. Mixing them would book one
-    ///   article's exclusions against another's, so these stay equal.
-    /// * `is_recovery` — the in-flight recovery count is added per batch and
-    ///   released per work item, so a batch that mixed the two would book one
-    ///   article's bytes against the other's ledger.
-    /// * `completion_critical` — the class the *batch* is sized and counted
-    ///   under.
-    ///
-    /// Neither of those makes the class of the *lane* immutable. A lane whose
-    /// job has completion-critical work queued changes class between batches
-    /// instead of parking: `try_lease_refill_download_batch` looks at the
-    /// critical heap first and re-opens the lease around that work's own
-    /// compatibility, and the refill grant rebooks the connection from the
-    /// class it held to the class it is being given. What stays fixed is one
-    /// *batch*'s class, which is all this rule decides.
-    ///
-    /// `priority` is deliberately **not** asked: it only orders the queue.
-    /// Gating a refill on it pinned each lane inside one direct-store volume
-    /// (`10 + volume_index`), so every lane parked "no work" at each of a
-    /// 125-volume job's boundaries with thousands of articles still queued.
-    ///
-    /// `groups` is asked only when `match_groups` says the lane's server has
-    /// proven it needs a selected group (RFC 3977 serves a message-id fetch
-    /// without one, and such a lane never sent GROUP). On a server that did
-    /// send GROUP at connect, an article from another group is not known to be
-    /// fetchable through that selection, so the refill keeps to the group the
-    /// connection was opened for and the initial rule reconnects for the rest.
-    fn refill_matches(&self, work: &DownloadWork, match_groups: bool) -> bool {
-        work.is_recovery == self.is_recovery
-            && work.completion_critical == self.completion_critical
-            && work.exclude_servers == self.exclude_servers
-            && work.avoid_server == self.avoid_server
-            && (!match_groups || self.groups_match(work))
-    }
-
-    fn groups_match(&self, work: &DownloadWork) -> bool {
-        std::sync::Arc::ptr_eq(&work.groups, &self.groups) || work.groups == self.groups
-    }
-}
-
-/// Which of the two compatibility rules a pop is being filtered by.
-///
-/// Kept as a selector rather than two `matches` call sites so the rule a lease
-/// was opened under is carried all the way through its batching loop: a refill
-/// that took the queue head under the refill rule must go on filling under the
-/// same rule, or it stops after one article at the next priority boundary.
-#[derive(Clone, Copy)]
-pub(super) struct DownloadBatchSelector<'a> {
-    compatibility: &'a DownloadBatchCompatibility,
-    rule: DownloadBatchRule,
-}
-
-/// The rule a lease is cut under; see [`DownloadBatchCompatibility::matches`]
-/// and [`DownloadBatchCompatibility::refill_matches`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum DownloadBatchRule {
-    /// A first lease: every work must agree with the head on everything.
-    Initial,
-    /// A refill of a live lane: priority is not asked, and `groups` only when
-    /// the lane's server has proven it needs a selected group.
-    Refill { match_groups: bool },
-}
-
-impl DownloadBatchRule {
-    pub(super) fn is_refill(self) -> bool {
-        matches!(self, Self::Refill { .. })
-    }
-}
-
-impl<'a> DownloadBatchSelector<'a> {
-    pub(super) fn new(
-        compatibility: &'a DownloadBatchCompatibility,
-        rule: DownloadBatchRule,
-    ) -> Self {
-        Self {
-            compatibility,
-            rule,
-        }
-    }
-
-    pub(super) fn initial(compatibility: &'a DownloadBatchCompatibility) -> Self {
-        Self::new(compatibility, DownloadBatchRule::Initial)
-    }
-
-    pub(super) fn matches(&self, work: &DownloadWork) -> bool {
-        match self.rule {
-            DownloadBatchRule::Initial => self.compatibility.matches(work),
-            DownloadBatchRule::Refill { match_groups } => {
-                self.compatibility.refill_matches(work, match_groups)
-            }
-        }
-    }
-
-    pub(super) fn is_refill(&self) -> bool {
-        self.rule.is_refill()
-    }
-}
-
 pub(super) struct DownloadLaneOwner {
     job_id: JobId,
     mode: DownloadLaneMode,
@@ -408,6 +270,11 @@ pub(super) struct DownloadBatchLease {
     /// acquisition use. Each result reports its own work's failure-only
     /// excludes; retention stays job-derived.
     pub(super) effective_exclude_servers: Vec<usize>,
+    /// The servers the lane's adopt or dial must not use. A batch is cut for
+    /// one server, so this is every other server: the connection goes where
+    /// the scheduler's answer was for. Kept apart from the excludes above,
+    /// which reach the failure ledger — a pin is not a failure.
+    pub(super) dial_exclude_servers: Vec<usize>,
     /// Immutable common-refinement geometry captured when this batch was
     /// leased. Each response carries this same snapshot through durable commit
     /// so grids admitted later cannot reinterpret old decoder output.
@@ -520,10 +387,6 @@ impl DownloadResultOrigin {
             self,
             Self::CompletionCriticalPrimary | Self::CompletionCriticalRecovery
         )
-    }
-
-    pub(super) fn counts_for_hot_primary(self) -> bool {
-        matches!(self, Self::NormalPrimary)
     }
 }
 

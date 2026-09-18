@@ -25,7 +25,7 @@ use crate::pipeline::download::scheduler::{Handout, YieldReason};
 pub(in crate::pipeline) const DOWNLOAD_REFILL_IDLE_HOLD: Duration = Duration::from_secs(2);
 
 /// A refill the scheduler could not fill yet, waiting for a wake.
-pub(in crate::pipeline) struct HeldDownloadRefill {
+pub(crate) struct HeldDownloadRefill {
     request: DownloadLaneRefillRequest,
     since: Instant,
 }
@@ -37,7 +37,10 @@ impl Pipeline {
     /// (see `refill_deadline` beside the ring), so one more than that keeps
     /// the cadence at one refill per ring turn without pre-leasing articles
     /// that other lanes of the same job could be fetching now.
-    fn download_refill_want(&self, lane_mode: DownloadLaneMode) -> usize {
+    pub(in crate::pipeline::download::worker) fn download_refill_want(
+        &self,
+        lane_mode: DownloadLaneMode,
+    ) -> usize {
         // A limited link activates its reservations after the lease is
         // finalized; single-article leases let every refill see the updated
         // token balance instead of pre-leasing past it.
@@ -48,7 +51,7 @@ impl Pipeline {
     }
 
     /// The depth a lane on `server_idx` should run at for its next batch.
-    fn download_lane_mode_for_server(
+    pub(in crate::pipeline::download::worker) fn download_lane_mode_for_server(
         &self,
         server_idx: usize,
         pressure: DownloadPressure,
@@ -137,7 +140,8 @@ impl Pipeline {
         }
         let lane_id = request.lane_id;
         let server_idx = request.server_idx;
-        if request.runtime_generation != self.pool_generation || !self.download_lane_is_live(lane_id)
+        if request.runtime_generation != self.pool_generation
+            || !self.download_lane_is_live(lane_id)
         {
             let _ = request.response_tx.send(DownloadLaneRefillResponse {
                 lease: None,
@@ -175,18 +179,7 @@ impl Pipeline {
         let works = match self.next_works(server_idx, want, spill_in_flight, pressure) {
             Handout::Works(works) => works,
             Handout::Idle => {
-                let since = held_since.unwrap_or(now);
-                if now.saturating_duration_since(since) >= DOWNLOAD_REFILL_IDLE_HOLD {
-                    self.park_download_lane_refill(
-                        request,
-                        LaneParkReason::NoWork,
-                        held_since,
-                        now,
-                    );
-                } else {
-                    self.held_download_refills
-                        .push(HeldDownloadRefill { request, since });
-                }
+                self.hold_or_park_idle_download_lane_refill(request, pressure, held_since, now);
                 return;
             }
             Handout::Yield(reason) => {
@@ -214,9 +207,10 @@ impl Pipeline {
 
         let Some(lease) = self.lease_for_handout(lane_id, server_idx, lane_mode, pressure, works)
         else {
-            // Every article the scheduler handed out was refused by a
+            // The first article the scheduler handed out was refused by a
             // reservation (durable lead, ISP cap) and is back in the queue.
-            self.park_download_lane_refill(request, LaneParkReason::Pressure, held_since, now);
+            // That clears the way it clears for an idle answer: on a wake.
+            self.hold_or_park_idle_download_lane_refill(request, pressure, held_since, now);
             return;
         };
 
@@ -309,6 +303,9 @@ impl Pipeline {
             return None;
         }
         let completion_critical = reserved.iter().any(|work| work.completion_critical);
+        let dial_exclude_servers = (0..self.nntp.pool().server_count())
+            .filter(|idx| *idx != server_idx)
+            .collect();
         Some(DownloadBatchLease {
             lane_id,
             job_id,
@@ -317,10 +314,58 @@ impl Pipeline {
             server_modes: vec![(server_idx, lane_mode)],
             completion_critical,
             effective_exclude_servers: self.effective_exclude_servers(job_id, &[]),
+            dial_exclude_servers,
             checkpoint_plan: self.par2_checkpoint_plan(job_id),
             pressure_clear: pressure.state == DownloadPressureState::Clear,
             works: reserved,
         })
+    }
+
+    /// A refill nothing could be cut for right now. The lane keeps its
+    /// socket and waits in the actor for the next wake — unless another
+    /// server could serve queued work now, in which case the slot this lane
+    /// is holding is worth more to a dial there than to a wait here, or the
+    /// hold has already run its course.
+    fn hold_or_park_idle_download_lane_refill(
+        &mut self,
+        request: DownloadLaneRefillRequest,
+        pressure: DownloadPressure,
+        held_since: Option<Instant>,
+        now: Instant,
+    ) {
+        let since = held_since.unwrap_or(now);
+        let hold_expired = now.saturating_duration_since(since) >= DOWNLOAD_REFILL_IDLE_HOLD;
+        if hold_expired || self.servable_work_on_other_server(request.server_idx, pressure) {
+            self.park_download_lane_refill(request, LaneParkReason::NoWork, held_since, now);
+            return;
+        }
+        self.held_download_refills
+            .push(HeldDownloadRefill { request, since });
+    }
+
+    /// Cut one lease for `server_idx` the way a dispatch pass would: one
+    /// scheduler handout, reserved and pinned to that server. `None` when the
+    /// scheduler had nothing for the server or nothing survived reservation.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn lease_for_server_for_test(
+        &mut self,
+        server_idx: usize,
+    ) -> Option<DownloadBatchLease> {
+        let pressure = self.refresh_download_pressure();
+        let lane_mode = self.download_lane_mode_for_server(server_idx, pressure, true);
+        let want = self.download_refill_want(lane_mode);
+        let spill_in_flight = self.spill_job_in_flight_on(server_idx);
+        let Handout::Works(works) = self.next_works(server_idx, want, spill_in_flight, pressure)
+        else {
+            return None;
+        };
+        self.lease_for_handout(
+            Self::next_download_lane_id(),
+            server_idx,
+            lane_mode,
+            pressure,
+            works,
+        )
     }
 
     fn park_download_lane_refill(

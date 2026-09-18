@@ -1034,6 +1034,10 @@ impl Pipeline {
                     }
                     _ = metrics_snapshot_interval.tick() => {
                         self.refresh_periodic_snapshot();
+                        // Lanes whose refill found nothing wait here for the
+                        // next wake; the tick is what ends the wait when no
+                        // wake comes.
+                        self.service_held_download_refills();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
@@ -1070,32 +1074,6 @@ impl Pipeline {
                             pressure_state = snapshot.download_pressure_state.as_str(),
                             pressure_reason = snapshot.download_pressure_reason.as_str(),
                             direct_write_evictions = snapshot.direct_write_evictions,
-                            hot_dispatch_job_id = snapshot.hot_dispatch_job_id,
-                            hot_dispatch_mode = snapshot.hot_dispatch_mode.as_str(),
-                            hot_dispatch_lent_connections = snapshot.hot_dispatch_lent_connections,
-                            hot_dispatch_underfill_ms = snapshot.hot_dispatch_underfill_ms,
-                            hot_dispatch_speed_bps = snapshot.hot_dispatch_hot_speed_bps,
-                            hot_dispatch_exclusive_peak_bps =
-                                snapshot.hot_dispatch_exclusive_peak_bps,
-                            hot_dispatch_spillover_pre_speed_bps =
-                                snapshot.hot_dispatch_spillover_pre_speed_bps,
-                            hot_dispatch_spillover_post_speed_bps =
-                                snapshot.hot_dispatch_spillover_post_speed_bps,
-                            hot_dispatch_spillover_active_loans =
-                                snapshot.hot_dispatch_spillover_active_loans,
-                            hot_dispatch_recent_expansion_improvement_pct =
-                                snapshot.hot_dispatch_recent_expansion_improvement_pct,
-                            hot_dispatch_best_mode_block_reason =
-                                snapshot.hot_dispatch_best_mode_block_reason,
-                            hot_dispatch_last_expansion_kind =
-                                snapshot.hot_dispatch_last_expansion_kind,
-                            hot_dispatch_last_expansion_before_bps =
-                                snapshot.hot_dispatch_last_expansion_before_bps,
-                            hot_dispatch_last_expansion_after_bps =
-                                snapshot.hot_dispatch_last_expansion_after_bps,
-                            hot_dispatch_last_spillover_decision = snapshot
-                                .hot_dispatch_last_spillover_decision
-                                .as_str(),
                             not_found,
                             health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                             "pipeline tick"

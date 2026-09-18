@@ -584,6 +584,7 @@ impl Pipeline {
                     self.seed_download_lane_explorers();
                     let recovery_requeues = self.wake_all_infrastructure_retries();
                     self.reset_owned_download_lanes();
+                    self.drop_held_download_refills();
                     self.clear_retention_exclude_cache();
                     for state in self.jobs.values_mut() {
                         state.download_queue.clear_exclude_servers();

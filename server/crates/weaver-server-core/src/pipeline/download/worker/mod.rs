@@ -1,11 +1,11 @@
 use super::*;
-use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use crate::pipeline::download::scheduler::Handout;
+use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 mod completion;
 mod direct_store;
-mod hot;
+mod eligibility;
 mod ip_replacement;
 mod lanes;
 mod leases;
@@ -19,6 +19,7 @@ mod spawn;
 pub(in crate::pipeline) use ip_replacement::{
     is_ip_replacement_policy_stop, should_neutrally_park_ip_replacement,
 };
+pub(in crate::pipeline) use refill::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
 
@@ -26,43 +27,6 @@ enum DispatchAttempt {
     Dispatched,
     NoWork,
     StopAll,
-}
-
-/// How the completion-critical dispatch phase ended, which is what decides the
-/// yield signal. Only demand that a freed connection could actually serve may
-/// ask lanes to yield: critical work that is queued but undispatchable — a
-/// propagation hold, a durable-lead backlog, every server excluded — must not
-/// park the rest of the queue behind work no yielded lane can be handed to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::pipeline::download) enum DownloadWorkSelection {
-    Any,
-    CompletionCritical,
-    NonCritical,
-}
-
-impl DownloadWorkSelection {
-    fn matches(self, work: &DownloadWork) -> bool {
-        match self {
-            Self::Any => true,
-            Self::CompletionCritical => work.completion_critical,
-            Self::NonCritical => !work.completion_critical,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DownloadBatchClass {
-    is_recovery: bool,
-    completion_critical: bool,
-}
-
-impl From<&DownloadBatchCompatibility> for DownloadBatchClass {
-    fn from(compatibility: &DownloadBatchCompatibility) -> Self {
-        Self {
-            is_recovery: compatibility.is_recovery,
-            completion_critical: compatibility.completion_critical,
-        }
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -81,9 +45,6 @@ struct DownloadPipelineBacklog {
 const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
 const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
-const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
-const HOT_LEASE_TARGET_RUNWAY_SECS: u64 = 2;
-const HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
 const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_LANE_CAPACITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_FETCH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -244,7 +205,6 @@ impl Pipeline {
                 }
             }
         }
-        let server_count = self.nntp.pool().server_count();
         for server_idx in servers {
             let spill_in_flight = self.spill_job_in_flight_on(server_idx);
             let lane_mode = self.download_lane_mode_for_server(server_idx, pressure, true);
@@ -255,16 +215,11 @@ impl Pipeline {
                 Handout::Works(works) => works,
             };
             let lane_id = Self::next_download_lane_id();
-            let Some(mut lease) =
+            let Some(lease) =
                 self.lease_for_handout(lane_id, server_idx, lane_mode, pressure, works)
             else {
                 return DispatchAttempt::NoWork;
             };
-            // The handout was cut for this server, so the lane is pinned to
-            // it: every other server is excluded from the adopt or dial.
-            lease.effective_exclude_servers = (0..server_count)
-                .filter(|idx| *idx != server_idx)
-                .collect();
             let job_id = lease.job_id;
             let activation_items = Self::activation_items(&lease);
             self.activate_download_batch_lease(&lease, &activation_items, true);

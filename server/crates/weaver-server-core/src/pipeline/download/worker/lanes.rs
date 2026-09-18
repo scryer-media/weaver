@@ -699,7 +699,7 @@ impl Pipeline {
     ) -> bool {
         !matches!(
             self.nntp
-                .blocking_body_lane_candidacy(&lease.effective_exclude_servers),
+                .blocking_body_lane_candidacy(&lease.dial_exclude_servers),
             weaver_nntp::client::BlockingBodyLaneCandidacy::None
         )
     }
@@ -716,43 +716,6 @@ impl Pipeline {
             Some(actual_bytes) => self.rate_limiter.reconcile(estimated_bytes, actual_bytes),
             None => self.rate_limiter.refund(estimated_bytes),
         }
-    }
-
-    /// The depth a new lease is dispatched at.
-    ///
-    /// Recovery is no longer singled out for sequential mode. It rides the
-    /// same owned lanes as everything else now, and a lane whose depth is
-    /// pinned to one gives back the round trip the pipeline exists to hide —
-    /// on exactly the work a job is waiting on to finish.
-    pub(in crate::pipeline) fn choose_download_lane_mode(
-        &mut self,
-        job_id: JobId,
-        is_recovery: bool,
-        pressure: DownloadPressure,
-    ) -> DownloadLaneMode {
-        let _ = (job_id, is_recovery);
-        let pressure_clear = pressure.state == DownloadPressureState::Clear;
-        self.download_lane_runtime
-            .servers
-            .values()
-            .map(|explorer| explorer.choose_mode(pressure_clear))
-            .max_by_key(|mode| mode.max_depth())
-            .unwrap_or(DownloadLaneMode::Sequential)
-    }
-
-    pub(in crate::pipeline) fn download_lane_server_modes(
-        &mut self,
-        job_id: JobId,
-        is_recovery: bool,
-        pressure: DownloadPressure,
-    ) -> Vec<(usize, DownloadLaneMode)> {
-        let _ = (job_id, is_recovery);
-        let pressure_clear = pressure.state == DownloadPressureState::Clear;
-        self.download_lane_runtime
-            .servers
-            .iter()
-            .map(|(server_idx, explorer)| (*server_idx, explorer.choose_mode(pressure_clear)))
-            .collect()
     }
 
     pub(in crate::pipeline) fn note_download_lane_mode_changed(
@@ -959,7 +922,7 @@ impl Pipeline {
             requeue = error.should_requeue_owned_work(),
             suppressed_since_last,
             candidate_servers = ?servers,
-            excluded_servers = ?lease.effective_exclude_servers,
+            excluded_servers = ?lease.dial_exclude_servers,
             "owned blocking download lane could not be acquired"
         );
     }
@@ -1021,48 +984,6 @@ impl Pipeline {
     /// itself, so a pass that has already run cannot be asked for twice.
     pub(crate) fn take_download_dispatch_wake(&mut self) -> bool {
         std::mem::take(&mut self.download_dispatch_wake)
-    }
-
-    /// Move an established connection's class booking when a refill hands it
-    /// the other class's work.
-    ///
-    /// The connection itself is counted once, at dispatch, under the class its
-    /// first batch carried, and released at park under the class of its last.
-    /// A lane that changes class in between has to move that booking with it,
-    /// or the two ends disagree: the critical spread in
-    /// `dispatch_completion_critical_work` would keep sending demand to a job
-    /// whose lane is already serving it, and the eventual park would decrement
-    /// a count this lane was never added to.
-    pub(in crate::pipeline::download::worker) fn rebook_download_lane_class(
-        &mut self,
-        job_id: JobId,
-        from: DownloadBatchClass,
-        to: DownloadBatchClass,
-    ) {
-        if from.completion_critical == to.completion_critical {
-            return;
-        }
-        if to.completion_critical {
-            self.active_completion_critical_connections += 1;
-            *self
-                .active_completion_critical_connections_by_job
-                .entry(job_id)
-                .or_default() += 1;
-        } else {
-            self.active_completion_critical_connections = self
-                .active_completion_critical_connections
-                .saturating_sub(1);
-            if let Some(in_flight) = self
-                .active_completion_critical_connections_by_job
-                .get_mut(&job_id)
-            {
-                *in_flight = in_flight.saturating_sub(1);
-                if *in_flight == 0 {
-                    self.active_completion_critical_connections_by_job
-                        .remove(&job_id);
-                }
-            }
-        }
     }
 
     pub(crate) fn handle_download_lane_parked(&mut self, mut parked: DownloadLaneParked) {
