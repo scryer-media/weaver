@@ -17,6 +17,8 @@ mod idle;
 
 enum TestArticle {
     Body(Vec<u8>),
+    /// Only the s2n socket-slice test, which does not build on Windows.
+    #[cfg(not(windows))]
     DelayedInitial {
         data: Vec<u8>,
         delay: Duration,
@@ -220,6 +222,7 @@ fn spawn_tls_nntp_server_with_upgrade(
                             stream.get_mut().write_all(&yenc_body(data)).await.unwrap();
                             stream.get_mut().write_all(b".\r\n").await.unwrap();
                         }
+                        #[cfg(not(windows))]
                         Some(TestArticle::DelayedInitial { data, delay }) => {
                             tokio::time::sleep(*delay).await;
                             if stream
