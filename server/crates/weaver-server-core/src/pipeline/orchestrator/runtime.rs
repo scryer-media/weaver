@@ -960,7 +960,7 @@ impl Pipeline {
                     Some(result) = self.download_done_rx.recv() => {
                         if !self.release_download_result(&result) { continue; }
                         self.note_released_download_result_pending(
-                            result.segment_id.file_id.job_id,
+                            result.job_id,
                             Self::released_download_result_lead_bytes(&result),
                         );
                         pending_download_results.push_back(result);
@@ -1342,7 +1342,7 @@ impl Pipeline {
                 continue;
             }
             self.note_released_download_result_pending(
-                result.segment_id.file_id.job_id,
+                result.job_id,
                 Self::released_download_result_lead_bytes(&result),
             );
             pending.push_back(result);

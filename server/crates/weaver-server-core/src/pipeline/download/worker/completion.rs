@@ -310,6 +310,14 @@ impl Pipeline {
     }
 
     pub(crate) fn release_download_result(&mut self, result: &DownloadResult) -> bool {
+        // Job attribution below comes from the result alone. While a lane is
+        // still booked to one job, the two must agree.
+        debug_assert!(
+            self.download_lane_owners
+                .get(&result.lane_id)
+                .is_none_or(|owner| owner.job_id == result.job_id),
+            "download result job disagrees with the lane owner still booked for its lane"
+        );
         if !self.accept_lane_work(result.lane_id, result.segment_id) {
             let bytes = match &result.data {
                 Ok(DownloadPayload::Raw(raw)) => raw.len() as u64,
@@ -355,7 +363,7 @@ impl Pipeline {
                 self.note_download_lane_released(observation.mode, reason);
             }
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
-            let job_id = result.segment_id.file_id.job_id;
+            let job_id = result.job_id;
             if let Some(in_flight) = self.active_download_connections_by_job.get_mut(&job_id) {
                 *in_flight = in_flight.saturating_sub(1);
                 if *in_flight == 0 {
@@ -383,7 +391,7 @@ impl Pipeline {
             self.active_recovery = self.active_recovery.saturating_sub(1);
         }
 
-        let job_id = result.segment_id.file_id.job_id;
+        let job_id = result.job_id;
         self.note_download_activity(job_id);
         if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
             *in_flight = in_flight.saturating_sub(1);
@@ -487,7 +495,7 @@ impl Pipeline {
     }
 
     pub(crate) async fn process_released_download_done(&mut self, result: DownloadResult) {
-        let job_id = result.segment_id.file_id.job_id;
+        let job_id = result.job_id;
         let lead_bytes = Self::released_download_result_lead_bytes(&result);
         self.process_download_done(result).await;
         self.finish_released_download_result_processing(job_id, lead_bytes);
@@ -516,7 +524,7 @@ impl Pipeline {
     }
 
     async fn process_download_done_inner(&mut self, result: DownloadResult) {
-        let job_id = result.segment_id.file_id.job_id;
+        let job_id = result.job_id;
         if self
             .jobs
             .get(&job_id)
@@ -1207,7 +1215,7 @@ impl Pipeline {
                             self.note_retry_scheduled(seg_id);
                             if infrastructure_retry {
                                 self.note_infrastructure_retry_scheduled(
-                                    seg_id.file_id.job_id,
+                                    job_id,
                                     failure.kind,
                                     Some(delay),
                                 );

@@ -124,6 +124,7 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     let bandwidth = pipeline.bandwidth_reservations.clone();
     let late_result = |data| DownloadResult {
         lane_id: old_id,
+        job_id: segment_id.file_id.job_id,
         segment_id,
         runtime_generation: pipeline.pool_generation,
         data,
@@ -254,6 +255,7 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
             pipeline
                 .handle_download_done(DownloadResult {
                     lane_id,
+                    job_id: segment_id.file_id.job_id,
                     segment_id,
                     runtime_generation: pipeline.pool_generation,
                     data,
@@ -336,6 +338,7 @@ async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
             lane_id,
             results: vec![DownloadResult {
                 lane_id,
+                job_id: segment_id.file_id.job_id,
                 segment_id,
                 runtime_generation: pipeline.pool_generation,
                 data: Err(DownloadError::fetch(
@@ -772,6 +775,7 @@ async fn checkpoint_progress_waits_for_result_even_when_durability_catches_up() 
     // and park the same work without spending its content-retry budget.
     let result = DownloadResult {
         lane_id,
+        job_id: segment_id.file_id.job_id,
         runtime_generation: pipeline.pool_generation,
         segment_id,
         data: Err(DownloadError::fetch(

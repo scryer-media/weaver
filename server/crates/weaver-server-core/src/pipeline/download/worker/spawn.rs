@@ -461,6 +461,7 @@ impl Pipeline {
                     let _ = tx
                         .send(DownloadResult {
                             lane_id,
+                            job_id,
                             segment_id: work.segment_id,
                             runtime_generation,
                             data: Err(DownloadError::Fetch(work_failure)),
@@ -622,6 +623,7 @@ impl Pipeline {
                                 let _ = tx
                                     .send(DownloadResult {
                                         lane_id,
+                                        job_id,
                                         segment_id,
                                         runtime_generation,
                                         data,
@@ -704,6 +706,7 @@ impl Pipeline {
                                             let _ = tx
                                                 .send(DownloadResult {
                                                     lane_id,
+                                                    job_id,
                                                     segment_id,
                                                     runtime_generation,
                                                     data,
@@ -739,6 +742,7 @@ impl Pipeline {
                         let _ = tx
                             .send(DownloadResult {
                                 lane_id,
+                                job_id,
                                 segment_id: work.segment_id,
                                 runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(
@@ -784,6 +788,7 @@ impl Pipeline {
                         let _ = tx
                             .send(DownloadResult {
                                 lane_id,
+                                job_id,
                                 segment_id: work.segment_id,
                                 runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(

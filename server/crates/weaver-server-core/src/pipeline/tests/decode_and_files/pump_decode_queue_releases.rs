@@ -275,6 +275,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(raw)),
@@ -381,6 +382,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from_static(
@@ -449,6 +451,7 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Decode {
@@ -579,6 +582,7 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Decoded(DecodeResult {

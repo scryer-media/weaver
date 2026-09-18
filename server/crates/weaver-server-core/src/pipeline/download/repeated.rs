@@ -443,6 +443,7 @@ impl Pipeline {
                 let _ = tx
                     .send(DownloadResult {
                         lane_id: lease.lane_id,
+                        job_id: lease.job_id,
                         segment_id: work.segment_id,
                         runtime_generation: lease.runtime_generation,
                         data: reply.data,

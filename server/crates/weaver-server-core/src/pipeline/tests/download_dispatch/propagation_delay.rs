@@ -360,6 +360,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: first_segment.file_id.job_id,
             runtime_generation: 0,
             segment_id: first_segment,
             data: quota_data,
@@ -375,6 +376,7 @@ async fn ip_replacement_policy_stop_is_neutral_and_lossless() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: tail_segment.file_id.job_id,
             runtime_generation: 0,
             segment_id: tail_segment,
             data: unrequested_data,
@@ -462,6 +464,7 @@ async fn release_download_result_excludes_ip_replacement_trial_from_hot_success_
 
     pipeline.release_download_result(&DownloadResult {
         lane_id: 0,
+        job_id: segment_id.file_id.job_id,
         runtime_generation: 0,
         segment_id,
         data: Ok(DownloadPayload::Raw(Bytes::from_static(b"trial-article"))),
@@ -1507,6 +1510,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Decoded(DecodeResult {
@@ -2577,6 +2581,7 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 500]))),
@@ -2615,6 +2620,7 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from(vec![0; 1_600]))),
