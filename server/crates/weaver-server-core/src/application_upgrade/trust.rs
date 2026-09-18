@@ -71,7 +71,7 @@ where
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn spawn_trust_root_priming_for_test<Refresh, Refreshing>(
     refresh: Refresh,
 ) -> JoinHandle<()>

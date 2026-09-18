@@ -1344,6 +1344,7 @@ mod tests {
     use std::fs;
     use std::future::Future;
     use std::pin::Pin;
+    #[cfg(unix)]
     use std::time::Duration;
 
     const TEST_TAG: &str = "weaver-v99.0.0";
@@ -1429,6 +1430,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn tar_gz(members: &[(&str, &[u8], u32)]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut archive = tar::Builder::new(encoder);
