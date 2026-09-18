@@ -3,6 +3,7 @@ mod bootstrap;
 mod commands;
 #[cfg(windows)]
 mod crash_dump;
+mod heartbeat;
 mod http;
 mod logging;
 mod restart;
