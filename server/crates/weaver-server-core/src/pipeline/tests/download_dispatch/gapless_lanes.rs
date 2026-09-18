@@ -518,3 +518,19 @@ async fn a_refill_on_a_lane_of_a_job_that_is_not_hot_is_answered_from_the_hot_jo
             .contains_key(&other_job_id)
     );
 }
+
+#[tokio::test]
+async fn a_lane_between_leases_outlives_the_job_it_last_served() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41016);
+    let lane_id = book_connected_lane(&mut pipeline, job_id, false);
+
+    assert_eq!(pipeline.retire_stalled_download_lanes(job_id), 0);
+
+    assert!(
+        pipeline.download_lane_owners.contains_key(&lane_id),
+        "an idle lane is pool property, not the finished job's"
+    );
+    assert_eq!(pipeline.active_download_connections, 1);
+}

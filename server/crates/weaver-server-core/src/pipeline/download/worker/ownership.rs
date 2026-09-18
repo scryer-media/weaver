@@ -139,11 +139,18 @@ impl Pipeline {
         accepted
     }
 
+    /// Tear down every lane still fetching for `job_id` and give its
+    /// articles back. A lane the job owns only on paper, with nothing in
+    /// flight, is a hot worker between leases: its next refill is answered
+    /// from whichever job the scheduler names, so it stays up, cached
+    /// connection and all, rather than dying with the job it last served.
     pub(in crate::pipeline) fn retire_stalled_download_lanes(&mut self, job_id: JobId) -> usize {
         let ids: Vec<_> = self
             .download_lane_owners
             .iter()
-            .filter_map(|(id, owner)| (owner.job_id == job_id).then_some(*id))
+            .filter_map(|(id, owner)| {
+                (owner.job_id == job_id && !owner.outstanding.is_empty()).then_some(*id)
+            })
             .collect();
         let mut returned = 0;
         for lane_id in ids {

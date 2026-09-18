@@ -353,7 +353,10 @@ async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pipeline.retire_stalled_download_lanes(HOT), 0);
     assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(pipeline.active_download_connections, 0);
+    // The lane had nothing left in flight, so it is a hot worker between
+    // leases: retirement leaves it up with its connection booked.
+    assert_eq!(pipeline.active_download_connections, 1);
+    assert!(pipeline.download_lane_owners.contains_key(&lane_id));
     assert_eq!(pipeline.jobs[&HOT].download_queue.len(), queued - 1);
     assert_eq!(
         pipeline.checkpoint_progress_articles[&HOT],
