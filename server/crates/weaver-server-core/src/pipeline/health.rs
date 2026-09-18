@@ -1,4 +1,5 @@
 use super::*;
+use crate::jobs::model::{HealthDeferral, HealthDeferralKind};
 
 const HEALTH_PROBE_REARM_MIN_BYTES: u64 = 128 * 1024 * 1024;
 const HEALTH_PROBE_REARM_PAYLOAD_DIVISOR: u64 = 200;
@@ -417,15 +418,28 @@ impl Pipeline {
         }
 
         if health <= critical && par2_bytes > 0 {
-            info!(
-                job_id = job_id.0,
-                health_pct = health as f64 / 10.0,
-                critical_pct = critical as f64 / 10.0,
-                failed_bytes,
-                total_bytes = total,
-                par2_bytes,
-                "deferring health failure to PAR2 recovery evaluation"
-            );
+            let entered = self.note_health_deferral(job_id, HealthDeferralKind::Par2Recovery);
+            if entered {
+                info!(
+                    job_id = job_id.0,
+                    health_pct = health as f64 / 10.0,
+                    critical_pct = critical as f64 / 10.0,
+                    failed_bytes,
+                    total_bytes = total,
+                    par2_bytes,
+                    "deferring health failure to PAR2 recovery evaluation"
+                );
+            } else {
+                debug!(
+                    job_id = job_id.0,
+                    health_pct = health as f64 / 10.0,
+                    critical_pct = critical as f64 / 10.0,
+                    failed_bytes,
+                    total_bytes = total,
+                    par2_bytes,
+                    "deferring health failure to PAR2 recovery evaluation"
+                );
+            }
             self.schedule_job_completion_check(job_id);
             return;
         }
@@ -434,22 +448,38 @@ impl Pipeline {
         // NZB to get a fast overall health estimate instead of waiting for sequential
         // processing to naturally reach damaged areas.
         if needs_probes && self.activate_health_probes(job_id) {
+            self.clear_health_deferral(job_id);
             return;
         }
 
         if health_probing && health <= critical {
-            info!(
-                job_id = job_id.0,
-                health_pct = health as f64 / 10.0,
-                critical_pct = critical as f64 / 10.0,
-                failed_bytes,
-                total_bytes = total,
-                "deferring health failure while probe confirmation is pending"
-            );
+            let entered = self.note_health_deferral(job_id, HealthDeferralKind::ProbeConfirmation);
+            if entered {
+                info!(
+                    job_id = job_id.0,
+                    health_pct = health as f64 / 10.0,
+                    critical_pct = critical as f64 / 10.0,
+                    failed_bytes,
+                    total_bytes = total,
+                    "deferring health failure while probe confirmation is pending"
+                );
+            } else {
+                debug!(
+                    job_id = job_id.0,
+                    health_pct = health as f64 / 10.0,
+                    critical_pct = critical as f64 / 10.0,
+                    failed_bytes,
+                    total_bytes = total,
+                    "deferring health failure while probe confirmation is pending"
+                );
+            }
             return;
         }
 
-        if health <= critical {
+        if health > critical {
+            // Health is back above the line: nothing is being held back now.
+            self.clear_health_deferral(job_id);
+        } else {
             warn!(
                 job_id = job_id.0,
                 health_pct = health as f64 / 10.0,
@@ -660,9 +690,57 @@ impl Pipeline {
         self.finish_failed_job(job_id, error, released_repair, released_extract);
     }
 
+    /// Record one deferral of a job's health failure.
+    ///
+    /// Returns whether it opened a new spell of deferring — the one event in a
+    /// spell the caller announces — rather than extending the one running.
+    fn note_health_deferral(&mut self, job_id: JobId, kind: HealthDeferralKind) -> bool {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        if state.health_deferral.kind == Some(kind) {
+            state.health_deferral.deferrals = state.health_deferral.deferrals.saturating_add(1);
+            return false;
+        }
+        let ended = std::mem::replace(
+            &mut state.health_deferral,
+            HealthDeferral {
+                kind: Some(kind),
+                deferrals: 1,
+            },
+        );
+        Self::report_health_deferral_end(job_id, ended);
+        true
+    }
+
+    /// Close any spell of health deferral this job is in, reporting its total.
+    pub(super) fn clear_health_deferral(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if state.health_deferral.kind.is_none() {
+            return;
+        }
+        let ended = std::mem::take(&mut state.health_deferral);
+        Self::report_health_deferral_end(job_id, ended);
+    }
+
+    fn report_health_deferral_end(job_id: JobId, ended: HealthDeferral) {
+        let Some(kind) = ended.kind else {
+            return;
+        };
+        info!(
+            job_id = job_id.0,
+            reason = kind.as_str(),
+            deferrals = ended.deferrals,
+            "health failure deferral ended"
+        );
+    }
+
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
         tracing::error!(job_id = job_id.0, reason = %error, "job failed");
+        self.clear_health_deferral(job_id);
         // Terminal transition: a job dying without a recovery set never had a
         // PAR2 verdict available to it. No-op when a pass already ruled.
         self.note_job_unverifiable_if_no_par2_set(job_id);

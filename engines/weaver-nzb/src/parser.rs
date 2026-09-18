@@ -188,6 +188,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             segments: Vec::new(),
                             segment_numbers: HashSet::new(),
                             message_ids: HashSet::new(),
+                            duplicates: DuplicateSegmentTally::default(),
                         });
                     }
                     "groups" if current_file.is_some() => in_groups = true,
@@ -282,19 +283,9 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 let bytes = seg.bytes.expect("validated segment byte count");
 
                                 if f.segment_numbers.contains(&number) {
-                                    tracing::warn!(
-                                        subject = %f.subject,
-                                        number,
-                                        duplicate_message_id = %message_id,
-                                        "skipping duplicate NZB segment number"
-                                    );
+                                    f.duplicates.note_number(&message_id);
                                 } else if f.message_ids.contains(&message_id) {
-                                    tracing::warn!(
-                                        subject = %f.subject,
-                                        number,
-                                        duplicate_message_id = %message_id,
-                                        "skipping duplicate NZB segment message id"
-                                    );
+                                    f.duplicates.note_message_id(&message_id);
                                 } else {
                                     f.segment_numbers.insert(number);
                                     f.message_ids.insert(message_id.clone());
@@ -330,6 +321,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                     "segments" => in_segments = false,
                     "file" => {
                         if let Some(f) = current_file.take() {
+                            f.duplicates.report(&f.subject);
                             if f.segments.is_empty() {
                                 tracing::warn!(
                                     subject = %f.subject,
@@ -419,6 +411,57 @@ struct FileBuilder {
     segments: Vec<NzbSegment>,
     segment_numbers: HashSet<u32>,
     message_ids: HashSet<String>,
+    duplicates: DuplicateSegmentTally,
+}
+
+/// The duplicate segments skipped while one file's `<segments>` were read.
+///
+/// A posting whose segment list repeats itself does not repeat it once: the
+/// same file arrives with tens of thousands of duplicates, and a line each
+/// buries every other thing the log had to say. They are counted here and
+/// reported once, when the file ends.
+#[derive(Debug, Default)]
+struct DuplicateSegmentTally {
+    numbers: u64,
+    message_ids: u64,
+    first: Option<String>,
+}
+
+impl DuplicateSegmentTally {
+    fn note_number(&mut self, message_id: &str) {
+        self.numbers = self.numbers.saturating_add(1);
+        self.remember(message_id);
+    }
+
+    fn note_message_id(&mut self, message_id: &str) {
+        self.message_ids = self.message_ids.saturating_add(1);
+        self.remember(message_id);
+    }
+
+    fn remember(&mut self, message_id: &str) {
+        if self.first.is_none() {
+            self.first = Some(message_id.to_owned());
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.numbers.saturating_add(self.message_ids)
+    }
+
+    /// Emit the one warning this file's duplicates are worth, if any.
+    fn report(&self, subject: &str) {
+        if self.total() == 0 {
+            return;
+        }
+        tracing::warn!(
+            subject = %subject,
+            duplicate_segments = self.total(),
+            duplicate_numbers = self.numbers,
+            duplicate_message_ids = self.message_ids,
+            first_duplicate_message_id = %self.first.as_deref().unwrap_or_default(),
+            "skipped duplicate NZB segments"
+        );
+    }
 }
 
 struct SegmentBuilder {
@@ -834,6 +877,64 @@ mod tests {
         assert_eq!(segments[0].message_id, "same-id");
         assert_eq!(segments[1].number, 3);
         assert_eq!(segments[1].message_id, "next-id");
+    }
+
+    /// A file whose segment list repeats itself is worth one line, not one
+    /// line per repeat: the tally is what the single warning reports.
+    #[test]
+    fn duplicate_segments_are_reported_once_per_file() {
+        let mut tally = DuplicateSegmentTally::default();
+        assert_eq!(tally.total(), 0, "a clean file reports nothing");
+
+        for _ in 0..5000 {
+            tally.note_message_id("repeated-id");
+        }
+        for _ in 0..3 {
+            tally.note_number("repeated-number");
+        }
+
+        assert_eq!(tally.message_ids, 5000);
+        assert_eq!(tally.numbers, 3);
+        assert_eq!(
+            tally.total(),
+            5003,
+            "every duplicate is counted into the one report"
+        );
+        assert_eq!(
+            tally.first.as_deref(),
+            Some("repeated-id"),
+            "and the report can name the first one it saw"
+        );
+    }
+
+    /// The parse itself keeps one segment per duplicated id, however many
+    /// copies the document carries.
+    #[test]
+    fn duplicate_segment_message_ids_collapse_to_one_segment() {
+        let mut xml = String::from(
+            r#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="Fixture Set A">
+    <groups><group>g</group></groups>
+    <segments>
+"#,
+        );
+        for number in 1..=64u32 {
+            xml.push_str(&format!(
+                "      <segment bytes=\"1\" number=\"{number}\">shared-id</segment>\n"
+            ));
+        }
+        xml.push_str(
+            r#"    </segments>
+  </file>
+</nzb>"#,
+        );
+
+        let nzb = parse_nzb(xml.as_bytes()).unwrap();
+        let segments = &nzb.files[0].segments;
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].number, 1);
+        assert_eq!(segments[0].message_id, "shared-id");
     }
 
     // Additional: invalid date value
