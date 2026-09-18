@@ -386,6 +386,16 @@ impl RepeatedArticles {
         reply
     }
 
+    /// The one fetch this cache cannot replay, and the last request in the
+    /// pipeline still issued through an async connection.
+    ///
+    /// On a server the owned download lanes serve, this acquire refuses to
+    /// queue behind them: it comes straight back as a capacity refusal rather
+    /// than spending the whole soft-timeout budget waiting for an article
+    /// transfer to end. That refusal is local capacity, never article
+    /// evidence, so the work requeues without spending the segment's retry
+    /// budget and the short-lived cached failure expires on its own. No
+    /// article is lost; the duplicates simply wait for a lane to free up.
     async fn fetch_uncached(work: &DownloadWork, excludes: &[usize], nntp: &NntpClient) -> Reply {
         let trace = nntp
             .fetch_body_decoded_with_groups_excluding_traced(
@@ -661,5 +671,60 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// "Every connection is busy" is local capacity, not article evidence.
+    /// A refusal that arrives without waiting must never latch as this
+    /// message id's answer: it has to expire so the duplicates come back, and
+    /// it has to leave the segment's retry budget alone.
+    #[tokio::test]
+    async fn a_capacity_refusal_expires_and_keeps_the_retry_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
+        let work = work();
+        let stale = CachedFailure {
+            error: DownloadError::from_nntp(weaver_nntp::NntpError::AcquireTimeout(0)),
+            generation: 7,
+            source: None,
+            groups: work.groups.clone(),
+            requested_excludes: Vec::new(),
+            proved_excludes: Vec::new(),
+            expires: Some(Instant::now() - Duration::from_millis(1)),
+            _memory: None,
+        };
+        let cache = Arc::new(RepeatedArticles {
+            entries: HashMap::from([(
+                work.message_id.clone(),
+                Arc::new(tokio::sync::Mutex::new(Some(Entry::Failure(stale)))),
+            )]),
+            root,
+            _index_memory: memory.try_reserve_retained(0).unwrap(),
+            memory,
+        });
+        let client = NntpClient::new(weaver_nntp::client::NntpClientConfig {
+            servers: Vec::new(),
+            max_idle_age: Duration::from_secs(1),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(1),
+        });
+        // The expired entry is discarded rather than replayed, so this reply
+        // is the fresh refusal from the fetch path.
+        let reply = cache.fetch(&work, &[], &client, 7).await;
+        let Err(DownloadError::Fetch(failure)) = &reply.data else {
+            panic!("the expired entry must be refetched into a capacity refusal")
+        };
+        assert_eq!(failure.kind, DownloadFailureKind::CapacityUnavailable);
+        assert!(
+            failure.kind.preserves_article_retry_budget(),
+            "a busy-lane refusal must requeue without spending the segment's retries"
+        );
+        let mut state = cache.entries[&work.message_id].lock().await;
+        let Some(Entry::Failure(cached)) = state.as_mut() else {
+            panic!("cached failure")
+        };
+        assert!(
+            cached.expires.is_some_and(|until| until > Instant::now()),
+            "a capacity refusal must be cached only briefly, never latched"
+        );
     }
 }

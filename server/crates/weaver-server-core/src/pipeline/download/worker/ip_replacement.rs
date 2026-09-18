@@ -202,6 +202,11 @@ impl Pipeline {
 
         tokio::spawn(async move {
             let server = weaver_nntp::ServerId(candidate.old_key.server_idx);
+            // An over-max trial lane is off the permit path entirely: it takes
+            // the one dedicated replacement socket slot and never a connection
+            // permit, so it neither queues behind the download lanes nor takes
+            // a connection away from them. Nothing here is affected by the
+            // rule that refuses to queue an async caller behind busy lanes.
             match nntp
                 .acquire_extra_body_lane_excluding(server, &groups, &[candidate.old_key.ip])
                 .await
