@@ -8,6 +8,9 @@ repository.workspace = true
 
 [features]
 slow-tests = []
+# Hooks that let other crates' tests move stored state directly instead of
+# waiting on the wall clock. Never enabled outside dev-dependencies.
+test-support = []
 
 [dependencies]
 weaver-tunnel = { path = "../../../engines/weaver-tunnel" }

@@ -2376,20 +2376,15 @@ fn park_job_on_its_final_decode(pipeline: &mut Pipeline, segment_id: SegmentId, 
 /// Drives every outstanding demotion reconstruction ticket to its handler, the
 /// way the orchestrator's select loop would.
 ///
-/// The timeout only turns a sweep that never reports into a failure instead of
-/// a hung test; it says nothing about how fast a sweep should be. A sweep
-/// writes the set's volumes back to disk, and on a loaded Windows runner the
-/// scenarios that end in one take eight to eighteen seconds where they take
-/// half a second on an idle machine, so the guard sits well clear of that.
+/// It waits on the completion itself, with no deadline: how long a sweep takes
+/// depends on the machine, so a hang is the test runner's to catch.
 async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
     while !pipeline.direct_demotion_in_flight.is_empty() {
-        let done = tokio::time::timeout(
-            Duration::from_secs(90),
-            pipeline.direct_demotion_done_rx.recv(),
-        )
-        .await
-        .expect("a detached demotion sweep should finish")
-        .expect("the demotion completion channel should stay open");
+        let done = pipeline
+            .direct_demotion_done_rx
+            .recv()
+            .await
+            .expect("the demotion completion channel should stay open");
         pipeline.handle_direct_demotion_done(done).await;
     }
 }

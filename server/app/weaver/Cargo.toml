@@ -66,6 +66,7 @@ tempfile = { workspace = true }
 embed-resource = "3.0.11"
 
 [dev-dependencies]
+weaver-server-core = { path = "../../crates/weaver-server-core", default-features = false, features = ["test-support"] }
 tower = { workspace = true, default-features = false }
 # `test-util` for the paused clocks in this crate's own tests, which must not
 # compile only when another workspace member's dev-dependencies are built too.
