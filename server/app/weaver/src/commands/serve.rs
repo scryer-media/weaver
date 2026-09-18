@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{error, info, warn};
 
-use crate::{http, restart, shutdown, wiring};
+use crate::{heartbeat, http, restart, shutdown, wiring};
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::{Config, SharedConfig};
@@ -405,6 +405,7 @@ pub(crate) async fn run(
     let update_check_task = update_check.start_background_loop();
     watch_folder.reconcile_from_config().await?;
     let metrics_history_task = shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
+    let heartbeat_task = heartbeat::spawn_heartbeat_task();
     let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
         db.clone(),
         maintenance_complete_dir,
@@ -533,6 +534,7 @@ pub(crate) async fn run(
             rss_task.abort();
             watch_folder.stop().await;
             metrics_history_task.abort();
+            heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
             semantic_promotion_task.abort();
@@ -554,6 +556,7 @@ pub(crate) async fn run(
             rss_task.abort();
             watch_folder.stop().await;
             metrics_history_task.abort();
+            heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
             semantic_promotion_task.abort();
@@ -596,11 +599,16 @@ pub(crate) async fn run(
     rss_task.abort();
     watch_folder.stop().await;
     metrics_history_task.abort();
+    heartbeat_task.abort();
     maintenance_task.abort();
     semantic_promotion_task.abort();
     server_transfer_maintenance.abort();
     wiring::flush_server_transfer_usage(Arc::clone(&server_transfer_policy), stop.flush_context())
         .await;
+    // The last thing an orderly run says about itself: how much memory it ever
+    // held. A run that ended on purpose and one that was killed for its size
+    // are only distinguishable if the orderly one leaves this behind.
+    heartbeat::log_peak_rss();
 
     match stop {
         ServeStop::Signal => Ok(()),

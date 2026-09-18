@@ -5,6 +5,9 @@ mod bootstrap;
 // the two halves of the protocol cannot drift apart.
 mod bundle_relaunch;
 mod commands;
+#[cfg(windows)]
+mod crash_dump;
+mod heartbeat;
 mod http;
 mod logging;
 mod restart;
@@ -196,6 +199,10 @@ async fn async_main() {
         )
         .init();
     install_panic_hook();
+    // After the subscriber, so the filter's own log line has somewhere to go,
+    // and after the log file path is resolved, so the dump lands beside it.
+    #[cfg(windows)]
+    crash_dump::install_unhandled_exception_filter();
 
     let command = match command {
         Command::Par2 { command } => match commands::par2::run(command) {

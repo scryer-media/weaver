@@ -38,6 +38,12 @@ const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// without a configured path.
 #[cfg(windows)]
 const SERVER_EXECUTABLE: &str = "weaver.exe";
+
+/// Size past which the captured stderr log is rotated on the next server
+/// start. What lands there is sparse — a setup code, a runtime's last words —
+/// so this is a bound against a server that spews, not a budget.
+const STDERR_LOG_ROTATE_BYTES: u64 = 1 << 20;
+
 #[cfg(windows)]
 const WRAPPER_EXECUTABLE: &str = "weaver-tray.exe";
 #[cfg(not(windows))]
@@ -721,7 +727,14 @@ pub(crate) struct ServerSupervisor {
     log_offset: u64,
 }
 
-fn forward_server_stderr(stderr: impl Read, setup_code: Arc<Mutex<Option<String>>>) {
+/// Reads the server's stderr to its end. Setup codes are kept for the UI;
+/// everything else is copied to the capture file and to the wrapper's own
+/// stderr, which has somewhere to go when the wrapper runs from a console.
+fn forward_server_stderr(
+    stderr: impl Read,
+    setup_code: Arc<Mutex<Option<String>>>,
+    mut capture: Option<std::fs::File>,
+) {
     let mut captured = false;
     for line in BufReader::new(stderr).lines() {
         let Ok(line) = line else { break };
@@ -732,8 +745,24 @@ fn forward_server_stderr(stderr: impl Read, setup_code: Arc<Mutex<Option<String>
             }
             continue;
         }
+        if let Some(capture) = capture.as_mut() {
+            let _ = writeln!(capture, "{line}");
+        }
         let _ = writeln!(std::io::stderr(), "{line}");
     }
+}
+
+/// The exit status with the raw code in hex beside it: on Windows a crash
+/// exits with an NTSTATUS, which the decimal rendering hides.
+fn describe_exit(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{status} (0x{:08X})", code as u32),
+        None => status.to_string(),
+    }
+}
+
+fn wrapper_timestamp() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn parse_setup_code_line(line: &str) -> Option<String> {
@@ -761,6 +790,45 @@ impl ServerSupervisor {
 
     fn log_file(&self) -> PathBuf {
         self.logs_dir().join("weaver.log")
+    }
+
+    /// Where the owned server's stderr lands. The server logs to `weaver.log`
+    /// itself; what reaches stderr is the runtime's own last words — a panic's
+    /// default report, "memory allocation of N bytes failed", "thread 'x' has
+    /// overflowed its stack" — none of which go through the logger, and none
+    /// of which survive being forwarded to a windowless wrapper's stderr. The
+    /// exit status the wrapper observes is recorded here too, so a server that
+    /// died without a word at least leaves its exit code.
+    fn stderr_log_file(&self) -> PathBuf {
+        weaver_server_core::runtime::log_buffer::stderr_capture_path(&self.log_file())
+    }
+
+    /// Opens the stderr capture for appending, rotating it first once it has
+    /// outgrown its bound. Failing to open it only loses the capture: the
+    /// wrapper still starts the server.
+    fn open_stderr_log(&self) -> Option<std::fs::File> {
+        let path = self.stderr_log_file();
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > STDERR_LOG_ROTATE_BYTES) {
+            let _ = std::fs::rename(&path, path.with_extension("log.1"));
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    }
+
+    /// Records how the owned server exited, next to whatever it said last.
+    fn record_server_exit(&self, status: ExitStatus) {
+        let Some(mut capture) = self.open_stderr_log() else {
+            return;
+        };
+        let _ = writeln!(
+            capture,
+            "{} [wrapper] the server exited: {}",
+            wrapper_timestamp(),
+            describe_exit(status)
+        );
     }
 
     pub(crate) fn port(&self) -> u16 {
@@ -805,7 +873,10 @@ impl ServerSupervisor {
         if let Some(child) = self.server.as_mut() {
             match child.try_wait() {
                 Ok(None) => return Ok(()),
-                Ok(Some(_)) => self.server = None,
+                Ok(Some(status)) => {
+                    self.record_server_exit(status);
+                    self.server = None;
+                }
                 Err(error) => {
                     return Err(format!("failed to check Weaver server status: {error}"));
                 }
@@ -827,7 +898,16 @@ impl ServerSupervisor {
         })?;
         if let Some(stderr) = child.stderr.take() {
             let setup_code = self.setup_code.clone();
-            thread::spawn(move || forward_server_stderr(stderr, setup_code));
+            let mut capture = self.open_stderr_log();
+            if let Some(capture) = capture.as_mut() {
+                let _ = writeln!(
+                    capture,
+                    "{} [wrapper] started the server (pid {})",
+                    wrapper_timestamp(),
+                    child.id()
+                );
+            }
+            thread::spawn(move || forward_server_stderr(stderr, setup_code, capture));
         }
         self.server = Some(child);
         Ok(())
@@ -913,7 +993,8 @@ impl ServerSupervisor {
         let status = child
             .try_wait()
             .map_err(|error| format!("failed to check Weaver server status: {error}"))?;
-        if status.is_some() {
+        if let Some(status) = status {
+            self.record_server_exit(status);
             self.server = None;
         }
         Ok(status)
@@ -938,7 +1019,8 @@ impl ServerSupervisor {
         while Instant::now() < deadline {
             match self.server.as_mut() {
                 Some(child) => match child.try_wait() {
-                    Ok(Some(_)) => {
+                    Ok(Some(status)) => {
+                        self.record_server_exit(status);
                         self.server = None;
                         return;
                     }
