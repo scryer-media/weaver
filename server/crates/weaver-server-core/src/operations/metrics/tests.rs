@@ -137,16 +137,22 @@ fn rate_gauges_reflect_the_recent_window_not_the_process_lifetime() {
 #[test]
 fn decode_rate_is_reported_in_mib_per_second() {
     let m = PipelineMetrics::new();
-    let _ = m.snapshot();
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    // 4 MiB decoded across roughly 0.2 s is on the order of 20 MiB/s. The exact
-    // value depends on the EMA, so assert the unit's order of magnitude rather
-    // than a brittle constant: in MB/s this would read ~21, in B/s ~4.2e6.
-    m.bytes_decoded.store(4 * 1024 * 1024, Ordering::Relaxed);
-    let snap = m.snapshot();
+    // Drive the tracker with explicit instants so the window is exactly 0.2 s
+    // however long the runner takes between the two ticks.
+    let start = Instant::now();
+    let tick = start + std::time::Duration::from_millis(200);
+    let _ = m.speed_tracker.lock().unwrap().update(start, 0, 0, 0);
+    let _ = m
+        .speed_tracker
+        .lock()
+        .unwrap()
+        .update(tick, 0, 0, 4 * 1024 * 1024);
+    // 4 MiB over 0.2 s is 20 MiB/s; the first windowed sample seeds the EMA
+    // directly. In MB/s this would read ~21, in B/s ~2.1e7.
+    let snap = m.raw_snapshot();
     assert!(
-        snap.decode_rate_mbps > 1.0 && snap.decode_rate_mbps < 1000.0,
-        "decode_rate_mbps out of plausible MiB/s range: {}",
+        (snap.decode_rate_mbps - 20.0).abs() < 1e-9,
+        "decode_rate_mbps should read in MiB/s: {}",
         snap.decode_rate_mbps
     );
 }
