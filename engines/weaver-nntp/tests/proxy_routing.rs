@@ -353,6 +353,7 @@ async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
             command_timeout: Duration::from_secs(if revoke { 30 } else { 1 }),
             ..Default::default()
         };
+        let started = std::time::Instant::now();
         let client = tokio::task::spawn_blocking(move || {
             let mut client =
                 BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
@@ -362,7 +363,6 @@ async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
         });
         // The server has decrypted the request and deliberately sends no reply.
         origin.stalled.notified().await;
-        let started = std::time::Instant::now();
         if revoke {
             bridge.revoke().await;
         }
