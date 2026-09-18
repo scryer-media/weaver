@@ -312,32 +312,32 @@ mod tests {
         assert!(events[0].file_id.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn persist_events_flushes_partial_batches_while_events_continue() {
         let db = Database::open_in_memory().unwrap();
         let (tx, rx) = broadcast::channel(64);
 
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let task = tokio::spawn(persist_events(rx, db.clone(), shutdown));
-        let sender_tx = tx.clone();
-        let sender = tokio::spawn(async move {
-            for _ in 0..30 {
-                sender_tx
-                    .send(PipelineEvent::JobPaused { job_id: JobId(7) })
-                    .unwrap();
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Keep the stream busy on the paused clock: one event per 50 ms, never
+        // idle, never closed and never near the 50-event batch size. Only the
+        // periodic flush can make an event visible.
+        let mut sent = 0;
+        loop {
+            tx.send(PipelineEvent::JobPaused { job_id: JobId(7) })
+                .unwrap();
+            sent += 1;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            db.flush_write_queue().await.unwrap();
+            if !db.get_job_events(7).unwrap().is_empty() {
+                break;
             }
-        });
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(1200)).await;
-        db.flush_write_queue().await.unwrap();
-        let job_events = db.get_job_events(7).unwrap();
+        }
         assert!(
-            !job_events.is_empty(),
-            "event persistence should flush partial batches without waiting for an idle event stream"
+            sent < 50,
+            "event persistence should flush partial batches without waiting for an idle event stream ({sent} sent)"
         );
 
-        sender.await.unwrap();
         drop(tx);
         task.await.unwrap();
     }
@@ -364,11 +364,7 @@ mod tests {
         }
         // Yield to the subscriber and SQLite worker, without advancing time,
         // closing the channel, reaching the batch size or notifying shutdown.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if db.get_job_events(8).unwrap().len() == 2 {
-                break;
-            }
+        while db.get_job_events(8).unwrap().len() != 2 {
             tokio::task::yield_now().await;
         }
         assert_eq!(tokio::time::Instant::now(), started);
