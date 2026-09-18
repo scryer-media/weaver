@@ -946,7 +946,7 @@ impl Pipeline {
     }
 
     /// Counts one owned-lane acquire failure by kind, and warns about it at
-    /// most once a minute.
+    /// most once a minute per job.
     ///
     /// Both arms of the caller — requeue and async fallback — keep the download
     /// running, so nothing above debug said that a lane had failed to open. A
@@ -969,13 +969,12 @@ impl Pipeline {
         crate::runtime::perf_probe::record_value(metric, 1);
         self.last_owned_lane_acquire_failure_at = Some(Instant::now());
 
-        if self
-            .last_owned_lane_acquire_failure_log_at
-            .is_some_and(|at| at.elapsed() < OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL)
-        {
+        let Some(suppressed_since_last) = self
+            .owned_lane_acquire_failure_log_throttle
+            .admit(lease.job_id, OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL)
+        else {
             return;
-        }
-        self.last_owned_lane_acquire_failure_log_at = Some(Instant::now());
+        };
         let servers: Vec<usize> = lease
             .server_modes
             .iter()
@@ -987,6 +986,7 @@ impl Pipeline {
             error = %error,
             requeued_works = lease.works.len(),
             requeue = error.should_requeue_owned_work(),
+            suppressed_since_last,
             candidate_servers = ?servers,
             excluded_servers = ?lease.effective_exclude_servers,
             "owned blocking download lane could not be acquired"

@@ -2321,6 +2321,7 @@ async fn drained_download_pass_retires_the_probe_instead_of_waiting_for_it() {
         probe_round: 0,
         total: 1,
         missed: 1,
+        unverified: 0,
         done: true,
         inconclusive: false,
     });

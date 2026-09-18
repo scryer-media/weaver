@@ -188,6 +188,11 @@ impl OwnedLaneProbeHandle {
             answered = true;
             if answer.inconclusive {
                 inconclusive = true;
+                debug!(
+                    server,
+                    batch_len = message_ids.len(),
+                    "owned lane probe: server left the batch unverified"
+                );
                 continue;
             }
             servers_settled.push(server);

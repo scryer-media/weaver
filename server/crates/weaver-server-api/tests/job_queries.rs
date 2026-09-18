@@ -330,6 +330,9 @@ async fn duplicate_summary_projections_chunk_more_than_256_jobs() {
             1_800_000_000 + index as i64,
         ));
     }
+    // Archiving a job releases it from the scheduler; a row whose job is still
+    // resident and non-terminal is not history and is excluded from both reads.
+    h.shared_state.publish_jobs(Vec::new());
     let history = h
         .execute(
             r#"{
@@ -732,6 +735,9 @@ async fn history_items_project_bulk_duplicate_summary() {
         "complete",
         1_700_000_123,
     ));
+    // Archiving a job releases it from the scheduler; a row whose job is still
+    // resident and non-terminal is not history and is excluded from both reads.
+    h.shared_state.publish_jobs(Vec::new());
 
     let resp = h
         .execute(
