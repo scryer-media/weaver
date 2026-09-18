@@ -76,6 +76,9 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 
 [target.'cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
+# Exact pin: `allocator.rs` addresses mimalloc options by the index of this
+# version's bundled v3 enum.
+libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["extended"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [
