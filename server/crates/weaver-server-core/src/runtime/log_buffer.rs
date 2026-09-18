@@ -32,8 +32,9 @@ pub fn log_file_path() -> Option<&'static Path> {
 }
 
 /// The active log file followed by every rotated generation that exists on
-/// disk, in newest-first order. Entries that do not exist are skipped, so the
-/// result is exactly the set of files a collector can read.
+/// disk, in newest-first order, then the stderr capture a supervisor keeps
+/// beside the log. Entries that do not exist are skipped, so the result is
+/// exactly the set of files a collector can read.
 pub fn existing_log_files() -> Vec<PathBuf> {
     let Some(path) = log_file_path() else {
         return Vec::new();
@@ -48,7 +49,21 @@ pub fn existing_log_files() -> Vec<PathBuf> {
             files.push(rotated);
         }
     }
+    let capture = stderr_capture_path(path);
+    for candidate in [capture.clone(), capture.with_extension("log.1")] {
+        if candidate.is_file() {
+            files.push(candidate);
+        }
+    }
     files
+}
+
+/// Where a process that supervises this one keeps its captured stderr: the
+/// runtime's last words on a crash go there, not through the logger, and a
+/// collector wants them with the log. `weaver.log` pairs with
+/// `weaver.stderr.log`; a rotated capture adds `.1`.
+pub fn stderr_capture_path(log_file: &Path) -> PathBuf {
+    log_file.with_extension("stderr.log")
 }
 
 /// Thread-safe ring buffer that captures log lines for live viewing.
@@ -297,6 +312,16 @@ mod tests {
             .write_all(contents.as_bytes())
             .expect("write gzip log");
         encoder.finish().expect("finish gzip log");
+    }
+
+    #[test]
+    fn stderr_capture_sits_beside_the_log_it_belongs_to() {
+        let capture = stderr_capture_path(Path::new("/var/weaver/logs/weaver.log"));
+        assert_eq!(capture, Path::new("/var/weaver/logs/weaver.stderr.log"));
+        assert_eq!(
+            capture.with_extension("log.1"),
+            Path::new("/var/weaver/logs/weaver.stderr.log.1")
+        );
     }
 
     #[test]
