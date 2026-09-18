@@ -323,10 +323,9 @@ mod tests {
                     return true;
                 }
                 let mut answer = [0u8; 2];
-                tokio::time::timeout(Duration::from_millis(250), stream.read_exact(&mut answer))
-                    .await
-                    .map(|result| result.is_err())
-                    .unwrap_or(true)
+                // A stopped front drops its listener, which resets or closes
+                // any connection still in the backlog, so the read ends.
+                stream.read_exact(&mut answer).await.is_err()
             }
         }
     }

@@ -38,7 +38,7 @@ impl ProxyServerDouble {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break; };
                         let auth = auth.clone(); let mapping = mapping.clone(); let recorded = recorded.clone();
-                        tasks.spawn(async move { let _ = tokio::time::timeout(std::time::Duration::from_secs(30), serve(stream, kind, auth, mapping, recorded)).await; });
+                        tasks.spawn(async move { let _ = serve(stream, kind, auth, mapping, recorded).await; });
                     }
                     _ = tasks.join_next(), if !tasks.is_empty() => {}
                 }
