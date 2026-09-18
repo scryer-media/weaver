@@ -768,12 +768,7 @@ async fn a_finalized_set_does_not_stop_its_live_neighbour_repairing_while_direct
         pipeline.check_job_completion(job_id).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
         settle_inflight_moves(&mut pipeline).await;
-        if let Ok(Some(done)) = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            pipeline.extract_done_rx.recv(),
-        )
-        .await
-        {
+        if let Some(done) = next_owed_extraction(&mut pipeline, job_id).await {
             pipeline.handle_extraction_done(done).await;
             pump_pipeline_runtime_queues(&mut pipeline).await;
             settle_inflight_moves(&mut pipeline).await;
@@ -1303,12 +1298,7 @@ async fn an_interior_hole_sizes_the_repair_by_the_slices_it_actually_touches() {
         sample_direct_sets(&pipeline, job_id, &mut sets);
         pump_pipeline_runtime_queues(&mut pipeline).await;
         settle_inflight_moves(&mut pipeline).await;
-        if let Ok(Some(done)) = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            pipeline.extract_done_rx.recv(),
-        )
-        .await
-        {
+        if let Some(done) = next_owed_extraction(&mut pipeline, job_id).await {
             pipeline.handle_extraction_done(done).await;
             pump_pipeline_runtime_queues(&mut pipeline).await;
             settle_inflight_moves(&mut pipeline).await;

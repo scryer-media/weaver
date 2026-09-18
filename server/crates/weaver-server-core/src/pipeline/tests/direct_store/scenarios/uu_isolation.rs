@@ -206,20 +206,23 @@ async fn download_archives(uu: bool, mixed: bool, low_space: bool) {
         .await
         .unwrap();
     let output_dir = complete_dir.join("Encoding isolation");
-    let result = wait_until(Duration::from_secs(30), || {
+    wait_until(|| {
         // The destination can exist while the move worker is still reporting
         // completion. Wait for the actor's terminal state before shutdown.
         shared
             .get_job(job_id)
-            .is_some_and(|job| job.status == JobStatus::Complete)
+            .is_some_and(|job| matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. }))
     })
     .await;
+    let completed = shared
+        .get_job(job_id)
+        .is_some_and(|job| job.status == JobStatus::Complete);
     handle.shutdown().await.unwrap();
     let pipeline = task.await.unwrap();
     server.abort();
     let _ = server.await;
     assert!(
-        result.is_ok(),
+        completed,
         "uu={uu} mixed={mixed} low_space={low_space}: status={:?}, queue={}",
         job_status_for_assert(&pipeline, job_id),
         shared

@@ -1496,7 +1496,9 @@ async fn fail_segment_on_transport(
     )
 }
 
-#[tokio::test]
+// Paused time keeps the clock still while the fault is handled, so the
+// parked delay is exactly the one the scheduler chose.
+#[tokio::test(start_paused = true)]
 async fn a_segment_that_keeps_breaking_connections_is_held_back_then_pays_for_retries() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

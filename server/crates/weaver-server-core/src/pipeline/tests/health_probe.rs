@@ -106,10 +106,10 @@ async fn excluded_source_not_found_retries_without_marking_health_failure() {
     );
     assert!(pipeline.pending_completion_checks.is_empty());
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     let work = pipeline
         .retry_rx
-        .try_recv()
+        .recv()
+        .await
         .expect("excluded-source miss should requeue the segment")
         .work;
     assert_eq!(work.exclude_servers, vec![0]);

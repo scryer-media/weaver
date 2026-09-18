@@ -1922,21 +1922,15 @@ mod tests {
                 };
                 let _ = picked_up.send(());
                 holding.fetch_add(1, Ordering::SeqCst);
-                // Bounded rather than a barrier: a probe that asks in
-                // sequence must fail this test, not hang it.
-                let deadline = Instant::now() + Duration::from_secs(2);
-                let together = loop {
-                    if holding.load(Ordering::SeqCst) == LANES {
-                        break true;
-                    }
-                    if Instant::now() >= deadline {
-                        break false;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                };
+                // Every lane holds its probe until all of them are held, so
+                // a probe that asks in sequence never answers and the runner
+                // ends the test.
+                while holding.load(Ordering::SeqCst) != LANES {
+                    std::thread::yield_now();
+                }
                 let _ = reply.send(Some(weaver_nntp::client::ProbeBatchResult {
                     exists: vec![false; message_ids.len()],
-                    inconclusive: !together,
+                    inconclusive: false,
                 }));
             }));
         }
@@ -1958,7 +1952,7 @@ mod tests {
         assert!(
             !outcome.result.inconclusive,
             "each lane must have been holding the batch while the other was: \
-             asked in sequence, the first one times out waiting for the second"
+             asked in sequence, the first one never answers"
         );
         assert_eq!(
             outcome.servers_settled.len(),

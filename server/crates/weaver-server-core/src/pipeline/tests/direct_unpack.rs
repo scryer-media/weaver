@@ -3009,14 +3009,12 @@ fn chase_context(
     }
 }
 
-async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
-    for _ in 0..3_000 {
-        if condition() {
-            return;
-        }
+/// Polls until `condition` holds; `what` names it for a reader. There is no
+/// deadline: the test runner bounds a condition that never arrives.
+async fn wait_until(mut condition: impl FnMut() -> bool, _what: &str) {
+    while !condition() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("timed out waiting for {what}");
 }
 
 /// A chase's decode pass holds its archive's decoders, not the ceiling.

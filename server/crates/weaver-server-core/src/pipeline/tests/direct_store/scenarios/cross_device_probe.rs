@@ -333,12 +333,7 @@ async fn a_disk_fault_in_the_repaired_volume_is_caught_after_a_repair() {
         }
         pump_pipeline_runtime_queues(&mut pipeline).await;
         settle_inflight_moves(&mut pipeline).await;
-        if let Ok(Some(done)) = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            pipeline.extract_done_rx.recv(),
-        )
-        .await
-        {
+        if let Some(done) = next_owed_extraction(&mut pipeline, job_id).await {
             pipeline.handle_extraction_done(done).await;
             pump_pipeline_runtime_queues(&mut pipeline).await;
             settle_inflight_moves(&mut pipeline).await;

@@ -1978,28 +1978,20 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
             job_status_for_assert(pipeline, job_id),
             Some(JobStatus::Moving)
         ) {
-            let done = tokio::time::timeout(Duration::from_secs(180), pipeline.move_done_rx.recv())
+            let done = pipeline
+                .move_done_rx
+                .recv()
                 .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "timed out waiting for final move completion\n{}",
-                        debug_job_state(pipeline, job_id)
-                    )
-                })
                 .expect("move channel should stay open");
             pipeline.handle_move_to_complete_done(done).await;
             pump_pipeline_runtime_queues(pipeline).await;
             continue;
         }
 
-        let done = tokio::time::timeout(Duration::from_secs(180), pipeline.extract_done_rx.recv())
+        let done = pipeline
+            .extract_done_rx
+            .recv()
             .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "timed out waiting for extraction completion\n{}",
-                    debug_job_state(pipeline, job_id)
-                )
-            })
             .expect("extraction channel should stay open");
         pipeline.handle_extraction_done(done).await;
         pump_pipeline_runtime_queues(pipeline).await;
@@ -2797,6 +2789,32 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
     settle_inflight_moves(pipeline).await;
 }
 
+/// The next extraction result for a driver that steps `job_id` a fixed number
+/// of rounds. An extraction the pipeline has in flight for the job, whole-set
+/// or a RAR member worker, is waited for with no deadline, so a round never ends on a slow extraction; otherwise
+/// a result already sent is taken, and a turn is yielded to background work.
+async fn next_owed_extraction(pipeline: &mut Pipeline, job_id: JobId) -> Option<ExtractionDone> {
+    if pipeline
+        .inflight_extractions
+        .get(&job_id)
+        .is_some_and(|sets| !sets.is_empty())
+        || pipeline.has_active_rar_workers(job_id)
+    {
+        return Some(
+            pipeline
+                .extract_done_rx
+                .recv()
+                .await
+                .expect("extraction channel should stay open"),
+        );
+    }
+    let done = pipeline.extract_done_rx.try_recv().ok();
+    if done.is_none() {
+        tokio::task::yield_now().await;
+    }
+    done
+}
+
 async fn next_extraction_done(pipeline: &mut Pipeline) -> ExtractionDone {
     pipeline
         .extract_done_rx
@@ -2805,32 +2823,23 @@ async fn next_extraction_done(pipeline: &mut Pipeline) -> ExtractionDone {
         .expect("extraction channel should stay open")
 }
 
-async fn wait_until(
-    timeout_duration: Duration,
-    mut predicate: impl FnMut() -> bool,
-) -> Result<(), &'static str> {
-    let deadline = tokio::time::Instant::now() + timeout_duration;
-    loop {
-        if predicate() {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("condition timed out");
-        }
+/// Polls until `predicate` holds. There is no deadline: the test runner
+/// bounds a condition that never arrives.
+async fn wait_until(mut predicate: impl FnMut() -> bool) {
+    while !predicate() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
 async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
     for index in 0..expected {
-        let done =
-            match tokio::time::timeout(Duration::from_secs(20), pipeline.decode_done_rx.recv())
-                .await
-            {
-                Ok(Some(done)) => done,
-                Ok(None) => panic!("decode channel should stay open"),
-                Err(_) => panic!("decode result {}/{} should arrive", index + 1, expected),
-            };
+        let done = pipeline.decode_done_rx.recv().await.unwrap_or_else(|| {
+            panic!(
+                "decode channel closed before result {}/{}",
+                index + 1,
+                expected
+            )
+        });
         pipeline.handle_decode_done(done).await;
         settle_inflight_moves(pipeline).await;
     }

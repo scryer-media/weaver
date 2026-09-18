@@ -41,7 +41,7 @@ async fn checkpoint_deadline_is_consumed_when_capacity_pressure_or_pause_bypasse
     }
     pipeline
         .download_restart_durable_lead_retry_after
-        .insert(HOT, Instant::now() + Duration::from_millis(250));
+        .insert(HOT, Instant::now() + Duration::from_secs(3600));
     let (reply, result) = oneshot::channel();
     pipeline
         .handle_command(SchedulerCommand::PauseAll { reply })

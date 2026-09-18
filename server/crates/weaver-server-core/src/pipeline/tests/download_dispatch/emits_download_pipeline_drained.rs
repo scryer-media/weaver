@@ -536,7 +536,7 @@ async fn dispatch_downloads_escapes_restart_durable_lead_when_pipeline_is_idle()
         .insert(job_id, 1);
     pipeline
         .download_restart_durable_lead_retry_after
-        .insert(job_id, Instant::now() + Duration::from_millis(250));
+        .insert(job_id, Instant::now() + Duration::from_secs(3600));
 
     pipeline.dispatch_downloads();
 

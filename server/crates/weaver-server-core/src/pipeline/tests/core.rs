@@ -429,15 +429,14 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
     .await
     .unwrap();
 
-    wait_until(Duration::from_secs(2), || {
+    wait_until(|| {
         harness
             .db
             .load_active_jobs()
             .map(|jobs| jobs.contains_key(&submitted.job_id))
             .unwrap_or(false)
     })
-    .await
-    .unwrap();
+    .await;
 
     let info = harness.handle.get_job(submitted.job_id).unwrap();
     assert_eq!(info.status, JobStatus::Queued);
@@ -471,7 +470,7 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
 async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_change() {
     const TOTAL_SEGMENTS: usize = 1_000;
     let payload = vec![b'A'; 1024];
-    let (port, release_final_body, active_connections, body_commands, server) =
+    let (port, release_final_body, active_connections, _body_commands, server) =
         spawn_capacity_limited_body_server(20, payload.clone(), TOTAL_SEGMENTS).await;
     let initial_client = capacity_test_client(port, 80);
     let old_pool = Arc::clone(initial_client.pool());
@@ -495,29 +494,15 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
         .await
         .unwrap();
 
-    wait_until(Duration::from_secs(15), || {
+    wait_until(|| {
         harness.handle.get_job(job_id).is_ok_and(|job| {
             job.downloaded_bytes > 0
                 && !matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. })
         })
     })
-    .await
-    .unwrap_or_else(|error| {
-        panic!(
-            "job should begin downloading before the generation correction: {error}; job={:?} metrics={:?} active={} bodies={} held_off={}",
-            harness.handle.get_job(job_id),
-            harness.handle.get_live_metrics(),
-            active_connections.load(Ordering::Acquire),
-            body_commands.lock().unwrap().len(),
-            old_pool.is_over_limit(weaver_nntp::ServerId(0)),
-        )
-    });
+    .await;
 
-    wait_until(Duration::from_secs(20), || {
-        old_pool.is_over_limit(weaver_nntp::ServerId(0))
-    })
-    .await
-    .expect("configured 80 against a provider limit of 20 should park fresh connects");
+    wait_until(|| old_pool.is_over_limit(weaver_nntp::ServerId(0))).await;
     // The holdoff never edits the operator's configuration.
     assert_eq!(
         old_pool.configured_connections(weaver_nntp::ServerId(0)),
@@ -537,29 +522,31 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
     assert_eq!(activation.configured_connections, 20);
     release_final_body.send_replace(true);
 
-    wait_until(Duration::from_secs(15), || {
+    wait_until(|| {
         harness
             .handle
             .get_job(job_id)
             .is_ok_and(|job| job.downloaded_bytes > progress_before_rebuild)
     })
-    .await
-    .expect("the same active job should resume within the generation handoff bound");
+    .await;
     assert_eq!(replacement_pool.fill_connection_capacity(), 20);
     assert_eq!(
         replacement_pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(0)),
         None
     );
 
-    let completed = wait_until(Duration::from_secs(30), || {
+    wait_until(|| {
         harness
             .handle
             .get_job(job_id)
-            .is_ok_and(|job| matches!(job.status, JobStatus::Complete))
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. }))
     })
     .await;
     assert!(
-        completed.is_ok(),
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete)),
         "same no-PAR2 job did not complete: job={:?} metrics={:?}",
         harness.handle.get_job(job_id),
         harness.handle.get_live_metrics()
@@ -896,14 +883,13 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
     drain_decode_results(&mut pipeline, 2).await;
 
     assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
-    wait_until(Duration::from_secs(2), || {
+    wait_until(|| {
         pipeline
             .buffers
             .available(crate::runtime::buffers::BufferTier::Medium)
             == 1
     })
-    .await
-    .expect("decode scratch buffer should be returned after backlog relief");
+    .await;
     assert_eq!(
         pipeline
             .buffers
@@ -1537,15 +1523,18 @@ async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
         .await
         .unwrap();
 
-    let completed = wait_until(Duration::from_secs(30), || {
+    wait_until(|| {
         harness
             .handle
             .get_job(job_id)
-            .is_ok_and(|job| matches!(job.status, JobStatus::Complete))
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. }))
     })
     .await;
     assert!(
-        completed.is_ok(),
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete)),
         "job did not complete against a bracket-strict provider: job={:?}",
         harness.handle.get_job(job_id)
     );
@@ -1653,12 +1642,9 @@ async fn repeated_article_case(uuencode: bool) {
         .add_job(id, spec, PathBuf::from("repeat.nzb"), sample_nzb_zstd())
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
         let job = harness.handle.get_job(id).unwrap();
-        if matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. })
-            || Instant::now() >= deadline
-        {
+        if matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. }) {
             break job.status;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

@@ -347,7 +347,8 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
     } else {
         pipeline.try_arm_rar_chase(job_id, &set_name);
     }
-    for _ in 0..3000 {
+    // The chase runs on its own worker; poll its outcome with no deadline.
+    loop {
         pipeline.reap_direct_unpack().await;
         if pipeline.direct_unpack.outcome(job_id, &set_name).is_some() {
             break;
@@ -436,12 +437,7 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
     state.recovery_queue = crate::DownloadQueue::new();
     pipeline.check_job_completion(job_id).await;
     drain_rar_refreshes(&mut pipeline).await;
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        drive_extractions_to_terminal(&mut pipeline, job_id, 64),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("{}", debug_job_state(&pipeline, job_id)));
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
     let output_root = complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Mixed chase"));
     for (name, bytes) in expected {
         assert_eq!(

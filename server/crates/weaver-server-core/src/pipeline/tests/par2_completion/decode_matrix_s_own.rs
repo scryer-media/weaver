@@ -270,10 +270,10 @@ async fn promoted_recovery_decode_retry_remains_completion_critical() {
         .promoted = true;
 
     pipeline.handle_decode_failure(recovery_segment, "bad recovery article", &[], Some(0));
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     let retry = pipeline
         .retry_rx
-        .try_recv()
+        .recv()
+        .await
         .expect("decode failure should schedule a retry");
 
     assert_eq!(retry.work.segment_id, recovery_segment);

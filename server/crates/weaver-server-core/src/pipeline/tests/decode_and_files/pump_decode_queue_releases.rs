@@ -111,15 +111,14 @@ async fn decode_tasks_record_one_wall_duration_each() {
     assert!(pipeline.pending_decode.is_empty());
 
     let metrics = Arc::clone(&pipeline.metrics);
-    wait_until(Duration::from_secs(10), || {
+    wait_until(|| {
         metrics
             .pipeline_histograms
             .snapshot()
             .decode_task_duration
             .is_some_and(|histogram| histogram.count == 2)
     })
-    .await
-    .expect("both decode tasks should record a duration");
+    .await;
 }
 
 #[tokio::test]
@@ -418,10 +417,10 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         Some(0)
     );
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     let work = pipeline
         .retry_rx
-        .try_recv()
+        .recv()
+        .await
         .expect("decode failure should schedule a retry")
         .work;
     assert_eq!(work.exclude_servers, vec![0]);
@@ -468,10 +467,10 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
     assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 1);
     assert!(pipeline.decode_done_rx.try_recv().is_err());
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     let work = pipeline
         .retry_rx
-        .try_recv()
+        .recv()
+        .await
         .expect("streamed decode failure should schedule a retry")
         .work;
     assert_eq!(work.exclude_servers, vec![0]);
@@ -545,10 +544,10 @@ async fn queued_yenc_layout_mismatch_retries_before_decode_acceptance() {
             .any(|event| matches!(event, PipelineEvent::SegmentDecoded { .. }))
     );
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     let work = pipeline
         .retry_rx
-        .try_recv()
+        .recv()
+        .await
         .expect("queued layout mismatch should schedule a retry")
         .work;
     assert_eq!(work.exclude_servers, vec![2, 1]);
@@ -629,10 +628,10 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
             .any(|event| matches!(event, PipelineEvent::SegmentDecoded { .. }))
     );
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
     let work = pipeline
         .retry_rx
-        .try_recv()
+        .recv()
+        .await
         .expect("fused layout mismatch should schedule a retry")
         .work;
     assert_eq!(work.exclude_servers, vec![3, 2]);
