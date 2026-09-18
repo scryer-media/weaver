@@ -49,6 +49,13 @@ const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_LANE_CAPACITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_FETCH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// How often a dispatch pass re-asks for its first server ranking while the
+/// health lock is held by a lane worker, and how long it waits between asks.
+/// The critical sections behind that lock are microseconds long, so the whole
+/// budget is well under a millisecond and nearly every ask after the first
+/// lands.
+const PASS_RANKING_CONTENTION_RETRIES: usize = 8;
+const PASS_RANKING_CONTENTION_PAUSE: Duration = Duration::from_micros(50);
 
 /// How many jobs may hold a throttle window at once.
 ///
@@ -165,6 +172,27 @@ impl Pipeline {
         self.download_scheduler_eligible_jobs().first().copied()
     }
 
+    /// The servers a dispatch pass hands leases to, best first. A pass's
+    /// first ranking is worth a short wait when the health lock is busy: the
+    /// only fallback is the idle connections, and a pass that starts with
+    /// none of those would otherwise send nothing at all.
+    fn rank_servers_for_pass(&self, first_of_pass: bool) -> Option<Vec<usize>> {
+        let attempts = if first_of_pass {
+            PASS_RANKING_CONTENTION_RETRIES
+        } else {
+            1
+        };
+        for attempt in 0..attempts {
+            if let Some(order) = self.nntp.blocking_body_server_order(&[]) {
+                return Some(order.into_iter().map(|server| server.0).collect());
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(PASS_RANKING_CONTENTION_PAUSE);
+            }
+        }
+        None
+    }
+
     /// Start one more connection: choose the server, ask the scheduler what
     /// that server should fetch, lease it and hand it to a worker.
     ///
@@ -195,9 +223,8 @@ impl Pipeline {
             *idle_by_server.entry(server).or_default() += 1;
         }
         let backfill_flags = self.nntp.pool().server_backfill_flags();
-        let mut servers: Vec<usize> = match self.nntp.blocking_body_server_order(&[]) {
+        let mut servers: Vec<usize> = match self.rank_servers_for_pass(ranked_this_pass.is_none()) {
             Some(order) => {
-                let order: Vec<usize> = order.into_iter().map(|server| server.0).collect();
                 *ranked_this_pass = Some(order.clone());
                 order
             }
