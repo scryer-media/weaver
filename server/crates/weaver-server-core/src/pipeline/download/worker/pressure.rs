@@ -432,7 +432,7 @@ impl Pipeline {
         }
     }
 
-    pub(super) fn note_checkpoint_dispatch_block(&mut self, job_id: JobId) {
+    pub(in crate::pipeline::download) fn note_checkpoint_dispatch_block(&mut self, job_id: JobId) {
         // Preserve the existing wake deadline across repeated availability
         // checks; continually extending it can itself starve a retry wake.
         if self

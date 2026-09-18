@@ -1,7 +1,7 @@
 use super::*;
 
 impl Pipeline {
-    pub(in crate::pipeline::download::worker) fn status_allows_download_dispatch(
+    pub(in crate::pipeline::download) fn status_allows_download_dispatch(
         status: &JobStatus,
     ) -> bool {
         matches!(
@@ -402,7 +402,7 @@ impl Pipeline {
         self.hot_dispatch_mode = DispatchShareMode::Exclusive;
     }
 
-    pub(in crate::pipeline::download::worker) fn job_dispatch_priority(state: &JobState) -> u8 {
+    pub(in crate::pipeline::download) fn job_dispatch_priority(state: &JobState) -> u8 {
         state
             .spec
             .metadata

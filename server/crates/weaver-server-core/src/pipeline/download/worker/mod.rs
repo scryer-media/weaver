@@ -34,7 +34,7 @@ enum DispatchAttempt {
 /// propagation hold, a durable-lead backlog, every server excluded — must not
 /// park the rest of the queue behind work no yielded lane can be handed to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DownloadWorkSelection {
+pub(in crate::pipeline::download) enum DownloadWorkSelection {
     Any,
     CompletionCritical,
     NonCritical,

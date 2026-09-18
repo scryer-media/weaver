@@ -5,6 +5,7 @@ pub mod queue;
 mod rar_unlock;
 pub(crate) mod repeated;
 mod retention;
+pub(in crate::pipeline) mod scheduler;
 pub(crate) mod transport;
 mod worker;
 
