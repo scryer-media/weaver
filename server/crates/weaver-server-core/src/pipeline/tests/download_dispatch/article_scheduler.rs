@@ -240,10 +240,10 @@ async fn a_checkpoint_held_hot_job_passes_the_server_to_the_next_job_only() {
 }
 
 /// Rule 1 outranks "the next job only": the walk keeps going past a second
-/// blocked job. Rule 4's ordering then reclaims the server for the earlier
-/// job the moment that job can serve it again.
+/// blocked job. A spill job with articles out on the server then keeps it
+/// until that ring drains; only then does the earlier job take over.
 #[tokio::test]
-async fn the_walk_passes_two_blocked_jobs_and_returns_to_the_earlier_one() {
+async fn the_walk_passes_two_blocked_jobs_and_a_spill_in_flight_keeps_its_server() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let hot = JobId(71031);
@@ -263,16 +263,19 @@ async fn the_walk_passes_two_blocked_jobs_and_returns_to_the_earlier_one() {
     assert_eq!(counts.get(&hot).copied(), None);
     assert_eq!(counts.get(&next).copied(), None);
 
-    // The second job opens while the third still has work out on this server.
+    // The second job opens while the third still has work out on this
+    // server: the third keeps the server until its ring drains, so no second
+    // spill job opens beside it.
     unblock_checkpoint(&mut pipeline, next);
     let third_queued = queued(&pipeline, third);
     let works = taken(ask(&mut pipeline, SERVER_A, 8, Some(third)));
+    assert_eq!(single_job(&works), third);
+    assert_eq!(queued(&pipeline, third), third_queued - 8);
+
+    // With nothing of the third's in flight, the earlier job takes over.
+    let works = taken(ask(&mut pipeline, SERVER_A, 8, None));
     assert_eq!(single_job(&works), next);
-    assert_eq!(
-        queued(&pipeline, third),
-        third_queued,
-        "the job that outranks it takes the server; the later one gets nothing new"
-    );
+    assert_eq!(queued(&pipeline, third), third_queued - 8);
     assert_eq!(idle_with_servable(&pipeline), 0);
 }
 

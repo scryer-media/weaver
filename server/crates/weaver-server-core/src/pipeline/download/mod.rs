@@ -15,6 +15,7 @@ pub(in crate::pipeline) use worker::{
     should_neutrally_park_ip_replacement,
 };
 
+pub(super) use worker::HeldDownloadRefill;
 pub(crate) use worker::JobLogThrottle;
 
 pub use queue::{DownloadQueue, DownloadWork};

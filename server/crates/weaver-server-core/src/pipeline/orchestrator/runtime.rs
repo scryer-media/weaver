@@ -207,14 +207,8 @@ impl Pipeline {
             active_download_connections: 0,
             active_completion_critical_connections: 0,
             active_recovery: 0,
-            hot_dispatch_job: None,
-            hot_dispatch_started_at: None,
-            hot_dispatch_last_lend_at: None,
-            hot_dispatch_underfill_since: None,
-            hot_dispatch_throughput_window: HotJobThroughputWindow::default(),
-            hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
-            hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
+            held_download_refills: Vec::new(),
             download_dispatch_wake: false,
             nntp_handoff_draining: false,
             ip_replacement_trial_extra_connections,
@@ -967,7 +961,7 @@ impl Pipeline {
                     Some(result) = self.download_done_rx.recv() => {
                         if !self.release_download_result(&result) { continue; }
                         self.note_released_download_result_pending(
-                            result.segment_id.file_id.job_id,
+                            result.job_id,
                             Self::released_download_result_lead_bytes(&result),
                         );
                         pending_download_results.push_back(result);
@@ -1040,6 +1034,10 @@ impl Pipeline {
                     }
                     _ = metrics_snapshot_interval.tick() => {
                         self.refresh_periodic_snapshot();
+                        // Lanes whose refill found nothing wait here for the
+                        // next wake; the tick is what ends the wait when no
+                        // wake comes.
+                        self.service_held_download_refills();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
@@ -1323,7 +1321,7 @@ impl Pipeline {
                 continue;
             }
             self.note_released_download_result_pending(
-                result.segment_id.file_id.job_id,
+                result.job_id,
                 Self::released_download_result_lead_bytes(&result),
             );
             pending.push_back(result);

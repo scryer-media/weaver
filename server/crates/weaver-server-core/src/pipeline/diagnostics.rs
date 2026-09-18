@@ -398,7 +398,7 @@ impl Pipeline {
             active_download_connections: self.active_download_connections,
             active_completion_critical_connections: self.active_completion_critical_connections,
             active_recovery: self.active_recovery,
-            hot_dispatch_job: self.hot_dispatch_job.map(|job_id| job_id.0),
+            hot_dispatch_job: self.current_hot_job().map(|job_id| job_id.0),
             nntp_handoff_draining: self.nntp_handoff_draining,
             pool_generation: self.pool_generation,
             jobs,

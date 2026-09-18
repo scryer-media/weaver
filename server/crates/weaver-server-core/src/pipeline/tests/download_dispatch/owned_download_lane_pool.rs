@@ -1189,6 +1189,7 @@ async fn shutdown_drain_consumes_inflight_download_results() {
         .download_done_tx
         .send(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1244,6 +1245,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1300,6 +1302,7 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: retry.segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id: retry.segment_id,
             data: Err(DownloadError::fetch(
@@ -1374,6 +1377,7 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1436,6 +1440,7 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1522,6 +1527,7 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -1573,6 +1579,7 @@ async fn fail_segment_on_transport(
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::from_nntp(
@@ -1737,6 +1744,7 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
         .handle_download_done(DownloadResult {
             runtime_generation: 0,
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             segment_id,
             data: Err(DownloadError::from_nntp(
                 weaver_nntp::NntpError::NoGroupSelected,
@@ -1836,6 +1844,7 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -1938,6 +1947,7 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -2123,6 +2133,7 @@ async fn stale_generation_transport_failure_is_requeued_without_poisoning_health
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 1,
             segment_id,
             data: Err(DownloadError::fetch(
@@ -2172,6 +2183,7 @@ async fn stale_generation_success_does_not_update_new_lane_health() {
 
     pipeline.release_download_result(&DownloadResult {
         lane_id: 0,
+        job_id: JobId(20017),
         runtime_generation: 1,
         segment_id: SegmentId {
             file_id: NzbFileId {
@@ -2594,6 +2606,7 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -2733,6 +2746,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: large_segment.file_id.job_id,
             runtime_generation: 0,
             segment_id: large_segment,
             data: Err(DownloadError::Fetch(first_failure)),
@@ -2748,6 +2762,7 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: tail_segment.file_id.job_id,
             runtime_generation: 0,
             segment_id: tail_segment,
             data: Err(DownloadError::Fetch(tail_failure)),
@@ -2854,6 +2869,7 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -2954,6 +2970,7 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -3096,6 +3113,7 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -3243,6 +3261,7 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Err(DownloadError::Fetch(failure)),
@@ -3368,6 +3387,7 @@ async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3436,6 +3456,7 @@ async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3497,6 +3518,7 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3566,6 +3588,7 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3626,6 +3649,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3669,6 +3693,7 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
+            job_id,
             runtime_generation: 0,
             segment_id: SegmentId {
                 file_id: NzbFileId {
@@ -3764,5 +3789,91 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
         pipeline.jobs.get(&job_id).unwrap().recovery_queue.len(),
         1,
         "optional recovery files should stay parked until promoted"
+    );
+}
+
+/// The job an article belongs to rides on the result itself, so per-job
+/// accounting never has to ask which job holds the lane the article arrived
+/// on. This result closes its lane — it carries the lane's last outstanding
+/// work and its connection slot — so the owner entry is struck from the map
+/// before any of that accounting runs, and the job is still booked correctly.
+#[tokio::test]
+async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40711);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let lane_id = Pipeline::next_download_lane_id();
+    pipeline.download_lane_owners.insert(
+        lane_id,
+        DownloadLaneOwner {
+            job_id,
+            mode: DownloadLaneMode::Sequential,
+            spillover_loan_kind: None,
+            completion_critical: false,
+            connection: true,
+            ip_replacement: false,
+            outstanding: HashMap::from([(
+                segment_id,
+                DownloadWork {
+                    segment_id,
+                    message_id: MessageId::new("carried-article@example.com"),
+                    groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+                    priority: 0,
+                    byte_estimate: 128,
+                    retry_count: 0,
+                    is_recovery: false,
+                    completion_critical: false,
+                    exclude_servers: Vec::new(),
+                    avoid_server: None,
+                },
+            )]),
+        },
+    );
+    pipeline.active_downloads = 1;
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.active_download_connections = 1;
+    pipeline
+        .active_download_connections_by_job
+        .insert(job_id, 1);
+
+    assert!(pipeline.release_download_result(&DownloadResult {
+        lane_id,
+        job_id,
+        runtime_generation: pipeline.pool_generation,
+        segment_id,
+        data: Ok(DownloadPayload::Raw(Bytes::from_static(b"carried-article"))),
+        attempts: Vec::new(),
+        lane_observation: None,
+        source_server_idx: Some(0),
+        origin: DownloadResultOrigin::NormalPrimary,
+        retry_count: 0,
+        exclude_servers: Vec::new(),
+        release_connection_slot: true,
+    }));
+
+    assert!(
+        !pipeline.download_lane_owners.contains_key(&lane_id),
+        "the result that closes a lane retires its owner before the job is booked"
+    );
+    assert!(
+        !pipeline.active_downloads_by_job.contains_key(&job_id),
+        "the result's own job is what the in-flight count is charged back to"
+    );
+    assert!(
+        !pipeline
+            .active_download_connections_by_job
+            .contains_key(&job_id),
+        "the result's own job is what the connection slot is returned to"
+    );
+    assert!(
+        pipeline.job_last_download_activity.contains_key(&job_id),
+        "download activity is noted against the result's own job"
     );
 }

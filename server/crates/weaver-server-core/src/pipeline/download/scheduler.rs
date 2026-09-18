@@ -35,9 +35,12 @@
 //! 3. **Spill goes to exactly one job.** When the hot job is blocked, the
 //!    walk continues down the same order and stops at the first job that
 //!    yields. Obligation 1 outranks "the next one only": if the next job is
-//!    blocked too, the walk keeps going. Because the walk is in order it can
-//!    never start a job behind one that still has servable work, so a second
-//!    spill job cannot open while the first can still be served.
+//!    blocked too, the walk keeps going. A spill job that already has
+//!    articles out on this server keeps it while it can still serve it, so
+//!    an earlier job that unblocks waits for that ring to drain rather than
+//!    opening a second spill beside it; only the hot job outranks a spill in
+//!    flight. Because the walk is in order it can never start a job behind
+//!    one that still has servable work either.
 //! 4. **A handout never spans jobs.** If the chosen job yields fewer articles
 //!    than were asked for, that is the handout.
 //! 5. **Completion-critical work orders a job internally, never globally.**
@@ -66,11 +69,7 @@
 //! connection and lane gauges, ISP bandwidth reservations, activation of the
 //! work it was handed, and returning unused work to the queue.
 
-// This packet lands the scheduler and its tests; the dispatch and refill
-// paths still run the older selection and switch over separately.
-#![allow(dead_code)]
-
-use super::worker::{DownloadPressure, DownloadWorkSelection};
+use super::worker::DownloadPressure;
 use super::*;
 
 /// What a server gets when it asks for work.
@@ -104,12 +103,10 @@ impl Pipeline {
     /// The next articles for `server_idx`, at most `want` of them.
     ///
     /// `spill_in_flight` names the job that already has articles out on this
-    /// server behind the hot one, if any. It never overrides the order: an
-    /// ordered walk already cannot open a job behind one that still has
-    /// servable work, and a job *ahead* of the in-flight one outranks it the
-    /// moment it can serve this server again. It is read only to say so in
-    /// the log. `pressure` is the pressure sample the caller already took for
-    /// this pass.
+    /// server behind the hot one, if any. While the hot job is blocked and
+    /// that job can still serve the server, it keeps it: a second spill job
+    /// never opens beside one in flight. `pressure` is the pressure sample the
+    /// caller already took for this pass.
     pub(in crate::pipeline) fn next_works(
         &mut self,
         server_idx: usize,
@@ -145,16 +142,19 @@ impl Pipeline {
             return Handout::Idle;
         }
 
+        if let Some(in_flight) = spill_in_flight
+            && spill_candidates.contains(&in_flight)
+        {
+            let works = self.take_servable_works(in_flight, server_idx, want, pressure);
+            if !works.is_empty() {
+                return self.record_handout(HandoutKind::Spill, works);
+            }
+        }
+
         for job_id in spill_candidates {
             let works = self.take_servable_works(*job_id, server_idx, want, pressure);
             if works.is_empty() {
                 continue;
-            }
-            if spill_in_flight.is_some_and(|in_flight| in_flight != *job_id) {
-                debug!(
-                    job_id = job_id.0,
-                    server_idx, "scheduler spill moved to an earlier job"
-                );
             }
             return self.record_handout(HandoutKind::Spill, works);
         }
@@ -193,7 +193,7 @@ impl Pipeline {
     /// Every job that could be downloaded from, in the order the hot job and
     /// then each spill candidate are drawn from: dispatch priority first,
     /// submission order within a priority.
-    fn download_scheduler_eligible_jobs(&self) -> Vec<JobId> {
+    pub(in crate::pipeline) fn download_scheduler_eligible_jobs(&self) -> Vec<JobId> {
         let mut eligible = self
             .job_order
             .iter()
@@ -229,6 +229,9 @@ impl Pipeline {
         if self.propagation_hold_until(job_id).is_some() {
             return Vec::new();
         }
+        // An archive whose unlock order changed re-ranks its queue before
+        // anything is taken from it.
+        self.apply_rar_unlock_priorities_if_dirty(job_id);
         let bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
         let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
 
@@ -240,9 +243,6 @@ impl Pipeline {
             let Some(filter) = self.servable_work_filter(
                 job_id,
                 server_idx,
-                DownloadWorkSelection::Any,
-                None,
-                None,
                 bootstrap_files.as_deref(),
                 uu_cursor_ordinals.as_ref(),
                 &taken,
@@ -307,6 +307,28 @@ impl Pipeline {
         }
     }
 
+    /// Whether any eligible job holds an article some server other than
+    /// `server_idx` may fetch: the sign that a lane idle on `server_idx` is
+    /// holding a slot a dial elsewhere could use.
+    pub(in crate::pipeline) fn servable_work_on_other_server(
+        &mut self,
+        server_idx: usize,
+        pressure: DownloadPressure,
+    ) -> bool {
+        let eligible = self.download_scheduler_eligible_jobs();
+        if eligible.is_empty() {
+            return false;
+        }
+        let server_count = self.nntp.pool().server_count();
+        (0..server_count)
+            .filter(|other| *other != server_idx)
+            .any(|other| {
+                eligible
+                    .iter()
+                    .any(|job_id| self.job_has_servable_work_for_server(*job_id, other, pressure))
+            })
+    }
+
     /// Whether one job holds an article `server_idx` may fetch, without
     /// taking it. The read-only twin of [`Self::take_servable_works`].
     fn job_has_servable_work_for_server(
@@ -323,9 +345,6 @@ impl Pipeline {
         let Some(filter) = self.servable_work_filter(
             job_id,
             server_idx,
-            DownloadWorkSelection::Any,
-            None,
-            None,
             bootstrap_files.as_deref(),
             uu_cursor_ordinals.as_ref(),
             &[],

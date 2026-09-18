@@ -355,7 +355,7 @@ impl Pipeline {
                 self.note_download_lane_released(observation.mode, reason);
             }
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
-            let job_id = result.segment_id.file_id.job_id;
+            let job_id = result.job_id;
             if let Some(in_flight) = self.active_download_connections_by_job.get_mut(&job_id) {
                 *in_flight = in_flight.saturating_sub(1);
                 if *in_flight == 0 {
@@ -377,13 +377,12 @@ impl Pipeline {
                     }
                 }
             }
-            self.clear_spillover_loan_if_idle();
         }
         if result.origin.is_recovery() {
             self.active_recovery = self.active_recovery.saturating_sub(1);
         }
 
-        let job_id = result.segment_id.file_id.job_id;
+        let job_id = result.job_id;
         self.note_download_activity(job_id);
         if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
             *in_flight = in_flight.saturating_sub(1);
@@ -413,17 +412,6 @@ impl Pipeline {
             }
             Err(_) => None,
         };
-        if result.origin.counts_for_hot_primary()
-            && self.hot_dispatch_job == Some(job_id)
-            && let Ok(payload) = &result.data
-        {
-            let raw_bytes = match payload {
-                DownloadPayload::Raw(raw) => raw.len() as u64,
-                DownloadPayload::Decoded(decoded) => decoded.raw_size,
-            };
-            self.hot_dispatch_throughput_window
-                .record(Instant::now(), raw_bytes);
-        }
         self.reconcile_rate_limit_for_download(result.segment_id, actual_raw_bytes);
         if let Some(raw_bytes) = actual_raw_bytes
             && let Err(error) = self.record_download_bandwidth_usage(raw_bytes)
@@ -434,7 +422,6 @@ impl Pipeline {
                 "failed to record ISP bandwidth usage"
             );
         }
-        self.refresh_hot_dispatch_loans(Instant::now());
         true
     }
 
@@ -499,7 +486,7 @@ impl Pipeline {
     }
 
     pub(crate) async fn process_released_download_done(&mut self, result: DownloadResult) {
-        let job_id = result.segment_id.file_id.job_id;
+        let job_id = result.job_id;
         let lead_bytes = Self::released_download_result_lead_bytes(&result);
         self.process_download_done(result).await;
         self.finish_released_download_result_processing(job_id, lead_bytes);
@@ -528,7 +515,7 @@ impl Pipeline {
     }
 
     async fn process_download_done_inner(&mut self, result: DownloadResult) {
-        let job_id = result.segment_id.file_id.job_id;
+        let job_id = result.job_id;
         if self
             .jobs
             .get(&job_id)
@@ -1219,7 +1206,7 @@ impl Pipeline {
                             self.note_retry_scheduled(seg_id);
                             if infrastructure_retry {
                                 self.note_infrastructure_retry_scheduled(
-                                    seg_id.file_id.job_id,
+                                    job_id,
                                     failure.kind,
                                     Some(delay),
                                 );

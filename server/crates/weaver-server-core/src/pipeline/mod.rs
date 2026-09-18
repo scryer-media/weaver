@@ -27,7 +27,9 @@ use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+
+use crate::pipeline::download::HeldDownloadRefill;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -242,151 +244,13 @@ impl Pipeline {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct DownloadBatchCompatibility {
-    pub(super) priority: u32,
-    pub(super) is_recovery: bool,
-    pub(super) completion_critical: bool,
-    pub(super) groups: std::sync::Arc<[String]>,
-    pub(super) exclude_servers: Vec<usize>,
-    /// Transport-rotation hint carried from [`DownloadWork::avoid_server`].
-    /// Batched works share one effective exclude set, so works with different
-    /// avoid hints must not share a lease.
-    pub(super) avoid_server: Option<usize>,
-}
-
-impl DownloadBatchCompatibility {
-    fn from_work(work: &DownloadWork) -> Self {
-        Self {
-            priority: work.priority,
-            is_recovery: work.is_recovery,
-            completion_critical: work.completion_critical,
-            groups: work.groups.clone(),
-            exclude_servers: work.exclude_servers.clone(),
-            avoid_server: work.avoid_server,
-        }
-    }
-
-    /// Whether `work` may join the batch this compatibility was cut from at
-    /// **initial dispatch**.
-    ///
-    /// A first lease also decides the connection: the lane is acquired for
-    /// `groups`, and `priority` is what the initial batch was sized around. Two
-    /// works only share that decision when they agree on all of it.
-    fn matches(&self, work: &DownloadWork) -> bool {
-        work.priority == self.priority && self.refill_matches(work, true)
-    }
-
-    /// Whether `work` may join a **refill** of an already-established lane.
-    ///
-    /// A refill inherits a live connection, so the only question it may ask is
-    /// what that connection can serve:
-    ///
-    /// * `exclude_servers` / `avoid_server` — every work in a lease shares one
-    ///   effective exclude set, and each result reports the batch's excludes
-    ///   back into the segment's failure ledger. Mixing them would book one
-    ///   article's exclusions against another's, so these stay equal.
-    /// * `is_recovery` — the in-flight recovery count is added per batch and
-    ///   released per work item, so a batch that mixed the two would book one
-    ///   article's bytes against the other's ledger.
-    /// * `completion_critical` — the class the *batch* is sized and counted
-    ///   under.
-    ///
-    /// Neither of those makes the class of the *lane* immutable. A lane whose
-    /// job has completion-critical work queued changes class between batches
-    /// instead of parking: `try_lease_refill_download_batch` looks at the
-    /// critical heap first and re-opens the lease around that work's own
-    /// compatibility, and the refill grant rebooks the connection from the
-    /// class it held to the class it is being given. What stays fixed is one
-    /// *batch*'s class, which is all this rule decides.
-    ///
-    /// `priority` is deliberately **not** asked: it only orders the queue.
-    /// Gating a refill on it pinned each lane inside one direct-store volume
-    /// (`10 + volume_index`), so every lane parked "no work" at each of a
-    /// 125-volume job's boundaries with thousands of articles still queued.
-    ///
-    /// `groups` is asked only when `match_groups` says the lane's server has
-    /// proven it needs a selected group (RFC 3977 serves a message-id fetch
-    /// without one, and such a lane never sent GROUP). On a server that did
-    /// send GROUP at connect, an article from another group is not known to be
-    /// fetchable through that selection, so the refill keeps to the group the
-    /// connection was opened for and the initial rule reconnects for the rest.
-    fn refill_matches(&self, work: &DownloadWork, match_groups: bool) -> bool {
-        work.is_recovery == self.is_recovery
-            && work.completion_critical == self.completion_critical
-            && work.exclude_servers == self.exclude_servers
-            && work.avoid_server == self.avoid_server
-            && (!match_groups || self.groups_match(work))
-    }
-
-    fn groups_match(&self, work: &DownloadWork) -> bool {
-        std::sync::Arc::ptr_eq(&work.groups, &self.groups) || work.groups == self.groups
-    }
-}
-
-/// Which of the two compatibility rules a pop is being filtered by.
-///
-/// Kept as a selector rather than two `matches` call sites so the rule a lease
-/// was opened under is carried all the way through its batching loop: a refill
-/// that took the queue head under the refill rule must go on filling under the
-/// same rule, or it stops after one article at the next priority boundary.
-#[derive(Clone, Copy)]
-pub(super) struct DownloadBatchSelector<'a> {
-    compatibility: &'a DownloadBatchCompatibility,
-    rule: DownloadBatchRule,
-}
-
-/// The rule a lease is cut under; see [`DownloadBatchCompatibility::matches`]
-/// and [`DownloadBatchCompatibility::refill_matches`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum DownloadBatchRule {
-    /// A first lease: every work must agree with the head on everything.
-    Initial,
-    /// A refill of a live lane: priority is not asked, and `groups` only when
-    /// the lane's server has proven it needs a selected group.
-    Refill { match_groups: bool },
-}
-
-impl DownloadBatchRule {
-    pub(super) fn is_refill(self) -> bool {
-        matches!(self, Self::Refill { .. })
-    }
-}
-
-impl<'a> DownloadBatchSelector<'a> {
-    pub(super) fn new(
-        compatibility: &'a DownloadBatchCompatibility,
-        rule: DownloadBatchRule,
-    ) -> Self {
-        Self {
-            compatibility,
-            rule,
-        }
-    }
-
-    pub(super) fn initial(compatibility: &'a DownloadBatchCompatibility) -> Self {
-        Self::new(compatibility, DownloadBatchRule::Initial)
-    }
-
-    pub(super) fn matches(&self, work: &DownloadWork) -> bool {
-        match self.rule {
-            DownloadBatchRule::Initial => self.compatibility.matches(work),
-            DownloadBatchRule::Refill { match_groups } => {
-                self.compatibility.refill_matches(work, match_groups)
-            }
-        }
-    }
-
-    pub(super) fn is_refill(&self) -> bool {
-        self.rule.is_refill()
-    }
-}
-
 pub(super) struct DownloadLaneOwner {
     job_id: JobId,
     mode: DownloadLaneMode,
-    spillover_loan_kind: Option<SpilloverLoanKind>,
     completion_critical: bool,
+    /// The server this lane is connected to, once a refill has told the
+    /// scheduler where the lane lives. `None` until the first refill.
+    server_idx: Option<usize>,
     connection: bool,
     ip_replacement: bool,
     outstanding: HashMap<SegmentId, DownloadWork>,
@@ -397,13 +261,20 @@ pub(super) struct DownloadBatchLease {
     pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) lane_mode: DownloadLaneMode,
-    pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) server_modes: Vec<(usize, DownloadLaneMode)>,
-    pub(super) compatibility: DownloadBatchCompatibility,
-    /// Compatibility excludes plus the job's retention exclusions — the set
-    /// server ordering and lane acquisition use. Results keep reporting the
-    /// compatibility (failure-only) excludes; retention stays job-derived.
+    /// The class every work in this batch is counted under. A batch is cut
+    /// from one job and one class; the worker reports it back on park so the
+    /// class gauges are released against what was booked.
+    pub(super) completion_critical: bool,
+    /// The job's retention exclusions — the set server ordering and lane
+    /// acquisition use. Each result reports its own work's failure-only
+    /// excludes; retention stays job-derived.
     pub(super) effective_exclude_servers: Vec<usize>,
+    /// The servers the lane's adopt or dial must not use. A batch is cut for
+    /// one server, so this is every other server: the connection goes where
+    /// the scheduler's answer was for. Kept apart from the excludes above,
+    /// which reach the failure ledger — a pin is not a failure.
+    pub(super) dial_exclude_servers: Vec<usize>,
     /// Immutable common-refinement geometry captured when this batch was
     /// leased. Each response carries this same snapshot through durable commit
     /// so grids admitted later cannot reinterpret old decoder output.
@@ -416,7 +287,6 @@ pub(super) struct DownloadBatchLease {
 
 pub(super) struct DownloadLaneRefillRequest {
     pub(super) lane_id: u64,
-    pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
     pub(super) remote_ip: Option<IpAddr>,
@@ -429,310 +299,12 @@ pub(super) struct DownloadLaneRefillRequest {
     /// `download_lanes_active{mode="sequential"}`. Lanes therefore carry the
     /// booked mode forward and update it from each granted lease.
     pub(super) current_mode: DownloadLaneMode,
-    pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
-    pub(super) compatibility: DownloadBatchCompatibility,
     pub(super) response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
 }
 
 pub(super) struct DownloadLaneRefillResponse {
     pub(super) lease: Option<DownloadBatchLease>,
     pub(super) park_reason: LaneParkReason,
-}
-
-const HOT_THROUGHPUT_WINDOW: Duration = Duration::from_secs(2);
-const HOT_THROUGHPUT_BUCKET_WIDTH: Duration = Duration::from_millis(200);
-const HOT_THROUGHPUT_BUCKETS: usize = 10;
-
-#[derive(Debug, Default)]
-pub(super) struct HotJobThroughputWindow {
-    buckets: VecDeque<HotThroughputBucket>,
-}
-
-#[derive(Debug)]
-struct HotThroughputBucket {
-    started_at: Instant,
-    bytes: u64,
-}
-
-impl HotJobThroughputWindow {
-    pub(super) fn clear(&mut self) {
-        self.buckets.clear();
-    }
-
-    pub(super) fn record(&mut self, now: Instant, bytes: u64) {
-        self.advance_to(now);
-        if let Some(bucket) = self.buckets.back_mut() {
-            bucket.bytes = bucket.bytes.saturating_add(bytes);
-        }
-    }
-
-    pub(super) fn bps(&mut self, now: Instant) -> u64 {
-        self.advance_to(now);
-        let bytes = self.buckets.iter().map(|bucket| bucket.bytes).sum::<u64>();
-        (bytes as f64 / HOT_THROUGHPUT_WINDOW.as_secs_f64()).round() as u64
-    }
-
-    fn advance_to(&mut self, now: Instant) {
-        if self.buckets.back().is_some_and(|bucket| {
-            now.saturating_duration_since(bucket.started_at) >= HOT_THROUGHPUT_WINDOW
-        }) {
-            self.buckets.clear();
-        }
-
-        if self.buckets.is_empty() {
-            self.buckets.push_back(HotThroughputBucket {
-                started_at: now,
-                bytes: 0,
-            });
-            return;
-        }
-
-        while self.buckets.back().is_some_and(|bucket| {
-            now.saturating_duration_since(bucket.started_at) >= HOT_THROUGHPUT_BUCKET_WIDTH
-        }) {
-            let next_started_at = self
-                .buckets
-                .back()
-                .map(|bucket| bucket.started_at + HOT_THROUGHPUT_BUCKET_WIDTH)
-                .unwrap_or(now);
-            self.buckets.push_back(HotThroughputBucket {
-                started_at: next_started_at,
-                bytes: 0,
-            });
-            while self.buckets.len() > HOT_THROUGHPUT_BUCKETS {
-                self.buckets.pop_front();
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) enum SpilloverReclaimReason {
-    SpeedHarm,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SpilloverLoanKind {
-    MeasuredUnderfill,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct SpilloverLoanState {
-    pub(super) measured_lent_connections: usize,
-    pub(super) measured_post_lend_bps: Option<u64>,
-    pub(super) measured_reclaim_reason: Option<SpilloverReclaimReason>,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct SpilloverLoanBook {
-    loans: HashMap<JobId, SpilloverLoanState>,
-    aggregate_pre_lend_bps: Option<u64>,
-    aggregate_lent_at: Option<Instant>,
-    aggregate_post_lend_bps: Option<u64>,
-}
-
-impl SpilloverLoanBook {
-    pub(super) fn clear(&mut self) {
-        self.loans.clear();
-        self.aggregate_pre_lend_bps = None;
-        self.aggregate_lent_at = None;
-        self.aggregate_post_lend_bps = None;
-    }
-
-    pub(super) fn start_or_extend(
-        &mut self,
-        job_id: JobId,
-        now: Instant,
-        hot_speed_bps: u64,
-        kind: SpilloverLoanKind,
-    ) {
-        if self.measured_lent_connections() == 0 {
-            self.aggregate_pre_lend_bps = Some(hot_speed_bps);
-            self.aggregate_lent_at = Some(now);
-            self.aggregate_post_lend_bps = None;
-        }
-        self.loans
-            .entry(job_id)
-            .and_modify(|loan| {
-                loan.increment(kind);
-            })
-            .or_insert(SpilloverLoanState {
-                measured_lent_connections: 1,
-                measured_post_lend_bps: None,
-                measured_reclaim_reason: None,
-            });
-    }
-
-    pub(super) fn release_one(&mut self, job_id: JobId, kind: SpilloverLoanKind) {
-        let Some(loan) = self.loans.get_mut(&job_id) else {
-            return;
-        };
-        loan.decrement(kind);
-        if loan.total_lent_connections() == 0 {
-            self.loans.remove(&job_id);
-        }
-        if self.measured_lent_connections() == 0 {
-            self.aggregate_pre_lend_bps = None;
-            self.aggregate_lent_at = None;
-            self.aggregate_post_lend_bps = None;
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn mark_reclaim_for_test(
-        &mut self,
-        job_id: JobId,
-        post_lend_bps: Option<u64>,
-        reason: SpilloverReclaimReason,
-    ) {
-        if let Some(loan) = self.loans.get_mut(&job_id) {
-            loan.measured_post_lend_bps = post_lend_bps;
-            loan.measured_reclaim_reason = Some(reason);
-        }
-    }
-
-    pub(super) fn reclaim_pending_for(&self, job_id: JobId) -> bool {
-        self.loans
-            .get(&job_id)
-            .is_some_and(|loan| loan.measured_reclaim_reason.is_some())
-    }
-
-    /// Total connections currently lent out. Kept for the loan-book tests:
-    /// dispatch no longer branches on the count.
-    #[cfg(test)]
-    pub(super) fn active_lent_connections(&self) -> usize {
-        self.loans
-            .values()
-            .map(SpilloverLoanState::total_lent_connections)
-            .sum()
-    }
-
-    fn measured_lent_connections(&self) -> usize {
-        self.loans
-            .values()
-            .map(|loan| loan.measured_lent_connections)
-            .sum()
-    }
-
-    pub(super) fn active_loan_count(&self) -> usize {
-        self.loans.len()
-    }
-
-    /// Number of distinct jobs currently holding a spillover loan. Same
-    /// value as `active_loan_count` (loans are keyed one-per-job); named for
-    /// the dispatch-side cap check against `HOT_DISPATCH_SPILLOVER_MAX_JOBS`,
-    /// so that call site reads as what it is instead of what it happens to
-    /// share a value with.
-    pub(super) fn distinct_loan_jobs(&self) -> usize {
-        self.active_loan_count()
-    }
-
-    /// Whether `job_id` already holds a spillover loan — used to prefer
-    /// concentrating new lanes onto jobs already spilling to, rather than
-    /// admitting a fresh job while under the distinct-job cap.
-    pub(super) fn holds_loan(&self, job_id: JobId) -> bool {
-        self.loans.contains_key(&job_id)
-    }
-
-    pub(super) fn update_speed_harm(
-        &mut self,
-        now: Instant,
-        hot_speed_bps: u64,
-        harm_percent: u64,
-    ) -> bool {
-        if self.measured_lent_connections() == 0 || hot_speed_bps == 0 {
-            return false;
-        }
-
-        let Some(lent_at) = self.aggregate_lent_at else {
-            return false;
-        };
-        let Some(pre_lend_bps) = self.aggregate_pre_lend_bps else {
-            return false;
-        };
-        if now.saturating_duration_since(lent_at) < Duration::from_secs(2) || pre_lend_bps == 0 {
-            return false;
-        }
-
-        self.aggregate_post_lend_bps = Some(hot_speed_bps);
-        for loan in self.loans.values_mut() {
-            if loan.measured_lent_connections == 0 {
-                continue;
-            }
-            loan.measured_post_lend_bps = Some(hot_speed_bps);
-        }
-
-        let harm_threshold = pre_lend_bps.saturating_mul(100 - harm_percent) / 100;
-        if hot_speed_bps >= harm_threshold {
-            return false;
-        }
-
-        let mut newly_reclaimed = false;
-        for loan in self.loans.values_mut() {
-            if loan.measured_lent_connections == 0 {
-                continue;
-            }
-            if loan.measured_reclaim_reason.is_none() {
-                loan.measured_reclaim_reason = Some(SpilloverReclaimReason::SpeedHarm);
-                newly_reclaimed = true;
-            }
-        }
-        newly_reclaimed
-    }
-}
-
-impl SpilloverLoanState {
-    fn increment(&mut self, kind: SpilloverLoanKind) {
-        match kind {
-            SpilloverLoanKind::MeasuredUnderfill => {
-                self.measured_lent_connections = self.measured_lent_connections.saturating_add(1)
-            }
-        }
-    }
-
-    fn decrement(&mut self, kind: SpilloverLoanKind) {
-        match kind {
-            SpilloverLoanKind::MeasuredUnderfill => {
-                self.measured_lent_connections = self.measured_lent_connections.saturating_sub(1)
-            }
-        }
-    }
-
-    fn total_lent_connections(&self) -> usize {
-        self.measured_lent_connections
-    }
-}
-
-/// Cooperative signal asking every non-critical lane to return its
-/// unrequested tail so the dispatcher can hand the freed connection to
-/// completion-critical work on the next pass. A plain flag rather than a
-/// targeted job id: once completion-critical demand goes unmet, ANY lane
-/// running regular bytes — the hot job's own included — is fair game to
-/// yield, not just one designated job's.
-#[derive(Debug, Default)]
-pub(super) struct HotShareYieldSignal {
-    requested: AtomicBool,
-}
-
-impl HotShareYieldSignal {
-    pub(super) fn request(&self) {
-        self.requested.store(true, Ordering::Relaxed);
-    }
-
-    pub(super) fn clear(&self) {
-        self.requested.store(false, Ordering::Relaxed);
-    }
-
-    pub(super) fn is_requested(&self) -> bool {
-        self.requested.load(Ordering::Relaxed)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HotBestModeBlockReason {
-    None,
-    HotHasQueuedPrimary,
-    LaneCapacityAvailable,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -763,7 +335,6 @@ pub(super) struct DownloadLaneParked {
     pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) mode: DownloadLaneMode,
-    pub(super) spillover_loan_kind: Option<SpilloverLoanKind>,
     pub(super) completion_critical: bool,
     pub(super) reason: LaneParkReason,
     pub(super) release_connection_slot: bool,
@@ -817,15 +388,14 @@ impl DownloadResultOrigin {
             Self::CompletionCriticalPrimary | Self::CompletionCriticalRecovery
         )
     }
-
-    pub(super) fn counts_for_hot_primary(self) -> bool {
-        matches!(self, Self::NormalPrimary)
-    }
 }
 
 /// Result of a download task.
 pub(super) struct DownloadResult {
     pub(super) lane_id: u64,
+    /// Job this article belongs to. Carried on the result itself so the
+    /// completion path never has to ask which job owns the lane it arrived on.
+    pub(super) job_id: JobId,
     pub(super) segment_id: SegmentId,
     pub(super) runtime_generation: u64,
     pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
@@ -2614,23 +2184,12 @@ pub struct Pipeline {
     pub(super) active_completion_critical_connections: usize,
     /// Number of in-flight recovery downloads (subset of active_downloads).
     pub(super) active_recovery: usize,
-    /// Current hot job receiving exclusive article-dispatch preference.
-    pub(super) hot_dispatch_job: Option<JobId>,
-    /// When the current hot-dispatch ownership period began.
-    pub(super) hot_dispatch_started_at: Option<Instant>,
-    /// Last time dispatch lent a reclaimable connection to spillover work.
-    pub(super) hot_dispatch_last_lend_at: Option<Instant>,
-    /// Start of the current unused-capacity underfill window.
-    pub(super) hot_dispatch_underfill_since: Option<Instant>,
-    /// Two-second measured throughput for successful hot-job primary BODY results.
-    pub(super) hot_dispatch_throughput_window: HotJobThroughputWindow,
-    /// Active reclaimable spillover loans keyed by lent job.
-    pub(super) hot_dispatch_spillover_loans: SpilloverLoanBook,
-    /// Cooperative signal asking owned hot lanes to return their unrequested tail.
-    pub(super) hot_share_yield_signal: Arc<HotShareYieldSignal>,
     /// Runtime-only per-server BODY depth explorers. Seeded from the persisted
     /// depth on first observation; the measurements themselves never persist.
     pub(super) download_lane_runtime: DownloadLaneRuntimeState,
+    /// Refill requests the scheduler had nothing for yet, waiting for the
+    /// next wake or for their hold to run out.
+    pub(super) held_download_refills: Vec<HeldDownloadRefill>,
     /// A lane parked and its connection slot came back; the run loop owes a
     /// dispatch pass.
     ///

@@ -236,37 +236,6 @@ impl Pipeline {
         started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
 
-    pub(in crate::pipeline::download::worker) fn normal_download_connection_capacity_available(
-        &self,
-    ) -> bool {
-        let params = self.tuner.params();
-        let mut limit =
-            self.effective_download_connection_capacity(params.max_concurrent_downloads);
-        // Ordinary work can only run on fill servers; lanes beyond the fill
-        // tier's connection budget would block on saturated fill semaphores
-        // without ever reaching backfill. Escalated demand (queued work with
-        // failure exclusions, or a job whose age retention-excludes servers)
-        // may legitimately need backfill lanes, so it restores the full
-        // budget. The retention read uses the warm cache only — leases keep
-        // it fresh for active jobs. All-fill configs skip the clamp entirely:
-        // the tuner already bounds lanes against total capacity there.
-        let fill_capacity = self.nntp.pool().fill_connection_capacity();
-        if self.nntp.pool().has_backfill_servers() && fill_capacity < limit {
-            let escalated_demand = self
-                .job_retention_exclude_cache
-                .values()
-                .any(|(_, excludes)| !excludes.is_empty())
-                || self
-                    .jobs
-                    .values()
-                    .any(|state| state.download_queue.excluded_work_count() > 0);
-            if !escalated_demand {
-                limit = fill_capacity;
-            }
-        }
-        self.active_download_connections < limit
-    }
-
     pub(in crate::pipeline) fn durable_download_floor_bytes_for_job(&self, job_id: JobId) -> u64 {
         let Some(state) = self.jobs.get(&job_id) else {
             return 0;

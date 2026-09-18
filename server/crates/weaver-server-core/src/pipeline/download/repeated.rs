@@ -443,6 +443,7 @@ impl Pipeline {
                 let _ = tx
                     .send(DownloadResult {
                         lane_id: lease.lane_id,
+                        job_id: lease.job_id,
                         segment_id: work.segment_id,
                         runtime_generation: lease.runtime_generation,
                         data: reply.data,
@@ -464,8 +465,7 @@ impl Pipeline {
                     lane_id: lease.lane_id,
                     job_id: lease.job_id,
                     mode: lease.lane_mode,
-                    spillover_loan_kind: lease.spillover_loan_kind,
-                    completion_critical: lease.compatibility.completion_critical,
+                    completion_critical: lease.completion_critical,
                     reason: LaneParkReason::NoWork,
                     release_connection_slot: true,
                     release_ip_replacement_burst: false,

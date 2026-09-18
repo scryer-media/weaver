@@ -1919,7 +1919,7 @@ impl Pipeline {
     /// Queued articles and delayed retries deliberately do not count: they are the
     /// scheduler's backlog, not current transfer activity.
     pub(crate) fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
-        self.hot_dispatch_job == Some(job_id)
+        self.current_hot_job() == Some(job_id)
             || self
                 .active_download_connections_by_job
                 .get(&job_id)

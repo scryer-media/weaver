@@ -1092,6 +1092,7 @@ async fn released_result_bytes_block_dispatch_until_processing_clears_hysteresis
     pipeline
         .process_released_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(payload)),
@@ -3151,6 +3152,7 @@ async fn released_download_result_fences_completion_until_processed() {
     pipeline
         .process_released_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(Bytes::from_static(b"discarded"))),
@@ -3216,6 +3218,7 @@ async fn failed_job_retains_released_result_ledgers_until_terminal_processing() 
     pipeline
         .process_released_download_done(DownloadResult {
             lane_id: 0,
+            job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
             data: Ok(DownloadPayload::Raw(payload)),
@@ -3268,6 +3271,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
             lane_id: 0,
             results: vec![DownloadResult {
                 lane_id: 0,
+                job_id: segment_id.file_id.job_id,
                 runtime_generation: 0,
                 segment_id,
                 data: Ok(DownloadPayload::Decoded(DecodeResult {
