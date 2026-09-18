@@ -804,6 +804,18 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     ] {
         out.sample(&f::LANE_REFILLS, &[("result", result)], value);
     }
+    for (kind, value) in [
+        ("hot", snapshot.download_scheduler_handouts_total_hot),
+        ("spill", snapshot.download_scheduler_handouts_total_spill),
+        ("probe", snapshot.download_scheduler_handouts_total_probe),
+    ] {
+        out.sample(&f::SCHEDULER_HANDOUTS, &[("kind", kind)], value);
+    }
+    out.sample(
+        &f::SCHEDULER_IDLE_WITH_SERVABLE,
+        &[],
+        snapshot.download_scheduler_idle_with_servable_total,
+    );
 
     for (event, value) in [
         (

@@ -167,6 +167,10 @@ metric_families! {
         "Article work items leased to download lanes.");
     LANE_REFILLS = ("weaver_pipeline_download_lane_refills_total", Counter, ["result"],
         "Lane refill scheduler decisions.");
+    SCHEDULER_HANDOUTS = ("weaver_pipeline_download_scheduler_handouts_total", Counter, ["kind"],
+        "Article handouts cut by the per-server scheduler, by kind.");
+    SCHEDULER_IDLE_WITH_SERVABLE = ("weaver_pipeline_download_scheduler_idle_with_servable_total", Counter, [],
+        "Scheduler answered idle while a job still had a servable article on that server; always zero when the scheduler is correct.");
 
     // ---- BODY pipelining proof -------------------------------------------
     BODY_PROOF_EVENTS = ("weaver_pipeline_body_proof_events_total", Counter, ["event"],

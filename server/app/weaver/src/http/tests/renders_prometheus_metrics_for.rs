@@ -68,6 +68,16 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     );
     assert!(rendered.contains("weaver_pipeline_download_lane_refills_total{result=\"parked\"} 45"));
     assert!(
+        rendered.contains("weaver_pipeline_download_scheduler_handouts_total{kind=\"hot\"} 202")
+    );
+    assert!(
+        rendered.contains("weaver_pipeline_download_scheduler_handouts_total{kind=\"spill\"} 203")
+    );
+    assert!(
+        rendered.contains("weaver_pipeline_download_scheduler_handouts_total{kind=\"probe\"} 204")
+    );
+    assert!(rendered.contains("weaver_pipeline_download_scheduler_idle_with_servable_total 201"));
+    assert!(
         rendered.contains("weaver_pipeline_body_proof_events_total{event=\"trial_success\"} 46")
     );
     assert!(rendered.contains("weaver_pipeline_body_proof_events_total{event=\"cooldown\"} 49"));
@@ -579,6 +589,12 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
         "weaver_pipeline_download_lane_refills_total",
         "result",
         &["granted", "parked", "deferred"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_pipeline_download_scheduler_handouts_total",
+        "kind",
+        &["hot", "spill", "probe"],
     );
     assert_label_set(
         &rendered,

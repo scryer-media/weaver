@@ -409,6 +409,8 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_pipeline_download_lane_parks_total` | counter | `reason` | Article download lane parks by reason. |
 | `weaver_pipeline_download_lane_lease_items_total` | counter | — | Article work items leased to download lanes. |
 | `weaver_pipeline_download_lane_refills_total` | counter | `result` | Lane refill scheduler decisions. |
+| `weaver_pipeline_download_scheduler_handouts_total` | counter | `kind` | Article handouts cut by the per-server scheduler, by kind. |
+| `weaver_pipeline_download_scheduler_idle_with_servable_total` | counter | — | Scheduler answered idle while a job still had a servable article on that server; always zero when the scheduler is correct. |
 | `weaver_pipeline_body_proof_events_total` | counter | `event` | BODY pipelining proof events. |
 | `weaver_pipeline_body_replay_items_total` | counter | — | BODY items returned unresolved after a lane reset or failure. |
 | `weaver_ip_replacement_trial_extra_connections` | gauge | — | Configured over-max IP replacement trial burst budget. |
