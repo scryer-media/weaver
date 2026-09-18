@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::pipeline::health::ProbeTally;
+
 #[tokio::test]
 async fn upstream_probe_does_not_misclassify_unknown_numeric_plain_files() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -146,6 +148,7 @@ async fn probe_activation_keeps_queues_live_and_completion_clears_health_probing
         probe_round: 0,
         total: 1,
         missed: 0,
+        unverified: 0,
         done: true,
         inconclusive: false,
     });
@@ -223,6 +226,7 @@ async fn probe_completion_inconclusive_restores_queues_without_health_damage() {
         probe_round: 0,
         total: 0,
         missed: 0,
+        unverified: 0,
         done: true,
         inconclusive: true,
     });
@@ -260,6 +264,7 @@ async fn inconclusive_final_probe_still_enforces_critical_health() {
         probe_round: 0,
         total: 0,
         missed: 0,
+        unverified: 0,
         done: true,
         inconclusive: true,
     });
@@ -280,6 +285,43 @@ fn health_probe_samples_rotate_across_rounds() {
     assert_ne!(first, second);
     assert_eq!(first.first().copied(), Some(0));
     assert_eq!(second.first().copied(), Some(1));
+}
+
+#[test]
+fn one_unsettled_batch_costs_coverage_not_the_verdict() {
+    let mut tally = ProbeTally::default();
+    tally.record_answered(&[true; 50]);
+    tally.record_unsettled(50);
+    let mut third = vec![true; 45];
+    third.extend_from_slice(&[false; 5]);
+    tally.record_answered(&third);
+
+    let update = tally.update(JobId(30040), 0, true);
+
+    assert!(update.done);
+    assert!(!update.inconclusive);
+    // The verdict is read over what answered, never over the sample the round
+    // set out to take.
+    assert_eq!(update.total, 100);
+    assert_eq!(update.missed, 5);
+    assert_eq!(update.unverified, 50);
+    assert_eq!(tally.unverified_batches, 1);
+}
+
+#[test]
+fn a_probe_that_settled_nothing_is_inconclusive() {
+    let mut tally = ProbeTally::default();
+    tally.record_unsettled(50);
+    tally.record_unsettled(50);
+    tally.record_unsettled(16);
+
+    let update = tally.update(JobId(30041), 0, true);
+
+    assert!(update.inconclusive);
+    assert_eq!(update.total, 0);
+    assert_eq!(update.missed, 0);
+    assert_eq!(update.unverified, 116);
+    assert_eq!(tally.unverified_batches, 3);
 }
 
 #[tokio::test]
@@ -308,6 +350,7 @@ async fn probe_completion_does_not_immediately_reenter_checking() {
         probe_round: 0,
         total: 1,
         missed: 0,
+        unverified: 0,
         done: true,
         inconclusive: false,
     });
@@ -382,6 +425,7 @@ async fn clean_probe_waits_for_material_new_damage_before_rearming() {
         probe_round: 0,
         total: 10,
         missed: 0,
+        unverified: 0,
         done: true,
         inconclusive: false,
     });
@@ -479,6 +523,7 @@ async fn missed_probe_rearms_on_next_failed_byte() {
         probe_round: 0,
         total: 10,
         missed: 1,
+        unverified: 0,
         done: true,
         inconclusive: false,
     });
@@ -1030,6 +1075,7 @@ async fn damage_across_files_without_recovery_probes_and_all_missing_aborts() {
         probe_round: 0,
         total: 10,
         missed: 10,
+        unverified: 0,
         done: true,
         inconclusive: false,
     });

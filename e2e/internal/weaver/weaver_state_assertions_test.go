@@ -1250,8 +1250,8 @@ func TestAssertHealthProbeScenarioReadsTheProbeLines(t *testing.T) {
 			name: "an inconclusive round fails",
 			lines: []string{
 				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
-				`health probe: confirmation batch inconclusive, aborting probe`,
-				`job_id=91 total=0 missed=0 miss_pct=0 inconclusive=true health probe complete`,
+				`job_id=91 probe_round=0 batch_index=0 batch_len=18 checked_so_far=0 health probe: confirmation batch inconclusive, skipping batch`,
+				`job_id=91 total=0 missed=0 miss_pct=0 inconclusive=true unverified=18 probe_count=18 health probe complete`,
 			},
 			wantErr: "ended inconclusive",
 		},

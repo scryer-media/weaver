@@ -20,6 +20,60 @@ const HEALTH_PROBE_DEAD_RELEASE_LANDED_DIVISOR: u64 = 4;
 /// with the direct-store PAR2 wiring, without unpicking the call sites.
 const EARLY_RECOVERY_PROMOTION: bool = true;
 
+/// Running tally over one probe round's confirmation batches.
+///
+/// A batch can come back without an answer — a transport failure, or no
+/// connection freed up inside the client's acquire deadline while the download
+/// lanes hold every permit. That costs the round coverage, not its verdict: the
+/// batches that did answer are still evidence about the release, and a sample
+/// that is smaller than intended is what `total` already stands for. Only a
+/// round that answered for nothing at all has no verdict to give.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProbeTally {
+    /// Segments a batch answered for authoritatively.
+    pub(super) checked: usize,
+    /// Of those, the ones no usable server holds.
+    pub(super) missed: usize,
+    /// Segments left unanswered by a batch that could not settle.
+    pub(super) unverified: usize,
+    /// How many batches could not settle.
+    pub(super) unverified_batches: usize,
+}
+
+impl ProbeTally {
+    /// Fold in a batch that answered.
+    pub(super) fn record_answered(&mut self, exists: &[bool]) {
+        for found in exists {
+            self.checked = self.checked.saturating_add(1);
+            if !found {
+                self.missed = self.missed.saturating_add(1);
+            }
+        }
+    }
+
+    /// Fold in a batch that could not settle, so the round goes on with the
+    /// segments it could not reach counted against its coverage.
+    pub(super) fn record_unsettled(&mut self, batch_len: usize) {
+        self.unverified_batches = self.unverified_batches.saturating_add(1);
+        self.unverified = self.unverified.saturating_add(batch_len);
+    }
+
+    /// The update the round reports with what it has so far.
+    pub(super) fn update(&self, job_id: JobId, probe_round: u32, done: bool) -> ProbeUpdate {
+        ProbeUpdate {
+            job_id,
+            probe_round,
+            total: self.checked,
+            missed: self.missed,
+            unverified: self.unverified,
+            done,
+            // Nothing answered leaves nothing to read a health estimate from;
+            // anything else is a verdict over the part that did.
+            inconclusive: done && self.checked == 0,
+        }
+    }
+}
+
 impl Pipeline {
     fn health_tracked_bytes(total_bytes: u64, par2_bytes: u64) -> u64 {
         total_bytes.saturating_sub(par2_bytes)
@@ -454,6 +508,7 @@ impl Pipeline {
             probe_round,
             total,
             missed,
+            unverified,
             done,
             inconclusive,
         } = update;
@@ -483,9 +538,17 @@ impl Pipeline {
         let miss_pct = missed.saturating_mul(100).checked_div(total).unwrap_or(0);
 
         if done {
+            // `total` is what the round answered for; with `unverified` beside
+            // it the line says how much of the sample the verdict rests on.
             info!(
                 job_id = job_id.0,
-                total, missed, miss_pct, inconclusive, "health probe complete"
+                total,
+                missed,
+                miss_pct,
+                inconclusive,
+                unverified,
+                probe_count = total.saturating_add(unverified),
+                "health probe complete"
             );
         }
 
@@ -982,13 +1045,12 @@ impl Pipeline {
                 "health probe starting"
             );
 
-            let mut missed: usize = 0;
-            let mut checked: usize = 0;
+            let mut tally = ProbeTally::default();
             const BATCH_SIZE: usize = 50;
             const UPDATE_INTERVAL: usize = 10;
             let mut batches_since_update: usize = 0;
 
-            for batch in probes.chunks(BATCH_SIZE) {
+            for (batch_index, batch) in probes.chunks(BATCH_SIZE).enumerate() {
                 // Idle owned lanes answer on their own warm connections; the
                 // async client is the fallback for whatever they cannot settle
                 // — a server with no lane of its own, or a lane that faulted.
@@ -996,39 +1058,27 @@ impl Pipeline {
                     .confirm_exists_for_probe(&nntp, batch)
                     .await;
                 if results.inconclusive {
-                    warn!("health probe: confirmation batch inconclusive, aborting probe");
-                    let _ = probe_tx
-                        .send(ProbeUpdate {
-                            job_id,
-                            probe_round,
-                            total: checked,
-                            missed,
-                            done: true,
-                            inconclusive: true,
-                        })
-                        .await;
-                    return;
-                }
-
-                for exists in results.exists {
-                    checked += 1;
-                    if !exists {
-                        missed += 1;
-                    }
+                    // One batch that could not settle is a hole in the sample,
+                    // not a verdict about the release: the remaining batches
+                    // are still worth asking, and what they answer stands.
+                    tally.record_unsettled(batch.len());
+                    warn!(
+                        job_id = job_id.0,
+                        probe_round,
+                        batch_index,
+                        batch_len = batch.len(),
+                        checked_so_far = tally.checked,
+                        "health probe: confirmation batch inconclusive, skipping batch"
+                    );
+                } else {
+                    tally.record_answered(&results.exists);
                 }
 
                 batches_since_update += 1;
                 if batches_since_update >= UPDATE_INTERVAL {
                     batches_since_update = 0;
                     let _ = probe_tx
-                        .send(ProbeUpdate {
-                            job_id,
-                            probe_round,
-                            total: checked,
-                            missed,
-                            done: false,
-                            inconclusive: false,
-                        })
+                        .send(tally.update(job_id, probe_round, false))
                         .await;
                 }
             }
@@ -1036,19 +1086,13 @@ impl Pipeline {
             info!(
                 job_id = job_id.0,
                 probes = probe_count,
-                missed,
+                checked = tally.checked,
+                unverified = tally.unverified,
+                unverified_batches = tally.unverified_batches,
+                missed = tally.missed,
                 "health probe complete"
             );
-            let _ = probe_tx
-                .send(ProbeUpdate {
-                    job_id,
-                    probe_round,
-                    total: probe_count,
-                    missed,
-                    done: true,
-                    inconclusive: false,
-                })
-                .await;
+            let _ = probe_tx.send(tally.update(job_id, probe_round, true)).await;
         });
         true
     }

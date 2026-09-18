@@ -654,9 +654,11 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 }
 
 // The lines the health probe emits for a job. Activation is logged once per
-// round; the completion line carries `inconclusive=true` when a confirmation
-// batch hit its transport deadline rather than an answer, and it is the only
-// per-job trace of that — the batch's own warning names no job.
+// round; the completion line carries `inconclusive=true` when not one
+// confirmation batch got an answer — every batch hit its transport deadline —
+// so the round had nothing to read a verdict from. A round that lost some
+// batches but answered for others is conclusive over the part it answered
+// and reports the shortfall as `unverified=`.
 const (
 	healthProbeActivatedMessage = "health probe activated"
 	healthProbeCompleteMessage  = "health probe complete"
@@ -707,9 +709,9 @@ func assertHealthProbeScenario(jobID int, assertion *ScenarioHealthProbeAssertio
 	}
 	if assertion.ForbidInconclusive && inconclusive > 0 {
 		return fmt.Errorf(
-			"%d of %d health probe round(s) ended inconclusive: a confirmation batch hit its "+
-				"transport deadline instead of getting an answer, which on the harness's own "+
-				"server means the probe sat waiting on a lane it should have been handed",
+			"%d of %d health probe round(s) ended inconclusive: no confirmation batch got an "+
+				"answer before its transport deadline, which on the harness's own server means "+
+				"the probe sat waiting on lanes it should have been handed",
 			inconclusive, completed,
 		)
 	}

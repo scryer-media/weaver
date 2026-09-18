@@ -652,6 +652,7 @@ async fn probe_projection_uses_only_payload_bytes() {
         probe_round: 0,
         total: 2,
         missed: 1,
+        unverified: 0,
         done: true,
         inconclusive: false,
     });

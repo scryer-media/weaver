@@ -18,6 +18,22 @@ const PAR2_RECOVERY_PACKET_OVERHEAD: u64 = 68; // 64-byte header + 4-byte expone
 const PAR2_RETAINED_SESSION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const STATEFUL_PAR2_SESSION_ENV: &str = "WEAVER_STATEFUL_PAR2_SESSION";
 const PAR2_METADATA_PREFIX_CAP_BYTES: usize = PAR2_HASH_16K_BYTES;
+/// How many single-article prefix probes discovery keeps on the wire per job.
+///
+/// A prefix probe is one article. Sending them one at a time makes a posting
+/// whose recovery volumes are gone cost one full round trip through the
+/// download queue per volume, each answered by an article-not-found, while
+/// the job's data download waits on the verdict. Several probes in flight
+/// settle the same question in one round trip. Whole-volume metadata carriers
+/// still go alone: those are real downloads, not probes.
+const PAR2_DISCOVERY_PROBE_CONCURRENCY: usize = 4;
+/// After this many sibling volumes of one collection have probed to nothing —
+/// no article, no prefix bytes, no set identity — the collection's untouched
+/// volumes are retired without being asked. A posting that lost three of its
+/// recovery volumes has lost the rest; asking each one in turn only delays the
+/// job's own verdict. A collection with a single authenticated sighting is
+/// never retired this way.
+const PAR2_DISCOVERY_DEAD_SIBLING_LIMIT: usize = 3;
 
 fn par2_prefix_set_ids(prefix: &[u8]) -> Vec<par2_rs::RecoverySetId> {
     let budget = par2_rs::PacketScanBudget::new(par2_rs::PacketScanLimits::default());

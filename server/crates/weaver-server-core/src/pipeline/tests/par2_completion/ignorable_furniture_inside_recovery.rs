@@ -1661,6 +1661,159 @@ async fn metadata_discovery_bootstraps_one_indexless_carrier_per_collection() {
     assert!(pipeline.par2_metadata_discovery_closed(job_id));
 }
 
+/// Six indexless recovery volumes of one posting, one article each, and no
+/// index to bootstrap from.
+async fn install_six_volume_posting(pipeline: &mut Pipeline, job_id: JobId) {
+    let spec = JobSpec {
+        name: "Batched PAR2 Discovery".to_string(),
+        password: None,
+        total_bytes: 6 * 64,
+        category: None,
+        metadata: vec![],
+        files: (0..6)
+            .map(|index| {
+                let filename = format!("harbor.lantern.vol{index:02}+01.par2");
+                FileSpec {
+                    role: FileRole::from_filename(&filename),
+                    filename,
+                    groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
+                    segments: vec![segment_spec! {
+                        number: 0,
+                        bytes: 64,
+                        message_id: format!("batched-discovery-{index}@example.com"),
+                    }],
+                }
+            })
+            .collect(),
+    };
+    insert_active_job(pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.download_queue = DownloadQueue::new();
+    state.recovery_queue = DownloadQueue::new();
+}
+
+fn discovery_state(pipeline: &Pipeline, job_id: JobId, file_index: u32) -> Par2DiscoveryState {
+    pipeline.par2_discovery_state_for_candidate(job_id, file_index)
+}
+
+#[tokio::test]
+async fn metadata_discovery_probes_several_volumes_of_one_posting_at_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30801);
+    install_six_volume_posting(&mut pipeline, job_id).await;
+
+    assert!(
+        pipeline.promote_par2_metadata(job_id),
+        "an unprobed posting has discovery work to put on the wire"
+    );
+    let queued = (0..6)
+        .filter(|file_index| {
+            matches!(
+                discovery_state(&pipeline, job_id, *file_index),
+                Par2DiscoveryState::PrefixProbeQueued
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued,
+        vec![0, 1, 2, 3],
+        "several prefix probes ride together instead of one per round trip"
+    );
+    let mut probed_files = drain_promoted_segments(&mut pipeline, job_id)
+        .into_iter()
+        .map(|segment_id| segment_id.file_id.file_index)
+        .collect::<Vec<_>>();
+    probed_files.sort_unstable();
+    assert_eq!(probed_files, vec![0, 1, 2, 3]);
+
+    assert!(
+        pipeline.promote_par2_metadata(job_id),
+        "outstanding probes keep discovery pending"
+    );
+    assert!(
+        drain_promoted_segments(&mut pipeline, job_id).is_empty(),
+        "nothing more is queued while the probes in flight are unanswered"
+    );
+}
+
+#[tokio::test]
+async fn sibling_volumes_that_probe_to_nothing_retire_the_rest_of_their_posting() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30802);
+    install_six_volume_posting(&mut pipeline, job_id).await;
+
+    assert!(pipeline.promote_par2_metadata(job_id));
+    let probes = drain_promoted_segments(&mut pipeline, job_id);
+    assert_eq!(probes.len(), 4);
+    for segment_id in probes {
+        pipeline.mark_promoted_recovery_segment_unavailable(segment_id);
+    }
+
+    assert!(
+        !pipeline.promote_par2_metadata(job_id),
+        "a posting whose probed volumes are all gone has nothing left to ask"
+    );
+    assert!(
+        drain_promoted_segments(&mut pipeline, job_id).is_empty(),
+        "the untouched volumes are retired, not probed one by one"
+    );
+    for file_index in 0..6 {
+        assert!(
+            matches!(
+                discovery_state(&pipeline, job_id, file_index),
+                Par2DiscoveryState::Exhausted { ref set_ids } if set_ids.is_empty()
+            ),
+            "volume {file_index} must be exhausted: {:?}",
+            discovery_state(&pipeline, job_id, file_index)
+        );
+    }
+    assert!(pipeline.par2_metadata_discovery_closed(job_id));
+}
+
+#[tokio::test]
+async fn a_posting_with_one_authenticated_sighting_is_never_retired() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30803);
+    install_six_volume_posting(&mut pipeline, job_id).await;
+
+    for file_index in 0..4 {
+        pipeline
+            .ensure_par2_runtime(job_id)
+            .files
+            .entry(file_index)
+            .or_default()
+            .discovery = Par2DiscoveryState::Exhausted {
+            set_ids: Vec::new(),
+        };
+    }
+    let set_id = minimal_par2_file_set().recovery_set_id;
+    observe_recovery_prefix(&mut pipeline, job_id, 5, set_id);
+
+    assert!(
+        pipeline.promote_par2_metadata(job_id),
+        "the authenticated volume selects its own carrier"
+    );
+    assert!(matches!(
+        discovery_state(&pipeline, job_id, 5),
+        Par2DiscoveryState::MetadataCarrierQueued {
+            target_set_id: Some(target),
+            ..
+        } if target == set_id
+    ));
+    assert_eq!(
+        discovery_state(&pipeline, job_id, 4),
+        Par2DiscoveryState::Unseen,
+        "four dead siblings do not retire a posting that has shown a set"
+    );
+    let carrier = drain_promoted_segments(&mut pipeline, job_id);
+    assert_eq!(carrier.len(), 1);
+    assert_eq!(carrier[0].file_id.file_index, 5);
+}
+
 #[tokio::test]
 async fn two_indexless_metadata_carriers_build_two_mixed_grid_sets() {
     let temp_dir = tempfile::tempdir().unwrap();

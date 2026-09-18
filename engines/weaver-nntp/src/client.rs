@@ -1276,7 +1276,16 @@ impl NntpClient {
 
         let mut exists = match self.stat_many_in_order(message_ids, order.clone()).await {
             Ok(results) => results,
-            Err(_) => {
+            Err(error) => {
+                // Why a batch could not settle is only knowable here; the
+                // caller sees a flag and would otherwise be left guessing
+                // between a wire fault and a connection it never got.
+                warn!(
+                    servers = ?order,
+                    batch_len = message_ids.len(),
+                    %error,
+                    "probe confirmation: STAT batch left the batch unverified"
+                );
                 return Some(ProbeBatchResult {
                     exists: vec![false; message_ids.len()],
                     inconclusive: true,
@@ -1323,7 +1332,13 @@ impl NntpClient {
                 // The refusal just happened on this batch; it has been recorded
                 // against the server and the next one is asked instead.
                 Err(NntpError::CommandNotRecognized) => {}
-                Err(_) => {
+                Err(error) => {
+                    warn!(
+                        server = idx,
+                        batch_len = batch.len(),
+                        %error,
+                        "probe confirmation: HEAD recheck left the batch unverified"
+                    );
                     return Some(ProbeBatchResult {
                         exists,
                         inconclusive: true,
