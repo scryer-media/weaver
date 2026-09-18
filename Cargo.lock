@@ -1692,7 +1692,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1827,7 +1827,7 @@ checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes 2.0.4",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2524,7 +2524,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2806,9 +2806,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.3.1"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb9ddb5508e387c70d89bb5c3014d8f1240bc0a766a5ced923a629ef8ca2573e"
+checksum = "120c989c4bfc4226cffbabbc6fbb4698e4a68d09f4939b1681fa7b8f73ee37de"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -3253,9 +3253,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.4"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e16a56eea8a1e753ce4a7f3c7aca2d850a28ae37096d8992421dcb2854b35416"
+checksum = "b445da3fea594f4e84d9508ba7082858e141faf00fa4288c687bb8c5594351aa"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -3640,7 +3640,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4031,7 +4031,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4099,7 +4099,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4380,9 +4380,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.23.1"
+version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2c2bd41caa32666ab1e123b13c011f2be4467fbfe90e592ad12cbb17d8fddd5"
+checksum = "75881e12a7898d350b5accf0faf44ba6e0b25de1b2bb8c1623b298a26afbe926"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -4916,10 +4916,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5623,7 +5623,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -5679,14 +5679,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "bytes",
  "criterion",
@@ -5714,7 +5714,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "quick-xml",
  "serde",
@@ -5725,7 +5725,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -5756,7 +5756,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -5826,7 +5826,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5845,7 +5845,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "cc",
  "crc-fast",
@@ -5956,7 +5956,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6279,7 +6279,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags 2.13.2",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

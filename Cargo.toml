@@ -14,7 +14,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.12.3"
+version = "0.12.4"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -76,8 +76,8 @@ filetime = { version = "0.2.29", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 zstd = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-sevenz-turbo = { version = "0.23.1", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
-lzma-turbo = { version = "0.3.1", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
+sevenz-turbo = { version = "0.23.2", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
+lzma-turbo = { version = "0.3.3", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd", "socks"] }
 semver = { version = "1.0", default-features = false, features = ["serde", "std"] }
 httpdate = { version = "1.0", default-features = false }
@@ -114,7 +114,7 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.10.3", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "0.10.5", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
