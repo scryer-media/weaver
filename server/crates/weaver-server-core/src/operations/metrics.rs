@@ -447,6 +447,18 @@ pub struct PipelineMetrics {
     pub hot_dispatch_last_expansion_kind: AtomicUsize,
     pub hot_dispatch_last_expansion_before_bps: AtomicU64,
     pub hot_dispatch_last_expansion_after_bps: AtomicU64,
+    /// Article-scheduler guard: the scheduler answered "nothing to hand out"
+    /// for a server while an eligible job still held an article that server
+    /// was allowed to fetch. The scheduler's own rule forbids that, so any
+    /// nonzero reading is a defect, not a tuning signal.
+    pub download_scheduler_idle_with_servable_total: AtomicU64,
+    /// Handouts the article scheduler made from the job it considers hot.
+    pub download_scheduler_handouts_total_hot: AtomicU64,
+    /// Handouts the article scheduler made from a job behind the hot one,
+    /// because the hot job could not serve the asking server.
+    pub download_scheduler_handouts_total_spill: AtomicU64,
+    /// Handouts made for a probe rather than for payload throughput.
+    pub download_scheduler_handouts_total_probe: AtomicU64,
     pub download_lanes_active: AtomicUsize,
     pub download_lanes_sequential_active: AtomicUsize,
     pub download_lanes_depth2_active: AtomicUsize,
@@ -607,6 +619,10 @@ impl PipelineMetrics {
             hot_dispatch_last_expansion_kind: AtomicUsize::new(0),
             hot_dispatch_last_expansion_before_bps: AtomicU64::new(0),
             hot_dispatch_last_expansion_after_bps: AtomicU64::new(0),
+            download_scheduler_idle_with_servable_total: AtomicU64::new(0),
+            download_scheduler_handouts_total_hot: AtomicU64::new(0),
+            download_scheduler_handouts_total_spill: AtomicU64::new(0),
+            download_scheduler_handouts_total_probe: AtomicU64::new(0),
             download_lanes_active: AtomicUsize::new(0),
             download_lanes_sequential_active: AtomicUsize::new(0),
             download_lanes_depth2_active: AtomicUsize::new(0),
@@ -928,6 +944,18 @@ impl PipelineMetrics {
             hot_dispatch_last_expansion_after_bps: self
                 .hot_dispatch_last_expansion_after_bps
                 .load(Ordering::Relaxed),
+            download_scheduler_idle_with_servable_total: self
+                .download_scheduler_idle_with_servable_total
+                .load(Ordering::Relaxed),
+            download_scheduler_handouts_total_hot: self
+                .download_scheduler_handouts_total_hot
+                .load(Ordering::Relaxed),
+            download_scheduler_handouts_total_spill: self
+                .download_scheduler_handouts_total_spill
+                .load(Ordering::Relaxed),
+            download_scheduler_handouts_total_probe: self
+                .download_scheduler_handouts_total_probe
+                .load(Ordering::Relaxed),
             download_lanes_active: self.download_lanes_active.load(Ordering::Relaxed),
             download_lanes_sequential_active: self
                 .download_lanes_sequential_active
@@ -1173,6 +1201,10 @@ pub struct MetricsSnapshot {
     pub hot_dispatch_last_expansion_kind: usize,
     pub hot_dispatch_last_expansion_before_bps: u64,
     pub hot_dispatch_last_expansion_after_bps: u64,
+    pub download_scheduler_idle_with_servable_total: u64,
+    pub download_scheduler_handouts_total_hot: u64,
+    pub download_scheduler_handouts_total_spill: u64,
+    pub download_scheduler_handouts_total_probe: u64,
     pub download_lanes_active: usize,
     pub download_lanes_sequential_active: usize,
     pub download_lanes_depth2_active: usize,

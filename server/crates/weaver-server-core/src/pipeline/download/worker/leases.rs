@@ -1,4 +1,64 @@
+use super::direct_store::DirectStoreAdmission;
+use super::pressure::CheckpointAdmission;
 use super::*;
+
+/// One sampled answer to "may this server fetch this article of this job?",
+/// reusable across a whole queue scan. Built by
+/// [`Pipeline::servable_work_filter`], which is the only place the clauses
+/// are written down.
+pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
+    server_idx: usize,
+    selection: DownloadWorkSelection,
+    require_recovery: Option<bool>,
+    match_groups: Option<Arc<[String]>>,
+    bootstrap_files: Option<&'a [u32]>,
+    uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
+    leased: &'a [DownloadWork],
+    direct_admission: Vec<DirectStoreAdmission>,
+    sweep_held: Option<Vec<u32>>,
+    checkpoint: CheckpointAdmission,
+    /// Set when at least one article was refused *only* by the restart
+    /// checkpoint, so a caller that came away empty can tell "held for the
+    /// checkpoint" from "nothing here for this server" and schedule the
+    /// recheck the checkpoint needs.
+    checkpoint_blocked: std::cell::Cell<bool>,
+}
+
+impl ServableWorkFilter<'_> {
+    pub(in crate::pipeline::download) fn allows(&self, work: &DownloadWork) -> bool {
+        self.require_recovery
+            .is_none_or(|is_recovery| work.is_recovery == is_recovery)
+            && self.direct_admission.iter().all(|set| set.allows(work))
+            && self
+                .sweep_held
+                .as_deref()
+                .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
+            && !work.exclude_servers.contains(&self.server_idx)
+            && work.avoid_server != Some(self.server_idx)
+            && self
+                .match_groups
+                .as_ref()
+                .is_none_or(|groups| Arc::ptr_eq(&work.groups, groups) || work.groups == *groups)
+            && self
+                .bootstrap_files
+                .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
+            && self.selection.matches(work)
+            && self
+                .uu_cursor_ordinals
+                .is_none_or(|cursors| Pipeline::uu_work_closes_cursor(cursors, work))
+            && {
+                let allowed = self.checkpoint.decision(work, self.leased).allows();
+                if !allowed {
+                    self.checkpoint_blocked.set(true);
+                }
+                allowed
+            }
+    }
+
+    pub(in crate::pipeline::download) fn checkpoint_blocked(&self) -> bool {
+        self.checkpoint_blocked.get()
+    }
+}
 
 impl Pipeline {
     /// Effective excludes for one lease: the segment's failure ledger plus job
@@ -106,7 +166,7 @@ impl Pipeline {
     /// present in the primary queue must publish its grid first. Indexless
     /// recovery discovery stays completion-bounded instead of turning every
     /// optional volume into a pre-download barrier.
-    pub(in crate::pipeline::download::worker) fn par2_metadata_bootstrap_files(
+    pub(in crate::pipeline::download) fn par2_metadata_bootstrap_files(
         &mut self,
         job_id: JobId,
     ) -> Option<Vec<u32>> {
@@ -146,7 +206,11 @@ impl Pipeline {
     }
 
     /// While bootstrap is active, lease only tracked explicit-index work.
-    fn par2_metadata_bootstrap_claims_work(&mut self, job_id: JobId, work: &DownloadWork) {
+    pub(in crate::pipeline::download) fn par2_metadata_bootstrap_claims_work(
+        &mut self,
+        job_id: JobId,
+        work: &DownloadWork,
+    ) {
         let file_index = work.segment_id.file_id.file_index;
         if !matches!(
             self.par2_discovery_state_for_candidate(job_id, file_index),
@@ -381,9 +445,7 @@ impl Pipeline {
         pressure: DownloadPressure,
     ) -> Result<Option<DownloadBatchLease>, DispatchAttempt> {
         let par2_metadata_bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
-        let uu_cursor_ordinals = pressure
-            .uu_spool_admission_capped
-            .then(|| self.uu_spool_cursor_ordinals());
+        let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
         let lane_mode = self.choose_download_lane_mode(
             job_id,
             compatibility.is_recovery,
@@ -550,41 +612,19 @@ impl Pipeline {
         require_recovery: Option<bool>,
         uu_cursor_ordinals: Option<&HashMap<NzbFileId, u32>>,
     ) -> Option<DownloadWork> {
-        let retention_excludes = self.job_retention_excludes(job_id);
-        if retention_excludes.contains(&server_idx) {
-            return None;
-        }
         let match_groups = matches!(rule, DownloadBatchRule::Refill { match_groups: true });
-        let groups = compatibility.groups.clone();
-        let direct_admission = self.direct_store_admission(job_id, &[]);
-        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
-        let checkpoint = self.checkpoint_admission(job_id);
-        let checkpoint_blocked = std::cell::Cell::new(false);
+        let filter = self.servable_work_filter(
+            job_id,
+            server_idx,
+            selection,
+            require_recovery,
+            match_groups.then(|| compatibility.groups.clone()),
+            bootstrap_files,
+            uu_cursor_ordinals,
+            &[],
+        )?;
         let result = self.jobs.get_mut(&job_id).and_then(|state| {
-            let matches = |work: &DownloadWork| {
-                require_recovery.is_none_or(|is_recovery| work.is_recovery == is_recovery)
-                    && direct_admission.iter().all(|set| set.allows(work))
-                    && sweep_held
-                        .as_deref()
-                        .is_none_or(|held| !held.contains(&work.segment_id.file_id.file_index))
-                    && !work.exclude_servers.contains(&server_idx)
-                    && work.avoid_server != Some(server_idx)
-                    && (!match_groups
-                        || std::sync::Arc::ptr_eq(&work.groups, &groups)
-                        || work.groups == groups)
-                    && bootstrap_files
-                        .is_none_or(|files| files.contains(&work.segment_id.file_id.file_index))
-                    && selection.matches(work)
-                    && uu_cursor_ordinals
-                        .is_none_or(|cursors| Self::uu_work_closes_cursor(cursors, work))
-                    && {
-                        let allowed = checkpoint.decision(work, &[]).allows();
-                        if !allowed {
-                            checkpoint_blocked.set(true);
-                        }
-                        allowed
-                    }
-            };
+            let matches = |work: &DownloadWork| filter.allows(work);
             match selection {
                 DownloadWorkSelection::Any => state.download_queue.pop_first_matching(matches),
                 DownloadWorkSelection::CompletionCritical => state
@@ -595,10 +635,74 @@ impl Pipeline {
                     .pop_first_matching_in_class(false, matches),
             }
         });
-        if result.is_none() && checkpoint_blocked.get() {
+        if result.is_none() && filter.checkpoint_blocked() {
             self.note_checkpoint_dispatch_block(job_id);
         }
         result
+    }
+
+    /// The single definition of "this server may fetch this queued article
+    /// right now", for one job.
+    ///
+    /// Both selection paths ask the same question, and they must not be able
+    /// to answer it differently: one of them pops work onto a live connection
+    /// and the other decides whether a connection should be given work at
+    /// all, so a drift between them shows up as either an idle link or an
+    /// article handed to a server that cannot serve it. Everything the answer
+    /// depends on — retention, per-set disk admission, a demotion sweep's
+    /// held files, the restart checkpoint, the PAR2 index bootstrap, the UU
+    /// spool cursor, the work's own exclusions and rotation hint — is sampled
+    /// once here, so a whole scan of a queue costs one sample rather than one
+    /// per article.
+    ///
+    /// `None` means retention already rules this server out for the whole
+    /// job; there is nothing to scan.
+    ///
+    /// `leased` is the work already taken in the batch being built, so the
+    /// byte-budget clauses (per-set disk admission and the restart
+    /// checkpoint's undurable lead) see the batch's own projection rather
+    /// than only what the actor has already committed.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::pipeline::download) fn servable_work_filter<'a>(
+        &mut self,
+        job_id: JobId,
+        server_idx: usize,
+        selection: DownloadWorkSelection,
+        require_recovery: Option<bool>,
+        match_groups: Option<Arc<[String]>>,
+        bootstrap_files: Option<&'a [u32]>,
+        uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
+        leased: &'a [DownloadWork],
+    ) -> Option<ServableWorkFilter<'a>> {
+        if self.job_retention_excludes(job_id).contains(&server_idx) {
+            return None;
+        }
+        Some(ServableWorkFilter {
+            server_idx,
+            selection,
+            require_recovery,
+            match_groups,
+            bootstrap_files,
+            uu_cursor_ordinals,
+            leased,
+            direct_admission: self.direct_store_admission(job_id, leased),
+            sweep_held: self.demotion_sweep_held_file_indices(job_id),
+            checkpoint: self.checkpoint_admission(job_id),
+            checkpoint_blocked: std::cell::Cell::new(false),
+        })
+    }
+
+    /// The UU spool cursors a selection pass must respect, sampled once.
+    ///
+    /// Only a capped spool constrains selection; below the cap every encoding
+    /// dispatches freely and the map is not worth building.
+    pub(in crate::pipeline::download) fn selection_uu_cursor_ordinals(
+        &self,
+        pressure: DownloadPressure,
+    ) -> Option<HashMap<NzbFileId, u32>> {
+        pressure
+            .uu_spool_admission_capped
+            .then(|| self.uu_spool_cursor_ordinals())
     }
 
     pub(in crate::pipeline::download::worker) fn try_lease_ip_replacement_trial_batch(

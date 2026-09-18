@@ -45,7 +45,7 @@ enum CriticalDispatchPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DownloadWorkSelection {
+pub(in crate::pipeline::download) enum DownloadWorkSelection {
     Any,
     CompletionCritical,
     NonCritical,

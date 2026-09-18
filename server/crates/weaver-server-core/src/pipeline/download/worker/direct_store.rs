@@ -1,13 +1,13 @@
 use super::*;
 
-pub(super) struct DirectStoreAdmission {
+pub(in crate::pipeline::download) struct DirectStoreAdmission {
     files: HashSet<u32>,
     available: u64,
     probe: Option<SegmentId>,
 }
 
 impl DirectStoreAdmission {
-    pub(super) fn allows(&self, work: &DownloadWork) -> bool {
+    pub(in crate::pipeline::download) fn allows(&self, work: &DownloadWork) -> bool {
         !self.files.contains(&work.segment_id.file_id.file_index)
             || work.byte_estimate as u64 <= self.available
             || self.probe == Some(work.segment_id)
