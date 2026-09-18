@@ -8,7 +8,8 @@ pub struct ServerConnectivityResult {
     pub message: String,
     pub latency_ms: Option<u64>,
     /// Command-to-status-line round trip on the established session, which is
-    /// what BODY pipelining actually has to hide. `latency_ms` above is the
+    /// what BODY pipelining actually has to hide. Taken from the CAPABILITIES
+    /// exchange setup already sends; no extra command is issued for it. `latency_ms` above is the
     /// whole connect — TCP, TLS and authentication — and is far larger.
     pub first_byte_latency_ms: Option<u64>,
     /// "good", "moderate" or "slow" for `first_byte_latency_ms`. Descriptive
@@ -19,9 +20,8 @@ pub struct ServerConnectivityResult {
     /// IANA name of the TLS suite negotiated with weaver's CPU-preferred
     /// cipher family offered first; `None` for plaintext or failed probes.
     pub tls_cipher_suite: Option<String>,
-    /// Whether a second handshake offering the opposite family first
-    /// landed on a different suite, i.e. the server follows client order.
-    /// `None` when the second handshake could not be completed.
+    /// Whether the negotiated suite is the family weaver offered first, i.e.
+    /// the server follows client order. `None` for plaintext or failed probes.
     pub tls_honors_client_cipher_order: Option<bool>,
 }
 
@@ -33,34 +33,12 @@ pub async fn probe_server_connection_with_proxy(
     config: &ServerConfig,
     proxy: Option<std::sync::Arc<weaver_tunnel::bridge::Bridge>>,
 ) -> ServerConnectivityResult {
-    // Inspect an unadopted TLS server before the ordinary NNTP probe. A trusted
-    // hostname mismatch stops here, before any greeting or credentials are
-    // exchanged, and the first handshake supplies the exact candidate shown in
-    // the server form.
-    if config.tls
-        && config.tls_name_mismatch_certificate_der.is_none()
-        && let Ok(Some(certificate_der)) =
-            weaver_nntp::tls::inspect_tls_name_mismatch_certificate_via(
-                &config.host,
-                config.port,
-                config.tls_ca_cert.as_deref(),
-                proxy.as_ref(),
-            )
-            .await
-    {
-        return ServerConnectivityResult {
-            success: false,
-            message: "We reached the server securely, but its certificate belongs to a different hostname. Review the certificate below only if you recognise this provider.".to_string(),
-            latency_ms: None,
-            first_byte_latency_ms: None,
-            first_byte_latency_band: None,
-            supports_pipelining: false,
-            adoptable_tls_name_mismatch_certificate_der: Some(certificate_der),
-            tls_cipher_suite: None,
-            tls_honors_client_cipher_order: None,
-        };
-    }
-
+    // Every check happens on the one real connection. Its handshake verifies
+    // the certificate against the hostname, so a mismatch fails there, before
+    // any greeting or credentials are exchanged; only then is the presented
+    // certificate captured for the server form to offer. Nothing else dials:
+    // on a distant server each extra handshake or command is a full round
+    // trip, and a seeded server's probe must finish inside a fixed deadline.
     let nntp_config = weaver_nntp::ServerConfig {
         proxy: proxy.clone(),
         host: config.host.clone(),
@@ -79,12 +57,14 @@ pub async fn probe_server_connection_with_proxy(
             let latency = start.elapsed().as_millis() as u64;
             let pipelining = conn.capabilities().supports_pipelining();
             let tls_cipher_suite = conn.negotiated_cipher_suite();
-            let first_byte_latency = measure_first_byte_latency(&mut conn).await;
+            // Distance comes from the CAPABILITIES exchange setup already made.
+            let first_byte_latency = conn.capabilities_round_trip();
             let _ = conn.quit().await;
-            let tls_honors_client_cipher_order = match tls_cipher_suite.as_deref() {
-                Some(suite) => probe_cipher_order_honoured(&nntp_config, suite, pipelining).await,
-                None => None,
-            };
+            // The handshake already answered this: the server either picked the
+            // family this client offered first or overrode it.
+            let tls_honors_client_cipher_order = tls_cipher_suite
+                .as_deref()
+                .map(|suite| nntp_config.tls_cipher_preference.leads_with(suite));
             ServerConnectivityResult {
                 success: true,
                 message: "Connected successfully".to_string(),
@@ -112,9 +92,14 @@ pub async fn probe_server_connection_with_proxy(
             } else {
                 None
             };
+            let message = if adoptable_tls_name_mismatch_certificate_der.is_some() {
+                "We reached the server securely, but its certificate belongs to a different hostname. Review the certificate below only if you recognise this provider.".to_string()
+            } else {
+                user_facing_connection_error(&error)
+            };
             ServerConnectivityResult {
                 success: false,
-                message: user_facing_connection_error(&error),
+                message,
                 latency_ms: None,
                 first_byte_latency_ms: None,
                 first_byte_latency_band: None,
@@ -127,52 +112,10 @@ pub async fn probe_server_connection_with_proxy(
     }
 }
 
-/// Time the command-to-status-line round trip on a session that is already
-/// open, using the cheapest single-line command there is. This is the distance
-/// figure the download lanes work against, so the operator sees the same number
-/// the depth explorer does rather than a connect time dominated by TLS.
-///
-/// The best of a few tries is taken: a scheduler hiccup or a coalesced ACK can
-/// only inflate a sample, never shorten one below the real round trip.
-async fn measure_first_byte_latency(conn: &mut weaver_nntp::NntpConnection) -> Option<Duration> {
-    const PROBES: usize = 3;
-    let mut best: Option<Duration> = None;
-    for _ in 0..PROBES {
-        let started = std::time::Instant::now();
-        if conn.ping().await.is_err() {
-            break;
-        }
-        let sample = started.elapsed();
-        best = Some(best.map_or(sample, |best: Duration| best.min(sample)));
-    }
-    best
-}
-
 /// Descriptive label for a first-byte latency, on the same thresholds the
 /// download depth explorer uses.
 fn latency_band_label(latency: Duration) -> &'static str {
     crate::pipeline::download::transport::LatencyBand::from_latency(latency).label()
-}
-
-/// Reconnect once offering the opposite AEAD family first. A server that
-/// follows the client's order then lands on a different suite; a server
-/// with a fixed order of its own answers with the same suite again. The
-/// answer is recorded so the operator can see whether the CPU-derived
-/// preference actually decides which suite carries this server's traffic.
-async fn probe_cipher_order_honoured(
-    base: &weaver_nntp::ServerConfig,
-    negotiated: &str,
-    supports_pipelining: bool,
-) -> Option<bool> {
-    let config = weaver_nntp::ServerConfig {
-        tls_cipher_preference: weaver_nntp::TlsCipherPreference::opposing(negotiated),
-        pipelining: weaver_nntp::PipeliningCapability::Known(supports_pipelining),
-        ..base.clone()
-    };
-    let mut conn = weaver_nntp::NntpConnection::connect(&config).await.ok()?;
-    let opposing = conn.negotiated_cipher_suite();
-    let _ = conn.quit().await;
-    opposing.map(|suite| suite != negotiated)
 }
 
 fn user_facing_connection_error(error: &weaver_nntp::NntpError) -> String {
