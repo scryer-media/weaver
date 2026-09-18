@@ -366,7 +366,7 @@ fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
 ///
 /// The one arrangement still left out is STARTTLS, whose in-band upgrade the
 /// blocking transport does not implement.
-fn supports_blocking_body_lane(config: &ServerConfig) -> bool {
+pub(crate) fn supports_blocking_body_lane(config: &ServerConfig) -> bool {
     if config.starttls {
         return false;
     }
@@ -2908,6 +2908,11 @@ impl NntpClient {
 
     fn map_acquire_timeout(&self, error: NntpError) -> NntpError {
         match error {
+            // Zero is the pool reporting that it never waited: the deadline was
+            // already spent, or every connection belongs to a busy download
+            // lane. Restamping it with the soft timeout would claim a wait that
+            // never happened and hide the difference from whoever reads the log.
+            NntpError::AcquireTimeout(0) => NntpError::AcquireTimeout(0),
             NntpError::AcquireTimeout(_) => self.acquire_timeout_error(),
             other => other,
         }

@@ -1145,6 +1145,11 @@ fn acquire_timeout_is_capacity_not_transport() {
         NntpError::AcquireTimeout(15).to_string(),
         "no connection available within 15s"
     );
+    // Zero is not a duration: it is the pool declining to wait at all.
+    assert_eq!(
+        NntpError::AcquireTimeout(0).to_string(),
+        "no connection available; did not wait"
+    );
 }
 
 #[test]
