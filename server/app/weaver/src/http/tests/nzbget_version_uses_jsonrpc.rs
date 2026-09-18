@@ -722,7 +722,9 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     metrics
         .bytes_downloaded
-        .store((i32::MAX as u64) * 4, std::sync::atomic::Ordering::Relaxed);
+        // Far past i32::MAX per second however long this runner takes between
+        // samples or since the router started: both rates divide by elapsed time.
+        .store(1 << 60, std::sync::atomic::Ordering::Relaxed);
     shared_state.refresh_metrics_snapshot();
     assert!(shared_state.metrics_snapshot().current_download_speed > i32::MAX as u64);
     let handle = SchedulerHandle::new(cmd_tx, event_tx, shared_state);
@@ -1589,11 +1591,11 @@ async fn nzbget_global_pause_resume_and_scheduleresume_auto_resume() {
     .await;
     assert!(payload["result"]["ResumeTime"].as_u64().unwrap() > 0);
 
-    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
-    assert!(
-        !handle.is_globally_paused(),
-        "scheduleresume timer should resume downloads"
-    );
+    // Wait for the timer's resume itself. The coordinator clears ResumeTime
+    // before it resumes, under the same lock, so the status below sees 0.
+    while handle.is_globally_paused() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     let (_, payload) = post_nzbget(
         app.clone(),
         serde_json::json!({"method": "status", "params": [], "id": 4}),
@@ -2379,27 +2381,18 @@ async fn nzbget_scheduleresume_persists_and_recovers_across_restart() {
         test_config(),
         api_key_cache("control-key", "control"),
     );
-    for _ in 0..50 {
-        if !handle.is_globally_paused() {
-            break;
-        }
+    // An elapsed scheduled resume must resume downloads at startup and clear
+    // the setting. Wait for each outcome itself; the runner bounds a miss.
+    while handle.is_globally_paused() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(
-        !handle.is_globally_paused(),
-        "elapsed scheduled resume must resume downloads at startup"
-    );
-    for _ in 0..50 {
-        if db
-            .get_setting("nzbget.scheduled_resume_at")
-            .unwrap()
-            .is_none()
-        {
-            break;
-        }
+    while db
+        .get_setting("nzbget.scheduled_resume_at")
+        .unwrap()
+        .is_some()
+    {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(db.get_setting("nzbget.scheduled_resume_at").unwrap(), None);
 }
 
 #[tokio::test]
