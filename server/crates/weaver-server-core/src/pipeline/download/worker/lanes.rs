@@ -678,32 +678,6 @@ impl Pipeline {
         self.shared_state.server_probe_latency(stable_id.0)
     }
 
-    /// Whether this lease can run on an owned blocking lane.
-    ///
-    /// Every class of work does, recovery included. Holding PAR2 recovery back
-    /// on the async path made it the only consumer of a connection permit that
-    /// idle owned lanes were sitting on, so each recovery lease had to prise a
-    /// permit loose and open a fresh socket — greeting and authentication and,
-    /// on TLS, a handshake — for work that is by definition on the critical
-    /// path of finishing a job.
-    ///
-    /// A contended answer counts as yes. Only a definitive "no eligible
-    /// server" may send a lease to the asynchronous path: a momentary
-    /// collision on the shared health state is not a statement about the
-    /// servers, and demoting on it put the lease in a queue for the same
-    /// connection permits the idle owned lanes hold — where it waited out the
-    /// client's whole acquire deadline before failing.
-    pub(in crate::pipeline) fn should_use_owned_blocking_lane(
-        &self,
-        lease: &DownloadBatchLease,
-    ) -> bool {
-        !matches!(
-            self.nntp
-                .blocking_body_lane_candidacy(&lease.dial_exclude_servers),
-            weaver_nntp::client::BlockingBodyLaneCandidacy::None
-        )
-    }
-
     pub(in crate::pipeline::download::worker) fn reconcile_rate_limit_for_download(
         &mut self,
         segment_id: SegmentId,
@@ -733,22 +707,35 @@ impl Pipeline {
 
     pub(in crate::pipeline) fn reset_owned_download_lanes(&mut self) {
         for lease in self.owned_download_lane_pool.reset() {
-            for work in lease.works {
-                if !self.accept_lane_work(lease.lane_id, work.segment_id) {
-                    continue;
-                }
-                self.restore_owned_lane_unrequested_work(lease.lane_id, work);
-            }
-            self.handle_download_lane_parked(DownloadLaneParked {
-                lane_id: lease.lane_id,
-                job_id: lease.job_id,
-                mode: lease.lane_mode,
-                completion_critical: lease.completion_critical,
-                reason: LaneParkReason::Error,
-                release_connection_slot: true,
-                release_ip_replacement_burst: false,
-            });
+            self.restore_stopped_owned_lane_lease(lease);
         }
+    }
+
+    /// Hand a lease the lane pool will not run back to the scheduler.
+    ///
+    /// The pool stops on a runtime reset and on shutdown, neither of which is
+    /// an answer about the articles, so nothing here is reported as a download
+    /// failure: the works return to the queue and the lane parks on the error
+    /// reason so the dispatcher stops counting it as live.
+    pub(in crate::pipeline::download::worker) fn restore_stopped_owned_lane_lease(
+        &mut self,
+        lease: DownloadBatchLease,
+    ) {
+        for work in lease.works {
+            if !self.accept_lane_work(lease.lane_id, work.segment_id) {
+                continue;
+            }
+            self.restore_owned_lane_unrequested_work(lease.lane_id, work);
+        }
+        self.handle_download_lane_parked(DownloadLaneParked {
+            lane_id: lease.lane_id,
+            job_id: lease.job_id,
+            mode: lease.lane_mode,
+            completion_critical: lease.completion_critical,
+            reason: LaneParkReason::Error,
+            release_connection_slot: true,
+            release_ip_replacement_burst: false,
+        });
     }
 
     pub(crate) fn handle_owned_download_lane_event(
@@ -801,17 +788,94 @@ impl Pipeline {
                     });
                     return;
                 }
+                // There is nothing left to demote to: the owned lanes are the
+                // download engine. A refusal that is not "ask again shortly"
+                // is the answer these articles get, so each one takes the
+                // failure and the normal result path decides whether to retry
+                // it elsewhere.
                 debug!(
                     job_id = lease.job_id.0,
                     works = lease.works.len(),
                     error = %error,
-                    "owned blocking lane unavailable; falling back to async download lane"
+                    "owned blocking lane unavailable; failing the leased articles"
                 );
                 crate::runtime::perf_probe::record_value(
-                    "download.owned_lane.acquire_failed_fallback",
+                    "download.owned_lane.acquire_failed_lease_failed",
                     1,
                 );
-                self.spawn_async_download_batch(lease);
+                let failure = DownloadFailure::from_lane_acquire_failure(error.nntp_error());
+                let policy_blocked = failure.kind == DownloadFailureKind::ServerQuota;
+                let DownloadBatchLease {
+                    lane_id,
+                    job_id,
+                    runtime_generation,
+                    lane_mode,
+                    completion_critical,
+                    works,
+                    ..
+                } = lease;
+                for (work_index, work) in works.into_iter().enumerate() {
+                    // Only the first article met the server; the rest of the
+                    // lease was never asked for, and a quota refusal must not
+                    // be charged to all of them.
+                    let work_failure =
+                        super::spawn::lane_acquire_failure_for_work(&failure, work_index);
+                    let policy_outcome = matches!(
+                        work_failure.kind,
+                        DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
+                    );
+                    let result = DownloadResult {
+                        lane_id,
+                        job_id,
+                        segment_id: work.segment_id,
+                        runtime_generation,
+                        data: Err(DownloadError::Fetch(work_failure)),
+                        attempts: Vec::new(),
+                        lane_observation: Some(DownloadLaneObservation {
+                            server_idx: None,
+                            mode: lane_mode,
+                            supports_pipelining: false,
+                            latency: None,
+                            transfer: None,
+                            payload_bytes: 0,
+                            policy_elapsed: Duration::ZERO,
+                            pressure_clear: false,
+                            batch_complete: true,
+                            batch_clean: policy_outcome,
+                            unresolved_count: u64::from(!policy_outcome),
+                            connection_discarded: false,
+                        }),
+                        source_server_idx: None,
+                        origin: DownloadResultOrigin::from_work(
+                            work.is_recovery,
+                            work.completion_critical,
+                        ),
+                        retry_count: work.retry_count,
+                        exclude_servers: work.exclude_servers.clone(),
+                        release_connection_slot: false,
+                    };
+                    if !self.release_download_result(&result) {
+                        continue;
+                    }
+                    self.note_released_download_result_pending(
+                        result.job_id,
+                        Self::released_download_result_lead_bytes(&result),
+                    );
+                    pending.push_back(result);
+                }
+                self.handle_download_lane_parked(DownloadLaneParked {
+                    lane_id,
+                    job_id,
+                    mode: lane_mode,
+                    completion_critical,
+                    reason: if policy_blocked {
+                        LaneParkReason::ServerQuota
+                    } else {
+                        LaneParkReason::Error
+                    },
+                    release_connection_slot: true,
+                    release_ip_replacement_burst: false,
+                });
             }
             OwnedDownloadLaneEvent::BatchComplete {
                 lane_id,

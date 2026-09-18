@@ -3,7 +3,7 @@
 use super::*;
 
 #[tokio::test]
-async fn owned_download_lane_capacity_failure_requeues_without_async_fallback() {
+async fn owned_download_lane_capacity_failure_requeues_without_failing_the_articles() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20026);
@@ -86,11 +86,11 @@ async fn owned_download_lane_capacity_failure_requeues_without_async_fallback() 
 }
 
 /// Health-mutex contention is not a tiering verdict. Before it had its own
-/// variant it arrived as `NoEligibleServer`, which sends the lease down the
-/// async-fallback arm and resets the owned lane pool — churning a healthy
-/// cached TLS lane over a microsecond-long lock collision.
+/// variant it arrived as `NoEligibleServer`, which fails every leased article
+/// and resets the owned lane pool — churning a healthy cached TLS lane over a
+/// microsecond-long lock collision.
 #[tokio::test]
-async fn owned_download_lane_selection_contention_requeues_without_async_fallback() {
+async fn owned_download_lane_selection_contention_requeues_without_failing_the_articles() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20027);
@@ -147,7 +147,7 @@ async fn owned_download_lane_selection_contention_requeues_without_async_fallbac
 
     assert!(
         pending.is_empty(),
-        "contention must not spawn an async fallback batch"
+        "contention must not resolve any of the leased articles"
     );
     assert_eq!(pipeline.active_downloads, 0);
     assert_eq!(pipeline.active_download_connections, 0);

@@ -131,16 +131,6 @@ impl JobLogThrottle {
 /// opens, long enough that ordinary refill gaps between batches say nothing.
 const DOWNLOAD_LANES_UNDER_CAP_WINDOW: Duration = Duration::from_secs(5);
 const DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
-// Short debounce before the first spillover lane opens: this is slowness
-// DETECTION, not easing. A hot job hitting a brief refill hiccup should not
-// spray a lane onto another job for the few hundred milliseconds it takes to
-// recover; a genuinely idle or capacity-starved hot job clears this window
-// almost immediately and spillover engages at full speed from there.
-/// At most this many distinct non-hot jobs may hold a spillover loan at once.
-/// Lanes concentrate on the jobs already holding a loan before a new job is
-/// admitted, so spillover deepens a small number of jobs instead of fanning
-/// out across the whole queue.
-const LANE_REFILL_GRACE: Duration = Duration::from_millis(5);
 const IP_REPLACEMENT_MIN_OLD_SAMPLES: u16 = 16;
 const IP_REPLACEMENT_MIN_OLD_AGE: Duration = Duration::from_secs(30);
 const IP_REPLACEMENT_BASELINE_MIN_SAMPLES: u16 = 8;

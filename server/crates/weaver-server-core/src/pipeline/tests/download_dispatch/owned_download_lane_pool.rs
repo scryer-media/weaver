@@ -862,13 +862,20 @@ async fn a_recovery_lease_takes_an_owned_lane() {
     };
 
     assert!(
-        pipeline.should_use_owned_blocking_lane(&lease),
+        pipeline
+            .nntp
+            .has_blocking_body_lane_candidate(&lease.dial_exclude_servers),
         "a recovery lease must be eligible for a cached owned lane"
     );
 }
 
+/// Dispatching recovery must never tear the lane fleet down.
+///
+/// Recovery once came off a separate engine and had to prise a connection
+/// permit away from the idle owned lanes to get one; a lease that resets the
+/// fleet throws away every warm connection the job is about to need.
 #[tokio::test]
-async fn recovery_async_handoff_keeps_owned_lane_caches() {
+async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let work = DownloadWork {
@@ -908,7 +915,7 @@ async fn recovery_async_handoff_keeps_owned_lane_caches() {
     assert_eq!(
         pipeline.owned_download_lane_pool.reset_calls(),
         0,
-        "async-only recovery reclaims idle owned permits per starved server instead of resetting the owned fleet"
+        "a recovery lease is dispatched onto the owned lanes without resetting them"
     );
 }
 
