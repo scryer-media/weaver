@@ -54,6 +54,19 @@ pub(crate) fn spawn_heartbeat_task() -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// Logs the high-water resident set size for this run, once.
+///
+/// The last heartbeat can be up to a full interval old by the time a shutdown
+/// completes, so this takes one more sample first: a spike in the final
+/// minute would otherwise never be recorded anywhere.
+pub(crate) fn log_peak_rss() {
+    let _ = sample_and_record_rss();
+    let peak = peak_rss_bytes();
+    if peak > 0 {
+        info!(rss_peak_bytes = peak, "weaver peak memory at shutdown");
+    }
+}
+
 /// The highest resident set size recorded so far, in bytes. Zero means no
 /// sample has ever succeeded on this platform.
 fn peak_rss_bytes() -> u64 {

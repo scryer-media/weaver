@@ -560,6 +560,10 @@ pub(crate) async fn run(
     server_transfer_maintenance.abort();
     wiring::flush_server_transfer_usage(Arc::clone(&server_transfer_policy), stop.flush_context())
         .await;
+    // The last thing an orderly run says about itself: how much memory it ever
+    // held. A run that ended on purpose and one that was killed for its size
+    // are only distinguishable if the orderly one leaves this behind.
+    heartbeat::log_peak_rss();
 
     match stop {
         ServeStop::Signal => Ok(()),
