@@ -340,15 +340,21 @@ func runExclusiveFunctionalJob(
 		}
 		log.Printf("  %s: primary NNTP chaos enabled: %s", job.slug, config)
 	}
-	if backupGateFilename != "" {
+	backupGateForJob := job.scenario.BackupUnavailableUntilJobTerminal
+	if backupGateFilename != "" && backupGateForJob {
+		job.status = "setup_error"
+		job.errMsg = "backupUnavailableUntilFileComplete and backupUnavailableUntilJobTerminal are mutually exclusive"
+		return
+	}
+	if backupGateFilename != "" && len(job.scenario.PrimaryDeleteSubjectContains) == 0 {
+		job.status = "setup_error"
+		job.errMsg = "backup-unavailable gate requires primaryDeleteSubjectContains"
+		return
+	}
+	if backupGateFilename != "" || backupGateForJob {
 		if !backupNntpRunning() {
 			job.status = "setup_error"
 			job.errMsg = "backup-unavailable gate requires the backup NNTP server"
-			return
-		}
-		if len(job.scenario.PrimaryDeleteSubjectContains) == 0 {
-			job.status = "setup_error"
-			job.errMsg = "backup-unavailable gate requires primaryDeleteSubjectContains"
 			return
 		}
 		// Refuse new sessions and make any pooled session re-authenticate on
@@ -364,7 +370,12 @@ func runExclusiveFunctionalJob(
 			return
 		}
 		releaseBackupGate = release
-		log.Printf("  %s: backup NNTP unavailable until %s completes", job.slug, backupGateFilename)
+		if backupGateForJob {
+			// Released by the deferred cleanup once the job is terminal.
+			log.Printf("  %s: backup NNTP unavailable for the whole job", job.slug)
+		} else {
+			log.Printf("  %s: backup NNTP unavailable until %s completes", job.slug, backupGateFilename)
+		}
 	}
 
 	jobID, err := submitOneNZB(weaverURL, job.scenario)

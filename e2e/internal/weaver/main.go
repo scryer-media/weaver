@@ -32,37 +32,42 @@ import (
 
 // Scenario is the JSON manifest for a pre-built test fixture.
 type Scenario struct {
-	Slug                               string                     `json:"slug"`
-	Title                              string                     `json:"title"`
-	Description                        string                     `json:"description"`
-	Category                           string                     `json:"category"`
-	ExpectedOutcome                    string                     `json:"expected_outcome"`
-	Password                           string                     `json:"password,omitempty"`
-	SegmentSize                        int                        `json:"segment_size,omitempty"`
-	NZBSegmentNumbers                  []int                      `json:"nzb_segment_numbers,omitempty"`
-	NZBSegmentNumberStart              int                        `json:"nzb_segment_number_start,omitempty"`
-	NZBSegmentNumberStep               int                        `json:"nzb_segment_number_step,omitempty"`
-	NZBSubjectFilenameOverrides        map[string]string          `json:"nzb_subject_filename_overrides,omitempty"`
-	SkipArticlesPct                    int                        `json:"skip_articles_pct,omitempty"`
-	DeleteFirstMessageIDs              int                        `json:"deleteFirstMessageIDs,omitempty"`
-	DeleteFirstProbeSampleHits         int                        `json:"deleteFirstProbeSampleHits,omitempty"`
-	PrimaryDeleteFirstMessageIDs       int                        `json:"primaryDeleteFirstMessageIDs,omitempty"`
-	SharedAssets                       []string                   `json:"sharedAssets,omitempty"`
-	FixtureAssets                      []string                   `json:"fixtureAssets,omitempty"`
-	BackupFixtureAssets                []string                   `json:"backupFixtureAssets,omitempty"`
-	DeleteSubjectContains              []string                   `json:"deleteSubjectContains,omitempty"`
-	DeleteSubjectTailArticles          int                        `json:"deleteSubjectTailArticles,omitempty"`
-	DeleteSegmentNumbers               []int                      `json:"deleteSegmentNumbers,omitempty"`
-	DeleteSegmentSubjectContains       []string                   `json:"deleteSegmentSubjectContains,omitempty"`
-	PrimaryDeleteSubjectContains       []string                   `json:"primaryDeleteSubjectContains,omitempty"`
-	PrimaryChaosConfig                 string                     `json:"primaryChaosConfig,omitempty"`
-	BackupUnavailableUntilFileComplete string                     `json:"backupUnavailableUntilFileComplete,omitempty"`
-	RequiredJobEvents                  []string                   `json:"requiredJobEvents,omitempty"`
-	ForbiddenJobEvents                 []string                   `json:"forbiddenJobEvents,omitempty"`
-	MaxJobEventCounts                  map[string]int             `json:"maxJobEventCounts,omitempty"`
-	ExpectedOutputBLAKE3               map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
-	ForbiddenOutputPaths               []string                   `json:"forbiddenOutputPaths,omitempty"`
-	RuntimeAssertions                  *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
+	Slug                               string            `json:"slug"`
+	Title                              string            `json:"title"`
+	Description                        string            `json:"description"`
+	Category                           string            `json:"category"`
+	ExpectedOutcome                    string            `json:"expected_outcome"`
+	Password                           string            `json:"password,omitempty"`
+	SegmentSize                        int               `json:"segment_size,omitempty"`
+	NZBSegmentNumbers                  []int             `json:"nzb_segment_numbers,omitempty"`
+	NZBSegmentNumberStart              int               `json:"nzb_segment_number_start,omitempty"`
+	NZBSegmentNumberStep               int               `json:"nzb_segment_number_step,omitempty"`
+	NZBSubjectFilenameOverrides        map[string]string `json:"nzb_subject_filename_overrides,omitempty"`
+	SkipArticlesPct                    int               `json:"skip_articles_pct,omitempty"`
+	DeleteFirstMessageIDs              int               `json:"deleteFirstMessageIDs,omitempty"`
+	DeleteFirstProbeSampleHits         int               `json:"deleteFirstProbeSampleHits,omitempty"`
+	PrimaryDeleteFirstMessageIDs       int               `json:"primaryDeleteFirstMessageIDs,omitempty"`
+	SharedAssets                       []string          `json:"sharedAssets,omitempty"`
+	FixtureAssets                      []string          `json:"fixtureAssets,omitempty"`
+	BackupFixtureAssets                []string          `json:"backupFixtureAssets,omitempty"`
+	DeleteSubjectContains              []string          `json:"deleteSubjectContains,omitempty"`
+	DeleteSubjectTailArticles          int               `json:"deleteSubjectTailArticles,omitempty"`
+	DeleteSegmentNumbers               []int             `json:"deleteSegmentNumbers,omitempty"`
+	DeleteSegmentSubjectContains       []string          `json:"deleteSegmentSubjectContains,omitempty"`
+	PrimaryDeleteSubjectContains       []string          `json:"primaryDeleteSubjectContains,omitempty"`
+	PrimaryChaosConfig                 string            `json:"primaryChaosConfig,omitempty"`
+	BackupUnavailableUntilFileComplete string            `json:"backupUnavailableUntilFileComplete,omitempty"`
+	// BackupUnavailableUntilJobTerminal refuses the backup NNTP server for
+	// the whole job, so a fixture whose outcome depends on the primary copy
+	// alone cannot be satisfied by the backup taking the first fetch when the
+	// primary is out of seats. The gate lifts once the job is terminal.
+	BackupUnavailableUntilJobTerminal bool                       `json:"backupUnavailableUntilJobTerminal,omitempty"`
+	RequiredJobEvents                 []string                   `json:"requiredJobEvents,omitempty"`
+	ForbiddenJobEvents                []string                   `json:"forbiddenJobEvents,omitempty"`
+	MaxJobEventCounts                 map[string]int             `json:"maxJobEventCounts,omitempty"`
+	ExpectedOutputBLAKE3              map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
+	ForbiddenOutputPaths              []string                   `json:"forbiddenOutputPaths,omitempty"`
+	RuntimeAssertions                 *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
 	// Disabled keeps a fixture in the corpus, seeded and verified, while the
 	// canonical runs leave it out. The value says why: the behavior it pins is
 	// one weaver does not deliver yet.

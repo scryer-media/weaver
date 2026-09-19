@@ -328,7 +328,8 @@ func scenarioNeedsBackupServerState(scenario *Scenario) bool {
 		scenario.PrimaryDeleteFirstMessageIDs > 0 ||
 		len(scenario.PrimaryDeleteSubjectContains) > 0 ||
 		strings.TrimSpace(scenario.PrimaryChaosConfig) != "" ||
-		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != ""
+		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != "" ||
+		scenario.BackupUnavailableUntilJobTerminal
 }
 
 // segmentDeleteNeedles narrows which files the segment-number deletion may
@@ -350,6 +351,7 @@ func segmentDeleteNeedles(scenario *Scenario) []string {
 func scenarioUsesExclusiveNntpState(scenario *Scenario) bool {
 	return scenario != nil && (strings.TrimSpace(scenario.PrimaryChaosConfig) != "" ||
 		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != "" ||
+		scenario.BackupUnavailableUntilJobTerminal ||
 		scenario.queueLivenessAssertion() != nil)
 }
 

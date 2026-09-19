@@ -48,6 +48,9 @@ func TestScenarioNeedsBackupServerState(t *testing.T) {
 	if !scenarioNeedsBackupServerState(&Scenario{BackupUnavailableUntilFileComplete: "payload.mkv"}) {
 		t.Fatal("backup availability gate should require backup state")
 	}
+	if !scenarioNeedsBackupServerState(&Scenario{BackupUnavailableUntilJobTerminal: true}) {
+		t.Fatal("whole-job backup gate should require backup state")
+	}
 	if !scenarioNeedsBackupServerState(&Scenario{BackupFixtureAssets: []string{"single-mkv/test-media.mkv"}}) {
 		t.Fatal("backup fixture override should require backup state")
 	}
@@ -62,6 +65,9 @@ func TestScenarioUsesExclusiveNntpState(t *testing.T) {
 	}
 	if !scenarioUsesExclusiveNntpState(&Scenario{BackupUnavailableUntilFileComplete: "payload.mkv"}) {
 		t.Fatal("backup availability gate should force exclusive NNTP state")
+	}
+	if !scenarioUsesExclusiveNntpState(&Scenario{BackupUnavailableUntilJobTerminal: true}) {
+		t.Fatal("whole-job backup gate should force exclusive NNTP state")
 	}
 	if !scenarioUsesExclusiveNntpState(&Scenario{
 		RuntimeAssertions: &ScenarioRuntimeAssertions{
