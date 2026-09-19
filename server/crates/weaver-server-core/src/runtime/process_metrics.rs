@@ -11,9 +11,11 @@ use crate::operations::instrumentation::ProcessMetricsSnapshot;
 /// Sample the current process's CPU, memory, descriptor and thread usage.
 ///
 /// * Linux reads `/proc/self/{stat,statm,status,fd,limits}`.
+/// * macOS reads the task's own accounting through `proc_pidinfo`.
 /// * Other Unix platforms answer CPU through `getrusage` and leave the rest
 ///   `None` (there is no portable cheap equivalent).
-/// * Windows answers CPU through `GetProcessTimes` and leaves the rest `None`.
+/// * Windows answers CPU through `GetProcessTimes` and the working set through
+///   `GetProcessMemoryInfo`.
 pub fn sample() -> ProcessMetricsSnapshot {
     #[allow(unused_mut)]
     let mut snapshot = ProcessMetricsSnapshot {
@@ -25,7 +27,82 @@ pub fn sample() -> ProcessMetricsSnapshot {
     #[cfg(target_os = "linux")]
     linux::fill(&mut snapshot);
 
+    #[cfg(target_os = "macos")]
+    macos::fill(&mut snapshot);
+
+    #[cfg(target_os = "windows")]
+    windows::fill(&mut snapshot);
+
     snapshot
+}
+
+/// The resident set alone, for callers that only need the one number.
+///
+/// Separate from [`sample`] so a caller does not pay for the descriptor count
+/// and the `/proc` reads it is not going to look at.
+pub fn resident_memory_bytes() -> Option<u64> {
+    sample().resident_memory_bytes
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::ProcessMetricsSnapshot;
+
+    /// Resident and virtual size, plus the thread count, from one syscall.
+    ///
+    /// The fields are the kernel's own task accounting, which is what
+    /// Activity Monitor's "memory" column reports for the process.
+    pub(super) fn fill(snapshot: &mut ProcessMetricsSnapshot) {
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        // SAFETY: the buffer is exactly the size the call is told it is, and
+        // `getpid` is always a valid pid for this process.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDTASKINFO,
+                0,
+                std::ptr::addr_of_mut!(info).cast(),
+                size,
+            )
+        };
+        if written != size {
+            return;
+        }
+        snapshot.resident_memory_bytes = Some(info.pti_resident_size);
+        snapshot.virtual_memory_bytes = Some(info.pti_virtual_size);
+        if info.pti_threadnum > 0 {
+            snapshot.threads = Some(info.pti_threadnum as u64);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::ProcessMetricsSnapshot;
+
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    /// The working set, which is what Task Manager and the support bundles
+    /// call this process's memory, plus the commit charge as the virtual size.
+    pub(super) fn fill(snapshot: &mut ProcessMetricsSnapshot) {
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        counters.cb = size;
+        // SAFETY: the pseudo-handle needs no closing and the buffer is exactly
+        // the size the call is told it is.
+        let ok = unsafe {
+            GetProcessMemoryInfo(GetCurrentProcess(), std::ptr::addr_of_mut!(counters), size)
+        };
+        if ok == 0 {
+            return;
+        }
+        snapshot.resident_memory_bytes = Some(counters.WorkingSetSize as u64);
+        snapshot.virtual_memory_bytes = Some(counters.PagefileUsage as u64);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -127,9 +204,26 @@ mod tests {
         assert!(snapshot.threads.unwrap_or(0) > 0);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// The memory question is the one the support bundles and the working-set
+    /// dashboards ask, so every platform weaver ships for must answer it.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
-    fn non_linux_sample_leaves_unavailable_fields_absent_rather_than_zero() {
+    fn resident_memory_is_readable_on_every_shipped_platform() {
+        let snapshot = sample();
+        assert!(
+            snapshot.resident_memory_bytes.unwrap_or(0) > 0,
+            "the process's own resident set must be readable"
+        );
+        assert!(snapshot.virtual_memory_bytes.unwrap_or(0) > 0);
+        assert!(
+            resident_memory_bytes().unwrap_or(0) > 0,
+            "the shorthand reads the same field"
+        );
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn unsupported_platforms_leave_unavailable_fields_absent_rather_than_zero() {
         let snapshot = sample();
         assert!(snapshot.resident_memory_bytes.is_none());
         assert!(snapshot.open_fds.is_none());

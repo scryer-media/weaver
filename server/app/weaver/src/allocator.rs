@@ -83,6 +83,20 @@ fn apply_tuning() {
     }
 }
 
+/// Hand the calling thread's free allocator pages back.
+///
+/// mimalloc gives every thread its own heap. A download lane allocates the
+/// article buffers that the decode and writer threads free, so those blocks
+/// return to the lane thread's heap and the pages behind them are only
+/// reclaimed when that thread allocates again — which a parked lane does not
+/// do. `mi_collect(true)` forces the collection from the lane thread itself,
+/// which is the only thread that can reach its own heap.
+pub(crate) fn collect_idle_thread() {
+    // SAFETY: `mi_collect` takes no pointers and is safe to call from any
+    // thread that allocates through mimalloc.
+    unsafe { libmimalloc_sys::mi_collect(true) };
+}
+
 unsafe impl GlobalAlloc for TunedMiMalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -127,5 +141,21 @@ mod tests {
             }
             assert_eq!(unsafe { mi_option_get(option) }, value, "{name}");
         }
+    }
+
+    #[test]
+    fn collect_idle_thread_runs_on_a_worker_thread() {
+        // The interesting caller is a long-lived blocking thread that has
+        // allocated and then freed, which is the lane park shape.
+        let handle = std::thread::spawn(|| {
+            let buffer = vec![0u8; 4 * 1024 * 1024];
+            drop(buffer);
+            collect_idle_thread();
+            // Still usable afterwards: the collection must not poison the heap.
+            let again = vec![1u8; 64 * 1024];
+            again.len()
+        });
+        assert_eq!(handle.join().unwrap(), 64 * 1024);
+        collect_idle_thread();
     }
 }

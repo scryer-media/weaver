@@ -263,7 +263,7 @@ pub(crate) async fn run(
         cmd_rx,
         event_tx,
         nntp,
-        buffers,
+        Arc::clone(&buffers),
         profile,
         data_dir,
         intermediate_dir,
@@ -398,6 +398,7 @@ pub(crate) async fn run(
         nntp_pool,
         Arc::clone(&server_transfer_policy),
         shared_config.clone(),
+        buffers,
     );
 
     let mut pipeline_task = tokio::spawn(async move {

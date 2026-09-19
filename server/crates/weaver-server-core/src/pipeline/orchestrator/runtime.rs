@@ -1144,8 +1144,31 @@ impl Pipeline {
     fn refresh_periodic_snapshot(&mut self) {
         self.checkpoint_server_attribution_if_due();
         self.sample_phase_progress();
+        self.publish_download_footprint_metrics();
         self.shared_state.refresh_metrics_snapshot();
         self.flush_pending_snapshot();
+    }
+
+    /// Publish the download side's memory footprint.
+    ///
+    /// Both readings are walks — the dispatch reservations for the bytes, the
+    /// job order for the ranking — so they are taken on the snapshot tick and
+    /// never on an article path. The reservation map is the authoritative
+    /// record of articles handed to a lane and not yet reconciled, which is
+    /// exactly the raw bytes the lanes are holding.
+    fn publish_download_footprint_metrics(&self) {
+        self.metrics.download_lane_inflight_bytes.store(
+            self.rate_limit_reservations.values().sum::<u64>(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let eligible = self.download_scheduler_eligible_jobs().len();
+        self.metrics
+            .download_jobs_eligible
+            .store(eligible, std::sync::atomic::Ordering::Relaxed);
+        self.metrics.download_jobs_hot.store(
+            usize::from(eligible > 0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// The pause demand, at the command seam.

@@ -100,6 +100,10 @@ pub enum RefusalReason {
     /// chase that cannot start, and extraction awaits a started chase without a
     /// deadline.
     NoChaseCapacity,
+    /// Another job currently outranks this one for article dispatch. This job
+    /// is only being served the scraps the hot job leaves, so its chase would
+    /// hold a worker and a staging tree for a download that is not moving.
+    JobNotHot,
 }
 
 impl RefusalReason {
@@ -112,6 +116,7 @@ impl RefusalReason {
             Self::LengthOverflow => "length_overflow",
             Self::BudgetUnavailable => "budget_unavailable",
             Self::NoChaseCapacity => "no_chase_capacity",
+            Self::JobNotHot => "job_not_hot",
         }
     }
 }
@@ -227,6 +232,7 @@ pub struct DirectUnpackCounters {
     pub refused_length_overflow: u64,
     pub refused_budget_unavailable: u64,
     pub refused_no_chase_capacity: u64,
+    pub refused_job_not_hot: u64,
     pub completed: u64,
     pub demoted_download_ended: u64,
     pub demoted_part_unreadable: u64,
@@ -264,6 +270,7 @@ impl DirectUnpackCounters {
             RefusalReason::LengthOverflow => self.refused_length_overflow += 1,
             RefusalReason::BudgetUnavailable => self.refused_budget_unavailable += 1,
             RefusalReason::NoChaseCapacity => self.refused_no_chase_capacity += 1,
+            RefusalReason::JobNotHot => self.refused_job_not_hot += 1,
         }
     }
 
@@ -873,6 +880,19 @@ impl Pipeline {
         );
     }
 
+    /// Whether another job currently outranks this one for article dispatch.
+    ///
+    /// A job the scheduler does not list at all — nothing left to download, or
+    /// a queue that has already drained — is not outranked by anybody: the
+    /// question only has an answer while the job is competing for articles.
+    fn direct_unpack_job_is_outranked(&self, job_id: JobId) -> bool {
+        let eligible = self.download_scheduler_eligible_jobs();
+        let Some(hot_job) = eligible.first() else {
+            return false;
+        };
+        *hot_job != job_id && eligible.contains(&job_id)
+    }
+
     fn arm_prepared_direct_unpack(
         &mut self,
         job_id: JobId,
@@ -894,6 +914,31 @@ impl Pipeline {
         {
             return;
         }
+        // Arming belongs to the job the scheduler is actually feeding.
+        //
+        // Articles are handed out from the hot job, and from one spill job
+        // behind it when the hot job is blocked. A queued job therefore
+        // receives just enough of its opening bytes — its head wave — to look
+        // armable long before it will be downloaded, and submitting a batch of
+        // NZBs used to arm every one of them at once: a chase worker, a
+        // staging tree, a coverage map and an extraction budget per job, all
+        // held for a download that is not moving.
+        //
+        // Counted and deliberately NOT latched, exactly like the capacity
+        // refusal below: being outranked is a fact about this instant. The
+        // candidate stays pending, and the commits that follow the job
+        // becoming hot arm it then.
+        if self.direct_unpack_job_is_outranked(job_id) {
+            debug!(
+                job_id = job_id.0,
+                set_name, "direct unpack is not arming a job the scheduler is not serving yet"
+            );
+            self.direct_unpack
+                .counters
+                .record_refusal(RefusalReason::JobNotHot);
+            return;
+        }
+
         let end_header_bytes = match format {
             ChaseFormat::SevenZip { end_header_bytes } => end_header_bytes,
             ChaseFormat::Zip

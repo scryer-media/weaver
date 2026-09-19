@@ -161,6 +161,12 @@ metric_families! {
         deprecated_by = "weaver_pipeline_download_lanes");
     LANES = ("weaver_pipeline_download_lanes", Gauge, [],
         "Total active article download lanes.");
+    LANE_INFLIGHT_BYTES = ("weaver_pipeline_download_lane_inflight_bytes", Gauge, [],
+        "Raw article bytes handed to download lanes and not yet answered, summed across lanes.");
+    DOWNLOAD_JOBS_ELIGIBLE = ("weaver_pipeline_download_jobs_eligible", Gauge, [],
+        "Jobs competing for articles: the hot job plus every job queued behind it with fetchable work.");
+    DOWNLOAD_JOBS_HOT = ("weaver_pipeline_download_jobs_hot", Gauge, [],
+        "One while a job is being downloaded, zero while none is.");
     LANE_PARKS = ("weaver_pipeline_download_lane_parks_total", Counter, ["reason"],
         "Article download lane parks by reason.");
     LANE_LEASE_ITEMS = ("weaver_pipeline_download_lane_lease_items_total", Counter, [],
@@ -412,6 +418,14 @@ metric_families! {
         "Database submissions that had to wait on a full executor queue.");
     DB_OP_DURATION = ("weaver_db_op_duration_seconds", Histogram, ["engine"],
         "Database operation latency, measured around the executor round-trip.");
+
+    // ---- buffer pool -----------------------------------------------------------------------
+    BUFFER_POOL_IN_USE_BYTES = ("weaver_runtime_buffer_pool_in_use_bytes", Gauge, ["tier"],
+        "Pre-allocated article buffer bytes currently checked out, by tier.");
+    BUFFER_POOL_TOTAL_BYTES = ("weaver_runtime_buffer_pool_total_bytes", Gauge, ["tier"],
+        "Pre-allocated article buffer bytes the pool owns, by tier.");
+    BUFFER_POOL_WAITS = ("weaver_runtime_buffer_pool_waits_total", Counter, [],
+        "Buffer acquisitions that had to wait for a buffer to come back.");
 
     // ---- process ---------------------------------------------------------------------------
     // Standard process collector names, deliberately unprefixed so the usual
