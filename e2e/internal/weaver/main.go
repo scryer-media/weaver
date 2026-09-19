@@ -32,11 +32,18 @@ import (
 
 // Scenario is the JSON manifest for a pre-built test fixture.
 type Scenario struct {
-	Slug                               string            `json:"slug"`
-	Title                              string            `json:"title"`
-	Description                        string            `json:"description"`
-	Category                           string            `json:"category"`
-	ExpectedOutcome                    string            `json:"expected_outcome"`
+	Slug            string `json:"slug"`
+	Title           string `json:"title"`
+	Description     string `json:"description"`
+	Category        string `json:"category"`
+	ExpectedOutcome string `json:"expected_outcome"`
+	// ExpectedErrorContains narrows a failure expectation to a particular
+	// failure. A scenario that only asserts FAILED passes for every reason a
+	// job can end badly, including the fixture breaking in a way that never
+	// exercises the path under test; set this to a stable substring of the
+	// terminal error and the run has to fail for that reason. Matched
+	// case-insensitively against the job's terminal error message.
+	ExpectedErrorContains              string            `json:"expectedErrorContains,omitempty"`
 	Password                           string            `json:"password,omitempty"`
 	SegmentSize                        int               `json:"segment_size,omitempty"`
 	NZBSegmentNumbers                  []int             `json:"nzb_segment_numbers,omitempty"`

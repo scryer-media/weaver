@@ -940,9 +940,25 @@ func runTests(slugs []string) {
 			passed = j.status == "COMPLETE"
 		}
 
+		// A scenario that names the failure it is testing has to get that
+		// failure: "FAILED" on its own is also what a broken fixture looks like.
+		mismatch := ""
+		if expected := j.scenario.ExpectedErrorContains; passed && expected != "" {
+			if !strings.Contains(strings.ToLower(j.errMsg), strings.ToLower(expected)) {
+				passed = false
+				mismatch = fmt.Sprintf(
+					"  %s: expected error containing %q, got %q\n",
+					j.slug, expected, j.errMsg,
+				)
+			}
+		}
+
 		label := "PASS"
 		if !passed {
 			label = "FAIL"
+			if mismatch != "" {
+				fmt.Print(mismatch)
+			}
 			failCount++
 		} else {
 			passCount++

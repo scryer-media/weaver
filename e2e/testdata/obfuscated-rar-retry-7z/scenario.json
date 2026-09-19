@@ -4,6 +4,7 @@
   "description": "Primary serves a corrupted obfuscated RAR with no PAR2 while backup serves a clean obfuscated 7z. Under conservative primary-first retries, file-level corruption no longer proves the primary server is bad, so the job is expected to fail instead of switching to backup automatically. The backup is refused for the whole job: both harness servers are ordinary tiers, so with the primary out of seats the backup would otherwise take the first fetch and hand over the clean 7z.",
   "category": "2000",
   "expected_outcome": "health_failure",
+  "expectedErrorContains": "no retryable work remains for incomplete RAR sets",
   "backupUnavailableUntilJobTerminal": true,
   "segment_size": 16777216,
   "fixtureAssets": [

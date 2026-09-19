@@ -434,23 +434,102 @@ func extractFirstProbeSampleMessageIDs(nzbData []byte, count int) ([]string, err
 	return selected, nil
 }
 
+// extractFirstMessageIDs returns the first `count` segment ids of the posting,
+// ordered by the file's own place in the set rather than by where it landed in
+// the NZB.
+//
+// The poster uses several connections at once and appends each `<file>` element
+// as that file finishes uploading, so document order is completion order: a
+// small PAR2 index can be written ahead of the first archive volume. A scenario
+// that deletes "the first articles" to model a head-of-set loss would then be
+// deleting a repair file instead, and the job it is meant to damage completes
+// untouched. The subject carries the file's index — `[n/m] - "name" yEnc ...` —
+// so sorting on that index restores the order the set was posted in. Files
+// whose subject has no parseable index keep document order, after the ones that
+// do.
 func extractFirstMessageIDs(nzbData []byte, count int) ([]string, error) {
 	if count <= 0 {
 		return nil, nil
 	}
 
-	ids, err := extractAllMessageIDsFromNZB(nzbData)
-	if err != nil {
+	type nzbSegment struct {
+		MessageID string `xml:",chardata"`
+	}
+	type nzbFile struct {
+		Subject  string       `xml:"subject,attr"`
+		Segments []nzbSegment `xml:"segments>segment"`
+	}
+	type nzbDoc struct {
+		Files []nzbFile `xml:"file"`
+	}
+
+	var doc nzbDoc
+	if err := xml.Unmarshal(nzbData, &doc); err != nil {
 		return nil, err
+	}
+
+	type orderedFile struct {
+		index    int
+		hasIndex bool
+		docPos   int
+		file     nzbFile
+	}
+	ordered := make([]orderedFile, 0, len(doc.Files))
+	for pos, file := range doc.Files {
+		idx, ok := subjectFileIndex(file.Subject)
+		ordered = append(ordered, orderedFile{index: idx, hasIndex: ok, docPos: pos, file: file})
+	}
+	sort.SliceStable(ordered, func(a, b int) bool {
+		left, right := ordered[a], ordered[b]
+		if left.hasIndex != right.hasIndex {
+			return left.hasIndex
+		}
+		if left.hasIndex && left.index != right.index {
+			return left.index < right.index
+		}
+		return left.docPos < right.docPos
+	})
+
+	ids := make([]string, 0, count)
+	for _, entry := range ordered {
+		for _, segment := range entry.file.Segments {
+			msgID := strings.TrimSpace(segment.MessageID)
+			msgID = strings.TrimPrefix(msgID, "<")
+			msgID = strings.TrimSuffix(msgID, ">")
+			if msgID == "" {
+				continue
+			}
+			ids = append(ids, msgID)
+			if len(ids) == count {
+				return ids, nil
+			}
+		}
 	}
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	if count > len(ids) {
-		count = len(ids)
-	}
+	return ids, nil
+}
 
-	return append([]string(nil), ids[:count]...), nil
+// subjectFileIndex reads the leading `[n/m]` file counter out of an NZB subject.
+func subjectFileIndex(subject string) (int, bool) {
+	subject = strings.TrimSpace(subject)
+	if !strings.HasPrefix(subject, "[") {
+		return 0, false
+	}
+	close := strings.IndexByte(subject, ']')
+	if close <= 1 {
+		return 0, false
+	}
+	counter := subject[1:close]
+	if slash := strings.IndexByte(counter, '/'); slash >= 0 {
+		counter = counter[:slash]
+	}
+	idx, err := strconv.Atoi(strings.TrimSpace(counter))
+	if err != nil {
+		return 0, false
+	}
+	return idx, true
 }
 
 func deleteArticlesByMessageID(messageIDs []string) error {
