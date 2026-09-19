@@ -62,7 +62,12 @@ export interface ProviderHealth {
   capacityPenaltyUntilEpochMs: number | null;
   latencyMs: number;
   bodyLatencyMs: number | null;
+  bodyTransferMs: number | null;
   bodyLatencyBand: string | null;
+  /** How many BODYs the lanes keep in flight on this server; 1 is sequential. */
+  bodyPipelineDepth: number;
+  /** The lanes proved pipelining does not pay here, whatever the depth says. */
+  bodyPipeliningPinnedSequential: boolean;
   successCount: number;
   failureCount: number;
   consecutiveFailures: number;

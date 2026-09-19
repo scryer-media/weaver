@@ -2,13 +2,13 @@ import { useState } from "react";
 import { Link } from "react-router";
 import { useQuery } from "urql";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
-import { useTranslate } from "@/lib/context/translate-context";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import type { MetricsHistoryRange } from "@/lib/metrics";
 import { Bar, Eyebrow, KeyValueRow, MetricCell, SectionHeader, Square } from "../components/chrome";
 import { Segmented } from "../components/controls";
 import { Chart, type ChartSeries } from "../components/Chart";
 import { columnStyle } from "../components/columns";
-import { useNextData } from "../data/next-data";
+import { useNextData, type ProviderHealth } from "../data/next-data";
 import {
   EM_DASH,
   formatClock,
@@ -318,6 +318,8 @@ export function MonitoringPage() {
                   ? Math.round((provider.connectionsActive / connectionsActive) * 100)
                   : 0;
               const degraded = provider.state !== "healthy";
+              const sequential =
+                provider.bodyPipeliningPinnedSequential || provider.bodyPipelineDepth <= 1;
               return (
                 <div
                   key={`${provider.host}:${provider.port}`}
@@ -346,6 +348,14 @@ export function MonitoringPage() {
                       className={`min-w-[68px] text-right font-wv-mono text-[12.5px] ${degraded ? "text-wv-warn" : "text-wv-secondary"}`}
                     >
                       {formatLatency(provider.latencyMs)}
+                    </span>
+                    <span
+                      title={bodyDepthTitle(t, provider)}
+                      className={`w-[44px] text-right font-wv-mono text-[12.5px] ${sequential ? "text-wv-muted" : "text-wv-secondary"}`}
+                    >
+                      {sequential
+                        ? t("metrics.serverBodyDepthSequential")
+                        : `x${provider.bodyPipelineDepth}`}
                     </span>
                     <span
                       title={t("next.monitoring.failuresSinceStart")}
@@ -490,4 +500,19 @@ function DataCapSection({ block }: { block: ReturnType<typeof useNextData>["down
       />
     </section>
   );
+}
+
+/**
+ * The hover text for a provider's BODY depth: what the number is, and the
+ * latency and transfer halves the lanes derived it from when both are known.
+ */
+function bodyDepthTitle(t: Translate, provider: ProviderHealth): string {
+  const parts = [t("metrics.serverBodyDepth")];
+  if (provider.bodyLatencyBand) {
+    parts.push(t(`metrics.serverLatencyBand.${provider.bodyLatencyBand}`));
+  }
+  if (provider.bodyLatencyMs != null && provider.bodyTransferMs != null) {
+    parts.push(`${Math.round(provider.bodyLatencyMs)}/${Math.round(provider.bodyTransferMs)} ms`);
+  }
+  return parts.join(" · ");
 }
