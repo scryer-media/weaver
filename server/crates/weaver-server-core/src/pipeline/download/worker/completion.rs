@@ -1071,9 +1071,20 @@ impl Pipeline {
                 } else {
                     excluded_servers.clone()
                 };
+                // A 430 that adds nothing to the exclusion set taught the
+                // retry nothing: the next attempt re-enters selection with
+                // the same answer and comes back the same way, at zero delay,
+                // without ever spending retry budget. Treat it as terminal
+                // rather than spin, and count it — the article is not
+                // necessarily missing everywhere, but nothing on this path
+                // can still prove otherwise.
+                let article_not_found_learned_nothing = failure.kind
+                    == DownloadFailureKind::ArticleNotFound
+                    && !retry_exclude_servers.is_empty()
+                    && retry_exclude_servers.len() == excluded_servers.len();
                 let article_not_found_exhausted = failure.kind
                     == DownloadFailureKind::ArticleNotFound
-                    && (retry_exclude_servers.is_empty() || {
+                    && (retry_exclude_servers.is_empty() || article_not_found_learned_nothing || {
                         let server_count = self.nntp.pool().server_count();
                         server_count > 0 && {
                             // Retention-excluded servers can never 430; they
@@ -1083,6 +1094,11 @@ impl Pipeline {
                                 >= server_count
                         }
                     });
+                if article_not_found_learned_nothing {
+                    self.metrics
+                        .articles_not_found_without_new_server
+                        .fetch_add(1, Ordering::Relaxed);
+                }
 
                 // Transport rotation: point the retry away from the server
                 // whose established connection just failed, when an

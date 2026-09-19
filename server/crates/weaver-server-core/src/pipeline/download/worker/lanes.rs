@@ -960,6 +960,7 @@ impl Pipeline {
         let metric = match error.kind() {
             "provider_capacity" => "download.owned_lane.acquire_failed.provider_capacity",
             "local_capacity" => "download.owned_lane.acquire_failed.local_capacity",
+            "server_recovering" => "download.owned_lane.acquire_failed.server_recovering",
             "no_eligible_server" => "download.owned_lane.acquire_failed.no_eligible_server",
             "selection_contended" => "download.owned_lane.acquire_failed.selection_contended",
             _ => "download.owned_lane.acquire_failed.other",
@@ -978,6 +979,18 @@ impl Pipeline {
             .iter()
             .map(|(server_idx, _)| *server_idx)
             .collect();
+        // What the candidates' recovery gates say, so a refusal that is the
+        // gate's and not the pool's reads as one: a quarantined server with
+        // every permit free otherwise looks like a leak.
+        let server_count = self.nntp.pool().server_count();
+        let recovery: Vec<String> = servers
+            .iter()
+            .filter(|server_idx| **server_idx < server_count)
+            .map(|server_idx| {
+                let snapshot = self.nntp.pool().recovery_snapshot(*server_idx);
+                format!("{server_idx}:{snapshot:?}")
+            })
+            .collect();
         warn!(
             job_id = lease.job_id.0,
             kind = error.kind(),
@@ -986,6 +999,7 @@ impl Pipeline {
             requeue = error.should_requeue_owned_work(),
             suppressed_since_last,
             candidate_servers = ?servers,
+            candidate_recovery = ?recovery,
             excluded_servers = ?lease.dial_exclude_servers,
             "owned blocking download lane could not be acquired"
         );

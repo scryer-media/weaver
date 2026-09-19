@@ -2026,8 +2026,17 @@ impl BlockingNntpConnection {
             }
         };
         if initial.code.raw() == 480 {
+            // Mid-batch, a 480 says the session expired, not that the
+            // credentials are wrong: they were accepted when this connection
+            // was set up. Re-authenticating here is not open to us — the rest
+            // of the batch's replies are still queued on the socket, and an
+            // AUTHINFO would be answered by one of them — so the connection is
+            // dropped and the next dial authenticates from the start, which is
+            // also where a credential that has genuinely gone bad is booked.
+            // Reporting this as an auth failure instead disabled the whole
+            // server for the auth backoff and unlocked backfill behind it.
             self.fail_body_pipeline();
-            return Err(NntpError::AuthenticationRequired.into());
+            return Err(NntpError::SessionExpired.into());
         }
         self.last_response_line_wait = response_started.elapsed();
         self.stream_yenc_article_response(initial, budget, on_chunk)
@@ -3022,6 +3031,8 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::TruncatedMultilineBody => NntpError::TruncatedMultilineBody,
         NntpError::ServerDisconnectedMidBody => NntpError::ServerDisconnectedMidBody,
         NntpError::MalformedMultilineTerminator => NntpError::MalformedMultilineTerminator,
+        NntpError::ServerRecovering => NntpError::ServerRecovering,
+        NntpError::SessionExpired => NntpError::SessionExpired,
         NntpError::AuthenticationRequired => NntpError::AuthenticationRequired,
         NntpError::AuthenticationFailed => NntpError::AuthenticationFailed,
         NntpError::AuthenticationRejected => NntpError::AuthenticationRejected,

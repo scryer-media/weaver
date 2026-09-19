@@ -55,6 +55,20 @@ pub enum NntpError {
     #[error("malformed multiline terminator")]
     MalformedMultilineTerminator,
 
+    /// The server is recovering and its one probe connection is already out,
+    /// or the probe is not demanded work. Local admission, not a refusal by
+    /// the server and not a shortage of permits: a server can be wide open on
+    /// sockets and still answer this.
+    #[error("server is recovering; the recovery probe is already out")]
+    ServerRecovering,
+
+    /// The server asked for authentication again (480) part-way through a
+    /// pipelined batch. The session expired mid-stream; the credentials were
+    /// never rejected, so this is the connection's problem and not the
+    /// server's, and the batch's outstanding articles are simply unanswered.
+    #[error("session expired mid-pipeline (480)")]
+    SessionExpired,
+
     // --- Authentication errors ---
     /// The server requires authentication (480).
     #[error("authentication required (480)")]

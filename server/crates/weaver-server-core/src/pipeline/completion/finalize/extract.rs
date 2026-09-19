@@ -780,9 +780,176 @@ fn is_windows_drive_component(value: &str) -> bool {
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+/// Everything a zstd decoder holds besides the window: the input and output
+/// buffers, the entropy tables, and the literal and sequence workspaces. The
+/// format fixes the block size at 128 KiB and the tables at a few hundred
+/// kilobytes, so a flat couple of megabytes covers any frame with room to
+/// spare, and the window — which is what actually varies, from 1 KiB to over
+/// a gigabyte — is measured.
+const ZSTD_DECODER_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The longest a frame header can be: magic, descriptor, window descriptor,
+/// dictionary id and frame content size, all at their widest.
+const ZSTD_FRAME_HEADER_MAX_BYTES: usize = 4 + 1 + 1 + 4 + 8;
+
+/// Window the decoder of this frame will hold, read from the frame header.
+///
+/// Sizing a zstd reservation from the header rather than from the process
+/// limit is the difference between a reservation that can be granted and one
+/// that can only be granted when nothing else in the process holds a single
+/// byte. The whole-limit request also registers as a waiter, and a waiting
+/// decoder is what makes every running direct unpack yield its own — so one
+/// small archive could evict all of them and then park behind whoever held a
+/// few megabytes.
+fn zstd_frame_window_bytes(header: &[u8]) -> Result<u64, String> {
+    const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+    const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
+    const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
+
+    let mut cursor = 0usize;
+    // Skippable frames may precede the real one; each carries its own length.
+    loop {
+        let magic: [u8; 4] = header
+            .get(cursor..cursor + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| "zstd frame header is truncated".to_string())?;
+        if magic == MAGIC {
+            cursor += 4;
+            break;
+        }
+        let magic_value = u32::from_le_bytes(magic);
+        if magic_value & SKIPPABLE_MASK != SKIPPABLE_MAGIC {
+            return Err("file does not start with a zstd frame".to_string());
+        }
+        let size: [u8; 4] = header
+            .get(cursor + 4..cursor + 8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| "zstd skippable frame is truncated".to_string())?;
+        cursor = cursor
+            .checked_add(8)
+            .and_then(|next| next.checked_add(u32::from_le_bytes(size) as usize))
+            .ok_or_else(|| "zstd skippable frame length overflows".to_string())?;
+    }
+
+    let descriptor = *header
+        .get(cursor)
+        .ok_or_else(|| "zstd frame header is truncated".to_string())?;
+    cursor += 1;
+    if descriptor & 0b0000_1000 != 0 {
+        // Bit 3 is reserved and a decoder must refuse a frame that sets it.
+        return Err("zstd frame header sets a reserved bit".to_string());
+    }
+    let content_size_flag = descriptor >> 6;
+    let single_segment = descriptor & 0b0010_0000 != 0;
+    let dictionary_id_bytes = match descriptor & 0b0000_0011 {
+        0 => 0usize,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+
+    let mut window = None;
+    if !single_segment {
+        let window_descriptor = *header
+            .get(cursor)
+            .ok_or_else(|| "zstd frame header is truncated".to_string())?;
+        cursor += 1;
+        let exponent = u32::from(window_descriptor >> 3);
+        let mantissa = u64::from(window_descriptor & 0b0000_0111);
+        let base = 1u64
+            .checked_shl(10 + exponent)
+            .ok_or_else(|| "zstd window descriptor is out of range".to_string())?;
+        window = Some(base + (base / 8) * mantissa);
+    }
+    cursor += dictionary_id_bytes;
+
+    let content_size_bytes = match content_size_flag {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let content_size = if content_size_bytes == 0 {
+        None
+    } else {
+        let field = header
+            .get(cursor..cursor + content_size_bytes)
+            .ok_or_else(|| "zstd frame header is truncated".to_string())?;
+        let mut value = 0u64;
+        for (index, byte) in field.iter().enumerate() {
+            value |= u64::from(*byte) << (8 * index);
+        }
+        // The two-byte encoding is offset by 256.
+        Some(if content_size_bytes == 2 {
+            value + 256
+        } else {
+            value
+        })
+    };
+
+    match (window, content_size) {
+        // A single-segment frame has no window descriptor: the decoder holds
+        // the whole content instead, and the format requires the size to say
+        // how much that is.
+        (None, Some(content)) => Ok(content),
+        (None, None) => Err("zstd frame declares no window and no content size".to_string()),
+        // Nothing is gained by holding a window larger than the content that
+        // will ever be written into it.
+        (Some(window), Some(content)) => Ok(window.min(content)),
+        (Some(window), None) => Ok(window),
+    }
+}
+
+/// Decoder memory for one zstd file, measured from its first frame header.
+fn zstd_decoder_memory_bytes(path: &Path, max_memory_bytes: u64) -> Result<u64, String> {
+    use std::io::Read;
+
+    let mut header = [0u8; ZSTD_FRAME_HEADER_MAX_BYTES];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| {
+            let mut filled = 0usize;
+            while filled < header.len() {
+                match file.read(&mut header[filled..])? {
+                    0 => break,
+                    count => filled += count,
+                }
+            }
+            Ok(filled)
+        })
+        .map_err(|error| format!("failed to read zstd frame header: {error}"))?;
+
+    let window = zstd_frame_window_bytes(&header[..read])?;
+    let needed = window.saturating_add(ZSTD_DECODER_OVERHEAD_BYTES);
+    if needed > max_memory_bytes {
+        return Err(format!(
+            "zstd frame needs {needed} bytes of decoder memory, above the {max_memory_bytes} byte limit"
+        ));
+    }
+    Ok(needed)
+}
+
+/// Decoder memory for one simple archive, measured from the archive itself
+/// where the format says what the decoder will hold.
+pub(in crate::pipeline) fn measured_decoder_memory_bytes(
+    kind: SimpleArchiveKind,
+    path: Option<&Path>,
+    max_memory_bytes: u64,
+) -> Result<u64, String> {
+    match (kind, path) {
+        (SimpleArchiveKind::Zstd, Some(path)) => zstd_decoder_memory_bytes(path, max_memory_bytes),
+        (SimpleArchiveKind::Zstd, None) => {
+            Err("cannot size a zstd decoder without the archive".to_string())
+        }
+        _ => Ok(simple_decoder_memory_bytes(kind, max_memory_bytes)),
+    }
+}
+
 fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -> u64 {
     const MIB: u64 = 1024 * 1024;
     match kind {
+        // Sized from the frame header instead; see
+        // `measured_decoder_memory_bytes`, which is what the reservation
+        // paths call.
         SimpleArchiveKind::Zstd => max_memory_bytes,
         SimpleArchiveKind::Xz | SimpleArchiveKind::TarXz => {
             max_memory_bytes.min(crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES)
@@ -2357,12 +2524,15 @@ impl Pipeline {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
-                    let decoder_memory =
-                        simple_decoder_memory_bytes(kind, budget.max_memory_bytes());
-                    let _memory_permit = budget.reserve_memory_wait(decoder_memory)?;
                     if file_paths.is_empty() {
                         return Err(format!("no files found for set '{set_name_owned}'"));
                     }
+                    let decoder_memory = measured_decoder_memory_bytes(
+                        kind,
+                        file_paths.first().map(PathBuf::as_path),
+                        budget.max_memory_bytes(),
+                    )?;
+                    let _memory_permit = budget.reserve_memory_wait(decoder_memory)?;
 
                     let extracted_members = match kind {
                         SimpleArchiveKind::Zip => extract_zip(

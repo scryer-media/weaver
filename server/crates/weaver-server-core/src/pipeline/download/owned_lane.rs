@@ -983,7 +983,10 @@ struct LaneLeaseContext {
     job_id: JobId,
     runtime_generation: u64,
     completion_critical: bool,
-    exclude_servers: Vec<usize>,
+    /// The job's retention exclusions, carried from the lease. Job-derived and
+    /// the same for every article on the lane; each result unions it with the
+    /// article's own failure ledger.
+    retention_excludes: Vec<usize>,
     pressure_clear: bool,
     mode: DownloadLaneMode,
     checkpoint_plan: weaver_yenc::CheckpointPlan,
@@ -1000,7 +1003,7 @@ impl LaneLeaseContext {
             job_id: lease.job_id,
             runtime_generation: lease.runtime_generation,
             completion_critical: lease.completion_critical,
-            exclude_servers: lease.effective_exclude_servers.clone(),
+            retention_excludes: lease.effective_exclude_servers.clone(),
             pressure_clear: lease.pressure_clear,
             mode: Pipeline::actual_download_lane_mode(
                 lease.lane_mode,
@@ -1397,7 +1400,7 @@ fn run_owned_blocking_download_lane(
                     unresolved_count: 0,
                     connection_discarded: discarded,
                 },
-                &work_context.exclude_servers,
+                &work_context.retention_excludes,
             );
             if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
                 stop = Some(LaneStop::Error);
@@ -1537,7 +1540,7 @@ fn run_owned_blocking_download_lane(
                 unresolved_count: meta.unresolved_count,
                 connection_discarded: meta.connection_discarded,
             },
-            &work_context.exclude_servers,
+            &work_context.retention_excludes,
         );
         let keeps_connection = download_outcome_keeps_connection(&result.data);
         let policy_blocked = matches!(
@@ -1574,7 +1577,7 @@ fn run_owned_blocking_download_lane(
                     lane.transfer_ewma(),
                     work_context.pressure_clear,
                     unresolved_count,
-                    &work_context.exclude_servers,
+                    &work_context.retention_excludes,
                     "lane pipeline faulted before this article's response",
                 );
                 if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
@@ -1732,6 +1735,23 @@ fn send_owned_batch(
     Ok(())
 }
 
+/// The exclusions a result reports for one article: the article's own
+/// failure ledger, plus the job's retention exclusions the lease carried.
+///
+/// The ledger has to come from the work itself. A lane's batch is cut for one
+/// server but not for one exclusion set, so two articles on the same lane can
+/// have failed on different servers; reporting the lease's set instead loses
+/// every server this article has already been refused by, and an article
+/// missing everywhere then retries forever because its exclusion set never
+/// grows and exhaustion never trips.
+///
+/// The rotation hint (`avoid_server`) deliberately stays out: it only shapes
+/// selection, and counting it here would let a transient timeout help declare
+/// an article missing.
+fn result_exclude_servers(work: &DownloadWork, retention_excludes: &[usize]) -> Vec<usize> {
+    Pipeline::union_exclude_servers(&work.exclude_servers, retention_excludes)
+}
+
 fn result_from_trace(
     work: DownloadWork,
     runtime_generation: u64,
@@ -1739,10 +1759,11 @@ fn result_from_trace(
     job_id: JobId,
     trace: weaver_nntp::client::DecodedBodyTrace,
     mut observation: DownloadLaneObservation,
-    exclude_servers: &[usize],
+    retention_excludes: &[usize],
 ) -> DownloadResult {
     let segment_id = work.segment_id;
     let retry_count = work.retry_count;
+    let exclude_servers = result_exclude_servers(&work, retention_excludes);
     // The work's own flags, never the lease's: a lane may be refilled with the
     // other class's work, and the origin books the article that was actually
     // fetched.
@@ -1768,7 +1789,7 @@ fn result_from_trace(
         source_server_idx,
         origin: DownloadResultOrigin::from_work(is_recovery, completion_critical),
         retry_count,
-        exclude_servers: exclude_servers.to_vec(),
+        exclude_servers,
         release_connection_slot: false,
     }
 }
@@ -1786,11 +1807,12 @@ fn unresolved_result(
     transfer: Option<std::time::Duration>,
     pressure_clear: bool,
     unresolved_count: u64,
-    exclude_servers: &[usize],
+    retention_excludes: &[usize],
     message: &'static str,
 ) -> DownloadResult {
     let is_recovery = work.is_recovery;
     let completion_critical = work.completion_critical;
+    let exclude_servers = result_exclude_servers(&work, retention_excludes);
     DownloadResult {
         lane_id,
         job_id,
@@ -1818,7 +1840,7 @@ fn unresolved_result(
         source_server_idx: None,
         origin: DownloadResultOrigin::from_work(is_recovery, completion_critical),
         retry_count: work.retry_count,
-        exclude_servers: exclude_servers.to_vec(),
+        exclude_servers,
         release_connection_slot: false,
     }
 }
@@ -2004,7 +2026,7 @@ mod tests {
                 )),
             },
             observation,
-            &old.exclude_servers,
+            &old.retention_excludes,
         );
 
         assert_eq!(
@@ -2012,10 +2034,67 @@ mod tests {
             "the tail of the old lease keeps the old generation while the new \
              lease is already on the wire"
         );
-        assert_eq!(straggler.exclude_servers, vec![1]);
+        assert_eq!(
+            straggler.exclude_servers,
+            vec![1],
+            "the work carried no failure ledger, so the result reports the \
+             lease's retention exclusions alone"
+        );
         assert_eq!(new.runtime_generation, 4);
-        assert_eq!(new.exclude_servers, vec![2, 5]);
+        assert_eq!(new.retention_excludes, vec![2, 5]);
         assert_eq!(new.depth(), 4);
+    }
+
+    /// A lane's batch is cut for one job, not for one exclusion set, so the
+    /// result has to report the article's own failure ledger. Reporting the
+    /// lease's set instead loses every server this article has already been
+    /// refused by, and an article missing on all of them then retries forever
+    /// because its exclusion set never grows past the server that just
+    /// answered.
+    #[test]
+    fn a_result_reports_the_article_s_own_failure_ledger() {
+        let context = Arc::new(LaneLeaseContext::from_lease(
+            &test_lease(JobId(7), 3, Vec::new(), vec![tail_work(1, 0)]),
+            1,
+            true,
+        ));
+        let mut work = tail_work(1, 1);
+        work.exclude_servers = vec![0];
+
+        let result = result_from_trace(
+            work,
+            context.runtime_generation,
+            0,
+            JobId(7),
+            weaver_nntp::client::DecodedBodyTrace {
+                attempts: Vec::new(),
+                result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
+                    weaver_nntp::error::NntpError::ArticleNotFound,
+                )),
+            },
+            DownloadLaneObservation {
+                server_idx: Some(1),
+                mode: DownloadLaneMode::Sequential,
+                supports_pipelining: false,
+                latency: None,
+                transfer: None,
+                payload_bytes: 0,
+                policy_elapsed: std::time::Duration::ZERO,
+                pressure_clear: true,
+                batch_complete: false,
+                batch_clean: true,
+                unresolved_count: 0,
+                connection_discarded: false,
+            },
+            &context.retention_excludes,
+        );
+
+        assert_eq!(
+            result.exclude_servers,
+            vec![0],
+            "the server this article already failed on must survive the trip \
+             back, or the completion path cannot tell that both servers are out"
+        );
     }
 
     /// Per-article delivery is the point: decode starts on a lease's first
