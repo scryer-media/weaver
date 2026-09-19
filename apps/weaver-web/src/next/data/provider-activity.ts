@@ -11,7 +11,7 @@ export interface ProviderActivity {
   /** The raw counts — active, connected, maximum — kept as the secondary reading. */
   fraction: string;
   /** Which of the rail's colours the bar takes. */
-  tone: "accent" | "warn" | "inert";
+  tone: "accent" | "warn" | "error" | "inert";
 }
 
 /**
@@ -55,7 +55,7 @@ export function providerActivityLabel(
         word: t("next.rail.activity.disabled"),
         cause: t("next.rail.cause.disabled"),
         fraction: counts,
-        tone: "inert",
+        tone: "error",
       };
     case "cooling_down":
       return {
@@ -80,7 +80,7 @@ export function providerActivityLabel(
         word: t("next.rail.activity.degraded"),
         cause: t("next.rail.cause.degraded"),
         fraction: counts,
-        tone: "warn",
+        tone: "error",
       };
     case "preparing":
       return {

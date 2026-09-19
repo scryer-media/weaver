@@ -28,6 +28,7 @@ import { countLabel, providerStateLabel } from "../i18n/labels";
 const ACTIVITY_TONE: Record<ProviderActivity["tone"], string | undefined> = {
   accent: undefined,
   warn: WV.warn,
+  error: WV.error,
   inert: undefined,
 };
 

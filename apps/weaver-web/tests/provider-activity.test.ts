@@ -98,13 +98,13 @@ test("degraded and disabled each carry their own cause", () => {
     (({ word, cause, tone }) => ({ word, cause, tone }))(
       providerActivityLabel(provider({ activity: "degraded" }), t, NOW),
     ),
-    { word: "degraded", cause: "errors on recent requests", tone: "warn" },
+    { word: "degraded", cause: "errors on recent requests", tone: "error" },
   );
   assert.deepEqual(
     (({ word, cause, tone }) => ({ word, cause, tone }))(
       providerActivityLabel(provider({ activity: "disabled" }), t, NOW),
     ),
-    { word: "disabled", cause: "disabled in settings", tone: "inert" },
+    { word: "disabled", cause: "disabled in settings", tone: "error" },
   );
 });
 
