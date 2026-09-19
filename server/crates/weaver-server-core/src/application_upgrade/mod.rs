@@ -28,6 +28,29 @@ pub use service::{
     application_upgrade_helper_update_journal, phases,
 };
 
+/// When the operating system last booted, where the platform can say.
+///
+/// A reboot-required upgrade is only finished by a boot that happened after
+/// the journal was written, so without this the run stays Running forever and
+/// blocks every upgrade behind it. Windows reports the time since boot with
+/// `GetTickCount64`; other platforms have no reboot-required path, so they
+/// answer `None` and the journal keeps waiting as it did.
+#[cfg(windows)]
+pub fn operating_system_boot_time() -> Option<std::time::SystemTime> {
+    // SAFETY: `GetTickCount64` reads a counter and takes no arguments.
+    let uptime_ms = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetTickCount64()
+    };
+    std::time::SystemTime::now().checked_sub(std::time::Duration::from_millis(uptime_ms))
+}
+
+/// When the operating system last booted. Not reported off Windows, which is
+/// the only platform with a reboot-required upgrade phase.
+#[cfg(not(windows))]
+pub fn operating_system_boot_time() -> Option<std::time::SystemTime> {
+    None
+}
+
 /// Classify this installation from live startup evidence.
 ///
 /// The observation and the judgement both live in the shared crate; this binds

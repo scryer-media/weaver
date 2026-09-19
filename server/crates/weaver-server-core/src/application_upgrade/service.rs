@@ -908,7 +908,7 @@ impl ApplicationUpgradeService {
     /// reboot is still outstanding. Called once, early in startup, before the
     /// upgrade surface can accept anything new.
     pub fn finalize_journal(&self) -> ApplicationUpgradeResult<Vec<String>> {
-        self.finalize_journal_with_boot_time(None)
+        self.finalize_journal_with_boot_time(super::operating_system_boot_time())
     }
 
     /// [`Self::finalize_journal`] with an injectable operating-system boot time.
