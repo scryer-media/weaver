@@ -2910,9 +2910,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8afaed7813bc141a610a7b156db5f63d99ec934ac9fbef1d5bcd4f331e94ee80"
+checksum = "73366e9d30fdcbf16afd2713675b359392bd04fc5020d3a9e8432ce479eb58e7"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -4555,23 +4555,24 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.24.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e980173990e8c03f88d465045ea7150214ffbbfc7366ed57a71d2218aa8dc11c"
+checksum = "feed8acbf51cad27d70bc705c608bf2bd7d3cf0c41f688f6604aaad3546b92d5"
 dependencies = [
  "aes",
  "aws-lc-rs",
  "brotli",
  "bzip2",
+ "cap-std",
  "cbc",
  "flate2",
  "getrandom 0.4.3",
  "js-sys",
  "lz4_flex",
- "lzma-rust2",
  "lzma-turbo",
  "ppmd-rust",
  "wasm-bindgen",
+ "zeroize",
  "zstd 0.14.0",
 ]
 
