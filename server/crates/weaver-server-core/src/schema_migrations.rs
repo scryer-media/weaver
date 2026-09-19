@@ -107,7 +107,10 @@ pub async fn run_embedded_migrations(
     }
 
     let applied = load_applied_migrations(pool).await?;
-    validate_known_migrations(&applied, &catalog)?;
+    let stale_line_endings = validate_known_migrations(&applied, &catalog)?;
+    if !matches!(mode, MigrationMode::ValidateOnly) {
+        heal_line_ending_checksums(pool, &catalog, &stale_line_endings).await?;
+    }
     let pending = list_pending_migrations_from_applied(&applied, &catalog);
     if pending.is_empty() {
         return Ok(());
@@ -355,10 +358,15 @@ fn list_pending_migrations_from_applied(
     )
 }
 
+/// Checks the ledger against the embedded catalog and returns the versions
+/// whose recorded checksum is a legacy line-ending variant of the embedded one.
+/// Those rows are valid but stale: callers that may write should heal them with
+/// [`heal_line_ending_checksums`] so the next startup takes the plain path.
 fn validate_known_migrations(
     applied: &[MigrationLedgerRow],
     catalog: &CompiledMigrationCatalog,
-) -> Result<(), StateError> {
+) -> Result<Vec<i64>, StateError> {
+    let mut stale_line_endings = Vec::new();
     for row in applied {
         if !row.success {
             return Err(StateError::Database(format!(
@@ -386,19 +394,45 @@ fn validate_known_migrations(
                 migration.checksum_algo.as_str()
             )));
         }
-        if row.success
-            && row.checksum != migration.checksum
-            && !crate::migration_assets::is_superseded_migration_checksum(
+        if row.success && row.checksum != migration.checksum {
+            if migration.is_legacy_line_ending_checksum(&row.checksum_algo, &row.checksum) {
+                stale_line_endings.push(row.version);
+            } else if !crate::migration_assets::is_superseded_migration_checksum(
                 row.version,
                 &row.checksum_algo,
                 &row.checksum,
-            )
-        {
-            return Err(StateError::Database(format!(
-                "database migration {} checksum mismatch",
-                row.version
-            )));
+            ) {
+                return Err(StateError::Database(format!(
+                    "database migration {} checksum mismatch",
+                    row.version
+                )));
+            }
         }
+    }
+    Ok(stale_line_endings)
+}
+
+/// Rewrites the ledger checksum of `versions` to the embedded canonical value.
+///
+/// These rows were written by a build whose checkout carried the other line
+/// ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
+/// they hash the same SQL in a different form. Healing them keeps a database
+/// from bouncing between the released binary and a from-source build.
+async fn heal_line_ending_checksums(
+    pool: &SqlitePool,
+    catalog: &CompiledMigrationCatalog,
+    versions: &[i64],
+) -> Result<(), StateError> {
+    for version in versions {
+        let Some(migration) = catalog.find_migration(*version) else {
+            continue;
+        };
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2")
+            .bind(&migration.checksum)
+            .bind(version)
+            .execute(pool)
+            .await
+            .map_err(db_err)?;
     }
     Ok(())
 }
@@ -1953,6 +1987,7 @@ mod tests {
             filename: "synthetic.sql".to_string(),
             checksum_algo: ChecksumAlgorithm::Blake3,
             checksum: ChecksumAlgorithm::Blake3.digest(payload),
+            legacy_line_ending_checksums: Vec::new(),
             steps: vec![CompiledMigrationStep::Sql {
                 file: "synthetic.sql".to_string(),
                 engine: EngineScope::Postgres,
@@ -2073,6 +2108,71 @@ mod tests {
             "blake3",
             &[0xAB; 32]
         ));
+    }
+
+    /// A database written by a build whose checkout carried CRLF SQL (the
+    /// released Windows binary) must open under a build from an LF checkout,
+    /// and must come out of that startup holding the canonical checksum so the
+    /// next open takes the plain equality path.
+    #[tokio::test]
+    async fn legacy_line_ending_ledger_checksum_opens_and_is_healed() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .unwrap();
+
+        let catalog = embedded_catalog().unwrap();
+        // Pick a migration whose body actually has line breaks, so a CRLF form
+        // exists at all.
+        let migration = catalog
+            .migrations
+            .iter()
+            .find(|migration| !migration.legacy_line_ending_checksums.is_empty())
+            .expect("at least one embedded migration must have a CRLF variant");
+        let legacy = migration.legacy_line_ending_checksums[0].clone();
+        assert_ne!(legacy, migration.checksum);
+
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2")
+            .bind(&legacy)
+            .bind(migration.version)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .expect("a CRLF-era ledger checksum must be accepted");
+
+        let healed: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?1")
+                .bind(migration.version)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            healed, migration.checksum,
+            "the ledger must be rewritten to the canonical checksum"
+        );
+
+        // And the amnesty stays narrow: a body that is genuinely different
+        // still fails.
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2")
+            .bind(vec![0xABu8; 32])
+            .bind(migration.version)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = run_embedded_migrations(&pool, MigrationMode::Apply)
+            .await
+            .expect_err("an unrelated checksum must still be rejected");
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     async fn pragma_column_count(pool: &sqlx::SqlitePool, table: &str, columns: &[&str]) -> i64 {

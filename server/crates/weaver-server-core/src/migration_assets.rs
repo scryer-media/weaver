@@ -202,7 +202,36 @@ pub struct CompiledMigration {
     pub filename: String,
     pub checksum_algo: ChecksumAlgorithm,
     pub checksum: Vec<u8>,
+    /// Checksums this migration would have had under the pre-canonicalization
+    /// rule, where the SQL was hashed exactly as it sat on disk.
+    ///
+    /// `checksum` is now computed over an LF-canonical body, so a build from an
+    /// LF checkout and a build from a CRLF checkout agree. Databases written
+    /// before that change recorded whichever form their build happened to
+    /// embed, so both variants stay acceptable at startup and are healed to the
+    /// canonical value in place. Empty when the body has no line breaks at all
+    /// (every variant collapses onto `checksum`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_line_ending_checksums: Vec<Vec<u8>>,
     pub steps: Vec<CompiledMigrationStep>,
+}
+
+impl CompiledMigration {
+    /// True when `checksum` (under algorithm `checksum_algo`) is a ledger value
+    /// this migration used to produce before the checksum was made independent
+    /// of line endings. Callers that accept one must rewrite the ledger to
+    /// `self.checksum`.
+    pub(crate) fn is_legacy_line_ending_checksum(
+        &self,
+        checksum_algo: &str,
+        checksum: &[u8],
+    ) -> bool {
+        checksum_algo == self.checksum_algo.as_str()
+            && self
+                .legacy_line_ending_checksums
+                .iter()
+                .any(|legacy| legacy.as_slice() == checksum)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,7 +425,7 @@ fn compile_migration(
     }
 
     let mut compiled_steps = Vec::with_capacity(migration.steps.len());
-    let mut canonical_steps = Vec::with_capacity(migration.steps.len());
+    let mut step_sources = Vec::with_capacity(migration.steps.len());
     for step in &migration.steps {
         match step {
             SourceMigrationStep::Sql { file, scope, .. } => {
@@ -411,10 +440,10 @@ fn compile_migration(
                     scope: *scope,
                     payload,
                 });
-                canonical_steps.push(CanonicalStep::Sql {
+                step_sources.push(CanonicalStepSource::Sql {
                     engine: step.explicit_engine(),
                     scope: *scope,
-                    sql_blake3: checksum_hex(&ChecksumAlgorithm::Blake3.digest(&sql)),
+                    sql,
                 });
             }
             SourceMigrationStep::Rust { hook_id, scope, .. } => {
@@ -425,7 +454,7 @@ fn compile_migration(
                     engine,
                     scope: *scope,
                 });
-                canonical_steps.push(CanonicalStep::Rust {
+                step_sources.push(CanonicalStepSource::Rust {
                     engine: step.explicit_engine(),
                     scope: *scope,
                     hook_id: hook_id.clone(),
@@ -434,17 +463,19 @@ fn compile_migration(
         }
     }
 
-    let canonical = CanonicalMigration {
-        version: migration.version,
-        description: migration.description.clone(),
-        steps: canonical_steps,
-    };
-    let canonical_bytes = serde_json::to_vec(&canonical).map_err(|error| {
-        format!(
-            "failed to serialize canonical migration {:04}: {error}",
-            migration.version
-        )
-    })?;
+    // The checksum is taken over the LF-canonical body so that a checkout with
+    // `core.autocrlf=true` (GitHub's Windows runner) and an LF checkout of the
+    // same commit agree. The CRLF and raw-LF forms are recorded alongside it
+    // because databases written before this change recorded one of them.
+    let checksum = migration_checksum(migration, &step_sources, SqlLineEndings::Canonical)?;
+    let mut legacy_line_ending_checksums = Vec::new();
+    for form in [SqlLineEndings::Lf, SqlLineEndings::Crlf] {
+        let legacy = migration_checksum(migration, &step_sources, form)?;
+        if legacy != checksum && !legacy_line_ending_checksums.contains(&legacy) {
+            legacy_line_ending_checksums.push(legacy);
+        }
+    }
+
     let key = migration_key_from_version_and_desc(migration.version, &migration.description);
     let filename = infer_filename(migration, &key);
     Ok(CompiledMigration {
@@ -453,9 +484,116 @@ fn compile_migration(
         key,
         filename,
         checksum_algo: migration.checksum_algo,
-        checksum: migration.checksum_algo.digest(&canonical_bytes),
+        checksum,
+        legacy_line_ending_checksums,
         steps: compiled_steps,
     })
+}
+
+/// Which line-ending form a SQL body is hashed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlLineEndings {
+    /// LF-canonical: every CRLF collapsed to LF. What `checksum` uses.
+    Canonical,
+    /// The body exactly as an LF checkout stores it. Identical to `Canonical`
+    /// in practice, and computed separately so the legacy set stays explicit
+    /// rather than implied.
+    Lf,
+    /// The body as a `core.autocrlf=true` checkout stores it: every LF written
+    /// as CRLF.
+    Crlf,
+}
+
+impl SqlLineEndings {
+    fn apply(self, sql: &[u8]) -> Vec<u8> {
+        let canonical = to_lf(sql);
+        match self {
+            Self::Canonical | Self::Lf => canonical,
+            Self::Crlf => to_crlf(&canonical),
+        }
+    }
+}
+
+/// Drops the CR of every CRLF pair, leaving a lone CR (which `core.autocrlf`
+/// never introduces) untouched.
+fn to_lf(sql: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(sql.len());
+    let mut index = 0;
+    while index < sql.len() {
+        if sql[index] == b'\r' && sql.get(index + 1) == Some(&b'\n') {
+            index += 1;
+            continue;
+        }
+        out.push(sql[index]);
+        index += 1;
+    }
+    out
+}
+
+/// Expands every LF of an already-LF-canonical body back to CRLF.
+fn to_crlf(canonical: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(canonical.len());
+    for byte in canonical {
+        if *byte == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(*byte);
+    }
+    out
+}
+
+enum CanonicalStepSource {
+    Sql {
+        engine: Option<EngineScope>,
+        scope: StepScope,
+        sql: Vec<u8>,
+    },
+    Rust {
+        engine: Option<EngineScope>,
+        scope: StepScope,
+        hook_id: String,
+    },
+}
+
+fn migration_checksum(
+    migration: &SourceMigration,
+    step_sources: &[CanonicalStepSource],
+    line_endings: SqlLineEndings,
+) -> Result<Vec<u8>, String> {
+    let steps = step_sources
+        .iter()
+        .map(|source| match source {
+            CanonicalStepSource::Sql { engine, scope, sql } => CanonicalStep::Sql {
+                engine: *engine,
+                scope: *scope,
+                sql_blake3: checksum_hex(
+                    &ChecksumAlgorithm::Blake3.digest(&line_endings.apply(sql)),
+                ),
+            },
+            CanonicalStepSource::Rust {
+                engine,
+                scope,
+                hook_id,
+            } => CanonicalStep::Rust {
+                engine: *engine,
+                scope: *scope,
+                hook_id: hook_id.clone(),
+            },
+        })
+        .collect();
+
+    let canonical = CanonicalMigration {
+        version: migration.version,
+        description: migration.description.clone(),
+        steps,
+    };
+    let canonical_bytes = serde_json::to_vec(&canonical).map_err(|error| {
+        format!(
+            "failed to serialize canonical migration {:04}: {error}",
+            migration.version
+        )
+    })?;
+    Ok(migration.checksum_algo.digest(&canonical_bytes))
 }
 
 fn infer_filename(migration: &SourceMigration, key: &str) -> String {
@@ -650,5 +788,104 @@ file = "0021.sql"
 
         assert_eq!(baseline.through_version, 25);
         assert_eq!(baseline.file, "postgres/baselines/0025_baseline.sql");
+    }
+
+    const LINE_ENDING_MANIFEST: &str = r#"
+format_version = 1
+starting_version = 21
+
+[[migration]]
+version = 21
+description = "line ending probe"
+
+[[migration.steps]]
+kind = "sql"
+file = "0021.sql"
+"#;
+
+    /// Writes a one-migration source tree whose SQL body carries `line_ending`,
+    /// standing in for the two ways a checkout can land the same commit.
+    fn line_ending_source_tree(body: &str, line_ending: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("migrations")).unwrap();
+        fs::write(
+            source_manifest_path(dir.path()),
+            LINE_ENDING_MANIFEST.replace('\n', line_ending),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("0021.sql"),
+            body.replace('\n', line_ending).into_bytes(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn compiled_probe(body: &str, line_ending: &str) -> CompiledMigration {
+        let dir = line_ending_source_tree(body, line_ending);
+        let mut bundle = compile_source_bundle(dir.path()).unwrap();
+        bundle.catalog.migrations.remove(0)
+    }
+
+    #[test]
+    fn crlf_and_lf_migration_bodies_share_one_checksum() {
+        let body = "CREATE TABLE probe (id INTEGER PRIMARY KEY);\nDROP TABLE probe;\n";
+        let lf = compiled_probe(body, "\n");
+        let crlf = compiled_probe(body, "\r\n");
+
+        // The whole point: a Windows runner checkout (core.autocrlf=true) and an
+        // LF checkout of the same commit must record the same ledger value.
+        assert_eq!(
+            checksum_hex(&lf.checksum),
+            checksum_hex(&crlf.checksum),
+            "CRLF and LF bodies must hash identically"
+        );
+        // Both builds must also offer the same amnesty set, so either one can
+        // open a database the other wrote before the canonicalization.
+        assert_eq!(
+            lf.legacy_line_ending_checksums,
+            crlf.legacy_line_ending_checksums
+        );
+        assert_eq!(
+            lf.legacy_line_ending_checksums.len(),
+            1,
+            "a multi-line body has exactly one non-canonical legacy form"
+        );
+        assert!(
+            !lf.legacy_line_ending_checksums.contains(&lf.checksum),
+            "the canonical value is never listed as legacy"
+        );
+    }
+
+    #[test]
+    fn legacy_amnesty_covers_the_crlf_ledger_value_only() {
+        let body = "CREATE TABLE probe (id INTEGER PRIMARY KEY);\nDROP TABLE probe;\n";
+        let migration = compiled_probe(body, "\n");
+        let legacy = migration.legacy_line_ending_checksums[0].clone();
+
+        assert!(migration.is_legacy_line_ending_checksum("blake3", &legacy));
+        // A different algorithm name, or any other value, is not amnestied: this
+        // must not become a general escape hatch from checksum validation.
+        assert!(!migration.is_legacy_line_ending_checksum("sha256", &legacy));
+        assert!(!migration.is_legacy_line_ending_checksum("blake3", &[0u8; 32]));
+
+        // A genuinely different body shares neither the canonical value nor the
+        // amnesty.
+        let edited = compiled_probe(
+            "CREATE TABLE probe (id INTEGER PRIMARY KEY, extra TEXT);\nDROP TABLE probe;\n",
+            "\n",
+        );
+        assert_ne!(migration.checksum, edited.checksum);
+        assert!(!edited.is_legacy_line_ending_checksum("blake3", &legacy));
+        assert!(!migration.is_legacy_line_ending_checksum("blake3", &edited.checksum));
+    }
+
+    #[test]
+    fn canonicalization_only_touches_crlf_pairs() {
+        assert_eq!(to_lf(b"a\r\nb\r\n"), b"a\nb\n");
+        assert_eq!(to_lf(b"a\nb\n"), b"a\nb\n");
+        // A lone CR is data, not a line ending core.autocrlf would have written.
+        assert_eq!(to_lf(b"a\rb"), b"a\rb");
+        assert_eq!(to_crlf(b"a\nb\n"), b"a\r\nb\r\n");
     }
 }
