@@ -1129,6 +1129,21 @@ fn stream_owned_result(
     )
 }
 
+/// The newsgroups a connection for this lease has to be pointed at.
+///
+/// A batch is cut around its first work's compatibility and every work that
+/// joins it is admitted against that, so the first work's groups are the
+/// lease's groups. They are not decoration: a server that answers a
+/// message-id fetch only after a GROUP prologue gets none from an empty list,
+/// and a freshly dialled connection has no candidate for its initial group
+/// probe.
+fn lease_groups(lease: &DownloadBatchLease) -> &[String] {
+    match lease.works.first() {
+        Some(work) => work.groups.as_ref(),
+        None => &[],
+    }
+}
+
 /// Run one lease to its park on this worker's connection.
 ///
 /// Returns the commands that reached the worker mid-lease and belong to the
@@ -1166,7 +1181,7 @@ fn run_owned_blocking_download_lane(
     // rather than redialled; only a socket that cannot be re-pointed is let
     // go, and the dial below then replaces it.
     if let Some(cached) = cached_lane.as_mut()
-        && let Err(error) = cached.adopt_groups(&[])
+        && let Err(error) = cached.adopt_groups(lease_groups(&lease))
     {
         debug!(
             server = cached.lane.server_id().0,
@@ -1186,7 +1201,7 @@ fn run_owned_blocking_download_lane(
         );
         match acquire_owned_lane_through_contention(
             &nntp,
-            &[],
+            lease_groups(&lease),
             &lease.dial_exclude_servers,
             initial_estimate,
         ) {
@@ -2593,6 +2608,27 @@ mod routing_tests {
             shared.claim_worker_for(&run),
             Some(1),
             "the warm connection is preferred over a fresh dial whatever its groups"
+        );
+    }
+
+    /// Whatever connection a lease lands on is pointed at that lease's own
+    /// newsgroups. An empty list is not the same thing: a server that answers
+    /// a message-id fetch only after a GROUP prologue is sent none, and a
+    /// fresh dial has no candidate for its initial group probe.
+    #[test]
+    fn a_lease_carries_the_newsgroups_its_work_was_posted_to() {
+        let lease = test_lease(JobId(7), 1, Vec::new(), vec![tail_work(1, 0)]);
+        assert_eq!(
+            lease_groups(&lease),
+            ["alt.binaries.test".to_string()],
+            "the lane is opened for the lease's groups"
+        );
+
+        let run = test_run(&test_client(), Vec::new());
+        assert_eq!(
+            lease_groups(&run.initial_lease),
+            ["alt.binaries.test".to_string()],
+            "a run carries them through to the worker"
         );
     }
 
