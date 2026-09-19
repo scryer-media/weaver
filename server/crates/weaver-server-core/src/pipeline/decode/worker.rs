@@ -889,6 +889,12 @@ impl Pipeline {
         expected_crc: u32,
         actual_crc: u32,
     ) -> Result<bool, String> {
+        // A replacement can only come from a server that has not already
+        // produced the doubted bytes. When none remains the re-fetch is
+        // refused up front and the file is left to repair; queueing it
+        // would strand work no lane may take.
+        let server_count = self.nntp.pool().server_count();
+        let retention_excludes = self.job_retention_excludes(file_id.job_id);
         let Some(file_candidates) = self.unverified_segments.get(&file_id) else {
             return Ok(false);
         };
@@ -925,6 +931,23 @@ impl Pipeline {
                 &provenance.exclude_servers,
                 provenance.source_server_idx,
             );
+            if server_count > 0
+                && Self::unavailable_server_count_from_excludes(
+                    server_count,
+                    &exclude_servers,
+                    &retention_excludes,
+                ) >= server_count
+            {
+                warn!(
+                    file_id = %file_id,
+                    segment = %segment_id,
+                    exclude_servers = ?exclude_servers,
+                    expected_crc = format_args!("{expected_crc:08x}"),
+                    actual_crc = format_args!("{actual_crc:08x}"),
+                    "whole-file CRC recovery has no server left to re-fetch from; leaving the file to repair"
+                );
+                return Ok(false);
+            }
             queued.push((
                 segment_id,
                 retry_count + 1,
@@ -1305,19 +1328,25 @@ impl Pipeline {
             self.metrics
                 .segments_failed_permanent
                 .fetch_add(1, Ordering::Relaxed);
+            // A whole-file CRC recovery that cannot re-fetch one of its
+            // segments is abandoned, not escalated: the segment is booked as
+            // damage like any other and repair decides the file's fate. The
+            // file was already marked incomplete when recovery began, so
+            // completion cannot accept the doubted bytes on its own.
             if let Some((expected_crc, actual_crc)) = self
                 .file_crc_recoveries
                 .get(&segment_id.file_id)
                 .filter(|recovery| recovery.pending_segments.contains(&segment_id))
                 .map(|recovery| (recovery.expected_crc, recovery.last_actual_crc))
             {
-                self.fail_job(
-                    job_id,
-                    format!(
-                        "whole-file CRC32 recovery exhausted for {segment_id}: expected {expected_crc:08x}, last actual {actual_crc:08x}; final decode error: {error}"
-                    ),
+                self.file_crc_recoveries.remove(&segment_id.file_id);
+                warn!(
+                    segment = %segment_id,
+                    error,
+                    expected_crc = format_args!("{expected_crc:08x}"),
+                    last_actual_crc = format_args!("{actual_crc:08x}"),
+                    "whole-file CRC32 recovery could not re-fetch a segment; leaving the file to repair"
                 );
-                return;
             }
             self.book_terminal_segment(segment_id, SegmentTerminalState::DecodeExhausted);
             return;

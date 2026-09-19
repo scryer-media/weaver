@@ -1968,6 +1968,104 @@ async fn completed_file_crc32_mismatch_fails_before_persisting_completion() {
 }
 
 #[tokio::test]
+async fn single_server_whole_file_crc_mismatch_skips_recovery_and_leaves_the_file_to_repair() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let job_id = JobId(20901);
+    let filename = "payload.bin";
+    let expected_crc = par2_rs::checksum::crc32(b"abcdefgh");
+    let spec = two_segment_standalone_job_spec("CRC Recovery Solo", filename, 4, 4);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        b"abcd",
+        filename,
+        Some(expected_crc),
+        true,
+        Some(0),
+        Vec::new(),
+    )
+    .await;
+    submit_decoded_segment_from_server(
+        &mut pipeline,
+        file_id,
+        1,
+        4,
+        b"WXYZ",
+        filename,
+        Some(expected_crc),
+        false,
+        Some(0),
+        Vec::new(),
+    )
+    .await;
+
+    // The only server already produced the doubted bytes, so no re-fetch is
+    // queued: the mismatch falls through to the repair decision, which with
+    // no PAR2 in this job is the whole-file CRC failure.
+    assert!(!pipeline.file_crc_recoveries.contains_key(&file_id));
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| state.download_queue.is_empty())
+    );
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    assert!(matches!(
+        &status,
+        JobStatus::Failed { error } if error.contains("whole-file CRC32 mismatch")
+    ));
+}
+
+#[tokio::test]
+async fn crc_recovery_that_cannot_refetch_leaves_the_file_to_repair_instead_of_failing_the_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let job_id = JobId(20902);
+    let spec = segmented_job_spec("CRC Recovery Abandoned", "broken.bin", &[64, 4096]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let segment_id = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    pipeline.file_crc_recoveries.insert(
+        file_id,
+        crate::pipeline::FileCrcRecoveryState {
+            pending_segments: std::collections::HashSet::from([segment_id]),
+            expected_crc: 1,
+            last_actual_crc: 2,
+        },
+    );
+
+    pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+
+    assert!(!pipeline.file_crc_recoveries.contains_key(&file_id));
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(64)
+    );
+}
+
+#[tokio::test]
 async fn whole_file_crc_mismatch_recovers_unverified_nonzero_segment_from_alternate_server() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
