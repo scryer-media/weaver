@@ -1340,6 +1340,18 @@ impl Pipeline {
                 .map(|recovery| (recovery.expected_crc, recovery.last_actual_crc))
             {
                 self.file_crc_recoveries.remove(&segment_id.file_id);
+                // The doubted bytes were delivered before the mismatch was
+                // known, so the assembly still counts the segment as received.
+                // Delivery is terminal in the ledger: unless the ordinal is
+                // withdrawn first, the booking below is a no-op, the file
+                // reads as complete, and the known-corrupt bytes ship.
+                if let Some(file_asm) = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .and_then(|state| state.assembly.file_mut(segment_id.file_id))
+                {
+                    file_asm.retract_segment(segment_id.segment_number);
+                }
                 warn!(
                     segment = %segment_id,
                     error,

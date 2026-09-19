@@ -8,7 +8,7 @@ use crate::jobs::types::load_duplicate_summaries_chunked;
 
 enum HistoryQueryPlan {
     Empty,
-    Query(weaver_server_core::HistoryFilter),
+    Query(Box<weaver_server_core::HistoryFilter>),
 }
 
 /// Upper bound on job-event rows loaded for the polled detail snapshot. Large
@@ -699,7 +699,7 @@ fn history_query_plan(
     };
 
     let Some(filter) = filter else {
-        return HistoryQueryPlan::Query(history_filter);
+        return HistoryQueryPlan::Query(Box::new(history_filter));
     };
 
     if let Some(states) = &filter.states {
@@ -742,7 +742,7 @@ fn history_query_plan(
         }
     });
 
-    HistoryQueryPlan::Query(history_filter)
+    HistoryQueryPlan::Query(Box::new(history_filter))
 }
 
 fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> HistoryPage {

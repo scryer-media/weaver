@@ -265,6 +265,29 @@ impl FileAssembly {
         self.received_bytes = decoded_len;
     }
 
+    /// Withdraw a segment the assembly already holds, because the bytes it
+    /// delivered are now known not to be trustworthy.
+    ///
+    /// A whole-file CRC32 recovery that cannot re-fetch a doubted segment ends
+    /// with that segment's bytes still on disk. Leaving its ordinal marked
+    /// received would let the file read as complete and its failure be booked
+    /// as nothing, since delivery is a terminal state held in this bitmap. The
+    /// ordinal goes back to missing so the segment can be booked as damage and
+    /// repair decides the file's fate. Returns whether anything was withdrawn.
+    pub fn retract_segment(&mut self, segment_number: u32) -> bool {
+        if !self.has_segment(segment_number) {
+            return false;
+        }
+        self.received.set(segment_number as usize, false);
+        if let Some((_, len)) = self.placements.remove(&segment_number) {
+            self.received_bytes = self.received_bytes.saturating_sub(len as u64);
+        }
+        if let Some(ready) = &mut self.repair_output_ready {
+            *ready = false;
+        }
+        true
+    }
+
     /// Whether one specific segment has been received.
     ///
     /// Out-of-range segment numbers read as not received rather than panicking:
