@@ -113,11 +113,20 @@ export function ProvidersBlock() {
                 />
               </div>
               {/* The counts never leave: the state word answers "why", and the
-                  fraction under it stays the thing you can check. */}
-              <div className="flex flex-wrap items-baseline justify-between gap-x-2 font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
-                {activity.cause ? <span className="min-w-0">{activity.cause}</span> : null}
-                <span className="ml-auto flex-none">{activity.fraction}</span>
+                  summary under the bar stays the thing you can check. The cause
+                  sits below it in the state word's own colour, so the two read
+                  as one statement. */}
+              <div className="text-center font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
+                {activity.fraction}
               </div>
+              {activity.cause ? (
+                <div
+                  className="font-wv-mono text-[10.5px] leading-[1.35] text-wv-muted"
+                  style={{ color: ACTIVITY_TONE[activity.tone] }}
+                >
+                  {activity.cause}
+                </div>
+              ) : null}
             </div>
           );
         })
