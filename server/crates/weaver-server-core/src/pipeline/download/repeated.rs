@@ -145,7 +145,6 @@ struct CachedFailure {
     source: Option<usize>,
     groups: Arc<[String]>,
     requested_excludes: Vec<usize>,
-    proved_excludes: Vec<usize>,
     expires: Option<Instant>,
     _memory: Option<ProcessMemoryPermit>,
 }
@@ -280,11 +279,17 @@ impl RepeatedArticles {
                     && failure.requested_excludes == excludes
                     && failure.expires.is_none_or(|until| Instant::now() < until) =>
             {
+                // The replay reports the article's own ledger, exactly as
+                // the fetch that produced the entry did, and carries the
+                // proof as `source`. Folding the source into the ledger here
+                // would hand completion a set that already names the refusing
+                // server, which reads as a retry that learned nothing and
+                // books the segment after a single server's 430.
                 return Reply {
                     data: Err(failure.error.clone()),
                     attempts: Vec::new(),
                     source: failure.source,
-                    excludes: failure.proved_excludes.clone(),
+                    excludes: work.exclude_servers.clone(),
                 };
             }
             Some(Entry::Fatal(error)) => {
@@ -360,23 +365,12 @@ impl RepeatedArticles {
                     }
                     _ => None,
                 };
-                let mut proved_excludes = work.exclude_servers.clone();
-                for attempt in &reply.attempts {
-                    if matches!(
-                        attempt.outcome,
-                        weaver_nntp::client::FetchAttemptOutcome::NotFound
-                    ) && !proved_excludes.contains(&attempt.server_idx)
-                    {
-                        proved_excludes.push(attempt.server_idx);
-                    }
-                }
                 *state = Some(Entry::Failure(CachedFailure {
                     error: cached_error,
                     generation,
                     source: reply.source,
                     groups: work.groups.clone(),
                     requested_excludes: excludes.to_vec(),
-                    proved_excludes,
                     expires,
                     _memory: Some(reservation),
                 }));
@@ -629,7 +623,6 @@ mod tests {
             source: Some(0),
             groups: work.groups.clone(),
             requested_excludes: Vec::new(),
-            proved_excludes: vec![0],
             expires: None,
             _memory: None,
         };
@@ -656,7 +649,12 @@ mod tests {
                 ..
             }))
         ));
-        assert_eq!(reply.excludes, vec![0]);
+        assert_eq!(
+            reply.excludes,
+            Vec::<usize>::new(),
+            "the replay reports the article's own ledger; the proof rides as the source"
+        );
+        assert_eq!(reply.source, Some(0));
         assert!(reply.attempts.is_empty());
         {
             let mut state = cache.entries[&work.message_id].lock().await;
@@ -668,9 +666,10 @@ mod tests {
         let reply = cache.fetch(&work, &[1], &client, 7).await;
         assert_eq!(
             reply.excludes,
-            vec![0],
+            Vec::<usize>::new(),
             "a transport avoidance hint is not a missing-article proof"
         );
+        assert_eq!(reply.source, Some(0));
         let reply = cache.fetch(&work, &[], &client, 8).await;
         assert!(matches!(
             reply.data,
@@ -696,7 +695,6 @@ mod tests {
             source: None,
             groups: work.groups.clone(),
             requested_excludes: Vec::new(),
-            proved_excludes: Vec::new(),
             expires: Some(Instant::now() - Duration::from_millis(1)),
             _memory: None,
         };

@@ -1071,15 +1071,17 @@ impl Pipeline {
                 } else {
                     excluded_servers.clone()
                 };
-                // A 430 that adds nothing to the exclusion set taught the
-                // retry nothing: the next attempt re-enters selection with
-                // the same answer and comes back the same way, at zero delay,
-                // without ever spending retry budget. Treat it as terminal
-                // rather than spin, and count it — the article is not
-                // necessarily missing everywhere, but nothing on this path
-                // can still prove otherwise.
-                let article_not_found_learned_nothing = failure.kind
-                    == DownloadFailureKind::ArticleNotFound
+                // A 430 from a server the article already excluded taught
+                // the retry nothing: the next attempt re-enters selection
+                // with the same set, comes back the same way at zero delay,
+                // and — because a sourced 430 preserves retry budget — would
+                // do so forever. Treat it as terminal rather than spin, and
+                // count it: the article is not necessarily missing
+                // everywhere, but nothing on this path can still prove
+                // otherwise. A 430 without a source spends budget on each
+                // retry and cannot spin, so it keeps retrying with the set it
+                // has.
+                let article_not_found_learned_nothing = source_not_found
                     && !retry_exclude_servers.is_empty()
                     && retry_exclude_servers.len() == excluded_servers.len();
                 let article_not_found_exhausted = failure.kind
