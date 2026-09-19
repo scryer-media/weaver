@@ -183,6 +183,13 @@ struct UpdateCheckInner {
     etag: std::sync::Mutex<Option<String>>,
     /// Whether this process polls at all.
     enabled: bool,
+    /// Held for the length of one check, so the background loop and an
+    /// operator's "check now" never fetch at the same time.
+    check_lock: tokio::sync::Mutex<()>,
+    /// Until when the release API has asked us to back off. An operator's
+    /// check is refused inside this window; the background loop already
+    /// sleeps through it.
+    backoff_until: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl UpdateCheckService {
@@ -230,6 +237,8 @@ impl UpdateCheckService {
                 status: tx,
                 etag: std::sync::Mutex::new(etag),
                 enabled,
+                check_lock: tokio::sync::Mutex::new(()),
+                backoff_until: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -274,6 +283,38 @@ impl UpdateCheckService {
         })
     }
 
+    /// Check now, on an operator's request, and return what the check found.
+    ///
+    /// One extra check, not a reset of the cadence: the background loop keeps
+    /// its own schedule. It fetches nothing while the release API has asked us
+    /// to back off, and a request that arrives while a check is already
+    /// running waits for that check rather than starting a second one. Either
+    /// way the caller gets the current status, whose `last_error` says why
+    /// nothing new was learned.
+    pub async fn check_now(&self) -> UpdateStatus {
+        if self.inner.enabled && !self.backing_off() {
+            match self.inner.check_lock.try_lock() {
+                Ok(_guard) => {
+                    if let Err(error) = self.check_once().await {
+                        debug!(error = %error, "requested release check failed");
+                    }
+                }
+                Err(_) => drop(self.inner.check_lock.lock().await),
+            }
+        }
+        self.status()
+    }
+
+    /// Whether the release API's last answer asked us to wait, and that wait
+    /// has not run out yet.
+    fn backing_off(&self) -> bool {
+        self.inner
+            .backoff_until
+            .lock()
+            .expect("update-check backoff poisoned")
+            .is_some_and(|until| tokio::time::Instant::now() < until)
+    }
+
     /// Run one check. Returns the server-requested backoff, if any.
     ///
     /// The `Err` arm reports the fetch failure to the caller for logging; the
@@ -282,6 +323,13 @@ impl UpdateCheckService {
         if !self.inner.enabled {
             return Ok(None);
         }
+        let _guard = self.inner.check_lock.lock().await;
+        self.check_once().await
+    }
+
+    /// One fetch and the status transition it produces. Callers hold
+    /// `check_lock`.
+    async fn check_once(&self) -> Result<Option<Duration>, String> {
         self.publish(|status| status.checking = true);
 
         let etag = self
@@ -339,6 +387,15 @@ impl UpdateCheckService {
             Ok(FetchOutcome::RateLimited { retry_after }) => {
                 // Rate limiting is not a state-invalidating error: the last good
                 // release survives, we simply record when we tried and back off.
+                let wait = retry_after
+                    .unwrap_or(CHECK_INTERVAL)
+                    .clamp(MIN_CHECK_INTERVAL, MAX_RETRY_AFTER);
+                *self
+                    .inner
+                    .backoff_until
+                    .lock()
+                    .expect("update-check backoff poisoned") =
+                    Some(tokio::time::Instant::now() + wait);
                 self.publish(|status| {
                     status.checking = false;
                     status.last_checked_at_epoch_ms = Some(now);
