@@ -53,7 +53,12 @@ export function providerActivityLabel(
     case "disabled":
       return {
         word: t("next.rail.activity.disabled"),
-        cause: t("next.rail.cause.disabled"),
+        // Only a runtime quarantine reaches the rail: a server switched off in
+        // settings never enters the pool at all. So this is a login failure or
+        // a run of errors, and it carries a deadline like any other holdoff.
+        cause: remaining
+          ? t("next.rail.cause.disabledRetry", { time: remaining })
+          : t("next.rail.cause.disabled"),
         fraction: counts,
         tone: "error",
       };

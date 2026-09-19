@@ -104,8 +104,19 @@ test("degraded and disabled each carry their own cause", () => {
     (({ word, cause, tone }) => ({ word, cause, tone }))(
       providerActivityLabel(provider({ activity: "disabled" }), t, NOW),
     ),
-    { word: "disabled", cause: "disabled in settings", tone: "error" },
+    { word: "disabled", cause: "paused after login or repeated failures", tone: "error" },
   );
+});
+
+test("a quarantined server counts down to its retry like any other holdoff", () => {
+  const quarantined = providerActivityLabel(
+    provider({ activity: "disabled", activityUntilEpochMs: NOW + 45_000 }),
+    t,
+    NOW,
+  );
+  assert.equal(quarantined.word, "disabled");
+  assert.equal(quarantined.cause, "paused after login or repeated failures, retrying in 45s");
+  assert.equal(quarantined.tone, "error");
 });
 
 test("held-open connections read as preparing, with the repair fetch as the cause", () => {

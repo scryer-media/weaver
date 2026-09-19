@@ -1555,6 +1555,16 @@ type ProviderConnections {
 	The server's connection limit.
 	"""
 	max: Int!
+	"""
+	Sockets connected right now, the same reading as
+	`ServerHealth.connectionsOpen`.
+	"""
+	open: Int!
+	"""
+	Of those, sockets carrying a request, the same reading as
+	`ServerHealth.connectionsBusy`.
+	"""
+	busy: Int!
 }
 
 """

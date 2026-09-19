@@ -1085,6 +1085,8 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       providerConnections {
         label
         active
+        open
+        busy
         max
       }
     }
