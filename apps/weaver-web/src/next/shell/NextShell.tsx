@@ -7,6 +7,8 @@ import { authHeaders } from "@/graphql/client";
 import { signOut } from "@/lib/logout";
 import { setUiVariant } from "@/lib/ui-variant";
 import { cn } from "@/lib/utils";
+import { upgradesInApp } from "@/features/updates/application-upgrade";
+import { useApplicationUpgradeStatus } from "@/features/updates/application-upgrade-card";
 import { useNextData } from "../data/next-data";
 import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
@@ -85,6 +87,7 @@ export function NextShell({
 }) {
   const t = useTranslate();
   const { version, update, queue, historyCount, connection } = useNextData();
+  const upgradeInApp = upgradesInApp(useApplicationUpgradeStatus());
   const [navOpen, setNavOpen] = useState(false);
   const { pathname } = useLocation();
   const loginEnabled = useLoginEnabled();
@@ -178,7 +181,14 @@ export function NextShell({
         {railMiddle}
         <div className="mt-auto flex flex-none flex-col">{railFooter}</div>
       </div>
-      {update === undefined ? null : <UpdateBlock version={update.version} url={update.url} />}
+      {update === undefined ? null : (
+        <UpdateBlock
+          version={update.version}
+          url={update.url}
+          inApp={upgradeInApp}
+          onNavigate={onDismiss}
+        />
+      )}
       <ThroughputBlock />
       <InterfaceBlock />
     </>
@@ -346,29 +356,61 @@ function SignOutControl() {
  * takes the accent ground and the ping — the same treatment as the one other
  * control the rail insists on — because an update is easy to miss and cheap to
  * act on.
+ *
+ * An installation that upgrades itself is taken to System Info's installer;
+ * one something else manages (a container, a package manager) gets the release
+ * page on GitHub, since the upgrade has to happen there.
  */
-function UpdateBlock({ version, url }: { version: string; url: string }) {
+function UpdateBlock({
+  version,
+  url,
+  inApp,
+  onNavigate,
+}: {
+  version: string;
+  url: string;
+  inApp: boolean;
+  onNavigate?: () => void;
+}) {
   const t = useTranslate();
+  const className =
+    "wv-ping flex items-center gap-3 bg-wv-accent px-[12px] py-[11px] text-wv-on-accent hover:bg-wv-accent-hover";
+  const content = (
+    <>
+      <Icon name="update" size={22} className="flex-none" />
+      <span className="flex min-w-0 flex-col gap-[3px]">
+        <span className="text-[13.5px] leading-none font-semibold tracking-[-0.005em]">
+          {t("next.shell.updateAvailable")}
+        </span>
+        <span className="truncate font-wv-mono text-[11px] leading-none">
+          {t("next.shell.updateVersion", { version })}
+        </span>
+      </span>
+      {inApp ? null : <Icon name="external" size={15} className="ml-auto flex-none" />}
+    </>
+  );
   return (
     <div className="flex-none border-t border-wv-line-strong px-[10px] py-[10px]">
-      <a
-        href={url}
-        target="_blank"
-        rel="noreferrer noopener"
-        aria-label={t("update.newVersionAria", { version })}
-        className="wv-ping flex items-center gap-3 bg-wv-accent px-[12px] py-[11px] text-wv-on-accent hover:bg-wv-accent-hover"
-      >
-        <Icon name="update" size={22} className="flex-none" />
-        <span className="flex min-w-0 flex-col gap-[3px]">
-          <span className="text-[13.5px] leading-none font-semibold tracking-[-0.005em]">
-            {t("next.shell.updateAvailable")}
-          </span>
-          <span className="truncate font-wv-mono text-[11px] leading-none">
-            {t("next.shell.updateVersion", { version })}
-          </span>
-        </span>
-        <Icon name="external" size={15} className="ml-auto flex-none" />
-      </a>
+      {inApp ? (
+        <NavLink
+          to="/system-info"
+          onClick={onNavigate}
+          aria-label={t("update.newVersionAria", { version })}
+          className={className}
+        >
+          {content}
+        </NavLink>
+      ) : (
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer noopener"
+          aria-label={t("update.newVersionAria", { version })}
+          className={className}
+        >
+          {content}
+        </a>
+      )}
     </div>
   );
 }

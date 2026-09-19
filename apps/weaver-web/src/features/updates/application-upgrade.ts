@@ -63,3 +63,12 @@ export function downloadPercent(run: ApplicationUpgradeRun): number | undefined 
   }
   return Math.min(100, Math.round((run.downloadedBytes / run.totalBytes) * 100));
 }
+
+/**
+ * Whether a release notice should send the operator to the in-app installer
+ * rather than the GitHub release page: this installation upgrades itself, and
+ * there is a release to install or an install already under way.
+ */
+export function upgradesInApp(status: ApplicationUpgradeStatus | undefined): boolean {
+  return Boolean(status?.eligible && (status.updateAvailable || status.activeRun));
+}
