@@ -291,6 +291,22 @@ export const UPDATE_STATUS_SUBSCRIPTION = gql`
   }
 `;
 
+export const CHECK_FOR_UPDATES_MUTATION = gql`
+  mutation CheckForUpdates {
+    checkForUpdates {
+      currentVersion
+      latestVersion
+      updateAvailable
+      releaseUrl
+      publishedAtEpochMs
+      checking
+      lastCheckedAtEpochMs
+      lastSuccessfulCheckAtEpochMs
+      lastError
+    }
+  }
+`;
+
 const APPLICATION_UPGRADE_FIELDS = `
   currentVersion
   updateVersion

@@ -28,6 +28,18 @@ impl SystemMutation {
         Ok(listing.into())
     }
 
+    /// Check for a new release now instead of waiting for the next scheduled
+    /// check, and return what it found.
+    ///
+    /// Nothing is fetched while the release API has asked Weaver to back off,
+    /// or when checks are turned off; the returned status's `lastError` says
+    /// which.
+    #[graphql(guard = "AdminGuard")]
+    async fn check_for_updates(&self, ctx: &Context<'_>) -> Result<UpdateStatus> {
+        let service = ctx.data::<weaver_server_core::update_check::UpdateCheckService>()?;
+        Ok(service.check_now().await.into())
+    }
+
     /// Install the release the checker is currently advertising.
     ///
     /// Admin-only, and the input has to echo the notice the UI displayed: the

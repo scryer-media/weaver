@@ -9,6 +9,8 @@ import {
   type DuplicateAction,
   type DuplicatePolicy,
 } from "@/features/duplicates/duplicate-policy";
+import { useUpdateCheck } from "@/features/updates/use-update-check";
+import { SecondaryButton } from "../../../components/controls";
 import {
   SettingsBlocks,
   useDraft,
@@ -156,6 +158,20 @@ export function GeneralPanel() {
 
   const blocks: (SettingsBlock | null)[] = [
     { kind: "section", id: "interface", title: t("next.general.interface"), fields: interfaceFields },
+    {
+      kind: "section",
+      id: "updates",
+      title: t("next.general.updates"),
+      fields: [
+        {
+          id: "checkForUpdates",
+          label: t("next.general.checkForUpdates"),
+          help: t("next.general.checkForUpdatesHelp"),
+          keywords: "update upgrade release version",
+          control: { kind: "custom", control: <UpdateCheck /> },
+        },
+      ],
+    },
     values
       ? {
           kind: "section",
@@ -299,4 +315,20 @@ export function GeneralPanel() {
   ];
 
   return <SettingsBlocks blocks={blocks} loading={fetching && !data} />;
+}
+
+/** A button that asks the release checker to look now, and what it last found. */
+function UpdateCheck() {
+  const t = useTranslate();
+  const { busy, summary, failed, check } = useUpdateCheck();
+  return (
+    <div className="flex min-w-0 flex-col items-start gap-2">
+      <SecondaryButton icon="refresh" disabled={busy} onClick={check}>
+        {t("next.general.checkNow")}
+      </SecondaryButton>
+      <span role="status" className={failed ? "text-[12.5px] text-wv-error" : "text-[12.5px] text-wv-dim"}>
+        {summary}
+      </span>
+    </div>
+  );
 }
