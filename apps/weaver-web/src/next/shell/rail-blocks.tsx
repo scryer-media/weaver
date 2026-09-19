@@ -24,12 +24,25 @@ import { countLabel, providerStateLabel } from "../i18n/labels";
  * it under whatever a screen picks.
  */
 
-/** The rail's colour for each activity tone, resolved once. */
-const ACTIVITY_TONE: Record<ProviderActivity["tone"], string> = {
-  accent: WV.accent,
+/** The colour of the state word for each activity tone; the bars keep their own. */
+const ACTIVITY_TONE: Record<ProviderActivity["tone"], string | undefined> = {
+  accent: undefined,
   warn: WV.warn,
-  inert: WV.inert,
+  inert: undefined,
 };
+
+/** Connected sockets, whether or not they carry a request. */
+const OPEN_COLOR = WV.green;
+/** Sockets with a request in flight, drawn over the connected ones. */
+const BUSY_COLOR = WV.info;
+
+function connectionPercent(count: number, provider: ProviderHealth): number {
+  const max = provider.connectionsMax || provider.connectionsConfigured;
+  if (!max) {
+    return 0;
+  }
+  return (count / max) * 100;
+}
 
 export function providerLoadPercent(provider: ProviderHealth): number {
   const max = provider.connectionsMax || provider.connectionsConfigured;
@@ -70,20 +83,35 @@ export function ProvidersBlock() {
         </>
       ) : (
         providers.map((provider) => {
-          const load = providerLoadPercent(provider);
           const activity = providerActivityLabel(provider, t, now);
+          const open = connectionPercent(provider.connectionsOpen, provider);
+          const busy = connectionPercent(provider.connectionsBusy, provider);
           return (
             <div key={`${provider.host}:${provider.port}`} className="flex flex-col gap-[5px]">
               <div className="flex items-baseline justify-between gap-2 text-[12.5px]">
                 <span className="truncate text-wv-tertiary">{provider.host}</span>
                 <span
                   className="flex-none font-wv-mono text-[11px] text-wv-muted"
+                  style={{ color: ACTIVITY_TONE[activity.tone] }}
                   title={activity.fraction}
                 >
                   {activity.word}
                 </span>
               </div>
-              <Bar percent={load} color={ACTIVITY_TONE[activity.tone]} height={10} live />
+              {/* Two readings on one track: the connected sockets underneath,
+                  the ones carrying a request on top. Where the two part company
+                  is exactly where "1 / 100" used to look like a fault. */}
+              <div className="relative">
+                <Bar percent={open} color={OPEN_COLOR} height={10} live />
+                <Bar
+                  percent={busy}
+                  color={BUSY_COLOR}
+                  height={10}
+                  live
+                  className="absolute inset-0"
+                  style={{ backgroundImage: "none" }}
+                />
+              </div>
               {/* The counts never leave: the state word answers "why", and the
                   fraction under it stays the thing you can check. */}
               <div className="flex flex-wrap items-baseline justify-between gap-x-2 font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
@@ -171,7 +199,7 @@ export function useAttentionItems(): AttentionItem[] {
       text: t("next.attention.providerState", {
         host: provider.host,
         // The activity is the more specific of the two: a healthy server the
-        // provider is refusing reads as held back, not as healthy.
+        // provider is refusing reads as cooling, not as healthy.
         state: activity.word || providerStateLabel(t, provider.state),
       }),
       // Nothing the failure counters say explains a provider-side refusal, so

@@ -32,11 +32,11 @@ function provider(overrides: Partial<ProviderHealth> = {}): ProviderHealth {
   };
 }
 
-test("a running pool leads with the state word and keeps the leased fraction", () => {
+test("a running pool leads with the state word and keeps the counts", () => {
   const label = providerActivityLabel(provider(), t, NOW);
   assert.equal(label.word, "downloading");
   assert.equal(label.cause, null);
-  assert.equal(label.fraction, "39 / 100");
+  assert.equal(label.fraction, "38 active · 40 open · 100 max");
   assert.equal(label.tone, "accent");
 });
 
@@ -48,7 +48,7 @@ test("an idle pool says so rather than showing a zero", () => {
   );
   assert.equal(label.word, "idle");
   assert.equal(label.cause, null);
-  assert.equal(label.fraction, "0 / 100");
+  assert.equal(label.fraction, "0 active · 0 open · 100 max");
   assert.equal(label.tone, "inert");
 });
 
@@ -64,9 +64,9 @@ test("a provider refusing connections says so, and counts down to the retry", ()
     t,
     NOW,
   );
-  assert.equal(label.word, "held back");
-  assert.equal(label.cause, "provider refused more connections, retrying in 4m");
-  assert.equal(label.fraction, "1 / 100");
+  assert.equal(label.word, "cooling");
+  assert.equal(label.cause, "Too Many Connections, retrying in 4m");
+  assert.equal(label.fraction, "1 active · 1 open · 100 max");
   assert.equal(label.tone, "warn");
 });
 
@@ -76,7 +76,7 @@ test("a holdoff whose deadline has passed drops the countdown, not the cause", (
     t,
     NOW,
   );
-  assert.equal(label.cause, "provider refused more connections");
+  assert.equal(label.cause, "Too Many Connections");
 });
 
 test("a cooldown names the errors behind it and when it lifts", () => {
@@ -85,7 +85,7 @@ test("a cooldown names the errors behind it and when it lifts", () => {
     t,
     NOW,
   );
-  assert.equal(withDeadline.word, "cooling down");
+  assert.equal(withDeadline.word, "cooling");
   assert.equal(withDeadline.cause, "paused after repeated errors, resuming in 45s");
   assert.equal(withDeadline.tone, "warn");
 
@@ -104,27 +104,20 @@ test("degraded and disabled each carry their own cause", () => {
     (({ word, cause, tone }) => ({ word, cause, tone }))(
       providerActivityLabel(provider({ activity: "disabled" }), t, NOW),
     ),
-    { word: "off", cause: "switched off by the daemon", tone: "inert" },
+    { word: "disabled", cause: "disabled in settings", tone: "inert" },
   );
 });
 
-test("held-open connections read as preparing, and the cause counts them", () => {
+test("held-open connections read as preparing, with the repair fetch as the cause", () => {
   const many = providerActivityLabel(
     provider({ activity: "preparing", connectionsOpen: 8, connectionsBusy: 0 }),
     t,
     NOW,
   );
   assert.equal(many.word, "preparing");
-  assert.equal(many.cause, "8 connections held while the index is read");
-  assert.equal(many.fraction, "0 / 100");
+  assert.equal(many.cause, "fetching repair data");
+  assert.equal(many.fraction, "0 active · 8 open · 100 max");
   assert.equal(many.tone, "inert");
-
-  const one = providerActivityLabel(
-    provider({ activity: "preparing", connectionsOpen: 1, connectionsBusy: 0 }),
-    t,
-    NOW,
-  );
-  assert.equal(one.cause, "1 connection held while the index is read");
 });
 
 test("an activity the daemon has not taught the rail falls back to idle", () => {
@@ -137,5 +130,5 @@ test("a live maximum of zero falls back to the configured one", () => {
     t,
     NOW,
   );
-  assert.equal(label.fraction, "39 / 20");
+  assert.equal(label.fraction, "38 active · 40 open · 20 max");
 });

@@ -1,7 +1,6 @@
 import type { Translate } from "@/lib/context/translate-context";
 import type { ProviderHealth } from "./next-data";
 import { formatDuration } from "./format.ts";
-import { countLabel } from "../i18n/labels.ts";
 
 /** What the rail says about one server, once its state has had its say. */
 export interface ProviderActivity {
@@ -9,7 +8,7 @@ export interface ProviderActivity {
   word: string;
   /** One line saying why, for every state that is not simply running. */
   cause: string | null;
-  /** The raw counts, kept as the secondary reading. */
+  /** The raw counts — active, connected, maximum — kept as the secondary reading. */
   fraction: string;
   /** Which of the rail's colours the bar takes. */
   tone: "accent" | "warn" | "inert";
@@ -41,18 +40,21 @@ export function providerActivityLabel(
     provider.activityUntilEpochMs != null && provider.activityUntilEpochMs > now
       ? formatDuration((provider.activityUntilEpochMs - now) / 1000)
       : null;
-  // Which count belongs beside the maximum follows the state: while articles
-  // are moving, the leased connections are the honest reading; while the pool
-  // is held back, what matters is how few of the open sockets carry a request.
-  const busyFraction = `${provider.connectionsBusy} / ${max}`;
-  const activeFraction = `${provider.connectionsActive} / ${max}`;
+  // Two counts against one maximum: how many sockets are connected, and how
+  // many of those are carrying a request. A held-back pool is the case where
+  // they part company, and that gap is the whole story.
+  const counts = t("next.rail.counts", {
+    busy: provider.connectionsBusy,
+    open: provider.connectionsOpen,
+    max,
+  });
 
   switch (provider.activity) {
     case "disabled":
       return {
         word: t("next.rail.activity.disabled"),
         cause: t("next.rail.cause.disabled"),
-        fraction: busyFraction,
+        fraction: counts,
         tone: "inert",
       };
     case "cooling_down":
@@ -61,7 +63,7 @@ export function providerActivityLabel(
         cause: remaining
           ? t("next.rail.cause.coolingDownResume", { time: remaining })
           : t("next.rail.cause.coolingDown"),
-        fraction: busyFraction,
+        fraction: counts,
         tone: "warn",
       };
     case "over_limit":
@@ -70,28 +72,28 @@ export function providerActivityLabel(
         cause: remaining
           ? t("next.rail.cause.overLimitRetry", { time: remaining })
           : t("next.rail.cause.overLimit"),
-        fraction: busyFraction,
+        fraction: counts,
         tone: "warn",
       };
     case "degraded":
       return {
         word: t("next.rail.activity.degraded"),
         cause: t("next.rail.cause.degraded"),
-        fraction: busyFraction,
+        fraction: counts,
         tone: "warn",
       };
     case "preparing":
       return {
         word: t("next.rail.activity.preparing"),
-        cause: countLabel(t, "next.rail.cause.preparing", provider.connectionsOpen),
-        fraction: busyFraction,
+        cause: t("next.rail.cause.preparing"),
+        fraction: counts,
         tone: "inert",
       };
     case "downloading":
       return {
         word: t("next.rail.activity.downloading"),
         cause: null,
-        fraction: activeFraction,
+        fraction: counts,
         tone: "accent",
       };
     // A server the daemon has not classified is not worth inventing a word
@@ -100,7 +102,7 @@ export function providerActivityLabel(
       return {
         word: t("next.rail.idle"),
         cause: null,
-        fraction: activeFraction,
+        fraction: counts,
         tone: "inert",
       };
   }
