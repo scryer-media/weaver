@@ -2666,6 +2666,19 @@ async fn a_parked_chase_does_not_block_another_jobs_extraction() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
+/// Take a job out of the dispatch ranking.
+///
+/// Arming belongs to the job the scheduler is actually feeding, so a fixture
+/// that needs several sets chasing at once must not leave its jobs competing
+/// for the hot slot. The tests that use this are about chase-pool capacity and
+/// the shared decoder memory pool, not about dispatch order, so emptying the
+/// remaining queues is the whole of what they need.
+fn stop_competing_for_dispatch(pipeline: &mut Pipeline, job_id: JobId) {
+    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
+        state.download_queue.drain_all();
+    }
+}
+
 /// Admission is capped at the number of chase workers.
 ///
 /// A chase occupies one `chase_pool` worker for its entire life, parks included.
@@ -2724,6 +2737,7 @@ async fn arming_stops_at_the_number_of_chase_workers() {
             rar_job_spec("Silver Horizon Capacity", &files),
         )
         .await;
+        stop_competing_for_dispatch(&mut pipeline, job_id);
         let dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
         std::fs::write(dir.join(set_name), &archive[..64 * 1024]).unwrap();
         pipeline.direct_unpack_note_commit(
@@ -3227,6 +3241,7 @@ async fn parked_chases_share_the_decoder_memory_pool() {
     ];
     for (job_id, name) in jobs {
         insert_active_job(&mut pipeline, job_id, rar_job_spec(name, &files)).await;
+        stop_competing_for_dispatch(&mut pipeline, job_id);
         let dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
         std::fs::write(dir.join(set_name), &archive[..64 * 1024]).unwrap();
         pipeline.direct_unpack_note_commit(
@@ -3568,6 +3583,95 @@ async fn an_ungated_chase_leaves_the_strong_decode_skip_alone() {
         drain_job_verification_started(&mut verify_events, job_id),
         0,
         "an intact job with a clean chase takes the strong-decode skip"
+    );
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+/// A job the scheduler is not feeding yet does not get a chase.
+///
+/// Articles are handed out from the hot job, so a job further down the order
+/// only ever sees the scraps the hot job leaves — enough of its opening bytes
+/// to look armable, and nowhere near enough for the chase to make progress.
+/// Arming it anyway spent a chase worker, a staging tree, a coverage map and an
+/// extraction budget per queued job, which is what made a batch of NZBs
+/// expensive the moment it was submitted rather than while it was downloading.
+///
+/// The refusal must not latch: the same set arms as soon as the job reaches the
+/// front of the order.
+#[tokio::test]
+async fn a_queued_job_arms_no_chase_until_it_is_the_one_being_downloaded() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    enable_direct_unpack(&mut pipeline);
+    let set_name = "silver_horizon.7z";
+
+    let archive = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sevenz/generated_bcj2_silver_horizon.7z"),
+    )
+    .unwrap();
+    let files = vec![(set_name.to_string(), archive.clone())];
+
+    // Submission order is dispatch order, so the first job is the hot one and
+    // the second is queued behind it.
+    let hot = JobId(43001);
+    let queued = JobId(43002);
+    insert_active_job(
+        &mut pipeline,
+        hot,
+        rar_job_spec("Silver Horizon Hot", &files),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        queued,
+        rar_job_spec("Silver Horizon Queued", &files),
+    )
+    .await;
+    assert_eq!(pipeline.current_hot_job(), Some(hot));
+
+    let commit_head = |pipeline: &mut Pipeline, job_id: JobId| {
+        let dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+        std::fs::write(dir.join(set_name), &archive[..64 * 1024]).unwrap();
+        pipeline.direct_unpack_note_commit(
+            NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            set_name,
+            64 * 1024,
+            false,
+        );
+    };
+
+    commit_head(&mut pipeline, queued);
+    assert!(
+        !pipeline.direct_unpack.is_armed(queued, set_name),
+        "a job the scheduler is not serving must hold no chase worker"
+    );
+    assert_eq!(
+        pipeline.direct_unpack.latched_reason(queued, set_name),
+        None,
+        "being outranked says nothing about the archive, so it must not latch"
+    );
+    assert_eq!(pipeline.direct_unpack.counters().refused_job_not_hot, 1);
+
+    // The hot job itself still arms on its first volume, as before.
+    commit_head(&mut pipeline, hot);
+    assert!(
+        pipeline.direct_unpack.is_armed(hot, set_name),
+        "the job being downloaded still overlaps its extraction"
+    );
+
+    // The queue ahead of it drains, so the formerly queued job is now the one
+    // being downloaded and its next commit arms it.
+    stop_competing_for_dispatch(&mut pipeline, hot);
+    assert_eq!(pipeline.current_hot_job(), Some(queued));
+    commit_head(&mut pipeline, queued);
+    assert!(
+        pipeline.direct_unpack.is_armed(queued, set_name),
+        "the refusal was about the instant, not the archive"
     );
 
     pipeline.direct_unpack_shutdown("test teardown").await;
