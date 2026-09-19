@@ -2620,6 +2620,10 @@ pub struct Pipeline {
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
     /// Rate limiter, per job, for the owned blocking lane acquire warning.
     pub(super) owned_lane_acquire_failure_log_throttle: download::JobLogThrottle,
+    /// Rate limiter, per job, for the "a pass found this job ineligible"
+    /// warning. Every dispatch wake re-visits every job, so this one fires as
+    /// fast as the actor is woken until the job leaves the phase it is in.
+    pub(super) dispatch_ineligible_log_throttle: download::JobLogThrottle,
     /// Last time an owned blocking lane failed to be acquired at all, warned
     /// about or not. The under-cap report below is gated on it: lanes below
     /// their cap are only a fault when a lane actually failed to open.

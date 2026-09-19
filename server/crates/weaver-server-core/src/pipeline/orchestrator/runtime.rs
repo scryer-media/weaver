@@ -381,6 +381,7 @@ impl Pipeline {
             propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
+            dispatch_ineligible_log_throttle: Default::default(),
             last_owned_lane_acquire_failure_at: None,
             download_lanes_under_cap_since: None,
             last_download_lanes_under_cap_log_at: None,

@@ -49,6 +49,14 @@ const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_LANE_CAPACITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_FETCH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// How often one job may report that a dispatch pass found it ineligible.
+///
+/// A dispatch wake costs a pass, and passes come in bursts: a job in a phase
+/// that dispatches nothing — extracting, repairing, moving — is re-visited by
+/// every one of them. Unthrottled that is hundreds of identical lines a second
+/// for as long as the phase lasts, written synchronously on the pipeline actor
+/// thread, which is the same thread the stall itself needs to get work moving.
+const DISPATCH_INELIGIBLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// How often a dispatch pass re-asks for its first server ranking while the
 /// health lock is held by a lane worker, and how long it waits between asks.
 /// The critical sections behind that lock are microseconds long, so the whole
@@ -509,6 +517,10 @@ impl Pipeline {
         let eligible = self.download_scheduler_eligible_jobs();
         if eligible.is_empty() && self.active_downloads == 0 {
             let mut drained_parked_recovery_jobs = Vec::new();
+            // Collected rather than logged in place: the warning is throttled
+            // per job, and the throttle needs `&mut self` while this walk
+            // borrows `job_order`.
+            let mut ineligible_jobs = Vec::new();
             for (i, jid) in self.job_order.iter().enumerate() {
                 if let Some(s) = self.jobs.get(jid) {
                     let parked_recovery_only =
@@ -575,18 +587,45 @@ impl Pipeline {
                             "dispatch idle: job not eligible by status"
                         );
                     } else {
-                        warn!(
-                            job_id = jid.0,
-                            idx = i,
-                            status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
+                        ineligible_jobs.push((
+                            *jid,
+                            i,
+                            s.status.clone(),
+                            s.download_queue.len(),
+                            s.recovery_queue.len(),
                             parked_recovery_only,
                             status_allows_dispatch,
-                            "dispatch stall: job not eligible"
-                        );
+                        ));
                     }
                 }
+            }
+            for (
+                job_id,
+                idx,
+                status,
+                queue_len,
+                recovery_len,
+                parked_recovery_only,
+                status_allows_dispatch,
+            ) in ineligible_jobs
+            {
+                let Some(suppressed_since_last) = self
+                    .dispatch_ineligible_log_throttle
+                    .admit(job_id, DISPATCH_INELIGIBLE_LOG_INTERVAL)
+                else {
+                    continue;
+                };
+                warn!(
+                    job_id = job_id.0,
+                    idx,
+                    status = ?status,
+                    queue_len,
+                    recovery_len,
+                    parked_recovery_only,
+                    status_allows_dispatch,
+                    suppressed_since_last,
+                    "dispatch stall: job not eligible"
+                );
             }
             for job_id in drained_parked_recovery_jobs {
                 self.schedule_job_completion_check_if_download_pipeline_drained(
