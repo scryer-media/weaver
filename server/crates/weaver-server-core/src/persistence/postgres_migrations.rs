@@ -90,6 +90,8 @@ pub(crate) async fn run_migrations(pool: &PgPool, mode: MigrationMode) -> Result
     // Validation is read-only: no ledger DDL, no advisory lock, no mutation.
     if matches!(mode, MigrationMode::ValidateOnly) {
         let applied = load_applied_migrations(pool).await?;
+        // Read-only: legacy line-ending checksums are accepted here but healed
+        // only by a run that may write.
         validate_known_migrations(&applied, &catalog)?;
         let pending = list_pending_migrations_from_applied(&applied, &catalog);
         if pending.is_empty() {
@@ -133,7 +135,8 @@ async fn run_migrations_locked(
     catalog: &CompiledMigrationCatalog,
 ) -> Result<(), StateError> {
     let applied = load_applied_migrations(pool).await?;
-    validate_known_migrations(&applied, catalog)?;
+    let stale_line_endings = validate_known_migrations(&applied, catalog)?;
+    heal_line_ending_checksums(pool, catalog, &stale_line_endings).await?;
     let pending = list_pending_migrations_from_applied(&applied, catalog);
     if pending.is_empty() {
         mirror_schema_version_to_latest_successful_migration(pool).await?;
@@ -331,13 +334,18 @@ fn list_pending_migrations_from_applied(
     )
 }
 
+/// Checks the ledger against the embedded catalog and returns the versions
+/// whose recorded checksum is a legacy line-ending variant of the embedded one.
+/// Those rows are valid but stale: callers that may write should heal them with
+/// [`heal_line_ending_checksums`].
 fn validate_known_migrations(
     applied: &[MigrationLedgerRow],
     catalog: &CompiledMigrationCatalog,
-) -> Result<(), StateError> {
+) -> Result<Vec<i64>, StateError> {
     let max_supported_version = catalog.max_version();
     let mut unknown = Vec::new();
     let mut invalid_checksum = Vec::new();
+    let mut stale_line_endings = Vec::new();
 
     for row in applied {
         if !row.success {
@@ -361,14 +369,16 @@ fn validate_known_migrations(
 
         let checksum_matches = row.checksum_algo == expected.checksum_algo.as_str()
             && row.checksum == expected.checksum;
-        if !checksum_matches
-            && !migration_assets::is_superseded_migration_checksum(
+        if !checksum_matches {
+            if expected.is_legacy_line_ending_checksum(&row.checksum_algo, &row.checksum) {
+                stale_line_endings.push(row.version);
+            } else if !migration_assets::is_superseded_migration_checksum(
                 row.version,
                 &row.checksum_algo,
                 &row.checksum,
-            )
-        {
-            invalid_checksum.push(key);
+            ) {
+                invalid_checksum.push(key);
+            }
         }
     }
 
@@ -386,6 +396,30 @@ fn validate_known_migrations(
         )));
     }
 
+    Ok(stale_line_endings)
+}
+
+/// Rewrites the ledger checksum of `versions` to the embedded canonical value.
+///
+/// These rows were written by a build whose checkout carried the other line
+/// ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
+/// they hash the same SQL in a different form.
+async fn heal_line_ending_checksums(
+    pool: &PgPool,
+    catalog: &CompiledMigrationCatalog,
+    versions: &[i64],
+) -> Result<(), StateError> {
+    for version in versions {
+        let Some(migration) = catalog.find_migration(*version) else {
+            continue;
+        };
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2")
+            .bind(&migration.checksum)
+            .bind(version)
+            .execute(pool)
+            .await
+            .map_err(db_err)?;
+    }
     Ok(())
 }
 

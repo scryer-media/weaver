@@ -3,3 +3,8 @@ server/crates/weaver-server-core/tests/fixtures/**/*.7z filter=lfs diff=lfs merg
 server/crates/weaver-server-core/tests/fixtures/**/*.7z.* filter=lfs diff=lfs merge=lfs -text
 server/crates/weaver-server-core/tests/fixtures/**/*.mkv filter=lfs diff=lfs merge=lfs -text
 server/crates/weaver-server-core/tests/fixtures/**/*.rar filter=lfs diff=lfs merge=lfs -text lockable
+
+# GitHub's Windows runner checks out with core.autocrlf=true. The migration
+# checksums recorded in every database are derived from these files, so they
+# must read byte-identically on every platform.
+*.sql text eol=lf
