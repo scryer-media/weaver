@@ -362,6 +362,12 @@ pub struct ProviderConnections {
     pub active: u32,
     /// The server's connection limit.
     pub max: u32,
+    /// Sockets connected right now, the same reading as
+    /// `ServerHealth.connectionsOpen`.
+    pub open: u32,
+    /// Of those, sockets carrying a request, the same reading as
+    /// `ServerHealth.connectionsBusy`.
+    pub busy: u32,
 }
 
 /// The download-phase rate of one job, from the same estimator and the same
@@ -1257,11 +1263,14 @@ pub struct ServerHealth {
 /// are held open while no article is being fetched and a job is waiting on
 /// them. Without a waiting job those same open sockets are only the pool's
 /// keep-alive, which outlives a finished download by minutes, and that is
-/// "idle".
+/// "idle". So are they while another server in the pool is carrying the
+/// requests: a backup whose sockets sit open behind a busy primary is not
+/// preparing anything, the job simply has no work for it yet.
 pub(crate) fn server_activity(
     state: &str,
     holdoff_active: bool,
     work_waiting: bool,
+    pool_busy: bool,
     connections_open: u32,
     connections_busy: u32,
 ) -> &'static str {
@@ -1279,7 +1288,7 @@ pub(crate) fn server_activity(
     if connections_busy > 0 {
         return "downloading";
     }
-    if connections_open > 0 && work_waiting {
+    if connections_open > 0 && work_waiting && !pool_busy {
         return "preparing";
     }
     "idle"
@@ -1293,39 +1302,64 @@ mod tests {
 
     #[test]
     fn a_switched_off_server_outranks_every_other_signal() {
-        assert_eq!(server_activity("disabled", true, true, 8, 8), "disabled");
         assert_eq!(
-            server_activity("cooling_down", true, true, 8, 8),
+            server_activity("disabled", true, true, true, 8, 8),
+            "disabled"
+        );
+        assert_eq!(
+            server_activity("cooling_down", true, true, true, 8, 8),
             "cooling_down"
         );
     }
 
     #[test]
     fn a_running_holdoff_outranks_degraded_and_the_socket_counts() {
-        assert_eq!(server_activity("healthy", true, true, 1, 0), "over_limit");
-        assert_eq!(server_activity("degraded", true, true, 4, 4), "over_limit");
+        assert_eq!(
+            server_activity("healthy", true, true, true, 1, 0),
+            "over_limit"
+        );
+        assert_eq!(
+            server_activity("degraded", true, true, true, 4, 4),
+            "over_limit"
+        );
     }
 
     #[test]
     fn degraded_outranks_the_socket_counts() {
-        assert_eq!(server_activity("degraded", false, true, 4, 4), "degraded");
+        assert_eq!(
+            server_activity("degraded", false, true, true, 4, 4),
+            "degraded"
+        );
     }
 
     #[test]
     fn held_open_sockets_with_no_request_read_as_preparing_only_while_work_waits() {
-        assert_eq!(server_activity("healthy", false, true, 4, 0), "preparing");
+        assert_eq!(
+            server_activity("healthy", false, true, false, 4, 0),
+            "preparing"
+        );
         // The pool's keep-alive after a finished download is not preparation.
-        assert_eq!(server_activity("healthy", false, false, 4, 0), "idle");
+        assert_eq!(server_activity("healthy", false, false, false, 4, 0), "idle");
+    }
+
+    #[test]
+    fn idle_sockets_behind_a_busy_server_are_idle_not_preparing() {
+        // A backup with open sockets while the primary carries the requests
+        // is not fetching anything; the job has no work for it yet.
+        assert_eq!(server_activity("healthy", false, true, true, 8, 0), "idle");
     }
 
     #[test]
     fn busy_sockets_read_as_downloading_and_none_reads_as_idle() {
-        assert_eq!(server_activity("healthy", false, true, 4, 1), "downloading");
         assert_eq!(
-            server_activity("healthy", false, false, 4, 1),
+            server_activity("healthy", false, true, true, 4, 1),
             "downloading"
         );
-        assert_eq!(server_activity("healthy", false, true, 0, 0), "idle");
+        assert_eq!(
+            server_activity("healthy", false, false, true, 4, 1),
+            "downloading"
+        );
+        assert_eq!(server_activity("healthy", false, true, false, 0, 0), "idle");
     }
 
     #[test]

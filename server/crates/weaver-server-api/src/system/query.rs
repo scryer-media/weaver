@@ -599,6 +599,25 @@ fn instant_to_epoch_ms(until: std::time::Instant) -> Option<u64> {
     u64::try_from(now.saturating_add(remaining.as_millis())).ok()
 }
 
+/// How many sockets one server has connected, and how many of those are
+/// carrying a request.
+///
+/// The socket budget owns physical sockets, so it is the only place that can
+/// separate "a socket exists" from "a socket is carrying a request": a lane
+/// parked on an open connection is neither a free permit nor a fetch in
+/// flight. A socket still dialing is not open yet; everything else that is
+/// not idling or closing is busy. `serverHealth` and the live metrics stream
+/// both read through here so the two never disagree.
+pub(crate) fn server_socket_counts(pool: &NntpPool, idx: usize) -> (u32, u32) {
+    let sockets = pool.socket_budget_snapshot(idx);
+    let open = sockets.physical.saturating_sub(sockets.dialing);
+    let busy = open
+        .saturating_sub(sockets.async_idle)
+        .saturating_sub(sockets.owned_idle)
+        .saturating_sub(sockets.closing);
+    (open as u32, busy as u32)
+}
+
 /// Snapshot per-server health from the live NNTP pool. Mirrors the per-server fields
 /// emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
 /// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
@@ -616,8 +635,8 @@ async fn collect_server_health(
         active: usize,
         configured: usize,
         penalty_until: Option<u64>,
-        open: usize,
-        busy: usize,
+        open: u32,
+        busy: u32,
     }
 
     let configs = pool.server_configs();
@@ -632,17 +651,7 @@ async fn collect_server_health(
                 .configured_connections(weaver_nntp::ServerId(idx))
                 .unwrap_or(max_connections);
             let penalty_until = pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(idx));
-            // The socket budget owns physical sockets, so it is the only place
-            // that can separate "a socket exists" from "a socket is carrying a
-            // request": a lane parked on an open connection is neither a free
-            // permit nor a fetch in flight. A socket still dialing is not open
-            // yet; everything else that is not idling or closing is busy.
-            let sockets = pool.socket_budget_snapshot(idx);
-            let open = sockets.physical.saturating_sub(sockets.dialing);
-            let busy = open
-                .saturating_sub(sockets.async_idle)
-                .saturating_sub(sockets.owned_idle)
-                .saturating_sub(sockets.closing);
+            let (open, busy) = server_socket_counts(pool, idx);
             let tier = if idx == 0 { "PRIMARY" } else { "BACKUP" };
             ServerLoadSnapshot {
                 host: cfg.host.clone(),
@@ -657,6 +666,11 @@ async fn collect_server_health(
         })
         .collect();
 
+    // Whether any server in the pool is carrying a request right now. Open
+    // sockets on a server that is not are only "preparing" when nothing else
+    // is fetching either; behind a busy primary they are simply waiting.
+    let pool_busy = pre.iter().any(|snapshot| snapshot.busy > 0);
+
     let health = pool.health().lock().await;
     pre.into_iter()
         .enumerate()
@@ -669,22 +683,29 @@ async fn collect_server_health(
                 weaver_nntp::ServerState::CoolingDown { .. } => "cooling_down",
                 weaver_nntp::ServerState::Disabled { .. } => "disabled",
             };
-            let open = snapshot.open as u32;
-            let busy = snapshot.busy as u32;
+            let open = snapshot.open;
+            let busy = snapshot.busy;
             let activity = crate::system::types::server_activity(
                 state,
                 snapshot.penalty_until.is_some(),
                 work_waiting,
+                pool_busy,
                 open,
                 busy,
             );
-            // The holdoff already carries a wall-clock deadline; a cooldown
-            // carries a monotonic one, which only means anything to the
-            // browser once it is rebased on the wall clock here.
+            // The holdoff already carries a wall-clock deadline; a cooldown or
+            // a quarantine carries a monotonic one, which only means anything
+            // to the browser once it is rebased on the wall clock here.
             let activity_until = match activity {
                 "over_limit" => snapshot.penalty_until,
                 "cooling_down" => match srv.state() {
                     weaver_nntp::ServerState::CoolingDown { until, .. } => {
+                        instant_to_epoch_ms(*until)
+                    }
+                    _ => None,
+                },
+                "disabled" => match srv.state() {
+                    weaver_nntp::ServerState::Disabled { until, .. } => {
                         instant_to_epoch_ms(*until)
                     }
                     _ => None,

@@ -127,7 +127,7 @@ async fn build_system_metrics_snapshot(
     }
 }
 
-/// One atomic load per server, the same count `serverHealth` reports.
+/// A few atomic loads per server, the same counts `serverHealth` reports.
 fn provider_connections(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderConnections> {
     pool.server_configs()
         .iter()
@@ -136,10 +136,13 @@ fn provider_connections(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderConne
             let max = pool
                 .configured_connections(weaver_nntp::ServerId(idx))
                 .unwrap_or_else(|| pool.server_load(idx).1);
+            let (open, busy) = crate::system::query::server_socket_counts(pool, idx);
             ProviderConnections {
                 label: format!("{}:{}", cfg.host, cfg.port),
                 active: pool.active_connections(idx) as u32,
                 max: max as u32,
+                open,
+                busy,
             }
         })
         .collect()
