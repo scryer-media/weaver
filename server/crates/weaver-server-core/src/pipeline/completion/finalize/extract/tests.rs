@@ -647,6 +647,51 @@ fn multi_block_xz_extracts_with_the_filesystem_decoder() {
     assert_eq!(fs::read(output_dir.join("payload.bin")).unwrap(), payload);
 }
 
+/// The simple-archive task and the xz decoder must not both admit the same
+/// footprint. The decoder measures and reserves what it will hold; a
+/// ceiling-sized permit held over it leaves a job whose ceiling is the xz
+/// limit with nothing for the decoder to reserve, and the decoder then waits
+/// for room only the permit above it could release.
+#[test]
+fn xz_extraction_admits_its_decoder_footprint_once() {
+    let _test_guard = lock_xz_mt_decoder_test();
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("payload.bin.xz");
+    let output_dir = temp.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    let payload: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    fs::write(&archive_path, xz_compress_multiblock(&payload)).unwrap();
+
+    let (root, budget) = test_extraction_security_with_memory(
+        &output_dir,
+        crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES,
+    );
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+
+    // What the simple-archive task admits before it opens the decoder.
+    let _task_memory = simple_archive_task_memory_permit(
+        SimpleArchiveKind::Xz,
+        Some(archive_path.as_path()),
+        &budget,
+    )
+    .unwrap();
+
+    extract_xz(
+        &archive_path,
+        &root,
+        &budget,
+        &event_tx,
+        JobId(1),
+        "payload.bin.xz",
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(output_dir.join("payload.bin")).unwrap(), payload);
+}
+
 #[test]
 fn filesystem_xz_decoder_uses_parallel_for_a_multiblock_single_stream() {
     let _test_guard = lock_xz_mt_decoder_test();
@@ -692,7 +737,7 @@ fn filesystem_xz_decoder_falls_back_to_sequential_when_a_worker_does_not_fit() {
 
     let (_root, budget) = test_extraction_security_with_memory(&output_dir, one_worker - 1);
     let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 2).unwrap();
-    assert!(matches!(&decoder, FilesystemXzDecoder::Sequential(_)));
+    assert!(matches!(&decoder, FilesystemXzDecoder::Sequential { .. }));
 
     let mut output = Vec::new();
     decoder.read_to_end(&mut output).unwrap();
@@ -724,7 +769,7 @@ fn filesystem_xz_decoder_trims_its_threads_to_the_memory_budget() {
     let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 4).unwrap();
     match &decoder {
         FilesystemXzDecoder::Parallel { decoder, .. } => assert_eq!(decoder.threads(), 1),
-        FilesystemXzDecoder::Sequential(_) => panic!("expected the parallel decoder"),
+        FilesystemXzDecoder::Sequential { .. } => panic!("expected the parallel decoder"),
     }
 
     let mut output = Vec::new();

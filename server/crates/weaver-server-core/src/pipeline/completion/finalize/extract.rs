@@ -14,7 +14,10 @@ pub(in crate::pipeline) mod sequential;
 /// or block-parallel with the job's memory budget charged for exactly what the
 /// workers will hold.
 enum FilesystemXzDecoder<R: std::io::Read + std::io::Seek> {
-    Sequential(Box<lzma_turbo::xz::XzReader<R>>),
+    Sequential {
+        decoder: Box<lzma_turbo::xz::XzReader<R>>,
+        _memory: MemoryPermit,
+    },
     Parallel {
         decoder: Box<lzma_turbo::xz::XzParallelReader<R>>,
         _memory: MemoryPermit,
@@ -24,7 +27,7 @@ enum FilesystemXzDecoder<R: std::io::Read + std::io::Seek> {
 impl<R: std::io::Read + std::io::Seek> std::io::Read for FilesystemXzDecoder<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Self::Sequential(decoder) => decoder.read(buffer),
+            Self::Sequential { decoder, .. } => decoder.read(buffer),
             Self::Parallel { decoder, .. } => decoder.read(buffer),
         }
     }
@@ -944,6 +947,27 @@ pub(in crate::pipeline) fn measured_decoder_memory_bytes(
     }
 }
 
+/// The memory the simple-archive task admits before it opens a decoder.
+///
+/// One owner admits a decoder's footprint. `.xz` is opened by
+/// [`open_filesystem_xz_decoder`], which measures what the decoder it actually
+/// builds will hold and reserves that itself; a ceiling-sized permit taken out
+/// here as well would hold the whole job allowance while the inner request
+/// waited for room only this permit could release. `tar.xz` keeps its permit:
+/// its decoder is opened on the sequential path, which reserves nothing of its
+/// own.
+pub(in crate::pipeline) fn simple_archive_task_memory_permit(
+    kind: SimpleArchiveKind,
+    path: Option<&Path>,
+    budget: &Arc<JobExtractionBudget>,
+) -> Result<Option<MemoryPermit>, String> {
+    if matches!(kind, SimpleArchiveKind::Xz) {
+        return Ok(None);
+    }
+    let decoder_memory = measured_decoder_memory_bytes(kind, path, budget.max_memory_bytes())?;
+    budget.reserve_memory_wait(decoder_memory).map(Some)
+}
+
 fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -> u64 {
     const MIB: u64 = 1024 * 1024;
     match kind {
@@ -1717,8 +1741,15 @@ fn open_filesystem_xz_decoder(
     let file =
         std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
     let file = BudgetedReader::new(file, Arc::clone(budget));
+    // The sequential decoder's dictionary is bounded by `memory_limit`, and
+    // that is what it is charged for. Reserved before the decoder is built, so
+    // nothing is allocated outside the admission.
+    let memory = budget.reserve_memory_wait(memory_limit)?;
     crate::ingest::xz_multistream_decoder(file, memory_limit)
-        .map(|decoder| FilesystemXzDecoder::Sequential(Box::new(decoder)))
+        .map(|decoder| FilesystemXzDecoder::Sequential {
+            decoder: Box::new(decoder),
+            _memory: memory,
+        })
         .map_err(|error| format!("failed to open xz decoder: {error}"))
 }
 
@@ -2527,12 +2558,11 @@ impl Pipeline {
                     if file_paths.is_empty() {
                         return Err(format!("no files found for set '{set_name_owned}'"));
                     }
-                    let decoder_memory = measured_decoder_memory_bytes(
+                    let _memory_permit = simple_archive_task_memory_permit(
                         kind,
                         file_paths.first().map(PathBuf::as_path),
-                        budget.max_memory_bytes(),
+                        &budget,
                     )?;
-                    let _memory_permit = budget.reserve_memory_wait(decoder_memory)?;
 
                     let extracted_members = match kind {
                         SimpleArchiveKind::Zip => extract_zip(
