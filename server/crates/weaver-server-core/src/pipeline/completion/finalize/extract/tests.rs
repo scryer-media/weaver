@@ -1184,9 +1184,16 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
 
     let (root, budget) = test_extraction_security_with_memory(&out_dir, 256 * 1024 * 1024);
     let root = Arc::new(root);
+    let job_id = JobId(41815);
     let mut written = Vec::new();
+    // Which of the decode and its governor finishes first is scheduling, and
+    // scheduling must not decide a test. The consumer takes one chunk and then
+    // holds until the governor has actually read the backlog behind it, so the
+    // decode cannot race past the decision this test is about.
+    adaptive_probe::watch(job_id.0);
+    let mut waited_for_the_governor = false;
     let report = decode_7z_streaming(
-        JobId(41815),
+        job_id,
         "silver_horizon.7z",
         Cursor::new(archive.clone()),
         &out_dir,
@@ -1198,11 +1205,27 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
         },
         |entry, reader, _dest| {
             assert_eq!(entry.name(), "Silver.Horizon/reel.txt");
-            reader.read_to_end(&mut written)?;
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                written.extend_from_slice(&chunk[..read]);
+                if !waited_for_the_governor {
+                    adaptive_probe::wait_for_backlog(job_id.0);
+                    waited_for_the_governor = true;
+                }
+            }
             Ok(true)
         },
     )
     .expect("adaptive decode");
+    adaptive_probe::forget(job_id.0);
+    assert!(
+        waited_for_the_governor,
+        "the decode produced no bytes to hold on"
+    );
 
     assert_eq!(written, reel, "a widened decode produces the same bytes");
     assert!(

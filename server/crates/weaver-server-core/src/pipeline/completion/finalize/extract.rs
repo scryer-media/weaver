@@ -351,6 +351,78 @@ pub(in crate::pipeline) struct SevenZipDecodeReport {
     pub(in crate::pipeline) widest_threads: u32,
 }
 
+/// Test seam: what an adaptive governor has actually seen.
+///
+/// The governor runs beside the decode, so whether it looks at the backlog
+/// before the decode ends is a question of scheduling. A test that wants to
+/// assert what the governor decided waits here until it has seen the backlog,
+/// instead of racing it; nothing in a release build observes this.
+#[cfg(test)]
+pub(in crate::pipeline) mod adaptive_probe {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, Mutex};
+
+    static SEEN: Mutex<Option<HashMap<u64, bool>>> = Mutex::new(None);
+    static SEEN_CHANGED: Condvar = Condvar::new();
+
+    fn seen() -> std::sync::MutexGuard<'static, Option<HashMap<u64, bool>>> {
+        SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Start watching one job's governor, discarding anything a previous
+    /// decode of the same job left behind.
+    pub(in crate::pipeline) fn watch(job_id: u64) {
+        seen().get_or_insert_with(HashMap::new).insert(job_id, false);
+    }
+
+    /// Block until this job's governor has read a backlog behind the decode.
+    /// What it then did about it is the caller's assertion, not this wait.
+    pub(in crate::pipeline) fn wait_for_backlog(job_id: u64) {
+        let mut guard = seen();
+        loop {
+            let observed = guard
+                .as_ref()
+                .and_then(|jobs| jobs.get(&job_id))
+                .copied()
+                .unwrap_or(false);
+            if observed {
+                return;
+            }
+            guard = SEEN_CHANGED
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Stop watching, so a job id can be reused and nothing is retained.
+    pub(in crate::pipeline) fn forget(job_id: u64) {
+        if let Some(jobs) = seen().as_mut() {
+            jobs.remove(&job_id);
+        }
+    }
+
+    pub(super) fn note(job_id: u64, pending_runs: usize) {
+        if pending_runs == 0 {
+            return;
+        }
+        let mut guard = seen();
+        let Some(observed) = guard.as_mut().and_then(|jobs| jobs.get_mut(&job_id)) else {
+            return;
+        };
+        *observed = true;
+        drop(guard);
+        SEEN_CHANGED.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn note_adaptive_backlog(job_id: JobId, pending_runs: usize) {
+    adaptive_probe::note(job_id.0, pending_runs);
+}
+
+#[cfg(not(test))]
+fn note_adaptive_backlog(_job_id: JobId, _pending_runs: usize) {}
+
 /// The decode pass: the library helper's entry walk, opened under the job's
 /// limits and threaded as `threads` says.
 ///
@@ -415,6 +487,7 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
                     let Some(progress) = handle.progress() else {
                         continue;
                     };
+                    note_adaptive_backlog(job_id, progress.pending_runs);
                     let target = chase_decode_thread_target(progress.pending_runs, ceiling);
                     if target == applied {
                         continue;
