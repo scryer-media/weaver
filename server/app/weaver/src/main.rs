@@ -88,6 +88,15 @@ fn main() {
         .thread_name(|index| format!("weaver-rayon-{index}"))
         .build_global();
 
+    // A parked download lane holds the pages freed by the decode and writer
+    // threads on its own allocator heap until it allocates again, which it
+    // does not do while parked. The lane asks for the release itself; this
+    // installs the allocator half of that, before any pipeline thread exists.
+    #[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
+    weaver_server_core::runtime::thread_release::install_idle_thread_release(
+        allocator::collect_idle_thread,
+    );
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_stack_size(8 * 1024 * 1024); // 8 MB - pipeline futures are large
     weaver_server_core::runtime::affinity::install_tokio_worker_affinity(&mut builder);
