@@ -37,6 +37,7 @@ pub struct PipelineDiagnostics {
     pub direct_store: Vec<DirectStoreJobDiagnostics>,
     pub pool: Vec<PoolServerDiagnostics>,
     pub lanes: LaneDiagnostics,
+    pub memory: MemoryDiagnostics,
 }
 
 /// Tuner-owned concurrency parameters and the connection ceiling they respect.
@@ -165,6 +166,29 @@ pub struct PoolServerDiagnostics {
     pub recovery_probe_id: Option<u64>,
     pub recovery_next_attempt_ms: Option<u64>,
     pub recovery_quarantined: bool,
+}
+
+/// Where this process's memory is, in the terms the pipeline can account for.
+///
+/// The resident set is the whole process; the rest are the pieces of it the
+/// download side owns, so a bundle shows both the total and how much of it is
+/// explained.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryDiagnostics {
+    /// Working set on Windows, resident set elsewhere. `None` on a platform
+    /// that cannot answer cheaply.
+    pub process_resident_bytes: Option<u64>,
+    pub buffer_pool_small_in_use_bytes: usize,
+    pub buffer_pool_small_total_bytes: usize,
+    pub buffer_pool_medium_in_use_bytes: usize,
+    pub buffer_pool_medium_total_bytes: usize,
+    pub buffer_pool_large_in_use_bytes: usize,
+    pub buffer_pool_large_total_bytes: usize,
+    pub buffer_pool_waits: usize,
+    /// Raw article bytes dispatched to lanes and not yet answered.
+    pub lane_inflight_bytes: u64,
+    pub jobs_eligible: usize,
+    pub jobs_hot: usize,
 }
 
 /// Download lane occupancy, taken from the published lane counters.
@@ -419,6 +443,37 @@ impl Pipeline {
                 yield_after_batch: metrics.download_lanes_yield_after_batch_active,
                 parking: metrics.download_lanes_parking_active,
                 recovering: metrics.download_lanes_recovering_active,
+            },
+            memory: {
+                use crate::runtime::buffers::BufferTier;
+
+                let pool = self.buffers.metrics();
+                MemoryDiagnostics {
+                    process_resident_bytes: crate::runtime::process_metrics::resident_memory_bytes(
+                    ),
+                    buffer_pool_small_in_use_bytes: pool
+                        .small_in_use
+                        .saturating_mul(BufferTier::Small.size_bytes()),
+                    buffer_pool_small_total_bytes: pool
+                        .small_total
+                        .saturating_mul(BufferTier::Small.size_bytes()),
+                    buffer_pool_medium_in_use_bytes: pool
+                        .medium_in_use
+                        .saturating_mul(BufferTier::Medium.size_bytes()),
+                    buffer_pool_medium_total_bytes: pool
+                        .medium_total
+                        .saturating_mul(BufferTier::Medium.size_bytes()),
+                    buffer_pool_large_in_use_bytes: pool
+                        .large_in_use
+                        .saturating_mul(BufferTier::Large.size_bytes()),
+                    buffer_pool_large_total_bytes: pool
+                        .large_total
+                        .saturating_mul(BufferTier::Large.size_bytes()),
+                    buffer_pool_waits: pool.wait_count,
+                    lane_inflight_bytes: metrics.download_lane_inflight_bytes,
+                    jobs_eligible: metrics.download_jobs_eligible,
+                    jobs_hot: metrics.download_jobs_hot,
+                }
             },
         }
     }

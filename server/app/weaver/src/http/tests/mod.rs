@@ -972,6 +972,9 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         download_scheduler_handouts_total_hot: 202,
         download_scheduler_handouts_total_spill: 203,
         download_scheduler_handouts_total_probe: 204,
+        download_lane_inflight_bytes: 6291456,
+        download_jobs_eligible: 4,
+        download_jobs_hot: 1,
         download_lanes_active: 3,
         download_lanes_sequential_active: 1,
         download_lanes_depth2_active: 2,
@@ -1349,6 +1352,7 @@ struct CollectionFixtures {
     process: instr::ProcessMetricsSnapshot,
     disk_space: Vec<instr::DiskSpaceSnapshot>,
     http_metrics: instr::HttpMetricsSnapshot,
+    buffer_pool: weaver_server_core::runtime::buffers::BufferPoolMetrics,
 }
 
 impl CollectionFixtures {
@@ -1361,6 +1365,15 @@ impl CollectionFixtures {
             process: sample_process_metrics(),
             disk_space: sample_disk_space(),
             http_metrics: sample_http_metrics(),
+            buffer_pool: weaver_server_core::runtime::buffers::BufferPoolMetrics {
+                small_in_use: 2,
+                small_total: 8,
+                medium_in_use: 1,
+                medium_total: 4,
+                large_in_use: 0,
+                large_total: 2,
+                wait_count: 9,
+            },
         }
     }
 
@@ -1374,6 +1387,7 @@ impl CollectionFixtures {
         input.process = Some(&self.process);
         input.disk_space = &self.disk_space;
         input.http_metrics = Some(&self.http_metrics);
+        input.buffer_pool = Some(&self.buffer_pool);
     }
 }
 

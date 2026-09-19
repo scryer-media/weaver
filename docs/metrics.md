@@ -406,6 +406,9 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_pipeline_download_lane_states_active` | gauge | `state` | Active article download lanes by scheduler state. |
 | `weaver_pipeline_download_lanes_active_total` | gauge | — | Total active article download lanes. **Deprecated — use `weaver_pipeline_download_lanes`.** |
 | `weaver_pipeline_download_lanes` | gauge | — | Total active article download lanes. |
+| `weaver_pipeline_download_lane_inflight_bytes` | gauge | — | Raw article bytes handed to download lanes and not yet answered, summed across lanes. |
+| `weaver_pipeline_download_jobs_eligible` | gauge | — | Jobs competing for articles: the hot job plus every job queued behind it with fetchable work. |
+| `weaver_pipeline_download_jobs_hot` | gauge | — | One while a job is being downloaded, zero while none is. |
 | `weaver_pipeline_download_lane_parks_total` | counter | `reason` | Article download lane parks by reason. |
 | `weaver_pipeline_download_lane_lease_items_total` | counter | — | Article work items leased to download lanes. |
 | `weaver_pipeline_download_lane_refills_total` | counter | `result` | Lane refill scheduler decisions. |
@@ -512,6 +515,9 @@ cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture
 | `weaver_db_runtime_in_flight` | gauge | — | Database operations submitted and not yet answered. |
 | `weaver_db_runtime_blocked_submissions_total` | counter | — | Database submissions that had to wait on a full executor queue. |
 | `weaver_db_op_duration_seconds` | histogram | `engine` | Database operation latency, measured around the executor round-trip. |
+| `weaver_runtime_buffer_pool_in_use_bytes` | gauge | `tier` | Pre-allocated article buffer bytes currently checked out, by tier. |
+| `weaver_runtime_buffer_pool_total_bytes` | gauge | `tier` | Pre-allocated article buffer bytes the pool owns, by tier. |
+| `weaver_runtime_buffer_pool_waits_total` | counter | — | Buffer acquisitions that had to wait for a buffer to come back. |
 | `process_cpu_seconds_total` | counter | — | Total user and system CPU time spent by this process. |
 | `process_resident_memory_bytes` | gauge | — | Resident set size of this process. |
 | `process_virtual_memory_bytes` | gauge | — | Virtual memory size of this process. |
