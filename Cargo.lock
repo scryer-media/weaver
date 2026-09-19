@@ -5896,7 +5896,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "application-updater",
  "async-graphql",
@@ -5954,14 +5954,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -5989,7 +5989,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "quick-xml",
  "serde",
@@ -6000,7 +6000,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6031,7 +6031,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6105,7 +6105,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6124,7 +6124,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "cc",
  "crc-fast",
