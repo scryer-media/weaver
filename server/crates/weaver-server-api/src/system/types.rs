@@ -1339,7 +1339,10 @@ mod tests {
             "preparing"
         );
         // The pool's keep-alive after a finished download is not preparation.
-        assert_eq!(server_activity("healthy", false, false, false, 4, 0), "idle");
+        assert_eq!(
+            server_activity("healthy", false, false, false, 4, 0),
+            "idle"
+        );
     }
 
     #[test]

@@ -372,7 +372,9 @@ pub(in crate::pipeline) mod adaptive_probe {
     /// Start watching one job's governor, discarding anything a previous
     /// decode of the same job left behind.
     pub(in crate::pipeline) fn watch(job_id: u64) {
-        seen().get_or_insert_with(HashMap::new).insert(job_id, false);
+        seen()
+            .get_or_insert_with(HashMap::new)
+            .insert(job_id, false);
     }
 
     /// Block until this job's governor has read a backlog behind the decode.

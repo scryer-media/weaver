@@ -705,9 +705,7 @@ async fn collect_server_health(
                     _ => None,
                 },
                 "disabled" => match srv.state() {
-                    weaver_nntp::ServerState::Disabled { until, .. } => {
-                        instant_to_epoch_ms(*until)
-                    }
+                    weaver_nntp::ServerState::Disabled { until, .. } => instant_to_epoch_ms(*until),
                     _ => None,
                 },
                 _ => None,

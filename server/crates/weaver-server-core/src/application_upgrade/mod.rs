@@ -38,9 +38,7 @@ pub use service::{
 #[cfg(windows)]
 pub fn operating_system_boot_time() -> Option<std::time::SystemTime> {
     // SAFETY: `GetTickCount64` reads a counter and takes no arguments.
-    let uptime_ms = unsafe {
-        windows_sys::Win32::System::SystemInformation::GetTickCount64()
-    };
+    let uptime_ms = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
     std::time::SystemTime::now().checked_sub(std::time::Duration::from_millis(uptime_ms))
 }
 
