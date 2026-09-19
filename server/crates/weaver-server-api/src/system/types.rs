@@ -1199,6 +1199,21 @@ pub struct ServerHealth {
     pub tier: String,
     /// One of "healthy", "degraded", "cooling_down", "disabled".
     pub state: String,
+    /// What this server is doing right now, as one word a rail can lead with:
+    /// "downloading", "idle", "preparing", "over_limit", "cooling_down",
+    /// "degraded" or "disabled". A bare connection fraction reads as a fault
+    /// when the pool is deliberately holding back, so the state is the
+    /// headline and the counts are the detail.
+    pub activity: String,
+    /// When the current activity is expected to end, if the daemon knows:
+    /// the holdoff deadline while "over_limit", the cooldown deadline while
+    /// "cooling_down". Absent for every activity that has no deadline.
+    pub activity_until_epoch_ms: Option<u64>,
+    /// Sockets currently open to this server — owned lanes, warm lanes and
+    /// async pool connections alike — whether or not they carry a request.
+    pub connections_open: u32,
+    /// Open sockets currently carrying a request.
+    pub connections_busy: u32,
     /// Currently in-use connections (max - available permits).
     pub connections_active: u32,
     /// Configured maximum connections (legacy field).
@@ -1231,11 +1246,74 @@ pub struct ServerHealth {
     pub premature_deaths: u32,
 }
 
+/// Reduce one server's health state, holdoff and socket counts to the single
+/// word `ServerHealth::activity` carries.
+///
+/// The order matters more than any one arm: a server that is switched off, or
+/// paused, or being held back by the provider is not "idle" and not "busy" —
+/// it is in a state someone can act on, and that state outranks whatever the
+/// sockets happen to be doing. Only once nothing is holding the server back do
+/// the counts decide, and "preparing" is the honest answer for sockets that
+/// are held open while no article is being fetched.
+pub(crate) fn server_activity(
+    state: &str,
+    holdoff_active: bool,
+    connections_open: u32,
+    connections_busy: u32,
+) -> &'static str {
+    match state {
+        "disabled" => return "disabled",
+        "cooling_down" => return "cooling_down",
+        _ => {}
+    }
+    if holdoff_active {
+        return "over_limit";
+    }
+    if state == "degraded" {
+        return "degraded";
+    }
+    if connections_busy > 0 {
+        return "downloading";
+    }
+    if connections_open > 0 {
+        return "preparing";
+    }
+    "idle"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use weaver_server_core::events::model::PipelineEvent;
     use weaver_server_core::jobs::JobId;
+
+    #[test]
+    fn a_switched_off_server_outranks_every_other_signal() {
+        assert_eq!(server_activity("disabled", true, 8, 8), "disabled");
+        assert_eq!(server_activity("cooling_down", true, 8, 8), "cooling_down");
+    }
+
+    #[test]
+    fn a_running_holdoff_outranks_degraded_and_the_socket_counts() {
+        assert_eq!(server_activity("healthy", true, 1, 0), "over_limit");
+        assert_eq!(server_activity("degraded", true, 4, 4), "over_limit");
+    }
+
+    #[test]
+    fn degraded_outranks_the_socket_counts() {
+        assert_eq!(server_activity("degraded", false, 4, 4), "degraded");
+    }
+
+    #[test]
+    fn held_open_sockets_with_no_request_read_as_preparing() {
+        assert_eq!(server_activity("healthy", false, 4, 0), "preparing");
+    }
+
+    #[test]
+    fn busy_sockets_read_as_downloading_and_none_reads_as_idle() {
+        assert_eq!(server_activity("healthy", false, 4, 1), "downloading");
+        assert_eq!(server_activity("healthy", false, 0, 0), "idle");
+    }
 
     #[test]
     fn phase_progress_event_is_not_reported_as_segment_committed() {

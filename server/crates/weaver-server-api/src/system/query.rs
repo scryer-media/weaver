@@ -568,6 +568,20 @@ fn filesystem_name(value: &weaver_server_core::runtime::system_profile::Filesyst
     }
 }
 
+/// Rebase a monotonic deadline on the wall clock, so a browser can count down
+/// to it. A deadline already in the past has nothing left to show.
+fn instant_to_epoch_ms(until: std::time::Instant) -> Option<u64> {
+    let remaining = until.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    u64::try_from(now.saturating_add(remaining.as_millis())).ok()
+}
+
 /// Snapshot per-server health from the live NNTP pool. Mirrors the per-server fields
 /// emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
 /// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
@@ -584,6 +598,8 @@ async fn collect_server_health(
         active: usize,
         configured: usize,
         penalty_until: Option<u64>,
+        open: usize,
+        busy: usize,
     }
 
     let configs = pool.server_configs();
@@ -598,6 +614,17 @@ async fn collect_server_health(
                 .configured_connections(weaver_nntp::ServerId(idx))
                 .unwrap_or(max_connections);
             let penalty_until = pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(idx));
+            // The socket budget owns physical sockets, so it is the only place
+            // that can separate "a socket exists" from "a socket is carrying a
+            // request": a lane parked on an open connection is neither a free
+            // permit nor a fetch in flight. A socket still dialing is not open
+            // yet; everything else that is not idling or closing is busy.
+            let sockets = pool.socket_budget_snapshot(idx);
+            let open = sockets.physical.saturating_sub(sockets.dialing);
+            let busy = open
+                .saturating_sub(sockets.async_idle)
+                .saturating_sub(sockets.owned_idle)
+                .saturating_sub(sockets.closing);
             let tier = if idx == 0 { "PRIMARY" } else { "BACKUP" };
             ServerLoadSnapshot {
                 host: cfg.host.clone(),
@@ -606,6 +633,8 @@ async fn collect_server_health(
                 active,
                 configured,
                 penalty_until,
+                open,
+                busy,
             }
         })
         .collect();
@@ -622,12 +651,37 @@ async fn collect_server_health(
                 weaver_nntp::ServerState::CoolingDown { .. } => "cooling_down",
                 weaver_nntp::ServerState::Disabled { .. } => "disabled",
             };
+            let open = snapshot.open as u32;
+            let busy = snapshot.busy as u32;
+            let activity = crate::system::types::server_activity(
+                state,
+                snapshot.penalty_until.is_some(),
+                open,
+                busy,
+            );
+            // The holdoff already carries a wall-clock deadline; a cooldown
+            // carries a monotonic one, which only means anything to the
+            // browser once it is rebased on the wall clock here.
+            let activity_until = match activity {
+                "over_limit" => snapshot.penalty_until,
+                "cooling_down" => match srv.state() {
+                    weaver_nntp::ServerState::CoolingDown { until, .. } => {
+                        instant_to_epoch_ms(*until)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
             ServerHealth {
                 label: format!("{}:{}", snapshot.host, snapshot.port),
                 host: snapshot.host,
                 port: snapshot.port,
                 tier: snapshot.tier,
                 state: state.to_string(),
+                activity: activity.to_string(),
+                activity_until_epoch_ms: activity_until,
+                connections_open: open,
+                connections_busy: busy,
                 connections_active: snapshot.active as u32,
                 connections_max: snapshot.configured as u32,
                 connections_configured: snapshot.configured as u32,

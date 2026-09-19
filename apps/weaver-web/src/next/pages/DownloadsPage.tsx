@@ -45,7 +45,7 @@ import {
 } from "../data/status";
 import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
-import { CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
+import { AttentionBlock, CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
 import { SpeedLimitControl } from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
@@ -466,12 +466,18 @@ export function DownloadsPage() {
         </>
       }
       railMiddle={
-        <CategoryListBlock
-          items={categories}
-          selected={facets}
-          onToggle={(key) => setFacets((current) => toggleFacet(current, key))}
-          onClear={() => setFacets(NO_FACETS)}
-        />
+        <>
+          {/* A provider the daemon is holding back is the usual reason a queue
+              looks stalled, so Downloads says so rather than leaving it to the
+              diagnostic screens. The block draws nothing when all is well. */}
+          <AttentionBlock />
+          <CategoryListBlock
+            items={categories}
+            selected={facets}
+            onToggle={(key) => setFacets((current) => toggleFacet(current, key))}
+            onClear={() => setFacets(NO_FACETS)}
+          />
+        </>
       }
       railFooter={<ProvidersBlock />}
       beforeContent={

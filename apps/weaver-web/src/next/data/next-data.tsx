@@ -45,6 +45,17 @@ export interface ProviderHealth {
   /** `PRIMARY` for the first configured server, `BACKUP` for the rest. */
   tier: string;
   state: string;
+  /**
+   * What the pool is doing with this server right now: `downloading`, `idle`,
+   * `preparing`, `over_limit`, `cooling_down`, `degraded` or `disabled`. The
+   * rail leads with this rather than with a connection fraction, which reads
+   * as a fault whenever the daemon is deliberately holding back.
+   */
+  activity: string;
+  /** When the current activity is expected to end, when the daemon knows. */
+  activityUntilEpochMs: number | null;
+  connectionsOpen: number;
+  connectionsBusy: number;
   connectionsActive: number;
   connectionsMax: number;
   connectionsConfigured: number;

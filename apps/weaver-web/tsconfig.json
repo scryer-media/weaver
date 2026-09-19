@@ -8,6 +8,11 @@
     "strict": true,
     "noEmit": true,
     "isolatedModules": true,
+    // A module the node test runner loads directly has to name its own
+    // imports the way node resolves them, extension and all. Allowing the
+    // extension costs nothing — nothing is emitted — and keeps a pure helper
+    // testable without a second copy of whatever it reuses.
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
     "paths": {

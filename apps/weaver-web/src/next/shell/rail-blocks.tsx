@@ -10,7 +10,9 @@ import { Icon, type IconName } from "../components/icons";
 import { UNCATEGORISED, type CategoryEntry } from "../data/categories";
 import { useNextData, type ProviderHealth } from "../data/next-data";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
+import { useNow } from "../data/clock";
 import { formatClock, formatLatency, splitUptime } from "../data/format";
+import { providerActivityLabel, type ProviderActivity } from "../data/provider-activity";
 import { countLabel, providerStateLabel } from "../i18n/labels";
 
 /**
@@ -21,6 +23,13 @@ import { countLabel, providerStateLabel } from "../i18n/labels";
  * screens take Attention + Uptime. Throughput is not among them; the shell pins
  * it under whatever a screen picks.
  */
+
+/** The rail's colour for each activity tone, resolved once. */
+const ACTIVITY_TONE: Record<ProviderActivity["tone"], string> = {
+  accent: WV.accent,
+  warn: WV.warn,
+  inert: WV.inert,
+};
 
 export function providerLoadPercent(provider: ProviderHealth): number {
   const max = provider.connectionsMax || provider.connectionsConfigured;
@@ -33,6 +42,10 @@ export function providerLoadPercent(provider: ProviderHealth): number {
 export function ProvidersBlock() {
   const t = useTranslate();
   const { providers, providersLoaded } = useNextData();
+  // A holdoff counts down in the rail, so the clock has to be a value React
+  // knows about; it ticks only while something is actually counting down.
+  const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
+  const now = useNow(1000, counting);
 
   // Server health lists the live pool, and the pool leaves out every server
   // that is switched off, so only the configured list can say there are none.
@@ -58,18 +71,25 @@ export function ProvidersBlock() {
       ) : (
         providers.map((provider) => {
           const load = providerLoadPercent(provider);
-          const idle = provider.connectionsActive === 0;
+          const activity = providerActivityLabel(provider, t, now);
           return (
             <div key={`${provider.host}:${provider.port}`} className="flex flex-col gap-[5px]">
               <div className="flex items-baseline justify-between gap-2 text-[12.5px]">
                 <span className="truncate text-wv-tertiary">{provider.host}</span>
-                <span className="flex-none font-wv-mono text-[11px] text-wv-muted">
-                  {idle
-                    ? t("next.rail.idle")
-                    : `${provider.connectionsActive} / ${provider.connectionsMax || provider.connectionsConfigured}`}
+                <span
+                  className="flex-none font-wv-mono text-[11px] text-wv-muted"
+                  title={activity.fraction}
+                >
+                  {activity.word}
                 </span>
               </div>
-              <Bar percent={load} color={idle ? WV.inert : WV.accent} height={10} live />
+              <Bar percent={load} color={ACTIVITY_TONE[activity.tone]} height={10} live />
+              {/* The counts never leave: the state word answers "why", and the
+                  fraction under it stays the thing you can check. */}
+              <div className="flex items-baseline justify-between gap-2 font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
+                {activity.cause ? <span className="min-w-0 truncate">{activity.cause}</span> : null}
+                <span className="ml-auto flex-none">{activity.fraction}</span>
+              </div>
             </div>
           );
         })
@@ -116,6 +136,8 @@ export interface AttentionItem {
 export function useAttentionItems(): AttentionItem[] {
   const t = useTranslate();
   const { providers, holdoffs, downloadBlock, isPaused } = useNextData();
+  const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
+  const now = useNow(1000, counting);
   const items: AttentionItem[] = [];
 
   for (const holdoff of holdoffs) {
@@ -127,19 +149,35 @@ export function useAttentionItems(): AttentionItem[] {
     });
   }
 
+  // A holdoff the metrics stream already named does not deserve a second row
+  // just because server health saw the same episode.
+  const named = new Set(holdoffs.map((holdoff) => holdoff.label));
   for (const provider of providers) {
-    if (provider.state === "healthy") {
+    const held =
+      provider.activity === "over_limit" ||
+      provider.activity === "cooling_down" ||
+      provider.activity === "disabled";
+    if (!held && provider.state === "healthy") {
       continue;
     }
+    if (provider.activity === "over_limit" && named.has(provider.label)) {
+      continue;
+    }
+    const activity = providerActivityLabel(provider, t, now);
     const consecutive = provider.consecutiveFailures;
+    const failures = `${countLabel(t, "next.attention.consecutiveFailures", consecutive)} · ${formatLatency(provider.latencyMs)}`;
     items.push({
       id: `provider:${provider.host}:${provider.port}`,
       text: t("next.attention.providerState", {
         host: provider.host,
-        state: providerStateLabel(t, provider.state),
+        // The activity is the more specific of the two: a healthy server the
+        // provider is refusing reads as held back, not as healthy.
+        state: activity.word || providerStateLabel(t, provider.state),
       }),
-      meta: `${countLabel(t, "next.attention.consecutiveFailures", consecutive)} · ${formatLatency(provider.latencyMs)}`,
-      color: provider.state === "disabled" ? WV.error : WV.warn,
+      // Nothing the failure counters say explains a provider-side refusal, so
+      // that one row carries the cause instead.
+      meta: provider.activity === "over_limit" ? (activity.cause ?? failures) : failures,
+      color: provider.activity === "disabled" ? WV.error : WV.warn,
     });
   }
 

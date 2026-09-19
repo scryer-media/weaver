@@ -2555,6 +2555,29 @@ type ServerHealth {
 	"""
 	state: String!
 	"""
+	What this server is doing right now, as one word a rail can lead with:
+	"downloading", "idle", "preparing", "over_limit", "cooling_down",
+	"degraded" or "disabled". A bare connection fraction reads as a fault
+	when the pool is deliberately holding back, so the state is the
+	headline and the counts are the detail.
+	"""
+	activity: String!
+	"""
+	When the current activity is expected to end, if the daemon knows:
+	the holdoff deadline while "over_limit", the cooldown deadline while
+	"cooling_down". Absent for every activity that has no deadline.
+	"""
+	activityUntilEpochMs: Int
+	"""
+	Sockets currently open to this server — owned lanes, warm lanes and
+	async pool connections alike — whether or not they carry a request.
+	"""
+	connectionsOpen: Int!
+	"""
+	Open sockets currently carrying a request.
+	"""
+	connectionsBusy: Int!
+	"""
 	Currently in-use connections (max - available permits).
 	"""
 	connectionsActive: Int!
