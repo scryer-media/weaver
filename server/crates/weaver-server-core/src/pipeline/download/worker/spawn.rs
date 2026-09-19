@@ -152,12 +152,10 @@ impl Pipeline {
                             end: decode_result.metadata.end,
                         };
 
-                        let decoded = {
-                            let _cpu_scope = crate::runtime::perf_probe::cpu_scope(
-                                "download.decode.copy_to_owned",
-                            );
-                            DecodedChunk::from(output.as_slice().to_vec())
-                        };
+                        // The pool slot travels to the writer as the decoded
+                        // payload; it comes back to the pool when the write
+                        // batch drops it.
+                        let decoded = DecodedChunk::Pooled(output);
 
                         let _profile_scope =
                             crate::runtime::perf_probe::scope("download.decode.send_success");
@@ -327,14 +325,14 @@ impl Pipeline {
                 continue;
             }
 
+            // Pool slots now stay with the decoded article until it is
+            // written, so an empty tier is not a reason to hold decode back:
+            // fall through to an owned buffer and keep the lane moving.
             let tier = crate::runtime::buffers::BufferTier::for_size(work.raw.len());
-            let Some(output) = self.buffers.try_acquire(tier) else {
-                remaining.push_back(work);
-                continue;
-            };
+            let output = self.buffers.try_acquire(tier);
 
             self.note_decode_started(work.segment_id, work.raw.len() as u64);
-            self.spawn_decode_task(work, Some(output));
+            self.spawn_decode_task(work, output);
             available_decode_slots -= 1;
         }
 

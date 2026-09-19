@@ -1866,8 +1866,16 @@ impl Default for CompletedFileChecksumState {
 
 pub(super) enum DecodedChunk {
     Contiguous(Box<[u8]>),
-    Batches { chunks: Vec<Box<[u8]>>, len: usize },
+    Batches {
+        chunks: Vec<Box<[u8]>>,
+        len: usize,
+    },
     Shared(Arc<download::repeated::SharedArticle>),
+    /// Decoded straight into a pool slot and carried to the writer as-is, so
+    /// the article never needs a second heap allocation for its decoded
+    /// bytes. Dropping it returns the slot to the pool instead of freeing on
+    /// whichever thread finished with it.
+    Pooled(BufferHandle),
 }
 
 impl DecodedChunk {
@@ -1876,6 +1884,7 @@ impl DecodedChunk {
             Self::Contiguous(bytes) => bytes.len(),
             Self::Batches { len, .. } => *len,
             Self::Shared(body) => body.data.len_bytes(),
+            Self::Pooled(buffer) => buffer.len(),
         }
     }
 
@@ -1885,6 +1894,7 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => f(bytes),
+            Self::Pooled(buffer) => f(buffer.as_slice()),
             Self::Shared(body) => body.data.for_each_slice(f),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
@@ -1900,6 +1910,7 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => writer.write_all(bytes),
+            Self::Pooled(buffer) => writer.write_all(buffer.as_slice()),
             Self::Shared(body) => body.data.write_to(writer),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
@@ -1915,6 +1926,7 @@ impl DecodedChunk {
     pub(super) fn push_io_slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
         match self {
             Self::Contiguous(bytes) => out.push(std::io::IoSlice::new(bytes)),
+            Self::Pooled(buffer) => out.push(std::io::IoSlice::new(buffer.as_slice())),
             Self::Shared(body) => body.data.push_io_slices(out),
             Self::Batches { chunks, .. } => {
                 out.extend(chunks.iter().map(|chunk| std::io::IoSlice::new(chunk)));
