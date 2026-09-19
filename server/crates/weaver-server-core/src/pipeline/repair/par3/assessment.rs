@@ -48,11 +48,7 @@ impl AssessmentView {
         });
         let cost = assessment.requirements.iter().try_fold(
             cost.ok_or(budget::host_limit("PAR3 assessment view size"))?,
-            |bytes, requirement| {
-                bytes
-                    .checked_add(256)?
-                    .checked_add(requirement.available.len().checked_mul(16)?)
-            },
+            |bytes, requirement| bytes.checked_add(requirement_view_cost(requirement)?),
         );
         let reservation =
             ViewReservation::acquire(cost.ok_or(budget::host_limit("PAR3 assessment view size"))?)?;
@@ -86,6 +82,31 @@ impl AssessmentView {
             _reservation: reservation,
         })
     }
+}
+
+/// Retained host bytes one requirement costs the view that holds it.
+///
+/// Every vector the host keeps a copy of is charged here. The requirement
+/// itself is cloned into the view, so `available` and `next_indices` are held
+/// twice over — once in the engine's answer and once here. `recovery_indices`
+/// is a range, not a vector, so it costs nothing beyond the struct.
+///
+/// The cohort plan built from this view (see [`super::cohorts::CohortPlan`])
+/// copies `next_indices` again and a subset of `available` into each window,
+/// and has no reservation of its own: those copies live exactly as long as the
+/// view they were derived from, so the view is what pays for them.
+fn requirement_view_cost(requirement: &RecoveryRequirement) -> Option<usize> {
+    const INDEX_BYTES: usize = std::mem::size_of::<u64>();
+    let available = requirement.available.len();
+    let next = requirement.next_indices.len();
+    256usize
+        .checked_add(available.checked_mul(16)?)?
+        .checked_add(next.checked_mul(INDEX_BYTES)?)?
+        // The cohort window's own `next` and `held`, where `held` is at worst
+        // all of `available`.
+        .checked_add(64)?
+        .checked_add(next.checked_mul(INDEX_BYTES)?)?
+        .checked_add(available.checked_mul(INDEX_BYTES)?)
 }
 
 pub(super) struct SetSession {
@@ -182,5 +203,40 @@ mod tests {
         );
         // An independent small reservation still succeeds and releases on drop.
         drop(ViewReservation::acquire(1).unwrap());
+    }
+
+    fn requirement_with(available: &[u64], next_indices: &[u64]) -> RecoveryRequirement {
+        RecoveryRequirement {
+            matrix: [0u8; 16],
+            cohort: 0,
+            cohorts: 1,
+            recovery_indices: 0..64,
+            lost: next_indices.len() as u64,
+            available: available.to_vec(),
+            additional: next_indices.len() as u64,
+            in_flight: 0,
+            outstanding: next_indices.len() as u64,
+            next_indices: next_indices.to_vec(),
+        }
+    }
+
+    /// Every index vector the host retains is paid for. A requirement naming
+    /// the indices still to fetch costs more than one naming none, and a
+    /// requirement holding more available indices costs more again — nothing
+    /// the view and the cohort windows keep is free.
+    #[test]
+    fn the_view_cost_grows_with_every_retained_index_vector() {
+        let bare = requirement_view_cost(&requirement_with(&[], &[])).unwrap();
+        let with_next = requirement_view_cost(&requirement_with(&[], &[1, 3, 5])).unwrap();
+        let with_both = requirement_view_cost(&requirement_with(&[2, 4], &[1, 3, 5])).unwrap();
+
+        assert!(
+            with_next > bare,
+            "the indices still to fetch are retained twice and must be charged"
+        );
+        assert!(
+            with_both > with_next,
+            "available indices are retained by the cohort windows as well"
+        );
     }
 }
