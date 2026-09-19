@@ -11,6 +11,7 @@ import { EM_DASH, formatCount, formatDuration, formatSize } from "../data/format
 import { useMetricsSnapshot } from "../data/use-metrics-series";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../shell/rail-blocks";
+import { ApplicationUpgradeSection } from "../features/ApplicationUpgradeSection";
 
 interface DiskCapacity {
   totalBytes: number;
@@ -287,6 +288,8 @@ export function SystemInfoPage() {
             <KeyValueRow label={t("next.system.operatingSystem")} value={enumLabel(info.operatingSystem)} />
             <KeyValueRow label={t("next.system.database")} value={enumLabel(info.databaseEngine)} />
             <KeyValueRow label={t("next.rail.uptime")} value={formatDuration(info.uptimeSeconds)} />
+
+            <ApplicationUpgradeSection />
 
             <SectionHeader label={t("next.system.compute")} note={t("next.system.computeNote")} />
             <KeyValueRow label={t("next.system.decoderTier")} value={info.compute.decoderTier} />

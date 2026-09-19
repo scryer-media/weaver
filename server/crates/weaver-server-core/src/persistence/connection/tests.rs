@@ -2051,7 +2051,10 @@ async fn postgres_executor_runs_sync_calls_concurrently_when_configured() {
         if waiting == 4 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // PostgreSQL has no notification for a lock wait, so the lock table is
+        // read again; each read is a round trip, and nothing here waits on
+        // elapsed time.
+        tokio::task::yield_now().await;
     }
 
     lock_tx.commit().await.unwrap();

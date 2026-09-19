@@ -773,7 +773,17 @@ impl ApplicationUpgradeService {
     }
 
     fn fail_run(&self, run: &ApplicationUpgradeRun, error: String) {
-        let mut next = run.clone();
+        // Fail from the latest published state of this run, not the snapshot
+        // the caller started with: that one still says `checking`, and the
+        // failure has to name the phase and byte counts it actually reached.
+        let mut next = self
+            .inner
+            .state
+            .borrow()
+            .as_ref()
+            .filter(|current| current.run_id == run.run_id)
+            .cloned()
+            .unwrap_or_else(|| run.clone());
         next.status = ApplicationUpgradeRunStatus::Failed;
         next.error = Some(error);
         next.completed_at_epoch_ms = Some(epoch_ms_now());
@@ -2331,5 +2341,40 @@ mod tests {
             restarted.snapshot().active_run.is_none(),
             "a finished run is not active"
         );
+    }
+
+    /// A failure after the pipeline advanced reports where it stopped, not
+    /// the `checking` snapshot the upgrade task was started with.
+    #[tokio::test]
+    async fn a_late_failure_keeps_the_phase_and_bytes_it_reached() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = Database::open_in_memory().expect("in-memory database");
+        let update_check = UpdateCheckService::with_fetcher_enabled(
+            db.clone(),
+            Arc::new(StubReleaseFetcher {
+                version: Some(TEST_VERSION.to_string()),
+            }),
+            true,
+        );
+        let service = ApplicationUpgradeService::new(
+            db,
+            update_check,
+            temp.path(),
+            portable_assessment(),
+            None,
+        );
+        let request = test_request(temp.path().join("weaver"));
+        let started = ApplicationUpgradeRun::checking("late-failure".to_string(), &request);
+        service.publish(started.clone());
+        service.advance(&started, phases::STAGING, 4096, 8192);
+
+        service.fail_run(&started, "staging failed".to_string());
+
+        let failed = service.snapshot().latest_run.expect("the run is published");
+        assert_eq!(failed.status, ApplicationUpgradeRunStatus::Failed);
+        assert_eq!(failed.phase, phases::STAGING);
+        assert_eq!(failed.downloaded_bytes, 4096);
+        assert_eq!(failed.total_bytes, 8192);
+        assert_eq!(failed.error.as_deref(), Some("staging failed"));
     }
 }

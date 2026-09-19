@@ -662,6 +662,9 @@ pub(crate) fn row_detail(row: &QueueRow) -> String {
 
 use crate::bundle_relaunch::is_bundle_relaunch_exit;
 
+/// What a start or readiness wait reports while a bundle relaunch is pending.
+const RELAUNCH_PENDING_MESSAGE: &str = "Weaver was updated and is reopening to finish.";
+
 /// What one poll of the supervised server found.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SupervisedServer {
@@ -725,6 +728,11 @@ pub(crate) struct ServerSupervisor {
     /// How long the log was when the owned server was started, so a failed
     /// start is reported with its own error rather than an earlier run's.
     log_offset: u64,
+    /// The owned server exited asking for a bundle relaunch, and whichever
+    /// path reaped it was not the supervision poll. Held until the poll
+    /// reports it, so a start or readiness wait that happens to reap the exit
+    /// first cannot turn the relaunch into an ordinary server restart.
+    relaunch_pending: bool,
 }
 
 /// Reads the server's stderr to its end. Setup codes are kept for the UI;
@@ -777,6 +785,7 @@ impl ServerSupervisor {
             server: None,
             setup_code: Arc::new(Mutex::new(None)),
             log_offset: 0,
+            relaunch_pending: false,
         }
     }
 
@@ -819,7 +828,10 @@ impl ServerSupervisor {
     }
 
     /// Records how the owned server exited, next to whatever it said last.
-    fn record_server_exit(&self, status: ExitStatus) {
+    fn record_server_exit(&mut self, status: ExitStatus) {
+        if is_bundle_relaunch_exit(status) {
+            self.relaunch_pending = true;
+        }
         let Some(mut capture) = self.open_stderr_log() else {
             return;
         };
@@ -881,6 +893,11 @@ impl ServerSupervisor {
                     return Err(format!("failed to check Weaver server status: {error}"));
                 }
             }
+        }
+        // The replaced bundle has to be relaunched as a whole; a server
+        // started here would run under a wrapper whose binary is gone.
+        if self.relaunch_pending {
+            return Err(RELAUNCH_PENDING_MESSAGE.to_string());
         }
 
         let server_executable = self.server_executable()?;
@@ -956,6 +973,9 @@ impl ServerSupervisor {
                 return Ok(());
             }
             if let Some(status) = self.exited_server()? {
+                if self.relaunch_pending {
+                    return Err(RELAUNCH_PENDING_MESSAGE.to_string());
+                }
                 return Err(self.start_failure(status));
             }
             if Instant::now() >= deadline {
@@ -976,9 +996,13 @@ impl ServerSupervisor {
     /// be produced by anything else on the machine, needs no authentication of
     /// its own, and adds no listening surface.
     pub(crate) fn poll_supervised_server(&mut self) -> Result<SupervisedServer, String> {
+        if std::mem::take(&mut self.relaunch_pending) {
+            return Ok(SupervisedServer::RelaunchRequested);
+        }
         match self.exited_server()? {
             None => Ok(SupervisedServer::Running),
             Some(status) if is_bundle_relaunch_exit(status) => {
+                self.relaunch_pending = false;
                 Ok(SupervisedServer::RelaunchRequested)
             }
             Some(status) => Ok(SupervisedServer::Exited(status)),
@@ -1273,6 +1297,8 @@ mod tests {
         note_version_change, opens_in_external_browser, parse_http_response, parse_setup_code_line,
         popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
     };
+    #[cfg(unix)]
+    use super::{RELAUNCH_PENDING_MESSAGE, ServerSupervisor, SupervisedServer};
 
     #[test]
     fn the_spawn_command_marks_the_server_as_tray_supervised() {
@@ -1872,5 +1898,44 @@ mod tests {
         assert!(!is_bundle_relaunch_exit(
             std::process::ExitStatus::from_raw(BUNDLE_RELAUNCH_EXIT_CODE)
         ));
+    }
+
+    /// Opening the window after the upgraded server exited, but before the
+    /// supervision poll ran, reaps the relaunch exit in `start`. The relaunch
+    /// must survive that: `start` refuses to launch a server under the stale
+    /// wrapper, and the next poll still reports the relaunch, once.
+    #[cfg(unix)]
+    #[test]
+    fn a_relaunch_exit_reaped_by_start_still_reaches_the_poll() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("free port")
+            .port();
+        let mut supervisor = ServerSupervisor::new(profile.path().to_path_buf(), port);
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 87"])
+            .spawn()
+            .expect("spawn a child that exits with the relaunch code");
+        // Settle the exit now; `try_wait` then returns the recorded status.
+        child.wait().expect("child exits");
+        supervisor.server = Some(child);
+
+        let started = supervisor.start();
+        assert_eq!(started, Err(RELAUNCH_PENDING_MESSAGE.to_string()));
+        assert!(
+            supervisor.server.is_none(),
+            "no server under the stale wrapper"
+        );
+
+        assert_eq!(
+            supervisor.poll_supervised_server(),
+            Ok(SupervisedServer::RelaunchRequested)
+        );
+        assert_eq!(
+            supervisor.poll_supervised_server(),
+            Ok(SupervisedServer::Running),
+            "the relaunch is reported once"
+        );
     }
 }

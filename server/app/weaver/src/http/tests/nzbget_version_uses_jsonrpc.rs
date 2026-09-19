@@ -1555,7 +1555,11 @@ async fn nzbget_status_classifies_downloading_while_extracting_as_active() {
     assert_eq!(payload["result"]["ParJobCount"], 0);
 }
 
-#[tokio::test]
+// The resume timer is a tokio sleep, so the test runs on the paused clock:
+// time only moves when every task is idle, which makes both the wait for the
+// timer's resume and the check that a cancelled timer stays quiet independent
+// of how loaded the machine is.
+#[tokio::test(start_paused = true)]
 async fn nzbget_global_pause_resume_and_scheduleresume_auto_resume() {
     let handle = scheduler_handle_with_mock_commands(vec![]);
     let app = nzbget_test_router(
@@ -1592,7 +1596,8 @@ async fn nzbget_global_pause_resume_and_scheduleresume_auto_resume() {
     assert!(payload["result"]["ResumeTime"].as_u64().unwrap() > 0);
 
     // Wait for the timer's resume itself. The coordinator clears ResumeTime
-    // before it resumes, under the same lock, so the status below sees 0.
+    // before it resumes, under the same lock, so the status below sees 0. On
+    // the paused clock each step is an auto-advance, not elapsed wall time.
     while handle.is_globally_paused() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }

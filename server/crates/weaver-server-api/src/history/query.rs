@@ -391,20 +391,13 @@ async fn load_history_page(
     input: HistoryPageInput,
 ) -> Result<HistoryPage> {
     tokio::task::spawn_blocking(move || {
-        // Rows for jobs the scheduler still owns are not history. Excluding them
-        // after a SQL LIMIT/OFFSET would leave `total_count` and the bucket counts
-        // describing rows the page does not contain, so when the overlap is
-        // non-empty the page is built from the full row set with those rows
-        // removed: `build_history_page` derives counts, total_count, and
-        // pagination from the rows it is handed, which keeps all three
-        // consistent. The overlap is normally empty and this costs one indexed
-        // lookup over the live ids.
+        // Rows for jobs the scheduler still owns are not history. They are
+        // excluded before counting and pagination, on whichever path builds the
+        // page, so `total_count` and the bucket counts describe exactly the
+        // rows the page draws from. The overlap is normally empty and costs one
+        // indexed lookup over the live ids; when it is not, the SQL path still
+        // pages in SQL with a `NOT IN` over that handful of ids.
         let live_in_history = live_jobs_in_history(&db, &live_jobs)?;
-        if !live_in_history.is_empty() {
-            let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
-            let page = build_history_page(exclude_live_rows(rows, &live_in_history), input);
-            return attach_history_page_badges(&db, page);
-        }
         // Two code paths, selected by whether the request's semantics map exactly
         // onto SQL. The SQL path (`build_history_page_sql`) pushes the status
         // filter, ordering, counts, and LIMIT/OFFSET into the database, backed by
@@ -416,10 +409,10 @@ async fn load_history_page(
         // (not covered by the completed_at index) — keeps the original full-scan
         // Rust path (`build_history_page`) so results stay byte-identical.
         let page = if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
-            build_history_page_sql(&db, plan)?
+            build_history_page_sql(&db, plan, &live_in_history)?
         } else {
             let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
-            build_history_page(rows, input)
+            build_history_page(exclude_live_rows(rows, &live_in_history), input)
         };
         attach_history_page_badges(&db, page)
     })
@@ -544,22 +537,33 @@ fn failure_history_filter() -> weaver_server_core::HistoryFilter {
 fn build_history_page_sql(
     db: &Database,
     plan: HistoryPageSqlPlan,
+    live_in_history: &HashSet<u64>,
 ) -> Result<HistoryPage, weaver_server_core::StateError> {
+    // Every count and the page itself leave out rows of jobs still live.
+    let excluding_live = |mut filter: weaver_server_core::HistoryFilter| {
+        if !live_in_history.is_empty() {
+            let mut ids: Vec<u64> = live_in_history.iter().copied().collect();
+            ids.sort_unstable();
+            filter.item_ids_not_in = Some(ids);
+        }
+        filter
+    };
+
     // Counts are always computed over the entire (unfiltered-by-status) set, just
     // like the Rust path computes them before applying the status filter.
     let counts = HistoryPageCounts {
-        all: db.count_job_history(&weaver_server_core::HistoryFilter::default())?,
-        success: db.count_job_history(&success_history_filter())?,
-        failure: db.count_job_history(&failure_history_filter())?,
+        all: db.count_job_history(&excluding_live(weaver_server_core::HistoryFilter::default()))?,
+        success: db.count_job_history(&excluding_live(success_history_filter()))?,
+        failure: db.count_job_history(&excluding_live(failure_history_filter()))?,
     };
 
     // The status filter selects which rows are paginated and counted for
     // total_count. `All` needs no status predicate.
-    let mut items_filter = match plan.status {
+    let mut items_filter = excluding_live(match plan.status {
         HistoryStatusFilter::All => weaver_server_core::HistoryFilter::default(),
         HistoryStatusFilter::Success => success_history_filter(),
         HistoryStatusFilter::Failure => failure_history_filter(),
-    };
+    });
 
     let total_count = db.count_job_history(&items_filter)?;
 
@@ -1050,18 +1054,22 @@ mod tests {
         }
     }
 
-    fn rust_page(db: &Database, input: HistoryPageInput) -> HistoryPage {
+    fn rust_page(db: &Database, input: HistoryPageInput, live: &HashSet<u64>) -> HistoryPage {
         let rows = db
             .list_job_history(&weaver_server_core::HistoryFilter::default())
             .unwrap();
-        build_history_page(rows, input)
+        build_history_page(exclude_live_rows(rows, live), input)
     }
 
     fn assert_parity(db: &Database, input: HistoryPageInput) {
+        assert_parity_excluding(db, input, &HashSet::new());
+    }
+
+    fn assert_parity_excluding(db: &Database, input: HistoryPageInput, live: &HashSet<u64>) {
         let plan = HistoryPageSqlPlan::for_input(&input)
             .expect("input should be SQL-eligible for this parity check");
-        let sql = build_history_page_sql(db, plan).unwrap();
-        let rust = rust_page(db, input);
+        let sql = build_history_page_sql(db, plan, live).unwrap();
+        let rust = rust_page(db, input, live);
 
         assert_eq!(
             sql.total_count, rust.total_count,
@@ -1102,6 +1110,31 @@ mod tests {
                 assert_parity(&db, page_input(page_index, page_size, status));
             }
         }
+    }
+
+    /// A re-queued job's old row stays on the SQL path: the live ids are
+    /// excluded in SQL, and the page, its total and every bucket count match
+    /// the Rust path over the same rows with those ids removed.
+    #[test]
+    fn sql_path_excludes_live_rows_and_matches_rust_path() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        let live: HashSet<u64> = [2, 6].into_iter().collect();
+
+        for status in [
+            None,
+            Some(HistoryStatusFilter::Success),
+            Some(HistoryStatusFilter::Failure),
+        ] {
+            for (page_index, page_size) in [(0, 25), (0, 2), (1, 2), (3, 2)] {
+                assert_parity_excluding(&db, page_input(page_index, page_size, status), &live);
+            }
+        }
+
+        let plan = HistoryPageSqlPlan::for_input(&page_input(0, 25, None)).unwrap();
+        let page = build_history_page_sql(&db, plan, &live).unwrap();
+        assert_eq!(page.total_count, 5);
+        assert!(page.items.iter().all(|item| !live.contains(&item.id)));
     }
 
     #[test]
@@ -1156,7 +1189,7 @@ mod tests {
 
         let mut input = page_input(0, 25, None);
         input.categories = Some(vec!["movies".to_string()]);
-        let page = rust_page(&db, input.clone());
+        let page = rust_page(&db, input.clone(), &HashSet::new());
         assert_eq!(page.total_count, 2);
         assert_eq!(page.counts.all, 2, "counts describe the filtered set");
         assert_eq!(page.counts.success, 1);
@@ -1164,20 +1197,20 @@ mod tests {
 
         // A second facet widens rather than narrows.
         input.categories = Some(vec!["movies".to_string(), "tv".to_string()]);
-        let page = rust_page(&db, input.clone());
+        let page = rust_page(&db, input.clone(), &HashSet::new());
         assert_eq!(page.total_count, 3);
         assert_eq!(page.counts.success, 2);
 
         // The empty string is how a caller asks for rows with no category.
         input.categories = Some(vec![String::new()]);
-        let page = rust_page(&db, input.clone());
+        let page = rust_page(&db, input.clone(), &HashSet::new());
         let ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
         assert_eq!(ids, vec![4]);
 
         // A status filter still applies on top of the facets.
         input.categories = Some(vec!["movies".to_string(), "tv".to_string()]);
         input.status = Some(HistoryStatusFilter::Failure);
-        let page = rust_page(&db, input);
+        let page = rust_page(&db, input, &HashSet::new());
         let ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
         assert_eq!(ids, vec![2]);
     }

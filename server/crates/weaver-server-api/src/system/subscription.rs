@@ -44,10 +44,23 @@ impl SystemSubscription {
         let service = ctx
             .data::<weaver_server_core::application_upgrade::ApplicationUpgradeService>()?
             .clone();
-        let mut receiver = service.subscribe();
+        let mut runs = service.subscribe();
+        // The snapshot carries the release check as well as the run, so a
+        // release found after the page subscribed has to reach it too, or the
+        // install action stays hidden until the page is remounted.
+        let mut releases = ctx
+            .data::<weaver_server_core::update_check::UpdateCheckService>()?
+            .subscribe();
         Ok(async_stream::stream! {
             yield service.snapshot().into();
-            while receiver.changed().await.is_ok() {
+            loop {
+                let changed = tokio::select! {
+                    changed = runs.changed() => changed,
+                    changed = releases.changed() => changed,
+                };
+                if changed.is_err() {
+                    break;
+                }
                 yield service.snapshot().into();
             }
         })

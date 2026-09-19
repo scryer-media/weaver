@@ -1955,9 +1955,8 @@ fn spawn_session_expiry_server(
     let recorder = Arc::clone(&seen);
     let handle = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        // No read timeout: the server serves until the client closes the
+        // socket, which the test does before joining this thread.
         socket.write_all(b"200 ready\r\n").unwrap();
         let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
         let mut bodies_served = 0usize;

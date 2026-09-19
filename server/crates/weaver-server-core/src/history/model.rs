@@ -14,6 +14,9 @@ pub struct HistoryFilter {
     /// is every row that is neither `complete` nor `paused`).
     pub status_not_in: Option<Vec<String>>,
     pub item_ids: Option<Vec<u64>>,
+    /// Exclude rows whose job id is in this list (`NOT IN`). An empty list
+    /// excludes nothing.
+    pub item_ids_not_in: Option<Vec<u64>>,
     pub category: Option<String>,
     pub metadata_has_key: Option<String>,
     pub metadata_equals: Option<HistoryMetadataEquals>,
