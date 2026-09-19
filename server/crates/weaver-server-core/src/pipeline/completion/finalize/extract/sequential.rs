@@ -147,6 +147,13 @@ pub(in crate::pipeline) fn extract_sequential_stream<R: Read>(
     )
 }
 
-pub(in crate::pipeline) fn decoder_memory_bytes(kind: SimpleArchiveKind, ceiling: u64) -> u64 {
-    simple_decoder_memory_bytes(kind, ceiling)
+/// Decoder memory for one sequential stream. The archive is passed so the
+/// formats that declare what their decoder will hold are sized from the file
+/// instead of from the process ceiling.
+pub(in crate::pipeline) fn decoder_memory_bytes(
+    kind: SimpleArchiveKind,
+    path: Option<&Path>,
+    ceiling: u64,
+) -> Result<u64, String> {
+    measured_decoder_memory_bytes(kind, path, ceiling)
 }

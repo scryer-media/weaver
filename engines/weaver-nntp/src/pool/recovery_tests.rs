@@ -170,3 +170,85 @@ async fn recovered_batch_tries_unsent_articles_before_leaving_the_provider() {
     pool.drain_all_idle().await;
     server.await.unwrap();
 }
+
+/// A server that has been re-enabled but still owes a recovery probe refuses
+/// extra connections through the recovery gate, not through the permit
+/// semaphore. The two must answer differently: this one happens with every
+/// permit free and every socket idle, and calling it saturation sends the
+/// reader hunting a permit leak that does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recovery_gate_refusal_is_not_capacity_saturation() {
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![ServerPoolConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 1,
+                tls: false,
+                ..Default::default()
+            },
+            stable_id: StableServerId(11),
+            max_connections: 4,
+            ..Default::default()
+        }],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    });
+    let pool = client.pool();
+    for _ in 0..10 {
+        pool.health.lock().await.record_failure(0, false);
+    }
+    assert!(pool.requires_recovery(0));
+
+    // Before the backoff expires nothing is admitted at all.
+    assert!(matches!(
+        pool.try_acquire_blocking_permit_for_work(ServerId(0), true),
+        Err(NntpError::ServerRecovering)
+    ));
+
+    pool.recovery_gates[0].expire_now();
+    // A warm dial is not demanded work and must never spend the one probe.
+    assert!(matches!(
+        pool.try_acquire_blocking_permit_for_work(ServerId(0), false),
+        Err(NntpError::ServerRecovering)
+    ));
+
+    let probe = pool
+        .try_acquire_blocking_permit_for_work(ServerId(0), true)
+        .expect("the re-enabled server admits its one probe");
+    assert!(
+        probe.health_lease.0.probing(),
+        "the admitted connection is the recovery probe"
+    );
+    // Every permit but the probe's is still free: this refusal is the gate's.
+    assert_eq!(pool.server_load(0).0, 3);
+    assert!(matches!(
+        pool.try_acquire_blocking_permit_for_work(ServerId(0), true),
+        Err(NntpError::ServerRecovering)
+    ));
+
+    // The probe's success is what ends the quarantine, and ordinary work is
+    // admitted again.
+    assert!(probe.health_lease.0.complete_recovery());
+    assert!(!pool.requires_recovery(0));
+    pool.try_acquire_blocking_permit_for_work(ServerId(0), false)
+        .expect("a recovered server takes warm dials again");
+}
+
+/// The label the refusal travels under is the whole point of the variant.
+#[test]
+fn a_recovery_refusal_reports_its_own_kind() {
+    use crate::client::BlockingBodyLaneAcquireError;
+
+    let recovering = BlockingBodyLaneAcquireError::ServerRecovering;
+    assert_eq!(recovering.kind(), "server_recovering");
+    assert_ne!(
+        recovering.kind(),
+        BlockingBodyLaneAcquireError::LocalCapacity.kind()
+    );
+    assert!(
+        recovering.should_requeue_owned_work(),
+        "the probe clears on its own, so the work waits on the owned lanes"
+    );
+    assert!(recovering.nntp_error().is_none());
+}

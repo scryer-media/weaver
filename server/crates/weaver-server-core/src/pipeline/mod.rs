@@ -267,8 +267,10 @@ pub(super) struct DownloadBatchLease {
     /// class gauges are released against what was booked.
     pub(super) completion_critical: bool,
     /// The job's retention exclusions — the set server ordering and lane
-    /// acquisition use. Each result reports its own work's failure-only
-    /// excludes; retention stays job-derived.
+    /// acquisition use. Job-derived, so a server-config change applies without
+    /// rewriting queued work, and the same for every article on the lane:
+    /// each result unions it with its own work's failure ledger rather than
+    /// reporting this set alone.
     pub(super) effective_exclude_servers: Vec<usize>,
     /// The servers the lane's adopt or dial must not use. A batch is cut for
     /// one server, so this is every other server: the connection goes where
@@ -543,7 +545,10 @@ impl DownloadFailure {
             // A 412 learns the GROUP prologue needed by the next connection;
             // no article content has been received or rejected yet.
             NntpError::NoGroupSelected => Some(DownloadFailureKind::ConnectionEstablishment),
-            NntpError::PoolExhausted
+            // The recovery gate holding the server open for one probe: local
+            // admission, self-clearing, and no verdict about the article.
+            NntpError::ServerRecovering
+            | NntpError::PoolExhausted
             | NntpError::PoolShutdown
             | NntpError::TooManyConnections
             | NntpError::ServerOverLimit { .. }
@@ -560,6 +565,10 @@ impl DownloadFailure {
             | NntpError::Timeout
             | NntpError::SoftTimeout(_)
             | NntpError::ConnectionClosed
+            // A session that expired part-way through a batch costs the
+            // connection, not the server: the articles are re-asked on a
+            // freshly authenticated one.
+            | NntpError::SessionExpired
             | NntpError::ServerDisconnectedMidBody
             | NntpError::TruncatedMultilineBody
             | NntpError::MalformedMultilineTerminator
@@ -2618,6 +2627,11 @@ pub struct Pipeline {
     pub(super) propagation_delay_forced: Option<Duration>,
     /// Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
+    /// Retry-storm window: when it opened, and the retry and download counts
+    /// it opened with. A pipeline that retries without ever finishing an
+    /// article is as stalled as one with no active downloads, but it looks
+    /// busy from every gauge the stall log reads, so it gets its own window.
+    pub(super) download_retry_storm_window: Option<(Instant, u64, u64)>,
     /// Rate limiter, per job, for the owned blocking lane acquire warning.
     pub(super) owned_lane_acquire_failure_log_throttle: download::JobLogThrottle,
     /// Rate limiter, per job, for the "a pass found this job ineligible"

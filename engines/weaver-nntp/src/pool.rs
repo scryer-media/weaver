@@ -1395,9 +1395,13 @@ impl NntpPool {
             .try_acquire_owned()
             .map_err(|_| NntpError::PoolExhausted)?;
         let budget = &self.socket_budgets[idx];
+        // A distinct error, not `PoolExhausted`: this refusal is the recovery
+        // gate holding the tier open for one probe, and reading it as
+        // saturation sends the operator looking for a permit leak on a server
+        // that has every permit free.
         let health_lease = self.recovery_gates[idx]
             .admit(demanded)
-            .ok_or(NntpError::PoolExhausted)?;
+            .ok_or(NntpError::ServerRecovering)?;
         let socket_slot = budget
             .try_acquire()
             .or_else(|| {

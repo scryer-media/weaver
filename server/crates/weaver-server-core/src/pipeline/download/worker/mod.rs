@@ -160,6 +160,12 @@ const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How many retries inside one stall-log window, with nothing downloaded in
+/// the same window, read as a retry storm rather than as ordinary churn. A
+/// healthy pipeline retries a handful of articles per window and finishes
+/// others alongside them; a thousand retries and no completion is a loop.
+const DOWNLOAD_RETRY_STORM_THRESHOLD: u64 = 1_000;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
     pub(in crate::pipeline) state: DownloadPressureState,
@@ -201,14 +207,41 @@ impl Pipeline {
         None
     }
 
+    /// Order the servers one dispatch attempt may ask, in place.
+    ///
+    /// Idle-first, but only inside a priority group. The pool's ranking
+    /// already puts the higher group first, and a lower group may take
+    /// ordinary work only once the higher one is out of seats — a preference
+    /// order, unlike backfill, which is a reservation and so stays last
+    /// whatever group it is in. Sorting on idleness alone promoted whichever
+    /// server happened to be holding a cached lane over the whole group above
+    /// it, so a job retrying hard on a low-priority server quietly handed it
+    /// everyone else's work. The sort is stable, so the pool's own ranking
+    /// survives inside each group.
+    pub(in crate::pipeline) fn order_dispatch_candidates(
+        servers: &mut [usize],
+        groups: &[u32],
+        backfill_flags: &[bool],
+        idle_by_server: &HashMap<usize, usize>,
+    ) {
+        servers.sort_by_key(|server| {
+            (
+                backfill_flags.get(*server).copied().unwrap_or(false),
+                groups.get(*server).copied().unwrap_or(u32::MAX),
+                !idle_by_server.contains_key(server),
+            )
+        });
+    }
+
     /// Start one more connection: choose the server, ask the scheduler what
     /// that server should fetch, lease it and hand it to a worker.
     ///
     /// The server comes first because the scheduler's answer is per server:
     /// the hot job may have nothing left that server A may fetch while server
     /// B could still carry it. Servers are tried in the pool's own ranking,
-    /// those where an idle worker already holds a connection ahead of the
-    /// rest, and a server is only asked while it can still seat the lease:
+    /// and within one priority group those where an idle worker already
+    /// holds a connection come ahead of the rest. A server is only asked
+    /// while it can still seat the lease:
     /// an idle connection or a free permit beyond what this pass has already
     /// sent it. Without that, a pass that opens several lanes would send two
     /// dials at a server with one free permit, and the second would sit in
@@ -248,7 +281,8 @@ impl Pipeline {
                 None => idle_by_server.keys().copied().collect(),
             },
         };
-        servers.sort_by_key(|server| !idle_by_server.contains_key(server));
+        let groups = self.nntp.pool().server_groups().to_vec();
+        Self::order_dispatch_candidates(&mut servers, &groups, backfill_flags, &idle_by_server);
         // The backfill tier comes last, and only for what the fill tier has
         // given up on: the scheduler's filter holds a backfill server to
         // articles every available fill server is excluded from.
@@ -672,6 +706,7 @@ impl Pipeline {
         if active_connections_before_dispatch == 0 && self.active_download_connections == 0 {
             self.log_download_dispatch_liveness_stall(now, pressure, max, eligible_count);
         }
+        self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);
         self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();

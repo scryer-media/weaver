@@ -1574,6 +1574,14 @@ fn lane_acquire_failure_preserves_retry_semantics() {
         assert!(failure.kind.preserves_article_retry_budget());
         assert!(failure.kind.infrastructure_wait_reason().is_some());
     }
+    // A session that expired part-way through a batch costs the connection,
+    // not the server: it keeps the article's retry budget and is never booked
+    // as an auth failure, which would disable the server for the auth backoff
+    // and unlock the backfill tier behind it.
+    let expired = DownloadFailure::from_nntp(weaver_nntp::NntpError::SessionExpired);
+    assert_eq!(expired.kind, DownloadFailureKind::EstablishedTransport);
+    assert!(expired.kind.preserves_article_retry_budget());
+
     let unavailable = DownloadFailure::from_lane_acquire_failure(None);
     assert_eq!(unavailable.kind, DownloadFailureKind::LaneUnavailable);
 
@@ -3767,4 +3775,134 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
         pipeline.job_last_download_activity.contains_key(&job_id),
         "download activity is noted against the result's own job"
     );
+}
+
+/// An article that already failed on one server and 430s on the other is
+/// missing everywhere. The completion path can only see that when the result
+/// carries the article's own exclusions: a lane's batch is cut for one job,
+/// not for one exclusion set, so the lease's set says nothing about which
+/// servers this article has already been refused by. Reporting the lease's
+/// set instead leaves the exclusion set one server wide forever, and because
+/// a sourced 430 spends no retry budget and waits no delay, the article
+/// ping-pongs between the two servers for as long as the job lives.
+#[tokio::test]
+async fn article_not_found_exhausts_when_the_work_already_failed_elsewhere() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40160);
+    let spec = segmented_job_spec("Missing Everywhere", "gone.bin", &[128, 128, 128, 128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id,
+            runtime_generation: 0,
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::ArticleNotFound,
+                "article not found",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(1),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            // What the article carries after its first 430 on server 0.
+            exclude_servers: vec![0],
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .articles_not_found
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "both servers have now refused the article, so it is missing"
+    );
+    assert_eq!(pipeline.pending_retries_by_job.get(&job_id).copied(), None);
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| state.failed_bytes == 128),
+        "failed bytes must be booked (job may already be archived by health)"
+    );
+}
+
+/// A 430 whose server is already in the article's exclusion set taught the
+/// retry nothing: the next attempt asks the same servers, gets the same
+/// answer, spends no retry budget and waits no delay. Book it rather than
+/// spin, even with servers left over in the pool.
+#[tokio::test]
+async fn article_not_found_that_learns_no_new_server_books_instead_of_retrying() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40161);
+    let spec = segmented_job_spec("Nothing Learned", "loop.bin", &[128, 128, 128, 128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0, 0]));
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id,
+            runtime_generation: 0,
+            segment_id: SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::ArticleNotFound,
+                "article not found",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(1),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: vec![1],
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .articles_not_found_without_new_server
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a 430 that adds no server to the exclusion set must be counted"
+    );
+    assert_eq!(pipeline.pending_retries_by_job.get(&job_id).copied(), None);
 }

@@ -442,13 +442,18 @@ impl Pipeline {
         let parked = self.download_lane_parked_tx.clone();
         tokio::spawn(async move {
             for work in lease.works {
+                // The article's own failure ledger, unioned with the job's
+                // retention exclusions from the lease. A batch is cut for one
+                // job, not for one exclusion set, so the ledger has to come
+                // from the work: fetching on the lease's set alone re-asks a
+                // server this article has already been refused by, and the
+                // result then reports a set that never grows.
+                let excludes = Pipeline::union_exclude_servers(
+                    &work.exclude_servers,
+                    &lease.effective_exclude_servers,
+                );
                 let reply = cache
-                    .fetch(
-                        &work,
-                        &lease.effective_exclude_servers,
-                        &nntp,
-                        lease.runtime_generation,
-                    )
+                    .fetch(&work, &excludes, &nntp, lease.runtime_generation)
                     .await;
                 let _ = tx
                     .send(DownloadResult {
@@ -465,7 +470,10 @@ impl Pipeline {
                             work.completion_critical,
                         ),
                         retry_count: work.retry_count,
-                        exclude_servers: reply.excludes,
+                        exclude_servers: Pipeline::union_exclude_servers(
+                            &reply.excludes,
+                            &lease.effective_exclude_servers,
+                        ),
                         release_connection_slot: false,
                     })
                     .await;

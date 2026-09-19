@@ -369,6 +369,12 @@ pub struct PipelineMetrics {
     pub segments_decoded: AtomicU64,
     pub segments_committed: AtomicU64,
     pub articles_not_found: AtomicU64,
+    /// Articles booked missing because a 430 taught the retry nothing: the
+    /// exclusion set came back the same size it went out. Every increment is
+    /// a retry loop that would otherwise have re-asked the same servers at
+    /// zero delay forever, so a non-zero value here points at whatever lost
+    /// the article's exclusions on the way back.
+    pub articles_not_found_without_new_server: AtomicU64,
     pub decode_errors: AtomicU64,
 
     // Post-processing activity
@@ -501,6 +507,7 @@ impl PipelineMetrics {
             segments_decoded: AtomicU64::new(0),
             segments_committed: AtomicU64::new(0),
             articles_not_found: AtomicU64::new(0),
+            articles_not_found_without_new_server: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
             verify_active: AtomicUsize::new(0),
             repair_active: AtomicUsize::new(0),

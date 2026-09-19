@@ -355,10 +355,6 @@ fn assert_zip_method_matches_7z(extra_args: &[&str], password: Option<&str>) {
 fn simple_decoder_reservations_use_realistic_codec_bounds() {
     let large_limit = 48_u64 * 1024 * 1024 * 1024;
     assert_eq!(
-        simple_decoder_memory_bytes(SimpleArchiveKind::Zstd, large_limit),
-        large_limit
-    );
-    assert_eq!(
         simple_decoder_memory_bytes(SimpleArchiveKind::Brotli, large_limit),
         32 * 1024 * 1024
     );
@@ -1292,4 +1288,107 @@ fn chase_mirror_settles_installed_bytes_exactly_once() {
     let phase = phase_counters(0, 0);
     ChaseMirror::new(Arc::clone(&phase)).settle(700, 700);
     assert_eq!(phase_bytes(&phase), (700, 700));
+}
+
+/// A zstd frame says in its header how large a window its decoder will hold.
+/// Reading it is the difference between a reservation that can be granted
+/// and one that can only be granted when the whole process is idle.
+#[test]
+fn zstd_window_is_read_from_the_frame_header() {
+    // Frame header descriptor 0x00: no content size, not single-segment, no
+    // dictionary id. Window descriptor 0x00: exponent 0, mantissa 0 — the
+    // format's smallest window, 1 KiB.
+    let smallest = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+    assert_eq!(zstd_frame_window_bytes(&smallest).unwrap(), 1024);
+
+    // Exponent 10, mantissa 3: base 1 MiB plus three eighths of it.
+    let window_descriptor = (10u8 << 3) | 3;
+    let mid = [0x28, 0xB5, 0x2F, 0xFD, 0x00, window_descriptor];
+    let base = 1024 * 1024u64;
+    assert_eq!(
+        zstd_frame_window_bytes(&mid).unwrap(),
+        base + (base / 8) * 3
+    );
+
+    // Single-segment frame: no window descriptor, and the one-byte content
+    // size is what the decoder holds.
+    let single = [0x28, 0xB5, 0x2F, 0xFD, 0b0010_0000, 42];
+    assert_eq!(zstd_frame_window_bytes(&single).unwrap(), 42);
+
+    // A window larger than the content it can ever hold is not held.
+    let content_size_flag = 0b0100_0000u8;
+    let mut capped = vec![0x28, 0xB5, 0x2F, 0xFD, content_size_flag, window_descriptor];
+    // Two-byte content size is stored offset by 256.
+    capped.extend_from_slice(&(1024u16 - 256).to_le_bytes());
+    assert_eq!(zstd_frame_window_bytes(&capped).unwrap(), 1024);
+
+    // Anything that is not a zstd frame, or a header that stops early, is an
+    // error rather than a reservation.
+    assert!(zstd_frame_window_bytes(&[0x00, 0x01, 0x02, 0x03]).is_err());
+    assert!(zstd_frame_window_bytes(&[0x28, 0xB5, 0x2F]).is_err());
+    assert!(zstd_frame_window_bytes(&[0x28, 0xB5, 0x2F, 0xFD, 0b0000_1000, 0]).is_err());
+}
+
+/// A real frame's reservation has to be small enough to be granted while the
+/// rest of the process is working. The old sizing asked for the entire
+/// allowance, which registers as a waiter and makes every running direct
+/// unpack yield its decoder before this one can even start.
+#[test]
+fn a_zstd_reservation_is_a_fraction_of_the_process_allowance() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("payload.zst");
+    let payload = vec![7u8; 512 * 1024];
+    fs::write(
+        &archive,
+        zstd::stream::encode_all(payload.as_slice(), 3).unwrap(),
+    )
+    .unwrap();
+
+    let limit = 64_u64 * 1024 * 1024 * 1024;
+    let reserved =
+        measured_decoder_memory_bytes(SimpleArchiveKind::Zstd, Some(archive.as_path()), limit)
+            .unwrap();
+    assert!(
+        reserved < 64 * 1024 * 1024,
+        "a half-megabyte payload must not reserve {reserved} bytes"
+    );
+    assert!(
+        reserved * 1000 < limit,
+        "the reservation must leave the allowance usable by everything else"
+    );
+
+    // A file that is not a zstd frame fails the extraction instead of
+    // reserving the allowance and waiting for it.
+    let bogus = temp.path().join("not-really.zst");
+    fs::write(&bogus, b"this is not a frame").unwrap();
+    assert!(
+        measured_decoder_memory_bytes(SimpleArchiveKind::Zstd, Some(bogus.as_path()), limit)
+            .is_err()
+    );
+}
+
+/// A frame whose window is larger than the whole allowance cannot be decoded
+/// here, and says so instead of parking forever on a reservation nothing can
+/// grant.
+#[test]
+fn a_zstd_window_above_the_limit_is_refused() {
+    // Exponent 21, mantissa 0: a 2 GiB window (the base is 1 KiB shifted by
+    // the exponent).
+    let huge = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 21u8 << 3];
+    assert_eq!(
+        zstd_frame_window_bytes(&huge).unwrap(),
+        2 * 1024 * 1024 * 1024
+    );
+
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("wide.zst");
+    fs::write(&archive, huge).unwrap();
+    assert!(
+        measured_decoder_memory_bytes(
+            SimpleArchiveKind::Zstd,
+            Some(archive.as_path()),
+            32 * 1024 * 1024,
+        )
+        .is_err()
+    );
 }

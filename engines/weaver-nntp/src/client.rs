@@ -83,6 +83,11 @@ const BLOCKING_HEALTH_LOCK_SPINS: usize = 4;
 pub enum BlockingBodyLaneAcquireError {
     ProviderCapacity(NntpError),
     LocalCapacity,
+    /// Every candidate server is recovering and its one probe connection is
+    /// already out. Self-clearing like local capacity, but not the same
+    /// thing: the permits are free and the sockets are idle, and reporting it
+    /// as saturation points the reader at a leak that is not there.
+    ServerRecovering,
     NoEligibleServer,
     /// The health mutex was held elsewhere, so candidates could not be ranked.
     /// This says nothing about server availability — the caller should hand
@@ -105,7 +110,10 @@ impl BlockingBodyLaneAcquireError {
     }
 
     pub fn is_capacity_admission(&self) -> bool {
-        matches!(self, Self::ProviderCapacity(_) | Self::LocalCapacity)
+        matches!(
+            self,
+            Self::ProviderCapacity(_) | Self::LocalCapacity | Self::ServerRecovering
+        )
     }
 
     /// The transport error behind this refusal, where there is one. Local
@@ -114,7 +122,10 @@ impl BlockingBodyLaneAcquireError {
     pub fn nntp_error(&self) -> Option<&NntpError> {
         match self {
             Self::ProviderCapacity(error) | Self::Other(error) => Some(error),
-            Self::LocalCapacity | Self::NoEligibleServer | Self::SelectionContended => None,
+            Self::LocalCapacity
+            | Self::ServerRecovering
+            | Self::NoEligibleServer
+            | Self::SelectionContended => None,
         }
     }
 
@@ -134,6 +145,7 @@ impl BlockingBodyLaneAcquireError {
         match self {
             Self::ProviderCapacity(_) => "provider_capacity",
             Self::LocalCapacity => "local_capacity",
+            Self::ServerRecovering => "server_recovering",
             Self::NoEligibleServer => "no_eligible_server",
             Self::SelectionContended => "selection_contended",
             Self::Other(_) => "other",
@@ -146,6 +158,8 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
         match self {
             Self::ProviderCapacity(error) | Self::Other(error) => error.fmt(formatter),
             Self::LocalCapacity => formatter.write_str("blocking BODY lane capacity is saturated"),
+            Self::ServerRecovering => formatter
+                .write_str("server is recovering; the recovery probe connection is already out"),
             Self::NoEligibleServer => formatter.write_str("no eligible blocking BODY server"),
             Self::SelectionContended => {
                 formatter.write_str("blocking BODY server selection contended on server health")
@@ -2415,6 +2429,7 @@ impl NntpClient {
         }
 
         let mut saw_local_capacity = false;
+        let mut saw_recovery_gate = false;
         let mut provider_capacity_error = None;
         let mut other_error = None;
         for server in selection.eligible {
@@ -2423,6 +2438,13 @@ impl NntpClient {
                 .try_acquire_blocking_permit_for_work(server, demanded)
             {
                 Ok(permit) => permit,
+                // Kept apart from a permit or socket shortage: one is a queue
+                // to wait in, the other is a server holding itself open for a
+                // single probe.
+                Err(NntpError::ServerRecovering) => {
+                    saw_recovery_gate = true;
+                    continue;
+                }
                 Err(_) => {
                     saw_local_capacity = true;
                     continue;
@@ -2503,6 +2525,7 @@ impl NntpClient {
                             other_error = Some(error);
                         }
                         BlockingBodyLaneAcquireError::LocalCapacity
+                        | BlockingBodyLaneAcquireError::ServerRecovering
                         | BlockingBodyLaneAcquireError::NoEligibleServer
                         | BlockingBodyLaneAcquireError::SelectionContended => unreachable!(),
                     }
@@ -2515,6 +2538,8 @@ impl NntpClient {
             Err(BlockingBodyLaneAcquireError::Other(error))
         } else if saw_local_capacity {
             Err(BlockingBodyLaneAcquireError::LocalCapacity)
+        } else if saw_recovery_gate {
+            Err(BlockingBodyLaneAcquireError::ServerRecovering)
         } else {
             Err(BlockingBodyLaneAcquireError::NoEligibleServer)
         }
@@ -3844,6 +3869,9 @@ fn is_connection_error(err: &NntpError) -> bool {
             | NntpError::MalformedMultilineTerminator
             | NntpError::TooManyConnections
             | NntpError::AccessDenied
+            // The batch's remaining replies are still queued on that socket,
+            // so nothing else may be sent down it.
+            | NntpError::SessionExpired
             | NntpError::SoftTimeout(_)
     )
 }

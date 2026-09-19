@@ -1942,3 +1942,100 @@ fn tcp_peer_closed_sees_a_server_side_close_on_an_idle_socket() {
     let mut byte = [0u8; 1];
     assert_eq!((&client).read(&mut byte).unwrap(), 0);
 }
+
+/// A server that authenticates, serves the first BODY it is asked for, and
+/// answers every later one with 480 — a session that expired part-way through
+/// a pipelined batch. Records the command lines it saw.
+fn spawn_session_expiry_server(
+    body: Vec<u8>,
+) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket.write_all(b"200 ready\r\n").unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut bodies_served = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let command = line.trim_end_matches(['\r', '\n']).to_string();
+            recorder.lock().unwrap().push(command.clone());
+            let upper = command.to_ascii_uppercase();
+            let response: Vec<u8> = if upper.starts_with("AUTHINFO USER") {
+                b"381 password\r\n".to_vec()
+            } else if upper.starts_with("AUTHINFO PASS") {
+                b"281 authenticated\r\n".to_vec()
+            } else if upper.starts_with("BODY") {
+                bodies_served += 1;
+                if bodies_served == 1 {
+                    let mut reply = b"222 0 body follows\r\n".to_vec();
+                    reply.extend_from_slice(&body);
+                    reply.extend_from_slice(b".\r\n");
+                    reply
+                } else {
+                    b"480 authentication required\r\n".to_vec()
+                }
+            } else if upper.starts_with("QUIT") {
+                let _ = socket.write_all(b"205 closing\r\n");
+                break;
+            } else {
+                b"500 command not recognized\r\n".to_vec()
+            };
+            if socket.write_all(&response).is_err() {
+                break;
+            }
+        }
+    });
+    (port, seen, handle)
+}
+
+/// A 480 arriving in the middle of a pipelined batch means the session
+/// expired, not that the credentials are wrong: the same credentials were
+/// accepted when this connection was set up, and are about to be accepted
+/// again by the next one. Booking it as an auth failure disabled the server
+/// for the whole auth backoff and unlocked the backfill tier behind it, over
+/// a session that a redial fixes.
+#[test]
+fn a_480_mid_batch_is_a_session_expiry_not_an_auth_failure() {
+    let (port, seen, handle) = spawn_session_expiry_server(yenc_body(&[0x55; 256]));
+    let mut config = blocking_pipelined_setup_config(port);
+    config.command_timeout = Duration::from_secs(5);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    conn.authenticate("user", "pass").unwrap();
+    conn.write_body_request("<first@silver.horizon>").unwrap();
+    conn.write_body_request("<second@silver.horizon>").unwrap();
+    conn.flush_commands().unwrap();
+
+    let first = conn.stream_next_yenc_article().unwrap();
+    assert_eq!(first.to_data(), vec![0x55; 256]);
+
+    let error = conn.stream_next_yenc_article().unwrap_err();
+    assert!(
+        matches!(error, FusedYencError::Nntp(NntpError::SessionExpired)),
+        "a mid-batch 480 is a session expiry, got {error:?}"
+    );
+    assert!(
+        conn.poisoned,
+        "the batch's remaining replies are still queued, so the socket cannot be reused"
+    );
+
+    drop(conn);
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .any(|line| line.to_ascii_uppercase().starts_with("AUTHINFO PASS")),
+        "the connection authenticated before the batch; saw {seen:?}"
+    );
+}
