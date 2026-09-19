@@ -684,6 +684,99 @@ async fn repeated_data_decode_failures_mark_failed_bytes() {
 }
 
 #[tokio::test]
+async fn single_server_decode_failure_gives_the_article_up_for_repair() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let job_id = JobId(20017);
+    let spec = segmented_job_spec("Single Server Decode Failure", "broken.bin", &[64, 4096]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    // The only server produced a bad body: there is nowhere left to retry,
+    // so the article fails now instead of queueing work no lane may serve.
+    pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(64)
+    );
+    assert_eq!(pipeline.metrics.segments_retried.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert!(
+        !pipeline
+            .pending_retries_by_segment
+            .contains_key(&segment_id)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+}
+
+#[tokio::test]
+async fn decode_failure_moves_to_the_remaining_server_then_gives_up() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+    let job_id = JobId(20018);
+    let spec = segmented_job_spec("Two Server Decode Failure", "broken.bin", &[64, 4096]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    // Server 0 produced a bad body; server 1 is still untried, so the
+    // article moves there.
+    pipeline.handle_decode_failure(segment_id, "crc mismatch", &[], Some(0));
+    let work = pipeline
+        .retry_rx
+        .recv()
+        .await
+        .expect("a second server should draw a retry")
+        .work;
+    assert_eq!(work.exclude_servers, vec![0]);
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+
+    // Server 1 produced a bad body too: every server has been tried, so the
+    // article fails well inside the retry budget.
+    pipeline.handle_decode_failure(segment_id, "crc mismatch", &work.exclude_servers, Some(1));
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(64)
+    );
+    assert_eq!(pipeline.metrics.segments_retried.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
 async fn recovery_decode_failures_do_not_mark_health_failure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

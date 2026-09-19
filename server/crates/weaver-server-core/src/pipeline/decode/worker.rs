@@ -1239,11 +1239,12 @@ impl Pipeline {
     /// Handle a decode failure by re-queuing the segment for re-download.
     ///
     /// yEnc decode failures (CRC/size mismatch, malformed data) indicate the
-    /// article body was corrupted — either in transit or on the server. We
-    /// re-download the segment (which may hit a different
-    /// server via the connection pool's failover logic). After `MAX_SEGMENT_RETRIES`
-    /// decode failures for the same segment, mark it as permanently failed and
-    /// update health.
+    /// article body was corrupted — either in transit or on the server. The
+    /// segment is re-downloaded with the source server excluded, so the
+    /// retry lands on another server. Once every server has produced a bad
+    /// body (immediately on a one-server setup) or `MAX_SEGMENT_RETRIES`
+    /// decode failures have accrued, the segment is marked permanently
+    /// failed and health is updated so repair can take over.
     pub(crate) fn handle_decode_failure(
         &mut self,
         segment_id: SegmentId,
@@ -1273,13 +1274,34 @@ impl Pipeline {
             .or_insert(1);
         let retry_count = *retries;
 
-        if retry_count > MAX_SEGMENT_RETRIES {
-            warn!(
-                segment = %segment_id,
-                error,
-                retries = MAX_SEGMENT_RETRIES,
-                "decode failed permanently after max retries"
-            );
+        // The server that produced the undecodable body is off the list, and
+        // the article moves on only while another server remains to try.
+        // When none does — on a one-server setup, right after the first
+        // failure — the article is given up on now so repair can cover it.
+        // Re-queuing it would leave work no lane may serve sitting in the
+        // queue forever while the job reports downloading at 0 B/s.
+        let exclude = Self::decode_retry_exclude_servers(exclude_servers, source_server_idx);
+        let server_count = self.nntp.pool().server_count();
+        let no_server_left =
+            server_count > 0 && self.unavailable_server_count(job_id, &exclude) >= server_count;
+
+        if retry_count > MAX_SEGMENT_RETRIES || no_server_left {
+            if no_server_left {
+                warn!(
+                    segment = %segment_id,
+                    error,
+                    decode_failures = retry_count,
+                    exclude_servers = ?exclude,
+                    "decode failed on every server — giving the article up for repair"
+                );
+            } else {
+                warn!(
+                    segment = %segment_id,
+                    error,
+                    retries = MAX_SEGMENT_RETRIES,
+                    "decode failed permanently after max retries"
+                );
+            }
             self.metrics
                 .segments_failed_permanent
                 .fetch_add(1, Ordering::Relaxed);
@@ -1310,8 +1332,6 @@ impl Pipeline {
                     .iter()
                     .find(|s| s.ordinal == segment_id.segment_number)
             {
-                let exclude =
-                    Self::decode_retry_exclude_servers(exclude_servers, source_server_idx);
                 let work = DownloadWork {
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
