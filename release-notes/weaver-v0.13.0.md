@@ -1,4 +1,4 @@
-# Weaver 0.12.5 release notes
+# Weaver 0.13.0 release notes
 
 ## Highlights
 
