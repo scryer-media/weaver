@@ -53,6 +53,16 @@
   connection to a server is busy downloading, a request from outside the
   download lanes fails at once. It no longer waits out its whole timeout
   first.
+- **An article missing on two servers no longer loops forever.** A lane
+  reported which servers had refused its batch, not which had refused each
+  article, so every "article not found" answer named only the server that had
+  just replied. The retry went back and forth between the two servers until
+  the job was cancelled. Each article now carries its own list of servers that
+  refused it. A "not found" answer that adds no server to that list is final,
+  and a stretch of retries with nothing downloaded is logged as a warning.
+- **Server priority holds when a lower-priority server has an idle
+  connection.** Preferring a server with an idle connection now applies only
+  among servers of the same priority.
 
 ### Servers
 
@@ -65,6 +75,11 @@
   - the hostname is checked during that connection's TLS handshake;
   - latency is read from the CAPABILITIES round trip that setup already makes;
   - cipher-order preference is read from the cipher suite the server chose.
+- **A session that expires mid-batch no longer disables the server.** A 480
+  reply on a pipelined connection was counted as a failed login, which turned
+  the server off for the login-failure window. The connection is now dropped
+  and the next one logs in again. A rejected password is still a login
+  failure.
 
 ### Health checks and repair
 
@@ -84,6 +99,13 @@
   counted as a permanent failure. A 307-part uuencoded post failed this way
   every time. Weaver can now hold every part of the file while it waits, and
   those extra fetches are no longer mistaken for a stuck loop.
+
+### Extraction
+
+- **Zstandard extraction no longer stalls running direct unpacks.** It
+  reserved the whole decoder memory allowance, so every direct unpack in
+  progress had to yield, and it could then wait without limit. It now reserves
+  only what the file's frame header asks for.
 
 ### History
 
