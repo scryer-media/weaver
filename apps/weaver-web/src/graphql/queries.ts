@@ -892,6 +892,10 @@ export const SERVER_HEALTH_QUERY = gql`
       label
       tier
       state
+      activity
+      activityUntilEpochMs
+      connectionsOpen
+      connectionsBusy
       connectionsActive
       connectionsMax
       connectionsConfigured
@@ -1081,6 +1085,8 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       providerConnections {
         label
         active
+        open
+        busy
         max
       }
     }

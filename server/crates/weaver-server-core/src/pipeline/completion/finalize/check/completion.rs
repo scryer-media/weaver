@@ -186,10 +186,35 @@ impl Pipeline {
         // verifying or repairing what that set covers. Only an index nothing
         // can deliver any more is furniture.
         let metadata_discovery_closed = self.par2_metadata_discovery_closed(job_id);
+        let set_is_extracted = |set_name: &String| -> bool {
+            extracted_archives.contains(set_name)
+                || self
+                    .rar_sets
+                    .get(&(job_id, set_name.clone()))
+                    .and_then(|state| state.plan.as_ref())
+                    .is_some_and(|plan| {
+                        !plan.member_names.is_empty()
+                            && plan
+                                .member_names
+                                .iter()
+                                .all(|member| extracted_members.contains(member))
+                    })
+        };
         let mut saw_incomplete = false;
 
         for file in state.assembly.files() {
             if file.is_complete() {
+                // A volume that arrived intact still has to be opened. Skipping
+                // every complete file meant this read "nothing is left to do"
+                // for a job whose archives had all landed and whose only hole
+                // was an index nothing could deliver — while its sets had never
+                // been extracted. Finalizing there produces a job that reports
+                // success over an empty working directory.
+                if let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file)
+                    && !set_is_extracted(&set_name)
+                {
+                    return false;
+                }
                 continue;
             }
             match self.classified_role_for_file(job_id, file) {
@@ -206,19 +231,7 @@ impl Pipeline {
                     else {
                         return false;
                     };
-                    let set_complete = extracted_archives.contains(&set_name)
-                        || self
-                            .rar_sets
-                            .get(&(job_id, set_name.clone()))
-                            .and_then(|state| state.plan.as_ref())
-                            .is_some_and(|plan| {
-                                !plan.member_names.is_empty()
-                                    && plan
-                                        .member_names
-                                        .iter()
-                                        .all(|member| extracted_members.contains(member))
-                            });
-                    if !set_complete {
+                    if !set_is_extracted(&set_name) {
                         return false;
                     }
                     saw_incomplete = true;
@@ -848,6 +861,19 @@ impl Pipeline {
             return;
         }
 
+        // The residuals check reads "every file that matters is complete, and
+        // the only hole left is an index nothing can deliver". It says nothing
+        // about whether the archives it waved through were ever opened: a
+        // complete volume is skipped before its set is ever looked at. So a
+        // RAR-only job whose volumes all landed, whose index article never
+        // did, and whose recovery volume supplied the set could take this
+        // shortcut with its extraction still unstarted — straight to output
+        // reconciliation and the final move, completing with an empty working
+        // directory and nothing produced.
+        //
+        // The shortcut is for a job with nothing left to do, so it has to
+        // refuse one that still has extraction it could start, or a recovery
+        // verdict it still owes.
         if !has_crc_failures
             && self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id)
         {

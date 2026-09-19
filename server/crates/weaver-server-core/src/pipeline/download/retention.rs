@@ -209,6 +209,67 @@ impl Pipeline {
                 .count()
     }
 
+    /// Whether an article carrying `failure_excludes` has no server left
+    /// that may fetch it, once the job's retention exclusions are counted.
+    /// An unconfigured pool answers no: nothing can be booked against
+    /// servers that do not exist yet.
+    pub(in crate::pipeline) fn no_server_can_serve(
+        &mut self,
+        job_id: JobId,
+        failure_excludes: &[usize],
+    ) -> bool {
+        let server_count = self.nntp.pool().server_count();
+        server_count > 0 && self.unavailable_server_count(job_id, failure_excludes) >= server_count
+    }
+
+    /// Book one article as missing because no server may fetch it. The
+    /// article is not necessarily gone from Usenet, but nothing configured
+    /// can prove otherwise, and leaving it queued would hold the job at
+    /// downloading forever with nothing in flight.
+    pub(in crate::pipeline) fn book_unservable_work(&mut self, work: &DownloadWork) {
+        warn!(
+            segment = %work.segment_id,
+            exclude_servers = ?work.exclude_servers,
+            "no server may fetch this article; booking it as missing so repair can proceed"
+        );
+        self.metrics
+            .articles_not_found
+            .fetch_add(1, Ordering::Relaxed);
+        let segment_id = work.segment_id;
+        self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
+        self.book_failed_segment(segment_id);
+    }
+
+    /// Book as missing every queued article of `job_id` that no server may
+    /// fetch. Returns how many were retired.
+    pub(in crate::pipeline) fn retire_unservable_queued_work(&mut self, job_id: JobId) -> usize {
+        let server_count = self.nntp.pool().server_count();
+        if server_count == 0 {
+            return 0;
+        }
+        let retention = self.job_retention_excludes(job_id);
+        let unservable = |work: &DownloadWork| {
+            Self::unavailable_server_count_from_excludes(
+                server_count,
+                &work.exclude_servers,
+                &retention,
+            ) >= server_count
+        };
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return 0;
+        };
+        let mut retired = state.download_queue.extract_matching(unservable);
+        retired.extend(state.recovery_queue.extract_matching(unservable));
+        for work in &retired {
+            self.book_unservable_work(work);
+        }
+        if !retired.is_empty() {
+            self.update_queue_metrics();
+            self.maybe_finish_download_pass(job_id);
+        }
+        retired.len()
+    }
+
     pub(in crate::pipeline) fn clear_job_retention_excludes(&mut self, job_id: JobId) {
         self.job_retention_exclude_cache.remove(&job_id);
     }

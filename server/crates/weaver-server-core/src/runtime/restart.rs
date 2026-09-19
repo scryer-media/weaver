@@ -152,6 +152,10 @@ pub enum RestartAction {
 }
 
 impl RestartAction {
+    /// What the action cell holds before any request. Distinct from every
+    /// action, so a first request for a plain restart still claims the cell.
+    const UNSET: u8 = u8::MAX;
+
     const fn as_u8(self) -> u8 {
         match self {
             Self::Restart => 0,
@@ -199,7 +203,7 @@ impl RestartController {
     ) -> Self {
         Self {
             requested: Arc::new(Notify::new()),
-            action: Arc::new(AtomicU8::new(RestartAction::Restart.as_u8())),
+            action: Arc::new(AtomicU8::new(RestartAction::UNSET)),
             capability: Arc::new(source),
         }
     }
@@ -230,11 +234,11 @@ impl RestartController {
     }
 
     fn request(&self, action: RestartAction) {
-        // Compare-exchange from the default so the first non-default request
-        // sticks: a second ask arriving during teardown must not downgrade a
-        // bundle relaunch into a plain restart, or the reverse.
+        // Compare-exchange from the unset value so the first request sticks,
+        // whatever it asked for: a second ask arriving during teardown must not
+        // turn a restart into an exit, or a bundle relaunch into a restart.
         let _ = self.action.compare_exchange(
-            RestartAction::Restart.as_u8(),
+            RestartAction::UNSET,
             action.as_u8(),
             Ordering::SeqCst,
             Ordering::SeqCst,
@@ -278,6 +282,23 @@ mod tests {
 
     fn executable() -> PathBuf {
         PathBuf::from("/opt/weaver/weaver")
+    }
+
+    #[tokio::test]
+    async fn the_first_request_wins_even_when_it_is_a_plain_restart() {
+        let controller = RestartController::with_capability_source(RestartCapability::supported);
+        controller.request_restart();
+        controller.request_exit();
+        controller.request_bundle_relaunch();
+        assert_eq!(controller.requested().await, RestartAction::Restart);
+    }
+
+    #[tokio::test]
+    async fn a_later_request_does_not_replace_an_earlier_exit() {
+        let controller = RestartController::with_capability_source(RestartCapability::supported);
+        controller.request_exit();
+        controller.request_restart();
+        assert_eq!(controller.requested().await, RestartAction::ExitOnly);
     }
 
     #[test]

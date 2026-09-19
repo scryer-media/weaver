@@ -271,7 +271,7 @@ fn append_history_row_filter_predicates(
         );
     }
     if let Some(status_not_in) = &filter.status_not_in {
-        append_not_in_text_filter(
+        append_not_in_filter(
             sql,
             args,
             "h.status",
@@ -284,6 +284,18 @@ fn append_history_row_filter_predicates(
             args,
             "h.job_id",
             item_ids
+                .iter()
+                .copied()
+                .map(|value| SqlArg::I64(value as i64))
+                .collect(),
+        );
+    }
+    if let Some(excluded_ids) = &filter.item_ids_not_in {
+        append_not_in_filter(
+            sql,
+            args,
+            "h.job_id",
+            excluded_ids
                 .iter()
                 .copied()
                 .map(|value| SqlArg::I64(value as i64))
@@ -319,7 +331,7 @@ fn append_in_i64_or_text_filter(
     args.extend(values);
 }
 
-fn append_not_in_text_filter(
+fn append_not_in_filter(
     sql: &mut String,
     args: &mut Vec<SqlArg>,
     column: &str,

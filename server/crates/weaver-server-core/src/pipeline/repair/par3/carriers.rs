@@ -127,6 +127,22 @@ impl Default for CarrierScan {
 }
 
 impl CarrierScan {
+    /// Start the damage cursor at the offset the scan begins from.
+    ///
+    /// The cursor starts at zero, which is only right for a carrier read from
+    /// its first byte. A PAR3 payload embedded behind an archive's own prefix
+    /// is scanned from the offset where its packets begin, and without this
+    /// the first packet would credit that whole prefix as damage — a healthy
+    /// carrier reported as damaged from byte zero. Only a scan that has
+    /// produced nothing yet can be moved; once anything is credited the cursor
+    /// belongs to the scan.
+    pub fn start_at(&mut self, offset: u64) {
+        if self.bytes_scanned == 0 && self.damaged_bytes == 0 && self.first_damage_offset.is_none()
+        {
+            self.next_offset = offset;
+        }
+    }
+
     /// Credit one authenticated packet, together with whatever readable span
     /// preceded it and produced nothing.
     pub fn note_packet(&mut self, kind: Par3PacketKind, offset: u64, length: u64) {
@@ -217,6 +233,37 @@ mod tests {
         }
         scan.note_end(len);
         scan
+    }
+
+    /// A carrier scanned from an offset owes nothing for the bytes before it.
+    /// The prefix an embedded PAR3 payload sits behind was never part of the
+    /// scan, so the first packet credits no damage.
+    #[test]
+    fn a_scan_started_at_an_offset_reports_no_damage_for_the_prefix() {
+        const START: u64 = 4096;
+        let mut scan = CarrierScan::default();
+        scan.start_at(START);
+        scan.note_packet(Par3PacketKind::Root, START, 100);
+        scan.note_end(START + 100);
+
+        assert_eq!(scan.damaged_bytes, 0);
+        assert_eq!(scan.first_damage_offset, None);
+        assert!(!scan.is_damaged());
+        assert_eq!(scan.bytes_scanned, 100, "only the scanned span is counted");
+    }
+
+    /// Damage after the scan start is still damage: moving the cursor sets
+    /// where the scan begins, it does not excuse a hole inside it.
+    #[test]
+    fn a_scan_started_at_an_offset_still_reports_damage_inside_it() {
+        const START: u64 = 4096;
+        let mut scan = CarrierScan::default();
+        scan.start_at(START);
+        scan.note_packet(Par3PacketKind::Root, START + 64, 100);
+
+        assert_eq!(scan.damaged_bytes, 64);
+        assert_eq!(scan.first_damage_offset, Some(START));
+        assert!(scan.is_damaged());
     }
 
     /// A carrier whose packets abut leaves nothing unexplained.

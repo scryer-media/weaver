@@ -44,10 +44,23 @@ impl SystemSubscription {
         let service = ctx
             .data::<weaver_server_core::application_upgrade::ApplicationUpgradeService>()?
             .clone();
-        let mut receiver = service.subscribe();
+        let mut runs = service.subscribe();
+        // The snapshot carries the release check as well as the run, so a
+        // release found after the page subscribed has to reach it too, or the
+        // install action stays hidden until the page is remounted.
+        let mut releases = ctx
+            .data::<weaver_server_core::update_check::UpdateCheckService>()?
+            .subscribe();
         Ok(async_stream::stream! {
             yield service.snapshot().into();
-            while receiver.changed().await.is_ok() {
+            loop {
+                let changed = tokio::select! {
+                    changed = runs.changed() => changed,
+                    changed = releases.changed() => changed,
+                };
+                if changed.is_err() {
+                    break;
+                }
                 yield service.snapshot().into();
             }
         })
@@ -114,7 +127,7 @@ async fn build_system_metrics_snapshot(
     }
 }
 
-/// One atomic load per server, the same count `serverHealth` reports.
+/// A few atomic loads per server, the same counts `serverHealth` reports.
 fn provider_connections(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderConnections> {
     pool.server_configs()
         .iter()
@@ -123,10 +136,13 @@ fn provider_connections(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderConne
             let max = pool
                 .configured_connections(weaver_nntp::ServerId(idx))
                 .unwrap_or_else(|| pool.server_load(idx).1);
+            let (open, busy) = crate::system::query::server_socket_counts(pool, idx);
             ProviderConnections {
                 label: format!("{}:{}", cfg.host, cfg.port),
                 active: pool.active_connections(idx) as u32,
                 max: max as u32,
+                open,
+                busy,
             }
         })
         .collect()

@@ -328,7 +328,8 @@ func scenarioNeedsBackupServerState(scenario *Scenario) bool {
 		scenario.PrimaryDeleteFirstMessageIDs > 0 ||
 		len(scenario.PrimaryDeleteSubjectContains) > 0 ||
 		strings.TrimSpace(scenario.PrimaryChaosConfig) != "" ||
-		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != ""
+		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != "" ||
+		scenario.BackupUnavailableUntilJobTerminal
 }
 
 // segmentDeleteNeedles narrows which files the segment-number deletion may
@@ -350,6 +351,7 @@ func segmentDeleteNeedles(scenario *Scenario) []string {
 func scenarioUsesExclusiveNntpState(scenario *Scenario) bool {
 	return scenario != nil && (strings.TrimSpace(scenario.PrimaryChaosConfig) != "" ||
 		strings.TrimSpace(scenario.BackupUnavailableUntilFileComplete) != "" ||
+		scenario.BackupUnavailableUntilJobTerminal ||
 		scenario.queueLivenessAssertion() != nil)
 }
 
@@ -498,8 +500,10 @@ func runNyuuPost(
 		"-u", nntpUsername(),
 		"-p", nntpPassword(),
 		// Eight posting connections: message ids are fixed per segment by
-		// --message-id below and Nyuu writes the NZB in argv order, so the
-		// corpus is identical to a serial post and only seeding time changes.
+		// --message-id below, so the corpus is identical to a serial post and
+		// only seeding time changes. The `<file>` elements land in completion
+		// order rather than argv order, so anything that cares which file came
+		// first reads the subject's `[n/m]` counter instead of the NZB's order.
 		"-n", "8",
 		"-g", "alt.binaries.test",
 		"-f", "e2e-test@example.invalid",

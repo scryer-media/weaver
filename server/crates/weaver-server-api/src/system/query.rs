@@ -327,8 +327,25 @@ impl SystemQuery {
             .data_opt::<Option<Arc<NntpPool>>>()
             .and_then(Clone::clone);
         let transport = handle.download_transport_health();
+        // Open sockets only mean "preparing" while a job is waiting to fetch
+        // through them; the pool's keep-alive after a finished download, or a
+        // paused queue, holds the same sockets open with nothing to prepare.
+        let work_waiting = !handle.is_globally_paused()
+            && handle.list_jobs().iter().any(|job| {
+                matches!(
+                    job.status,
+                    weaver_server_core::JobStatus::Queued
+                        | weaver_server_core::JobStatus::Downloading
+                        | weaver_server_core::JobStatus::Checking
+                )
+            });
         match live_pool.or(fallback_pool) {
-            Some(pool) => Ok(collect_server_health(&pool, runtime_generation, &transport).await),
+            Some(pool) => {
+                Ok(
+                    collect_server_health(&pool, runtime_generation, &transport, work_waiting)
+                        .await,
+                )
+            }
             None => Ok(Vec::new()),
         }
     }
@@ -568,6 +585,39 @@ fn filesystem_name(value: &weaver_server_core::runtime::system_profile::Filesyst
     }
 }
 
+/// Rebase a monotonic deadline on the wall clock, so a browser can count down
+/// to it. A deadline already in the past has nothing left to show.
+fn instant_to_epoch_ms(until: std::time::Instant) -> Option<u64> {
+    let remaining = until.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    u64::try_from(now.saturating_add(remaining.as_millis())).ok()
+}
+
+/// How many sockets one server has connected, and how many of those are
+/// carrying a request.
+///
+/// The socket budget owns physical sockets, so it is the only place that can
+/// separate "a socket exists" from "a socket is carrying a request": a lane
+/// parked on an open connection is neither a free permit nor a fetch in
+/// flight. A socket still dialing is not open yet; everything else that is
+/// not idling or closing is busy. `serverHealth` and the live metrics stream
+/// both read through here so the two never disagree.
+pub(crate) fn server_socket_counts(pool: &NntpPool, idx: usize) -> (u32, u32) {
+    let sockets = pool.socket_budget_snapshot(idx);
+    let open = sockets.physical.saturating_sub(sockets.dialing);
+    let busy = open
+        .saturating_sub(sockets.async_idle)
+        .saturating_sub(sockets.owned_idle)
+        .saturating_sub(sockets.closing);
+    (open as u32, busy as u32)
+}
+
 /// Snapshot per-server health from the live NNTP pool. Mirrors the per-server fields
 /// emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
 /// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
@@ -576,6 +626,7 @@ async fn collect_server_health(
     pool: &NntpPool,
     runtime_generation: u64,
     transport: &[weaver_server_core::ServerTransportHealth],
+    work_waiting: bool,
 ) -> Vec<ServerHealth> {
     struct ServerLoadSnapshot {
         host: String,
@@ -584,6 +635,8 @@ async fn collect_server_health(
         active: usize,
         configured: usize,
         penalty_until: Option<u64>,
+        open: u32,
+        busy: u32,
     }
 
     let configs = pool.server_configs();
@@ -598,6 +651,7 @@ async fn collect_server_health(
                 .configured_connections(weaver_nntp::ServerId(idx))
                 .unwrap_or(max_connections);
             let penalty_until = pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(idx));
+            let (open, busy) = server_socket_counts(pool, idx);
             let tier = if idx == 0 { "PRIMARY" } else { "BACKUP" };
             ServerLoadSnapshot {
                 host: cfg.host.clone(),
@@ -606,9 +660,16 @@ async fn collect_server_health(
                 active,
                 configured,
                 penalty_until,
+                open,
+                busy,
             }
         })
         .collect();
+
+    // Whether any server in the pool is carrying a request right now. Open
+    // sockets on a server that is not are only "preparing" when nothing else
+    // is fetching either; behind a busy primary they are simply waiting.
+    let pool_busy = pre.iter().any(|snapshot| snapshot.busy > 0);
 
     let health = pool.health().lock().await;
     pre.into_iter()
@@ -622,12 +683,43 @@ async fn collect_server_health(
                 weaver_nntp::ServerState::CoolingDown { .. } => "cooling_down",
                 weaver_nntp::ServerState::Disabled { .. } => "disabled",
             };
+            let open = snapshot.open;
+            let busy = snapshot.busy;
+            let activity = crate::system::types::server_activity(
+                state,
+                snapshot.penalty_until.is_some(),
+                work_waiting,
+                pool_busy,
+                open,
+                busy,
+            );
+            // The holdoff already carries a wall-clock deadline; a cooldown or
+            // a quarantine carries a monotonic one, which only means anything
+            // to the browser once it is rebased on the wall clock here.
+            let activity_until = match activity {
+                "over_limit" => snapshot.penalty_until,
+                "cooling_down" => match srv.state() {
+                    weaver_nntp::ServerState::CoolingDown { until, .. } => {
+                        instant_to_epoch_ms(*until)
+                    }
+                    _ => None,
+                },
+                "disabled" => match srv.state() {
+                    weaver_nntp::ServerState::Disabled { until, .. } => instant_to_epoch_ms(*until),
+                    _ => None,
+                },
+                _ => None,
+            };
             ServerHealth {
                 label: format!("{}:{}", snapshot.host, snapshot.port),
                 host: snapshot.host,
                 port: snapshot.port,
                 tier: snapshot.tier,
                 state: state.to_string(),
+                activity: activity.to_string(),
+                activity_until_epoch_ms: activity_until,
+                connections_open: open,
+                connections_busy: busy,
                 connections_active: snapshot.active as u32,
                 connections_max: snapshot.configured as u32,
                 connections_configured: snapshot.configured as u32,
