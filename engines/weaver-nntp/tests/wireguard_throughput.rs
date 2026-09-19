@@ -172,13 +172,12 @@ async fn wireguard_download_throughput() {
                             assert_eq!(stream.read(&mut buffer).await.unwrap(), 0);
                         });
                     }
-                    tokio::time::timeout(Duration::from_secs(120), async {
+                    async {
                         while let Some(result) = readers.join_next().await {
                             result.unwrap();
                         }
-                    })
-                    .await
-                    .unwrap();
+                    }
+                    .await;
                     println!(
                         "WireGuard mode={mode} sample={sample} ACK-delay={rtt_ms}ms connections={connections}: {:.1} Mbps, verified {} MiB",
                         bytes as f64 * connections as f64 * 8.0

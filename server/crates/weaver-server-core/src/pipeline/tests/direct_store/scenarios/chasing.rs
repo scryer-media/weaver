@@ -83,7 +83,7 @@ async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
         if gate == DirectStoreGate::Enabled {
             pipeline.update_mixed_rar_chase(job_id, 0);
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
+        async {
             loop {
                 pipeline.reap_direct_unpack().await;
                 if pipeline.direct_unpack.outcome(job_id, "mixed").is_some() {
@@ -91,9 +91,8 @@ async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .unwrap();
+        }
+        .await;
         let outcome = pipeline.direct_unpack.outcome(job_id, "mixed").unwrap();
         assert!(
             outcome
@@ -248,9 +247,7 @@ async fn handing_a_chase_to_extraction_publishes_parts_that_finished_unheard() {
         panic!("the armed chase must be handed over while it runs");
     };
     assert!(coverage.part_is_complete(0));
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(20), pending.handle)
-        .await
-        .expect("the chase must finish once the handoff publishes the finished part");
+    let joined = pending.handle.await;
     let outcome = joined.unwrap().unwrap();
     assert_eq!(
         outcome.extracted.len(),
@@ -350,7 +347,8 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
     } else {
         pipeline.try_arm_rar_chase(job_id, &set_name);
     }
-    for _ in 0..3000 {
+    // The chase runs on its own worker; poll its outcome with no deadline.
+    loop {
         pipeline.reap_direct_unpack().await;
         if pipeline.direct_unpack.outcome(job_id, &set_name).is_some() {
             break;
@@ -439,12 +437,7 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
     state.recovery_queue = crate::DownloadQueue::new();
     pipeline.check_job_completion(job_id).await;
     drain_rar_refreshes(&mut pipeline).await;
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        drive_extractions_to_terminal(&mut pipeline, job_id, 64),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("{}", debug_job_state(&pipeline, job_id)));
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
     let output_root = complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Mixed chase"));
     for (name, bytes) in expected {
         assert_eq!(
@@ -778,9 +771,7 @@ async fn handing_a_chase_to_extraction_never_raises_a_gate() {
         !coverage.is_gated(),
         "a gate raised at handoff can never be lifted; the handoff must not raise one"
     );
-    let joined = tokio::time::timeout(std::time::Duration::from_secs(20), pending.handle)
-        .await
-        .expect("the chase must finish once the handoff publishes the finished part");
+    let joined = pending.handle.await;
     let outcome = joined.unwrap().unwrap();
     assert_eq!(
         outcome.extracted.len(),

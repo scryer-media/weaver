@@ -1637,8 +1637,9 @@ impl Pipeline {
                         };
                         let _memory_permit = budget.reserve_memory_wait(decoder_memory_bytes(
                             kind,
+                            paths.first().map(|path| path.as_path()),
                             budget.max_memory_bytes(),
-                        ))?;
+                        )?)?;
                         let reader =
                             GatedSplitReader::open_sequential(&paths, Arc::clone(&coverage))
                                 .map_err(|error| {

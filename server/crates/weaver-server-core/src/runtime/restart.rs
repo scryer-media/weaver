@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio::sync::Notify;
 
@@ -130,6 +131,44 @@ pub fn current_restart_capability() -> RestartCapability {
     )
 }
 
+/// What the serve loop should do once it has torn the server down.
+///
+/// One channel rather than three, because every one of these ends the same way
+/// — graceful teardown first — and only the last step differs. An in-app
+/// upgrade needs the two non-restart endings: a Windows helper has already been
+/// detached and only wants this process out of the way, and a replaced macOS
+/// application bundle needs the desktop wrapper to start the new build because
+/// the binary this process would re-exec no longer exists.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RestartAction {
+    /// Replace this process with a fresh one from the program file.
+    #[default]
+    Restart,
+    /// Exit without launching a replacement.
+    ExitOnly,
+    /// Exit with the code that asks the supervising desktop wrapper to relaunch
+    /// the application bundle.
+    BundleRelaunch,
+}
+
+impl RestartAction {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::Restart => 0,
+            Self::ExitOnly => 1,
+            Self::BundleRelaunch => 2,
+        }
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::ExitOnly,
+            2 => Self::BundleRelaunch,
+            _ => Self::Restart,
+        }
+    }
+}
+
 /// The restart surface the HTTP layer holds: whether a restart is allowed
 /// here, and the request that reaches the serve loop.
 ///
@@ -139,6 +178,9 @@ pub fn current_restart_capability() -> RestartCapability {
 #[derive(Clone)]
 pub struct RestartController {
     requested: Arc<Notify>,
+    /// The action the first request asked for. First writer wins: once a
+    /// teardown is under way, a later request must not change what it ends in.
+    action: Arc<AtomicU8>,
     capability: Arc<dyn Fn() -> RestartCapability + Send + Sync>,
 }
 
@@ -157,6 +199,7 @@ impl RestartController {
     ) -> Self {
         Self {
             requested: Arc::new(Notify::new()),
+            action: Arc::new(AtomicU8::new(RestartAction::Restart.as_u8())),
             capability: Arc::new(source),
         }
     }
@@ -169,12 +212,40 @@ impl RestartController {
     /// Ask for a restart. Never blocks and never fails: the serve loop decides
     /// when the process is safe to replace.
     pub fn request_restart(&self) {
+        self.request(RestartAction::Restart);
+    }
+
+    /// Ask the serve loop to shut down without launching a replacement.
+    ///
+    /// The Windows upgrade helper is already detached and waiting for this
+    /// process to release its own executable; it starts the new build itself.
+    pub fn request_exit(&self) {
+        self.request(RestartAction::ExitOnly);
+    }
+
+    /// Ask the serve loop to exit with the relaunch signal for the desktop
+    /// wrapper, after an in-place application-bundle upgrade.
+    pub fn request_bundle_relaunch(&self) {
+        self.request(RestartAction::BundleRelaunch);
+    }
+
+    fn request(&self, action: RestartAction) {
+        // Compare-exchange from the default so the first non-default request
+        // sticks: a second ask arriving during teardown must not downgrade a
+        // bundle relaunch into a plain restart, or the reverse.
+        let _ = self.action.compare_exchange(
+            RestartAction::Restart.as_u8(),
+            action.as_u8(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         self.requested.notify_one();
     }
 
-    /// Resolves once a restart has been requested.
-    pub async fn requested(&self) {
+    /// Resolves once a restart has been requested, with what to do about it.
+    pub async fn requested(&self) -> RestartAction {
         self.requested.notified().await;
+        RestartAction::from_u8(self.action.load(Ordering::SeqCst))
     }
 }
 
@@ -299,6 +370,29 @@ mod tests {
         assert!(!controller.capability().supported);
     }
 
+    /// Each request names the ending the serve loop must use, and the first
+    /// one wins: a second ask during teardown must not turn a replaced bundle's
+    /// relaunch into an ordinary restart.
+    #[tokio::test]
+    async fn each_request_carries_the_ending_the_serve_loop_must_use() {
+        for (request, expected) in [
+            (
+                RestartController::request_restart as fn(&RestartController),
+                RestartAction::Restart,
+            ),
+            (RestartController::request_exit, RestartAction::ExitOnly),
+            (
+                RestartController::request_bundle_relaunch,
+                RestartAction::BundleRelaunch,
+            ),
+        ] {
+            let controller = RestartController::new();
+            request(&controller);
+            controller.request_restart();
+            assert_eq!(controller.requested().await, expected);
+        }
+    }
+
     #[tokio::test]
     async fn a_restart_request_wakes_the_waiting_serve_loop() {
         let controller = RestartController::new();
@@ -307,10 +401,7 @@ mod tests {
 
         controller.request_restart();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), serve_loop)
-            .await
-            .expect("a requested restart wakes the serve loop")
-            .expect("the waiting task completes");
+        serve_loop.await.expect("the waiting task completes");
     }
 
     #[tokio::test]
@@ -318,8 +409,6 @@ mod tests {
         let controller = RestartController::new();
         controller.request_restart();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), controller.requested())
-            .await
-            .expect("a stored request is delivered to the first waiter");
+        controller.requested().await;
     }
 }

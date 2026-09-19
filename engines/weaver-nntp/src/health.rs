@@ -700,20 +700,40 @@ mod recovery_tests;
 mod tests {
     use super::*;
 
+    /// Longer than any test runs: a quarantine or cooldown never lapses on
+    /// its own, so a test that needs one over says so with [`lapse`].
+    const NEVER_LAPSES: Duration = Duration::from_secs(3600);
+
     fn test_config() -> HealthConfig {
         HealthConfig {
             degraded_threshold: 3,
             disable_threshold: 5,
-            base_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(10),
-            auth_disable_duration: Duration::from_millis(100),
-            transient_cooldown: Duration::from_millis(50),
-            capacity_cooldown: Duration::from_millis(25),
+            base_backoff: NEVER_LAPSES,
+            max_backoff: NEVER_LAPSES * 2,
+            auth_disable_duration: NEVER_LAPSES,
+            transient_cooldown: NEVER_LAPSES,
+            capacity_cooldown: NEVER_LAPSES,
             // High sample floor so consecutive-machine tests above never
             // interact with the ratio window.
             failure_ratio_window: Duration::from_secs(3600),
             failure_ratio_min_attempts: 40,
             failure_ratio_threshold_pct: 10,
+        }
+    }
+
+    /// End the server's current quarantine or cooldown now, instead of
+    /// waiting for it to run out.
+    fn lapse(health: &mut ServerHealth) {
+        match &mut health.state {
+            ServerState::Disabled { until, .. } | ServerState::CoolingDown { until, .. } => {
+                *until = Instant::now();
+            }
+            ServerState::Healthy | ServerState::Degraded { .. } => {
+                panic!("nothing to lapse in {:?}", health.state)
+            }
+        }
+        if health.recovery.quarantined() {
+            health.recovery.expire_now();
         }
     }
 
@@ -818,11 +838,15 @@ mod tests {
 
     #[test]
     fn ratio_window_expiry_resets_counts() {
-        let mut health = ServerHealth::new(ratio_config(4, 50, Duration::from_millis(30)));
+        let window = NEVER_LAPSES;
+        let mut health = ServerHealth::new(ratio_config(4, 50, window));
 
         health.record_cooldown(CooldownReason::Transport);
         health.record_cooldown(CooldownReason::Transport);
-        std::thread::sleep(Duration::from_millis(60));
+        // Start the window a full length back rather than waiting it out.
+        health.ratio_window_started = health
+            .ratio_window_started
+            .map(|started| started - window - Duration::from_millis(1));
 
         // Fresh window: 1 failure over 4 attempts stays under 50% — without
         // the reset the carried failures would have tripped at attempt four.
@@ -918,7 +942,7 @@ mod tests {
         }
         assert!(!health.is_available());
 
-        std::thread::sleep(Duration::from_millis(150));
+        lapse(&mut health);
         health.check_reenable();
 
         // Same re-entry semantics as a consecutive-failure disable: probe as
@@ -1047,17 +1071,12 @@ mod tests {
 
     #[test]
     fn reenable_after_backoff() {
-        let config = HealthConfig {
-            auth_disable_duration: Duration::from_millis(1),
-            ..test_config()
-        };
-        let mut health = ServerHealth::new(config);
+        let mut health = ServerHealth::new(test_config());
 
         health.record_failure(true);
         assert!(!health.is_available());
 
-        // Wait for the disable duration to expire.
-        std::thread::sleep(Duration::from_millis(5));
+        lapse(&mut health);
 
         health.check_reenable();
         // Re-enables as Degraded (probationary), not Healthy.
@@ -1118,7 +1137,7 @@ mod tests {
         ));
         assert!(!health.is_available());
 
-        std::thread::sleep(Duration::from_millis(60));
+        lapse(&mut health);
         health.check_reenable();
 
         assert_eq!(*health.state(), ServerState::Healthy);
@@ -1142,7 +1161,7 @@ mod tests {
         health.record_cooldown(CooldownReason::Capacity);
         assert!(!health.is_available());
 
-        std::thread::sleep(Duration::from_millis(30));
+        lapse(&mut health);
         health.check_reenable();
 
         assert!(matches!(
@@ -1169,7 +1188,7 @@ mod tests {
             ));
             assert_eq!(health.consecutive_failures, expected_failures);
 
-            std::thread::sleep(Duration::from_millis(60));
+            lapse(&mut health);
             health.check_reenable();
         }
 

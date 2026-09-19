@@ -119,9 +119,7 @@ async fn caller_disconnect_cancels_pending_dial() {
         .unwrap();
     fixture.started.notified().await;
     drop(client);
-    tokio::time::timeout(Duration::from_secs(1), fixture.dropped.notified())
-        .await
-        .unwrap();
+    fixture.dropped.notified().await;
     assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
     bridge.revoke().await;
 }
@@ -161,11 +159,7 @@ async fn direct_stream_works_without_the_listener_and_revokes_a_pending_read() {
     let reader = tokio::spawn(async move { stream.read_u8().await });
     tokio::task::yield_now().await;
     bridge.revoke().await;
-    let error = tokio::time::timeout(Duration::from_secs(1), reader)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
+    let error = reader.await.unwrap().unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
     assert!(bridge.dial("unresolved.invalid", 119).await.is_err());
 }
@@ -184,9 +178,7 @@ async fn abandoning_direct_establishment_cancels_the_owned_runtime_task() {
     fixture.started.notified().await;
     dial.abort();
     let _ = dial.await;
-    tokio::time::timeout(Duration::from_secs(1), fixture.dropped.notified())
-        .await
-        .unwrap();
+    fixture.dropped.notified().await;
     assert_eq!(bridge.direct_slots.available_permits(), 1024);
     bridge.revoke().await;
 }
@@ -218,9 +210,7 @@ async fn revocation_waits_for_pending_direct_dials_to_unwind() {
         async move { bridge.dial("unresolved.invalid", 119).await }
     });
     fixture.started.notified().await;
-    tokio::time::timeout(Duration::from_secs(1), bridge.revoke())
-        .await
-        .unwrap();
+    bridge.revoke().await;
     assert_eq!(bridge.direct_slots.available_permits(), 1024);
     assert!(dial.await.unwrap().is_err());
 }

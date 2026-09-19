@@ -280,13 +280,12 @@ func TestWaitForManagedWeaverGraphQLReadyFailsWhenProcessExits(t *testing.T) {
 		},
 	}
 
-	started := time.Now()
-	err := ctx.waitForManagedWeaverGraphQLReady(30 * time.Second)
+	// A readiness timeout no run can reach: the wait can only return by
+	// noticing the exit. A wait that ignored the exit would sit out the timeout
+	// and the go test runner's own bound would end it.
+	err := ctx.waitForManagedWeaverGraphQLReady(time.Hour)
 	if err == nil {
 		t.Fatal("expected readiness wait to fail when managed process exits")
-	}
-	if time.Since(started) > time.Second {
-		t.Fatalf("expected fail-fast readiness error, got after %s: %v", time.Since(started), err)
 	}
 	message := err.Error()
 	if !strings.Contains(message, "managed weaver exited before GraphQL readiness") ||

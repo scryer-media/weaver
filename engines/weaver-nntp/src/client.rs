@@ -83,6 +83,11 @@ const BLOCKING_HEALTH_LOCK_SPINS: usize = 4;
 pub enum BlockingBodyLaneAcquireError {
     ProviderCapacity(NntpError),
     LocalCapacity,
+    /// Every candidate server is recovering and its one probe connection is
+    /// already out. Self-clearing like local capacity, but not the same
+    /// thing: the permits are free and the sockets are idle, and reporting it
+    /// as saturation points the reader at a leak that is not there.
+    ServerRecovering,
     NoEligibleServer,
     /// The health mutex was held elsewhere, so candidates could not be ranked.
     /// This says nothing about server availability — the caller should hand
@@ -105,7 +110,23 @@ impl BlockingBodyLaneAcquireError {
     }
 
     pub fn is_capacity_admission(&self) -> bool {
-        matches!(self, Self::ProviderCapacity(_) | Self::LocalCapacity)
+        matches!(
+            self,
+            Self::ProviderCapacity(_) | Self::LocalCapacity | Self::ServerRecovering
+        )
+    }
+
+    /// The transport error behind this refusal, where there is one. Local
+    /// capacity, selection contention and an empty candidate list are the
+    /// lane's own bookkeeping and carry no server answer to report.
+    pub fn nntp_error(&self) -> Option<&NntpError> {
+        match self {
+            Self::ProviderCapacity(error) | Self::Other(error) => Some(error),
+            Self::LocalCapacity
+            | Self::ServerRecovering
+            | Self::NoEligibleServer
+            | Self::SelectionContended => None,
+        }
     }
 
     /// Whether the leased work should be handed straight back to the scheduler
@@ -124,6 +145,7 @@ impl BlockingBodyLaneAcquireError {
         match self {
             Self::ProviderCapacity(_) => "provider_capacity",
             Self::LocalCapacity => "local_capacity",
+            Self::ServerRecovering => "server_recovering",
             Self::NoEligibleServer => "no_eligible_server",
             Self::SelectionContended => "selection_contended",
             Self::Other(_) => "other",
@@ -136,6 +158,8 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
         match self {
             Self::ProviderCapacity(error) | Self::Other(error) => error.fmt(formatter),
             Self::LocalCapacity => formatter.write_str("blocking BODY lane capacity is saturated"),
+            Self::ServerRecovering => formatter
+                .write_str("server is recovering; the recovery probe connection is already out"),
             Self::NoEligibleServer => formatter.write_str("no eligible blocking BODY server"),
             Self::SelectionContended => {
                 formatter.write_str("blocking BODY server selection contended on server health")
@@ -359,41 +383,17 @@ fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
 
 /// Whether an owned blocking BODY lane can serve this server.
 ///
-/// Owned lanes are the download fast path and every server gets one, plaintext
-/// included: a single lane pool per server is what lets one warm connection
-/// serve BODY, PAR2 recovery and the existence probe alike, instead of the
-/// probe having to reclaim a permit and cold-dial its own socket.
+/// It always can. Owned lanes are the only download engine, and the blocking
+/// transport carries every arrangement a server config can describe:
+/// plaintext, implicit TLS, and the in-band STARTTLS upgrade. A TLS backend
+/// that cannot build trust for a given config — the s2n lane without a pinned
+/// CA PEM — yields to the rustls lane rather than leaving the server unserved.
 ///
-/// The one arrangement still left out is STARTTLS, whose in-band upgrade the
-/// blocking transport does not implement.
-fn supports_blocking_body_lane(config: &ServerConfig) -> bool {
-    if config.starttls {
-        return false;
-    }
-    if !config.tls {
-        // Plain TCP needs no trust material and no backend selection.
-        return true;
-    }
-    if config.tls_name_mismatch_certificate_der.is_some() {
-        return blocking_lane_tls_eligible(config, crate::tls::NntpTlsBackend::ManualRustls);
-    }
-    match crate::tls::selected_blocking_tls_backend() {
-        Ok(backend) => blocking_lane_tls_eligible(config, backend),
-        Err(_) => false,
-    }
-}
-
-fn blocking_lane_tls_eligible(config: &ServerConfig, backend: crate::tls::NntpTlsBackend) -> bool {
-    if !config.tls || config.starttls {
-        return false;
-    }
-    match backend {
-        // The rustls lane trusts webpki roots, so a pinned CA is optional.
-        crate::tls::NntpTlsBackend::ManualRustls => true,
-        // The s2n lane builds trust exclusively from a pinned CA PEM.
-        #[cfg(not(windows))]
-        crate::tls::NntpTlsBackend::S2n => config.tls_ca_cert.is_some(),
-    }
+/// The predicate is kept because its callers read as a question about one
+/// server, and because a transport that genuinely could not be lane-served
+/// would have to answer here.
+fn supports_blocking_body_lane(_config: &ServerConfig) -> bool {
+    true
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1276,7 +1276,16 @@ impl NntpClient {
 
         let mut exists = match self.stat_many_in_order(message_ids, order.clone()).await {
             Ok(results) => results,
-            Err(_) => {
+            Err(error) => {
+                // Why a batch could not settle is only knowable here; the
+                // caller sees a flag and would otherwise be left guessing
+                // between a wire fault and a connection it never got.
+                warn!(
+                    servers = ?order,
+                    batch_len = message_ids.len(),
+                    %error,
+                    "probe confirmation: STAT batch left the batch unverified"
+                );
                 return Some(ProbeBatchResult {
                     exists: vec![false; message_ids.len()],
                     inconclusive: true,
@@ -1323,7 +1332,13 @@ impl NntpClient {
                 // The refusal just happened on this batch; it has been recorded
                 // against the server and the next one is asked instead.
                 Err(NntpError::CommandNotRecognized) => {}
-                Err(_) => {
+                Err(error) => {
+                    warn!(
+                        server = idx,
+                        batch_len = batch.len(),
+                        %error,
+                        "probe confirmation: HEAD recheck left the batch unverified"
+                    );
                     return Some(ProbeBatchResult {
                         exists,
                         inconclusive: true,
@@ -2414,6 +2429,7 @@ impl NntpClient {
         }
 
         let mut saw_local_capacity = false;
+        let mut saw_recovery_gate = false;
         let mut provider_capacity_error = None;
         let mut other_error = None;
         for server in selection.eligible {
@@ -2422,6 +2438,13 @@ impl NntpClient {
                 .try_acquire_blocking_permit_for_work(server, demanded)
             {
                 Ok(permit) => permit,
+                // Kept apart from a permit or socket shortage: one is a queue
+                // to wait in, the other is a server holding itself open for a
+                // single probe.
+                Err(NntpError::ServerRecovering) => {
+                    saw_recovery_gate = true;
+                    continue;
+                }
                 Err(_) => {
                     saw_local_capacity = true;
                     continue;
@@ -2502,6 +2525,7 @@ impl NntpClient {
                             other_error = Some(error);
                         }
                         BlockingBodyLaneAcquireError::LocalCapacity
+                        | BlockingBodyLaneAcquireError::ServerRecovering
                         | BlockingBodyLaneAcquireError::NoEligibleServer
                         | BlockingBodyLaneAcquireError::SelectionContended => unreachable!(),
                     }
@@ -2514,6 +2538,8 @@ impl NntpClient {
             Err(BlockingBodyLaneAcquireError::Other(error))
         } else if saw_local_capacity {
             Err(BlockingBodyLaneAcquireError::LocalCapacity)
+        } else if saw_recovery_gate {
+            Err(BlockingBodyLaneAcquireError::ServerRecovering)
         } else {
             Err(BlockingBodyLaneAcquireError::NoEligibleServer)
         }
@@ -2528,6 +2554,14 @@ impl NntpClient {
     /// sends the work to the asynchronous lanes, which then queue for the very
     /// connection permits the idle owned lanes are holding and wait out the
     /// whole acquire deadline for it.
+    /// The servers a new owned lane would try, in the order the pool ranks
+    /// them right now. A question, not a dispatch: it reserves nothing and
+    /// clears no quota latch. `None` while the health state is contended.
+    pub fn blocking_body_server_order(&self, exclude: &[usize]) -> Option<Vec<ServerId>> {
+        self.try_blocking_body_server_selection(exclude, 0, QuotaCheck::ReadOnly)
+            .map(|selection| selection.eligible)
+    }
+
     pub fn blocking_body_lane_candidacy(&self, exclude: &[usize]) -> BlockingBodyLaneCandidacy {
         // A question, not a dispatch: it asks for no bytes, so every server
         // with any headroom "fits", and letting that fit clear a server's
@@ -2885,6 +2919,11 @@ impl NntpClient {
 
     fn map_acquire_timeout(&self, error: NntpError) -> NntpError {
         match error {
+            // Zero is the pool reporting that it never waited: the deadline was
+            // already spent, or every connection belongs to a busy download
+            // lane. Restamping it with the soft timeout would claim a wait that
+            // never happened and hide the difference from whoever reads the log.
+            NntpError::AcquireTimeout(0) => NntpError::AcquireTimeout(0),
             NntpError::AcquireTimeout(_) => self.acquire_timeout_error(),
             other => other,
         }
@@ -3830,6 +3869,9 @@ fn is_connection_error(err: &NntpError) -> bool {
             | NntpError::MalformedMultilineTerminator
             | NntpError::TooManyConnections
             | NntpError::AccessDenied
+            // The batch's remaining replies are still queued on that socket,
+            // so nothing else may be sent down it.
+            | NntpError::SessionExpired
             | NntpError::SoftTimeout(_)
     )
 }

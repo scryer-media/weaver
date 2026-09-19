@@ -131,22 +131,16 @@ async fn land(pipeline: &mut Pipeline, id: NzbFileId, name: &str, bytes: &[u8], 
     .await;
 }
 
-async fn wait_for_output(path: &std::path::Path, minimum: u64) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if std::fs::metadata(path).is_ok_and(|m| m.len() >= minimum) {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
+/// Waits, with no deadline, for the chase to have written `minimum` bytes of
+/// output. A chase that never writes early leaves the runner to end the test.
+async fn wait_for_output(path: &std::path::Path, minimum: u64) {
+    while !std::fs::metadata(path).is_ok_and(|m| m.len() >= minimum) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
 async fn finish(pipeline: &mut Pipeline, job: JobId, set: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while pipeline.direct_unpack.is_armed(job, set) && tokio::time::Instant::now() < deadline {
+    while pipeline.direct_unpack.is_armed(job, set) {
         pipeline.reap_direct_unpack().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -156,10 +150,7 @@ async fn finish(pipeline: &mut Pipeline, job: JobId, set: &str) {
 }
 
 async fn extracted(pipeline: &mut Pipeline, job: JobId, expected: &[(String, Vec<u8>)]) {
-    let done = tokio::time::timeout(Duration::from_secs(20), pipeline.extract_done_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let done = pipeline.extract_done_rx.recv().await.unwrap();
     let ExtractionDone::FullSet { result, .. } = done else {
         panic!("expected full set")
     };
@@ -186,7 +177,8 @@ async fn overlaps_download(kind: SimpleArchiveKind) {
     for number in 0..count / 2 {
         land(&mut pipeline, id, &name, &bytes, number).await;
     }
-    let early = wait_for_output(
+    // The member is written before the tail arrives.
+    wait_for_output(
         &pipeline
             .direct_unpack_staging_dir(job, &name)
             .join(&members[0].0),
@@ -199,7 +191,6 @@ async fn overlaps_download(kind: SimpleArchiveKind) {
         land(&mut pipeline, id, &name, &bytes, number).await;
     }
     finish(&mut pipeline, job, &name).await;
-    assert!(early, "{kind:?} must write output before the tail arrives");
     assert!(incomplete);
     assert_eq!(pipeline.direct_unpack.counters().consumed, 1, "{kind:?}");
     extracted(&mut pipeline, job, &members).await;

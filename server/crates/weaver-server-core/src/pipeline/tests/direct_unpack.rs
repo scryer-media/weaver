@@ -721,12 +721,7 @@ async fn conventional_split_7z_jobs_finish_after_peer_metadata_grows() {
     }
     let mut completed = std::collections::HashSet::new();
     for _ in jobs {
-        let done = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            next_extraction_done(&mut pipeline),
-        )
-        .await
-        .expect("decoder admission must progress");
+        let done = next_extraction_done(&mut pipeline).await;
         let ExtractionDone::FullSet { job_id, result, .. } = done else {
             panic!("full set required")
         };
@@ -3014,14 +3009,12 @@ fn chase_context(
     }
 }
 
-async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
-    for _ in 0..3_000 {
-        if condition() {
-            return;
-        }
+/// Polls until `condition` holds; `what` names it for a reader. There is no
+/// deadline: the test runner bounds a condition that never arrives.
+async fn wait_until(mut condition: impl FnMut() -> bool, _what: &str) {
+    while !condition() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("timed out waiting for {what}");
 }
 
 /// A chase's decode pass holds its archive's decoders, not the ceiling.

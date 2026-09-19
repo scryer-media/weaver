@@ -1,4 +1,5 @@
 use super::*;
+use crate::pipeline::download::scheduler::Handout;
 
 pub(in crate::pipeline) fn is_ip_replacement_policy_stop(
     data: &std::result::Result<DownloadPayload, DownloadError>,
@@ -201,6 +202,11 @@ impl Pipeline {
 
         tokio::spawn(async move {
             let server = weaver_nntp::ServerId(candidate.old_key.server_idx);
+            // An over-max trial lane is off the permit path entirely: it takes
+            // the one dedicated replacement socket slot and never a connection
+            // permit, so it neither queues behind the download lanes nor takes
+            // a connection away from them. Nothing here is affected by the
+            // rule that refuses to queue an async caller behind busy lanes.
             match nntp
                 .acquire_extra_body_lane_excluding(server, &groups, &[candidate.old_key.ip])
                 .await
@@ -232,6 +238,65 @@ impl Pipeline {
         });
     }
 
+    /// Cut the sample batch a trial fetches through its candidate
+    /// connection: payload articles only, from one job, and exactly the
+    /// sample count or nothing. Anything the scheduler handed out that a
+    /// trial cannot use goes straight back to its queue.
+    fn try_lease_ip_replacement_trial_batch(
+        &mut self,
+        job_id: JobId,
+        server_idx: usize,
+    ) -> Option<DownloadBatchLease> {
+        if self.repeated_articles.contains_key(&job_id) {
+            return None;
+        }
+        let pressure = self.refresh_download_pressure();
+        let spill_in_flight = self.spill_job_in_flight_on(server_idx);
+        let works = match self.next_works(
+            server_idx,
+            IP_REPLACEMENT_TRIAL_SAMPLES,
+            spill_in_flight,
+            pressure,
+        ) {
+            Handout::Works(works) => works,
+            Handout::Idle | Handout::Yield(_) => return None,
+        };
+        let handout_job = works.first()?.segment_id.file_id.job_id;
+        // Recovery articles are what a repair is waiting on, and critical
+        // work is sized for the lane it was cut for: neither is a sample.
+        let (samples, returned): (Vec<_>, Vec<_>) = works
+            .into_iter()
+            .partition(|work| !work.is_recovery && !work.completion_critical);
+        let usable = samples.len() >= IP_REPLACEMENT_TRIAL_SAMPLES
+            && !self.repeated_articles.contains_key(&handout_job);
+        let returned = if usable {
+            returned
+        } else {
+            returned.into_iter().chain(samples.clone()).collect()
+        };
+        if let Some(state) = self.jobs.get_mut(&handout_job) {
+            for work in returned {
+                state.download_queue.push(work);
+            }
+        }
+        if !usable {
+            self.update_queue_metrics();
+            return None;
+        }
+        let lease = self.lease_for_handout(
+            Self::next_download_lane_id(),
+            server_idx,
+            DownloadLaneMode::Sequential,
+            pressure,
+            samples,
+        )?;
+        if lease.works.len() < IP_REPLACEMENT_TRIAL_SAMPLES {
+            self.rollback_download_batch_lease(lease);
+            return None;
+        }
+        Some(lease)
+    }
+
     pub(crate) fn handle_ip_replacement_trial_event(&mut self, event: IpReplacementTrialEvent) {
         match event {
             IpReplacementTrialEvent::CandidateAcquired {
@@ -252,11 +317,10 @@ impl Pipeline {
                     return;
                 }
 
-                let lease = match self
-                    .try_lease_ip_replacement_trial_batch(job_id, candidate.old_key.server_idx)
-                {
-                    Ok(Some(lease)) => lease,
-                    Ok(None) | Err(_) => {
+                let server_idx = candidate.old_key.server_idx;
+                let lease = match self.try_lease_ip_replacement_trial_batch(job_id, server_idx) {
+                    Some(lease) => lease,
+                    None => {
                         let trial_tx = self.ip_replacement_trial_tx.clone();
                         tokio::spawn(async move {
                             let lane = lane;
@@ -271,6 +335,9 @@ impl Pipeline {
 
                 let activation_items = Self::activation_items(&lease);
                 self.activate_download_batch_lease(&lease, &activation_items, false);
+                if let Some(owner) = self.download_lane_owners.get_mut(&lease.lane_id) {
+                    owner.server_idx = Some(server_idx);
+                }
                 self.spawn_ip_replacement_trial(lease, candidate, candidate_ip, *lane);
             }
             IpReplacementTrialEvent::AcquireFailed => {
@@ -326,7 +393,6 @@ impl Pipeline {
             let fetch_started = Instant::now();
             let server = weaver_nntp::ServerId(candidate.old_key.server_idx);
             let mode = DownloadLaneMode::Sequential;
-            let exclude_servers = lease.compatibility.exclude_servers.clone();
             let job_id = lease.job_id;
             let runtime_generation = lease.runtime_generation;
             let lane_id = lease.lane_id;
@@ -343,6 +409,7 @@ impl Pipeline {
                 trial_attempts.extend(trace.attempts.iter().cloned());
                 let segment_id = work.segment_id;
                 let retry_count = work.retry_count;
+                let exclude_servers = work.exclude_servers.clone();
                 let (data, attempts, source_server_idx) =
                     Self::download_data_from_decoded_trace(segment_id, trace);
                 let policy_stop = is_ip_replacement_policy_stop(&data);
@@ -352,6 +419,7 @@ impl Pipeline {
                 let _ = tx
                     .send(DownloadResult {
                         lane_id,
+                        job_id,
                         segment_id,
                         runtime_generation,
                         data,
@@ -360,7 +428,7 @@ impl Pipeline {
                         source_server_idx,
                         origin: DownloadResultOrigin::IpReplacementTrial,
                         retry_count,
-                        exclude_servers: exclude_servers.clone(),
+                        exclude_servers,
                         release_connection_slot: false,
                     })
                     .await;
@@ -369,7 +437,8 @@ impl Pipeline {
                     for unrequested in works.by_ref() {
                         let _ = tx
                             .send(DownloadResult {
-                        lane_id,
+                                lane_id,
+                                job_id,
                                 segment_id: unrequested.segment_id,
                                 runtime_generation,
                                 data: Err(DownloadError::Fetch(DownloadFailure::new(
@@ -381,7 +450,7 @@ impl Pipeline {
                                 source_server_idx: None,
                                 origin: DownloadResultOrigin::IpReplacementTrial,
                                 retry_count: unrequested.retry_count,
-                                exclude_servers: exclude_servers.clone(),
+                                exclude_servers: unrequested.exclude_servers.clone(),
                                 release_connection_slot: false,
                             })
                             .await;
@@ -481,7 +550,6 @@ impl Pipeline {
                     lane_id,
                     job_id,
                     mode,
-                    spillover_loan_kind: None,
                     completion_critical: false,
                     reason: if policy_parked {
                         LaneParkReason::ServerQuota

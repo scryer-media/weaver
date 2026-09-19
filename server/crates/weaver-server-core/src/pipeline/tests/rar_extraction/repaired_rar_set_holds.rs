@@ -545,9 +545,10 @@ async fn a_claimed_set_with_genuinely_missing_volumes_fails_once_instead_of_loop
         "the second visit must report the absence, not spawn again"
     );
 
-    let done = tokio::time::timeout(Duration::from_secs(5), pipeline.extract_done_rx.recv())
+    let done = pipeline
+        .extract_done_rx
+        .recv()
         .await
-        .expect("the dispatched extraction should report back")
         .expect("the extraction channel should stay open");
     pipeline.handle_extraction_done(done).await;
 

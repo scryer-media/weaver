@@ -1,4 +1,4 @@
-use async_graphql::{Enum, SimpleObject};
+use async_graphql::{Enum, InputObject, SimpleObject};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::{
@@ -142,30 +142,6 @@ pub struct Metrics {
     pub download_pressure_stalls_total: u64,
     pub download_pressure_stall_duration_ms: u64,
     pub download_pressure_current_stall_ms: u64,
-    pub hot_dispatch_job_id: u64,
-    pub hot_dispatch_mode: String,
-    pub hot_dispatch_underfill_ms: u64,
-    pub hot_dispatch_lent_connections: u32,
-    pub hot_dispatch_last_spillover_decision: String,
-    pub hot_dispatch_spillover_blocked_pressure_total: u64,
-    pub hot_dispatch_spillover_blocked_near_cap_total: u64,
-    pub hot_dispatch_spillover_blocked_hot_can_use_capacity_total: u64,
-    pub hot_dispatch_spillover_blocked_best_mode_pending_total: u64,
-    pub hot_dispatch_spillover_blocked_cap_speed_total: u64,
-    pub hot_dispatch_spillover_allowed_underfill_total: u64,
-    pub hot_dispatch_spillover_allowed_measured_underfill_total: u64,
-    pub hot_dispatch_spillover_reclaimed_total: u64,
-    pub hot_dispatch_hot_speed_bps: u64,
-    pub hot_dispatch_exclusive_peak_bps: u64,
-    pub hot_dispatch_spillover_pre_speed_bps: u64,
-    pub hot_dispatch_spillover_post_speed_bps: u64,
-    pub hot_dispatch_spillover_active_loans: u32,
-    pub hot_dispatch_spillover_reclaimed_speed_harm_total: u64,
-    pub hot_dispatch_recent_expansion_improvement_pct: u64,
-    pub hot_dispatch_best_mode_block_reason: u32,
-    pub hot_dispatch_last_expansion_kind: u32,
-    pub hot_dispatch_last_expansion_before_bps: u64,
-    pub hot_dispatch_last_expansion_after_bps: u64,
     pub download_lanes_active: u32,
     pub download_lanes_sequential_active: u32,
     pub download_lanes_depth2_active: u32,
@@ -181,7 +157,6 @@ pub struct Metrics {
     pub download_lanes_parking_active: u32,
     pub download_lanes_recovering_active: u32,
     pub download_lane_parks_no_work_total: u64,
-    pub download_lane_parks_spillover_speed_harm_total: u64,
     pub download_lane_parks_ip_replacement_retired_total: u64,
     pub download_lane_parks_error_total: u64,
     pub download_lane_lease_items_total: u64,
@@ -294,42 +269,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_pressure_stalls_total: m.download_pressure_stalls_total,
             download_pressure_stall_duration_ms: m.download_pressure_stall_duration_ms,
             download_pressure_current_stall_ms: m.download_pressure_current_stall_ms,
-            hot_dispatch_job_id: m.hot_dispatch_job_id,
-            hot_dispatch_mode: m.hot_dispatch_mode.as_str().to_string(),
-            hot_dispatch_underfill_ms: m.hot_dispatch_underfill_ms,
-            hot_dispatch_lent_connections: m.hot_dispatch_lent_connections as u32,
-            hot_dispatch_last_spillover_decision: m
-                .hot_dispatch_last_spillover_decision
-                .as_str()
-                .to_string(),
-            hot_dispatch_spillover_blocked_pressure_total: m
-                .hot_dispatch_spillover_blocked_pressure_total,
-            hot_dispatch_spillover_blocked_near_cap_total: m
-                .hot_dispatch_spillover_blocked_near_cap_total,
-            hot_dispatch_spillover_blocked_hot_can_use_capacity_total: m
-                .hot_dispatch_spillover_blocked_hot_can_use_capacity_total,
-            hot_dispatch_spillover_blocked_best_mode_pending_total: m
-                .hot_dispatch_spillover_blocked_best_mode_pending_total,
-            hot_dispatch_spillover_blocked_cap_speed_total: m
-                .hot_dispatch_spillover_blocked_cap_speed_total,
-            hot_dispatch_spillover_allowed_underfill_total: m
-                .hot_dispatch_spillover_allowed_underfill_total,
-            hot_dispatch_spillover_allowed_measured_underfill_total: m
-                .hot_dispatch_spillover_allowed_measured_underfill_total,
-            hot_dispatch_spillover_reclaimed_total: m.hot_dispatch_spillover_reclaimed_total,
-            hot_dispatch_hot_speed_bps: m.hot_dispatch_hot_speed_bps,
-            hot_dispatch_exclusive_peak_bps: m.hot_dispatch_exclusive_peak_bps,
-            hot_dispatch_spillover_pre_speed_bps: m.hot_dispatch_spillover_pre_speed_bps,
-            hot_dispatch_spillover_post_speed_bps: m.hot_dispatch_spillover_post_speed_bps,
-            hot_dispatch_spillover_active_loans: m.hot_dispatch_spillover_active_loans as u32,
-            hot_dispatch_spillover_reclaimed_speed_harm_total: m
-                .hot_dispatch_spillover_reclaimed_speed_harm_total,
-            hot_dispatch_recent_expansion_improvement_pct: m
-                .hot_dispatch_recent_expansion_improvement_pct,
-            hot_dispatch_best_mode_block_reason: m.hot_dispatch_best_mode_block_reason as u32,
-            hot_dispatch_last_expansion_kind: m.hot_dispatch_last_expansion_kind as u32,
-            hot_dispatch_last_expansion_before_bps: m.hot_dispatch_last_expansion_before_bps,
-            hot_dispatch_last_expansion_after_bps: m.hot_dispatch_last_expansion_after_bps,
             download_lanes_active: m.download_lanes_active as u32,
             download_lanes_sequential_active: m.download_lanes_sequential_active as u32,
             download_lanes_depth2_active: m.download_lanes_depth2_active as u32,
@@ -346,8 +285,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             download_lanes_parking_active: m.download_lanes_parking_active as u32,
             download_lanes_recovering_active: m.download_lanes_recovering_active as u32,
             download_lane_parks_no_work_total: m.download_lane_parks_no_work_total,
-            download_lane_parks_spillover_speed_harm_total: m
-                .download_lane_parks_spillover_speed_harm_total,
             download_lane_parks_ip_replacement_retired_total: m
                 .download_lane_parks_ip_replacement_retired_total,
             download_lane_parks_error_total: m.download_lane_parks_error_total,
@@ -914,6 +851,185 @@ impl From<weaver_server_core::update_check::UpdateStatus> for UpdateStatus {
             last_error: value.last_error,
         }
     }
+}
+
+/// Installation layout identified for the in-app upgrade surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum ApplicationInstallationKindValue {
+    /// A writable standalone installation.
+    Portable,
+    /// A directly installed Windows MSI package.
+    DirectMsi,
+    /// A macOS application bundle, upgraded by replacing the bundle in place.
+    MacosAppBundle,
+    /// A container-managed installation.
+    Docker,
+    /// A Homebrew-managed installation.
+    Homebrew,
+    /// A winget-managed Windows installation.
+    Winget,
+    /// A Windows service or session-zero installation.
+    WindowsSupervised,
+    /// In-app upgrades turned off by the operator.
+    Disabled,
+    /// A layout that is not supported for in-app upgrades.
+    Unsupported,
+}
+
+impl From<weaver_server_core::application_upgrade::InstallationKind>
+    for ApplicationInstallationKindValue
+{
+    fn from(value: weaver_server_core::application_upgrade::InstallationKind) -> Self {
+        use weaver_server_core::application_upgrade::InstallationKind;
+        match value {
+            InstallationKind::Portable => Self::Portable,
+            InstallationKind::DirectMsi => Self::DirectMsi,
+            InstallationKind::MacosAppBundle => Self::MacosAppBundle,
+            InstallationKind::Docker => Self::Docker,
+            InstallationKind::Homebrew => Self::Homebrew,
+            InstallationKind::Winget => Self::Winget,
+            InstallationKind::WindowsSupervised => Self::WindowsSupervised,
+            InstallationKind::Disabled => Self::Disabled,
+            InstallationKind::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+/// Who is responsible for upgrading this installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum ApplicationUpgradeOwnerValue {
+    /// Weaver can upgrade itself.
+    InApp,
+    /// The operator or an external package manager owns upgrades.
+    Operator,
+}
+
+impl From<weaver_server_core::application_upgrade::ManagementOwner>
+    for ApplicationUpgradeOwnerValue
+{
+    fn from(value: weaver_server_core::application_upgrade::ManagementOwner) -> Self {
+        use weaver_server_core::application_upgrade::ManagementOwner;
+        match value {
+            ManagementOwner::InApp => Self::InApp,
+            ManagementOwner::Operator => Self::Operator,
+        }
+    }
+}
+
+/// How an upgrade attempt ended, or that it is still going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum ApplicationUpgradeRunStatusValue {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl From<weaver_server_core::application_upgrade::ApplicationUpgradeRunStatus>
+    for ApplicationUpgradeRunStatusValue
+{
+    fn from(value: weaver_server_core::application_upgrade::ApplicationUpgradeRunStatus) -> Self {
+        use weaver_server_core::application_upgrade::ApplicationUpgradeRunStatus;
+        match value {
+            ApplicationUpgradeRunStatus::Running => Self::Running,
+            ApplicationUpgradeRunStatus::Completed => Self::Completed,
+            ApplicationUpgradeRunStatus::Failed => Self::Failed,
+        }
+    }
+}
+
+/// One upgrade attempt, as the UI follows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SimpleObject)]
+pub struct ApplicationUpgradeRunPayload {
+    pub run_id: String,
+    pub status: ApplicationUpgradeRunStatusValue,
+    /// Stable phase name: checking, downloading, verifying, staging, applying,
+    /// awaiting_elevation, restarting or reboot_required.
+    pub phase: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub target_version: String,
+    pub target_tag: String,
+    pub from_version: String,
+    pub error: Option<String>,
+    pub started_at_epoch_ms: i64,
+    pub completed_at_epoch_ms: Option<i64>,
+}
+
+impl From<weaver_server_core::application_upgrade::ApplicationUpgradeRun>
+    for ApplicationUpgradeRunPayload
+{
+    fn from(value: weaver_server_core::application_upgrade::ApplicationUpgradeRun) -> Self {
+        Self {
+            run_id: value.run_id,
+            status: value.status.into(),
+            phase: value.phase,
+            downloaded_bytes: value.downloaded_bytes,
+            total_bytes: value.total_bytes,
+            target_version: value.target_version,
+            target_tag: value.target_tag,
+            from_version: value.from_version,
+            error: value.error,
+            started_at_epoch_ms: value.started_at_epoch_ms,
+            completed_at_epoch_ms: value.completed_at_epoch_ms,
+        }
+    }
+}
+
+/// Update availability and installation eligibility in one read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SimpleObject)]
+pub struct ApplicationUpgradeStatus {
+    pub current_version: String,
+    /// The available version, or null when no update notice exists.
+    pub update_version: Option<String>,
+    /// The available release tag, or null when no update notice exists.
+    pub update_tag: Option<String>,
+    pub update_available: bool,
+    /// The layout classified at startup, from the running process.
+    pub installation_kind: ApplicationInstallationKindValue,
+    pub management_owner: ApplicationUpgradeOwnerValue,
+    pub eligible: bool,
+    /// Stable snake_case code explaining the eligibility verdict.
+    pub eligibility_reason: String,
+    /// The run in flight, if one is.
+    pub active_run: Option<ApplicationUpgradeRunPayload>,
+    /// The newest run, in flight or finished.
+    pub latest_run: Option<ApplicationUpgradeRunPayload>,
+}
+
+impl From<weaver_server_core::application_upgrade::ApplicationUpgradeSnapshot>
+    for ApplicationUpgradeStatus
+{
+    fn from(value: weaver_server_core::application_upgrade::ApplicationUpgradeSnapshot) -> Self {
+        Self {
+            current_version: value.current_version,
+            update_version: value.update_version,
+            update_tag: value.update_tag,
+            update_available: value.update_available,
+            installation_kind: value.installation_kind.into(),
+            management_owner: value.management_owner.into(),
+            eligible: value.eligible,
+            eligibility_reason: value.eligibility_reason.as_str().to_string(),
+            active_run: value.active_run.map(Into::into),
+            latest_run: value.latest_run.map(Into::into),
+        }
+    }
+}
+
+/// The exact update notice the operator pressed Install on.
+///
+/// Echoing the notice back is what keeps the mutation from being a "install
+/// whatever the server likes" trigger: the release checker must already have
+/// found this tag and version, or the request is refused.
+#[derive(Debug, Clone, InputObject)]
+pub struct StartApplicationUpgradeInput {
+    pub expected_tag: String,
+    pub expected_version: String,
+}
+
+/// The accepted upgrade run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SimpleObject)]
+pub struct ApplicationUpgradeStartPayload {
+    pub run: ApplicationUpgradeRunPayload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]

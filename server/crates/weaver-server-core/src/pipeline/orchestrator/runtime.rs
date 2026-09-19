@@ -207,19 +207,8 @@ impl Pipeline {
             active_download_connections: 0,
             active_completion_critical_connections: 0,
             active_recovery: 0,
-            hot_dispatch_job: None,
-            hot_dispatch_started_at: None,
-            hot_dispatch_exclusive_peak_bps: 0,
-            hot_dispatch_last_lend_at: None,
-            hot_dispatch_mode: DispatchShareMode::Exclusive,
-            hot_dispatch_underfill_since: None,
-            hot_dispatch_last_spillover_decision: SpilloverDecision::None,
-            hot_dispatch_throughput_window: HotJobThroughputWindow::default(),
-            hot_dispatch_exclusive_window: HotExclusiveWindow::default(),
-            hot_dispatch_expansion_window: HotExpansionWindow::default(),
-            hot_dispatch_spillover_loans: SpilloverLoanBook::default(),
-            hot_share_yield_signal: Arc::new(HotShareYieldSignal::default()),
             download_lane_runtime: DownloadLaneRuntimeState::default(),
+            held_download_refills: Vec::new(),
             download_dispatch_wake: false,
             nntp_handoff_draining: false,
             ip_replacement_trial_extra_connections,
@@ -260,6 +249,7 @@ impl Pipeline {
             uu_spool_root,
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
+            uu_park_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
@@ -390,7 +380,9 @@ impl Pipeline {
             #[cfg(test)]
             propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
-            last_owned_lane_acquire_failure_log_at: None,
+            download_retry_storm_window: None,
+            owned_lane_acquire_failure_log_throttle: Default::default(),
+            dispatch_ineligible_log_throttle: Default::default(),
             last_owned_lane_acquire_failure_at: None,
             download_lanes_under_cap_since: None,
             last_download_lanes_under_cap_log_at: None,
@@ -435,8 +427,9 @@ impl Pipeline {
             phase_progress_snapshots: HashMap::new(),
             phase_publish_state: HashMap::new(),
             job_retention_exclude_cache: HashMap::new(),
-            last_no_eligible_server_warn: None,
-            last_body_fetch_failure_log_at: None,
+            no_eligible_server_warn_throttle: Default::default(),
+            body_lane_capacity_log_throttle: Default::default(),
+            body_fetch_failure_log_throttle: Default::default(),
             par2_cancellations: HashMap::new(),
             next_direct_post_repair_work_id: 0,
             direct_post_repair_in_flight: HashMap::new(),
@@ -971,7 +964,7 @@ impl Pipeline {
                     Some(result) = self.download_done_rx.recv() => {
                         if !self.release_download_result(&result) { continue; }
                         self.note_released_download_result_pending(
-                            result.segment_id.file_id.job_id,
+                            result.job_id,
                             Self::released_download_result_lead_bytes(&result),
                         );
                         pending_download_results.push_back(result);
@@ -1044,6 +1037,10 @@ impl Pipeline {
                     }
                     _ = metrics_snapshot_interval.tick() => {
                         self.refresh_periodic_snapshot();
+                        // Lanes whose refill found nothing wait here for the
+                        // next wake; the tick is what ends the wait when no
+                        // wake comes.
+                        self.service_held_download_refills();
                     }
                     _ = rate_sleep, if !rate_delay.is_zero() => {}
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
@@ -1080,32 +1077,6 @@ impl Pipeline {
                             pressure_state = snapshot.download_pressure_state.as_str(),
                             pressure_reason = snapshot.download_pressure_reason.as_str(),
                             direct_write_evictions = snapshot.direct_write_evictions,
-                            hot_dispatch_job_id = snapshot.hot_dispatch_job_id,
-                            hot_dispatch_mode = snapshot.hot_dispatch_mode.as_str(),
-                            hot_dispatch_lent_connections = snapshot.hot_dispatch_lent_connections,
-                            hot_dispatch_underfill_ms = snapshot.hot_dispatch_underfill_ms,
-                            hot_dispatch_speed_bps = snapshot.hot_dispatch_hot_speed_bps,
-                            hot_dispatch_exclusive_peak_bps =
-                                snapshot.hot_dispatch_exclusive_peak_bps,
-                            hot_dispatch_spillover_pre_speed_bps =
-                                snapshot.hot_dispatch_spillover_pre_speed_bps,
-                            hot_dispatch_spillover_post_speed_bps =
-                                snapshot.hot_dispatch_spillover_post_speed_bps,
-                            hot_dispatch_spillover_active_loans =
-                                snapshot.hot_dispatch_spillover_active_loans,
-                            hot_dispatch_recent_expansion_improvement_pct =
-                                snapshot.hot_dispatch_recent_expansion_improvement_pct,
-                            hot_dispatch_best_mode_block_reason =
-                                snapshot.hot_dispatch_best_mode_block_reason,
-                            hot_dispatch_last_expansion_kind =
-                                snapshot.hot_dispatch_last_expansion_kind,
-                            hot_dispatch_last_expansion_before_bps =
-                                snapshot.hot_dispatch_last_expansion_before_bps,
-                            hot_dispatch_last_expansion_after_bps =
-                                snapshot.hot_dispatch_last_expansion_after_bps,
-                            hot_dispatch_last_spillover_decision = snapshot
-                                .hot_dispatch_last_spillover_decision
-                                .as_str(),
                             not_found,
                             health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                             "pipeline tick"
@@ -1353,7 +1324,7 @@ impl Pipeline {
                 continue;
             }
             self.note_released_download_result_pending(
-                result.segment_id.file_id.job_id,
+                result.job_id,
                 Self::released_download_result_lead_bytes(&result),
             );
             pending.push_back(result);

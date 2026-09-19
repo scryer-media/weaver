@@ -38,6 +38,12 @@ const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// without a configured path.
 #[cfg(windows)]
 const SERVER_EXECUTABLE: &str = "weaver.exe";
+
+/// Size past which the captured stderr log is rotated on the next server
+/// start. What lands there is sparse — a setup code, a runtime's last words —
+/// so this is a bound against a server that spews, not a budget.
+const STDERR_LOG_ROTATE_BYTES: u64 = 1 << 20;
+
 #[cfg(windows)]
 const WRAPPER_EXECUTABLE: &str = "weaver-tray.exe";
 #[cfg(not(windows))]
@@ -654,6 +660,56 @@ pub(crate) fn row_detail(row: &QueueRow) -> String {
     format!("{} · {}%", row.state, row.progress_percent.round())
 }
 
+use crate::bundle_relaunch::is_bundle_relaunch_exit;
+
+/// What one poll of the supervised server found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SupervisedServer {
+    /// Still running, or never owned by this wrapper.
+    Running,
+    /// The server applied an application-bundle upgrade and asked the wrapper
+    /// to relaunch the app from the replaced bundle.
+    RelaunchRequested,
+    /// The server exited for some other reason.
+    Exited(ExitStatus),
+}
+
+/// The `.app` bundle the running wrapper was launched from, if it was.
+///
+/// Derived from this process's own path rather than anything the server said,
+/// so a relaunch can only ever target the bundle the user actually started.
+#[cfg(target_os = "macos")]
+pub(crate) fn running_app_bundle() -> Option<PathBuf> {
+    let wrapper = std::env::current_exe().ok()?;
+    let resolved = std::fs::canonicalize(&wrapper).unwrap_or(wrapper);
+    application_updater::installation::macos_app_bundle_path(&resolved).map(Path::to_path_buf)
+}
+
+/// Start the updated bundle once this wrapper has exited.
+///
+/// The wrapper holds the single-instance lock until its process ends, and a
+/// second instance that finds the lock taken hands off to the first and exits.
+/// Opening the bundle directly would race this wrapper's own shutdown and, when
+/// it lost, leave nothing running. So a detached shell waits for this process
+/// to go, then opens the bundle. The bundle path travels as an argument, never
+/// as script text.
+#[cfg(target_os = "macos")]
+pub(crate) fn relaunch_app_bundle(bundle: &Path) -> Result<(), String> {
+    const WAIT_THEN_OPEN: &str = "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.2; done; exec /usr/bin/open -n \"$2\"";
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(WAIT_THEN_OPEN)
+        .arg("weaver-relaunch")
+        .arg(std::process::id().to_string())
+        .arg(bundle)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to relaunch {}: {error}", bundle.display()))
+}
+
 /// The `weaver` server process the wrapper owns.
 ///
 /// The wrapper is the parent of the server it started, so this is also what
@@ -671,7 +727,14 @@ pub(crate) struct ServerSupervisor {
     log_offset: u64,
 }
 
-fn forward_server_stderr(stderr: impl Read, setup_code: Arc<Mutex<Option<String>>>) {
+/// Reads the server's stderr to its end. Setup codes are kept for the UI;
+/// everything else is copied to the capture file and to the wrapper's own
+/// stderr, which has somewhere to go when the wrapper runs from a console.
+fn forward_server_stderr(
+    stderr: impl Read,
+    setup_code: Arc<Mutex<Option<String>>>,
+    mut capture: Option<std::fs::File>,
+) {
     let mut captured = false;
     for line in BufReader::new(stderr).lines() {
         let Ok(line) = line else { break };
@@ -682,8 +745,24 @@ fn forward_server_stderr(stderr: impl Read, setup_code: Arc<Mutex<Option<String>
             }
             continue;
         }
+        if let Some(capture) = capture.as_mut() {
+            let _ = writeln!(capture, "{line}");
+        }
         let _ = writeln!(std::io::stderr(), "{line}");
     }
+}
+
+/// The exit status with the raw code in hex beside it: on Windows a crash
+/// exits with an NTSTATUS, which the decimal rendering hides.
+fn describe_exit(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{status} (0x{:08X})", code as u32),
+        None => status.to_string(),
+    }
+}
+
+fn wrapper_timestamp() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn parse_setup_code_line(line: &str) -> Option<String> {
@@ -711,6 +790,45 @@ impl ServerSupervisor {
 
     fn log_file(&self) -> PathBuf {
         self.logs_dir().join("weaver.log")
+    }
+
+    /// Where the owned server's stderr lands. The server logs to `weaver.log`
+    /// itself; what reaches stderr is the runtime's own last words — a panic's
+    /// default report, "memory allocation of N bytes failed", "thread 'x' has
+    /// overflowed its stack" — none of which go through the logger, and none
+    /// of which survive being forwarded to a windowless wrapper's stderr. The
+    /// exit status the wrapper observes is recorded here too, so a server that
+    /// died without a word at least leaves its exit code.
+    fn stderr_log_file(&self) -> PathBuf {
+        weaver_server_core::runtime::log_buffer::stderr_capture_path(&self.log_file())
+    }
+
+    /// Opens the stderr capture for appending, rotating it first once it has
+    /// outgrown its bound. Failing to open it only loses the capture: the
+    /// wrapper still starts the server.
+    fn open_stderr_log(&self) -> Option<std::fs::File> {
+        let path = self.stderr_log_file();
+        if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > STDERR_LOG_ROTATE_BYTES) {
+            let _ = std::fs::rename(&path, path.with_extension("log.1"));
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    }
+
+    /// Records how the owned server exited, next to whatever it said last.
+    fn record_server_exit(&self, status: ExitStatus) {
+        let Some(mut capture) = self.open_stderr_log() else {
+            return;
+        };
+        let _ = writeln!(
+            capture,
+            "{} [wrapper] the server exited: {}",
+            wrapper_timestamp(),
+            describe_exit(status)
+        );
     }
 
     pub(crate) fn port(&self) -> u16 {
@@ -755,7 +873,10 @@ impl ServerSupervisor {
         if let Some(child) = self.server.as_mut() {
             match child.try_wait() {
                 Ok(None) => return Ok(()),
-                Ok(Some(_)) => self.server = None,
+                Ok(Some(status)) => {
+                    self.record_server_exit(status);
+                    self.server = None;
+                }
                 Err(error) => {
                     return Err(format!("failed to check Weaver server status: {error}"));
                 }
@@ -765,14 +886,8 @@ impl ServerSupervisor {
         let server_executable = self.server_executable()?;
         let log_file = self.log_file();
         self.log_offset = std::fs::metadata(&log_file).map_or(0, |metadata| metadata.len());
-        let mut command = Command::new(&server_executable);
-        command
-            .arg("--config")
-            .arg(&self.profile_dir)
-            .arg("--log-file")
-            .arg(&log_file)
-            .args(["serve", "--port", &self.port.to_string()]);
-        command.stderr(Stdio::piped());
+        let mut command =
+            build_server_command(&server_executable, &self.profile_dir, &log_file, self.port);
         configure_server_command(&mut command);
         self.setup_code = Arc::new(Mutex::new(None));
         let mut child = command.spawn().map_err(|error| {
@@ -783,7 +898,16 @@ impl ServerSupervisor {
         })?;
         if let Some(stderr) = child.stderr.take() {
             let setup_code = self.setup_code.clone();
-            thread::spawn(move || forward_server_stderr(stderr, setup_code));
+            let mut capture = self.open_stderr_log();
+            if let Some(capture) = capture.as_mut() {
+                let _ = writeln!(
+                    capture,
+                    "{} [wrapper] started the server (pid {})",
+                    wrapper_timestamp(),
+                    child.id()
+                );
+            }
+            thread::spawn(move || forward_server_stderr(stderr, setup_code, capture));
         }
         self.server = Some(child);
         Ok(())
@@ -844,6 +968,23 @@ impl ServerSupervisor {
         }
     }
 
+    /// What the supervised server is doing right now.
+    ///
+    /// This is the whole of the server→wrapper channel for a bundle upgrade.
+    /// It is deliberately not a socket, a port or a file: the only thing read
+    /// here is the exit status of a child *this process started*, which cannot
+    /// be produced by anything else on the machine, needs no authentication of
+    /// its own, and adds no listening surface.
+    pub(crate) fn poll_supervised_server(&mut self) -> Result<SupervisedServer, String> {
+        match self.exited_server()? {
+            None => Ok(SupervisedServer::Running),
+            Some(status) if is_bundle_relaunch_exit(status) => {
+                Ok(SupervisedServer::RelaunchRequested)
+            }
+            Some(status) => Ok(SupervisedServer::Exited(status)),
+        }
+    }
+
     /// How the owned server exited, once it has.
     fn exited_server(&mut self) -> Result<Option<ExitStatus>, String> {
         let Some(child) = self.server.as_mut() else {
@@ -852,7 +993,8 @@ impl ServerSupervisor {
         let status = child
             .try_wait()
             .map_err(|error| format!("failed to check Weaver server status: {error}"))?;
-        if status.is_some() {
+        if let Some(status) = status {
+            self.record_server_exit(status);
             self.server = None;
         }
         Ok(status)
@@ -877,7 +1019,8 @@ impl ServerSupervisor {
         while Instant::now() < deadline {
             match self.server.as_mut() {
                 Some(child) => match child.try_wait() {
-                    Ok(Some(_)) => {
+                    Ok(Some(status)) => {
+                        self.record_server_exit(status);
                         self.server = None;
                         return;
                     }
@@ -1003,6 +1146,33 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Build the command that starts the supervised server.
+///
+/// Separate from `start` so a test can read the environment back: the
+/// supervision marker is what tells the server it may hand a bundle upgrade to
+/// the wrapper, so losing it would silently make in-app upgrades ineligible
+/// rather than fail loudly.
+fn build_server_command(
+    server_executable: &Path,
+    profile_dir: &Path,
+    log_file: &Path,
+    port: u16,
+) -> Command {
+    let mut command = Command::new(server_executable);
+    command
+        .arg("--config")
+        .arg(profile_dir)
+        .arg("--log-file")
+        .arg(log_file)
+        .args(["serve", "--port", &port.to_string()])
+        .env(
+            weaver_server_core::application_upgrade::WEAVER_PRODUCT.tray_supervised_env,
+            "1",
+        )
+        .stderr(Stdio::piped());
+    command
+}
+
 /// Keep the server out of the user's face. On Windows a console subsystem
 /// child would flash a window on every start; on macOS the child inherits the
 /// wrapper's already-windowless session and needs nothing.
@@ -1098,11 +1268,31 @@ mod tests {
 
     use super::{
         HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
-        decode_chunked, desktop_profile_dir_from, format_bytes, format_speed, http_origin,
-        is_weaver_document, last_logged_error, logged_error_message, note_version_change,
-        opens_in_external_browser, parse_http_response, parse_setup_code_line,
+        build_server_command, decode_chunked, desktop_profile_dir_from, format_bytes, format_speed,
+        http_origin, is_weaver_document, last_logged_error, logged_error_message,
+        note_version_change, opens_in_external_browser, parse_http_response, parse_setup_code_line,
         popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
     };
+
+    #[test]
+    fn the_spawn_command_marks_the_server_as_tray_supervised() {
+        let command = build_server_command(
+            Path::new("/opt/weaver/weaver"),
+            Path::new("/opt/weaver/profile"),
+            Path::new("/opt/weaver/profile/logs/weaver.log"),
+            8080,
+        );
+        let marker = weaver_server_core::application_upgrade::WEAVER_PRODUCT.tray_supervised_env;
+        let supervised = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(marker))
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            supervised,
+            Some(std::ffi::OsStr::new("1")),
+            "the supervised server must see {marker}=1, or bundle upgrades are never eligible"
+        );
+    }
 
     #[test]
     fn setup_code_parser_accepts_only_the_exact_marker() {
@@ -1656,5 +1846,31 @@ mod tests {
             progress_percent: 42.5,
         };
         assert_eq!(row_detail(&row), "Downloading · 43%");
+    }
+
+    // -- the server's relaunch request ---------------------------------------
+
+    /// The request is a specific exit code and nothing else. An ordinary
+    /// failure, a panic, a clean exit and a signal must all stay ordinary
+    /// exits, or a crashing server would relaunch the app in a loop.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_relaunch_exit_code_asks_the_wrapper_to_relaunch() {
+        use std::os::unix::process::ExitStatusExt;
+
+        use crate::bundle_relaunch::{BUNDLE_RELAUNCH_EXIT_CODE, is_bundle_relaunch_exit};
+
+        let exited = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        assert!(is_bundle_relaunch_exit(exited(BUNDLE_RELAUNCH_EXIT_CODE)));
+        for code in [0, 1, 2, 70, 86, 88, 101, 255] {
+            assert!(
+                !is_bundle_relaunch_exit(exited(code)),
+                "exit code {code} must not be read as a relaunch request"
+            );
+        }
+        // Killed by signal 87: no exit code at all.
+        assert!(!is_bundle_relaunch_exit(
+            std::process::ExitStatus::from_raw(BUNDLE_RELAUNCH_EXIT_CODE)
+        ));
     }
 }

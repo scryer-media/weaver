@@ -389,6 +389,12 @@
       "rationale": "The runtime browser flow verifies history rendering and pagination without deleting release evidence."
     },
     {
+      "name": "startApplicationUpgrade",
+      "owner": "ui-runtime-observability",
+      "oracle": "unit-only",
+      "rationale": "The mutation installs only a signed release published on the product's own release feed, which this ladder cannot mint; the admin-only refusal paths and the download, verification and staging pipeline are covered by weaver-server-core application_upgrade::service tests."
+    },
+    {
       "name": "changePassword",
       "owner": "ui-security",
       "oracle": "browser"

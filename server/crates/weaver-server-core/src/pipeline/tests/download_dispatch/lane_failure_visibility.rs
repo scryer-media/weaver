@@ -1,9 +1,10 @@
 //! A lane that cannot be acquired must be visible, and must be retried.
 //!
-//! Both arms of the acquire-failure handler keep the download running — the
-//! work is requeued or handed to an async lane — so the failure itself has to
-//! announce that it happened. Nothing above debug did, which made a job running
-//! on a fraction of its lanes look exactly like a slow server.
+//! The acquire-failure handler keeps the download running either way — the
+//! work is requeued, or the leased articles take the failure and are retried
+//! through the ordinary result path — so the failure itself has to announce
+//! that it happened. Nothing above debug did, which made a job running on a
+//! fraction of its lanes look exactly like a slow server.
 
 use super::*;
 
@@ -13,16 +14,16 @@ fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let works = state.download_queue.drain_all();
     assert!(!works.is_empty(), "the fixture job has queued work");
-    let compatibility = DownloadBatchCompatibility::from_work(&works[0]);
+    let completion_critical = works.iter().any(|work| work.completion_critical);
     DownloadBatchLease {
         lane_id: 0,
         job_id,
         runtime_generation: 0,
         lane_mode: DownloadLaneMode::Sequential,
-        spillover_loan_kind: None,
         server_modes: vec![(0, DownloadLaneMode::Sequential)],
-        compatibility,
+        completion_critical,
         effective_exclude_servers: Vec::new(),
+        dial_exclude_servers: Vec::new(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         pressure_clear: true,
         works,
@@ -80,7 +81,10 @@ async fn a_contended_acquire_requeues_its_work_and_asks_for_another_pass() {
          opened"
     );
     assert!(
-        pipeline.last_owned_lane_acquire_failure_log_at.is_some(),
+        pipeline
+            .owned_lane_acquire_failure_log_throttle
+            .last_emitted_at(job_id)
+            .is_some(),
         "the failure must be reported rather than swallowed"
     );
 }
@@ -109,7 +113,8 @@ async fn repeated_acquire_failures_report_at_most_once_a_window() {
         &mut pending,
     );
     let first = pipeline
-        .last_owned_lane_acquire_failure_log_at
+        .owned_lane_acquire_failure_log_throttle
+        .last_emitted_at(job_id)
         .expect("the first failure of a window reports itself");
 
     let lease = lease_for(&mut pipeline, job_id);
@@ -121,7 +126,9 @@ async fn repeated_acquire_failures_report_at_most_once_a_window() {
         &mut pending,
     );
     assert_eq!(
-        pipeline.last_owned_lane_acquire_failure_log_at,
+        pipeline
+            .owned_lane_acquire_failure_log_throttle
+            .last_emitted_at(job_id),
         Some(first),
         "the second failure inside the window is counted, not logged again"
     );

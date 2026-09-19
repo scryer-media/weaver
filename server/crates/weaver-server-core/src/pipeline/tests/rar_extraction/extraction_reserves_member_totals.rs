@@ -908,11 +908,11 @@ async fn rar_refresh_follow_up_covers_holey_inflight_snapshot() {
 
     write_and_complete_rar_volume_without_drain(&mut pipeline, job_id, 2, &files[2].0, &files[2].1)
         .await;
-    let stale_done =
-        tokio::time::timeout(Duration::from_secs(5), pipeline.rar_refresh_done_rx.recv())
-            .await
-            .expect("holey RAR refresh result should arrive")
-            .expect("RAR refresh channel should stay open");
+    let stale_done = pipeline
+        .rar_refresh_done_rx
+        .recv()
+        .await
+        .expect("RAR refresh channel should stay open");
 
     write_and_complete_rar_volume_without_drain(&mut pipeline, job_id, 1, &files[1].0, &files[1].1)
         .await;
@@ -1194,9 +1194,10 @@ async fn rar_refresh_follow_up_does_not_starve_covered_ready_members() {
         "follow-up coverage refresh should still be launched"
     );
 
-    let done = tokio::time::timeout(Duration::from_secs(5), pipeline.extract_done_rx.recv())
+    let done = pipeline
+        .extract_done_rx
+        .recv()
         .await
-        .expect("covered member extraction should complete")
         .expect("extraction channel should stay open");
     pipeline.handle_extraction_done(done).await;
 }

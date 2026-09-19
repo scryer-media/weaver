@@ -389,6 +389,27 @@ impl Database {
         })
     }
 
+    /// Moves a session's expiry, so a test can expire a live session outright
+    /// instead of waiting for the wall clock to pass it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_browser_session_expiry(
+        &self,
+        token_hash: &str,
+        expires_at: i64,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let token_hash = token_hash.to_string();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE browser_sessions SET expires_at = {} WHERE token_hash = {}",
+                &[SqlArg::I64(expires_at), SqlArg::Text(token_hash)],
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+
     pub fn revoke_all_browser_sessions(&self, now: i64) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {

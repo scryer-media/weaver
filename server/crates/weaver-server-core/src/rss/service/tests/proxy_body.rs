@@ -67,15 +67,7 @@ async fn changing_feed_policy_closes_an_active_response_before_mutation_complete
         )
         .unwrap();
     runtime.reload().await.unwrap();
-    assert!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            read_response_with_limit(response, 2000)
-        )
-        .await
-        .unwrap()
-        .is_err()
-    );
+    assert!(read_response_with_limit(response, 2000).await.is_err());
     assert!(
         service
             .send_rss_request(&feed, &feed.url, false)

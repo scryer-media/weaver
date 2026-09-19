@@ -1,6 +1,10 @@
 [profile.default]
 # A test that leaves a child holding stdout or stderr open is a test failure.
 leak-timeout = { period = "2s", result = "fail" }
+# Tests wait on the events they check rather than racing a deadline of their
+# own, so a hang is the runner's to end: flag a test after a minute, kill it
+# after ten. This bounds a stuck run; it asserts nothing about speed.
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 # macOS has no pipe2, so the standard library creates a test's stdio pipes and
 # sets close-on-exec in two steps. A sibling test spawned inside that window

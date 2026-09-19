@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{error, info, warn};
 
-use crate::{http, restart, shutdown, wiring};
+use crate::{heartbeat, http, restart, shutdown, wiring};
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::{Config, SharedConfig};
@@ -202,7 +202,7 @@ pub(crate) async fn run(
         shared_config.clone(),
         db.clone(),
         rss.clone(),
-        restore_locator_dir,
+        restore_locator_dir.clone(),
     );
     let jwt_secret = db.get_or_create_jwt_signing_secret()?;
     let auth_credentials = db.get_auth_credentials()?;
@@ -331,6 +331,42 @@ pub(crate) async fn run(
     };
     let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())?;
 
+    // The in-application upgrade. The installation is classified once, here,
+    // from the running process: an install someone else manages (a container, a
+    // package manager, a Windows service) is refused from this point on, and
+    // nothing the API is told can change that verdict.
+    let application_upgrade =
+        weaver_server_core::application_upgrade::ApplicationUpgradeService::new(
+            db.clone(),
+            update_check.clone(),
+            &restore_locator_dir,
+            weaver_server_core::application_upgrade::collect_installation_assessment(),
+            weaver_server_core::runtime::restart::resolvable_executable(),
+        );
+    // An upgrade that promoted before this boot is settled now, before anything
+    // serves: the journal is the only record that survives the restart, and
+    // whether this is the expected build is only knowable from this process.
+    match application_upgrade.finalize_journal() {
+        Ok(awaiting_reboot) => {
+            for run_id in awaiting_reboot {
+                warn!(
+                    run_id,
+                    "application upgrade is waiting for a reboot to finish"
+                );
+            }
+        }
+        Err(error) => warn!(%error, "could not settle the application-upgrade journal"),
+    }
+    // TLS for the upgrade download, and fresher Sigstore trust roots than the
+    // build's embedded snapshot. The refresh is detached: it talks to the
+    // network, and an upgrade must stay installable when that fails. With
+    // release checks turned off no upgrade can ever start, so the refresh is
+    // not started either: the opt-out means no upgrade traffic at all.
+    weaver_server_core::application_upgrade::install_default_rustls_provider();
+    if update_check.enabled() {
+        weaver_server_core::application_upgrade::spawn_sigstore_trust_root_priming();
+    }
+
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
     let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
         handle: handle.clone(),
@@ -344,6 +380,7 @@ pub(crate) async fn run(
         rss: rss.clone(),
         watch_folder: watch_folder.clone(),
         update_check: update_check.clone(),
+        application_upgrade: application_upgrade.clone(),
         schedules: shared_schedules,
         log_buffer: log_ring_buffer,
         system_runtime: weaver_server_api::SystemRuntimeContext {
@@ -372,6 +409,7 @@ pub(crate) async fn run(
     let update_check_task = update_check.start_background_loop();
     watch_folder.reconcile_from_config().await?;
     let metrics_history_task = shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
+    let heartbeat_task = heartbeat::spawn_heartbeat_task();
     let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
         db.clone(),
         maintenance_complete_dir,
@@ -380,6 +418,12 @@ pub(crate) async fn run(
     // The UI's restart button reaches the serve loop through this handle; the
     // loop owns when the process is actually safe to replace.
     let restart_controller = weaver_server_core::runtime::restart::RestartController::new();
+    // The upgrade reaches the same loop: a portable promotion restarts in place,
+    // a Windows handoff exits so the helper can replace these files, and a macOS
+    // bundle upgrade exits with the code that asks the wrapper to relaunch.
+    application_upgrade
+        .set_restart_controller(restart_controller.clone())
+        .await;
 
     // Run HTTP server on the listener bound above.
     let server_runtime = http::ServerRuntime {
@@ -485,7 +529,7 @@ pub(crate) async fn run(
     // spelling the sequence out.
     let stop = tokio::select! {
         _ = shutdown::wait_for_shutdown() => ServeStop::Signal,
-        _ = restart_controller.requested() => ServeStop::Restart,
+        action = restart_controller.requested() => ServeStop::from(action),
         result = &mut pipeline_task => {
             proxies.stop_all().await;
             let error = shutdown::pipeline_exit_error(result);
@@ -494,6 +538,7 @@ pub(crate) async fn run(
             rss_task.abort();
             watch_folder.stop().await;
             metrics_history_task.abort();
+            heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
             semantic_promotion_task.abort();
@@ -515,6 +560,7 @@ pub(crate) async fn run(
             rss_task.abort();
             watch_folder.stop().await;
             metrics_history_task.abort();
+            heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
             semantic_promotion_task.abort();
@@ -535,6 +581,12 @@ pub(crate) async fn run(
     match stop {
         ServeStop::Signal => info!("received shutdown signal, shutting down"),
         ServeStop::Restart => info!("restart requested, shutting down before starting again"),
+        ServeStop::ExitOnly => {
+            info!("application upgrade handed off to its installer, shutting down")
+        }
+        ServeStop::BundleRelaunch => {
+            info!("application bundle upgraded, asking the desktop wrapper to relaunch")
+        }
     }
     update_check_task.abort();
     proxies.stop_all().await;
@@ -551,16 +603,30 @@ pub(crate) async fn run(
     rss_task.abort();
     watch_folder.stop().await;
     metrics_history_task.abort();
+    heartbeat_task.abort();
     maintenance_task.abort();
     semantic_promotion_task.abort();
     server_transfer_maintenance.abort();
     wiring::flush_server_transfer_usage(Arc::clone(&server_transfer_policy), stop.flush_context())
         .await;
+    // The last thing an orderly run says about itself: how much memory it ever
+    // held. A run that ended on purpose and one that was killed for its size
+    // are only distinguishable if the orderly one leaves this behind.
+    heartbeat::log_peak_rss();
 
     match stop {
         ServeStop::Signal => Ok(()),
         // Unix re-execs in place, so on success this never returns.
         ServeStop::Restart => restart::restart_now().map_err(Into::into),
+        // The Windows upgrade helper is already waiting for these files to be
+        // released; restarting would only take them back.
+        ServeStop::ExitOnly => Ok(()),
+        // The bundle this process was launched from has been replaced, so the
+        // running wrapper cannot become the new build by restarting the server.
+        // This exit code is the whole of the request to relaunch the app.
+        ServeStop::BundleRelaunch => {
+            std::process::exit(crate::bundle_relaunch::BUNDLE_RELAUNCH_EXIT_CODE)
+        }
     }
 }
 
@@ -676,6 +742,23 @@ mod migration_tests {
 enum ServeStop {
     Signal,
     Restart,
+    /// Shut down and stay down: an upgrade handed the installation to a helper
+    /// that needs these files released.
+    ExitOnly,
+    /// Shut down with the code that asks the desktop wrapper to relaunch the
+    /// application from the bundle an upgrade just replaced.
+    BundleRelaunch,
+}
+
+impl From<weaver_server_core::runtime::restart::RestartAction> for ServeStop {
+    fn from(action: weaver_server_core::runtime::restart::RestartAction) -> Self {
+        use weaver_server_core::runtime::restart::RestartAction;
+        match action {
+            RestartAction::Restart => Self::Restart,
+            RestartAction::ExitOnly => Self::ExitOnly,
+            RestartAction::BundleRelaunch => Self::BundleRelaunch,
+        }
+    }
 }
 
 impl ServeStop {
@@ -683,6 +766,8 @@ impl ServeStop {
         match self {
             Self::Signal => "serve shutdown",
             Self::Restart => "serve restart",
+            Self::ExitOnly => "serve upgrade handoff",
+            Self::BundleRelaunch => "serve bundle relaunch",
         }
     }
 }

@@ -4,6 +4,16 @@ use thiserror::Error;
 
 use crate::types::StatusCode;
 
+/// Render [`NntpError::AcquireTimeout`], whose zero case is not a duration at
+/// all but the statement that we declined to wait.
+fn acquire_timeout_message(seconds: u64) -> String {
+    if seconds == 0 {
+        "no connection available; did not wait".to_string()
+    } else {
+        format!("no connection available within {seconds}s")
+    }
+}
+
 /// Errors that can occur during NNTP operations.
 #[derive(Debug, Error)]
 pub enum NntpError {
@@ -44,6 +54,20 @@ pub enum NntpError {
     /// The server started a multiline terminator but never completed it.
     #[error("malformed multiline terminator")]
     MalformedMultilineTerminator,
+
+    /// The server is recovering and its one probe connection is already out,
+    /// or the probe is not demanded work. Local admission, not a refusal by
+    /// the server and not a shortage of permits: a server can be wide open on
+    /// sockets and still answer this.
+    #[error("server is recovering; the recovery probe is already out")]
+    ServerRecovering,
+
+    /// The server asked for authentication again (480) part-way through a
+    /// pipelined batch. The session expired mid-stream; the credentials were
+    /// never rejected, so this is the connection's problem and not the
+    /// server's, and the batch's outstanding articles are simply unanswered.
+    #[error("session expired mid-pipeline (480)")]
+    SessionExpired,
 
     // --- Authentication errors ---
     /// The server requires authentication (480).
@@ -132,7 +156,11 @@ pub enum NntpError {
     /// leased, or the adaptive limit is saturated), never a server fault, so it
     /// must not cool the server down or advance its failure counters — see
     /// `cooldown_reason` and `record_transient_server_failure` in `client.rs`.
-    #[error("no connection available within {0}s")]
+    ///
+    /// A zero means the acquire never waited: either the caller's deadline was
+    /// already spent, or every connection was held by a busy download lane and
+    /// queueing behind it would only have burned the caller's whole budget.
+    #[error("{}", acquire_timeout_message(*.0))]
     AcquireTimeout(u64),
 
     /// A per-server BODY quota rejected admission before the command was sent.

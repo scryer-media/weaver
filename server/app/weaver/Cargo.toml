@@ -26,6 +26,10 @@ unrar-rs = { workspace = true, features = [
     "crypto-aws-lc",
 ] }
 weaver-server-api = { path = "../../crates/weaver-server-api", default-features = false }
+# The tray resolves the running `.app` bundle with the shared classifier, and
+# the Windows upgrade helper runs from a copy of this binary. Pinned to the same
+# signed tag the server core uses, so one version lands in the lock file.
+application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.0" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -62,6 +66,7 @@ tempfile = { workspace = true }
 embed-resource = "3.0.11"
 
 [dev-dependencies]
+weaver-server-core = { path = "../../crates/weaver-server-core", default-features = false, features = ["test-support"] }
 tower = { workspace = true, default-features = false }
 # `test-util` for the paused clocks in this crate's own tests, which must not
 # compile only when another workspace member's dev-dependencies are built too.
@@ -72,18 +77,39 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 
 [target.'cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
+# Exact pin: `allocator.rs` addresses mimalloc options by the index of this
+# version's bundled v3 enum.
+libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["extended"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
-  # `CreateMutexW` and `RegCreateKeyExW` take `SECURITY_ATTRIBUTES`, whose type
-  # this feature defines. Another crate in the graph currently enables it too,
-  # but this crate must not compile only by that accident of feature
-  # unification.
+  # `CreateMutexW`, `RegCreateKeyExW` and `CreateFileW` take
+  # `SECURITY_ATTRIBUTES`, whose type this feature defines. Another crate in
+  # the graph currently enables it too, but this crate must not compile only by
+  # that accident of feature unification.
   "Win32_Security",
+  # `CreateFileW`, which opens the crash dump file.
+  "Win32_Storage_FileSystem",
+  # `SetUnhandledExceptionFilter` and `MiniDumpWriteDump`.
+  "Win32_System_Diagnostics_Debug",
+  # `CONTEXT`, which `EXCEPTION_POINTERS` and `MINIDUMP_EXCEPTION_INFORMATION`
+  # are declared behind. Both minidump entry points are gated on it.
+  "Win32_System_Kernel",
   "Win32_System_LibraryLoader",
+  # Another gate on `MiniDumpWriteDump`, for the memory-range types in its
+  # callback structures.
+  "Win32_System_Memory",
+  # `GetProcessMemoryInfo`, which the heartbeat reads the working set from.
+  "Win32_System_ProcessStatus",
+  # `WriteFile`, which the exception filter appends its crash line with; the
+  # `OVERLAPPED` parameter gates it on this feature.
+  "Win32_System_IO",
+  # `GetLocalTime`, which stamps the crash line the exception filter appends
+  # to the log without going through the logger.
+  "Win32_System_SystemInformation",
   "Win32_System_Registry",
     "Win32_System_Threading",
     # `WM_MOUSELEAVE`, which the tray flyout tracks the pointer with. The

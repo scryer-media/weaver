@@ -1405,6 +1405,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) {
+        self.clear_health_deferral(job_id);
         self.transition_completed_runtime(job_id);
         if self.active_download_passes.remove(&job_id) {
             self.phase_end(job_id, JobPhase::Downloading);

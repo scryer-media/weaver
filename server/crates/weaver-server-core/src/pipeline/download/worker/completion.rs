@@ -355,7 +355,7 @@ impl Pipeline {
                 self.note_download_lane_released(observation.mode, reason);
             }
             self.active_download_connections = self.active_download_connections.saturating_sub(1);
-            let job_id = result.segment_id.file_id.job_id;
+            let job_id = result.job_id;
             if let Some(in_flight) = self.active_download_connections_by_job.get_mut(&job_id) {
                 *in_flight = in_flight.saturating_sub(1);
                 if *in_flight == 0 {
@@ -377,13 +377,12 @@ impl Pipeline {
                     }
                 }
             }
-            self.clear_spillover_loan_if_idle();
         }
         if result.origin.is_recovery() {
             self.active_recovery = self.active_recovery.saturating_sub(1);
         }
 
-        let job_id = result.segment_id.file_id.job_id;
+        let job_id = result.job_id;
         self.note_download_activity(job_id);
         if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
             *in_flight = in_flight.saturating_sub(1);
@@ -413,17 +412,6 @@ impl Pipeline {
             }
             Err(_) => None,
         };
-        if result.origin.counts_for_hot_primary()
-            && self.hot_dispatch_job == Some(job_id)
-            && let Ok(payload) = &result.data
-        {
-            let raw_bytes = match payload {
-                DownloadPayload::Raw(raw) => raw.len() as u64,
-                DownloadPayload::Decoded(decoded) => decoded.raw_size,
-            };
-            self.hot_dispatch_throughput_window
-                .record(Instant::now(), raw_bytes);
-        }
         self.reconcile_rate_limit_for_download(result.segment_id, actual_raw_bytes);
         if let Some(raw_bytes) = actual_raw_bytes
             && let Err(error) = self.record_download_bandwidth_usage(raw_bytes)
@@ -434,7 +422,6 @@ impl Pipeline {
                 "failed to record ISP bandwidth usage"
             );
         }
-        self.publish_hot_dispatch_metrics(Instant::now());
         true
     }
 
@@ -499,7 +486,7 @@ impl Pipeline {
     }
 
     pub(crate) async fn process_released_download_done(&mut self, result: DownloadResult) {
-        let job_id = result.segment_id.file_id.job_id;
+        let job_id = result.job_id;
         let lead_bytes = Self::released_download_result_lead_bytes(&result);
         self.process_download_done(result).await;
         self.finish_released_download_result_processing(job_id, lead_bytes);
@@ -528,7 +515,7 @@ impl Pipeline {
     }
 
     async fn process_download_done_inner(&mut self, result: DownloadResult) {
-        let job_id = result.segment_id.file_id.job_id;
+        let job_id = result.job_id;
         if self
             .jobs
             .get(&job_id)
@@ -783,11 +770,10 @@ impl Pipeline {
                         | DownloadFailureKind::EstablishedTransport
                         | DownloadFailureKind::Auth
                         | DownloadFailureKind::ContentOrProtocol
-                ) && self
-                    .last_body_fetch_failure_log_at
-                    .is_none_or(|at| at.elapsed() >= BODY_FETCH_FAILURE_LOG_INTERVAL)
+                ) && let Some(suppressed_since_last) = self
+                    .body_fetch_failure_log_throttle
+                    .admit(job_id, BODY_FETCH_FAILURE_LOG_INTERVAL)
                 {
-                    self.last_body_fetch_failure_log_at = Some(Instant::now());
                     info!(
                         job_id = job_id.0,
                         segment = %result.segment_id,
@@ -795,6 +781,7 @@ impl Pipeline {
                         retry_count = result.retry_count,
                         attempt_count = result.attempts.len(),
                         source_server_idx = ?source_server_idx,
+                        suppressed_since_last,
                         error = %failure.message,
                         "NNTP BODY fetch failed"
                     );
@@ -946,34 +933,46 @@ impl Pipeline {
                             Some(BODY_SERVER_BLOCKED_RECHECK_DELAY)
                         }
                     };
-                    if self
-                        .last_no_eligible_server_warn
-                        .is_none_or(|at| at.elapsed() >= NO_ELIGIBLE_SERVER_WARN_INTERVAL)
-                    {
-                        self.last_no_eligible_server_warn = Some(Instant::now());
-                        if !matches!(
-                            availability,
-                            weaver_nntp::pool::BodyServerAvailability::Eligible
-                        ) {
-                            warn!(
-                                job_id = job_id.0,
-                                segment = %result.segment_id,
-                                configured_server_count = server_count,
-                                excluded_server_count = unavailable_server_count,
-                                error = %failure.message,
-                                "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
-                            );
-                        } else {
+                    // An eligible server means nothing about the *servers*
+                    // turned this work away: the lane was not opened because
+                    // local lane capacity was spent. That is self-clearing and
+                    // has nothing to do with server health or credentials, so
+                    // it neither warns nor sends anyone to their account page.
+                    if matches!(
+                        availability,
+                        weaver_nntp::pool::BodyServerAvailability::Eligible
+                    ) {
+                        if let Some(suppressed_since_last) = self
+                            .body_lane_capacity_log_throttle
+                            .admit(job_id, BODY_LANE_CAPACITY_LOG_INTERVAL)
+                        {
                             info!(
                                 job_id = job_id.0,
                                 segment = %result.segment_id,
                                 configured_server_count = server_count,
                                 excluded_server_count = unavailable_server_count,
                                 retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
+                                failure_kind = ?failure.kind,
+                                suppressed_since_last,
                                 error = %failure.message,
-                                "BODY lane acquisition failed; download work will retry"
+                                "downloads waiting: local BODY lane capacity is saturated; a server is eligible and the work retries as lanes free"
                             );
                         }
+                    } else if let Some(suppressed_since_last) = self
+                        .no_eligible_server_warn_throttle
+                        .admit(job_id, NO_ELIGIBLE_SERVER_WARN_INTERVAL)
+                    {
+                        warn!(
+                            job_id = job_id.0,
+                            segment = %result.segment_id,
+                            configured_server_count = server_count,
+                            excluded_server_count = unavailable_server_count,
+                            availability = ?availability,
+                            failure_kind = ?failure.kind,
+                            suppressed_since_last,
+                            error = %failure.message,
+                            "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
+                        );
                     }
                     self.metrics
                         .download_failures_capacity_unavailable
@@ -1072,9 +1071,22 @@ impl Pipeline {
                 } else {
                     excluded_servers.clone()
                 };
+                // A 430 from a server the article already excluded taught
+                // the retry nothing: the next attempt re-enters selection
+                // with the same set, comes back the same way at zero delay,
+                // and — because a sourced 430 preserves retry budget — would
+                // do so forever. Treat it as terminal rather than spin, and
+                // count it: the article is not necessarily missing
+                // everywhere, but nothing on this path can still prove
+                // otherwise. A 430 without a source spends budget on each
+                // retry and cannot spin, so it keeps retrying with the set it
+                // has.
+                let article_not_found_learned_nothing = source_not_found
+                    && !retry_exclude_servers.is_empty()
+                    && retry_exclude_servers.len() == excluded_servers.len();
                 let article_not_found_exhausted = failure.kind
                     == DownloadFailureKind::ArticleNotFound
-                    && (retry_exclude_servers.is_empty() || {
+                    && (retry_exclude_servers.is_empty() || article_not_found_learned_nothing || {
                         let server_count = self.nntp.pool().server_count();
                         server_count > 0 && {
                             // Retention-excluded servers can never 430; they
@@ -1084,6 +1096,11 @@ impl Pipeline {
                                 >= server_count
                         }
                     });
+                if article_not_found_learned_nothing {
+                    self.metrics
+                        .articles_not_found_without_new_server
+                        .fetch_add(1, Ordering::Relaxed);
+                }
 
                 // Transport rotation: point the retry away from the server
                 // whose established connection just failed, when an
@@ -1207,7 +1224,7 @@ impl Pipeline {
                             self.note_retry_scheduled(seg_id);
                             if infrastructure_retry {
                                 self.note_infrastructure_retry_scheduled(
-                                    seg_id.file_id.job_id,
+                                    job_id,
                                     failure.kind,
                                     Some(delay),
                                 );

@@ -181,11 +181,7 @@ async fn settle_par3_recovery(pipeline: &mut Pipeline, job_id: JobId) {
         .as_ref()
         .is_some_and(|runtime| runtime.has_work(job_id))
     {
-        let done =
-            tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let done = pipeline.repair_work_done_rx.recv().await.unwrap();
         pipeline.handle_repair_work_done(done).await;
     }
 }
@@ -562,13 +558,11 @@ async fn a_peer_handback_wakes_every_job_parked_on_par3_memory() {
     // The wait is wall time like any other: let it register before it ends.
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
 
-    let done = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        pipeline.repair_work_done_rx.recv(),
-    )
-    .await
-    .expect("the peer work unit finishes")
-    .expect("the coordinator holds the sender");
+    let done = pipeline
+        .repair_work_done_rx
+        .recv()
+        .await
+        .expect("the coordinator holds the sender");
     pipeline.handle_repair_work_done(done).await;
     assert!(
         pipeline.pending_completion_checks.contains(&parked),

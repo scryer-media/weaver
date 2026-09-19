@@ -112,7 +112,7 @@ impl Http3ServerDouble {
                                                 tokio::try_join!(upload, download)?;
                                                 Ok(())
                                             };
-                                            let _ = tokio::time::timeout(Duration::from_secs(30), serve).await;
+                                            let _ = serve.await;
                                         });
                                     }
                                     _ = streams.join_next(), if !streams.is_empty() => {}
@@ -145,7 +145,8 @@ impl Http3ServerDouble {
                         Http3ProxyCredentials::new("fixture".into(), "fixture-only".into())
                             .unwrap(),
                     ),
-                    request_timeout: Duration::from_secs(5),
+                    // The widest the provider accepts, so a loaded runner never trips it.
+                    request_timeout: Duration::from_secs(300),
                 },
                 self.roots.clone(),
             )

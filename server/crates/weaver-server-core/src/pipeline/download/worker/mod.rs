@@ -1,10 +1,11 @@
 use super::*;
+use crate::pipeline::download::scheduler::Handout;
 use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 mod completion;
 mod direct_store;
-mod hot;
+mod eligibility;
 mod ip_replacement;
 mod lanes;
 mod leases;
@@ -18,6 +19,7 @@ mod spawn;
 pub(in crate::pipeline) use ip_replacement::{
     is_ip_replacement_policy_stop, should_neutrally_park_ip_replacement,
 };
+pub(in crate::pipeline) use refill::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
 
@@ -25,55 +27,6 @@ enum DispatchAttempt {
     Dispatched,
     NoWork,
     StopAll,
-}
-
-/// How the completion-critical dispatch phase ended, which is what decides the
-/// yield signal. Only demand that a freed connection could actually serve may
-/// ask lanes to yield: critical work that is queued but undispatchable — a
-/// propagation hold, a durable-lead backlog, every server excluded — must not
-/// park the rest of the queue behind work no yielded lane can be handed to.
-enum CriticalDispatchPhase {
-    /// The dispatch loop must stop entirely (lane spawn hit a stop-all).
-    StopAll,
-    /// Dispatchable critical demand remains, and capacity, rate limiting, or
-    /// the pass budget is what stopped the phase from taking it. Non-critical
-    /// lanes should yield so the next pass can hand their connections here.
-    CapacityStarved,
-    /// Every job's critical demand was dispatched or is not currently
-    /// dispatchable. Nothing a yielded lane could serve remains.
-    Drained,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DownloadWorkSelection {
-    Any,
-    CompletionCritical,
-    NonCritical,
-}
-
-impl DownloadWorkSelection {
-    fn matches(self, work: &DownloadWork) -> bool {
-        match self {
-            Self::Any => true,
-            Self::CompletionCritical => work.completion_critical,
-            Self::NonCritical => !work.completion_critical,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DownloadBatchClass {
-    is_recovery: bool,
-    completion_critical: bool,
-}
-
-impl From<&DownloadBatchCompatibility> for DownloadBatchClass {
-    fn from(compatibility: &DownloadBatchCompatibility) -> Self {
-        Self {
-            is_recovery: compatibility.is_recovery,
-            completion_critical: compatibility.completion_critical,
-        }
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -92,30 +45,107 @@ struct DownloadPipelineBacklog {
 const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
 const SOFT_PRESSURE_DISPATCH_MAX_DELAY: Duration = Duration::from_millis(150);
 const SOFT_PRESSURE_DISPATCH_MIN_DELAY: Duration = Duration::from_millis(1);
-const HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
-const HOT_LEASE_TARGET_RUNWAY_SECS: u64 = 2;
-const HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
 const NO_ELIGIBLE_SERVER_WARN_INTERVAL: Duration = Duration::from_secs(60);
+const BODY_LANE_CAPACITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const BODY_FETCH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// How often one job may report that a dispatch pass found it ineligible.
+///
+/// A dispatch wake costs a pass, and passes come in bursts: a job in a phase
+/// that dispatches nothing — extracting, repairing, moving — is re-visited by
+/// every one of them. Unthrottled that is hundreds of identical lines a second
+/// for as long as the phase lasts, written synchronously on the pipeline actor
+/// thread, which is the same thread the stall itself needs to get work moving.
+const DISPATCH_INELIGIBLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// How often a dispatch pass re-asks for its first server ranking while the
+/// health lock is held by a lane worker, and how long it waits between asks.
+/// The critical sections behind that lock are microseconds long, so the whole
+/// budget is well under a millisecond and nearly every ask after the first
+/// lands.
+const PASS_RANKING_CONTENTION_RETRIES: usize = 8;
+const PASS_RANKING_CONTENTION_PAUSE: Duration = Duration::from_micros(50);
+
+/// How many jobs may hold a throttle window at once.
+///
+/// Nothing is asked to tidy up after a job that leaves, so the map bounds
+/// itself: expired windows go first, and if every window is still live the
+/// whole map goes. Losing a window costs one extra log line, nothing more.
+const JOB_LOG_THROTTLE_MAX_JOBS: usize = 256;
+
+/// One log-rate window per job.
+///
+/// These throttles used to share a single instant across the worker, so the
+/// one job failing in a loop spent the window and every other job's *first*
+/// line was dropped along with it — silently, which also left the real rate
+/// unreadable from the log. Each job gets its own window here, and whatever a
+/// closed window swallowed is counted and reported by the next line that gets
+/// through it.
+#[derive(Debug, Default)]
+pub(crate) struct JobLogThrottle {
+    windows: HashMap<JobId, JobLogWindow>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JobLogWindow {
+    emitted_at: Instant,
+    suppressed: u64,
+}
+
+impl JobLogThrottle {
+    /// Whether this job may log now, and how many of its emissions the closed
+    /// window swallowed since the last one that got through.
+    pub(crate) fn admit(&mut self, job_id: JobId, interval: Duration) -> Option<u64> {
+        self.admit_at(job_id, interval, Instant::now())
+    }
+
+    fn admit_at(&mut self, job_id: JobId, interval: Duration, now: Instant) -> Option<u64> {
+        match self.windows.get_mut(&job_id) {
+            Some(window) if now.duration_since(window.emitted_at) < interval => {
+                window.suppressed = window.suppressed.saturating_add(1);
+                None
+            }
+            Some(window) => {
+                let suppressed = window.suppressed;
+                window.emitted_at = now;
+                window.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                self.bound_windows(interval, now);
+                self.windows.insert(
+                    job_id,
+                    JobLogWindow {
+                        emitted_at: now,
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
+    }
+
+    fn bound_windows(&mut self, interval: Duration, now: Instant) {
+        if self.windows.len() < JOB_LOG_THROTTLE_MAX_JOBS {
+            return;
+        }
+        self.windows
+            .retain(|_, window| now.duration_since(window.emitted_at) < interval);
+        if self.windows.len() >= JOB_LOG_THROTTLE_MAX_JOBS {
+            self.windows.clear();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_emitted_at(&self, job_id: JobId) -> Option<Instant> {
+        self.windows.get(&job_id).map(|window| window.emitted_at)
+    }
+}
+
 /// How long the servers must stay below their connection cap, with work
 /// queued, before that is reported. Short enough to catch a lane that never
 /// opens, long enough that ordinary refill gaps between batches say nothing.
 const DOWNLOAD_LANES_UNDER_CAP_WINDOW: Duration = Duration::from_secs(5);
 const DOWNLOAD_LANES_UNDER_CAP_LOG_INTERVAL: Duration = Duration::from_secs(60);
-// Short debounce before the first spillover lane opens: this is slowness
-// DETECTION, not easing. A hot job hitting a brief refill hiccup should not
-// spray a lane onto another job for the few hundred milliseconds it takes to
-// recover; a genuinely idle or capacity-starved hot job clears this window
-// almost immediately and spillover engages at full speed from there.
-const HOT_DISPATCH_SLOWNESS_WINDOW: Duration = Duration::from_millis(500);
-const HOT_DISPATCH_SPILLOVER_HARM_PERCENT: u64 = 7;
-/// At most this many distinct non-hot jobs may hold a spillover loan at once.
-/// Lanes concentrate on the jobs already holding a loan before a new job is
-/// admitted, so spillover deepens a small number of jobs instead of fanning
-/// out across the whole queue.
-const HOT_DISPATCH_SPILLOVER_MAX_JOBS: usize = 2;
-const LANE_REFILL_GRACE: Duration = Duration::from_millis(5);
 const IP_REPLACEMENT_MIN_OLD_SAMPLES: u16 = 16;
 const IP_REPLACEMENT_MIN_OLD_AGE: Duration = Duration::from_secs(30);
 const IP_REPLACEMENT_BASELINE_MIN_SAMPLES: u16 = 8;
@@ -129,6 +159,12 @@ const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_milli
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How many retries inside one stall-log window, with nothing downloaded in
+/// the same window, read as a retry storm rather than as ordinary churn. A
+/// healthy pipeline retries a handful of articles per window and finishes
+/// others alongside them; a thousand retries and no completion is a loop.
+const DOWNLOAD_RETRY_STORM_THRESHOLD: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadPressure {
@@ -144,40 +180,168 @@ pub(crate) struct DownloadPressure {
 }
 
 impl Pipeline {
-    fn try_dispatch_download_for_job(
-        &mut self,
-        job_id: JobId,
-        pressure: DownloadPressure,
-        spillover_loan_kind: Option<SpilloverLoanKind>,
-        selection: DownloadWorkSelection,
-    ) -> DispatchAttempt {
-        // Too young to fetch: its articles are still propagating, and asking for
-        // them now produces not-founds that are indistinguishable from missing
-        // articles. Ahead of every other gate because it is a statement about
-        // the post rather than about the pipeline's own capacity.
-        if self.propagation_hold_until(job_id).is_some() {
-            return DispatchAttempt::NoWork;
-        }
-        if self
-            .download_restart_durable_lead_retry_after
-            .contains_key(&job_id)
-        {
-            self.flush_file_progress_batch(
-                "download.file_progress.flush.restart_durable_lead_retry_recheck",
-            );
-        }
-        self.apply_rar_unlock_priorities_if_dirty(job_id);
-        let mut lease = match self.try_lease_initial_download_batch(job_id, pressure, selection) {
-            Ok(Some(lease)) => lease,
-            Ok(None) => return DispatchAttempt::NoWork,
-            Err(attempt) => return attempt,
+    /// The job every handout comes from while it can serve the asking
+    /// server: the first eligible job in dispatch order.
+    pub(in crate::pipeline) fn current_hot_job(&self) -> Option<JobId> {
+        self.download_scheduler_eligible_jobs().first().copied()
+    }
+
+    /// The servers a dispatch pass hands leases to, best first. A pass's
+    /// first ranking is worth a short wait when the health lock is busy: the
+    /// only fallback is the idle connections, and a pass that starts with
+    /// none of those would otherwise send nothing at all.
+    fn rank_servers_for_pass(&self, first_of_pass: bool) -> Option<Vec<usize>> {
+        let attempts = if first_of_pass {
+            PASS_RANKING_CONTENTION_RETRIES
+        } else {
+            1
         };
-        lease.spillover_loan_kind = spillover_loan_kind;
-        let activation_items = Self::activation_items(&lease);
-        self.activate_download_batch_lease(&lease, &activation_items, true);
-        self.spawn_download_batch(lease);
-        self.warm_idle_download_lanes_for_barrier(job_id);
-        DispatchAttempt::Dispatched
+        for attempt in 0..attempts {
+            if let Some(order) = self.nntp.blocking_body_server_order(&[]) {
+                return Some(order.into_iter().map(|server| server.0).collect());
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(PASS_RANKING_CONTENTION_PAUSE);
+            }
+        }
+        None
+    }
+
+    /// Order the servers one dispatch attempt may ask, in place.
+    ///
+    /// Idle-first, but only inside a priority group. The pool's ranking
+    /// already puts the higher group first, and a lower group may take
+    /// ordinary work only once the higher one is out of seats — a preference
+    /// order, unlike backfill, which is a reservation and so stays last
+    /// whatever group it is in. Sorting on idleness alone promoted whichever
+    /// server happened to be holding a cached lane over the whole group above
+    /// it, so a job retrying hard on a low-priority server quietly handed it
+    /// everyone else's work. The sort is stable, so the pool's own ranking
+    /// survives inside each group.
+    pub(in crate::pipeline) fn order_dispatch_candidates(
+        servers: &mut [usize],
+        groups: &[u32],
+        backfill_flags: &[bool],
+        idle_by_server: &HashMap<usize, usize>,
+    ) {
+        servers.sort_by_key(|server| {
+            (
+                backfill_flags.get(*server).copied().unwrap_or(false),
+                groups.get(*server).copied().unwrap_or(u32::MAX),
+                !idle_by_server.contains_key(server),
+            )
+        });
+    }
+
+    /// Start one more connection: choose the server, ask the scheduler what
+    /// that server should fetch, lease it and hand it to a worker.
+    ///
+    /// The server comes first because the scheduler's answer is per server:
+    /// the hot job may have nothing left that server A may fetch while server
+    /// B could still carry it. Servers are tried in the pool's own ranking,
+    /// and within one priority group those where an idle worker already
+    /// holds a connection come ahead of the rest. A server is only asked
+    /// while it can still seat the lease:
+    /// an idle connection or a free permit beyond what this pass has already
+    /// sent it. Without that, a pass that opens several lanes would send two
+    /// dials at a server with one free permit, and the second would sit in
+    /// the pool's contention loop instead of fetching. The seat count is the
+    /// one the pass started with, not a fresh reading — see the retain below.
+    fn dispatch_one_download_lane(
+        &mut self,
+        pressure: DownloadPressure,
+        sent_this_pass: &mut HashMap<usize, usize>,
+        headroom_at_pass_start: &mut HashMap<usize, usize>,
+        ranked_this_pass: &mut Option<Vec<usize>>,
+    ) -> DispatchAttempt {
+        let mut idle_by_server: HashMap<usize, usize> = HashMap::new();
+        for server in self
+            .owned_download_lane_pool
+            .idle_lane_servers()
+            .into_iter()
+            .flatten()
+        {
+            *idle_by_server.entry(server).or_default() += 1;
+        }
+        let backfill_flags = self.nntp.pool().server_backfill_flags();
+        let mut servers: Vec<usize> = match self.rank_servers_for_pass(ranked_this_pass.is_none()) {
+            Some(order) => {
+                *ranked_this_pass = Some(order.clone());
+                order
+            }
+            // The ranking is contended right now, most likely by the lane
+            // workers this very pass just started, which take the same health
+            // lock as they dial. The order the pass last ranked is still good
+            // for the seats it started with; only a pass that never ranked
+            // falls back to the idle connections, and the next pass ranks
+            // again. Giving up here instead cut a pass short at whatever
+            // point the contention landed, and at a different one each run.
+            None => match ranked_this_pass {
+                Some(order) => order.clone(),
+                None => idle_by_server.keys().copied().collect(),
+            },
+        };
+        let groups = self.nntp.pool().server_groups().to_vec();
+        Self::order_dispatch_candidates(&mut servers, &groups, backfill_flags, &idle_by_server);
+        // The backfill tier comes last, and only for what the fill tier has
+        // given up on: the scheduler's filter holds a backfill server to
+        // articles every available fill server is excluded from.
+        if !servers.iter().any(|server| backfill_flags[*server]) {
+            let fill: Vec<usize> = (0..backfill_flags.len())
+                .filter(|idx| !backfill_flags[*idx])
+                .collect();
+            if let Some(order) = self.nntp.blocking_body_server_order(&fill) {
+                for server in order {
+                    if backfill_flags[server.0] && !servers.contains(&server.0) {
+                        servers.push(server.0);
+                    }
+                }
+            }
+        }
+        servers.retain(|server| {
+            let idle = idle_by_server.get(server).copied().unwrap_or(0);
+            let (available, _) = self.nntp.pool().server_load(*server);
+            // The seat count is read once per server per pass, the first time
+            // the pass looks at it and so before it has sent anything there.
+            // Re-reading it would charge each lease twice: once as a lease in
+            // `sent`, and again as the permit its lane has meanwhile taken —
+            // the lane worker runs on its own thread, so how much of that has
+            // happened by the next iteration is a matter of thread scheduling.
+            // A pass that measured itself that way stopped around half its
+            // configured capacity, and stopped at a different place each run.
+            let seats = *headroom_at_pass_start
+                .entry(*server)
+                .or_insert(idle + available);
+            let sent = sent_this_pass.get(server).copied().unwrap_or(0);
+            seats > sent
+        });
+        for server_idx in servers {
+            let spill_in_flight = self.spill_job_in_flight_on(server_idx);
+            let lane_mode = self.download_lane_mode_for_server(server_idx, pressure, true);
+            let want = self.download_refill_want(lane_mode);
+            let works = match self.next_works(server_idx, want, spill_in_flight, pressure) {
+                Handout::Idle => continue,
+                Handout::Yield(_) => return DispatchAttempt::StopAll,
+                Handout::Works(works) => works,
+            };
+            let lane_id = Self::next_download_lane_id();
+            let Some(lease) =
+                self.lease_for_handout(lane_id, server_idx, lane_mode, pressure, works)
+            else {
+                return DispatchAttempt::NoWork;
+            };
+            let job_id = lease.job_id;
+            let activation_items = Self::activation_items(&lease);
+            self.activate_download_batch_lease(&lease, &activation_items, true);
+            if let Some(owner) = self.download_lane_owners.get_mut(&lane_id) {
+                owner.server_idx = Some(server_idx);
+            }
+            self.spawn_download_batch(lease);
+            *sent_this_pass.entry(server_idx).or_default() += 1;
+            self.warm_idle_download_lanes_for_barrier(job_id);
+            return DispatchAttempt::Dispatched;
+        }
+        DispatchAttempt::NoWork
     }
 
     /// Open the connections a barred job is about to need, while it is barred.
@@ -207,22 +371,20 @@ impl Pipeline {
         if self.par2_metadata_bootstrap_files(job_id).is_none() {
             return;
         }
-        // The groups a payload lease would ask for, falling back to the
-        // barrier's own class when the payload queue has not been built yet.
-        let Some(groups) = self.jobs.get(&job_id).and_then(|state| {
+        // Sized for a payload article, falling back to the barrier's own
+        // class when the payload queue has not been built yet.
+        let Some(byte_estimate) = self.jobs.get(&job_id).and_then(|state| {
             state
                 .download_queue
                 .peek_in_class(false)
                 .or_else(|| state.download_queue.peek_in_class(true))
-                .map(|work| (Arc::clone(&work.groups), work.byte_estimate))
+                .map(|work| work.byte_estimate)
         }) else {
             return;
         };
-        let (groups, byte_estimate) = groups;
         let exclude_servers: Arc<[usize]> = Arc::from(self.effective_exclude_servers(job_id, &[]));
         let warmed = self.owned_download_lane_pool.warm(
             &self.nntp,
-            groups,
             exclude_servers,
             Self::bandwidth_reservation_estimate(byte_estimate),
             free,
@@ -313,73 +475,13 @@ impl Pipeline {
     /// least-loaded critical job first (ties break on `eligible`'s existing
     /// priority/submission order), so no single job's critical backlog
     /// starves another's.
-    fn dispatch_completion_critical_work(
-        &mut self,
-        eligible: &[(u8, usize, JobId)],
-        pressure: DownloadPressure,
-        max_connections: usize,
-        dispatch_budget: &mut usize,
-    ) -> CriticalDispatchPhase {
-        let mut skipped = Vec::new();
-        while self.active_download_connections < max_connections
-            && !self.rate_limiter.should_wait()
-            && *dispatch_budget > 0
-        {
-            let Some(job_id) = eligible
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, _, job_id))| self.job_has_completion_critical_work(*job_id))
-                .filter(|(_, (_, _, job_id))| !skipped.contains(job_id))
-                .min_by_key(|(index, (_, _, job_id))| {
-                    (
-                        self.active_completion_critical_connections_by_job
-                            .get(job_id)
-                            .copied()
-                            .unwrap_or(0),
-                        *index,
-                    )
-                })
-                .map(|(_, (_, _, job_id))| *job_id)
-            else {
-                // No candidate is left: everything queued was dispatched or
-                // answered `NoWork` this pass. Queued-but-skipped work is
-                // deliberately NOT capacity starvation — a yielded lane could
-                // not have been handed to it.
-                return CriticalDispatchPhase::Drained;
-            };
-            match self.try_dispatch_download_for_job(
-                job_id,
-                pressure,
-                None,
-                DownloadWorkSelection::CompletionCritical,
-            ) {
-                DispatchAttempt::Dispatched => {
-                    *dispatch_budget = dispatch_budget.saturating_sub(1);
-                }
-                DispatchAttempt::NoWork => skipped.push(job_id),
-                DispatchAttempt::StopAll => return CriticalDispatchPhase::StopAll,
-            }
-        }
-        // Capacity, rate limiting, or the pass budget ended the phase. Only
-        // jobs this pass did not already prove undispatchable count as the
-        // starved remainder.
-        let starved_remainder = eligible.iter().any(|(_, _, job_id)| {
-            !skipped.contains(job_id) && self.job_has_completion_critical_work(*job_id)
-        });
-        if starved_remainder {
-            CriticalDispatchPhase::CapacityStarved
-        } else {
-            CriticalDispatchPhase::Drained
-        }
-    }
-
     pub(crate) fn dispatch_downloads(&mut self) {
         let now = Instant::now();
-        // Whatever park asked for this pass is being served by it, including
-        // the passes the run loop starts at the top of a turn.
         self.download_dispatch_wake = false;
+        // Lanes already connected and waiting in the actor are answered
+        // before any dial: an established socket outranks a new one.
+        self.service_held_download_refills();
         if self.global_paused || self.rate_limiter.should_wait() {
-            self.hot_share_yield_signal.clear();
             if self.active_downloads == 0 {
                 debug!(
                     global_paused = self.global_paused,
@@ -387,36 +489,24 @@ impl Pipeline {
                     "dispatch blocked: paused/rate"
                 );
             }
-            self.publish_hot_dispatch_metrics(now);
             return;
         }
         if self.nntp_handoff_draining {
-            // The previous pool's sockets are still open at the provider; a
-            // dial now competes with them for the same allowance. The drain
-            // completion dispatches (see `handle_nntp_handoff_drained`).
-            self.hot_share_yield_signal.clear();
-            self.publish_hot_dispatch_metrics(now);
             return;
         }
         if let Err(error) = self.refresh_bandwidth_cap_window() {
             error!(error = %error, "failed to refresh ISP bandwidth cap state");
-            self.hot_share_yield_signal.clear();
-            self.publish_hot_dispatch_metrics(now);
             return;
         }
         if self.bandwidth_cap.cap_enabled() && self.bandwidth_cap.remaining_bytes() == 0 {
-            self.hot_share_yield_signal.clear();
             self.update_queue_metrics();
             if self.active_downloads == 0 {
                 debug!("dispatch blocked: bandwidth cap exhausted");
             }
-            self.publish_hot_dispatch_metrics(now);
             return;
         }
-
         let pressure = self.refresh_download_pressure();
         if pressure.is_hard() {
-            self.hot_share_yield_signal.clear();
             self.update_queue_metrics();
             if self.active_downloads == 0 {
                 debug!(
@@ -429,14 +519,11 @@ impl Pipeline {
                     "dispatch blocked: byte pressure"
                 );
             }
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
-            self.publish_hot_dispatch_metrics(now);
             return;
         }
         let soft_dispatch_delay = self.soft_pressure_dispatch_delay(pressure);
         let mut dispatch_budget = usize::MAX;
         if let Some(delay) = soft_dispatch_delay {
-            let now = Instant::now();
             if self
                 .download_pressure_soft_dispatch_after
                 .is_some_and(|ready_at| ready_at > now)
@@ -451,8 +538,6 @@ impl Pipeline {
                         "dispatch delayed: soft byte pressure"
                     );
                 }
-                self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
-                self.publish_hot_dispatch_metrics(now);
                 return;
             }
             self.download_pressure_soft_dispatch_after = Some(now + delay);
@@ -460,40 +545,16 @@ impl Pipeline {
         } else {
             self.download_pressure_soft_dispatch_after = None;
         }
-
         let params = self.tuner.params();
         let tuner_max = params.max_concurrent_downloads;
         let max = self.effective_download_connection_capacity(tuner_max);
-
-        // Soft byte pressure keeps the current hot job moving, but avoids
-        // expanding into spillover work until memory pressure drains.
-        let suppress_spillover = pressure.suppresses_spillover();
-        // When the bandwidth cap is within 15% of exhaustion, also revert to
-        // single-job dispatch so remaining quota goes to the highest-priority job.
-        let bandwidth_cap_tight = self.bandwidth_cap.cap_enabled()
-            && self.bandwidth_cap.remaining_bytes() <= self.bandwidth_cap.limit_bytes() * 15 / 100;
-
-        // Prefer higher submitted priority first. Within the top runnable band,
-        // keep the already-active job hot when possible; otherwise choose FIFO
-        // submission order.
-        let mut eligible = self
-            .job_order
-            .iter()
-            .enumerate()
-            .filter_map(|(index, id)| {
-                let state = self.jobs.get(id)?;
-                if state.download_queue.is_empty()
-                    || !Self::status_allows_download_dispatch(&state.status)
-                {
-                    return None;
-                }
-                Some((Self::job_dispatch_priority(state), index, *id))
-            })
-            .collect::<Vec<_>>();
-        eligible.sort_unstable();
-
+        let eligible = self.download_scheduler_eligible_jobs();
         if eligible.is_empty() && self.active_downloads == 0 {
             let mut drained_parked_recovery_jobs = Vec::new();
+            // Collected rather than logged in place: the warning is throttled
+            // per job, and the throttle needs `&mut self` while this walk
+            // borrows `job_order`.
+            let mut ineligible_jobs = Vec::new();
             for (i, jid) in self.job_order.iter().enumerate() {
                 if let Some(s) = self.jobs.get(jid) {
                     let parked_recovery_only =
@@ -541,8 +602,15 @@ impl Pipeline {
                             status_allows_dispatch,
                             "dispatch idle: download pipeline draining"
                         );
-                    } else {
-                        warn!(
+                    } else if matches!(
+                        s.status,
+                        JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                    ) {
+                        // A job someone paused, or one that is already over, is
+                        // not dispatching because it was told not to. Warning
+                        // about it once per job per pass is how a single paused
+                        // job fills a log.
+                        debug!(
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
@@ -550,10 +618,48 @@ impl Pipeline {
                             recovery_len = s.recovery_queue.len(),
                             parked_recovery_only,
                             status_allows_dispatch,
-                            "dispatch stall: job not eligible"
+                            "dispatch idle: job not eligible by status"
                         );
+                    } else {
+                        ineligible_jobs.push((
+                            *jid,
+                            i,
+                            s.status.clone(),
+                            s.download_queue.len(),
+                            s.recovery_queue.len(),
+                            parked_recovery_only,
+                            status_allows_dispatch,
+                        ));
                     }
                 }
+            }
+            for (
+                job_id,
+                idx,
+                status,
+                queue_len,
+                recovery_len,
+                parked_recovery_only,
+                status_allows_dispatch,
+            ) in ineligible_jobs
+            {
+                let Some(suppressed_since_last) = self
+                    .dispatch_ineligible_log_throttle
+                    .admit(job_id, DISPATCH_INELIGIBLE_LOG_INTERVAL)
+                else {
+                    continue;
+                };
+                warn!(
+                    job_id = job_id.0,
+                    idx,
+                    status = ?status,
+                    queue_len,
+                    recovery_len,
+                    parked_recovery_only,
+                    status_allows_dispatch,
+                    suppressed_since_last,
+                    "dispatch stall: job not eligible"
+                );
             }
             for job_id in drained_parked_recovery_jobs {
                 self.schedule_job_completion_check_if_download_pipeline_drained(
@@ -574,198 +680,94 @@ impl Pipeline {
         }
 
         let eligible_count = eligible.len();
-        let Some((_hot_priority, hot_job_id)) = self.select_hot_dispatch_job(&eligible, now) else {
+        let Some(hot_job_id) = eligible.first().copied() else {
             self.update_queue_metrics();
             return;
         };
-
         let active_connections_before_dispatch = self.active_download_connections;
-
-        // Phase 1: completion-critical work, unconditionally, ahead of every
-        // regular byte on every job — the hot job's own included. No lane
-        // cap: critical demand takes every connection it can use.
-        //
-        // The phase's outcome owns the yield signal: capacity starvation asks
-        // every non-critical lane to return its unrequested tail so the next
-        // pass can hand those connections back here (owned_lane checks the
-        // signal every few articles; refill checks it too). Drained demand —
-        // including demand that is queued but undispatchable — clears it, so
-        // a held or server-starved critical job can never park the rest of
-        // the queue behind work no yielded lane could serve.
-        let critical_capacity_starved = match self.dispatch_completion_critical_work(
-            &eligible,
-            pressure,
-            max,
-            &mut dispatch_budget,
-        ) {
-            CriticalDispatchPhase::StopAll => {
-                self.publish_hot_dispatch_metrics(now);
-                return;
-            }
-            CriticalDispatchPhase::CapacityStarved => true,
-            CriticalDispatchPhase::Drained => false,
-        };
-        if critical_capacity_starved {
-            self.hot_share_yield_signal.request();
-        } else {
-            self.hot_share_yield_signal.clear();
-        }
-
-        // Phase 2: the hot job fills everything else, full speed, no ramp.
-        // `Any` selection leads with whatever critical work of its own phase
-        // 1 didn't reach (there is none unless capacity ran out first), then
-        // falls through to its ordinary queue.
+        let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
+        let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
+        let mut ranked_this_pass: Option<Vec<usize>> = None;
         while self.active_download_connections < max
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
         {
-            match self.try_dispatch_download_for_job(
-                hot_job_id,
+            match self.dispatch_one_download_lane(
                 pressure,
-                None,
-                DownloadWorkSelection::Any,
+                &mut sent_this_pass,
+                &mut headroom_at_pass_start,
+                &mut ranked_this_pass,
             ) {
                 DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
-                DispatchAttempt::StopAll => {
-                    self.publish_hot_dispatch_metrics(now);
-                    return;
-                }
+                DispatchAttempt::StopAll => return,
             }
         }
-
-        // Phase 3: spillover — only once the hot job genuinely cannot use
-        // its capacity (it has no queued dispatchable work left), never
-        // merely because dispatch hasn't caught up to it yet.
-        let has_unused_capacity = self.active_download_connections < max
-            && !self.rate_limiter.should_wait()
-            && dispatch_budget > 0;
-        let best_mode_block_reason = self.hot_best_mode_block_reason(hot_job_id, max);
-
-        let spillover_allowed = if suppress_spillover {
-            // Spillover is suppressed, but the critical yield lever is not:
-            // capacity-starved critical demand keeps its request so the next
-            // pass's (budgeted) dispatch can still hand freed lanes to it.
-            if !critical_capacity_starved {
-                self.hot_share_yield_signal.clear();
-            }
-            self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedPressure);
-            false
-        } else if bandwidth_cap_tight {
-            if !critical_capacity_starved {
-                self.hot_share_yield_signal.clear();
-            }
-            self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedNearCap);
-            false
-        } else if best_mode_block_reason == HotBestModeBlockReason::HotHasQueuedPrimary {
-            self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(best_mode_block_reason);
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedHotCanUseCapacity);
-            false
-        } else if best_mode_block_reason == HotBestModeBlockReason::LaneCapacityAvailable {
-            self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(best_mode_block_reason);
-            self.block_or_reclaim_spillover(SpilloverDecision::BlockedBestModePending);
-            false
-        } else if !has_unused_capacity {
-            self.hot_dispatch_underfill_since = None;
-            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
-            if self.hot_dispatch_spillover_loans.active_lent_connections() == 0 {
-                self.hot_dispatch_mode = DispatchShareMode::Exclusive;
-            }
-            false
-        } else {
-            self.set_hot_best_mode_block_reason(HotBestModeBlockReason::None);
-            let underfill_started_at = *self.hot_dispatch_underfill_since.get_or_insert(now);
-            if now.saturating_duration_since(underfill_started_at) >= HOT_DISPATCH_SLOWNESS_WINDOW {
-                self.hot_dispatch_mode = DispatchShareMode::Shared;
-                true
-            } else {
-                self.block_or_reclaim_spillover(SpilloverDecision::BlockedHotCanUseCapacity);
-                false
-            }
-        };
-
-        if spillover_allowed {
-            let hot_speed_bps = self.hot_dispatch_speed_bps(now);
-            // A hot job with nothing in flight has nothing to measure and
-            // nothing to harm, so the per-pass growth cap (one new loan
-            // connection per pass, paced against the 7% speed-harm reclaim
-            // in `update_spillover_loan_measurement`) does not apply — spill
-            // up to full capacity immediately instead of trickling in.
-            let hot_idle = !self.job_has_active_download_work(hot_job_id);
-            if !hot_idle {
-                dispatch_budget = dispatch_budget.min(1);
-            }
-
-            // Prefer jobs that already hold a loan so lanes concentrate
-            // instead of fanning out, then fall back to priority order for a
-            // fresh job — bounded to HOT_DISPATCH_SPILLOVER_MAX_JOBS distinct
-            // jobs at a time.
-            let mut spill_targets: Vec<JobId> = eligible
-                .iter()
-                .map(|(_, _, job_id)| *job_id)
-                .filter(|job_id| *job_id != hot_job_id)
-                .collect();
-            spill_targets
-                .sort_by_key(|job_id| !self.hot_dispatch_spillover_loans.holds_loan(*job_id));
-
-            for job_id in spill_targets {
-                if self.active_download_connections >= max
-                    || self.rate_limiter.should_wait()
-                    || dispatch_budget == 0
-                {
-                    break;
-                }
-                if !self.hot_dispatch_spillover_loans.holds_loan(job_id)
-                    && self.hot_dispatch_spillover_loans.distinct_loan_jobs()
-                        >= HOT_DISPATCH_SPILLOVER_MAX_JOBS
-                {
-                    continue;
-                }
-                while self.active_download_connections < max
-                    && !self.rate_limiter.should_wait()
-                    && dispatch_budget > 0
-                {
-                    match self.try_dispatch_download_for_job(
-                        job_id,
-                        pressure,
-                        Some(SpilloverLoanKind::MeasuredUnderfill),
-                        DownloadWorkSelection::Any,
-                    ) {
-                        DispatchAttempt::Dispatched => {
-                            self.start_spillover_loan(
-                                job_id,
-                                now,
-                                hot_speed_bps,
-                                SpilloverLoanKind::MeasuredUnderfill,
-                            );
-                            self.record_spillover_decision(
-                                SpilloverDecision::AllowedMeasuredUnderfill,
-                            );
-                            dispatch_budget = dispatch_budget.saturating_sub(1)
-                        }
-                        DispatchAttempt::NoWork => break,
-                        DispatchAttempt::StopAll => {
-                            self.publish_hot_dispatch_metrics(now);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
         if active_connections_before_dispatch == 0 && self.active_download_connections == 0 {
             self.log_download_dispatch_liveness_stall(now, pressure, max, eligible_count);
         }
+        self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);
-
         self.maybe_start_ip_replacement_trial(hot_job_id, pressure, max);
         self.update_queue_metrics();
-        self.publish_hot_dispatch_metrics(now);
+    }
+}
+
+#[cfg(test)]
+mod job_log_throttle_tests {
+    use super::*;
+
+    const WINDOW: Duration = Duration::from_secs(60);
+
+    /// A job failing in a loop must not spend another job's first line, and
+    /// what its own window swallowed must be readable from the next line.
+    #[test]
+    fn a_noisy_job_does_not_throttle_a_quiet_one() {
+        let mut throttle = JobLogThrottle::default();
+        let noisy = JobId(9001);
+        let quiet = JobId(9002);
+        let start = Instant::now();
+
+        assert_eq!(
+            throttle.admit_at(noisy, WINDOW, start),
+            Some(0),
+            "the first emission of a window always gets through"
+        );
+        for _ in 0..500 {
+            assert_eq!(
+                throttle.admit_at(noisy, WINDOW, start),
+                None,
+                "repeats inside the window are counted, not emitted"
+            );
+        }
+
+        assert_eq!(
+            throttle.admit_at(quiet, WINDOW, start),
+            Some(0),
+            "another job's first emission is its own window, not the noisy job's"
+        );
+
+        assert_eq!(
+            throttle.admit_at(noisy, WINDOW, start + WINDOW),
+            Some(500),
+            "the next line that gets through reports what the window swallowed"
+        );
+        assert_eq!(
+            throttle.admit_at(noisy, WINDOW, start + WINDOW * 2),
+            Some(0),
+            "and the count starts again from the line that reported it"
+        );
+    }
+
+    /// The map is bounded, so a long-lived worker cannot accumulate a window
+    /// for every job it has ever seen.
+    #[test]
+    fn the_throttle_bounds_the_jobs_it_remembers() {
+        let mut throttle = JobLogThrottle::default();
+        let start = Instant::now();
+        for job in 0..(JOB_LOG_THROTTLE_MAX_JOBS as u64 * 2) {
+            throttle.admit_at(JobId(job), WINDOW, start);
+        }
+        assert!(throttle.windows.len() <= JOB_LOG_THROTTLE_MAX_JOBS);
     }
 }

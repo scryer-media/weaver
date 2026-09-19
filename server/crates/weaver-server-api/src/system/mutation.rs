@@ -27,6 +27,44 @@ impl SystemMutation {
 
         Ok(listing.into())
     }
+
+    /// Install the release the checker is currently advertising.
+    ///
+    /// Admin-only, and the input has to echo the notice the UI displayed: the
+    /// server installs the release it already found, never one the caller names.
+    #[graphql(guard = "AdminGuard")]
+    async fn start_application_upgrade(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::system::types::StartApplicationUpgradeInput,
+    ) -> Result<crate::system::types::ApplicationUpgradeStartPayload> {
+        let service =
+            ctx.data::<weaver_server_core::application_upgrade::ApplicationUpgradeService>()?;
+        let run = service
+            .start(
+                weaver_server_core::application_upgrade::ApplicationUpgradeStartRequest {
+                    expected_tag: input.expected_tag,
+                    expected_version: input.expected_version,
+                },
+            )
+            .await
+            .map_err(map_application_upgrade_error)?;
+        Ok(crate::system::types::ApplicationUpgradeStartPayload { run: run.into() })
+    }
+}
+
+/// The upgrade's own error codes, kept out of `INTERNAL`: a refusal the operator
+/// can act on (an ineligible install, a stale notice) must not read as a bug.
+fn map_application_upgrade_error(
+    error: weaver_server_core::application_upgrade::ApplicationUpgradeError,
+) -> async_graphql::Error {
+    use weaver_server_core::application_upgrade::ApplicationUpgradeError;
+    let message = error.to_string();
+    match error {
+        ApplicationUpgradeError::Validation(_) => graphql_error("INVALID_INPUT", message),
+        ApplicationUpgradeError::NotFound(_) => graphql_error("NOT_FOUND", message),
+        ApplicationUpgradeError::Repository(_) => graphql_error("INTERNAL", message),
+    }
 }
 
 fn map_create_directory_error(error: CreateDirectoryError) -> async_graphql::Error {

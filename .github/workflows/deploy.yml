@@ -969,6 +969,43 @@ jobs:
           cp target/x86_64-apple-darwin/release/weaver dist/package/weaver
           tar -czf weaver-darwin-x86_64-portable.tar.gz -C dist/package .
           test -f weaver-darwin-x86_64-portable.tar.gz
+      # The bundle as an upgradeable asset. The in-application upgrade replaces a
+      # whole `.app` in place, so the release has to carry the bundle itself, not
+      # only the disk image a person mounts. `COPYFILE_DISABLE` keeps macOS from
+      # writing `._` AppleDouble members, and the archive is rooted at
+      # `Weaver.app/` so the staged replacement is exactly one directory.
+      - name: Package application bundle
+        run: |
+          set -euo pipefail
+          # Any non-regular member is refused here rather than at upgrade time:
+          # the upgrade's extractor accepts regular files only, so a symlink or a
+          # device node in the bundle would ship an archive that cannot install.
+          if find dist/app/Weaver.app ! -type d ! -type f | grep -q .; then
+            echo "Weaver.app carries non-regular files the upgrade extractor rejects:" >&2
+            find dist/app/Weaver.app ! -type d ! -type f >&2
+            exit 1
+          fi
+          COPYFILE_DISABLE=1 tar -czf weaver-darwin-x86_64.app.tar.gz -C dist/app Weaver.app
+          test -s weaver-darwin-x86_64.app.tar.gz
+      - name: Validate packaged application bundle
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          tar -xzf weaver-darwin-x86_64.app.tar.gz -C "$staging"
+          test -x "$staging/Weaver.app/Contents/MacOS/weaver"
+          test -x "$staging/Weaver.app/Contents/MacOS/weaver-tray"
+      # A promoted bundle has to satisfy Gatekeeper on the machine it lands on,
+      # so the seal is checked on the extracted copy — not on the tree it was
+      # archived from.
+      - name: Verify packaged bundle signature
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          tar -xzf weaver-darwin-x86_64.app.tar.gz -C "$staging"
+          codesign --verify --deep --strict "$staging/Weaver.app"
       # Built from dist/app as it stands, so on a tag build the image wraps the
       # already-signed bundle. Re-signing anything after this point would break
       # the seal the image carries.
@@ -1056,6 +1093,7 @@ jobs:
           name: weaver-darwin-x86_64-portable-${{ github.run_id }}
           path: |
             weaver-darwin-x86_64-portable.tar.gz
+            weaver-darwin-x86_64.app.tar.gz
             weaver-darwin-x86_64.dmg
             weaver-darwin-x86_64.spdx.json
           if-no-files-found: error
@@ -1188,6 +1226,43 @@ jobs:
           cp target/aarch64-apple-darwin/release/weaver dist/package/weaver
           tar -czf weaver-darwin-arm64-portable.tar.gz -C dist/package .
           test -f weaver-darwin-arm64-portable.tar.gz
+      # The bundle as an upgradeable asset. The in-application upgrade replaces a
+      # whole `.app` in place, so the release has to carry the bundle itself, not
+      # only the disk image a person mounts. `COPYFILE_DISABLE` keeps macOS from
+      # writing `._` AppleDouble members, and the archive is rooted at
+      # `Weaver.app/` so the staged replacement is exactly one directory.
+      - name: Package application bundle
+        run: |
+          set -euo pipefail
+          # Any non-regular member is refused here rather than at upgrade time:
+          # the upgrade's extractor accepts regular files only, so a symlink or a
+          # device node in the bundle would ship an archive that cannot install.
+          if find dist/app/Weaver.app ! -type d ! -type f | grep -q .; then
+            echo "Weaver.app carries non-regular files the upgrade extractor rejects:" >&2
+            find dist/app/Weaver.app ! -type d ! -type f >&2
+            exit 1
+          fi
+          COPYFILE_DISABLE=1 tar -czf weaver-darwin-arm64.app.tar.gz -C dist/app Weaver.app
+          test -s weaver-darwin-arm64.app.tar.gz
+      - name: Validate packaged application bundle
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          tar -xzf weaver-darwin-arm64.app.tar.gz -C "$staging"
+          test -x "$staging/Weaver.app/Contents/MacOS/weaver"
+          test -x "$staging/Weaver.app/Contents/MacOS/weaver-tray"
+      # A promoted bundle has to satisfy Gatekeeper on the machine it lands on,
+      # so the seal is checked on the extracted copy — not on the tree it was
+      # archived from.
+      - name: Verify packaged bundle signature
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          tar -xzf weaver-darwin-arm64.app.tar.gz -C "$staging"
+          codesign --verify --deep --strict "$staging/Weaver.app"
       # Built from dist/app as it stands, so on a tag build the image wraps the
       # already-signed bundle. Re-signing anything after this point would break
       # the seal the image carries.
@@ -1274,6 +1349,7 @@ jobs:
           name: weaver-darwin-arm64-portable-${{ github.run_id }}
           path: |
             weaver-darwin-arm64-portable.tar.gz
+            weaver-darwin-arm64.app.tar.gz
             weaver-darwin-arm64.dmg
             weaver-darwin-arm64.spdx.json
             weaver-darwin-arm64-webview-smoke.log
@@ -1625,6 +1701,17 @@ jobs:
             -StageDir $stage `
             -Version $version `
             -OutputPath weaver-windows-x86_64.msi
+      # The ZIP is what a person downloads; the upgrade reads a tarball, because
+      # one extractor (and one member-list format) serves every platform. Both
+      # carry the same three files from the same stage directory, named
+      # explicitly so nothing the MSI step adds later can drift into it.
+      - name: Package portable tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf weaver-windows-x86_64-portable.tar.gz \
+            -C weaver-windows-x86_64-stage weaver.exe weaver-tray.exe LICENSE
+          test -s weaver-windows-x86_64-portable.tar.gz
       - name: Validate packaged Windows artifact
         shell: pwsh
         run: |
@@ -1652,6 +1739,7 @@ jobs:
           name: weaver-windows-x86_64-${{ github.run_id }}
           path: |
             weaver-windows-x86_64.zip
+            weaver-windows-x86_64-portable.tar.gz
             weaver-windows-x86_64.msi
             weaver-windows-x86_64.msi.json
             weaver-windows-x86_64-build.log
@@ -1974,6 +2062,17 @@ jobs:
             -StageDir $stage `
             -Version $version `
             -OutputPath weaver-windows-arm64.msi
+      # The ZIP is what a person downloads; the upgrade reads a tarball, because
+      # one extractor (and one member-list format) serves every platform. Both
+      # carry the same three files from the same stage directory, named
+      # explicitly so nothing the MSI step adds later can drift into it.
+      - name: Package portable tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf weaver-windows-arm64-portable.tar.gz \
+            -C weaver-windows-arm64-stage weaver.exe weaver-tray.exe LICENSE
+          test -s weaver-windows-arm64-portable.tar.gz
       - name: Validate packaged Windows artifact
         shell: pwsh
         run: |
@@ -2001,6 +2100,7 @@ jobs:
           name: weaver-windows-arm64-${{ github.run_id }}
           path: |
             weaver-windows-arm64.zip
+            weaver-windows-arm64-portable.tar.gz
             weaver-windows-arm64.msi
             weaver-windows-arm64.msi.json
             weaver-windows-arm64-build.log
@@ -2324,10 +2424,10 @@ jobs:
           RELEASE_TAG: ${{ needs.verify-release-tag.outputs.release_tag }}
         run: |
           set -euo pipefail
-          # 7 archives + 2 msi + 2 dmg + 9 SBOMs.
+          # 11 archives + 2 msi + 2 dmg + 13 SBOMs.
           mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' -o -name 'weaver-*.msi' -o -name 'weaver-*.dmg' -o -name 'weaver-*.spdx.json' \) -printf '%f\n' | sort)
-          if [ "${#release_assets[@]}" -ne 20 ]; then
-            echo "expected 20 release assets under artifacts/, found ${#release_assets[@]}:" >&2
+          if [ "${#release_assets[@]}" -ne 28 ]; then
+            echo "expected 28 release assets under artifacts/, found ${#release_assets[@]}:" >&2
             printf '  %s\n' "${release_assets[@]}" >&2
             exit 1
           fi
@@ -2362,6 +2462,48 @@ jobs:
             artifacts/weaver-windows-*.zip
             artifacts/weaver-windows-*.msi
             artifacts/weaver-darwin-*.dmg
+      # The upgrade manifests are generated from the assets this release actually
+      # carries — every size, hash and archive member is read out of the files
+      # above — so a manifest can never describe a build that was not published.
+      # Both generations come from the same pass: v1 is frozen, v2 is where new
+      # platforms and channels go, and an installed Weaver reads v2 first and
+      # falls back to v1 only when the v2 asset is absent.
+      - name: Generate signed upgrade manifests
+        env:
+          IDENTITY: ^https://github.com/${{ github.repository }}/.github/workflows/deploy.yml@refs/tags/weaver-v.*$
+          RELEASE_TAG: ${{ needs.verify-release-tag.outputs.release_tag }}
+          VERSION: ${{ needs.verify-release-tag.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cargo run -p xtask --locked -- ci upgrade-manifest \
+            --schema v1 \
+            --version "$VERSION" \
+            --tag "$RELEASE_TAG" \
+            --repository "$REPOSITORY" \
+            --artifacts-dir artifacts \
+            --output artifacts/weaver-upgrade-manifest.json
+          cargo run -p xtask --locked -- ci upgrade-manifest \
+            --schema v2 \
+            --version "$VERSION" \
+            --tag "$RELEASE_TAG" \
+            --repository "$REPOSITORY" \
+            --artifacts-dir artifacts \
+            --output artifacts/weaver-upgrade-manifest.v2.json
+          for manifest in weaver-upgrade-manifest.json weaver-upgrade-manifest.v2.json; do
+            test -s "artifacts/${manifest}"
+            cosign sign-blob --yes \
+              --bundle "artifacts/${manifest}.sigstore.json" \
+              "artifacts/${manifest}"
+            # Verified here, with the same identity policy the running build
+            # applies: an unverifiable manifest must fail the release, not the
+            # upgrade of everyone who downloads it.
+            cosign verify-blob \
+              --bundle "artifacts/${manifest}.sigstore.json" \
+              --certificate-identity-regexp "$IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "artifacts/${manifest}"
+          done
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -2377,6 +2519,10 @@ jobs:
             artifacts/weaver-*.msi.json \
             artifacts/weaver-*.dmg \
             artifacts/weaver-*.spdx.json \
+            artifacts/weaver-upgrade-manifest.json \
+            artifacts/weaver-upgrade-manifest.json.sigstore.json \
+            artifacts/weaver-upgrade-manifest.v2.json \
+            artifacts/weaver-upgrade-manifest.v2.json.sigstore.json \
             artifacts/weaver-checksums.txt \
             artifacts/weaver-checksums.txt.sigstore.json \
             artifacts/weaver-provenance.intoto.jsonl
@@ -2840,7 +2986,9 @@ jobs:
           set -euo pipefail
           mkdir -p release-inputs
           mapfile -t archives < <(find artifacts -maxdepth 1 -type f \( -name 'weaver-*.tar.gz' -o -name 'weaver-*.zip' \) -printf '%f\n' | sort)
-          test "${#archives[@]}" -eq 7
+          # 4 portable tarballs (linux, darwin), 2 windows portable tarballs,
+          # 2 macOS bundle tarballs, 2 windows ZIPs and the winget manifests.
+          test "${#archives[@]}" -eq 11
           mapfile -t msi_packages < <(find artifacts -maxdepth 1 -type f -name 'weaver-*.msi' -printf '%f\n' | sort)
           test "${#msi_packages[@]}" -eq 2
           # The disk images arrive finished: syft cannot read a UDZO image
@@ -2874,8 +3022,8 @@ jobs:
               sha256sum "release-inputs/${asset}"
             done
           } | sed -e 's#artifacts/##' -e 's#release-inputs/##' > slsa-subjects.txt
-          # 7 archives + 2 msi + 2 dmg + 2 darwin bundle SBOMs + 7 archive SBOMs.
-          test "$(wc -l < slsa-subjects.txt)" -eq 20
+          # 11 archives + 2 msi + 2 dmg + 2 darwin bundle SBOMs + 11 archive SBOMs.
+          test "$(wc -l < slsa-subjects.txt)" -eq 28
           cp slsa-subjects.txt release-inputs/
       # Upload a single directory so the artifact root is flat, like every
       # other release artifact: a multi-path upload keys off the workspace

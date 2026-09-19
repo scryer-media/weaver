@@ -98,7 +98,8 @@ async fn spawn_tls_drain_server(
         }
 
         let _ = flushed_tx.send(());
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Hold the session open until the client is done with it.
+        let _ = tls.read_to_end(&mut Vec::new()).await;
     });
 
     (addr, flushed_rx)
@@ -151,6 +152,7 @@ async fn connect_tls_drain_client(
         health_lease: None,
         checkpoint_plan: CheckpointPlan::None,
         last_response_line_wait: Duration::ZERO,
+        capabilities_round_trip: None,
         group_probe_armed: false,
     }
 }
@@ -741,13 +743,10 @@ async fn manual_tls_transport_bounds_each_turn_and_preserves_stream() {
     let mut read_calls = 0usize;
 
     while received.len() < payload_len {
-        let read = tokio::time::timeout(
-            Duration::from_secs(5),
-            transport.read_into_buf_with_stats(&mut read_buf, usize::MAX),
-        )
-        .await
-        .expect("manual TLS read timed out")
-        .expect("manual TLS read failed");
+        let read = transport
+            .read_into_buf_with_stats(&mut read_buf, usize::MAX)
+            .await
+            .expect("manual TLS read failed");
         assert_ne!(read.bytes, 0, "stream closed before the complete payload");
         assert_eq!(read.bytes, read_buf.len());
         assert!(
@@ -762,13 +761,10 @@ async fn manual_tls_transport_bounds_each_turn_and_preserves_stream() {
     }
 
     server.await.unwrap();
-    let eof = tokio::time::timeout(
-        Duration::from_secs(5),
-        transport.read_into_buf(&mut read_buf, usize::MAX),
-    )
-    .await
-    .expect("manual TLS EOF read timed out")
-    .expect("manual TLS EOF read failed");
+    let eof = transport
+        .read_into_buf(&mut read_buf, usize::MAX)
+        .await
+        .expect("manual TLS EOF read failed");
 
     assert_eq!(eof, 0);
     assert!(read_buf.is_empty());
@@ -780,13 +776,17 @@ async fn spawn_scripted_server(steps: Vec<ScriptStep>, hold_open_after_last: Dur
     spawn_shared_scripted_server(steps, hold_open_after_last).await
 }
 
+/// Longer than any test runs. A script answers or closes, so a connection's
+/// own timeouts only decide a test that sets them itself, never a slow runner.
+const UNREACHED_TIMEOUT: Duration = Duration::from_secs(3600);
+
 fn scripted_plain_config(port: u16) -> ServerConfig {
     ServerConfig {
         host: "127.0.0.1".into(),
         port,
         tls: false,
-        connect_timeout: Duration::from_secs(1),
-        command_timeout: Duration::from_millis(100),
+        connect_timeout: UNREACHED_TIMEOUT,
+        command_timeout: UNREACHED_TIMEOUT,
         ..Default::default()
     }
 }
@@ -814,17 +814,12 @@ async fn spawn_pipelined_setup_server(
             socket.write_all(response).await.unwrap();
             socket.flush().await.unwrap();
         }
+        // A client that does not pipeline waits for an answer here instead,
+        // and the test never finishes.
         let mut lines = Vec::new();
-        let wait = tokio::time::timeout(Duration::from_secs(2), async {
-            while lines.len() < expected.len() {
-                lines.push(crate::test_support::read_command_line(&mut socket).await);
-            }
-        })
-        .await;
-        assert!(
-            wait.is_ok(),
-            "client did not pipeline MODE READER and GROUP; received {lines:?}"
-        );
+        while lines.len() < expected.len() {
+            lines.push(crate::test_support::read_command_line(&mut socket).await);
+        }
         for (line, prefix) in lines.iter().zip(&expected) {
             assert!(
                 line.starts_with(prefix),
@@ -833,7 +828,8 @@ async fn spawn_pipelined_setup_server(
         }
         socket.write_all(responses).await.unwrap();
         socket.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Hold the session open until the client is done with it.
+        let _ = socket.read_to_end(&mut Vec::new()).await;
     });
     port
 }
@@ -843,7 +839,6 @@ fn pipelined_setup_config(port: u16) -> ServerConfig {
         username: Some("user".into()),
         password: Some("pass".into()),
         pipelining: PipeliningCapability::Known(true),
-        command_timeout: Duration::from_secs(1),
         ..scripted_plain_config(port)
     }
 }
@@ -1589,13 +1584,10 @@ async fn expired_active_budget_does_not_enter_async_rate_wait() {
     conn.read_buf = BytesMut::from(buffered_body.as_slice());
     let mut budget = ActiveTransferBudget::new(Duration::ZERO);
 
-    let error = tokio::time::timeout(
-        Duration::from_secs(2),
-        conn.stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(())),
-    )
-    .await
-    .expect("expired budget must not wait on the rate limiter")
-    .unwrap_err();
+    let error = conn
+        .stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(()))
+        .await
+        .unwrap_err();
 
     assert!(matches!(
         error,
@@ -1701,7 +1693,9 @@ async fn body_by_id_reports_truncated_multiline_body_on_timeout() {
                 delay: Duration::ZERO,
             },
         ],
-        Duration::from_millis(1500),
+        // The server never closes, so only the command timeout can end the
+        // read.
+        UNREACHED_TIMEOUT,
     )
     .await;
 

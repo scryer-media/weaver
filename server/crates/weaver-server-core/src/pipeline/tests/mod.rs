@@ -257,6 +257,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         probe_projected_failed_bytes: 0,
         par2_bytes: 0,
         health_probing: false,
+        health_deferral: Default::default(),
         health_probe_round: 0,
         health_probe_failing_files: 0,
         health_failing_files: std::collections::HashSet::new(),
@@ -353,6 +354,64 @@ fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, n
     .unwrap();
 }
 
+/// The one server every harness pool points at.
+///
+/// It answers each dial with a greeting the lane refuses, so a worker that
+/// was handed a lease fails its dial at once and gives the permit back, and
+/// the refusal is a protocol answer rather than a transport fault: it records
+/// no cooldown, so the server stays eligible for the next pass. A name that
+/// does not resolve did the first half of that and not the second, and left
+/// each test racing the worker's health bookkeeping.
+fn refusing_harness_server_port() -> u16 {
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind the refusing harness server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::Builder::new()
+            .name("refusing-harness-server".into())
+            .spawn(move || {
+                for socket in listener.incoming().flatten() {
+                    let _ = std::io::Write::write_all(
+                        &mut &socket,
+                        b"555 harness server takes no session\r\n",
+                    );
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                }
+            })
+            .expect("spawn the refusing harness server");
+        port
+    })
+}
+
+/// Wait until every worker thread the passes so far handed a lease to has
+/// given its dial up and returned the server's permit.
+///
+/// The harness server refuses every session, so each worker fails its dial;
+/// but the pass that leased it returns before that, and before the worker has
+/// even taken the permit. A test that then describes one of those lanes as
+/// finished, by rewinding the pipeline's counters, must wait for the seat to
+/// be real: the dispatcher measures a server by the permits it can see, not
+/// by the counters. Counting free permits cannot tell a worker that gave its
+/// permit back from one that has not taken it yet, so this waits for each
+/// lane's own failure report instead, which the worker sends only after its
+/// permit is back.
+async fn settle_lane_dials(pipeline: &mut Pipeline) {
+    for _ in 0..pipeline.download_lane_owners.len() {
+        match pipeline
+            .owned_download_lane_event_rx
+            .recv()
+            .await
+            .expect("lane event channel should stay open")
+        {
+            OwnedDownloadLaneEvent::AcquireFailed { .. } => {}
+            OwnedDownloadLaneEvent::BatchComplete { lane_id, .. } => {
+                panic!("lane {lane_id} fetched from a server that refuses every session")
+            }
+        }
+    }
+}
+
 async fn new_direct_pipeline_with_buffers(
     temp_dir: &TempDir,
     buffer_config: BufferPoolConfig,
@@ -436,8 +495,26 @@ async fn new_direct_pipeline_at_roots(
     let (_cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
     let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    // Dispatch asks the pool which server a new lane should try, so a harness
+    // that is given connections needs a server to rank, and the lane workers
+    // those leases go to will dial it. A harness with no connections keeps
+    // its empty pool.
+    let harness_servers = if total_connections == 0 {
+        Vec::new()
+    } else {
+        vec![weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: refusing_harness_server_port(),
+                tls: false,
+                ..Default::default()
+            },
+            max_connections: total_connections,
+            ..weaver_nntp::pool::ServerPoolConfig::default()
+        }]
+    };
     let nntp = NntpClient::new(NntpClientConfig {
-        servers: vec![],
+        servers: harness_servers,
         max_idle_age: Duration::from_secs(1),
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
@@ -1080,9 +1157,6 @@ fn many_standalone_files(prefix: &str, count: usize) -> Vec<(String, u32)> {
         .map(|idx| (format!("{prefix}-{idx}.bin"), 512u32))
         .collect()
 }
-
-const TEST_HOT_CLEAR_PRESSURE_LANE_LEASE_WORK_LIMIT: usize = 64;
-const TEST_HOT_LEASE_COLD_START_WORK_LIMIT: usize = 16;
 
 fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes: u32) -> JobSpec {
     JobSpec {
@@ -1837,6 +1911,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             probe_projected_failed_bytes: 0,
             par2_bytes,
             health_probing: false,
+            health_deferral: Default::default(),
             health_probe_round: 0,
             health_probe_failing_files: 0,
             health_failing_files: std::collections::HashSet::new(),
@@ -1903,28 +1978,20 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
             job_status_for_assert(pipeline, job_id),
             Some(JobStatus::Moving)
         ) {
-            let done = tokio::time::timeout(Duration::from_secs(180), pipeline.move_done_rx.recv())
+            let done = pipeline
+                .move_done_rx
+                .recv()
                 .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "timed out waiting for final move completion\n{}",
-                        debug_job_state(pipeline, job_id)
-                    )
-                })
                 .expect("move channel should stay open");
             pipeline.handle_move_to_complete_done(done).await;
             pump_pipeline_runtime_queues(pipeline).await;
             continue;
         }
 
-        let done = tokio::time::timeout(Duration::from_secs(180), pipeline.extract_done_rx.recv())
+        let done = pipeline
+            .extract_done_rx
+            .recv()
             .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "timed out waiting for extraction completion\n{}",
-                    debug_job_state(pipeline, job_id)
-                )
-            })
             .expect("extraction channel should stay open");
         pipeline.handle_extraction_done(done).await;
         pump_pipeline_runtime_queues(pipeline).await;
@@ -1937,9 +2004,10 @@ async fn settle_inflight_moves(pipeline: &mut Pipeline) {
     while !pipeline.inflight_moves.is_empty() {
         // The same bound the terminal-state driver gives a move: a loaded
         // Windows runner can take seconds to close handles and scan the tree.
-        let done = tokio::time::timeout(Duration::from_secs(180), pipeline.move_done_rx.recv())
+        let done = pipeline
+            .move_done_rx
+            .recv()
             .await
-            .expect("final move result should arrive")
             .expect("move channel should stay open");
         pipeline.handle_move_to_complete_done(done).await;
         pipeline.pump_decode_queue();
@@ -1971,11 +2039,11 @@ async fn drain_rar_refreshes(pipeline: &mut Pipeline) {
         {
             return;
         }
-        let done =
-            tokio::time::timeout(Duration::from_secs(5), pipeline.rar_refresh_done_rx.recv())
-                .await
-                .expect("RAR refresh result should arrive")
-                .expect("RAR refresh channel should stay open");
+        let done = pipeline
+            .rar_refresh_done_rx
+            .recv()
+            .await
+            .expect("RAR refresh channel should stay open");
         pipeline.handle_rar_refresh_done(done).await;
     }
     panic!("RAR refresh queue did not drain");
@@ -2300,15 +2368,16 @@ fn park_job_on_its_final_decode(pipeline: &mut Pipeline, segment_id: SegmentId, 
 
 /// Drives every outstanding demotion reconstruction ticket to its handler, the
 /// way the orchestrator's select loop would.
+///
+/// It waits on the completion itself, with no deadline: how long a sweep takes
+/// depends on the machine, so a hang is the test runner's to catch.
 async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
     while !pipeline.direct_demotion_in_flight.is_empty() {
-        let done = tokio::time::timeout(
-            Duration::from_secs(10),
-            pipeline.direct_demotion_done_rx.recv(),
-        )
-        .await
-        .expect("a detached demotion sweep should finish")
-        .expect("the demotion completion channel should stay open");
+        let done = pipeline
+            .direct_demotion_done_rx
+            .recv()
+            .await
+            .expect("the demotion completion channel should stay open");
         pipeline.handle_direct_demotion_done(done).await;
     }
 }
@@ -2657,24 +2726,20 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         let tolerated_rx = &mut pipeline.direct_tolerated_done_rx;
         let demotion_rx = &mut pipeline.direct_demotion_done_rx;
         let repair_rx = &mut pipeline.repair_work_done_rx;
-        let ticket = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::select! {
-                done = post_repair_rx.recv(), if post_repair_pending => {
-                    Ticket::PostRepair(done.expect("direct post-repair completion channel should stay open"))
-                }
-                done = tolerated_rx.recv(), if tolerated_pending => {
-                    Ticket::Tolerated(done.expect("direct tolerated-extraction channel should stay open"))
-                }
-                done = demotion_rx.recv(), if demotion_pending => {
-                    Ticket::Demotion(done.expect("direct demotion channel should stay open"))
-                }
-                done = repair_rx.recv(), if par2_analysis_pending => {
-                    Ticket::Repair(done.expect("repair completion channel should stay open"))
-                }
+        let ticket = tokio::select! {
+            done = post_repair_rx.recv(), if post_repair_pending => {
+                Ticket::PostRepair(done.expect("direct post-repair completion channel should stay open"))
             }
-        })
-        .await
-        .expect("a detached pipeline ticket should finish");
+            done = tolerated_rx.recv(), if tolerated_pending => {
+                Ticket::Tolerated(done.expect("direct tolerated-extraction channel should stay open"))
+            }
+            done = demotion_rx.recv(), if demotion_pending => {
+                Ticket::Demotion(done.expect("direct demotion channel should stay open"))
+            }
+            done = repair_rx.recv(), if par2_analysis_pending => {
+                Ticket::Repair(done.expect("repair completion channel should stay open"))
+            }
+        };
         match ticket {
             Ticket::PostRepair(done) => pipeline.handle_direct_post_repair_done(done),
             Ticket::Tolerated(done) => pipeline.handle_direct_tolerated_done(done).await,
@@ -2694,11 +2759,11 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
 /// behind rather than on the state a fully drained queue eventually reaches.
 async fn settle_par2_analysis_work(pipeline: &mut Pipeline) {
     while !pipeline.par2_analysis_in_flight.is_empty() {
-        let done =
-            tokio::time::timeout(Duration::from_secs(10), pipeline.repair_work_done_rx.recv())
-                .await
-                .expect("a detached PAR2 damaged-path analysis should finish")
-                .expect("the PAR2 analysis completion channel should stay open");
+        let done = pipeline
+            .repair_work_done_rx
+            .recv()
+            .await
+            .expect("the PAR2 analysis completion channel should stay open");
         pipeline.handle_repair_work_done(done).await;
         if let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
             pipeline.check_job_completion(queued_job).await;
@@ -2724,39 +2789,57 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
     settle_inflight_moves(pipeline).await;
 }
 
+/// The next extraction result for a driver that steps `job_id` a fixed number
+/// of rounds. An extraction the pipeline has in flight for the job, whole-set
+/// or a RAR member worker, is waited for with no deadline, so a round never ends on a slow extraction; otherwise
+/// a result already sent is taken, and a turn is yielded to background work.
+async fn next_owed_extraction(pipeline: &mut Pipeline, job_id: JobId) -> Option<ExtractionDone> {
+    if pipeline
+        .inflight_extractions
+        .get(&job_id)
+        .is_some_and(|sets| !sets.is_empty())
+        || pipeline.has_active_rar_workers(job_id)
+    {
+        return Some(
+            pipeline
+                .extract_done_rx
+                .recv()
+                .await
+                .expect("extraction channel should stay open"),
+        );
+    }
+    let done = pipeline.extract_done_rx.try_recv().ok();
+    if done.is_none() {
+        tokio::task::yield_now().await;
+    }
+    done
+}
+
 async fn next_extraction_done(pipeline: &mut Pipeline) -> ExtractionDone {
-    tokio::time::timeout(Duration::from_secs(2), pipeline.extract_done_rx.recv())
+    pipeline
+        .extract_done_rx
+        .recv()
         .await
-        .expect("extraction result should arrive")
         .expect("extraction channel should stay open")
 }
 
-async fn wait_until(
-    timeout_duration: Duration,
-    mut predicate: impl FnMut() -> bool,
-) -> Result<(), &'static str> {
-    let deadline = tokio::time::Instant::now() + timeout_duration;
-    loop {
-        if predicate() {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("condition timed out");
-        }
+/// Polls until `predicate` holds. There is no deadline: the test runner
+/// bounds a condition that never arrives.
+async fn wait_until(mut predicate: impl FnMut() -> bool) {
+    while !predicate() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
 async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
     for index in 0..expected {
-        let done =
-            match tokio::time::timeout(Duration::from_secs(20), pipeline.decode_done_rx.recv())
-                .await
-            {
-                Ok(Some(done)) => done,
-                Ok(None) => panic!("decode channel should stay open"),
-                Err(_) => panic!("decode result {}/{} should arrive", index + 1, expected),
-            };
+        let done = pipeline.decode_done_rx.recv().await.unwrap_or_else(|| {
+            panic!(
+                "decode channel closed before result {}/{}",
+                index + 1,
+                expected
+            )
+        });
         pipeline.handle_decode_done(done).await;
         settle_inflight_moves(pipeline).await;
     }

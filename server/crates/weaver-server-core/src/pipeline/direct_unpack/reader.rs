@@ -262,9 +262,7 @@ impl Read for GatedSplitReader {
             #[cfg(test)]
             if let Some((entered, resume)) = self.read_barrier.take() {
                 entered.send(()).expect("read barrier observer");
-                resume
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .expect("read barrier release");
+                resume.recv().expect("read barrier release");
             }
             let read = result.as_ref().copied().unwrap_or(0);
             if !self

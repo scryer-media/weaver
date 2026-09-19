@@ -2,9 +2,10 @@ use super::*;
 use crate::observability::with_timed_config_read;
 use crate::system::metrics_history::{build_metrics_history, tier_for_range};
 use crate::system::types::{
-    ConfiguredStorage, DatabaseEngineGql, DecoderTierGql, DeploymentEnvironmentGql, DiskCapacity,
-    KernelComponentGql, KernelSelectionInfo, MetricsHistoryRangeGql, OperatingSystemGql,
-    ServerRestartCapability, SystemComputeInfo, SystemInfo, SystemMemoryInfo, SystemStorageProfile,
+    ApplicationUpgradeStatus, ConfiguredStorage, DatabaseEngineGql, DecoderTierGql,
+    DeploymentEnvironmentGql, DiskCapacity, KernelComponentGql, KernelSelectionInfo,
+    MetricsHistoryRangeGql, OperatingSystemGql, ServerRestartCapability, SystemComputeInfo,
+    SystemInfo, SystemMemoryInfo, SystemStorageProfile,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +25,16 @@ impl SystemQuery {
     async fn update_status(&self, ctx: &Context<'_>) -> Result<UpdateStatus> {
         let service = ctx.data::<weaver_server_core::update_check::UpdateCheckService>()?;
         Ok(service.status().into())
+    }
+    /// In-application upgrade availability and this installation's eligibility.
+    #[graphql(guard = "ReadGuard")]
+    async fn application_upgrade_status(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<ApplicationUpgradeStatus> {
+        let service =
+            ctx.data::<weaver_server_core::application_upgrade::ApplicationUpgradeService>()?;
+        Ok(service.snapshot().into())
     }
     /// Safe runtime and storage facts for the built-in troubleshooting UI.
     #[graphql(guard = "ReadGuard")]

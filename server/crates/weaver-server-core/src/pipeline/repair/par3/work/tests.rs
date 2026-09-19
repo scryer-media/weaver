@@ -14,10 +14,7 @@ fn refused<T>(result: EngineResult<T>) -> bool {
 }
 
 async fn next(coordinator: &mut Coordinator) -> WorkDone {
-    tokio::time::timeout(std::time::Duration::from_secs(10), coordinator.recv())
-        .await
-        .unwrap()
-        .unwrap()
+    coordinator.recv().await.unwrap()
 }
 
 #[tokio::test]
@@ -605,12 +602,7 @@ async fn cancellation_during_native_read_keeps_capacity_until_worker_returns() {
         )
         .unwrap();
     coordinator.dispatch().unwrap();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        access.started.notified(),
-    )
-    .await
-    .unwrap();
+    access.started.notified().await;
     coordinator.forget(JobId(1));
     coordinator.enqueue(JobId(2), SourceId(0), path).unwrap();
     coordinator.dispatch().unwrap();

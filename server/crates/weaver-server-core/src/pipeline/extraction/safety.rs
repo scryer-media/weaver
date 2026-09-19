@@ -1835,15 +1835,8 @@ mod tests {
         });
         let waiter_pool = Arc::clone(&pool);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let deadline = Instant::now() + Duration::from_secs(5);
         let waiter = std::thread::spawn(move || {
-            let check_active = || {
-                if Instant::now() >= deadline {
-                    Err("wait timed out".to_string())
-                } else {
-                    Ok(())
-                }
-            };
+            let check_active = || Ok(());
             let result = if retained {
                 waiter_pool.reserve_retained_wait(1024, check_active)
             } else {
@@ -1858,7 +1851,7 @@ mod tests {
             }
             done_tx.send(result.map(drop)).unwrap();
         });
-        let result = done_rx.recv_timeout(Duration::from_secs(6));
+        let result = done_rx.recv();
         coverage.abort("test teardown");
         let chase_result = chase.join().unwrap();
         waiter.join().unwrap();
@@ -1961,17 +1954,16 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled);
         let owner = pool.for_job(1);
-        let deadline = Instant::now() + Duration::from_secs(5);
         let waiter = std::thread::spawn(move || {
             owner.reserve_wait(400, || {
-                if flag.load(Ordering::Acquire) || Instant::now() >= deadline {
+                if flag.load(Ordering::Acquire) {
                     Err("cancelled".into())
                 } else {
                     Ok(())
                 }
             })
         });
-        while !pool.has_waiters() && Instant::now() < deadline {
+        while !pool.has_waiters() {
             std::thread::yield_now();
         }
         assert!(pool.has_waiters());
@@ -1990,18 +1982,9 @@ mod tests {
         let pool = Arc::new(ProcessMemoryBudget::new(1024));
         let peer = pool.for_job(1).try_reserve_retained(700).unwrap();
         let own = pool.for_job(2).try_reserve_retained(100).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
         let owner = pool.for_job(2);
-        let waiter = std::thread::spawn(move || {
-            owner.reserve_wait(800, || {
-                if Instant::now() < deadline {
-                    Ok(())
-                } else {
-                    Err("test deadline".into())
-                }
-            })
-        });
-        while !pool.has_waiters() && Instant::now() < deadline {
+        let waiter = std::thread::spawn(move || owner.reserve_wait(800, || Ok(())));
+        while !pool.has_waiters() {
             std::thread::yield_now();
         }
         assert!(
@@ -2033,17 +2016,16 @@ mod tests {
         let cancellation = par2_rs::CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let worker_pool = Arc::clone(&pool);
-        let deadline = Instant::now() + Duration::from_secs(5);
         let worker = std::thread::spawn(move || {
             worker_pool.reserve_retained_wait(128, || {
-                if worker_cancellation.is_cancelled() || Instant::now() >= deadline {
+                if worker_cancellation.is_cancelled() {
                     Err("metadata scan cancelled".to_string())
                 } else {
                     Ok(())
                 }
             })
         });
-        while !pool.has_waiters() && Instant::now() < deadline {
+        while !pool.has_waiters() {
             std::thread::yield_now();
         }
         assert!(pool.has_waiters());
@@ -2104,7 +2086,7 @@ mod tests {
         waiting_budget.cancel();
 
         let error = done_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv()
             .expect("cancelled job should leave the shared-memory wait")
             .unwrap_err();
         assert!(error.contains("job extraction was cancelled"));

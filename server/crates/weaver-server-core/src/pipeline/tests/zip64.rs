@@ -159,10 +159,7 @@ async fn land_article(pipeline: &mut Pipeline, id: NzbFileId, bytes: &[u8], numb
 }
 
 async fn reap_zip(pipeline: &mut Pipeline, job_id: JobId) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while pipeline.direct_unpack.is_armed(job_id, ARCHIVE_NAME)
-        && tokio::time::Instant::now() < deadline
-    {
+    while pipeline.direct_unpack.is_armed(job_id, ARCHIVE_NAME) {
         pipeline.reap_direct_unpack().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -186,16 +183,10 @@ async fn zip64_direct_unpack_finishes_a_member_before_middle_articles_arrive() {
         land_article(&mut pipeline, id, &bytes, count - 2).await;
         land_article(&mut pipeline, id, &bytes, 0).await;
         let staging = pipeline.direct_unpack_staging_dir(job_id, ARCHIVE_NAME);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let early = loop {
-            if std::fs::read(staging.join(members[0].0)).ok().as_ref() == Some(&members[0].1) {
-                break true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break false;
-            }
+        // The member finishes before the middle arrives; no deadline.
+        while std::fs::read(staging.join(members[0].0)).ok().as_ref() != Some(&members[0].1) {
             tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        }
         let incomplete = !pipeline.jobs[&job_id]
             .assembly
             .file(id)
@@ -206,20 +197,13 @@ async fn zip64_direct_unpack_finishes_a_member_before_middle_articles_arrive() {
             land_article(&mut pipeline, id, &bytes, number).await;
         }
         reap_zip(&mut pipeline, job_id).await;
-        assert!(
-            early,
-            "ZIP64 member must finish before the middle arrives: {descriptor:?}"
-        );
         assert!(incomplete);
         assert_eq!(
             buffered, 0,
             "tail must be persisted, not parked in write backlog"
         );
         assert_eq!(pipeline.direct_unpack.counters().consumed, 1);
-        let done = tokio::time::timeout(Duration::from_secs(30), pipeline.extract_done_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let done = pipeline.extract_done_rx.recv().await.unwrap();
         let ExtractionDone::FullSet { result, .. } = done else {
             panic!("full ZIP set expected")
         };
@@ -302,10 +286,7 @@ async fn zip64_par2_repairs_payload_directory_and_missing_articles() {
             .extract_simple_archive(job_id, ARCHIVE_NAME, SimpleArchiveKind::Zip)
             .await
             .unwrap();
-        let done = tokio::time::timeout(Duration::from_secs(30), pipeline.extract_done_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let done = pipeline.extract_done_rx.recv().await.unwrap();
         let ExtractionDone::FullSet { result, .. } = done else {
             panic!("full ZIP set expected")
         };

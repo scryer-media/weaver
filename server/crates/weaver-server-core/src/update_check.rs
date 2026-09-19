@@ -195,7 +195,11 @@ impl UpdateCheckService {
         Self::with_fetcher_enabled(db, fetcher, release_checks_enabled())
     }
 
-    fn with_fetcher_enabled(db: Database, fetcher: Arc<dyn ReleaseFetcher>, enabled: bool) -> Self {
+    pub(crate) fn with_fetcher_enabled(
+        db: Database,
+        fetcher: Arc<dyn ReleaseFetcher>,
+        enabled: bool,
+    ) -> Self {
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         let persisted = load_persisted_state(&db);
         let mut status = UpdateStatus::initial(current_version);
@@ -239,6 +243,14 @@ impl UpdateCheckService {
     /// state immediately instead of waiting for the next transition.
     pub fn subscribe(&self) -> watch::Receiver<UpdateStatus> {
         self.inner.status.subscribe()
+    }
+
+    /// Whether this process polls for releases at all.
+    ///
+    /// An operator who turned the check off gets nothing that exists only to
+    /// serve it — no release polling, and no upgrade-related network traffic.
+    pub fn enabled(&self) -> bool {
+        self.inner.enabled
     }
 
     pub fn start_background_loop(&self) -> JoinHandle<()> {
@@ -413,6 +425,15 @@ fn epoch_ms_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// The release tag that carries `version`'s assets.
+///
+/// The in-application upgrade needs the tag, not just the version: every release
+/// asset URL is built from it. One function so the tag the upgrade asks for and
+/// the tag the release was cut as cannot drift apart.
+pub fn release_tag_for_version(version: &str) -> String {
+    format!("{RELEASE_TAG_PREFIX}{version}")
 }
 
 /// Parse a release tag into a comparable stable version.

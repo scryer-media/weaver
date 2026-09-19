@@ -57,6 +57,9 @@ fn context(job_id: u64, working_directory: PathBuf) -> JobExecutionContext {
     }
 }
 
+/// A script timeout no test run can reach, for tests that are not about it.
+const OUT_OF_REACH: Duration = Duration::from_secs(3600);
+
 fn request(
     data_dir: &Path,
     script: &ScriptName,
@@ -124,7 +127,7 @@ printf 'stderr-line\n' >&2
             data.path(),
             &script,
             working_directory.clone(),
-            Some(Duration::from_secs(30)),
+            Some(OUT_OF_REACH),
         ),
         None,
     )
@@ -172,7 +175,7 @@ async fn nzbget_exit_codes_are_honoured_end_to_end() {
                 data.path(),
                 &script,
                 working_directory.clone(),
-                Some(Duration::from_secs(30)),
+                Some(OUT_OF_REACH),
             ),
             None,
         )
@@ -196,7 +199,9 @@ async fn a_script_that_outlives_its_timeout_is_killed_after_the_grace_period() {
     let script = write_script(
         data.path(),
         "sleeper.sh",
-        "#!/bin/sh\ntrap '' TERM\nprintf 'started\\n'\nsleep 120\n",
+        // It ignores SIGTERM and never exits on its own, so only the timeout
+        // kill can end it; if that kill never fires, the runner bounds the hang.
+        "#!/bin/sh\ntrap '' TERM\nprintf 'started\\n'\nwhile :; do sleep 3600; done\n",
     );
 
     let started = Instant::now();
@@ -218,10 +223,12 @@ async fn a_script_that_outlives_its_timeout_is_killed_after_the_grace_period() {
         "{:?}",
         result.error_message
     );
-    // A script that ignores SIGTERM is still gone once the grace period expires.
+    // Returning at all proves a script that ignores SIGTERM is gone: it never
+    // exits on its own. It cannot be killed before its timeout.
     assert!(
-        started.elapsed() < Duration::from_secs(30),
-        "the grace kill did not fire"
+        started.elapsed() >= Duration::from_millis(200),
+        "killed before the timeout elapsed: {:?}",
+        started.elapsed()
     );
 }
 
@@ -245,12 +252,7 @@ printf 'FINAL-LINE\n'
     );
 
     let result = execute_script(
-        request(
-            data.path(),
-            &script,
-            working_directory,
-            Some(Duration::from_secs(60)),
-        ),
+        request(data.path(), &script, working_directory, Some(OUT_OF_REACH)),
         None,
     )
     .await
@@ -430,11 +432,9 @@ async fn cancelling_a_job_stops_the_run_and_records_the_cancellation() {
     };
     started_rx.await.unwrap();
     // The cancel registration is installed before the first script starts, but
-    // the script itself needs a moment to be spawned.
-    for _ in 0..200 {
-        if executor.cancel_job(104) {
-            break;
-        }
+    // the script itself needs a moment to be spawned. Wait for the cancel to
+    // land, however long the spawn takes.
+    while !executor.cancel_job(104) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -680,7 +680,7 @@ async fn a_script_outside_its_package_root_is_refused() {
             data.path(),
             &ScriptName::new("escape").unwrap(),
             working_directory,
-            Some(Duration::from_secs(10)),
+            Some(OUT_OF_REACH),
         ),
         None,
     )
@@ -743,13 +743,12 @@ async fn changing_the_scripts_directory_pins_admitted_work_and_updates_future_jo
     // that treats a freshly built binary as needing launch verification can
     // spend several seconds in the loader before `main` runs. Five seconds
     // was inside that window and made this fail on a loaded machine.
-    tokio::time::timeout(Duration::from_secs(60), async {
+    async {
         while !first_working_directory.join("started").exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    })
-    .await
-    .expect("the first script should begin");
+    }
+    .await;
 
     fs::write(first_working_directory.join("release"), "").unwrap();
     running.await.unwrap();

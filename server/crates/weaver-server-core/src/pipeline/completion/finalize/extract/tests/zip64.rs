@@ -176,12 +176,11 @@ fn zip64_real_5_gib_member_and_large_offsets_from_both_writers() {
                 None,
             )
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let overlap = loop {
             if fs::metadata(out.join("a-payload.bin")).is_ok_and(|m| m.len() >= 1024 * 1024) {
                 break true;
             }
-            if worker.is_finished() || std::time::Instant::now() >= deadline {
+            if worker.is_finished() {
                 break false;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

@@ -359,7 +359,7 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?.clone();
         handle.delete_history(JobId(id), delete_files).await?;
-        history_items_from_db(db).await
+        history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Explicitly forget durable duplicate identity for a job without deleting history or files.
     #[graphql(guard = "ControlGuard")]
@@ -482,7 +482,7 @@ impl JobsMutation {
         for &id in &ids {
             handle.delete_history(JobId(id), delete_files).await?;
         }
-        history_items_from_db(db).await
+        history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Delete all completed/failed/cancelled jobs from history.
     /// Integration (control) scope may also delete completed output with `deleteFiles: true`.
@@ -495,7 +495,7 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?.clone();
         handle.delete_all_history(delete_files).await?;
-        history_items_from_db(db).await
+        history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Update category and/or priority for one or more jobs.
     #[graphql(guard = "ControlGuard")]
@@ -1145,9 +1145,17 @@ async fn submit_uploaded_nzb(
     .await
 }
 
-async fn history_items_from_db(db: Database) -> Result<Vec<HistoryItem>> {
+/// The full remaining history listing returned by the delete mutations.
+///
+/// This is the same read surface as the `historyItems` query, so it applies the
+/// same exclusion: a job the scheduler still owns is not history, however it
+/// came to have a row.
+async fn history_items_from_db(db: Database, live_jobs: HashSet<u64>) -> Result<Vec<HistoryItem>> {
     tokio::task::spawn_blocking(move || {
-        let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
+        let rows = crate::history::query::exclude_live_rows(
+            db.list_job_history(&weaver_server_core::HistoryFilter::default())?,
+            &live_jobs,
+        );
         let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
         let delete_states = db.list_history_delete_row_states(&ids)?;
         Ok::<_, weaver_server_core::StateError>(

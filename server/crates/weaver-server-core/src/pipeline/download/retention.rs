@@ -140,6 +140,22 @@ impl Pipeline {
             .collect()
     }
 
+    /// Set union of two exclusion lists, order-preserving and duplicate-free.
+    /// Small sets (one entry per configured server at most), so the linear
+    /// membership scan is cheaper than any set type.
+    pub(in crate::pipeline) fn union_exclude_servers(
+        first: &[usize],
+        second: &[usize],
+    ) -> Vec<usize> {
+        let mut merged = first.to_vec();
+        for idx in second {
+            if !merged.contains(idx) {
+                merged.push(*idx);
+            }
+        }
+        merged
+    }
+
     /// Union of a work item's failure exclusions and the job's retention
     /// exclusions — the effective exclude set for server ordering. Failure
     /// excludes stay per-article on the work item; retention excludes stay

@@ -17,10 +17,15 @@ mod idle;
 
 enum TestArticle {
     Body(Vec<u8>),
+    /// Only the s2n socket-slice test, which does not build on Windows.
+    #[cfg(not(windows))]
     DelayedInitial {
         data: Vec<u8>,
         delay: Duration,
     },
+    /// Never answers the BODY: only the client's own budget ends the read.
+    Silent,
+    /// Sends the article a line at a time and never terminates it.
     Trickle {
         data: Vec<u8>,
         line_delay: Duration,
@@ -80,6 +85,30 @@ fn spawn_tls_nntp_server(
     std::thread::JoinHandle<()>,
     std::path::PathBuf,
 ) {
+    spawn_tls_nntp_server_with_upgrade(articles, false)
+}
+
+/// The same fixture reached the other way round: the greeting arrives in
+/// plaintext, the client asks for `STARTTLS`, and the handshake runs on the
+/// socket that already carried the greeting.
+fn spawn_starttls_nntp_server(
+    articles: Vec<(&'static str, TestArticle)>,
+) -> (
+    ServerConfig,
+    std::thread::JoinHandle<()>,
+    std::path::PathBuf,
+) {
+    spawn_tls_nntp_server_with_upgrade(articles, true)
+}
+
+fn spawn_tls_nntp_server_with_upgrade(
+    articles: Vec<(&'static str, TestArticle)>,
+    starttls: bool,
+) -> (
+    ServerConfig,
+    std::thread::JoinHandle<()>,
+    std::path::PathBuf,
+) {
     let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .expect("generate test cert");
     let cert_der = certified_key.cert.der().clone();
@@ -116,14 +145,41 @@ fn spawn_tls_nntp_server(
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             let (socket, _) = listener.accept().await.unwrap();
             let acceptor = TlsAcceptor::from(Arc::new(server_config));
-            let tls = acceptor.accept(socket).await.unwrap();
-            let mut stream = BufReader::new(tls);
-            stream
-                .get_mut()
-                .write_all(b"200 test server ready\r\n")
-                .await
-                .unwrap();
-            stream.get_mut().flush().await.unwrap();
+            let mut stream = if starttls {
+                let mut plain = BufReader::new(socket);
+                plain
+                    .get_mut()
+                    .write_all(b"200 test server ready\r\n")
+                    .await
+                    .unwrap();
+                plain.get_mut().flush().await.unwrap();
+                let mut request = String::new();
+                plain.read_line(&mut request).await.unwrap();
+                assert_eq!(
+                    request.trim_end_matches(['\r', '\n']).to_ascii_uppercase(),
+                    "STARTTLS",
+                    "the upgrade must be the first command on the plaintext socket"
+                );
+                plain
+                    .get_mut()
+                    .write_all(b"382 continue with TLS negotiation\r\n")
+                    .await
+                    .unwrap();
+                plain.get_mut().flush().await.unwrap();
+                // No second greeting: the session resumes where it left off,
+                // encrypted.
+                BufReader::new(acceptor.accept(plain.into_inner()).await.unwrap())
+            } else {
+                let tls = acceptor.accept(socket).await.unwrap();
+                let mut stream = BufReader::new(tls);
+                stream
+                    .get_mut()
+                    .write_all(b"200 test server ready\r\n")
+                    .await
+                    .unwrap();
+                stream.get_mut().flush().await.unwrap();
+                stream
+            };
 
             let mut line = String::new();
             let mut close_after_next_request = false;
@@ -166,6 +222,7 @@ fn spawn_tls_nntp_server(
                             stream.get_mut().write_all(&yenc_body(data)).await.unwrap();
                             stream.get_mut().write_all(b".\r\n").await.unwrap();
                         }
+                        #[cfg(not(windows))]
                         Some(TestArticle::DelayedInitial { data, delay }) => {
                             tokio::time::sleep(*delay).await;
                             if stream
@@ -181,6 +238,7 @@ fn spawn_tls_nntp_server(
                                 return;
                             }
                         }
+                        Some(TestArticle::Silent) => {}
                         Some(TestArticle::Trickle { data, line_delay }) => {
                             stream
                                 .get_mut()
@@ -197,9 +255,6 @@ fn spawn_tls_nntp_server(
                                 {
                                     return;
                                 }
-                            }
-                            if stream.get_mut().write_all(b".\r\n").await.is_err() {
-                                return;
                             }
                         }
                         Some(TestArticle::Truncated {
@@ -254,8 +309,8 @@ fn spawn_tls_nntp_server(
         revocation: None,
         host: "localhost".to_string(),
         port,
-        tls: true,
-        starttls: false,
+        tls: !starttls,
+        starttls,
         username: None,
         password: None,
         connect_timeout: Duration::from_secs(5),
@@ -271,10 +326,10 @@ fn spawn_tls_nntp_server(
 }
 
 #[cfg(not(windows))]
-fn spawn_partial_tls_record_proxy(
-    upstream_port: u16,
-    stall: Duration,
-) -> (u16, std::thread::JoinHandle<()>) {
+/// Forwards the session until the first large TLS record, sends half of it,
+/// and then holds the connection open until the client closes it: only the
+/// client's own budget can end its read of that record.
+fn spawn_partial_tls_record_proxy(upstream_port: u16) -> (u16, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = std::thread::spawn(move || {
@@ -303,7 +358,6 @@ fn spawn_partial_tls_record_proxy(
                 downstream.write_all(&payload[..record_len / 2]).unwrap();
                 downstream.flush().unwrap();
                 fragmented = true;
-                std::thread::sleep(stall);
                 break;
             }
 
@@ -312,9 +366,16 @@ fn spawn_partial_tls_record_proxy(
             downstream.flush().unwrap();
         }
 
-        let _ = downstream.shutdown(std::net::Shutdown::Both);
-        let _ = upstream.shutdown(std::net::Shutdown::Both);
-        let _ = request_forwarder.join();
+        if fragmented {
+            // The forwarder ends when the client closes its side.
+            let _ = request_forwarder.join();
+            let _ = downstream.shutdown(std::net::Shutdown::Both);
+            let _ = upstream.shutdown(std::net::Shutdown::Both);
+        } else {
+            let _ = downstream.shutdown(std::net::Shutdown::Both);
+            let _ = upstream.shutdown(std::net::Shutdown::Both);
+            let _ = request_forwarder.join();
+        }
         assert!(
             fragmented,
             "proxy never observed a large TLS application record"
@@ -1138,6 +1199,91 @@ fn blocking_known_non_pipelining_skips_capabilities_probe() {
     assert_blocking_known_pipelining_skips_capabilities_probe(false);
 }
 
+fn starttls_lane_reads_a_body_after_the_upgrade(backend: NntpTlsBackend) {
+    let (config, handle, ca_path) = spawn_starttls_nntp_server(vec![(
+        "<upgraded@test>",
+        TestArticle::Body(b"body carried after the in-band upgrade".to_vec()),
+    )]);
+    assert!(!config.tls, "the dial itself is plaintext");
+    let mut conn = connect_with_backend(&config, backend);
+    conn.select_group("alt.test").unwrap();
+
+    let article = conn.stream_yenc_article("<upgraded@test>").unwrap();
+
+    assert_eq!(
+        article.into_data(),
+        b"body carried after the in-band upgrade"
+    );
+    conn.quit().unwrap();
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(ca_path);
+}
+
+/// A STARTTLS server is lane-served like any other: the greeting arrives in
+/// plaintext, the upgrade runs in band, and the rest of the session — group
+/// selection and BODY included — is encrypted on the same socket.
+#[test]
+fn blocking_starttls_rustls_reads_a_body_after_the_upgrade() {
+    starttls_lane_reads_a_body_after_the_upgrade(NntpTlsBackend::ManualRustls);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn blocking_starttls_s2n_reads_a_body_after_the_upgrade() {
+    let _guard = s2n_test_guard();
+    starttls_lane_reads_a_body_after_the_upgrade(NntpTlsBackend::S2n);
+}
+
+/// A server that refuses the upgrade must fail the connect rather than carry
+/// on in plaintext: the credentials and the article both come after this
+/// point, and the config asked for them to be encrypted.
+#[test]
+fn blocking_starttls_refusal_fails_the_connect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(b"200 test server ready\r\n").unwrap();
+        socket.flush().unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        assert_eq!(request.trim_end_matches(['\r', '\n']), "STARTTLS");
+        socket
+            .write_all(b"580 can not initiate TLS now\r\n")
+            .unwrap();
+        socket.flush().unwrap();
+    });
+
+    let config = ServerConfig {
+        host: "127.0.0.1".to_string(),
+        port,
+        tls: false,
+        starttls: true,
+        connect_timeout: Duration::from_secs(5),
+        command_timeout: Duration::from_secs(5),
+        ..ServerConfig::default()
+    };
+    let Err(error) = BlockingNntpConnection::connect_with_ip_policy_with_backend(
+        &config,
+        &[],
+        0,
+        Some(NntpTlsBackend::ManualRustls),
+        None,
+    ) else {
+        panic!("a refused upgrade must not yield a usable connection");
+    };
+
+    assert!(
+        matches!(
+            error,
+            NntpError::UnexpectedResponse { code, .. } if code.raw() == 580
+        ),
+        "{error:?}"
+    );
+    handle.join().unwrap();
+}
+
 #[test]
 fn blocking_rustls_reads_single_body_response() {
     tls_lane_reads_single_body_response(NntpTlsBackend::ManualRustls);
@@ -1197,13 +1343,8 @@ fn blocking_rustls_remote_trickle_consumes_active_budget() {
 
 #[test]
 fn blocking_rustls_delayed_initial_consumes_active_budget() {
-    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
-        "<delayed@test>",
-        TestArticle::DelayedInitial {
-            data: vec![b'A'; 128],
-            delay: Duration::from_millis(300),
-        },
-    )]);
+    let (config, handle, ca_path) =
+        spawn_tls_nntp_server(vec![("<delayed@test>", TestArticle::Silent)]);
     let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
     conn.select_group("alt.test").unwrap();
     let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
@@ -1383,13 +1524,8 @@ fn blocking_s2n_remote_trickle_consumes_active_budget() {
 #[test]
 fn blocking_s2n_delayed_initial_consumes_active_budget() {
     let _guard = s2n_test_guard();
-    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
-        "<delayed@test>",
-        TestArticle::DelayedInitial {
-            data: vec![b'A'; 128],
-            delay: Duration::from_millis(300),
-        },
-    )]);
+    let (config, handle, ca_path) =
+        spawn_tls_nntp_server(vec![("<delayed@test>", TestArticle::Silent)]);
     let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
     conn.select_group("alt.test").unwrap();
     let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
@@ -1422,7 +1558,9 @@ fn blocking_s2n_retries_socket_slices_within_active_budget() {
     let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
     conn.select_group("alt.test").unwrap();
     assert_s2n_socket_timeout_slice(&conn);
-    let mut budget = ActiveTransferBudget::new(Duration::from_millis(500));
+    // The delay outlasts a socket slice, so at least one slice times out; the
+    // budget itself is never the limit here.
+    let mut budget = ActiveTransferBudget::new(Duration::from_secs(3600));
 
     let article = conn
         .stream_yenc_article_with_active_budget("<within-budget@test>", 0, &mut budget)
@@ -1444,17 +1582,16 @@ fn blocking_s2n_partial_tls_record_respects_active_budget() {
         "<partial-record@test>",
         TestArticle::Body(vec![b'A'; 256 * 1024]),
     )]);
-    let (proxy_port, proxy_handle) =
-        spawn_partial_tls_record_proxy(config.port, Duration::from_secs(2));
+    let (proxy_port, proxy_handle) = spawn_partial_tls_record_proxy(config.port);
     config.port = proxy_port;
 
     let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
     conn.select_group("alt.test").unwrap();
     let mut budget = ActiveTransferBudget::new(Duration::from_millis(150));
-    let started = Instant::now();
+    // The proxy never completes the record, so returning at all is the proof
+    // that the budget bounds a partial record.
     let result =
         conn.stream_yenc_article_with_active_budget("<partial-record@test>", 0, &mut budget);
-    let elapsed = started.elapsed();
 
     drop(conn);
     proxy_handle.join().unwrap();
@@ -1466,10 +1603,6 @@ fn blocking_s2n_partial_tls_record_respects_active_budget() {
         error,
         FusedYencError::Nntp(NntpError::SoftTimeout(_))
     ));
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "partial TLS record ignored active budget for {elapsed:?}"
-    );
 }
 
 const TLS_DRAIN_RECORD_BYTES: usize = 16 * 1024;
@@ -1792,29 +1925,117 @@ fn tcp_peer_closed_sees_a_server_side_close_on_an_idle_socket() {
         use std::io::Write;
         (&server).write_all(b"400 idle timeout\r\n").unwrap();
     }
-    std::thread::sleep(Duration::from_millis(50));
-    assert!(tcp_peer_closed(&client));
+    // A blocking peek returns once the bytes have arrived.
     let mut probe = [0u8; 1];
+    assert_eq!(client.peek(&mut probe).unwrap(), 1);
+    assert!(tcp_peer_closed(&client));
     assert_eq!(client.peek(&mut probe).unwrap(), 1);
 
     drop(server);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut closed = false;
-    while Instant::now() < deadline {
-        // No drain is needed to detect an unusable idle session.
-        if tcp_peer_closed(&client) {
-            closed = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    // No drain is needed to detect an unusable idle session.
+    while !tcp_peer_closed(&client) {
+        std::thread::yield_now();
     }
-    assert!(closed, "a server-closed socket reports closed");
     let mut sink = [0u8; 64];
     assert!((&client).read(&mut sink).unwrap() > 0);
     // The probe leaves the socket in blocking mode for the lane's own reads.
     let mut byte = [0u8; 1];
-    client
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
     assert_eq!((&client).read(&mut byte).unwrap(), 0);
+}
+
+/// A server that authenticates, serves the first BODY it is asked for, and
+/// answers every later one with 480 — a session that expired part-way through
+/// a pipelined batch. Records the command lines it saw.
+fn spawn_session_expiry_server(
+    body: Vec<u8>,
+) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket.write_all(b"200 ready\r\n").unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut bodies_served = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let command = line.trim_end_matches(['\r', '\n']).to_string();
+            recorder.lock().unwrap().push(command.clone());
+            let upper = command.to_ascii_uppercase();
+            let response: Vec<u8> = if upper.starts_with("AUTHINFO USER") {
+                b"381 password\r\n".to_vec()
+            } else if upper.starts_with("AUTHINFO PASS") {
+                b"281 authenticated\r\n".to_vec()
+            } else if upper.starts_with("BODY") {
+                bodies_served += 1;
+                if bodies_served == 1 {
+                    let mut reply = b"222 0 body follows\r\n".to_vec();
+                    reply.extend_from_slice(&body);
+                    reply.extend_from_slice(b".\r\n");
+                    reply
+                } else {
+                    b"480 authentication required\r\n".to_vec()
+                }
+            } else if upper.starts_with("QUIT") {
+                let _ = socket.write_all(b"205 closing\r\n");
+                break;
+            } else {
+                b"500 command not recognized\r\n".to_vec()
+            };
+            if socket.write_all(&response).is_err() {
+                break;
+            }
+        }
+    });
+    (port, seen, handle)
+}
+
+/// A 480 arriving in the middle of a pipelined batch means the session
+/// expired, not that the credentials are wrong: the same credentials were
+/// accepted when this connection was set up, and are about to be accepted
+/// again by the next one. Booking it as an auth failure disabled the server
+/// for the whole auth backoff and unlocked the backfill tier behind it, over
+/// a session that a redial fixes.
+#[test]
+fn a_480_mid_batch_is_a_session_expiry_not_an_auth_failure() {
+    let (port, seen, handle) = spawn_session_expiry_server(yenc_body(&[0x55; 256]));
+    let mut config = blocking_pipelined_setup_config(port);
+    config.command_timeout = Duration::from_secs(5);
+    crate::server_caps::forget(&config.host, config.port);
+
+    let mut conn = BlockingNntpConnection::connect_with_ip_policy(&config, &[], 0).unwrap();
+    conn.authenticate("user", "pass").unwrap();
+    conn.write_body_request("<first@silver.horizon>").unwrap();
+    conn.write_body_request("<second@silver.horizon>").unwrap();
+    conn.flush_commands().unwrap();
+
+    let first = conn.stream_next_yenc_article().unwrap();
+    assert_eq!(first.to_data(), vec![0x55; 256]);
+
+    let error = conn.stream_next_yenc_article().unwrap_err();
+    assert!(
+        matches!(error, FusedYencError::Nntp(NntpError::SessionExpired)),
+        "a mid-batch 480 is a session expiry, got {error:?}"
+    );
+    assert!(
+        conn.poisoned,
+        "the batch's remaining replies are still queued, so the socket cannot be reused"
+    );
+
+    drop(conn);
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .any(|line| line.to_ascii_uppercase().starts_with("AUTHINFO PASS")),
+        "the connection authenticated before the batch; saw {seen:?}"
+    );
 }

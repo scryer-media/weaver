@@ -291,6 +291,79 @@ export const UPDATE_STATUS_SUBSCRIPTION = gql`
   }
 `;
 
+const APPLICATION_UPGRADE_FIELDS = `
+  currentVersion
+  updateVersion
+  updateTag
+  updateAvailable
+  installationKind
+  managementOwner
+  eligible
+  eligibilityReason
+  activeRun {
+    runId
+    status
+    phase
+    downloadedBytes
+    totalBytes
+    targetVersion
+    targetTag
+    fromVersion
+    error
+    startedAtEpochMs
+    completedAtEpochMs
+  }
+  latestRun {
+    runId
+    status
+    phase
+    downloadedBytes
+    totalBytes
+    targetVersion
+    targetTag
+    fromVersion
+    error
+    startedAtEpochMs
+    completedAtEpochMs
+  }
+`;
+
+export const APPLICATION_UPGRADE_STATUS_QUERY = gql`
+  query ApplicationUpgradeStatus {
+    applicationUpgradeStatus {
+      ${APPLICATION_UPGRADE_FIELDS}
+    }
+  }
+`;
+
+export const APPLICATION_UPGRADE_SUBSCRIPTION = gql`
+  subscription ApplicationUpgradeUpdates {
+    applicationUpgradeUpdates {
+      ${APPLICATION_UPGRADE_FIELDS}
+    }
+  }
+`;
+
+export const START_APPLICATION_UPGRADE_MUTATION = gql`
+  mutation StartApplicationUpgrade($input: StartApplicationUpgradeInput!) {
+    startApplicationUpgrade(input: $input) {
+      run {
+        runId
+        status
+        phase
+        downloadedBytes
+        totalBytes
+        targetVersion
+        targetTag
+        fromVersion
+        error
+        startedAtEpochMs
+        completedAtEpochMs
+      }
+    }
+  }
+`;
+
 export const BROWSE_DIRECTORIES_QUERY = gql`
   query BrowseDirectories($path: String) {
     browseDirectories(path: $path) {

@@ -1,12 +1,25 @@
+#[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
+mod allocator;
+mod application_upgrade_helper;
 mod args;
 mod bootstrap;
+// The server→wrapper relaunch signal. Both binaries compile the same file, so
+// the two halves of the protocol cannot drift apart.
+mod bundle_relaunch;
 mod commands;
+#[cfg(windows)]
+mod crash_dump;
+mod heartbeat;
 mod http;
 mod logging;
 mod restart;
 mod shutdown;
 #[cfg(windows)]
 mod tray_ipc;
+// The startup registration the tray owns and the upgrade helper restores; the
+// helper runs from a copy of this binary, so this binary carries it too.
+#[cfg(windows)]
+mod windows_startup;
 mod wiring;
 
 use std::io::IsTerminal;
@@ -28,13 +41,25 @@ const DOTENV_FILE: &str = ".env";
 // musl's bundled allocator serializes multi-threaded allocation heavily
 // (measured −18% CPU on the container download benchmark when replaced), and
 // the Windows system heap has the same reputation under threaded load, so
-// both build targets swap in mimalloc. glibc/macOS builds keep the system
-// allocator.
+// both build targets swap in mimalloc, tuned for the pipeline's cross-thread
+// article buffers (see `allocator`). glibc builds keep the system allocator.
 #[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
 #[global_allocator]
-static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL_ALLOC: allocator::TunedMiMalloc = allocator::TunedMiMalloc;
 
 fn main() {
+    // The Windows upgrade helper is this binary run with `--upgrade-helper`: it
+    // replaces the installation the server it was copied from is still holding
+    // open. Checked before anything else, because a helper must never start a
+    // server, read a config, or touch the database.
+    match application_upgrade_helper::maybe_run_upgrade_helper() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("upgrade helper failed: {error}");
+            std::process::exit(1);
+        }
+    }
     if let Some(code) =
         weaver_server_core::post_processing::runner::maybe_run_supervisor_from_process_args()
     {
@@ -176,6 +201,10 @@ async fn async_main() {
         )
         .init();
     install_panic_hook();
+    // After the subscriber, so the filter's own log line has somewhere to go,
+    // and after the log file path is resolved, so the dump lands beside it.
+    #[cfg(windows)]
+    crash_dump::install_unhandled_exception_filter();
 
     let command = match command {
         Command::Par2 { command } => match commands::par2::run(command) {

@@ -255,14 +255,7 @@ async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
     .unwrap();
     runtime.reload().await.unwrap();
     assert!(registry.check().is_err());
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), fixture)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap(),
-        0
-    );
+    assert_eq!(fixture.await.unwrap().unwrap(), 0);
     assert!(weaver_nntp::NntpConnection::connect(&config).await.is_err());
     runtime.stop_all().await;
 }
@@ -542,10 +535,7 @@ async fn cancelled_route_wakes_waiters_and_prevents_bridge_recreation() {
         waiting.cancelled().await;
     });
     route.revoke().await;
-    tokio::time::timeout(Duration::from_secs(1), waiter)
-        .await
-        .unwrap()
-        .unwrap();
+    waiter.await.unwrap();
     assert!(route.bridge().is_err());
     assert!(route.begin(1).is_none());
 }

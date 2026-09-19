@@ -3,6 +3,7 @@ import { Download, RefreshCw } from "lucide-react";
 import { useQuery } from "urql";
 import { PageHeader } from "@/components/PageHeader";
 import { SectionCard } from "@/components/SectionCard";
+import { ApplicationUpgradeCard } from "@/features/updates/application-upgrade-card";
 import { formatBytes } from "@/components/SpeedDisplay";
 import { Button } from "@/components/ui/button";
 import { authHeaders } from "@/graphql/client";
@@ -170,6 +171,8 @@ export function SystemInfoPage() {
           {t("label.loading")}
         </div>
       ) : null}
+
+      <ApplicationUpgradeCard />
 
       {info ? (
         <>

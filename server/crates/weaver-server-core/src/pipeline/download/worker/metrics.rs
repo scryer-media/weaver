@@ -84,7 +84,7 @@ impl Pipeline {
         }
 
         self.last_download_dispatch_stall_log_at = Some(now);
-        let hot_job_id = self.hot_dispatch_job.map(|id| id.0).unwrap_or_default();
+        let hot_job_id = self.current_hot_job().map(|id| id.0).unwrap_or_default();
         if let Some(job_id) = self.job_order.iter().copied().find(|job_id| {
             self.jobs.get(job_id).is_some_and(|state| {
                 !state.download_queue.is_empty() || !state.recovery_queue.is_empty()
@@ -139,6 +139,43 @@ impl Pipeline {
                 "download dispatch liveness stall: queued work but no active downloads"
             );
         }
+    }
+
+    /// Reports a pipeline that is retrying hard and finishing nothing.
+    ///
+    /// The liveness stall above only speaks when nothing is in flight, so a
+    /// loop that keeps a lane busy re-fetching the same articles is invisible
+    /// to it: connections are up, downloads are active, and the only sign is
+    /// a retry counter climbing without a download counter to match.
+    pub(in crate::pipeline::download::worker) fn log_download_retry_storm(&mut self, now: Instant) {
+        let retried = self.metrics.segments_retried.load(Ordering::Relaxed);
+        let downloaded = self.metrics.segments_downloaded.load(Ordering::Relaxed);
+        let Some((opened_at, retried_at_open, downloaded_at_open)) =
+            self.download_retry_storm_window
+        else {
+            self.download_retry_storm_window = Some((now, retried, downloaded));
+            return;
+        };
+        if now.saturating_duration_since(opened_at) < DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL {
+            return;
+        }
+        let retries = retried.saturating_sub(retried_at_open);
+        let downloads = downloaded.saturating_sub(downloaded_at_open);
+        self.download_retry_storm_window = Some((now, retried, downloaded));
+        if downloads != 0 || retries < DOWNLOAD_RETRY_STORM_THRESHOLD {
+            return;
+        }
+        warn!(
+            retries,
+            window_secs = DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL.as_secs(),
+            active_downloads = self.active_downloads,
+            active_connections = self.active_download_connections,
+            articles_not_found_without_new_server = self
+                .metrics
+                .articles_not_found_without_new_server
+                .load(Ordering::Relaxed),
+            "download retry storm: articles are being retried without any completing"
+        );
     }
 
     /// Reports lanes that are not being filled: work is queued, dispatch is

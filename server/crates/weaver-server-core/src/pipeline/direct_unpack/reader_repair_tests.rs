@@ -1,7 +1,6 @@
 use super::*;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
 
 fn reader_for(paths: &[PathBuf], sequential: bool) -> (GatedSplitReader, Arc<SetCoverage>) {
     let coverage = Arc::new(SetCoverage::new(paths.len()));
@@ -28,9 +27,7 @@ fn barrier(reader: &mut GatedSplitReader) -> (mpsc::Receiver<()>, mpsc::SyncSend
 }
 
 fn wait_for_park(coverage: &SetCoverage, previous: u64) {
-    let deadline = Instant::now() + Duration::from_secs(5);
     while coverage.park_count() == previous {
-        assert!(Instant::now() < deadline, "reader never parked");
         thread::yield_now();
     }
 }
@@ -54,7 +51,7 @@ fn a_read_in_flight_retries_after_repair_replaces_its_open_file() {
             reader.read_to_end(&mut rest).unwrap();
             rest
         });
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered.recv().unwrap();
         coverage.cap_at_damage(0, 1);
         coverage.note_vouched_prefix(0, 1);
         coverage.pause_for_repair();
@@ -83,7 +80,7 @@ fn a_read_in_flight_cannot_cross_a_new_damage_cap_or_repair_pause() {
             reader.read_to_end(&mut rest).unwrap();
             rest
         });
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered.recv().unwrap();
         // Test the pause without a damage cap too: some evidence arrives only
         // in the disk verification pass, after the last download verdict.
         if pause {
@@ -123,7 +120,7 @@ fn abort_rejects_bytes_already_read_but_not_published() {
             assert_eq!(reader.position(), 0);
             error
         });
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered.recv().unwrap();
         coverage.pause_for_repair();
         coverage.abort("cancel during repair");
         resume.send(()).unwrap();

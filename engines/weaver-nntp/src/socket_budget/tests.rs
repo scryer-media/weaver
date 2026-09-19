@@ -108,7 +108,7 @@ fn retirement_is_visible_without_waiting_for_the_registry() {
         tx.send((first.retiring(), second.retiring())).unwrap();
         (first, second)
     });
-    let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+    let result = rx.recv();
     drop(guard);
     drop(worker.join().unwrap());
     assert_eq!(result.unwrap(), (false, true));

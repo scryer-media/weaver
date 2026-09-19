@@ -511,6 +511,102 @@ impl Pipeline {
                 _ => {}
             }
         }
+        self.retire_dead_par2_collections(job_id);
+    }
+
+    /// Group the discovery candidates by the posting they belong to.
+    ///
+    /// Obfuscated names do not identify siblings, so a candidate without a
+    /// recognisable set base name is a collection of one until authenticated
+    /// metadata says otherwise.
+    fn par2_metadata_collections(&self, job_id: JobId) -> HashMap<String, Vec<(u32, bool, u64)>> {
+        let mut collections = HashMap::<String, Vec<(u32, bool, u64)>>::new();
+        for candidate in self.par2_metadata_candidate_indices(job_id) {
+            let key = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.spec.files.get(candidate.0 as usize))
+                .and_then(|file| par2_set_base_name(&file.filename))
+                .map(|base_name| format!("name:{base_name}"))
+                .unwrap_or_else(|| format!("file:{}", candidate.0));
+            collections.entry(key).or_default().push(candidate);
+        }
+        collections
+    }
+
+    /// A candidate whose probe came back with nothing at all: it is exhausted,
+    /// it identified no set, and not one prefix byte of it ever arrived. That
+    /// is what a volume whose leading article is gone looks like; a carrier
+    /// that answered but turned out not to be PAR2 leaves prefix bytes behind.
+    fn par2_candidate_probe_found_nothing(&self, job_id: JobId, file_index: u32) -> bool {
+        let exhausted_empty = matches!(
+            self.par2_discovery_state_for_candidate(job_id, file_index),
+            Par2DiscoveryState::Exhausted { set_ids } if set_ids.is_empty()
+        );
+        exhausted_empty
+            && self
+                .file_prefix_16k
+                .get(&NzbFileId { job_id, file_index })
+                .is_none_or(Vec::is_empty)
+    }
+
+    /// Retire the untouched candidates of every collection whose probed
+    /// siblings all came back with nothing, so the job stops walking a dead
+    /// posting one volume at a time. A collection with any sighting of a set
+    /// keeps its remaining candidates: something of it is still on the wire.
+    fn retire_dead_par2_collections(&mut self, job_id: JobId) {
+        let mut retire = Vec::new();
+        for members in self.par2_metadata_collections(job_id).values() {
+            let any_sighting = members.iter().any(|(file_index, _, _)| {
+                !self
+                    .par2_discovery_state_for_candidate(job_id, *file_index)
+                    .observed_set_ids()
+                    .is_empty()
+            });
+            if any_sighting {
+                continue;
+            }
+            let dead_siblings = members
+                .iter()
+                .filter(|(file_index, _, _)| {
+                    self.par2_candidate_probe_found_nothing(job_id, *file_index)
+                })
+                .count();
+            if dead_siblings < PAR2_DISCOVERY_DEAD_SIBLING_LIMIT {
+                continue;
+            }
+            retire.extend(members.iter().filter_map(|(file_index, _, _)| {
+                matches!(
+                    self.par2_discovery_state_for_candidate(job_id, *file_index),
+                    Par2DiscoveryState::Unseen
+                )
+                .then_some((*file_index, dead_siblings))
+            }));
+        }
+        for (file_index, dead_siblings) in retire {
+            let filename = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.spec.files.get(file_index as usize))
+                .map(|file| file.filename.clone())
+                .unwrap_or_default();
+            info!(
+                job_id = job_id.0,
+                file_index,
+                filename = %filename,
+                dead_siblings,
+                "retiring PAR2 discovery candidate: its sibling volumes are gone"
+            );
+            let file = self
+                .ensure_par2_runtime(job_id)
+                .files
+                .entry(file_index)
+                .or_default();
+            file.filename = filename;
+            file.discovery = Par2DiscoveryState::Exhausted {
+                set_ids: Vec::new(),
+            };
+        }
     }
 
     /// Select the next bounded discovery action as
@@ -519,26 +615,9 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> Option<(u32, bool, Option<par2_rs::RecoverySetId>)> {
-        let candidates = self.par2_metadata_candidate_indices(job_id);
         let discovery_for =
             |file_index: u32| self.par2_discovery_state_for_candidate(job_id, file_index);
-        let collection_key_for = |file_index: u32| {
-            self.jobs
-                .get(&job_id)
-                .and_then(|state| state.spec.files.get(file_index as usize))
-                .and_then(|file| par2_set_base_name(&file.filename))
-                .map(|base_name| format!("name:{base_name}"))
-                // Obfuscated names do not identify siblings. Keep those
-                // carriers separate until authenticated metadata does.
-                .unwrap_or_else(|| format!("file:{file_index}"))
-        };
-        let mut collections = HashMap::<String, Vec<(u32, bool, u64)>>::new();
-        for candidate in candidates {
-            collections
-                .entry(collection_key_for(candidate.0))
-                .or_default()
-                .push(candidate);
-        }
+        let collections = self.par2_metadata_collections(job_id);
 
         let metadata_is_installed = |set_id| {
             self.par2_runtime(job_id)
@@ -860,31 +939,53 @@ impl Pipeline {
         true
     }
 
-    /// Put the next finite metadata probe or set-specific carrier on the wire.
-    /// Discovery continues even after one usable set exists.
+    /// Put the next finite metadata probes or set-specific carrier on the
+    /// wire. Discovery continues even after one usable set exists.
+    ///
+    /// Up to `PAR2_DISCOVERY_PROBE_CONCURRENCY` single-article prefix probes
+    /// ride together; a whole-volume carrier goes alone, and only once no probe
+    /// is outstanding, so its selection can use what the probes found.
     pub(crate) fn promote_par2_metadata(&mut self, job_id: JobId) -> bool {
         if self.rearm_prefix_probe_from_recovery_queue(job_id) {
             return true;
         }
         self.refresh_par2_metadata_discovery(job_id);
-        if self
-            .par2_metadata_candidate_indices(job_id)
-            .iter()
-            .any(|(file_index, _, _)| {
-                self.par2_runtime(job_id)
-                    .and_then(|runtime| runtime.files.get(file_index))
-                    .is_some_and(|file| file.discovery.work_is_queued())
-            })
-        {
+        let (carriers_in_flight, mut probes_in_flight) =
+            self.par2_metadata_candidate_indices(job_id).iter().fold(
+                (0_usize, 0_usize),
+                |(carriers, probes), (file_index, _, _)| match self
+                    .par2_discovery_state_for_candidate(job_id, *file_index)
+                {
+                    Par2DiscoveryState::MetadataCarrierQueued { .. } => (carriers + 1, probes),
+                    Par2DiscoveryState::PrefixProbeQueued => (carriers, probes + 1),
+                    _ => (carriers, probes),
+                },
+            );
+        if carriers_in_flight > 0 {
             return true;
         }
 
-        while let Some((file_index, prefix_only, target_set_id)) =
-            self.next_par2_metadata_action(job_id)
-        {
-            if self.queue_par2_metadata_action(job_id, file_index, prefix_only, target_set_id) {
+        while probes_in_flight < PAR2_DISCOVERY_PROBE_CONCURRENCY {
+            // A sibling that just probed to nothing can retire the rest of
+            // its collection before the next one is chosen.
+            self.retire_dead_par2_collections(job_id);
+            let Some((file_index, prefix_only, target_set_id)) =
+                self.next_par2_metadata_action(job_id)
+            else {
+                break;
+            };
+            if !prefix_only && probes_in_flight > 0 {
                 return true;
             }
+            if self.queue_par2_metadata_action(job_id, file_index, prefix_only, target_set_id) {
+                if !prefix_only {
+                    return true;
+                }
+                probes_in_flight += 1;
+            }
+        }
+        if probes_in_flight > 0 {
+            return true;
         }
 
         let exhausted = self

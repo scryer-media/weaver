@@ -605,10 +605,8 @@ fn apply_duplicate_policy_update(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use tokio::sync::{RwLock, oneshot};
-    use tokio::time::timeout;
 
     use crate::observability::{persist_then_update_config, with_timed_config_read};
 
@@ -664,12 +662,9 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        let read_result = timeout(
-            Duration::from_millis(50),
-            with_timed_config_read(&config, "tests.settings.read", |cfg| cfg.max_download_speed),
-        )
-        .await
-        .expect("settings read should not block on slow persist");
+        let read_result =
+            with_timed_config_read(&config, "tests.settings.read", |cfg| cfg.max_download_speed)
+                .await;
         assert_eq!(read_result, None);
 
         release_tx

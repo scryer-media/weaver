@@ -246,10 +246,8 @@ async fn reconcile_watch_folder(ctx: &Context<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use tokio::sync::{RwLock, oneshot};
-    use tokio::time::timeout;
 
     use crate::observability::{persist_then_update_config, with_timed_config_read};
 
@@ -311,12 +309,9 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        let category_count = timeout(
-            Duration::from_millis(50),
-            with_timed_config_read(&config, "tests.categories.read", |cfg| cfg.categories.len()),
-        )
-        .await
-        .expect("category read should not block on slow persist");
+        let category_count =
+            with_timed_config_read(&config, "tests.categories.read", |cfg| cfg.categories.len())
+                .await;
         assert_eq!(category_count, 0);
 
         release_tx

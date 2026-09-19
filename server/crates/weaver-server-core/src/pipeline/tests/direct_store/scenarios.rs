@@ -92,12 +92,7 @@ async fn run_lost_article_gate(
         pump_pipeline_runtime_queues(&mut pipeline).await;
         sample_direct_sets(&pipeline, job_id, &mut sets);
         settle_inflight_moves(&mut pipeline).await;
-        if let Ok(Some(done)) = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            pipeline.extract_done_rx.recv(),
-        )
-        .await
-        {
+        if let Some(done) = next_owed_extraction(&mut pipeline, job_id).await {
             pipeline.handle_extraction_done(done).await;
             pump_pipeline_runtime_queues(&mut pipeline).await;
             settle_inflight_moves(&mut pipeline).await;
@@ -1238,12 +1233,7 @@ async fn drive_grid_fed_job_to_terminal(pipeline: &mut Pipeline, job_id: JobId) 
         pipeline.check_job_completion(job_id).await;
         pump_pipeline_runtime_queues(pipeline).await;
         settle_inflight_moves(pipeline).await;
-        if let Ok(Some(done)) = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            pipeline.extract_done_rx.recv(),
-        )
-        .await
-        {
+        if let Some(done) = next_owed_extraction(pipeline, job_id).await {
             pipeline.handle_extraction_done(done).await;
             pump_pipeline_runtime_queues(pipeline).await;
             settle_inflight_moves(pipeline).await;

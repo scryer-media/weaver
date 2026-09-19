@@ -1,7 +1,5 @@
 mod common;
 
-use std::time::Duration;
-
 use common::{BlockingDbOperation, TestHarness, assert_no_errors, local_request, response_data};
 use weaver_server_core::auth::CallerScope;
 
@@ -387,12 +385,7 @@ async fn settings_query_stays_responsive_during_update_settings_persist() {
 
     blocker.wait_until_started().await;
 
-    let resp = tokio::time::timeout(
-        Duration::from_millis(100),
-        h.execute(r#"{ settings { completeDir } }"#),
-    )
-    .await
-    .expect("settings query should stay responsive while persist is blocked");
+    let resp = h.execute(r#"{ settings { completeDir } }"#).await;
     assert_no_errors(&resp);
     assert_ne!(
         response_data(&resp)["settings"]["completeDir"]

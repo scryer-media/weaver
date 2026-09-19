@@ -5,7 +5,7 @@ use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 /// A filesystem path as a GraphQL string literal, so a Windows separator does
 /// not read as an escape.
 fn gql_string(path: &std::path::Path) -> String {
-    serde_json::to_string(path.to_string_lossy().as_ref()).unwrap()
+    serde_json::to_string(&*path.to_string_lossy()).unwrap()
 }
 
 #[tokio::test]
@@ -22,7 +22,7 @@ async fn browse_specific_path() {
     let data = response_data(&resp);
     assert_eq!(
         data["browseDirectories"]["currentPath"].as_str().unwrap(),
-        tempdir.path().to_string_lossy().as_ref()
+        &*tempdir.path().to_string_lossy()
     );
 }
 
@@ -90,7 +90,7 @@ async fn browse_default_relative_complete_dir_is_resolved() {
     let data = response_data(&resp);
     assert_eq!(
         data["browseDirectories"]["currentPath"].as_str().unwrap(),
-        complete_dir.path().to_string_lossy().as_ref()
+        &*complete_dir.path().to_string_lossy()
     );
 }
 
@@ -173,7 +173,7 @@ async fn browse_has_parent_path() {
         parent.is_some(),
         "browsing a subdirectory should have a parentPath"
     );
-    assert_eq!(parent.unwrap(), tempdir.path().to_string_lossy().as_ref());
+    assert_eq!(parent.unwrap(), &*tempdir.path().to_string_lossy());
 }
 
 #[tokio::test]
@@ -217,11 +217,11 @@ async fn create_directory_creates_folder_and_returns_listing() {
     let data = response_data(&resp);
     assert_eq!(
         data["createDirectory"]["currentPath"].as_str().unwrap(),
-        created_path.to_string_lossy().as_ref()
+        &*created_path.to_string_lossy()
     );
     assert_eq!(
         data["createDirectory"]["parentPath"].as_str().unwrap(),
-        tempdir.path().to_string_lossy().as_ref()
+        &*tempdir.path().to_string_lossy()
     );
     assert!(
         data["createDirectory"]["entries"]

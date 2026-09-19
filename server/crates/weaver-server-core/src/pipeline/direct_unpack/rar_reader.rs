@@ -130,7 +130,6 @@ impl Seek for RarVolumeReader {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
     use unrar_rs::VolumeProvider;
 
     fn input(bytes: &[u8]) -> (tempfile::TempDir, RarVolumeProvider) {
@@ -145,14 +144,9 @@ mod tests {
     }
 
     fn wait_for_park(coverage: &SetCoverage) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while coverage.park_count() == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
+        while coverage.park_count() == 0 {
+            std::thread::yield_now();
         }
-        assert!(
-            coverage.park_count() > 0,
-            "reader did not reach the input gap"
-        );
     }
 
     #[test]
@@ -170,10 +164,7 @@ mod tests {
         wait_for_park(&provider.coverage);
         assert!(rx.try_recv().is_err());
         provider.coverage.note_committed_range(0, 3, 5);
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(),
-            *b"abcdefgh"
-        );
+        assert_eq!(rx.recv().unwrap().unwrap(), *b"abcdefgh");
         worker.join().unwrap();
     }
 

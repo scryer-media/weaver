@@ -568,7 +568,8 @@ mod tests {
         security.apply_stored_access_policy_revision(None, None, false);
         let token = "expired-subscription-token";
         let csrf = "expired-subscription-csrf";
-        db.create_browser_session(&browser_session(token, csrf, epoch_seconds() + 1))
+        let expires_at = epoch_seconds() + 3600;
+        db.create_browser_session(&browser_session(token, csrf, expires_at))
             .unwrap();
         let request_auth = request_auth(db.clone(), security);
         let peer = Some("127.0.0.1:49152".parse().unwrap());
@@ -580,8 +581,15 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            authorization.remains_active(&request_auth, peer).await,
+            "the subscription must be open before its expiry can close it"
+        );
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Expire the session under the open subscription by moving its expiry
+        // into the past, not by waiting for the clock to reach it.
+        db.set_browser_session_expiry(&hash_to_hex(token), epoch_seconds() - 1)
+            .unwrap();
         assert!(
             !authorization.remains_active(&request_auth, peer).await,
             "the live transport check must close an existing subscription after expiry"

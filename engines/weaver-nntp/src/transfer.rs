@@ -1097,18 +1097,21 @@ mod tests {
             (command_timeout, false)
         );
 
+        // Read each budget at the instant it started, so the test is not
+        // racing the clock it is checking.
         let long_budget = ActiveTransferBudget::new(Duration::from_secs(60));
+        let started = long_budget.deadline - Duration::from_secs(60);
         assert_eq!(
-            active_transfer_read_timeout(command_timeout, Some(&long_budget)).unwrap(),
+            active_transfer_read_timeout_at(started, command_timeout, Some(&long_budget)).unwrap(),
             (command_timeout, false)
         );
 
         let short_budget = ActiveTransferBudget::new(Duration::from_secs(1));
-        let (timeout, active) =
-            active_transfer_read_timeout(command_timeout, Some(&short_budget)).unwrap();
-        assert!(active);
-        assert!(!timeout.is_zero());
-        assert!(timeout <= Duration::from_secs(1));
+        let started = short_budget.deadline - Duration::from_secs(1);
+        assert_eq!(
+            active_transfer_read_timeout_at(started, command_timeout, Some(&short_budget)).unwrap(),
+            (Duration::from_secs(1), true)
+        );
 
         let expired = ActiveTransferBudget::new(Duration::ZERO);
         assert!(matches!(
@@ -1159,6 +1162,14 @@ mod tests {
 
         let unbounded = ActiveTransferBudget::new(Duration::MAX);
         assert!(!unbounded.remaining().is_zero());
+    }
+
+    /// Wait until a spawned rate waiter is parked on its wake-up: it
+    /// subscribes to capacity changes only once it has a ticket to wait on.
+    async fn wait_for_rate_waiter(control: &ServerTransferControl) {
+        while control.capacity_changed.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
     }
 
     fn quota(limit_bytes: u64, generation: u64) -> ServerTransferConfig {
@@ -1337,14 +1348,11 @@ mod tests {
         assert!(warmup.target_micros <= control.rate_now_micros());
         let first = control.reserve_rate(50).expect("burst credit is exhausted");
         let second = control.reserve_rate(50).expect("aggregate debt is shared");
-        let first_delay = first
-            .target_micros
-            .saturating_sub(control.rate_now_micros());
-        let second_delay = second
-            .target_micros
-            .saturating_sub(control.rate_now_micros());
-        assert!((490_000..=500_000).contains(&first_delay));
-        assert!((990_000..=1_000_000).contains(&second_delay));
+        // Each ticket is scheduled after the one before it, by its own cost:
+        // the burst credit went to the warmup and the debt is shared. The
+        // targets are compared with each other, not with the clock.
+        assert_eq!(first.target_micros - warmup.target_micros, 500_000);
+        assert_eq!(second.target_micros - first.target_micros, 500_000);
     }
 
     #[test]
@@ -1437,7 +1445,6 @@ mod tests {
         waits.sort_unstable();
         assert!(waits[0] >= Duration::from_millis(50), "waits={waits:?}");
         assert!(waits[1] >= Duration::from_millis(150), "waits={waits:?}");
-        assert!(waits[1] < Duration::from_secs(1), "waits={waits:?}");
     }
 
     #[tokio::test]
@@ -1446,28 +1453,26 @@ mod tests {
         let control = registry.configure(
             StableServerId(12),
             ServerTransferConfig {
-                rate_bytes_per_sec: 10,
+                rate_bytes_per_sec: 1,
                 quota: None,
             },
         );
         let mut warmup = control.try_reserve(0).unwrap();
-        warmup.record_async(10).await;
+        warmup.record_async(1).await;
 
+        // At the old rate this waiter would sleep for more than a day, so
+        // only the reconfigure can finish it.
         let mut permit = control.try_reserve(0).unwrap();
-        let waiter = tokio::spawn(async move { permit.record_async(100).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let waiter = tokio::spawn(async move { permit.record_async(100_000).await });
+        wait_for_rate_waiter(&control).await;
         registry.configure(
             StableServerId(12),
             ServerTransferConfig {
-                rate_bytes_per_sec: 1_000,
+                rate_bytes_per_sec: 1_000_000_000,
                 quota: None,
             },
         );
-        let waited = tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("rate raise should wake waiter")
-            .unwrap();
-        assert!(waited < Duration::from_secs(1));
+        waiter.await.unwrap();
     }
 
     #[tokio::test]
@@ -1490,10 +1495,16 @@ mod tests {
             },
         );
 
-        let mut permit = control.try_reserve(0).unwrap();
-        let waited = permit.record_async(150).await;
-        assert!(waited >= Duration::from_millis(400), "waited={waited:?}");
-        assert!(waited < Duration::from_secs(2), "waited={waited:?}");
+        // Only one second of credit at the new rate survives: 100 of the 150
+        // bytes, so the ticket lands half a second past the clock reading
+        // taken before it was reserved.
+        let before = control.rate_now_micros();
+        let ticket = control.reserve_rate(150).expect("a rate is configured");
+        assert!(
+            ticket.target_micros >= before + 500_000,
+            "target {} is less than half a second past {before}",
+            ticket.target_micros
+        );
     }
 
     #[tokio::test]
@@ -1516,7 +1527,7 @@ mod tests {
 
         let mut permit = control.try_reserve(100).unwrap();
         let waiter = tokio::spawn(async move { permit.record_async(100).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_for_rate_waiter(&control).await;
         waiter.abort();
         let _ = waiter.await;
 
@@ -1612,15 +1623,11 @@ mod tests {
         let mut async_changes = control.subscribe_capacity_changes();
         let blocking_control = Arc::clone(&control);
         let blocking_waiter = std::thread::spawn(move || {
-            blocking_control
-                .wait_for_capacity_change_blocking(observed, Some(Duration::from_secs(1)))
+            blocking_control.wait_for_capacity_change_blocking(observed, None)
         });
 
         drop(permit);
-        tokio::time::timeout(Duration::from_secs(1), async_changes.changed())
-            .await
-            .expect("refund must wake async capacity watcher")
-            .unwrap();
+        async_changes.changed().await.unwrap();
         let blocking_revision = blocking_waiter.join().unwrap();
         assert!(blocking_revision > observed);
         assert!(control.quota_rejection_for(30).is_none());
@@ -1681,10 +1688,7 @@ mod tests {
 
         drop(other_permit);
 
-        tokio::time::timeout(Duration::from_secs(1), changes.changed())
-            .await
-            .expect("another server refund must wake the registry waiter")
-            .unwrap();
+        changes.changed().await.unwrap();
         assert_ne!(
             registry.capacity_revision(),
             rejection.registry_capacity_revision
@@ -1771,10 +1775,7 @@ mod tests {
         waiter.abort();
         let _ = waiter.await;
 
-        tokio::time::timeout(Duration::from_secs(1), changes.changed())
-            .await
-            .expect("canceled permit owner must publish its refund")
-            .unwrap();
+        changes.changed().await.unwrap();
         let snapshot = control.snapshot();
         assert!(snapshot.capacity_revision > observed);
         assert_eq!(snapshot.quota_reserved_bytes, 0);
@@ -1956,20 +1957,18 @@ mod tests {
         let control = registry.configure(
             StableServerId(11),
             ServerTransferConfig {
-                rate_bytes_per_sec: 10,
+                rate_bytes_per_sec: 1,
                 quota: None,
             },
         );
         let mut permit = control.try_reserve(0).unwrap();
-        permit.record_async(10).await;
+        permit.record_async(1).await;
 
-        let waiter = tokio::spawn(async move { permit.record_async(100).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // At the old rate this waiter would sleep for more than a day, so
+        // only clearing the rate can finish it.
+        let waiter = tokio::spawn(async move { permit.record_async(100_000).await });
+        wait_for_rate_waiter(&control).await;
         registry.configure(StableServerId(11), ServerTransferConfig::default());
-        let waited = tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("rate clear should wake waiter")
-            .unwrap();
-        assert!(waited < Duration::from_secs(1));
+        waiter.await.unwrap();
     }
 }

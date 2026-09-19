@@ -49,20 +49,22 @@ async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
             .unwrap();
         socket.flush().await.unwrap();
 
-        for _ in 0..20 {
+        // The body never ends: only the client's soft timeout can end the
+        // read, however slowly the client runs.
+        loop {
             tokio::time::sleep(line_delay).await;
             if socket.write_all(LINE).await.is_err() || socket.flush().await.is_err() {
                 return;
             }
         }
-        let _ = socket.write_all(b"=yend size=2560\r\n.\r\n").await;
-        let _ = socket.flush().await;
     });
 
     port
 }
 
-async fn spawn_delayed_body_initial_server(delay: Duration) -> u16 {
+/// Answers a BODY with nothing at all, holding the session open until the
+/// client gives up on it.
+async fn spawn_delayed_body_initial_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -79,19 +81,15 @@ async fn spawn_delayed_body_initial_server(delay: Duration) -> u16 {
 
         let body = read_command_line(&mut socket).await;
         assert!(body.starts_with("BODY "));
-        tokio::time::sleep(delay).await;
-        let _ = socket
-            .write_all(
-                b"222 1 <delayed@example.com>\r\n=ybegin line=128 size=1 name=x\r\nk\r\n=yend size=1\r\n.\r\n",
-            )
-            .await;
-        let _ = socket.flush().await;
+        let _ = socket.read_to_end(&mut Vec::new()).await;
     });
 
     port
 }
 
-async fn spawn_delayed_reauth_server(delay: Duration) -> u16 {
+/// Asks for re-authentication mid-session, then never answers the AUTHINFO,
+/// holding the session open until the client gives up on it.
+async fn spawn_delayed_reauth_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -122,9 +120,7 @@ async fn spawn_delayed_reauth_server(delay: Duration) -> u16 {
 
         let user = read_command_line(&mut socket).await;
         assert!(user.starts_with("AUTHINFO USER "));
-        tokio::time::sleep(delay).await;
-        let _ = socket.write_all(b"381 password required\r\n").await;
-        let _ = socket.flush().await;
+        let _ = socket.read_to_end(&mut Vec::new()).await;
     });
 
     port
@@ -160,7 +156,7 @@ async fn spawn_unterminated_body_server() -> u16 {
             .unwrap();
         socket.write_all(&vec![b'x'; 64 * 1024]).await.unwrap();
         socket.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = socket.read_to_end(&mut Vec::new()).await;
     });
 
     port
@@ -190,8 +186,7 @@ async fn spawn_probe_confirmation_server(head_response: &'static [u8]) -> u16 {
 
     tokio::spawn(async move {
         loop {
-            let accept = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
-            let Ok(Ok((mut socket, _))) = accept else {
+            let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
 
@@ -281,12 +276,7 @@ async fn spawn_pipelined_head_recheck_server() -> u16 {
                 continue;
             }
             if line.starts_with("HEAD <first@example.com>") {
-                let second = tokio::time::timeout(
-                    Duration::from_millis(250),
-                    read_command_line(&mut socket),
-                )
-                .await
-                .expect("the HEAD re-check must send every miss before reading an answer");
+                let second = read_command_line(&mut socket).await;
                 assert!(
                     second.starts_with("HEAD <second@example.com>"),
                     "unexpected second command: {second:?}"
@@ -307,14 +297,19 @@ async fn spawn_pipelined_head_recheck_server() -> u16 {
     port
 }
 
+/// Longer than any test runs. A script answers, closes or deliberately goes
+/// silent, so a connection's own timeouts only decide a test that sets them
+/// itself, never a slow runner.
+const UNREACHED_TIMEOUT: Duration = Duration::from_secs(3600);
+
 fn scripted_server(port: u16, group: usize) -> ServerPoolConfig {
     ServerPoolConfig {
         server: ServerConfig {
             host: "127.0.0.1".into(),
             port,
             tls: false,
-            connect_timeout: Duration::from_secs(1),
-            command_timeout: Duration::from_secs(1),
+            connect_timeout: UNREACHED_TIMEOUT,
+            command_timeout: UNREACHED_TIMEOUT,
             ..Default::default()
         },
         max_connections: 2,
@@ -352,9 +347,7 @@ async fn spawn_checkpoint_plan_pipelining_server() -> u16 {
 
         let first = read_command_line(&mut socket).await;
         assert_eq!(first, "BODY <first@checkpoint.test>\r\n");
-        let second = tokio::time::timeout(Duration::from_secs(1), read_command_line(&mut socket))
-            .await
-            .expect("depth-2 lane must issue both BODY commands before a response");
+        let second = read_command_line(&mut socket).await;
         assert_eq!(second, "BODY <second@checkpoint.test>\r\n");
         socket
             .write_all(&yenc_body_response(
@@ -412,10 +405,7 @@ async fn spawn_stat_server(expect_pipelined: bool) -> u16 {
         let first = read_command_line(&mut socket).await;
         assert!(first.starts_with("STAT <first@example.com>"));
         if expect_pipelined {
-            let second =
-                tokio::time::timeout(Duration::from_millis(250), read_command_line(&mut socket))
-                    .await
-                    .expect("known pipelining mode must send the next STAT before a response");
+            let second = read_command_line(&mut socket).await;
             assert!(second.starts_with("STAT <second@example.com>"));
             socket
                 .write_all(
@@ -608,16 +598,13 @@ fn blocking_body_lane_candidate_survives_the_over_limit_holdoff() {
 
 #[test]
 fn blocking_body_lane_candidate_keeps_backfill_locked_until_fill_excluded() {
-    // The fill server negotiates STARTTLS, which an owned lane cannot do, so
-    // the only lane candidate is a backfill server — and that must stay
-    // unreachable for ordinary work.
+    // The fill server is allowed no connections at all, so the only lane
+    // candidate is a backfill server — and that must stay unreachable for
+    // ordinary work.
     let client = NntpClient::new(NntpClientConfig {
         servers: vec![
             ServerPoolConfig {
-                server: ServerConfig {
-                    starttls: true,
-                    ..scripted_server(1, 0).server
-                },
+                max_connections: 0,
                 ..scripted_server(1, 0)
             },
             ServerPoolConfig {
@@ -936,7 +923,7 @@ async fn stat_batch_that_stalls_mid_command_still_cools_the_server_down() {
             },
         ],
         // Keep the socket open but silent so the STAT reply never arrives.
-        Duration::from_secs(3),
+        UNREACHED_TIMEOUT,
     )
     .await;
 
@@ -1145,6 +1132,11 @@ fn acquire_timeout_is_capacity_not_transport() {
         NntpError::AcquireTimeout(15).to_string(),
         "no connection available within 15s"
     );
+    // Zero is not a duration: it is the pool declining to wait at all.
+    assert_eq!(
+        NntpError::AcquireTimeout(0).to_string(),
+        "no connection available; did not wait"
+    );
 }
 
 #[test]
@@ -1332,7 +1324,7 @@ fn quota_selection_client(
         servers,
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     })
 }
 
@@ -1382,7 +1374,7 @@ async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_movi
         ],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
 
     let large = client.body_server_selection_with_estimate(&[], 41).await;
@@ -1464,7 +1456,7 @@ async fn pipelined_article_not_found_keeps_the_batch_and_connection_clean() {
         servers: vec![scripted_server(port, 0)],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(2),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
     let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
     let message_ids = ["<one@miss-batch>", "<two@miss-batch>", "<three@miss-batch>"];
@@ -1543,7 +1535,7 @@ async fn quota_stopped_pipeline_reports_every_unissued_item_without_poisoning_la
         servers: vec![server],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
     let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
     let message_ids = [
@@ -2090,7 +2082,7 @@ async fn decoded_quota_rejection_fails_over_to_another_fill_server() {
         servers: vec![capped, healthy],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
 
     let trace = client
@@ -2158,7 +2150,7 @@ async fn decoded_quota_rejection_does_not_unlock_backfill() {
         servers: vec![capped, backfill],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
 
     let trace = client
@@ -2275,12 +2267,9 @@ async fn remote_trickle_consumes_active_budget_and_fails_over() {
         soft_timeout: Duration::from_millis(75),
     });
 
-    let trace = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.fetch_body_decoded_with_groups_traced("<trickle@example.com>", &[]),
-    )
-    .await
-    .expect("trickle failover must complete before the watchdog");
+    let trace = client
+        .fetch_body_decoded_with_groups_traced("<trickle@example.com>", &[])
+        .await;
     let decoded = trace.result.expect("backup should satisfy the BODY fetch");
     assert_eq!(decoded.decoded.concat(), vec![b'A'; 128]);
     assert_eq!(trace.attempts.len(), 2);
@@ -2307,7 +2296,7 @@ async fn remote_trickle_consumes_active_budget_and_fails_over() {
 
 #[tokio::test]
 async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
-    let primary_port = spawn_delayed_body_initial_server(Duration::from_millis(300)).await;
+    let primary_port = spawn_delayed_body_initial_server().await;
     let backup_port = spawn_scripted_server(vec![
         ScriptStep {
             expect_prefix: None,
@@ -2333,12 +2322,9 @@ async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
         soft_timeout: Duration::from_millis(75),
     });
 
-    let trace = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.fetch_body_decoded_with_groups_traced("<delayed@example.com>", &[]),
-    )
-    .await
-    .expect("initial-response failover must complete before the watchdog");
+    let trace = client
+        .fetch_body_decoded_with_groups_traced("<delayed@example.com>", &[])
+        .await;
 
     assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
     assert_eq!(trace.attempts.len(), 2);
@@ -2353,7 +2339,7 @@ async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
 
 #[tokio::test]
 async fn delayed_reauth_consumes_active_budget_and_fails_over() {
-    let primary_port = spawn_delayed_reauth_server(Duration::from_millis(300)).await;
+    let primary_port = spawn_delayed_reauth_server().await;
     let backup_port = spawn_scripted_server(vec![
         ScriptStep {
             expect_prefix: None,
@@ -2379,12 +2365,9 @@ async fn delayed_reauth_consumes_active_budget_and_fails_over() {
         soft_timeout: Duration::from_millis(75),
     });
 
-    let trace = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.fetch_body_decoded_with_groups_traced("<reauth@example.com>", &[]),
-    )
-    .await
-    .expect("re-auth failover must complete before the watchdog");
+    let trace = client
+        .fetch_body_decoded_with_groups_traced("<reauth@example.com>", &[])
+        .await;
 
     assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
     assert_eq!(trace.attempts.len(), 2);
@@ -2438,15 +2421,12 @@ async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
         soft_timeout: Duration::from_millis(75),
     });
 
-    let trace = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.fetch_body_with_groups_traced(
+    let trace = client
+        .fetch_body_with_groups_traced(
             "<unterminated@example.com>",
             &[String::from("alt.binaries.test")],
-        ),
-    )
-    .await
-    .expect("raw timeout cleanup must not wait on the rate limiter");
+        )
+        .await;
 
     assert_eq!(trace.result.unwrap().as_ref(), b"backup\r\n");
     assert_eq!(trace.attempts.len(), 2);
@@ -2671,7 +2651,6 @@ async fn parked_extra_body_lane_is_not_returned_to_normal_idle_pool() {
         .await
         .expect("extra BODY lane should acquire");
     extra.park();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let normal = client
         .acquire_body_lane(ServerId(0), &[String::from("alt.binaries.test")])
@@ -3162,70 +3141,30 @@ fn lane_config(tls: bool, starttls: bool, pinned_ca: bool) -> ServerConfig {
     }
 }
 
-/// Owned lanes are the one download path, so a plaintext server gets one too:
-/// its lane is what serves BODY, PAR2 recovery and the existence probe from a
-/// single warm connection. Only STARTTLS is left out, because the blocking
-/// transport has no in-band upgrade.
+/// Owned lanes are the one download engine, so every server gets one: there is
+/// no second path left for a config to fall to. Plaintext, implicit TLS with
+/// and without a pinned CA, STARTTLS, and an adopted name-mismatch certificate
+/// are all lane-served.
 #[test]
-fn a_plaintext_server_gets_an_owned_lane_and_a_starttls_one_does_not() {
-    assert!(supports_blocking_body_lane(&lane_config(
-        false, false, false
-    )));
-    assert!(!supports_blocking_body_lane(&lane_config(true, true, true)));
-    assert!(!supports_blocking_body_lane(&lane_config(
-        false, true, false
-    )));
+fn every_server_arrangement_gets_an_owned_lane() {
+    for tls in [false, true] {
+        for starttls in [false, true] {
+            for pinned_ca in [false, true] {
+                assert!(
+                    supports_blocking_body_lane(&lane_config(tls, starttls, pinned_ca)),
+                    "tls={tls} starttls={starttls} pinned_ca={pinned_ca}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn blocking_tls_lane_eligibility_rejects_plain_and_starttls() {
-    use crate::tls::NntpTlsBackend;
-
-    assert!(!blocking_lane_tls_eligible(
-        &lane_config(false, false, true),
-        NntpTlsBackend::ManualRustls
-    ));
-    assert!(!blocking_lane_tls_eligible(
-        &lane_config(true, true, true),
-        NntpTlsBackend::ManualRustls
-    ));
-}
-
-#[test]
-fn blocking_tls_lane_eligibility_rustls_works_without_pinned_ca() {
-    use crate::tls::NntpTlsBackend;
-
-    assert!(blocking_lane_tls_eligible(
-        &lane_config(true, false, false),
-        NntpTlsBackend::ManualRustls
-    ));
-    assert!(blocking_lane_tls_eligible(
-        &lane_config(true, false, true),
-        NntpTlsBackend::ManualRustls
-    ));
-}
-
-#[test]
-fn adopted_name_mismatch_certificate_forces_the_rustls_body_lane() {
+fn adopted_name_mismatch_certificate_still_gets_an_owned_lane() {
     let mut config = lane_config(true, false, false);
     config.tls_name_mismatch_certificate_der = Some(vec![0x30, 0x82, 0x01, 0x0a]);
 
     assert!(supports_blocking_body_lane(&config));
-}
-
-#[cfg(not(windows))]
-#[test]
-fn blocking_tls_lane_eligibility_s2n_requires_pinned_ca() {
-    use crate::tls::NntpTlsBackend;
-
-    assert!(!blocking_lane_tls_eligible(
-        &lane_config(true, false, false),
-        NntpTlsBackend::S2n
-    ));
-    assert!(blocking_lane_tls_eligible(
-        &lane_config(true, false, true),
-        NntpTlsBackend::S2n
-    ));
 }
 
 /// A 501 is a syntax error in the one request, not a server without STAT.
@@ -3381,7 +3320,7 @@ fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
         ],
         max_idle_age: Duration::from_secs(300),
         max_retries_per_server: 0,
-        soft_timeout: Duration::from_secs(1),
+        soft_timeout: UNREACHED_TIMEOUT,
     });
 
     // A dispatch that skips the limited server for headroom is the server

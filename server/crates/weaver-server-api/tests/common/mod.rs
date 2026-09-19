@@ -244,6 +244,17 @@ impl TestHarness {
             weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
         let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())
             .expect("failed to create update checker");
+        // The upgrade surface is part of the schema, so the harness carries one
+        // too. Its profile directory is the test's own temporary tree: nothing
+        // here may touch a real installation.
+        let application_upgrade =
+            weaver_server_core::application_upgrade::ApplicationUpgradeService::new(
+                db.clone(),
+                update_check.clone(),
+                tempdir.path(),
+                weaver_server_core::application_upgrade::collect_installation_assessment(),
+                None,
+            );
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
             scheduled_resume: scheduled_resume.clone(),
@@ -256,6 +267,7 @@ impl TestHarness {
             rss,
             watch_folder,
             update_check: update_check.clone(),
+            application_upgrade,
             schedules: shared_schedules,
             log_buffer:
                 weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
@@ -600,6 +612,7 @@ fn spawn_test_scheduler(
                         probe_projected_failed_bytes: 0,
                         par2_bytes,
                         health_probing: false,
+                        health_deferral: Default::default(),
                         health_probe_round: 0,
                         health_probe_failing_files: 0,
                         health_failing_files: std::collections::HashSet::new(),
@@ -753,6 +766,7 @@ fn spawn_test_scheduler(
                         probe_projected_failed_bytes: 0,
                         par2_bytes,
                         health_probing: false,
+                        health_deferral: Default::default(),
                         health_probe_round: 0,
                         health_probe_failing_files: 0,
                         health_failing_files: std::collections::HashSet::new(),

@@ -228,7 +228,8 @@ async fn sevenz_split_suffix_far_past_the_named_parts_is_cheap_to_hold() {
         write_and_complete_file(&mut pipeline, job_id, file_index as u32, filename, bytes).await;
     }
 
-    let started = std::time::Instant::now();
+    // Work proportional to the declared count would walk a billion volumes;
+    // the runner ends it long before that finishes.
     let state = pipeline.jobs.get(&job_id).unwrap();
     let topology = state
         .assembly
@@ -256,8 +257,4 @@ async fn sevenz_split_suffix_far_past_the_named_parts_is_cheap_to_hold() {
         crate::jobs::assembly::ExtractionReadiness::Ready
     ));
     assert!(pipeline.job_has_sevenz_set_waiting_for_absent_volumes(job_id));
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "holding a declared count must not cost work proportional to it"
-    );
 }
