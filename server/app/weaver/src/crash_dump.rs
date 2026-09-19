@@ -28,11 +28,11 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use tracing::{info, warn};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME,
+    CloseHandle, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_ALWAYS, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
@@ -128,11 +128,25 @@ fn dump_directory(log_file: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// What the dump thread needs from the faulting thread, and its answer.
+///
+/// Process-static rather than a local of the filter. The dump thread reads it
+/// for as long as it runs, and a wait that ends early — a timeout, or a wait
+/// that fails outright — leaves that thread running: a request on the faulting
+/// thread's stack would then be read out of a frame that had already gone.
+/// Static is also the allocation-free way to own it, which matters in a filter
+/// that must not allocate. Only the first faulting thread ever reaches it, so
+/// there is exactly one writer.
 struct DumpRequest {
-    exception_info: *const EXCEPTION_POINTERS,
-    faulting_thread_id: u32,
+    exception_info: AtomicPtr<EXCEPTION_POINTERS>,
+    faulting_thread_id: AtomicU32,
     written: AtomicBool,
 }
+
+static DUMP_REQUEST: DumpRequest = DumpRequest {
+    exception_info: AtomicPtr::new(std::ptr::null_mut()),
+    faulting_thread_id: AtomicU32::new(0),
+    written: AtomicBool::new(false),
+};
 
 /// The top-level exception filter itself.
 unsafe extern "system" fn write_minidump(exception_info: *const EXCEPTION_POINTERS) -> i32 {
@@ -143,21 +157,24 @@ unsafe extern "system" fn write_minidump(exception_info: *const EXCEPTION_POINTE
         }
     }
     if let Some(target) = DUMP_TARGET.get() {
-        let request = DumpRequest {
-            exception_info,
-            // SAFETY: no preconditions; identifies the faulting thread.
-            faulting_thread_id: unsafe { GetCurrentThreadId() },
-            written: AtomicBool::new(false),
-        };
+        let request = &DUMP_REQUEST;
+        request
+            .exception_info
+            .store(exception_info.cast_mut(), Ordering::SeqCst);
+        // SAFETY: no preconditions; identifies the faulting thread.
+        request
+            .faulting_thread_id
+            .store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
         // SAFETY: `exception_info` is the pointer the OS handed this filter,
-        // valid for the duration of the call; `request` outlives the wait
-        // below; the target was built once at install time and is never
-        // mutated.
+        // valid for the duration of the call; the request is static, so the
+        // dump thread can read it whatever this thread does next; the target
+        // was built once at install time and is never mutated.
         unsafe {
-            if !dump_on_fresh_thread(&request) {
-                // No thread could be created: dump on this stack and hope it
-                // is deep enough. Better a truncated dump than none.
-                dump_thread_main((&request as *const DumpRequest).cast_mut().cast());
+            if !dump_on_fresh_thread(request) {
+                // No thread could be created, so nothing else is reading the
+                // request: dump on this stack and hope it is deep enough.
+                // Better a truncated dump than none.
+                dump_thread_main(std::ptr::from_ref(request).cast_mut().cast());
             }
             record_in_log(
                 target,
@@ -175,14 +192,20 @@ unsafe extern "system" fn write_minidump(exception_info: *const EXCEPTION_POINTE
 }
 
 /// Runs the dump on a new thread with a full stack and waits for it. Returns
-/// `false` when no thread could be started.
+/// `false` when no thread could be started — and only then, so the inline
+/// fallback never runs beside a live dump thread.
 ///
-/// A wait that times out leaves the dump thread running against `request`;
-/// the caller then writes its log line and returns, and the OS terminates
-/// the process, dump thread included. That is the intended end state.
-unsafe fn dump_on_fresh_thread(request: &DumpRequest) -> bool {
+/// The wait has three outcomes and each is taken for what it is. Signalled:
+/// the dump is finished and its answer is in the request. Timed out, or the
+/// wait itself failed: the dump thread may still be running and still reading
+/// the request, so nothing may be freed on its account — which is why the
+/// request is static — and the caller writes its log line from an answer that
+/// is simply not there yet, then returns to let the process die as it was
+/// going to. Either way the process is already terminating; this function's
+/// job is only to make sure the worker never outlives what it reads.
+unsafe fn dump_on_fresh_thread(request: &'static DumpRequest) -> bool {
     // SAFETY: the start routine has the required ABI, and the parameter is a
-    // pointer this function keeps alive until the wait below returns.
+    // pointer to process-static state, valid for as long as the thread runs.
     let thread: HANDLE = unsafe {
         CreateThread(
             std::ptr::null(),
@@ -197,10 +220,16 @@ unsafe fn dump_on_fresh_thread(request: &DumpRequest) -> bool {
         return false;
     }
     // SAFETY: `thread` is a live handle from `CreateThread` above.
-    unsafe {
-        WaitForSingleObject(thread, DUMP_WAIT_MS);
-        CloseHandle(thread);
+    let wait = unsafe { WaitForSingleObject(thread, DUMP_WAIT_MS) };
+    if wait != WAIT_OBJECT_0 {
+        // The dump thread is stuck, or the wait could not be made at all. The
+        // request it reads is static and the handle below is only this
+        // thread's reference to it, so letting go of both is safe; the dump
+        // simply did not finish, and the log line says so.
+        request.written.store(false, Ordering::SeqCst);
     }
+    // SAFETY: `thread` came from `CreateThread` above and is not used again.
+    unsafe { CloseHandle(thread) };
     true
 }
 
@@ -209,8 +238,8 @@ unsafe extern "system" fn dump_thread_main(parameter: *mut c_void) -> u32 {
     let Some(target) = DUMP_TARGET.get() else {
         return 0;
     };
-    // SAFETY: the parameter is the `DumpRequest` the faulting thread keeps
-    // alive while it waits on this thread.
+    // SAFETY: the parameter is the process-static `DumpRequest`, which
+    // outlives every thread that reads it.
     let request = unsafe { &*parameter.cast::<DumpRequest>() };
     // SAFETY: the request's exception pointers are the ones the OS handed the
     // filter, valid until the filter returns, which is after this thread.
@@ -240,8 +269,8 @@ unsafe fn write_dump(target: &DumpTarget, request: &DumpRequest) -> bool {
     }
 
     let exception = MINIDUMP_EXCEPTION_INFORMATION {
-        ThreadId: request.faulting_thread_id,
-        ExceptionPointers: request.exception_info.cast_mut(),
+        ThreadId: request.faulting_thread_id.load(Ordering::SeqCst),
+        ExceptionPointers: request.exception_info.load(Ordering::SeqCst),
         // The pointers belong to this process, not to a client one.
         ClientPointers: 0,
     };
