@@ -86,8 +86,8 @@ export function ProvidersBlock() {
               <Bar percent={load} color={ACTIVITY_TONE[activity.tone]} height={10} live />
               {/* The counts never leave: the state word answers "why", and the
                   fraction under it stays the thing you can check. */}
-              <div className="flex items-baseline justify-between gap-2 font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
-                {activity.cause ? <span className="min-w-0 truncate">{activity.cause}</span> : null}
+              <div className="flex flex-wrap items-baseline justify-between gap-x-2 font-wv-mono text-[10.5px] leading-[1.35] text-wv-faint">
+                {activity.cause ? <span className="min-w-0">{activity.cause}</span> : null}
                 <span className="ml-auto flex-none">{activity.fraction}</span>
               </div>
             </div>

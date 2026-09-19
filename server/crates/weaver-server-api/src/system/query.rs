@@ -327,8 +327,25 @@ impl SystemQuery {
             .data_opt::<Option<Arc<NntpPool>>>()
             .and_then(Clone::clone);
         let transport = handle.download_transport_health();
+        // Open sockets only mean "preparing" while a job is waiting to fetch
+        // through them; the pool's keep-alive after a finished download, or a
+        // paused queue, holds the same sockets open with nothing to prepare.
+        let work_waiting = !handle.is_globally_paused()
+            && handle.list_jobs().iter().any(|job| {
+                matches!(
+                    job.status,
+                    weaver_server_core::JobStatus::Queued
+                        | weaver_server_core::JobStatus::Downloading
+                        | weaver_server_core::JobStatus::Checking
+                )
+            });
         match live_pool.or(fallback_pool) {
-            Some(pool) => Ok(collect_server_health(&pool, runtime_generation, &transport).await),
+            Some(pool) => {
+                Ok(
+                    collect_server_health(&pool, runtime_generation, &transport, work_waiting)
+                        .await,
+                )
+            }
             None => Ok(Vec::new()),
         }
     }
@@ -590,6 +607,7 @@ async fn collect_server_health(
     pool: &NntpPool,
     runtime_generation: u64,
     transport: &[weaver_server_core::ServerTransportHealth],
+    work_waiting: bool,
 ) -> Vec<ServerHealth> {
     struct ServerLoadSnapshot {
         host: String,
@@ -656,6 +674,7 @@ async fn collect_server_health(
             let activity = crate::system::types::server_activity(
                 state,
                 snapshot.penalty_until.is_some(),
+                work_waiting,
                 open,
                 busy,
             );

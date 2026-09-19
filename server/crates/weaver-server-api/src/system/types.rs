@@ -1254,10 +1254,14 @@ pub struct ServerHealth {
 /// it is in a state someone can act on, and that state outranks whatever the
 /// sockets happen to be doing. Only once nothing is holding the server back do
 /// the counts decide, and "preparing" is the honest answer for sockets that
-/// are held open while no article is being fetched.
+/// are held open while no article is being fetched and a job is waiting on
+/// them. Without a waiting job those same open sockets are only the pool's
+/// keep-alive, which outlives a finished download by minutes, and that is
+/// "idle".
 pub(crate) fn server_activity(
     state: &str,
     holdoff_active: bool,
+    work_waiting: bool,
     connections_open: u32,
     connections_busy: u32,
 ) -> &'static str {
@@ -1275,7 +1279,7 @@ pub(crate) fn server_activity(
     if connections_busy > 0 {
         return "downloading";
     }
-    if connections_open > 0 {
+    if connections_open > 0 && work_waiting {
         return "preparing";
     }
     "idle"
@@ -1289,30 +1293,39 @@ mod tests {
 
     #[test]
     fn a_switched_off_server_outranks_every_other_signal() {
-        assert_eq!(server_activity("disabled", true, 8, 8), "disabled");
-        assert_eq!(server_activity("cooling_down", true, 8, 8), "cooling_down");
+        assert_eq!(server_activity("disabled", true, true, 8, 8), "disabled");
+        assert_eq!(
+            server_activity("cooling_down", true, true, 8, 8),
+            "cooling_down"
+        );
     }
 
     #[test]
     fn a_running_holdoff_outranks_degraded_and_the_socket_counts() {
-        assert_eq!(server_activity("healthy", true, 1, 0), "over_limit");
-        assert_eq!(server_activity("degraded", true, 4, 4), "over_limit");
+        assert_eq!(server_activity("healthy", true, true, 1, 0), "over_limit");
+        assert_eq!(server_activity("degraded", true, true, 4, 4), "over_limit");
     }
 
     #[test]
     fn degraded_outranks_the_socket_counts() {
-        assert_eq!(server_activity("degraded", false, 4, 4), "degraded");
+        assert_eq!(server_activity("degraded", false, true, 4, 4), "degraded");
     }
 
     #[test]
-    fn held_open_sockets_with_no_request_read_as_preparing() {
-        assert_eq!(server_activity("healthy", false, 4, 0), "preparing");
+    fn held_open_sockets_with_no_request_read_as_preparing_only_while_work_waits() {
+        assert_eq!(server_activity("healthy", false, true, 4, 0), "preparing");
+        // The pool's keep-alive after a finished download is not preparation.
+        assert_eq!(server_activity("healthy", false, false, 4, 0), "idle");
     }
 
     #[test]
     fn busy_sockets_read_as_downloading_and_none_reads_as_idle() {
-        assert_eq!(server_activity("healthy", false, 4, 1), "downloading");
-        assert_eq!(server_activity("healthy", false, 0, 0), "idle");
+        assert_eq!(server_activity("healthy", false, true, 4, 1), "downloading");
+        assert_eq!(
+            server_activity("healthy", false, false, 4, 1),
+            "downloading"
+        );
+        assert_eq!(server_activity("healthy", false, true, 0, 0), "idle");
     }
 
     #[test]
