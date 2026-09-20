@@ -2,6 +2,12 @@
 
 use super::*;
 
+const RPC_EXTENSION_ORIGINS: [&str; 3] = [
+    "chrome-extension://mpejfoghnejnbfkpbiafklkmlhebkapb",
+    "moz-extension://00000000-0000-4000-8000-000000000000",
+    "safari-web-extension://00000000-0000-4000-8000-000000000000",
+];
+
 #[tokio::test]
 async fn nzbunity_connection_and_queue_requests_accept_basic_auth_without_rpc_id() {
     let security = weaver_server_core::security::RuntimeSecurityConfig::default();
@@ -15,42 +21,39 @@ async fn nzbunity_connection_and_queue_requests_accept_basic_auth_without_rpc_id
 
     // NZBUnity 2.1.4 tests the connection with status, then loads listgroups
     // and config for its queue. Its requests omit the JSON-RPC id.
-    for method in ["status", "listgroups", "config"] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/jsonrpc")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, basic_auth("extension-key"))
-                    .header(
-                        header::ORIGIN,
-                        "chrome-extension://mpejfoghnejnbfkpbiafklkmlhebkapb",
-                    )
-                    .body(Body::from(
-                        serde_json::json!({"method": method, "params": []}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{method}");
-        assert_eq!(
-            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
-            Some(&HeaderValue::from_static(
-                "chrome-extension://mpejfoghnejnbfkpbiafklkmlhebkapb"
-            )),
-        );
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["version"], "1.1");
-        assert!(payload["error"].is_null(), "{method}: {payload}");
-        if method == "status" {
-            assert!(payload["result"]["ServerStandBy"].is_boolean());
-            assert!(payload["result"]["DownloadRate"].is_number());
-        } else {
-            assert!(payload["result"].is_array(), "{method}: {payload}");
+    for origin in RPC_EXTENSION_ORIGINS {
+        for method in ["status", "listgroups", "config"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/jsonrpc")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, basic_auth("extension-key"))
+                        .header(header::ORIGIN, origin)
+                        .body(Body::from(
+                            serde_json::json!({"method": method, "params": []}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static(origin)),
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["version"], "1.1");
+            assert!(payload["error"].is_null(), "{method}: {payload}");
+            if method == "status" {
+                assert!(payload["result"]["ServerStandBy"].is_boolean());
+                assert!(payload["result"]["DownloadRate"].is_number());
+            } else {
+                assert!(payload["result"].is_array(), "{method}: {payload}");
+            }
         }
     }
 }
@@ -71,10 +74,7 @@ async fn nzbget_extension_preflight_is_limited_to_rpc_paths() {
             Router::new().nest(base_url, routes)
         }
         .layer(cors_layer(&security, base_url).unwrap());
-        for origin in [
-            "chrome-extension://mpejfoghnejnbfkpbiafklkmlhebkapb",
-            "moz-extension://00000000-0000-4000-8000-000000000000",
-        ] {
+        for origin in RPC_EXTENSION_ORIGINS {
             for suffix in ["/jsonrpc", "/xmlrpc", "/graphql", "/api/auth/csrf", "/"] {
                 let response = app
                     .clone()
@@ -133,6 +133,12 @@ async fn nzbget_extension_cors_preserves_web_origin_allowlist() {
             "chrome-extension://user@extension",
             "chrome-extension://extension:1234",
             "chrome-extension://extension?query",
+            "https://safari-web-extension.example",
+            "safari-web-extension://extension/path",
+            "safari-web-extension://user@extension",
+            "safari-web-extension://extension:1234",
+            "safari-web-extension://extension?query",
+            "safari-web-extension://extension#fragment",
         ] {
             let response = app
                 .clone()
@@ -173,53 +179,52 @@ async fn nzbget_extension_origin_does_not_replace_api_key_authentication() {
         api_key_cache("read-key", "read"),
     )
     .layer(cors_layer(&security, "").unwrap());
-    for (auth, method, expected) in [
-        (None, "status", StatusCode::UNAUTHORIZED),
-        (
-            Some(basic_auth("invalid-key")),
-            "status",
-            StatusCode::UNAUTHORIZED,
-        ),
-        (
-            Some(basic_auth("read-key")),
-            "append",
-            StatusCode::FORBIDDEN,
-        ),
-    ] {
-        let mut request = Request::builder()
-            .method("POST")
-            .uri("/jsonrpc")
-            .header(
-                header::ORIGIN,
-                "chrome-extension://mpejfoghnejnbfkpbiafklkmlhebkapb",
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::COOKIE, "weaver_session=browser-session-token");
-        if let Some(auth) = auth {
-            request = request.header(header::AUTHORIZATION, auth);
+    for origin in RPC_EXTENSION_ORIGINS {
+        for (auth, method, expected) in [
+            (None, "status", StatusCode::UNAUTHORIZED),
+            (
+                Some(basic_auth("invalid-key")),
+                "status",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(basic_auth("read-key")),
+                "append",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(header::ORIGIN, origin)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, "weaver_session=browser-session-token");
+            if let Some(auth) = auth {
+                request = request.header(header::AUTHORIZATION, auth);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(Body::from(
+                            serde_json::json!({"method": method, "params": []}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert!(
+                response
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            );
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            );
         }
-        let response = app
-            .clone()
-            .oneshot(
-                request
-                    .body(Body::from(
-                        serde_json::json!({"method": method, "params": []}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), expected);
-        assert!(
-            response
-                .headers()
-                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-        );
-        assert!(
-            !response
-                .headers()
-                .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
-        );
     }
 }
 

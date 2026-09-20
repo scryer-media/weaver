@@ -172,8 +172,10 @@ fn browser_extension_origin(origin: &HeaderValue) -> bool {
     else {
         return false;
     };
-    matches!(url.scheme(), "chrome-extension" | "moz-extension")
-        && url.host_str().is_some()
+    matches!(
+        url.scheme(),
+        "chrome-extension" | "moz-extension" | "safari-web-extension"
+    ) && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
         && url.port().is_none()
