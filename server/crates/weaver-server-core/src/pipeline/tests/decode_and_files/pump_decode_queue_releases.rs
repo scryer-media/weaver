@@ -452,7 +452,6 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
             data: Err(DownloadError::Decode {
                 raw_size: 19,
                 error: "missing =ybegin header".to_string(),
-                crc_mismatch: false,
             }),
             attempts: Vec::new(),
             lane_observation: None,

@@ -165,7 +165,7 @@ impl Pipeline {
                         let crc_valid =
                             crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
-                            decode_result.expected_part_crc.is_some() && crc_valid;
+                            decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
@@ -194,9 +194,6 @@ impl Pipeline {
                         );
                     }
                     Err(e) => {
-                        if let weaver_yenc::YencError::CrcMismatch { .. } = &e {
-                            metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                        }
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");
@@ -238,7 +235,7 @@ impl Pipeline {
                         let crc_valid =
                             crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
-                            decode_result.expected_part_crc.is_some() && crc_valid;
+                            decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
@@ -267,9 +264,6 @@ impl Pipeline {
                         );
                     }
                     Err(e) => {
-                        if let weaver_yenc::YencError::CrcMismatch { .. } = &e {
-                            metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                        }
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");

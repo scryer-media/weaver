@@ -178,27 +178,6 @@ pub fn decode_body_chunk_until_control(
     decode_body_chunk_until_end(decode_state, input, output)
 }
 
-fn validate_ypart_decoded_size(
-    metadata: &YencMetadata,
-    bytes_written: usize,
-) -> Result<(), YencError> {
-    if metadata.part.is_some()
-        && let (Some(begin), Some(end)) = (metadata.begin, metadata.end)
-        // Checked arithmetic: `end < begin` is rejected at parse time, but the
-        // metadata is public and callers can hand us anything, and malformed
-        // input must never panic.
-        && let Some(expected_size) = end.checked_sub(begin).and_then(|len| len.checked_add(1))
-        && bytes_written as u64 != expected_size
-    {
-        return Err(YencError::SizeMismatch {
-            expected: expected_size,
-            actual: bytes_written as u64,
-        });
-    }
-
-    Ok(())
-}
-
 /// Shared post-decode validation for every article entry point (whole-buffer,
 /// streaming, and the fused NNTP decoder), so all three agree on which
 /// inconsistencies fail an article and which are merely recorded.
@@ -215,54 +194,35 @@ fn finalize_decode(
         Some(yend) => (yend.pcrc32, yend.crc32, yend.size, yend.defects, true),
         None => (None, None, None, YencHeaderDefects::default(), false),
     };
-    let defects = metadata.defects.merged(yend_defects);
-
-    // Validate decoded size against =yend size.
-    if let Some(expected_size) = yend_size
-        && bytes_written as u64 != expected_size
-    {
-        return Err(YencError::SizeMismatch {
-            expected: expected_size,
-            actual: bytes_written as u64,
-        });
+    let mut defects = metadata.defects.merged(yend_defects);
+    let multipart = metadata.part.is_some() || metadata.begin.is_some();
+    defects.yend_size_mismatch = yend_size.is_some_and(|size| size != bytes_written as u64);
+    if let (Some(begin), Some(end)) = (metadata.begin, metadata.end) {
+        defects.ypart_size_mismatch =
+            end.checked_sub(begin).and_then(|n| n.checked_add(1)) != Some(bytes_written as u64);
     }
-
-    validate_ypart_decoded_size(&metadata, bytes_written)?;
-
-    // For single-part articles, also validate =ybegin size vs =yend size --
-    // but only when =ybegin actually declared a usable size. A poster who
-    // omitted or mangled `size=` gives us nothing to cross-check against, and
-    // the placeholder 0 must not be read as a real declaration.
-    if metadata.part.is_none()
+    defects.ybegin_size_mismatch = !multipart
         && !defects.missing_size
         && !defects.invalid_size
-        && let Some(expected_size) = yend_size
-        && metadata.size != expected_size
-    {
-        return Err(YencError::SizeMismatch {
-            expected: metadata.size,
-            actual: expected_size,
-        });
-    }
+        && metadata.size != bytes_written as u64;
 
     // For single-part articles, the `crc32` field in =yend is the part CRC.
     // For multi-part articles, `pcrc32` is the part CRC.
-    let expected_crc_to_check = if metadata.part.is_some() {
+    let expected_crc_to_check = if multipart {
         expected_part_crc
     } else {
-        // For single-part, crc32 is the file CRC which equals the part CRC.
-        // A poster may emit only `pcrc32=` there;
-        // fall back so a lone part CRC is checked rather than read as absent.
-        expected_file_crc.or(expected_part_crc)
+        expected_part_crc.or(expected_file_crc)
+    };
+    // Do not reintroduce a contradictory single-part crc32 through the
+    // downstream whole-file verifier after preferring pcrc32 here.
+    let expected_file_crc = if multipart || expected_file_crc.is_none() {
+        expected_file_crc
+    } else {
+        expected_crc_to_check
     };
 
     let crc_status = match expected_crc_to_check {
-        Some(expected) if expected != part_crc => {
-            return Err(YencError::CrcMismatch {
-                expected,
-                actual: part_crc,
-            });
-        }
+        Some(expected) if expected != part_crc => CrcVerification::Mismatch,
         Some(_) => CrcVerification::Verified,
         // No usable expected CRC: either none was posted or it was unparseable
         // and dropped. Either way nothing was verified, and `crc_status` says
@@ -1064,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_article_decoder_crc_mismatch_errors() {
+    fn streaming_article_decoder_retains_crc_mismatch() {
         let original = b"Hello streamed yEnc";
         let mut article =
             format!("=ybegin line=128 size={} name=test.bin\r\n", original.len()).into_bytes();
@@ -1076,15 +1036,9 @@ mod tests {
         let mut decoder = StreamingArticleDecoder::new();
         let mut output = Vec::new();
         decoder.feed_chunk(&article, &mut output).unwrap();
-        let err = decoder.finish(output).unwrap_err();
-
-        assert!(matches!(
-            err,
-            YencError::CrcMismatch {
-                expected: 0xDEADBEEF,
-                ..
-            }
-        ));
+        let decoded = decoder.finish(output).unwrap();
+        assert_eq!(decoded.data, original);
+        assert_eq!(decoded.result.crc_status, CrcVerification::Mismatch);
     }
 
     #[test]
@@ -1642,10 +1596,10 @@ mod tests {
         }
     }
 
-    /// A real CRC mismatch must still fail: tolerance is about *absent* data,
-    /// not about accepting corrupt data.
+    /// Known damage remains distinct from missing checksums, even when the
+    /// decoded bytes are retained for repair.
     #[test]
-    fn genuine_crc_mismatch_still_fails_after_tolerance_changes() {
+    fn genuine_crc_mismatch_remains_distinct_from_unverified() {
         let article = broken_poster_article(
             b"junk line\r\n",
             b"=ybegin name=mismatch.bin\r\n",
@@ -1653,14 +1607,9 @@ mod tests {
         );
 
         let mut out = vec![0u8; article.len() + 64];
-        let err = decode_nntp(&article, &mut out).unwrap_err();
-        assert!(matches!(
-            err,
-            YencError::CrcMismatch {
-                expected: 0xDEADBEEF,
-                ..
-            }
-        ));
+        let result = decode_nntp(&article, &mut out).unwrap();
+        assert_eq!(&out[..result.bytes_written], TOLERANT_BODY);
+        assert_eq!(result.crc_status, CrcVerification::Mismatch);
     }
 
     /// A body with no `=ybegin` at all is still a hard failure, and the
@@ -1958,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_full_crc_mismatch_errors() {
+    fn decode_full_retains_crc_mismatch() {
         let original = b"Test data";
         let encoded_data = encode_raw(original);
 
@@ -1970,15 +1919,9 @@ mod tests {
         article.extend_from_slice(b"\r\n=yend size=9 crc32=DEADBEEF\r\n");
 
         let mut output = vec![0u8; 1024];
-        let err = decode(&article, &mut output).unwrap_err();
-
-        assert!(matches!(
-            err,
-            YencError::CrcMismatch {
-                expected: 0xDEADBEEF,
-                ..
-            }
-        ));
+        let result = decode(&article, &mut output).unwrap();
+        assert_eq!(&output[..result.bytes_written], original);
+        assert_eq!(result.crc_status, CrcVerification::Mismatch);
     }
 
     #[test]
@@ -2046,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_single_part_pcrc32_only_mismatch_errors() {
+    fn decode_single_part_pcrc32_only_mismatch_retains_bytes() {
         let original = b"Test data";
         let encoded_data = encode_raw(original);
 
@@ -2060,14 +2003,9 @@ mod tests {
         );
 
         let mut output = vec![0u8; 1024];
-        let err = decode(&article, &mut output).unwrap_err();
-        assert!(matches!(
-            err,
-            YencError::CrcMismatch {
-                expected: 0xDEADBEEF,
-                ..
-            }
-        ));
+        let result = decode(&article, &mut output).unwrap();
+        assert_eq!(&output[..result.bytes_written], original);
+        assert_eq!(result.crc_status, CrcVerification::Mismatch);
     }
 
     #[test]
@@ -2129,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_multipart_ypart_range_size_mismatch_errors() {
+    fn decode_multipart_ypart_range_size_mismatch_is_a_defect() {
         let original = b"Test data";
         let encoded_data = encode_raw(original);
 
@@ -2140,15 +2078,10 @@ mod tests {
         article.extend_from_slice(format!("\r\n=yend size={}\r\n", original.len()).as_bytes());
 
         let mut output = vec![0u8; 1024];
-        let err = decode(&article, &mut output).unwrap_err();
-
-        assert!(matches!(
-            err,
-            YencError::SizeMismatch {
-                expected: 8,
-                actual: 9,
-            }
-        ));
+        let result = decode(&article, &mut output).unwrap();
+        assert_eq!(&output[..result.bytes_written], original);
+        assert!(result.defects.ypart_size_mismatch);
+        assert_eq!(result.crc_status, CrcVerification::Unverified);
     }
 
     #[test]
@@ -2430,14 +2363,10 @@ mod tests {
         article.extend_from_slice(b"\r\n=yend size=999\r\n");
 
         let mut output = vec![0u8; 1024];
-        let result = decode(&article, &mut output);
-        assert!(matches!(
-            result,
-            Err(YencError::SizeMismatch {
-                expected: 999,
-                actual: 5
-            })
-        ));
+        let result = decode(&article, &mut output).unwrap();
+        assert_eq!(&output[..result.bytes_written], original);
+        assert!(result.defects.yend_size_mismatch);
+        assert_eq!(result.crc_status, CrcVerification::Unverified);
     }
 
     #[test]
@@ -2452,15 +2381,10 @@ mod tests {
         article.extend_from_slice(format!("\r\n=yend size={}\r\n", original.len()).as_bytes());
 
         let mut output = vec![0u8; 1024];
-        let result = decode(&article, &mut output);
-        // =ybegin size=100 != =yend size=5
-        assert!(matches!(
-            result,
-            Err(YencError::SizeMismatch {
-                expected: 100,
-                actual: 5
-            })
-        ));
+        let result = decode(&article, &mut output).unwrap();
+        assert_eq!(&output[..result.bytes_written], original);
+        assert!(result.defects.ybegin_size_mismatch);
+        assert_eq!(result.crc_status, CrcVerification::Unverified);
     }
 
     #[test]

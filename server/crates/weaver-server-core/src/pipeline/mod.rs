@@ -636,7 +636,6 @@ pub(super) enum DownloadError {
     Decode {
         raw_size: u64,
         error: String,
-        crc_mismatch: bool,
     },
 }
 

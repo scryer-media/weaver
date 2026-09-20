@@ -1737,19 +1737,12 @@ mod tests {
 
         let mut decoder = FusedYencArticleDecoder::new();
         let mut src = BytesMut::from(transcript.as_slice());
-        let err = decoder.decode_available(&mut src).unwrap_err();
-        // `expected` is the lie and `actual` the trailer's truth: had the tail
-        // probe dropped bytes, the earlier check of decoded length against the
-        // trailer would have failed first, with 5000 as `expected`.
-        assert!(
-            matches!(
-                err,
-                FusedYencError::Yenc(YencError::SizeMismatch {
-                    expected: 4000,
-                    actual: 5000
-                })
-            ),
-            "unexpected error {err}"
+        let article = decoder.decode_available(&mut src).unwrap().unwrap();
+        assert_eq!(article.to_data(), original);
+        assert!(article.yenc_result().defects.ybegin_size_mismatch);
+        assert_eq!(
+            article.yenc_result().crc_status,
+            weaver_yenc::CrcVerification::Verified
         );
         assert!(decoder.stats.output_grow_events >= 1);
     }

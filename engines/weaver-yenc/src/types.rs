@@ -27,6 +27,14 @@ pub struct YencHeaderDefects {
     pub invalid_pcrc32: bool,
     /// `=yend crc32=` was present but not valid hex; treated as absent.
     pub invalid_crc32: bool,
+    /// The multipart end was missing or unusable; placement uses begin and decoded length.
+    pub invalid_ypart_end: bool,
+    /// The declared multipart length differed from the bytes decoded.
+    pub ypart_size_mismatch: bool,
+    /// The trailer length differed from the bytes decoded.
+    pub yend_size_mismatch: bool,
+    /// A single-part size declaration differed from the bytes decoded.
+    pub ybegin_size_mismatch: bool,
 }
 
 impl YencHeaderDefects {
@@ -49,6 +57,10 @@ impl YencHeaderDefects {
             invalid_yend_size: self.invalid_yend_size || other.invalid_yend_size,
             invalid_pcrc32: self.invalid_pcrc32 || other.invalid_pcrc32,
             invalid_crc32: self.invalid_crc32 || other.invalid_crc32,
+            invalid_ypart_end: self.invalid_ypart_end || other.invalid_ypart_end,
+            ypart_size_mismatch: self.ypart_size_mismatch || other.ypart_size_mismatch,
+            yend_size_mismatch: self.yend_size_mismatch || other.yend_size_mismatch,
+            ybegin_size_mismatch: self.ybegin_size_mismatch || other.ybegin_size_mismatch,
         }
     }
 }
@@ -62,10 +74,8 @@ pub enum CrcVerification {
     Unverified,
     /// An expected CRC was present and matched the computed CRC.
     Verified,
-    /// An expected CRC was present and did not match. Whole-article decode
-    /// entry points report this as [`crate::YencError::CrcMismatch`] instead of
-    /// returning a result, so this variant only appears on paths that collect
-    /// the status without failing.
+    /// An expected CRC was present and did not match. Bytes remain available
+    /// for alternate-server replacement and repair; they are not verified data.
     Mismatch,
 }
 
