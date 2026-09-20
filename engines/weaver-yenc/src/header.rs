@@ -210,12 +210,7 @@ pub struct ParsedHeaders {
 ///
 /// The keyword must be followed by ASCII whitespace or end-of-line, so junk
 /// lines that merely share a prefix (`=yb`, `=ybegin_notes`) never match.
-fn find_line_start(input: &[u8], keyword: &[u8]) -> Option<usize> {
-    find_line_start_within(input, keyword, usize::MAX)
-}
-
-/// [`find_line_start`], giving up once a candidate line would start past
-/// `max_start`.
+/// Give up once a candidate line would start past `max_start`.
 ///
 /// The bound matters for `=ybegin`: the streaming and fused decoders both stop
 /// scanning after [`crate::decode::MAX_HEADER_SCAN_BYTES`] of leading junk, and
@@ -533,11 +528,17 @@ pub fn parse_headers_with_options(
     let mut metadata = parse_ybegin_line(&input[ybegin_start..ybegin_line_end])?;
     metadata.defects.junk_before_ybegin = ybegin_start > 0;
 
-    // If multi-part, parse =ypart.
-    let data_start = if metadata.part.is_some() {
-        let ypart_start = find_line_start(&input[after_ybegin..], b"=ypart")
-            .map(|off| off + after_ybegin)
-            .ok_or(YencError::MissingField("=ypart".to_string()))?;
+    // A usable =ypart identifies multipart data even if part= was absent or
+    // malformed. Without part=, only recognize it before any payload bytes.
+    let optional_part = is_control_line(&input[after_ybegin..], b"=ypart");
+    let data_start = if metadata.part.is_some() || optional_part {
+        let ypart_start = find_line_start_within(
+            &input[after_ybegin..],
+            b"=ypart",
+            crate::decode::MAX_HEADER_SCAN_BYTES,
+        )
+        .map(|off| off + after_ybegin)
+        .ok_or(YencError::MissingField("=ypart".to_string()))?;
         let (ypart_line_end, after_ypart) = line_end(input, ypart_start);
 
         apply_ypart_line(&input[ypart_start..ypart_line_end], &mut metadata)?;

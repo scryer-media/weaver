@@ -89,6 +89,177 @@ fn corpus() -> Vec<Case> {
         verified,
         8,
     );
+    add(
+        "header_gap",
+        header,
+        "poster note\r\n\r\n=ypart begin=9 end=16\r\n",
+        &trailer,
+        clean,
+        verified,
+        8,
+    );
+    for (name, part) in [("missing_part", ""), ("invalid_part", "part=garbled ")] {
+        let h = format!("=ybegin {part}total=3 line=128 size=24 name=sample.bin\r\n");
+        add(name, &h, range, &trailer, clean, verified, 8);
+    }
+    for (name, end) in [
+        ("begin_only", ""),
+        ("invalid_end", " end=oops"),
+        ("reversed_end", " end=3"),
+    ] {
+        add(
+            name,
+            header,
+            &format!("=ypart begin=9{end}\r\n"),
+            &trailer,
+            YencHeaderDefects {
+                invalid_ypart_end: true,
+                ..clean
+            },
+            verified,
+            8,
+        );
+    }
+    for (name, end) in [("long_range", 17), ("short_range", 15)] {
+        add(
+            name,
+            header,
+            &format!("=ypart begin=9 end={end}\r\n"),
+            &trailer,
+            YencHeaderDefects {
+                ypart_size_mismatch: true,
+                ..clean
+            },
+            verified,
+            8,
+        );
+    }
+    add(
+        "wrong_trailer_size",
+        header,
+        range,
+        &format!("=yend size=999 pcrc32={crc:08x}\r\n"),
+        YencHeaderDefects {
+            yend_size_mismatch: true,
+            ..clean
+        },
+        verified,
+        8,
+    );
+    add(
+        "padded_crc",
+        header,
+        range,
+        &format!("=yend size=8 pcrc32={crc:012x}\r\n"),
+        clean,
+        verified,
+        8,
+    );
+    add(
+        "missing_part_crc",
+        header,
+        range,
+        &format!("=yend size=8 crc32={crc:08x}\r\n"),
+        clean,
+        CrcVerification::Unverified,
+        8,
+    );
+    add(
+        "unusable_part_crc",
+        header,
+        range,
+        "=yend size=8 pcrc32=garbled\r\n",
+        YencHeaderDefects {
+            invalid_pcrc32: true,
+            ..clean
+        },
+        CrcVerification::Unverified,
+        8,
+    );
+    add(
+        "mismatching_part_crc",
+        header,
+        range,
+        &format!("=yend size=8 pcrc32={:08x}\r\n", crc ^ 1),
+        clean,
+        CrcVerification::Mismatch,
+        8,
+    );
+    add(
+        "trailer_junk",
+        header,
+        range,
+        &format!("{trailer}poster signature\r\n"),
+        clean,
+        verified,
+        8,
+    );
+    add(
+        "preamble",
+        &format!("poster note\r\n{header}"),
+        range,
+        &trailer,
+        YencHeaderDefects {
+            junk_before_ybegin: true,
+            ..clean
+        },
+        verified,
+        8,
+    );
+    add(
+        "missing_trailer",
+        header,
+        range,
+        "",
+        clean,
+        CrcVerification::Unverified,
+        8,
+    );
+    let single = "=ybegin line=128 size=8 name=sample.bin\r\n";
+    add(
+        "single_both_crc",
+        single,
+        "",
+        &format!("=yend size=8 pcrc32={crc:08x} crc32={:08x}\r\n", crc ^ 1),
+        clean,
+        verified,
+        0,
+    );
+    add(
+        "single_wrong_size",
+        "=ybegin line=128 size=999 name=sample.bin\r\n",
+        "",
+        &trailer,
+        YencHeaderDefects {
+            ybegin_size_mismatch: true,
+            ..clean
+        },
+        verified,
+        0,
+    );
+    add(
+        "optional_header_fields",
+        "=ybegin part=2\r\n",
+        range,
+        &trailer,
+        YencHeaderDefects {
+            missing_name: true,
+            missing_line: true,
+            missing_size: true,
+            ..clean
+        },
+        verified,
+        8,
+    );
+    add(
+        "tabs_and_case",
+        "=ybegin\tPART=2\tTOTAL=3\tLINE=128\tSIZE=24\tNAME=sample.bin\r\n",
+        range,
+        &trailer,
+        clean,
+        verified,
+        8,
+    );
     cases
 }
 
@@ -193,5 +364,82 @@ fn compatibility_corpus_across_codec_and_fused_tcp_boundaries() {
         let (decoded, left) = fused(&chunks);
         check(&case, &decoded.to_data(), decoded.yenc_result());
         assert_eq!(left, next);
+    }
+}
+
+#[test]
+fn missing_trailer_does_not_consume_the_next_response() {
+    let cases = corpus();
+    let first = cases
+        .iter()
+        .find(|case| case.name == "missing_trailer")
+        .unwrap();
+    let second = &cases[0];
+    let second_wire = wire(&second.article);
+    let mut input = wire(&first.article);
+    input.extend_from_slice(&second_wire);
+    let chunks: Vec<_> = input.chunks(1).collect();
+    let (decoded, remaining) = fused(&chunks);
+    check(first, &decoded.to_data(), decoded.yenc_result());
+    assert_eq!(decoded.stats.nntp_terminator_hits, 1);
+    assert_eq!(decoded.stats.nntp_terminator_bytes, 3);
+    assert_eq!(
+        decoded.stats.encoded_bytes_consumed - decoded.stats.nntp_terminator_bytes,
+        (wire(&first.article).len() - 3) as u64
+    );
+    assert_eq!(remaining, second_wire);
+    let (decoded, remaining) = fused(&[&remaining]);
+    check(second, &decoded.to_data(), decoded.yenc_result());
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn transport_interruption_is_not_a_missing_trailer() {
+    let cases = corpus();
+    let case = cases
+        .iter()
+        .find(|case| case.name == "missing_trailer")
+        .unwrap();
+    let response = wire(&case.article);
+    let mut input = BytesMut::from(&response[..response.len() - 3]);
+    let mut decoder = FusedYencArticleDecoder::new();
+    assert!(decoder.decode_available(&mut input).unwrap().is_none());
+}
+
+#[test]
+fn unusable_multipart_starts_remain_structural_errors() {
+    for range in [
+        "=ypart end=8\r\n",
+        "=ypart begin=0 end=8\r\n",
+        "=ypart begin=invalid end=8\r\n",
+        "=ypart begin=-1 end=8\r\n",
+    ] {
+        let article = article(
+            "=ybegin part=1 total=2 line=128 size=16 name=sample.bin\r\n",
+            range,
+            "=yend size=8\r\n",
+            PAYLOAD,
+        );
+        let mut output = vec![0; article.len()];
+        assert!(weaver_yenc::decode_nntp(&article, &mut output).is_err());
+        let response = wire(&article);
+        for chunk_size in [1, response.len()] {
+            let mut src = BytesMut::new();
+            let mut decoder = FusedYencArticleDecoder::new();
+            let mut rejected = false;
+            for chunk in response.chunks(chunk_size) {
+                src.extend_from_slice(chunk);
+                match decoder.decode_available(&mut src) {
+                    Err(FusedYencError::Yenc(_)) => {
+                        rejected = true;
+                        break;
+                    }
+                    Err(error) => panic!("unexpected transport error: {error}"),
+                    Ok(Some(_)) => panic!("unusable multipart start was accepted"),
+                    Ok(None) => {}
+                }
+            }
+            assert!(rejected, "range={range:?}, chunk={chunk_size}");
+        }
     }
 }

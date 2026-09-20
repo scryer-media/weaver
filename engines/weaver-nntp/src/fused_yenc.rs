@@ -420,17 +420,44 @@ impl FusedYencArticleDecoder {
     }
 
     fn process_yenc_header(&mut self, src: &mut BytesMut) -> Result<bool> {
+        if self.metadata.as_ref().is_some_and(|m| m.part.is_none()) && self.line_buf.is_empty() {
+            // Peek without consuming payload. In particular, a TCP split in
+            // =ypart must not make an absent/malformed part= lose its range.
+            if src.is_empty() {
+                return Ok(false);
+            }
+            let prefix = b"=ypart";
+            let compared = src.len().min(prefix.len());
+            if src[..compared] != prefix[..compared]
+                || src
+                    .get(prefix.len())
+                    .is_some_and(|byte| !matches!(byte, b' ' | b'\t'))
+            {
+                self.reserve_output_if_known();
+                self.begin_body();
+                return Ok(true);
+            }
+            if src.len() <= prefix.len() {
+                return Ok(false);
+            }
+        }
         if !self.consume_line_into_buffer(src)? {
             return Ok(false);
         }
 
         if let Some(metadata) = self.metadata.as_mut() {
-            if metadata.part.is_none() || metadata.begin.is_some() || metadata.end.is_some() {
-                return Err(YencError::InvalidHeader {
-                    field: "=ypart".to_string(),
-                    reason: "unexpected yEnc header line".to_string(),
+            if !header::is_control_line(&self.line_buf, b"=ypart") {
+                if self.line_buf == b".\r\n" || self.line_buf == b".\n" {
+                    return Err(YencError::MissingField("=ypart".to_string()).into());
                 }
-                .into());
+                self.junk_before_ybegin_bytes = self
+                    .junk_before_ybegin_bytes
+                    .saturating_add(self.line_buf.len());
+                self.line_buf.clear();
+                if self.junk_before_ybegin_bytes > MAX_HEADER_SCAN_BYTES {
+                    return Err(YencError::MissingField("=ypart".to_string()).into());
+                }
+                return Ok(true);
             }
             header::apply_ypart_line(&self.line_buf, metadata)?;
             self.line_buf.clear();
@@ -481,14 +508,9 @@ impl FusedYencArticleDecoder {
         let mut metadata = header::parse_ybegin_line(&self.line_buf)?;
         metadata.defects.junk_before_ybegin = self.junk_before_ybegin_bytes > 0;
         self.line_buf.clear();
-        let needs_ypart = metadata.part.is_some();
         self.decode_state
             .set_line_length_hint(Some(metadata.line_length));
         self.metadata = Some(metadata);
-        if !needs_ypart {
-            self.reserve_output_if_known();
-            self.begin_body();
-        }
         Ok(true)
     }
 
@@ -539,10 +561,14 @@ impl FusedYencArticleDecoder {
                 self.state = FusedArticleState::YEndLine;
                 Ok(None)
             }
-            RapidyencDecodeEnd::Article => Err(NntpError::MalformedResponse(
-                "NNTP terminator before yEnc trailer".to_string(),
-            )
-            .into()),
+            RapidyencDecodeEnd::Article => {
+                self.stats.nntp_terminator_hits += 1;
+                // The body decoder consumed the complete NNTP dot/CRLF,
+                // even when its bytes arrived in separate TCP chunks.
+                self.stats.nntp_terminator_bytes += 3;
+                self.stats.leftover_bytes_after_terminator = src.len() as u64;
+                self.finish_article().map(Some)
+            }
         }
     }
 
@@ -645,24 +671,27 @@ impl FusedYencArticleDecoder {
             NntpError::MalformedResponse("missing BODY response line".to_string())
         })?;
         let metadata = self.metadata.take().ok_or(YencError::MissingHeader)?;
-        let yend_line = self.yend_line.take().ok_or(YencError::MissingTrailer)?;
+        let yend_line = self.yend_line.take();
 
-        let yend = header::parse_yend_line(&yend_line)?;
+        let yend = yend_line
+            .as_deref()
+            .map(header::parse_yend_line)
+            .transpose()?;
         let crc_update_calls = self.decode_state.crc_update_calls;
 
         self.flush_output();
 
         let result =
-            finish_streaming_result(metadata, Some(yend), std::mem::take(&mut self.decode_state))?;
+            finish_streaming_result(metadata, yend, std::mem::take(&mut self.decode_state))?;
         let chunks = std::mem::take(&mut self.output_chunks);
 
         let mut stats = self.stats.clone();
         stats.decoded_bytes_written = result.bytes_written as u64;
         stats.crc_actual = result.part_crc;
-        stats.crc_expected = if result.metadata.part.is_some() {
+        stats.crc_expected = if result.metadata.part.is_some() || result.metadata.begin.is_some() {
             result.expected_part_crc
         } else {
-            result.expected_file_crc
+            result.expected_part_crc.or(result.expected_file_crc)
         };
         stats.yenc_size_expected = expected_decoded_size(&result.metadata);
         stats.yenc_size_actual = result.bytes_written as u64;
@@ -1661,6 +1690,9 @@ mod tests {
             bytes.extend_from_slice(
                 format!("=ybegin line=128 size={size} name=huge.bin\r\n").as_bytes(),
             );
+            // One body byte resolves the optional =ypart lookahead. The large
+            // reservation must still happen before decoding that byte.
+            bytes.push(b'k');
 
             let mut src = BytesMut::from(bytes.as_slice());
             let mut decoder = FusedYencArticleDecoder::new();

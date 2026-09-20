@@ -372,6 +372,7 @@ pub struct StreamingArticleDecoder {
     yend_line: Option<Vec<u8>>,
     decode_state: DecodeState,
     output_reserved: bool,
+    trailer_junk_bytes: usize,
     checkpoint_plan: CheckpointPlan,
 }
 
@@ -385,6 +386,7 @@ impl StreamingArticleDecoder {
             yend_line: None,
             decode_state: DecodeState::new(),
             output_reserved: false,
+            trailer_junk_bytes: 0,
             checkpoint_plan: CheckpointPlan::None,
         }
     }
@@ -407,10 +409,7 @@ impl StreamingArticleDecoder {
             return Ok(());
         }
         if self.stage == StreamingStage::Finished {
-            return Err(YencError::InvalidHeader {
-                field: "stream".to_string(),
-                reason: "received data after =yend trailer".to_string(),
-            });
+            return self.note_trailer_junk(input.len());
         }
 
         if self.stage == StreamingStage::Body && self.pending.is_empty() {
@@ -526,11 +525,32 @@ impl StreamingArticleDecoder {
             return Ok(false);
         };
 
+        // A single-part-looking header needs one line of lookahead: a poster
+        // may have mangled part= while still supplying a usable =ypart.
+        if let Some(metadata) = self.metadata.as_mut() {
+            if header::is_control_line(&self.pending[..line_len], b"=ypart") {
+                header::apply_ypart_line(&self.pending[..line_len], metadata)?;
+                self.header_bytes.extend(self.pending.drain(..line_len));
+            }
+            self.decode_state
+                .set_line_length_hint(Some(metadata.line_length));
+            self.decode_state.set_segment_plan(
+                metadata.article_file_offset(),
+                std::mem::take(&mut self.checkpoint_plan),
+            );
+            self.stage = StreamingStage::Body;
+            return Ok(true);
+        }
+
         let line = self.pending.drain(..line_len).collect::<Vec<_>>();
         self.header_bytes.extend_from_slice(&line);
 
         match header::parse_headers(&self.header_bytes) {
             Ok(parsed) => {
+                if parsed.metadata.part.is_none() && parsed.metadata.begin.is_none() {
+                    self.metadata = Some(parsed.metadata);
+                    return Ok(true);
+                }
                 self.decode_state
                     .set_line_length_hint(Some(parsed.metadata.line_length));
                 self.decode_state.set_segment_plan(
@@ -581,6 +601,17 @@ impl StreamingArticleDecoder {
         Ok(false)
     }
 
+    fn note_trailer_junk(&mut self, len: usize) -> Result<(), YencError> {
+        self.trailer_junk_bytes = self.trailer_junk_bytes.saturating_add(len);
+        if self.trailer_junk_bytes > MAX_HEADER_SCAN_BYTES {
+            return Err(YencError::InvalidHeader {
+                field: "stream".to_string(),
+                reason: "too much data after =yend trailer".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn process_trailer(&mut self) -> Result<bool, YencError> {
         let Some(line_len) = next_line_len(&self.pending) else {
             return Ok(false);
@@ -590,6 +621,8 @@ impl StreamingArticleDecoder {
         if header::is_control_line(&line, b"=yend") {
             self.yend_line = Some(line);
             self.stage = StreamingStage::Finished;
+            self.note_trailer_junk(self.pending.len())?;
+            self.pending.clear();
         } else if !line.iter().all(|b| matches!(b, b'\r' | b'\n')) {
             return Err(YencError::InvalidHeader {
                 field: "=yend".to_string(),
@@ -1431,12 +1464,13 @@ mod tests {
     fn streaming_reserves_the_cap_for_articles_larger_than_it() {
         const CAP: usize = 16 * 1024 * 1024;
 
-        // Metadata-driven: the header declares 32 MiB, the body is one byte.
+        // Metadata-driven: the header declares 32 MiB, the body is one byte
+        // in a complete codec line, resolving the optional =ypart lookahead.
         let mut decoder = StreamingArticleDecoder::new();
         let mut output = Vec::new();
         decoder
             .feed_chunk(
-                b"=ybegin line=128 size=33554432 name=huge.bin\r\nA",
+                b"=ybegin line=128 size=33554432 name=huge.bin\r\nA\r\n",
                 &mut output,
             )
             .unwrap();
@@ -1451,7 +1485,7 @@ mod tests {
         let mut small = Vec::new();
         decoder
             .feed_chunk(
-                b"=ybegin line=128 size=1048576 name=small.bin\r\nA",
+                b"=ybegin line=128 size=1048576 name=small.bin\r\nA\r\n",
                 &mut small,
             )
             .unwrap();
