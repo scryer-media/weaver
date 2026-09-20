@@ -1576,7 +1576,7 @@ async fn an_incomplete_content_match_at_or_under_the_described_length_still_bind
 }
 
 #[tokio::test]
-async fn an_incomplete_fragment_with_a_contradictory_declared_size_is_refused() {
+async fn a_split_fragment_remains_unbound_despite_a_stale_size() {
     let payload = binding_payload(37, 49_152);
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, file_id) = obfuscated_binding_fixture(
@@ -1591,12 +1591,12 @@ async fn an_incomplete_fragment_with_a_contradictory_declared_size_is_refused() 
 
     assert!(
         pipeline.resolve_par2_file_binding(file_id).is_none(),
-        "a contradictory yEnc declaration must refuse the content match"
+        "a numeric split fragment cannot bind to the joined file by prefix alone"
     );
 }
 
 #[tokio::test]
-async fn an_incomplete_obfuscated_file_with_a_contradictory_declared_size_is_refused() {
+async fn an_incomplete_obfuscated_file_with_a_stale_declared_size_still_binds() {
     let payload = binding_payload(39, 49_152);
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, file_id) = obfuscated_binding_fixture(
@@ -1617,8 +1617,8 @@ async fn an_incomplete_obfuscated_file_with_a_contradictory_declared_size_is_ref
     assert!(!file.is_complete(), "the fixture must remain incomplete");
     assert!(file.received_bytes() <= payload.len() as u64);
     assert!(
-        pipeline.resolve_par2_file_binding(file_id).is_none(),
-        "a contradictory yEnc declaration must refuse an otherwise matching content bind"
+        pipeline.resolve_par2_file_binding(file_id).is_some(),
+        "an obfuscated content match is independent of the yEnc size hint"
     );
 }
 
@@ -1703,7 +1703,7 @@ async fn content_binding_disambiguates_equal_length_obfuscated_descriptions() {
     let first = binding_payload(73, 40_000);
     let second = binding_payload(74, 40_000);
     let temp_dir = tempfile::tempdir().unwrap();
-    let (pipeline, file_id) = obfuscated_binding_fixture(
+    let (mut pipeline, file_id) = obfuscated_binding_fixture(
         &temp_dir,
         JobId(200901),
         "a7f3e91c8b2d.bin",
@@ -1715,6 +1715,7 @@ async fn content_binding_disambiguates_equal_length_obfuscated_descriptions() {
     )
     .await;
 
+    pipeline.file_declared_size.insert(file_id, 6_108_962);
     let set = pipeline.par2_set(file_id.job_id).cloned().expect("a set");
     let expected = set
         .files

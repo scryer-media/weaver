@@ -714,7 +714,20 @@ async fn a_swapped_pair_of_unequal_length_binds_by_the_length_each_file_has() {
         let mut identity = pipeline.effective_file_identity(job_id, file_id).unwrap();
         identity.canonical_filename = Some(canonical.to_string());
         pipeline.set_file_identity(job_id, identity).unwrap();
-        pipeline.file_declared_size.insert(file_id, length);
+        pipeline.file_declared_size.insert(file_id, 6_108_962);
+        assert!(
+            pipeline.resolve_par2_file_binding(file_id).is_none(),
+            "a header size cannot break an otherwise ambiguous name match"
+        );
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .assembly
+            .file_mut(file_id)
+            .unwrap()
+            .commit_segment(0, length as u32)
+            .unwrap();
     }
 
     let bound = |file_index| {

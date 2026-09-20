@@ -232,9 +232,6 @@ impl Pipeline {
             transport_failure_streaks: HashMap::new(),
             download_wait_by_job: HashMap::new(),
             segment_terminal_states: HashMap::new(),
-            foreign_layout_watches: HashMap::new(),
-            #[cfg(test)]
-            foreign_layout_breaker_override: None,
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),

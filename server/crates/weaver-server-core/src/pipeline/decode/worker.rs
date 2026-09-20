@@ -1633,12 +1633,7 @@ impl Pipeline {
                 }
             } else {
                 match validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
-                    Ok(file_offset) => {
-                        // The declared file exists on the wire. Nothing this
-                        // file's articles say afterwards may retire it.
-                        self.disarm_foreign_layout_watch(file_id);
-                        file_offset
-                    }
+                    Ok(file_offset) => file_offset,
                     Err(mismatch) => {
                         let error = format_yenc_layout_mismatch(
                             mismatch,
@@ -1648,7 +1643,6 @@ impl Pipeline {
                         );
                         self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         drop(_cpu_scope);
-                        self.note_yenc_layout_refusal(segment_id, mismatch, yenc_layout);
                         self.handle_decode_failure(
                             segment_id,
                             &error,
@@ -2064,25 +2058,19 @@ impl Pipeline {
         if file_offset >= crate::pipeline::PAR2_HASH_16K_BYTES as u64 {
             return;
         }
-        let (prefix_complete, header_became_available) = {
+        let (prefix_complete, header_became_available, replaced_prefix) = {
             let prefix = self.file_prefix_16k.entry(file_id).or_default();
             let captured = prefix.len() as u64;
             let header_was_incomplete = prefix.len() < par2_rs::packet::header::HEADER_SIZE;
-            // A gap the buffer cannot close, or a range already wholly captured.
+            // A gap cannot establish a contiguous prefix.
             if file_offset > captured {
                 return;
             }
-            let mut skip = (captured - file_offset) as usize;
-            if skip >= data.len_bytes() {
-                return;
+            let replaced_prefix = file_offset < captured;
+            if replaced_prefix {
+                prefix.truncate(file_offset as usize);
             }
             data.for_each_slice(|slice| {
-                if skip >= slice.len() {
-                    skip -= slice.len();
-                    return;
-                }
-                let slice = &slice[skip..];
-                skip = 0;
                 let room = crate::pipeline::PAR2_HASH_16K_BYTES.saturating_sub(prefix.len());
                 if room == 0 {
                     return;
@@ -2091,7 +2079,9 @@ impl Pipeline {
             });
             (
                 prefix.len() == crate::pipeline::PAR2_HASH_16K_BYTES,
-                header_was_incomplete && prefix.len() >= par2_rs::packet::header::HEADER_SIZE,
+                (header_was_incomplete || replaced_prefix)
+                    && prefix.len() >= par2_rs::packet::header::HEADER_SIZE,
+                replaced_prefix,
             )
         };
         if header_became_available {
@@ -2100,12 +2090,12 @@ impl Pipeline {
                 self.file_declared_size.get(&file_id).copied(),
             );
         }
-        if prefix_complete {
+        if prefix_complete || replaced_prefix {
             self.refresh_par2_md5_substitution_binding(file_id);
         }
     }
 
-    /// Retain the first usable yEnc total for content-binding corroboration.
+    /// Retain the first yEnc size hint for metadata probing, never identity rejection.
     fn note_par2_binding_declared_size(&mut self, file_id: NzbFileId, declared_size: u64) {
         if declared_size == 0 {
             return;

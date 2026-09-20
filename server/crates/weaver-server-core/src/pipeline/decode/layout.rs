@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "layout_compatibility_tests.rs"]
+mod compatibility_tests;
+
 /// What the NZB can honestly say about one segment.
 ///
 /// The NZB's `<segment bytes>` attribute is the **yEnc-encoded** size, roughly
@@ -18,8 +22,8 @@ use super::*;
 ///   can never exceed it.
 /// * `max_file_size` — the encoded total, the same bound applied to the file.
 ///
-/// `part`/`total` are the exception: the NZB *is* authoritative for a segment's
-/// ordinal and the file's segment count, so those are compared for equality.
+/// `part`/`total` identify the scheduled work for diagnostics. Poster metadata
+/// can be stale, so it cannot override a bounded decoded placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ExpectedSegmentLayout {
     pub(super) max_file_offset: u64,
@@ -44,19 +48,12 @@ pub(in crate::pipeline) enum YencLayoutMismatch {
     /// Decoded more bytes than the segment declared. yEnc expands, so this
     /// cannot happen for a well-formed article.
     DecodedSizeAboveDeclared,
-    /// The header claims a file larger than the declared (encoded) total.
-    FileSizeAboveDeclared,
-    PartialRange,
-    /// `end - (begin - 1)` disagrees with what actually decoded, so the header
-    /// is not describing the bytes it shipped.
-    RangeContradictsDecode,
+    InvalidBegin,
     /// The claimed offset is past the encoded prefix sum, i.e. further into the
     /// file than this segment could possibly begin.
     BeginAboveDeclaredPrefix,
     /// The claimed range ends past the declared envelope of the whole file.
     EndAboveDeclaredFileSize,
-    Part,
-    Total,
 }
 
 #[inline]
@@ -97,15 +94,12 @@ pub(super) fn expected_segment_layout(
 /// decoded offset the segment may be written at.
 ///
 /// The offset comes from the article (`begin - 1`) because nothing else knows
-/// it, but it is pinned inside `[0, max_file_offset]` and its length to
-/// `max_decoded_size`, so a hostile server cannot choose where its bytes land —
-/// only how far short of the declared ceiling they fall. A header that omits
-/// the optional `=ypart` range is placed at the segment's declared offset,
-/// which is the only estimate available and is exact for a single-part file.
+/// it, but it is bounded by `[0, max_file_offset]` and its length by
+/// `max_decoded_size`. Only a single-article file may omit its range and use
+/// offset zero; encoded NZB prefixes cannot place multipart decoded bytes.
 ///
 /// This is defence in depth, not the integrity guarantee: misplaced or corrupt
-/// bytes are caught by the per-article yEnc CRC32, the whole-file CRC32, PAR2
-/// block verification and the RAR member checksums.
+/// bytes still require placement coverage and checksum/repair verification.
 #[inline]
 pub(super) fn validate_yenc_layout(
     expected: ExpectedSegmentLayout,
@@ -115,34 +109,21 @@ pub(super) fn validate_yenc_layout(
     if decoded_len > expected.max_decoded_size as usize {
         return Err(YencLayoutMismatch::DecodedSizeAboveDeclared);
     }
-    if actual.file_size > expected.max_file_size {
-        return Err(YencLayoutMismatch::FileSizeAboveDeclared);
-    }
-    let file_offset = match (actual.begin, actual.end) {
-        (None, None) => expected.max_file_offset,
-        (Some(begin), Some(end)) => {
-            let file_offset = begin
-                .checked_sub(1)
-                .ok_or(YencLayoutMismatch::RangeContradictsDecode)?;
-            // The header must describe the bytes it actually shipped.
-            if end.checked_sub(file_offset) != Some(decoded_len as u64) {
-                return Err(YencLayoutMismatch::RangeContradictsDecode);
-            }
-            if file_offset > expected.max_file_offset {
-                return Err(YencLayoutMismatch::BeginAboveDeclaredPrefix);
-            }
-            if end > expected.max_file_size {
-                return Err(YencLayoutMismatch::EndAboveDeclaredFileSize);
-            }
-            file_offset
-        }
-        _ => return Err(YencLayoutMismatch::PartialRange),
+    let file_offset = match actual.begin {
+        Some(begin) => begin
+            .checked_sub(1)
+            .ok_or(YencLayoutMismatch::InvalidBegin)?,
+        None if expected.total == 1 && actual.part.is_none() && actual.end.is_none() => 0,
+        None => return Err(YencLayoutMismatch::InvalidBegin),
     };
-    if actual.part.is_some_and(|part| part != expected.part) {
-        return Err(YencLayoutMismatch::Part);
+    if file_offset > expected.max_file_offset {
+        return Err(YencLayoutMismatch::BeginAboveDeclaredPrefix);
     }
-    if actual.total.is_some_and(|total| total != expected.total) {
-        return Err(YencLayoutMismatch::Total);
+    if file_offset
+        .checked_add(decoded_len as u64)
+        .is_none_or(|end| end > expected.max_file_size)
+    {
+        return Err(YencLayoutMismatch::EndAboveDeclaredFileSize);
     }
     Ok(file_offset)
 }
@@ -237,7 +218,7 @@ mod tests {
                     file_size: 11,
                     part: None,
                     total: None,
-                    begin: None,
+                    begin: Some(5),
                     end: None,
                 },
                 7,
@@ -278,22 +259,13 @@ mod tests {
         let expected = expected_segment_layout(&file, 1).unwrap();
         let valid = assertions(expected);
         let cases = [
-            // A file larger than the encoded envelope is impossible.
-            (
-                YencLayoutAssertions {
-                    file_size: 12,
-                    ..valid
-                },
-                7,
-                YencLayoutMismatch::FileSizeAboveDeclared,
-            ),
             (
                 YencLayoutAssertions {
                     begin: None,
                     ..valid
                 },
                 7,
-                YencLayoutMismatch::PartialRange,
+                YencLayoutMismatch::InvalidBegin,
             ),
             // Placing the segment past its declared prefix sum: the attack the
             // bound exists to stop.
@@ -305,31 +277,6 @@ mod tests {
                 },
                 7,
                 YencLayoutMismatch::BeginAboveDeclaredPrefix,
-            ),
-            // A range that does not describe the bytes actually shipped.
-            (
-                YencLayoutAssertions {
-                    end: Some(10),
-                    ..valid
-                },
-                7,
-                YencLayoutMismatch::RangeContradictsDecode,
-            ),
-            (
-                YencLayoutAssertions {
-                    part: Some(1),
-                    ..valid
-                },
-                7,
-                YencLayoutMismatch::Part,
-            ),
-            (
-                YencLayoutAssertions {
-                    total: Some(3),
-                    ..valid
-                },
-                7,
-                YencLayoutMismatch::Total,
             ),
             // Decoding more than the segment declared cannot happen: yEnc only
             // ever expands.
@@ -398,7 +345,7 @@ mod tests {
                 },
                 1,
             ),
-            Err(YencLayoutMismatch::RangeContradictsDecode)
+            Err(YencLayoutMismatch::InvalidBegin)
         );
         // An absurd offset against real declared bounds is caught by the bound,
         // not by panicking on the arithmetic.

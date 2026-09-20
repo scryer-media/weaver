@@ -269,8 +269,6 @@ impl Pipeline {
             state.health_failing_files.clear();
             state.early_recovery_requested_blocks = 0;
         }
-        self.foreign_layout_watches
-            .retain(|file_id, _| file_id.job_id != job_id);
         self.files_counted_missing
             .retain(|file_id| file_id.job_id != job_id);
     }
