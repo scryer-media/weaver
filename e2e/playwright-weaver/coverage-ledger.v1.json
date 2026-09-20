@@ -371,6 +371,12 @@
       "rationale": "The runtime browser flow verifies history rendering and pagination without deleting release evidence."
     },
     {
+      "name": "checkForUpdates",
+      "owner": "ui-runtime-observability",
+      "oracle": "unit-only",
+      "rationale": "Manual-check outcomes, backoff, and disabled behavior are covered by weaver-server-core update-check tests using an injected fetcher; the browser flow does not depend on the live release API."
+    },
+    {
       "name": "deleteHistory",
       "owner": "ui-runtime-observability",
       "oracle": "unit-only",
