@@ -718,6 +718,7 @@ async fn dispatch_downloads_respects_hard_write_byte_pressure() {
         file_index: 0,
     };
     let buffered = BufferedDecodedSegment {
+        damaged_source: None,
         encoding: SegmentEncoding::Yenc,
         segment_id: SegmentId {
             file_id,

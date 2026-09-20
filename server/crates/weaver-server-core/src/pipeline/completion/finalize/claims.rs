@@ -151,6 +151,34 @@ impl Pipeline {
             .filter_map(|file_id| self.census_row(job_id, file_id))
             .collect();
 
+        let unrepaired_damage: Vec<_> = census
+            .iter()
+            .filter(|row| {
+                state
+                    .assembly
+                    .file(row.file_id)
+                    .is_some_and(|file| file.requires_file_verification())
+                    && !row.is_furniture
+                    && !matches!(
+                        row.claim,
+                        TerminalFileClaim::Par2Verdict
+                            | TerminalFileClaim::Par3Verdict
+                            | TerminalFileClaim::Discarded(TerminalDiscardKind::RepairLeftover)
+                    )
+            })
+            .map(|row| row.filename.as_str())
+            .collect();
+        if !unrepaired_damage.is_empty() {
+            let names = unrepaired_damage.join(", ");
+            self.semantic_terminal_causes.insert(
+                job_id,
+                crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth,
+            );
+            return Err(format!(
+                "retained damaged article bytes require verification or repair: {names}"
+            ));
+        }
+
         // Whether any settlement fact handed content to the destination. The
         // question decides which way the ambiguous rows fall, in both
         // directions, so it is answered once over the whole census — and
@@ -326,9 +354,6 @@ impl Pipeline {
         if self.par2_join_consumed_split_part(job_id, file_id) {
             return TerminalFileClaim::Discarded(TerminalDiscardKind::RepairLeftover);
         }
-        if self.file_content_could_never_arrive(file_id) {
-            return TerminalFileClaim::Discarded(TerminalDiscardKind::UnfetchableDuplicate);
-        }
         if self.direct_set_delivered_file(file_id) {
             return TerminalFileClaim::InStreamProof;
         }
@@ -382,19 +407,6 @@ impl Pipeline {
             return TerminalFileClaim::Par2Verdict;
         }
         TerminalFileClaim::Unclaimed
-    }
-
-    /// Whether the breaker proved this file's declared bytes are not on any
-    /// configured server.
-    ///
-    /// The only positive evidence for "could never arrive" the pipeline has:
-    /// a run of refusals that agreed, article after article, that the servers
-    /// hold one other coherent file under these message ids. Anything weaker —
-    /// a file that merely failed a lot — is ordinary damage and stays counted.
-    fn file_content_could_never_arrive(&self, file_id: NzbFileId) -> bool {
-        self.foreign_layout_watches
-            .get(&file_id)
-            .is_some_and(|watch| watch.tripped)
     }
 
     /// Whether a finalized direct set already routed this file's bytes into its

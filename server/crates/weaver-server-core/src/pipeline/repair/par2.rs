@@ -1297,7 +1297,6 @@ impl Pipeline {
         // binding whatever the lengths say, because a short file at its own
         // name is damage, and damage is what the verdicts are for.
         let candidates = if candidates.len() > 1 {
-            let declared_size = self.file_declared_size.get(&file_id).copied();
             let possible = candidates
                 .iter()
                 .copied()
@@ -1307,8 +1306,7 @@ impl Pipeline {
                             file.received_bytes() != desc.length
                         } else {
                             file.received_bytes() > desc.length
-                        } || declared_size
-                            .is_some_and(|size| size != desc.length);
+                        };
                         !contradicted
                     })
                 })
@@ -1487,7 +1485,6 @@ impl Pipeline {
         let source_filename = self
             .effective_file_identity(file_id.job_id, file_id)
             .map(|identity| identity.source_filename);
-        let declared_size = self.file_declared_size.get(&file_id).copied();
         let matches = set
             .files
             .iter()
@@ -1496,7 +1493,7 @@ impl Pipeline {
                     file.received_bytes() != desc.length
                 } else {
                     file.received_bytes() > desc.length
-                } || declared_size.is_some_and(|size| size != desc.length);
+                };
                 if length_contradicts
                     || crate::pipeline::is_split_fragment_of(&current_filename, &desc.filename)
                     || source_filename.as_ref().is_some_and(|source_filename| {

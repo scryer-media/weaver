@@ -452,7 +452,6 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
             data: Err(DownloadError::Decode {
                 raw_size: 19,
                 error: "missing =ybegin header".to_string(),
-                crc_mismatch: false,
             }),
             attempts: Vec::new(),
             lane_observation: None,
@@ -593,9 +592,9 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 },
                 crc_valid: true,
                 part_crc_verified: true,
-                part_crc: par2_rs::checksum::crc32(b"data"),
+                part_crc: par2_rs::checksum::crc32(b"data!"),
                 expected_file_crc: None,
-                data: DecodedChunk::from(b"data".to_vec()),
+                data: DecodedChunk::from(b"data!".to_vec()),
                 yenc_name: filename.to_string(),
                 checkpoint_plan: weaver_yenc::CheckpointPlan::None,
                 segments: Vec::new(),
@@ -926,6 +925,7 @@ async fn fail_job_clears_write_backlog_accounting() {
         file_index: 0,
     };
     let buffered = BufferedDecodedSegment {
+        damaged_source: None,
         encoding: SegmentEncoding::Yenc,
         segment_id: SegmentId {
             file_id,
@@ -2517,6 +2517,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
     };
     let buffered_payload = [9u8; 64];
     let buffered = BufferedDecodedSegment {
+        damaged_source: None,
         encoding: SegmentEncoding::Yenc,
         segment_id: SegmentId {
             file_id,
@@ -2539,6 +2540,13 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
     pipeline.note_write_buffered(buffered_len, 1);
 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    // This fixture inserts below the decoder, which normally records placement
+    // before handing the article to the write reorder buffer.
+    state
+        .assembly
+        .file_mut(file_id)
+        .unwrap()
+        .record_placement(0, 0, 64);
     state
         .assembly
         .file_mut(NzbFileId {
@@ -2642,6 +2650,7 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
         file_index: 0,
     };
     let buffered = BufferedDecodedSegment {
+        damaged_source: None,
         encoding: SegmentEncoding::Yenc,
         segment_id: SegmentId {
             file_id,

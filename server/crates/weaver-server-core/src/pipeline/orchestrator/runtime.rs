@@ -232,9 +232,6 @@ impl Pipeline {
             transport_failure_streaks: HashMap::new(),
             download_wait_by_job: HashMap::new(),
             segment_terminal_states: HashMap::new(),
-            foreign_layout_watches: HashMap::new(),
-            #[cfg(test)]
-            foreign_layout_breaker_override: None,
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
@@ -650,6 +647,14 @@ impl Pipeline {
         if self.uu_files.contains_key(&file_id) {
             return;
         }
+        let contiguous_bytes_written = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .and_then(|file| file.retained_damage_floor())
+            .map_or(contiguous_bytes_written, |floor| {
+                contiguous_bytes_written.min(floor)
+            });
         let current = self
             .pending_file_progress
             .get(&file_id)
@@ -2447,6 +2452,7 @@ mod disk_write_handle_cache_tests {
 
     fn segment(bytes: &[u8]) -> BufferedDecodedSegment {
         BufferedDecodedSegment {
+            damaged_source: None,
             encoding: SegmentEncoding::Yenc,
             segment_id: SegmentId {
                 file_id: NzbFileId {

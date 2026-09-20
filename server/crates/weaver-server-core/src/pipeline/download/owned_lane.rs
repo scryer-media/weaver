@@ -2348,8 +2348,7 @@ mod tests {
             ))),
             Err(DownloadError::Decode {
                 raw_size: 128,
-                error: "crc mismatch".to_string(),
-                crc_mismatch: true,
+                error: "invalid yEnc header".to_string(),
             }),
         ] {
             assert!(

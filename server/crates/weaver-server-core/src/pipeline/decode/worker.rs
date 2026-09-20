@@ -1290,6 +1290,13 @@ impl Pipeline {
             return;
         }
 
+        if self.segment_terminal_states.contains_key(&segment_id) {
+            // A later metadata probe still needs its unavailable marker, while
+            // the existing terminal booking and metrics remain unchanged.
+            self.book_terminal_segment(segment_id, SegmentTerminalState::DecodeExhausted);
+            return;
+        }
+
         let retries = self
             .decode_retries
             .entry(segment_id)
@@ -1633,12 +1640,7 @@ impl Pipeline {
                 }
             } else {
                 match validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
-                    Ok(file_offset) => {
-                        // The declared file exists on the wire. Nothing this
-                        // file's articles say afterwards may retire it.
-                        self.disarm_foreign_layout_watch(file_id);
-                        file_offset
-                    }
+                    Ok(file_offset) => file_offset,
                     Err(mismatch) => {
                         let error = format_yenc_layout_mismatch(
                             mismatch,
@@ -1648,7 +1650,6 @@ impl Pipeline {
                         );
                         self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         drop(_cpu_scope);
-                        self.note_yenc_layout_refusal(segment_id, mismatch, yenc_layout);
                         self.handle_decode_failure(
                             segment_id,
                             &error,
@@ -1663,23 +1664,37 @@ impl Pipeline {
             // sizes are yEnc-encoded and run ~3% large.
             let decoded_size = decoded_len as u32;
 
-            // One bounded memcpy for the obfuscation binder, and for the
-            // overwhelming majority of articles not even that — the first thing
-            // it does is compare `file_offset` against 16 KiB and return.
-            self.note_par2_binding_declared_size(file_id, yenc_layout.file_size);
-            self.note_par2_binding_prefix(file_id, file_offset, &data);
-
             // The per-segment bounds above cannot see across segments, so they
             // would still let an article claim a range an earlier ordinal
             // already owns. Check against this segment's neighbours and record
             // the placement in the same borrow: this is per-article work on the
             // orchestrator thread, so it is two range probes and one insert.
+            if !crc_valid
+                && self
+                    .file_crc_recoveries
+                    .get(&file_id)
+                    .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id))
+            {
+                drop(_cpu_scope);
+                self.handle_decode_failure(
+                    segment_id,
+                    "CRC mismatch during whole-file recovery",
+                    &source.exclude_servers,
+                    source.source_server_idx,
+                );
+                return;
+            }
             let conflict = match self
                 .jobs
                 .get_mut(&job_id)
                 .and_then(|state| state.assembly.file_mut(file_id))
             {
                 Some(file) => {
+                    // A late corrupt duplicate must not replace bytes already
+                    // committed by a good response (or their placement).
+                    if !crc_valid && file.has_segment(segment_id.segment_number) {
+                        return;
+                    }
                     match file.placement_conflict(
                         segment_id.segment_number,
                         file_offset,
@@ -1714,6 +1729,93 @@ impl Pipeline {
                 return;
             }
 
+            let unresolved_replacement = !part_crc_verified
+                && self
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|state| state.assembly.file(file_id))
+                    .is_some_and(|file| {
+                        file.segment_has_retained_damage(segment_id.segment_number)
+                    });
+            if !crc_valid || unresolved_replacement {
+                if !crc_valid {
+                    self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                drop(_cpu_scope);
+                self.demote_direct_sets_for_article(
+                    file_id,
+                    crate::pipeline::direct_store::router::DemotionReason::PartChecksumMismatch,
+                )
+                .await;
+                // Demotion may reset assembly; record damage after it has
+                // transferred this volume back to conventional assembly.
+                if let Some(file) = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .and_then(|state| state.assembly.file_mut(file_id))
+                {
+                    file.record_placement(segment_id.segment_number, file_offset, decoded_size);
+                    file.note_retained_damage(segment_id.segment_number);
+                }
+                let filename = self
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|state| state.assembly.file(file_id))
+                    .map(|file| self.current_filename_for_file(job_id, file));
+                if let Some(filename) = filename {
+                    self.direct_unpack_abort_sets_containing(
+                        job_id,
+                        &filename,
+                        "damaged yEnc article retained for repair",
+                    );
+                }
+                self.invalidate_par2_session_for_file_write(file_id);
+                self.mark_file_hash_reread_required_for(file_id, "retained_damage");
+                let segment = BufferedDecodedSegment {
+                    segment_id,
+                    decoded_size,
+                    encoding,
+                    data,
+                    part_crc,
+                    part_crc_verified: false,
+                    yenc_name,
+                    checkpoint_plan,
+                    segments,
+                    damaged_source: Some(Box::new((
+                        source,
+                        if crc_valid {
+                            weaver_yenc::CrcVerification::Unverified
+                        } else {
+                            weaver_yenc::CrcVerification::Mismatch
+                        },
+                    ))),
+                };
+                self.note_write_buffered(decoded_len, 1);
+                if self.demotion_sweep_owns_file(file_id) {
+                    // The existing sweep handback drains these bytes only
+                    // after reconstruction has stopped owning the file.
+                    self.write_buffers
+                        .entry(file_id)
+                        .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending))
+                        .insert(file_offset, segment);
+                } else if let Err(error) = self
+                    .persist_out_of_order_segments(
+                        file_id,
+                        vec![(file_offset, segment)],
+                        OutOfOrderPersistReason::QuiescentFlush,
+                    )
+                    .await
+                {
+                    self.fail_job_for_disk_write(error, "damaged article write failed");
+                }
+                return;
+            }
+
+            // Only usable data may establish the obfuscated file's prefix.
+            // Damaged candidates never enter the first-wins binding caches.
+            self.note_par2_binding_declared_size(file_id, yenc_layout.file_size);
+            self.note_par2_binding_prefix(file_id, file_offset, &data);
+
             self.metrics
                 .bytes_decoded
                 .fetch_add(u64::from(decoded_size), Ordering::Relaxed);
@@ -1734,9 +1836,6 @@ impl Pipeline {
                 return;
             }
 
-            if !crc_valid {
-                self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-            }
             if part_crc_verified {
                 crate::runtime::perf_probe::record(
                     "download.yenc_part_crc.verified",
@@ -1818,6 +1917,7 @@ impl Pipeline {
             }
 
             let mut buffered_segment = BufferedDecodedSegment {
+                damaged_source: None,
                 segment_id,
                 decoded_size,
                 encoding,
@@ -2064,25 +2164,19 @@ impl Pipeline {
         if file_offset >= crate::pipeline::PAR2_HASH_16K_BYTES as u64 {
             return;
         }
-        let (prefix_complete, header_became_available) = {
+        let (prefix_complete, header_became_available, replaced_prefix) = {
             let prefix = self.file_prefix_16k.entry(file_id).or_default();
             let captured = prefix.len() as u64;
             let header_was_incomplete = prefix.len() < par2_rs::packet::header::HEADER_SIZE;
-            // A gap the buffer cannot close, or a range already wholly captured.
+            // A gap cannot establish a contiguous prefix.
             if file_offset > captured {
                 return;
             }
-            let mut skip = (captured - file_offset) as usize;
-            if skip >= data.len_bytes() {
-                return;
+            let replaced_prefix = file_offset < captured;
+            if replaced_prefix {
+                prefix.truncate(file_offset as usize);
             }
             data.for_each_slice(|slice| {
-                if skip >= slice.len() {
-                    skip -= slice.len();
-                    return;
-                }
-                let slice = &slice[skip..];
-                skip = 0;
                 let room = crate::pipeline::PAR2_HASH_16K_BYTES.saturating_sub(prefix.len());
                 if room == 0 {
                     return;
@@ -2091,7 +2185,9 @@ impl Pipeline {
             });
             (
                 prefix.len() == crate::pipeline::PAR2_HASH_16K_BYTES,
-                header_was_incomplete && prefix.len() >= par2_rs::packet::header::HEADER_SIZE,
+                (header_was_incomplete || replaced_prefix)
+                    && prefix.len() >= par2_rs::packet::header::HEADER_SIZE,
+                replaced_prefix,
             )
         };
         if header_became_available {
@@ -2100,12 +2196,12 @@ impl Pipeline {
                 self.file_declared_size.get(&file_id).copied(),
             );
         }
-        if prefix_complete {
+        if prefix_complete || replaced_prefix {
             self.refresh_par2_md5_substitution_binding(file_id);
         }
     }
 
-    /// Retain the first usable yEnc total for content-binding corroboration.
+    /// Retain the first yEnc size hint for metadata probing, never identity rejection.
     fn note_par2_binding_declared_size(&mut self, file_id: NzbFileId, declared_size: u64) {
         if declared_size == 0 {
             return;
@@ -2959,7 +3055,41 @@ impl Pipeline {
         hash_mode: SegmentHashMode,
     ) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.commit_persisted_segment");
+        if let Some(unresolved) = segment.damaged_source.as_ref() {
+            let (source, status) = unresolved.as_ref();
+            let file_id = segment.segment_id.file_id;
+            if let Some(file) = self
+                .jobs
+                .get_mut(&file_id.job_id)
+                .and_then(|state| state.assembly.file_mut(file_id))
+            {
+                file.record_placement(
+                    segment.segment_id.segment_number,
+                    file_offset,
+                    segment.decoded_size,
+                );
+                file.note_retained_damage(segment.segment_id.segment_number);
+            }
+            // The disk owner completed this write before an alternate response
+            // can be scheduled. No assembly bit, successful event, checksum
+            // evidence or completed-file row may be produced for these bytes.
+            self.handle_decode_failure(
+                segment.segment_id,
+                match status {
+                    weaver_yenc::CrcVerification::Mismatch => {
+                        "yEnc CRC mismatch; decoded bytes retained for repair"
+                    }
+                    _ => {
+                        "unverified replacement of damaged yEnc bytes; verification still required"
+                    }
+                },
+                &source.exclude_servers,
+                source.source_server_idx,
+            );
+            return;
+        }
         let BufferedDecodedSegment {
+            damaged_source: _,
             segment_id,
             decoded_size,
             encoding,
@@ -2982,18 +3112,31 @@ impl Pipeline {
                 return;
             };
 
+            // A demotion can reset assembly while this accepted article is
+            // parked in the write buffer. Restore its measured placement at
+            // the durable handoff, before deciding whether coverage is whole.
+            if file_asm.placement_of(segment_id.segment_number).is_none() {
+                file_asm.record_placement(segment_id.segment_number, file_offset, decoded_size);
+            }
+            let replaced_damage =
+                part_crc_verified && file_asm.clear_retained_damage(segment_id.segment_number);
+            file_asm.note_part_verification(segment_id.segment_number, part_crc_verified);
             match file_asm.commit_segment(segment_id.segment_number, decoded_size) {
                 Ok(commit) => Ok((
                     commit.file_complete,
                     file_asm.received_bytes(),
                     commit.was_duplicate,
+                    replaced_damage,
                 )),
                 Err(e) => Err(e),
             }
         };
 
         match commit_result {
-            Ok((file_complete, total_bytes, was_duplicate)) => {
+            Ok((file_complete, total_bytes, was_duplicate, replaced_damage)) => {
+                if replaced_damage {
+                    self.clear_replaced_damage_failure(segment_id);
+                }
                 if !was_duplicate {
                     self.metrics
                         .bytes_committed
@@ -3180,6 +3323,83 @@ impl Pipeline {
                             }
                         }
                     }
+
+                    let total_bytes = if encoding.is_uu() {
+                        total_bytes
+                    } else {
+                        let file = self
+                            .jobs
+                            .get(&job_id)
+                            .and_then(|state| state.assembly.file(file_id));
+                        let end = file.and_then(|file| file.decoded_coverage_end());
+                        let final_verified = file.is_some_and(|file| file.final_part_verified());
+                        let disk_len = match tokio::fs::metadata(file_path).await {
+                            Ok(metadata) => metadata.len(),
+                            Err(error) => {
+                                self.fail_job_for_disk_write(
+                                    SegmentWriteError::new(file_id, error),
+                                    "completed file metadata failed",
+                                );
+                                return;
+                            }
+                        };
+                        let safe_end = end
+                            .filter(|end| disk_len == *end || (disk_len > *end && final_verified));
+                        let Some(end) = safe_end else {
+                            // A file geometry problem does not make the last
+                            // verified article a failed download. Keep its
+                            // successful ledger entry and require file repair.
+                            if let Some(file) = self
+                                .jobs
+                                .get_mut(&job_id)
+                                .and_then(|state| state.assembly.file_mut(file_id))
+                            {
+                                file.require_geometry_verification();
+                            }
+                            self.mark_file_hash_reread_required_for(file_id, "incomplete_geometry");
+                            self.direct_unpack_abort_sets_containing(
+                                job_id,
+                                filename,
+                                "file geometry requires verification",
+                            );
+                            self.schedule_job_completion_check(job_id);
+                            return;
+                        };
+                        if disk_len > end {
+                            // The verified final article and contiguous ranges
+                            // prove this suffix is stale, including after a
+                            // restart. No interior bytes are zeroed or removed.
+                            crate::pipeline::release_cached_write_handle(file_path);
+                            let truncate = async {
+                                tokio::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(file_path)
+                                    .await?
+                                    .set_len(end)
+                                    .await
+                            }
+                            .await;
+                            if let Err(error) = truncate {
+                                self.fail_job_for_disk_write(
+                                    SegmentWriteError::new(file_id, error),
+                                    "stale suffix truncate failed",
+                                );
+                                return;
+                            }
+                            self.mark_file_hash_reread_required_for(
+                                file_id,
+                                "stale_suffix_removed",
+                            );
+                        }
+                        if let Some(file) = self
+                            .jobs
+                            .get_mut(&job_id)
+                            .and_then(|state| state.assembly.file_mut(file_id))
+                        {
+                            file.clear_geometry_verification();
+                        }
+                        end
+                    };
 
                     // The file's length is what makes its short final block
                     // closable: until now that block's extent was undecided.
