@@ -615,7 +615,7 @@ export function JobDetailPage() {
               job.optionalRecoveryBytes === 0
                 ? "text-wv-muted"
                 : job.optionalRecoveryDownloadedBytes > 0
-                  ? "text-wv-warn"
+                  ? undefined
                   : "text-wv-accent"
             }
             note={
