@@ -3368,9 +3368,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.5"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b445da3fea594f4e84d9508ba7082858e141faf00fa4288c687bb8c5594351aa"
+checksum = "1f4e3071967f671f618584179c4cb020d3180b82cb96aebca2ec5b9a925be00a"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -3387,9 +3387,9 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.4.1"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fb5b98d15b2131ab7f04f17da856efc2cd80c0cd000db2966cf0e27da739835"
+checksum = "2b4c4c9fa61c1181081494ea208f56def0969a46b538a5e89e1cb360c7821708"
 dependencies = [
  "blake3",
  "crc-fast",
@@ -3924,9 +3924,9 @@ dependencies = [
 
 [[package]]
 name = "reedsolomon-rs"
-version = "0.4.6"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1310cc920830f59859b6deb471129a6b05d2842b88b02e301cf5f58d7dce61a"
+checksum = "1f5c9886f0fb33841060092d2552aa1893edd77fad64143d31660edc8b3ae19a"
 dependencies = [
  "memmap2",
  "rayon",
