@@ -111,6 +111,37 @@ impl Database {
         })
     }
 
+    /// How many history rows each category holds, as `(category, count)`.
+    ///
+    /// A row with no category comes back under the empty string, which is what
+    /// the column holds for it. The aggregate runs in SQL so the caller can put
+    /// a number beside a facet without reading the table it is counting: the
+    /// whole point of the facet list is that it describes rows no page is
+    /// showing.
+    pub fn count_job_history_by_category(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<Vec<(String, u32)>, StateError> {
+        let datastore = self.datastore();
+        let filter = filter.clone();
+        self.run_sql_blocking_read(async move {
+            let mut sql = String::from(
+                "SELECT COALESCE(h.category, '') AS category, COUNT(*) AS count FROM ",
+            );
+            let mut args = Vec::new();
+
+            append_history_from_clause(&mut sql, &mut args, &filter);
+            append_history_row_filter_predicates(&mut sql, &mut args, &filter);
+
+            sql.push_str(" GROUP BY COALESCE(h.category, '')");
+
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            rows.into_iter()
+                .map(|row| Ok((row.text("category")?, row.i64("count")?.max(0) as u32)))
+                .collect()
+        })
+    }
+
     pub fn list_integration_events_after(
         &self,
         after_id: Option<i64>,

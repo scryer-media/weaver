@@ -151,11 +151,28 @@ pub struct HistoryPageCounts {
     pub failure: u32,
 }
 
+/// How many history rows carry one category.
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct HistoryCategoryCount {
+    /// The category, or the empty string for rows with none — the same spelling
+    /// `HistoryPageInput.categories` takes back.
+    pub category: String,
+    pub count: u32,
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct HistoryPage {
     pub items: Vec<HistoryItem>,
     pub total_count: u32,
     pub counts: HistoryPageCounts,
+    /// Every category present in history, with its row count.
+    ///
+    /// Counted with the search applied but *before* the category and status
+    /// filters, so this answers "how many rows would that facet show me" for
+    /// each one — including the facets the current selection is hiding. A
+    /// caller that built its facet list out of `items` instead would watch the
+    /// other categories vanish the moment one was picked.
+    pub category_counts: Vec<HistoryCategoryCount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]

@@ -565,6 +565,18 @@ fn build_history_page_sql(
         HistoryStatusFilter::Failure => failure_history_filter(),
     });
 
+    // Facet counts, like the bucket counts above, describe the whole set: the
+    // plan only exists when no category filter is set, so there is nothing to
+    // leave out of them here.
+    let mut category_counts: Vec<HistoryCategoryCount> = db
+        .count_job_history_by_category(&excluding_live(
+            weaver_server_core::HistoryFilter::default(),
+        ))?
+        .into_iter()
+        .map(|(category, count)| HistoryCategoryCount { category, count })
+        .collect();
+    category_counts.sort_by(|left, right| left.category.cmp(&right.category));
+
     let total_count = db.count_job_history(&items_filter)?;
 
     items_filter.limit = Some(plan.page_size as u32);
@@ -580,6 +592,7 @@ fn build_history_page_sql(
         items,
         total_count,
         counts,
+        category_counts,
     })
 }
 
@@ -758,7 +771,7 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
     // Delete-operation badges are attached by the caller for the final page only
     // (see `load_history_page`); they do not affect search, sort, status, or
     // counts, so they are omitted here.
-    let filtered_by_search: Vec<HistoryItem> = rows
+    let matched_search: Vec<HistoryItem> = rows
         .into_iter()
         .map(|row| {
             if requires_full_display_projection {
@@ -768,6 +781,14 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
             }
         })
         .filter(|item| history_matches_search(item, search.as_deref()))
+        .collect();
+
+    // Before the category filter: a facet's count has to survive that facet's
+    // rivals being selected, or the rail empties itself as you use it.
+    let category_counts = count_history_categories(&matched_search);
+
+    let filtered_by_search: Vec<HistoryItem> = matched_search
+        .into_iter()
         .filter(|item| history_matches_categories(item, categories.as_deref()))
         .collect();
 
@@ -801,7 +822,28 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
         items,
         total_count,
         counts,
+        category_counts,
     }
+}
+
+/// Tally the rows per category, ordered by category so the response does not
+/// depend on hash iteration order.
+fn count_history_categories(items: &[HistoryItem]) -> Vec<HistoryCategoryCount> {
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for item in items {
+        *counts
+            .entry(item.category.as_deref().unwrap_or_default())
+            .or_default() += 1;
+    }
+    let mut counts: Vec<HistoryCategoryCount> = counts
+        .into_iter()
+        .map(|(category, count)| HistoryCategoryCount {
+            category: category.to_string(),
+            count,
+        })
+        .collect();
+    counts.sort_by(|left, right| left.category.cmp(&right.category));
+    counts
 }
 
 fn sanitize_page_size(page_size: u32) -> usize {
@@ -1085,12 +1127,89 @@ mod tests {
             sql.counts.failure, rust.counts.failure,
             "counts.failure mismatch"
         );
+        assert_eq!(
+            sql.category_counts, rust.category_counts,
+            "category counts mismatch"
+        );
         let sql_ids: Vec<u64> = sql.items.iter().map(|item| item.id).collect();
         let rust_ids: Vec<u64> = rust.items.iter().map(|item| item.id).collect();
         assert_eq!(sql_ids, rust_ids, "page item ids/order mismatch");
         // Items are produced by the same `history_item_from_row`, so equal ids in
         // equal order means byte-identical items for identical data.
         assert_eq!(sql.items, rust.items, "page items mismatch");
+    }
+
+    /// The bug this guards: a facet list built from the rows a filtered page
+    /// returned shows only the facet already selected, so there is no way back
+    /// to the others and no way to discover them in the first place.
+    #[test]
+    fn category_counts_survive_the_category_filter() {
+        let db = Database::open_in_memory().unwrap();
+        let mut rows = [
+            history_row(1, "complete", 1_000),
+            history_row(2, "complete", 1_100),
+            history_row(3, "failed", 1_200),
+            history_row(4, "complete", 1_300),
+        ];
+        rows[0].category = Some("anime".to_string());
+        rows[1].category = Some("movie".to_string());
+        rows[2].category = Some("movie".to_string());
+        for row in &rows {
+            db.insert_job_history(row).unwrap();
+        }
+
+        let mut input = page_input(0, 25, None);
+        input.categories = Some(vec!["anime".to_string()]);
+        let page = rust_page(&db, input, &HashSet::new());
+
+        // One anime row on the page, and every category still countable.
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.category_counts,
+            vec![
+                HistoryCategoryCount {
+                    category: String::new(),
+                    count: 1
+                },
+                HistoryCategoryCount {
+                    category: "anime".to_string(),
+                    count: 1
+                },
+                HistoryCategoryCount {
+                    category: "movie".to_string(),
+                    count: 2
+                },
+            ]
+        );
+    }
+
+    /// A search is the one filter the counts do follow: it changes which rows
+    /// are on offer at all, so a facet's number has to answer for the search
+    /// the person typed.
+    #[test]
+    fn category_counts_follow_the_search() {
+        let db = Database::open_in_memory().unwrap();
+        let mut rows = [
+            history_row(1, "complete", 1_000),
+            history_row(2, "complete", 1_100),
+        ];
+        rows[0].category = Some("anime".to_string());
+        rows[1].category = Some("movie".to_string());
+        for row in &rows {
+            db.insert_job_history(row).unwrap();
+        }
+
+        let mut input = page_input(0, 25, None);
+        input.search = Some("Release.1.".to_string());
+        let page = rust_page(&db, input, &HashSet::new());
+
+        assert_eq!(
+            page.category_counts,
+            vec![HistoryCategoryCount {
+                category: "anime".to_string(),
+                count: 1
+            }]
+        );
     }
 
     #[test]
