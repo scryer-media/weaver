@@ -733,6 +733,10 @@ jobs:
           else
             export CC_x86_64_unknown_linux_musl="musl-gcc"
           fi
+          # jemalloc fixes its page size when it is compiled, and a binary
+          # built for a smaller page than the kernel it runs on will not work.
+          # Pinned per target so the artifact never inherits a runner's page size.
+          export JEMALLOC_SYS_WITH_LG_PAGE=12
           mold -run cargo build -p weaver --release --locked --target x86_64-unknown-linux-musl
       - name: Verify native libraries are statically bundled
         run: |
@@ -820,6 +824,11 @@ jobs:
           else
             export CC_aarch64_unknown_linux_musl="musl-gcc"
           fi
+          # jemalloc fixes its page size when it is compiled, and a binary built
+          # for a smaller page than the kernel it runs on will not work. arm64
+          # Linux ships both 4 KiB and 64 KiB kernels, so this portable artifact
+          # is built for the larger one, which runs correctly on both.
+          export JEMALLOC_SYS_WITH_LG_PAGE=16
           mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
       - name: Verify native libraries are statically bundled
         run: |
@@ -911,6 +920,10 @@ jobs:
             export CC="clang"
             export CXX="clang++"
           fi
+          # jemalloc fixes its page size when it is compiled, and a binary
+          # built for a smaller page than the kernel it runs on will not work.
+          # Pinned per target so the artifact never inherits a runner's page size.
+          export JEMALLOC_SYS_WITH_LG_PAGE=12
           cargo build -p weaver --bins --release --locked --target x86_64-apple-darwin
       - name: Verify native libraries are statically bundled
         run: |
@@ -1165,6 +1178,9 @@ jobs:
             export CC="clang"
             export CXX="clang++"
           fi
+          # jemalloc fixes its page size when it is compiled; Apple Silicon is
+          # 16 KiB. Pinned so the artifact never inherits a runner's page size.
+          export JEMALLOC_SYS_WITH_LG_PAGE=14
           cargo build -p weaver --bins --release --locked --target aarch64-apple-darwin
       - name: Verify native libraries are statically bundled
         run: |

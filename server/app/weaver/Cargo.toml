@@ -75,13 +75,21 @@ tokio = { workspace = true, features = ["test-util"] }
 # connection, never through a one-shot router call.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 
-[target.'cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))'.dependencies]
-mimalloc = { version = "0.1.52", default-features = false }
-# Exact pin: `allocator.rs` addresses mimalloc options by the index of this
-# version's bundled v3 enum.
-libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["extended"] }
+# Every target but Windows allocates through jemalloc; see
+# `allocator_jemalloc`. jemalloc fixes its page size at compile time, so the
+# release build sets `JEMALLOC_SYS_WITH_LG_PAGE` for each target it
+# cross-compiles.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = { version = "0.6", default-features = false }
+tikv-jemalloc-sys = { version = "0.6", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Windows has no jemalloc, and its system heap serializes threaded allocation
+# badly, so it keeps the tuned mimalloc; see `allocator_mimalloc`.
+mimalloc = { version = "0.1.52", default-features = false }
+# Exact pin: `allocator_mimalloc.rs` addresses mimalloc options by the index
+# of this version's bundled v3 enum.
+libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["extended"] }
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",

@@ -1,5 +1,10 @@
-//! The process allocator: mimalloc with the arena behaviour tuned for this
-//! workload.
+//! The process allocator on Windows: mimalloc with the arena behaviour tuned
+//! for this workload.
+//!
+//! Every other target builds `allocator_jemalloc` instead. jemalloc has no
+//! Windows support, and the Windows system heap is the one this binary can
+//! least afford to fall back to, so Windows keeps the tuned mimalloc and the
+//! two modules present the same three items to `main`.
 //!
 //! Every article the pipeline moves is a few allocations in the 64 KiB to
 //! 1 MiB range that are made on one thread (a connection reader or a decode
@@ -98,6 +103,13 @@ const TUNING: [(mi_option_t, &[u8], libc::c_long); 6] = [
 
 /// mimalloc, with [`TUNING`] applied before the first allocation goes through.
 pub(crate) struct TunedMiMalloc;
+
+/// The allocator `main` installs. Both allocator modules define this name, so
+/// the installation site does not change with the target.
+pub(crate) type ProcessAllocator = TunedMiMalloc;
+
+/// The value for that static.
+pub(crate) const PROCESS_ALLOCATOR: ProcessAllocator = TunedMiMalloc;
 
 static TUNED: AtomicBool = AtomicBool::new(false);
 

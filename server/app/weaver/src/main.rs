@@ -1,4 +1,10 @@
-#[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
+// Windows and everything else get different allocators, so the module that
+// `allocator` names differs by target; both define the same three items.
+#[cfg(target_os = "windows")]
+#[path = "allocator_mimalloc.rs"]
+mod allocator;
+#[cfg(not(target_os = "windows"))]
+#[path = "allocator_jemalloc.rs"]
 mod allocator;
 mod application_upgrade_helper;
 mod args;
@@ -38,14 +44,14 @@ use crate::logging::{LocalTimer, LogColor, LogFormat};
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
 
-// musl's bundled allocator serializes multi-threaded allocation heavily
-// (measured −18% CPU on the container download benchmark when replaced), and
-// the Windows system heap has the same reputation under threaded load, so
-// both build targets swap in mimalloc, tuned for the pipeline's cross-thread
-// article buffers (see `allocator`). glibc builds keep the system allocator.
-#[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
+// The platform allocators this binary would otherwise get are the wrong shape
+// for the pipeline's cross-thread article buffers: musl's serializes threaded
+// allocation heavily (measured −18% CPU on the container download benchmark
+// when replaced) and the Windows system heap has the same reputation. Every
+// target therefore installs a chosen one — jemalloc, or mimalloc on Windows,
+// which jemalloc does not support.
 #[global_allocator]
-static GLOBAL_ALLOC: allocator::TunedMiMalloc = allocator::TunedMiMalloc;
+static GLOBAL_ALLOC: allocator::ProcessAllocator = allocator::PROCESS_ALLOCATOR;
 
 fn main() {
     // The Windows upgrade helper is this binary run with `--upgrade-helper`: it
@@ -94,7 +100,6 @@ fn main() {
     // pages that nothing is going to ask for again. Both boundaries release
     // explicitly rather than waiting on the allocator's purge clock; this
     // installs the allocator half of both, before any pipeline thread exists.
-    #[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
     {
         weaver_server_core::runtime::thread_release::install_idle_thread_release(
             allocator::collect_idle_thread,
