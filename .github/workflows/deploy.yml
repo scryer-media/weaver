@@ -857,7 +857,8 @@ jobs:
 
   rust-package-darwin-x86_64-portable:
     name: rust-package-darwin-x86_64-portable
-    runs-on: macos-26
+    # Intel image: this artifact is built natively, never cross-arch.
+    runs-on: macos-15-intel
     timeout-minutes: 90
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
@@ -936,10 +937,10 @@ jobs:
             echo "release binary dynamically links a bundled native library" >&2
             exit 1
           fi
-      # There is deliberately no WebKit smoke test in this job: the runners
-      # are Apple silicon, so an x86_64 weaver-tray would have to launch WebKit
-      # under Rosetta. The wrapper source is identical across the two targets,
-      # so the arm64 job's run is what proves the wiring.
+      # There is deliberately no WebKit smoke test in this job. The wrapper
+      # source is identical across the two targets, so the arm64 job's run is
+      # what proves the wiring. This job could run one now that it builds on
+      # an Intel image rather than under Rosetta, but that has never run here.
       - name: Assemble Weaver.app
         run: |
           version="$(cargo metadata --format-version 1 --no-deps \
