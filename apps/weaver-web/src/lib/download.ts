@@ -118,3 +118,22 @@ export async function readDownloadErrorMessage(
 
   return fallbackMessage;
 }
+
+/**
+ * Let the browser fetch a URL as a download, streaming it to disk rather than
+ * through a blob this tab would have to hold whole. The server answers with
+ * `Content-Disposition: attachment`, so the page itself stays put.
+ *
+ * A link rather than the hidden frame below: these responses carry
+ * `X-Frame-Options: DENY`, which a frame load is refused for.
+ */
+export function openUrlAsDownload(url: string) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "";
+  link.rel = "noreferrer noopener";
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}

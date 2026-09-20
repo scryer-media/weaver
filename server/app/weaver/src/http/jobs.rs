@@ -2,7 +2,7 @@ use std::path::{Path as FsPath, PathBuf};
 
 use axum::Form;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Extension, Path};
+use axum::extract::{ConnectInfo, Extension, Path, Query};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -101,6 +101,21 @@ pub(super) async fn job_nzb_download_handler(
     }
 }
 
+/// The browser's own download of an output file: a plain navigation, so the
+/// bytes stream to disk instead of through a blob the tab has to hold. A GET
+/// carries no CSRF header, which is why the form POST below still exists for
+/// callers that already send one.
+pub(super) async fn job_output_file_download_get_handler(
+    Path(job_id): Path<u64>,
+    Extension(handle): Extension<SchedulerHandle>,
+    Extension(request_auth): Extension<super::RequestAuthContext>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Query(request): Query<JobOutputFileDownloadRequest>,
+) -> Response {
+    job_output_file_download(job_id, handle, request_auth, peer, headers, request).await
+}
+
 pub(super) async fn job_output_file_download_handler(
     Path(job_id): Path<u64>,
     Extension(handle): Extension<SchedulerHandle>,
@@ -108,6 +123,17 @@ pub(super) async fn job_output_file_download_handler(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Form(request): Form<JobOutputFileDownloadRequest>,
+) -> Response {
+    job_output_file_download(job_id, handle, request_auth, peer, headers, request).await
+}
+
+async fn job_output_file_download(
+    job_id: u64,
+    handle: SchedulerHandle,
+    request_auth: super::RequestAuthContext,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    request: JobOutputFileDownloadRequest,
 ) -> Response {
     if let Err(status) = require_read(
         &request_auth.db,
