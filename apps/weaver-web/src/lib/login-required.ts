@@ -5,9 +5,9 @@ import type { Translate } from "@/lib/context/translate-context";
  * Whether this browser has to sign in before the interface can do anything.
  *
  * Set at startup from `/api/auth/status`, and again whenever one of Weaver's
- * own requests comes back 401 — which is how a login turned on from this very
- * tab, or a login cookie that expired mid-session, reaches the sign-in page.
- * A 401 alone never shows the page: the status endpoint has the final word,
+ * own requests comes back 401 or 403. This covers expired cookies and sessions
+ * bound to another origin, including another port on the same host.
+ * A refusal alone never shows the page: the status endpoint has the final word,
  * and only a login this browser lacks counts. Nothing clears it: signing in
  * reloads the page.
  */
@@ -70,7 +70,7 @@ export function watchForSignOut() {
   const nativeFetch = window.fetch.bind(window);
   window.fetch = async (input, init) => {
     const response = await nativeFetch(input, init);
-    if (response.status === 401) {
+    if (response.status === 401 || response.status === 403) {
       const url = new URL(input instanceof Request ? input.url : String(input), document.baseURI);
       if (url.origin === origin && !ownEndpoints.has(url.href)) {
         void recheckLoginRequired();
