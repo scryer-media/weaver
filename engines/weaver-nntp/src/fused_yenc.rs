@@ -913,6 +913,10 @@ fn expected_decoded_size(metadata: &YencMetadata) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[path = "yenc_compatibility_tests.rs"]
+mod compatibility_tests;
+
+#[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
 
