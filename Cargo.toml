@@ -14,7 +14,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.13.0"
+version = "0.13.1"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -76,8 +76,8 @@ filetime = { version = "0.2.29", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 zstd = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-sevenz-turbo = { version = "0.23.2", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
-lzma-turbo = { version = "0.3.3", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
+sevenz-turbo = { version = "0.24.0", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
+lzma-turbo = { version = "0.4.0", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd", "socks"] }
 semver = { version = "1.0", default-features = false, features = ["serde", "std"] }
 httpdate = { version = "1.0", default-features = false }
@@ -141,7 +141,9 @@ par3-rs = { version = "0.4.1", default-features = false }
 # 0.10.5 adds adaptive decoder selection and bounded parallel match replay.
 # 0.10.7 stops hashing a split streaming member with BLAKE2sp unless its first
 # header names one, which is every store member weaver opens from volume one.
-unrar-rs = { version = "0.10.7", default-features = false, features = ["crypto-aws-lc"] }
+# 0.10.8 makes the NEON BLAKE2sp message load alignment-agnostic (no UB) and
+# adds an x86-64-v3 clone of the RAR5 fast symbol loop, picked at runtime.
+unrar-rs = { version = "0.10.8", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

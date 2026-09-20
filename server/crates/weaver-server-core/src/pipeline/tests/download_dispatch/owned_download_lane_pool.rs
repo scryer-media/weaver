@@ -3330,6 +3330,89 @@ async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
 }
 
 #[tokio::test]
+async fn enqueued_work_no_server_may_fetch_is_booked_missing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let job_id = JobId(40153);
+    let spec = segmented_job_spec("Unservable Requeue", "solo.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    pipeline.enqueue_download_work(DownloadWork {
+        segment_id,
+        message_id: crate::jobs::ids::MessageId::new("unservable@example.com"),
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+        priority: 100,
+        byte_estimate: 128,
+        retry_count: 0,
+        is_recovery: false,
+        completion_critical: false,
+        exclude_servers: vec![0],
+        avoid_server: None,
+    });
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .articles_not_found
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| state.download_queue.is_empty() && state.failed_bytes == 128),
+        "the article must be booked missing, not queued (job may already be archived by health)"
+    );
+}
+
+#[tokio::test]
+async fn fully_retention_excluded_queue_is_retired_when_the_scheduler_is_asked() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40154);
+    let spec = segmented_job_spec(
+        "Beyond All Retention Queue",
+        "ancient.bin",
+        &[128, 128, 128, 128],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[5, 5]));
+    age_job_days(&mut pipeline, job_id, 10);
+    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 4);
+
+    let pressure = pipeline.refresh_download_pressure();
+    let handout = pipeline.next_works(0, 4, None, pressure);
+    assert!(matches!(
+        handout,
+        crate::pipeline::download::scheduler::Handout::Idle
+    ));
+    assert_eq!(
+        pipeline
+            .metrics
+            .articles_not_found
+            .load(std::sync::atomic::Ordering::Relaxed),
+        4
+    );
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| state.download_queue.is_empty() && state.failed_bytes == 512),
+        "every article must be booked missing (job may already be archived by health)"
+    );
+}
+
+#[tokio::test]
 async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

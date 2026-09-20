@@ -14,7 +14,10 @@ pub(in crate::pipeline) mod sequential;
 /// or block-parallel with the job's memory budget charged for exactly what the
 /// workers will hold.
 enum FilesystemXzDecoder<R: std::io::Read + std::io::Seek> {
-    Sequential(Box<lzma_turbo::xz::XzReader<R>>),
+    Sequential {
+        decoder: Box<lzma_turbo::xz::XzReader<R>>,
+        _memory: MemoryPermit,
+    },
     Parallel {
         decoder: Box<lzma_turbo::xz::XzParallelReader<R>>,
         _memory: MemoryPermit,
@@ -24,7 +27,7 @@ enum FilesystemXzDecoder<R: std::io::Read + std::io::Seek> {
 impl<R: std::io::Read + std::io::Seek> std::io::Read for FilesystemXzDecoder<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Self::Sequential(decoder) => decoder.read(buffer),
+            Self::Sequential { decoder, .. } => decoder.read(buffer),
             Self::Parallel { decoder, .. } => decoder.read(buffer),
         }
     }
@@ -348,6 +351,80 @@ pub(in crate::pipeline) struct SevenZipDecodeReport {
     pub(in crate::pipeline) widest_threads: u32,
 }
 
+/// Test seam: what an adaptive governor has actually seen.
+///
+/// The governor runs beside the decode, so whether it looks at the backlog
+/// before the decode ends is a question of scheduling. A test that wants to
+/// assert what the governor decided waits here until it has seen the backlog,
+/// instead of racing it; nothing in a release build observes this.
+#[cfg(test)]
+pub(in crate::pipeline) mod adaptive_probe {
+    use std::collections::HashMap;
+    use std::sync::{Condvar, Mutex};
+
+    static SEEN: Mutex<Option<HashMap<u64, bool>>> = Mutex::new(None);
+    static SEEN_CHANGED: Condvar = Condvar::new();
+
+    fn seen() -> std::sync::MutexGuard<'static, Option<HashMap<u64, bool>>> {
+        SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Start watching one job's governor, discarding anything a previous
+    /// decode of the same job left behind.
+    pub(in crate::pipeline) fn watch(job_id: u64) {
+        seen()
+            .get_or_insert_with(HashMap::new)
+            .insert(job_id, false);
+    }
+
+    /// Block until this job's governor has read a backlog behind the decode.
+    /// What it then did about it is the caller's assertion, not this wait.
+    pub(in crate::pipeline) fn wait_for_backlog(job_id: u64) {
+        let mut guard = seen();
+        loop {
+            let observed = guard
+                .as_ref()
+                .and_then(|jobs| jobs.get(&job_id))
+                .copied()
+                .unwrap_or(false);
+            if observed {
+                return;
+            }
+            guard = SEEN_CHANGED
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Stop watching, so a job id can be reused and nothing is retained.
+    pub(in crate::pipeline) fn forget(job_id: u64) {
+        if let Some(jobs) = seen().as_mut() {
+            jobs.remove(&job_id);
+        }
+    }
+
+    pub(super) fn note(job_id: u64, pending_runs: usize) {
+        if pending_runs == 0 {
+            return;
+        }
+        let mut guard = seen();
+        let Some(observed) = guard.as_mut().and_then(|jobs| jobs.get_mut(&job_id)) else {
+            return;
+        };
+        *observed = true;
+        drop(guard);
+        SEEN_CHANGED.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn note_adaptive_backlog(job_id: JobId, pending_runs: usize) {
+    adaptive_probe::note(job_id.0, pending_runs);
+}
+
+#[cfg(not(test))]
+fn note_adaptive_backlog(_job_id: JobId, _pending_runs: usize) {}
+
 /// The decode pass: the library helper's entry walk, opened under the job's
 /// limits and threaded as `threads` says.
 ///
@@ -412,6 +489,7 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
                     let Some(progress) = handle.progress() else {
                         continue;
                     };
+                    note_adaptive_backlog(job_id, progress.pending_runs);
                     let target = chase_decode_thread_target(progress.pending_runs, ceiling);
                     if target == applied {
                         continue;
@@ -942,6 +1020,27 @@ pub(in crate::pipeline) fn measured_decoder_memory_bytes(
         }
         _ => Ok(simple_decoder_memory_bytes(kind, max_memory_bytes)),
     }
+}
+
+/// The memory the simple-archive task admits before it opens a decoder.
+///
+/// One owner admits a decoder's footprint. `.xz` is opened by
+/// [`open_filesystem_xz_decoder`], which measures what the decoder it actually
+/// builds will hold and reserves that itself; a ceiling-sized permit taken out
+/// here as well would hold the whole job allowance while the inner request
+/// waited for room only this permit could release. `tar.xz` keeps its permit:
+/// its decoder is opened on the sequential path, which reserves nothing of its
+/// own.
+pub(in crate::pipeline) fn simple_archive_task_memory_permit(
+    kind: SimpleArchiveKind,
+    path: Option<&Path>,
+    budget: &Arc<JobExtractionBudget>,
+) -> Result<Option<MemoryPermit>, String> {
+    if matches!(kind, SimpleArchiveKind::Xz) {
+        return Ok(None);
+    }
+    let decoder_memory = measured_decoder_memory_bytes(kind, path, budget.max_memory_bytes())?;
+    budget.reserve_memory_wait(decoder_memory).map(Some)
 }
 
 fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -> u64 {
@@ -1717,8 +1816,15 @@ fn open_filesystem_xz_decoder(
     let file =
         std::fs::File::open(archive_path).map_err(|error| format!("failed to open xz: {error}"))?;
     let file = BudgetedReader::new(file, Arc::clone(budget));
+    // The sequential decoder's dictionary is bounded by `memory_limit`, and
+    // that is what it is charged for. Reserved before the decoder is built, so
+    // nothing is allocated outside the admission.
+    let memory = budget.reserve_memory_wait(memory_limit)?;
     crate::ingest::xz_multistream_decoder(file, memory_limit)
-        .map(|decoder| FilesystemXzDecoder::Sequential(Box::new(decoder)))
+        .map(|decoder| FilesystemXzDecoder::Sequential {
+            decoder: Box::new(decoder),
+            _memory: memory,
+        })
         .map_err(|error| format!("failed to open xz decoder: {error}"))
 }
 
@@ -2527,12 +2633,11 @@ impl Pipeline {
                     if file_paths.is_empty() {
                         return Err(format!("no files found for set '{set_name_owned}'"));
                     }
-                    let decoder_memory = measured_decoder_memory_bytes(
+                    let _memory_permit = simple_archive_task_memory_permit(
                         kind,
                         file_paths.first().map(PathBuf::as_path),
-                        budget.max_memory_bytes(),
+                        &budget,
                     )?;
-                    let _memory_permit = budget.reserve_memory_wait(decoder_memory)?;
 
                     let extracted_members = match kind {
                         SimpleArchiveKind::Zip => extract_zip(

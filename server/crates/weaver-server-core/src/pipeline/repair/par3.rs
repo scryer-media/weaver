@@ -375,6 +375,7 @@ impl Par3Job {
         for carrier in self.carriers.values_mut() {
             carrier.revision = 0;
             carrier.resume = Some(carrier.scan_start);
+            carrier.scan.start_at(carrier.scan_start);
         }
         self.name_search = placement::NameSearch::default();
         self.donor_search.evict();
@@ -496,6 +497,7 @@ impl Par3Job {
                 .map_or(earliest, |old| old.min(earliest));
             carrier.scanner.seek(rewind)?;
             carrier.scan_start = earliest;
+            carrier.scan.start_at(earliest);
             carrier.revision = 0;
             self.scan(source)?;
         }
@@ -552,6 +554,7 @@ impl Par3Job {
         carrier.path = Some(path);
         carrier.scanner.seek(start)?;
         carrier.scan_start = start;
+        carrier.scan.start_at(start);
         self.scan(source)
     }
 

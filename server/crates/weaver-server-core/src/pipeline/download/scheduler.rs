@@ -247,6 +247,16 @@ impl Pipeline {
                 uu_cursor_ordinals.as_ref(),
                 &taken,
             ) else {
+                // Retention rules this server out for the job. When it rules
+                // every server out, no lane will ever take the queue: retire
+                // it as missing now rather than leave the job waiting.
+                let server_count = self.nntp.pool().server_count();
+                let retention = self.job_retention_excludes(job_id);
+                if Self::unavailable_server_count_from_excludes(server_count, &[], &retention)
+                    >= server_count
+                {
+                    self.retire_unservable_queued_work(job_id);
+                }
                 break;
             };
             let popped = self.jobs.get_mut(&job_id).and_then(|state| {

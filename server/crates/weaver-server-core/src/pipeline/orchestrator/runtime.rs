@@ -1424,6 +1424,16 @@ impl Pipeline {
             );
             return;
         }
+        // Work every server is excluded from can never be seated by a lane:
+        // the queue would hold it, and the job with it, indefinitely. Every
+        // producer of a re-queue passes through here, so this is where the
+        // article is retired instead.
+        if self.no_server_can_serve(job_id, &work.exclude_servers) {
+            self.book_unservable_work(&work);
+            self.update_queue_metrics();
+            self.maybe_finish_download_pass(job_id);
+            return;
+        }
         let completion_critical =
             work.completion_critical || self.segment_is_completion_critical(segment_id);
         let promoted_recovery = work.is_recovery && completion_critical;

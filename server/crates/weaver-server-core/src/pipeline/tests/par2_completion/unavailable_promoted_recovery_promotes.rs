@@ -445,6 +445,127 @@ async fn extracted_archive_job_finalizes_without_reverifying_missing_par2_index(
     assert!(output_dir.join("E02.mkv").exists());
 }
 
+#[tokio::test]
+async fn unextracted_archive_job_does_not_finalize_on_the_missing_index_shortcut() {
+    // Same shape as the fixture above — every RAR volume delivered, the PAR2
+    // index article never posted, the set loaded from a recovery volume — but
+    // extraction has not run. The residuals shortcut only asks whether the
+    // remaining hole is furniture; if it also finalized here the job would
+    // reconcile an empty working directory and report Complete with nothing
+    // produced.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30085);
+    let files = build_multifile_multivolume_rar_set();
+    let mut spec = rar_job_spec("RAR Finalize Before Extraction", &files);
+    spec.total_bytes += 128;
+    spec.files.push(FileSpec {
+        filename: "repair.par2".to_string(),
+        role: FileRole::from_filename("repair.par2"),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: 64,
+            message_id: "rar-unextracted-par2-index@example.com".to_string(),
+        }],
+    });
+    spec.files.push(FileSpec {
+        filename: "repair.vol00+01.par2".to_string(),
+        role: FileRole::from_filename("repair.vol00+01.par2"),
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: vec![segment_spec! {
+            number: 0,
+            bytes: 64,
+            message_id: "rar-unextracted-par2-recovery@example.com".to_string(),
+        }],
+    });
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+
+    for (file_index, (filename, bytes)) in files.iter().enumerate() {
+        tokio::fs::write(working_dir.join(filename), bytes)
+            .await
+            .unwrap();
+        let file_id = NzbFileId {
+            job_id,
+            file_index: file_index as u32,
+        };
+        {
+            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            state
+                .assembly
+                .file_mut(file_id)
+                .unwrap()
+                .commit_segment(0, bytes.len() as u32)
+                .unwrap();
+        }
+        pipeline
+            .refresh_archive_state_for_completed_file(job_id, file_id, false)
+            .await;
+    }
+    drain_rar_refreshes(&mut pipeline).await;
+
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        build_repairable_par2_set(&files[0].0, &files[0].1, 64, 0),
+        &[],
+    );
+
+    // No worker holds the set: the eager extraction spawned during fixture
+    // setup is out of scope here.
+    for ((rar_job_id, _), set_state) in pipeline.rar_sets.iter_mut() {
+        if *rar_job_id == job_id {
+            set_state.active_workers = 0;
+            set_state.in_flight_members.clear();
+        }
+    }
+    // Extraction has not started and cannot start yet: the set is parked on
+    // an extraction capacity retry. Nothing has failed, so nothing reopens the
+    // recovery verdict — the job is simply owed an extraction it never had.
+    let parked_sets: Vec<String> = pipeline
+        .rar_sets
+        .keys()
+        .filter(|(rar_job_id, _)| *rar_job_id == job_id)
+        .map(|(_, set_name)| set_name.clone())
+        .collect();
+    assert!(!parked_sets.is_empty(), "fixture should have a RAR set");
+    for set_name in parked_sets {
+        pipeline.pending_rar_capacity_retries.insert((
+            job_id,
+            set_name,
+            crate::pipeline::RarCapacityRetryKind::Extraction,
+        ));
+    }
+    assert!(
+        pipeline
+            .extracted_members
+            .get(&job_id)
+            .is_none_or(|members| members.is_empty()),
+        "fixture should start with nothing extracted"
+    );
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    resume_job_downloading_for_test(&mut pipeline, job_id);
+
+    // The volumes stay on disk: they were delivered and never opened.
+
+    pipeline.check_job_completion(job_id).await;
+    settle_inflight_moves(&mut pipeline).await;
+
+    assert_ne!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "a job whose RAR sets were never extracted must not complete: {}",
+        debug_job_state(&pipeline, job_id)
+    );
+}
+
 #[test]
 fn quick_par2_verification_uses_verifying_failpoint() {
     assert_eq!(

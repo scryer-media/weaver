@@ -2910,9 +2910,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.3.3"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "120c989c4bfc4226cffbabbc6fbb4698e4a68d09f4939b1681fa7b8f73ee37de"
+checksum = "8afaed7813bc141a610a7b156db5f63d99ec934ac9fbef1d5bcd4f331e94ee80"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -4555,9 +4555,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.23.2"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75881e12a7898d350b5accf0faf44ba6e0b25de1b2bb8c1623b298a26afbe926"
+checksum = "e980173990e8c03f88d465045ea7150214ffbbfc7366ed57a71d2218aa8dc11c"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -5682,9 +5682,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.10.7"
+version = "0.10.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e95765ade916897db5042eb0fc7d11df4e39447203e6ccaf04197e5679cecec"
+checksum = "8c88ea2344a272f16075d56b89c1cdbcbf533b15cceb1fb86a4d8f2175486a61"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -5896,7 +5896,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "application-updater",
  "async-graphql",
@@ -5954,14 +5954,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -5989,7 +5989,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "quick-xml",
  "serde",
@@ -6000,7 +6000,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6031,7 +6031,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6105,7 +6105,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6124,7 +6124,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "cc",
  "crc-fast",

@@ -251,9 +251,12 @@ async fn zip64_par2_repairs_payload_directory_and_missing_articles() {
                 land_article(&mut pipeline, id, &damaged, number).await;
             }
         }
-        if missing.is_none() {
-            reap_zip(&mut pipeline, job_id).await;
-        }
+        // No waiting for the chase to end on its own. Whether its reader
+        // passed the damage before the part completed is a thread race: if it
+        // did, the chase fails on the bad bytes; if not, the completion's
+        // damage verdict gates the set and the chase parks for the repair
+        // below, which is the only thing that will ever move it. The repair
+        // seam handles both, so every damage shape goes straight to it.
 
         let working = pipeline.jobs[&job_id].working_dir.clone();
         let mut options = par2_rs::Par2RepairerOptions::new(working.clone(), Vec::new());

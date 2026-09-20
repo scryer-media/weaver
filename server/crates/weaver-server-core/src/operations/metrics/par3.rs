@@ -672,7 +672,15 @@ impl Par3Metrics {
     pub fn note_engine_phase(&self, job_id: u64, phase: Par3Phase, now_ms: u64) {
         for slot in &self.slots {
             if slot.job_id.load(Ordering::Relaxed) == job_id {
-                slot.phase.store(phase.as_code(), Ordering::Relaxed);
+                // A phase is entered when it changes. Leaving the mark alone
+                // here had each engine phase inherit the time the phase before
+                // it began, so the phase a job is in reads as older than it is
+                // — and the longer the job ran, the older. Progress inside one
+                // phase is not a new entry, so the mark only moves on a real
+                // transition, the same rule `store_phase` follows.
+                if slot.phase.swap(phase.as_code(), Ordering::Relaxed) != phase.as_code() {
+                    slot.phase_entered_ms.store(now_ms, Ordering::Relaxed);
+                }
                 slot.last_progress_ms.store(now_ms, Ordering::Relaxed);
                 return;
             }
@@ -965,6 +973,33 @@ mod tests {
             crate::alloc_probe::allocations(),
             before,
             "the progress handler allocated"
+        );
+    }
+
+    /// Deliverable: a phase's age is its own. The engine's phase handler
+    /// changes the phase a slot reports, so it has to stamp when that phase
+    /// was entered; inheriting the previous phase's mark makes every later
+    /// phase read as old as the job.
+    #[test]
+    fn an_engine_phase_change_stamps_its_own_entry() {
+        let metrics = Par3Metrics::default();
+        metrics.store_phase(11, Par3Phase::Verifying, 1_000);
+        assert_eq!(metrics.observe(1_400)[0].phase_age_ms, 400);
+
+        metrics.note_engine_phase(11, Par3Phase::Repairing, 1_500);
+        let entered = metrics.observe(1_900);
+        assert_eq!(entered[0].phase, Par3Phase::Repairing);
+        assert_eq!(
+            entered[0].phase_age_ms, 400,
+            "the new phase is aged from when the engine entered it"
+        );
+
+        // Progress inside the same phase is not a new entry.
+        metrics.note_engine_phase(11, Par3Phase::Repairing, 1_900);
+        assert_eq!(
+            metrics.observe(2_100)[0].phase_age_ms,
+            600,
+            "re-announcing a phase must not reset its age"
         );
     }
 

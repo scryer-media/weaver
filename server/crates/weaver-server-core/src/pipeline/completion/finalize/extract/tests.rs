@@ -647,6 +647,51 @@ fn multi_block_xz_extracts_with_the_filesystem_decoder() {
     assert_eq!(fs::read(output_dir.join("payload.bin")).unwrap(), payload);
 }
 
+/// The simple-archive task and the xz decoder must not both admit the same
+/// footprint. The decoder measures and reserves what it will hold; a
+/// ceiling-sized permit held over it leaves a job whose ceiling is the xz
+/// limit with nothing for the decoder to reserve, and the decoder then waits
+/// for room only the permit above it could release.
+#[test]
+fn xz_extraction_admits_its_decoder_footprint_once() {
+    let _test_guard = lock_xz_mt_decoder_test();
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("payload.bin.xz");
+    let output_dir = temp.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    let payload: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    fs::write(&archive_path, xz_compress_multiblock(&payload)).unwrap();
+
+    let (root, budget) = test_extraction_security_with_memory(
+        &output_dir,
+        crate::ingest::XZ_DECODER_MEMORY_LIMIT_BYTES,
+    );
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(32);
+
+    // What the simple-archive task admits before it opens the decoder.
+    let _task_memory = simple_archive_task_memory_permit(
+        SimpleArchiveKind::Xz,
+        Some(archive_path.as_path()),
+        &budget,
+    )
+    .unwrap();
+
+    extract_xz(
+        &archive_path,
+        &root,
+        &budget,
+        &event_tx,
+        JobId(1),
+        "payload.bin.xz",
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(output_dir.join("payload.bin")).unwrap(), payload);
+}
+
 #[test]
 fn filesystem_xz_decoder_uses_parallel_for_a_multiblock_single_stream() {
     let _test_guard = lock_xz_mt_decoder_test();
@@ -692,7 +737,7 @@ fn filesystem_xz_decoder_falls_back_to_sequential_when_a_worker_does_not_fit() {
 
     let (_root, budget) = test_extraction_security_with_memory(&output_dir, one_worker - 1);
     let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 2).unwrap();
-    assert!(matches!(&decoder, FilesystemXzDecoder::Sequential(_)));
+    assert!(matches!(&decoder, FilesystemXzDecoder::Sequential { .. }));
 
     let mut output = Vec::new();
     decoder.read_to_end(&mut output).unwrap();
@@ -724,7 +769,7 @@ fn filesystem_xz_decoder_trims_its_threads_to_the_memory_budget() {
     let mut decoder = open_filesystem_xz_decoder(&archive_path, &budget, 4).unwrap();
     match &decoder {
         FilesystemXzDecoder::Parallel { decoder, .. } => assert_eq!(decoder.threads(), 1),
-        FilesystemXzDecoder::Sequential(_) => panic!("expected the parallel decoder"),
+        FilesystemXzDecoder::Sequential { .. } => panic!("expected the parallel decoder"),
     }
 
     let mut output = Vec::new();
@@ -1139,9 +1184,16 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
 
     let (root, budget) = test_extraction_security_with_memory(&out_dir, 256 * 1024 * 1024);
     let root = Arc::new(root);
+    let job_id = JobId(41815);
     let mut written = Vec::new();
+    // Which of the decode and its governor finishes first is scheduling, and
+    // scheduling must not decide a test. The consumer takes one chunk and then
+    // holds until the governor has actually read the backlog behind it, so the
+    // decode cannot race past the decision this test is about.
+    adaptive_probe::watch(job_id.0);
+    let mut waited_for_the_governor = false;
     let report = decode_7z_streaming(
-        JobId(41815),
+        job_id,
         "silver_horizon.7z",
         Cursor::new(archive.clone()),
         &out_dir,
@@ -1153,11 +1205,27 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
         },
         |entry, reader, _dest| {
             assert_eq!(entry.name(), "Silver.Horizon/reel.txt");
-            reader.read_to_end(&mut written)?;
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                written.extend_from_slice(&chunk[..read]);
+                if !waited_for_the_governor {
+                    adaptive_probe::wait_for_backlog(job_id.0);
+                    waited_for_the_governor = true;
+                }
+            }
             Ok(true)
         },
     )
     .expect("adaptive decode");
+    adaptive_probe::forget(job_id.0);
+    assert!(
+        waited_for_the_governor,
+        "the decode produced no bytes to hold on"
+    );
 
     assert_eq!(written, reel, "a widened decode produces the same bytes");
     assert!(

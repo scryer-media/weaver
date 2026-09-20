@@ -26,8 +26,12 @@ import {
  * installation someone else manages (a container, Homebrew, winget, a Windows
  * service) says so instead of offering a button that would be refused.
  */
-export function ApplicationUpgradeCard() {
-  const t = useTranslate();
+/**
+ * Upgrade state and the install action, shared by the classic card and the
+ * Next UI's System Info section so both offer the same button for the same
+ * release.
+ */
+export function useApplicationUpgrade() {
   const [{ data: queryData }] = useQuery<{
     applicationUpgradeStatus: ApplicationUpgradeStatus;
   }>({ query: APPLICATION_UPGRADE_STATUS_QUERY, requestPolicy: "cache-and-network" });
@@ -39,11 +43,8 @@ export function ApplicationUpgradeCard() {
   const [starting, setStarting] = useState(false);
 
   const status = liveData?.applicationUpgradeUpdates ?? queryData?.applicationUpgradeStatus;
-  if (!status) {
-    return null;
-  }
-  const installable = installableUpgrade(status);
-  const run = status.activeRun ?? status.latestRun;
+  const installable = status ? installableUpgrade(status) : null;
+  const run = status ? (status.activeRun ?? status.latestRun) : null;
 
   const install = async () => {
     if (!installable) return;
@@ -57,6 +58,16 @@ export function ApplicationUpgradeCard() {
       setStartError(result.error.graphQLErrors[0]?.message ?? result.error.message);
     }
   };
+
+  return { status, installable, run, install, starting, startError };
+}
+
+export function ApplicationUpgradeCard() {
+  const t = useTranslate();
+  const { status, installable, run, install, starting, startError } = useApplicationUpgrade();
+  if (!status) {
+    return null;
+  }
 
   return (
     <SectionCard title={t("applicationUpgrade.title")}>
@@ -113,11 +124,17 @@ export function ApplicationUpgradeCard() {
 }
 
 /** The phase, and the download percentage once the artifact's size is known. */
-function RunProgress({ run }: { run: ApplicationUpgradeRun }) {
+export function RunProgress({
+  run,
+  className = "text-sm text-muted-foreground",
+}: {
+  run: ApplicationUpgradeRun;
+  className?: string;
+}) {
   const t = useTranslate();
   const percent = downloadPercent(run);
   return (
-    <div role="status" className="text-sm text-muted-foreground">
+    <div role="status" className={className}>
       {t(`applicationUpgrade.phase.${run.phase}`, { version: run.targetVersion })}
       {run.phase === "downloading" && percent != null ? ` · ${percent}%` : null}
     </div>

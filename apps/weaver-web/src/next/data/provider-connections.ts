@@ -4,6 +4,10 @@ import type { ProviderHealth } from "./next-data";
 export interface ProviderConnections {
   label: string;
   active: number;
+  /** Sockets connected to the server right now. */
+  open: number;
+  /** How many of those are carrying a request. */
+  busy: number;
   max: number;
 }
 
@@ -27,12 +31,21 @@ export function withLiveConnections(
     const entry = byLabel.get(provider.label);
     if (
       !entry ||
-      (entry.active === provider.connectionsActive && entry.max === provider.connectionsMax)
+      (entry.active === provider.connectionsActive &&
+        entry.open === provider.connectionsOpen &&
+        entry.busy === provider.connectionsBusy &&
+        entry.max === provider.connectionsMax)
     ) {
       return provider;
     }
     changed = true;
-    return { ...provider, connectionsActive: entry.active, connectionsMax: entry.max };
+    return {
+      ...provider,
+      connectionsActive: entry.active,
+      connectionsOpen: entry.open,
+      connectionsBusy: entry.busy,
+      connectionsMax: entry.max,
+    };
   });
   return changed ? merged : providers;
 }
