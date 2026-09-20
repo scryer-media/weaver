@@ -224,6 +224,12 @@ impl Pipeline {
                             Some(state.created_at.elapsed()),
                         );
 
+                        // Same boundary as a job that completed or failed: the
+                        // cancelled job's article pages are free and unwanted,
+                        // so hand them back rather than holding a job-sized
+                        // working set until the purge clock runs out.
+                        crate::runtime::thread_release::release_job_completion_memory();
+
                         let working_dir = state.working_dir.clone();
                         let staging_dir = state.staging_dir.clone();
                         tokio::spawn(async move {

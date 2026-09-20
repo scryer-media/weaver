@@ -89,13 +89,20 @@ fn main() {
         .build_global();
 
     // A parked download lane holds the pages freed by the decode and writer
-    // threads on its own allocator heap until it allocates again, which it
-    // does not do while parked. The lane asks for the release itself; this
-    // installs the allocator half of that, before any pipeline thread exists.
+    // threads on its own allocator heap until it allocates again, and a job
+    // that has just finished holds a whole job's worth of recycled article
+    // pages that nothing is going to ask for again. Both boundaries release
+    // explicitly rather than waiting on the allocator's purge clock; this
+    // installs the allocator half of both, before any pipeline thread exists.
     #[cfg(any(target_env = "musl", target_os = "windows", target_os = "macos"))]
-    weaver_server_core::runtime::thread_release::install_idle_thread_release(
-        allocator::collect_idle_thread,
-    );
+    {
+        weaver_server_core::runtime::thread_release::install_idle_thread_release(
+            allocator::collect_idle_thread,
+        );
+        weaver_server_core::runtime::thread_release::install_job_completion_release(
+            allocator::collect_after_job,
+        );
+    }
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all().thread_stack_size(8 * 1024 * 1024); // 8 MB - pipeline futures are large
