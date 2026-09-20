@@ -62,6 +62,7 @@ mod sequential_unpack;
 mod server_attribution;
 mod sfv_completion;
 mod terminal_settlement;
+mod yenc_compatibility;
 mod zip64;
 
 struct TestHarness {

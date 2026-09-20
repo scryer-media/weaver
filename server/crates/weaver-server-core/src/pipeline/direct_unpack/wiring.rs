@@ -904,6 +904,20 @@ impl Pipeline {
         if self.direct_unpack.repairing_jobs.contains(&job_id) {
             return;
         }
+        // A different volume can trigger arming after damaged bytes arrived.
+        // Check the whole input set before exposing any of its files to a chase.
+        if self.jobs.get(&job_id).is_some_and(|state| {
+            state.assembly.files().any(|file| {
+                file.requires_file_verification()
+                    && paths.iter().any(|path| {
+                        path == &state
+                            .working_dir
+                            .join(self.current_filename_for_file(job_id, file))
+                    })
+            })
+        }) {
+            return;
+        }
         // A paused worker still owns this staging path until it is joined and
         // cleaned up. Reusing it sooner would race both its writes and cleanup.
         if self
@@ -1277,6 +1291,10 @@ impl Pipeline {
         let Some(file_asm) = state.assembly.file(file_id) else {
             return;
         };
+
+        if file_asm.requires_file_verification() {
+            return;
+        }
 
         if file_asm.is_complete() {
             self.publish_completed_part_to_chase(job_id, file_id);

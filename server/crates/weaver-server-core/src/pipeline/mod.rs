@@ -1966,6 +1966,9 @@ impl From<Vec<Box<[u8]>>> for DecodedChunk {
 
 pub(super) struct BufferedDecodedSegment {
     pub(super) segment_id: SegmentId,
+    /// Unresolved damage is written before retrying. Retain the actual CRC
+    /// status so a missing checksum is never reported as a mismatch.
+    pub(super) damaged_source: Option<Box<(SegmentSource, weaver_yenc::CrcVerification)>>,
     pub(super) decoded_size: u32,
     /// Carried from the decoder so the durability seam can tell whether this
     /// segment is allowed to feed the dual-CRC grid.

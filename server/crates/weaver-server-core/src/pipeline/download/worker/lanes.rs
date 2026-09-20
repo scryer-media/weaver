@@ -170,6 +170,23 @@ impl Pipeline {
             .is_some_and(|file| file.has_segment(seg_id.segment_number))
     }
 
+    /// A verified late replacement settles a previously damaged ordinal once.
+    pub(in crate::pipeline) fn clear_replaced_damage_failure(&mut self, segment_id: SegmentId) {
+        if self.segment_terminal_states.remove(&segment_id).is_none() {
+            return;
+        }
+        let bytes = self.health_counted_segment_bytes(segment_id);
+        let file_has_failures = self.file_terminal_failed_bytes(segment_id.file_id) > 0;
+        if let Some(state) = self.jobs.get_mut(&segment_id.file_id.job_id) {
+            state.failed_bytes = state.failed_bytes.saturating_sub(bytes);
+            if !file_has_failures {
+                state
+                    .health_failing_files
+                    .remove(&segment_id.file_id.file_index);
+            }
+        }
+    }
+
     /// The job's failed bytes as the terminal states alone define them.
     ///
     /// The running figure on `JobState` is maintained by the single edge in

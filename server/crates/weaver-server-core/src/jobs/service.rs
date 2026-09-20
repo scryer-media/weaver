@@ -1004,6 +1004,7 @@ impl Pipeline {
                 }
             }
 
+            file_assembly.note_restored_prefix(file_assembly.received_bytes());
             assembly.add_file(file_assembly);
         }
 

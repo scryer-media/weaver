@@ -28,6 +28,15 @@ impl Pipeline {
     /// very first article is uuencoded would otherwise find no set to demote
     /// and admit one moments later.
     pub(crate) async fn demote_direct_sets_for_uu_article(&mut self, file_id: NzbFileId) {
+        self.demote_direct_sets_for_article(file_id, DemotionReason::UuencodedSourceVolume)
+            .await;
+    }
+
+    pub(crate) async fn demote_direct_sets_for_article(
+        &mut self,
+        file_id: NzbFileId,
+        reason: DemotionReason,
+    ) {
         let job_id = file_id.job_id;
         self.ensure_direct_sets(job_id);
         // Identity rosters go with the sets, and for the same reason: nothing
@@ -45,8 +54,7 @@ impl Pipeline {
             })
             .collect();
         for set_index in set_indices {
-            self.demote_direct_set(job_id, set_index, DemotionReason::UuencodedSourceVolume)
-                .await;
+            self.demote_direct_set(job_id, set_index, reason).await;
         }
     }
 
