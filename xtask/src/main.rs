@@ -1586,6 +1586,25 @@ fn write_workspace_version(path: &Path, version: &Version) -> Result<()> {
     Ok(())
 }
 
+/// The toolchain `rust-toolchain.toml` pins.
+///
+/// The Linux clippy image is derived from it rather than named on its own,
+/// because rustup inside that container reads the same file from the mounted
+/// checkout: an image built on another compiler does not run clippy on an older
+/// toolchain, it downloads this one on every run. A hard-coded tag only drifts
+/// silently until someone notices the container is not the toolchain.
+fn pinned_rust_channel(ctx: &TaskContext) -> Result<String> {
+    let path = ctx.repo_root.join("rust-toolchain.toml");
+    let document = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    document["toolchain"]["channel"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{} has no toolchain.channel", path.display()))
+}
+
 fn linux_clippy_defaults(host_target: &str) -> (&'static str, &'static str) {
     if host_target.starts_with("aarch64-") {
         ("aarch64-unknown-linux-musl", "linux/arm64")
@@ -1614,8 +1633,10 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
     let (default_linux_target, default_linux_platform) = linux_clippy_defaults(&host_target);
     let linux_target =
         std::env::var("WEAVER_LINUX_CLIPPY_TARGET").unwrap_or_else(|_| default_linux_target.into());
-    let linux_image = std::env::var("WEAVER_LINUX_CLIPPY_IMAGE")
-        .unwrap_or_else(|_| "rust:1.96-bookworm".to_string());
+    let linux_image = match std::env::var("WEAVER_LINUX_CLIPPY_IMAGE") {
+        Ok(image) => image,
+        Err(_) => format!("rust:{}-bookworm", pinned_rust_channel(ctx)?),
+    };
     let linux_platform = std::env::var("WEAVER_LINUX_CLIPPY_PLATFORM")
         .unwrap_or_else(|_| default_linux_platform.into());
     let linux_rustflags = ci_rustflags_for_target(&linux_target, ReleaseLane::Portable)?;

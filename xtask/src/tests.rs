@@ -862,3 +862,37 @@ fn setup_code_line_must_carry_a_whole_code() {
     );
     assert_eq!(parse_setup_code_line("INFO listening"), None);
 }
+
+#[test]
+fn the_linux_clippy_image_follows_the_pinned_toolchain() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = TaskContext {
+        repo_root: temp.path().to_path_buf(),
+    };
+    fs::write(
+        temp.path().join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.98.0\"\ncomponents = [\"clippy\"]\n",
+    )
+    .unwrap();
+
+    assert_eq!(pinned_rust_channel(&ctx).unwrap(), "1.98.0");
+
+    // The pin this repository actually carries, since that is the tag the
+    // release pulls. A missing or renamed file is a release failure, not a
+    // silently older container.
+    let repo = TaskContext {
+        repo_root: repo_root(),
+    };
+    let channel = pinned_rust_channel(&repo).unwrap();
+    assert!(
+        Version::parse(&channel).is_ok(),
+        "expected an exact toolchain version, got {channel}"
+    );
+
+    let empty = tempfile::tempdir().unwrap();
+    let error = pinned_rust_channel(&TaskContext {
+        repo_root: empty.path().to_path_buf(),
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("failed to read"));
+}
