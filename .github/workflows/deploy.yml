@@ -774,8 +774,12 @@ jobs:
       AWS_LC_SYS_STATIC: "1"
       AWS_LC_SYS_SMALL: "0"
       AWS_LC_SYS_CMAKE_BUILDER: "0"
-      CFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
-      CXXFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      # Ubuntu's aarch64 gcc defaults to -moutline-atomics, which drags
+      # libgcc's lse-init.o into every link that touches an atomic. That object
+      # calls __getauxval, which glibc has and musl does not, so the link fails
+      # and any configure probe using atomics reports the feature missing.
+      CFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
+      CXXFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
