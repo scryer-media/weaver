@@ -2727,10 +2727,17 @@ pub struct Pipeline {
     /// restarts whenever the cursor has moved, because a displacement behind a
     /// moving cursor is progress, not a cycle.
     pub(super) uu_park_requeues: HashMap<SegmentId, (u32, u32)>,
+    /// Articles that declared no usable start and arrived before the ordinal
+    /// they follow, held decoded until that ordinal is placed. Their bytes are
+    /// charged to the write-buffer ledger while they wait.
+    pub(super) unanchored_parked: HashMap<NzbFileId, BTreeMap<u32, (DecodeResult, SegmentSource)>>,
     /// How often each article that declared no usable start has been sent back
-    /// for the ordinal before it. Like the park counter above, a livelock bound
-    /// and never a retry budget: the bytes are not at fault.
-    pub(super) unanchored_requeues: HashMap<SegmentId, u32>,
+    /// for the ordinal before it because the park above had no room for it,
+    /// paired with how many ordinals of its file were placed when that count
+    /// was taken. Like the park counter above, a livelock bound and never a
+    /// retry budget: the bytes are not at fault, and the count restarts
+    /// whenever the file has placed another part.
+    pub(super) unanchored_requeues: HashMap<SegmentId, (u32, usize)>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.

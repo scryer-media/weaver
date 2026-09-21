@@ -1490,8 +1490,8 @@ async fn an_article_without_a_start_follows_the_one_before_it() {
 }
 
 /// Arriving before the part it must follow is an ordering condition, not
-/// damage: the article is asked for again on the same terms and lands once its
-/// predecessor is placed.
+/// damage: the decoded article is held, costs no fetch and no retry, and lands
+/// the moment its predecessor is placed.
 #[tokio::test]
 async fn an_article_without_a_start_waits_for_its_predecessor() {
     let temp = tempfile::tempdir().unwrap();
@@ -1500,13 +1500,15 @@ async fn an_article_without_a_start_waits_for_its_predecessor() {
         file_id,
         segment_number: 1,
     };
+    let buffered = pipeline.write_buffered_bytes;
     deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
-    assert_eq!(pipeline.unanchored_requeues.get(&segment), Some(&1));
+    assert!(pipeline.unanchored_parked[&file_id].contains_key(&1));
+    assert_eq!(pipeline.write_buffered_bytes, buffered + 4);
+    assert!(pipeline.unanchored_requeues.is_empty());
     assert!(!pipeline.decode_retries.contains_key(&segment));
     assert!(!pipeline.segment_terminal_states.contains_key(&segment));
     assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 0);
-    let queued = pipeline.jobs[&file_id.job_id].download_queue.len();
-    assert_eq!(queued, 1);
+    assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
     assert!(
         !pipeline.jobs[&file_id.job_id]
             .assembly
@@ -1515,7 +1517,102 @@ async fn an_article_without_a_start_waits_for_its_predecessor() {
             .has_segment(1)
     );
     deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
+    assert_eq!(std::fs::read(path).unwrap(), b"headtail");
+    assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.write_buffered_bytes, buffered);
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.is_complete());
+    assert_eq!(file.placement_of(1), Some((4, 4)));
+    assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
+}
+
+/// A run of held articles releases in one pass once its head is placed, each
+/// laid after the one before it.
+#[tokio::test]
+async fn a_run_of_held_articles_releases_behind_its_head() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40230, &[12, 12, 12]).await;
+    deliver_unanchored(&mut pipeline, file_id, 2, b"cccc").await;
+    deliver_unanchored(&mut pipeline, file_id, 1, b"bbbb").await;
+    assert_eq!(pipeline.unanchored_parked[&file_id].len(), 2);
+    deliver(&mut pipeline, file_id, 0, 0, b"aaaa", true).await;
+    assert_eq!(std::fs::read(path).unwrap(), b"aaaabbbbcccc");
+    assert!(pipeline.unanchored_parked.is_empty());
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert_eq!(file.placement_of(2), Some((8, 4)));
+    assert!(file.is_complete());
+}
+
+/// Held articles have no offset once the part they follow is given up, so they
+/// are retired with it rather than held for a placement that cannot come.
+#[tokio::test]
+async fn giving_up_a_predecessor_retires_the_articles_held_behind_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _path) = setup(&temp, 40231, &[12, 12, 12]).await;
+    let buffered = pipeline.write_buffered_bytes;
+    deliver_unanchored(&mut pipeline, file_id, 1, b"bbbb").await;
+    deliver_unanchored(&mut pipeline, file_id, 2, b"cccc").await;
+    let head = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    pipeline.book_terminal_segment(head, SegmentTerminalState::Missing);
+    assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.write_buffered_bytes, buffered);
+    for number in [1, 2] {
+        assert_eq!(
+            pipeline.segment_terminal_states.get(&SegmentId {
+                file_id,
+                segment_number: number,
+            }),
+            Some(&SegmentTerminalState::DecodeExhausted)
+        );
+    }
+    assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
+}
+
+/// An article that cannot be held is asked for again without retry budget, and
+/// the bound on that counts only attempts since the file last placed a part.
+#[tokio::test]
+async fn an_article_that_cannot_be_held_is_requeued_until_the_file_stalls() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _path) = setup(&temp, 40232, &[12, 12, 12]).await;
+    pipeline.uu_park_max_segments = 0;
+    let segment = SegmentId {
+        file_id,
+        segment_number: 2,
+    };
+    deliver_unanchored(&mut pipeline, file_id, 2, b"cccc").await;
+    assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.unanchored_requeues.get(&segment), Some(&(1, 0)));
+    assert!(!pipeline.decode_retries.contains_key(&segment));
+    assert_eq!(pipeline.jobs[&file_id.job_id].download_queue.len(), 1);
+
+    deliver(&mut pipeline, file_id, 0, 0, b"aaaa", true).await;
+    deliver_unanchored(&mut pipeline, file_id, 2, b"cccc").await;
+    // The file moved on, so the count starts over rather than accumulating.
+    assert_eq!(pipeline.unanchored_requeues.get(&segment), Some(&(1, 1)));
+    assert!(!pipeline.segment_terminal_states.contains_key(&segment));
+}
+
+/// A predecessor that lands as damage is sent for again rather than placed,
+/// so the article held behind it keeps waiting and lands behind the verified
+/// replacement.
+#[tokio::test]
+async fn a_held_article_waits_out_a_damaged_predecessor() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40233, &[8, 8]).await;
     deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    deliver(&mut pipeline, file_id, 0, 0, b"hexd", false).await;
+    assert!(pipeline.unanchored_parked[&file_id].contains_key(&1));
+    deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
+    assert!(pipeline.unanchored_parked.is_empty());
     assert_eq!(std::fs::read(path).unwrap(), b"headtail");
     assert!(
         pipeline.jobs[&file_id.job_id]
@@ -1524,4 +1621,27 @@ async fn an_article_without_a_start_waits_for_its_predecessor() {
             .unwrap()
             .is_complete()
     );
+}
+
+/// An article arriving after the part it follows was given up is retired at
+/// once: there is no offset to wait for.
+#[tokio::test]
+async fn an_article_behind_a_given_up_predecessor_is_not_held() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _path) = setup(&temp, 40234, &[8, 8]).await;
+    let head = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    pipeline.book_terminal_segment(head, SegmentTerminalState::Missing);
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(
+        pipeline.segment_terminal_states.get(&SegmentId {
+            file_id,
+            segment_number: 1,
+        }),
+        Some(&SegmentTerminalState::DecodeExhausted)
+    );
+    assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
 }
