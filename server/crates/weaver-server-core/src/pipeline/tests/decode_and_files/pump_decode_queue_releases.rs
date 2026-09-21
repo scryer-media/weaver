@@ -583,8 +583,10 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 encoding: SegmentEncoding::Yenc,
                 segment_id,
                 raw_size: 8,
+                // No declared size of its own, so nothing can justify a range
+                // that runs past every envelope the job knows.
                 yenc_layout: YencLayoutAssertions {
-                    file_size: 5,
+                    file_size: 0,
                     part: None,
                     total: None,
                     begin: None,

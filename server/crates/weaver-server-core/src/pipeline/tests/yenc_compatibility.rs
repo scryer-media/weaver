@@ -277,6 +277,32 @@ async fn deliver_from(
     status: weaver_yenc::CrcVerification,
     source_server_idx: Option<usize>,
 ) {
+    deliver_declared(
+        pipeline,
+        file_id,
+        number,
+        offset,
+        bytes,
+        status,
+        source_server_idx,
+        // Consistently wrong: the declared size must never override a usable
+        // begin plus the bytes that actually decoded.
+        6,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_declared(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    number: u32,
+    offset: u64,
+    bytes: &[u8],
+    status: weaver_yenc::CrcVerification,
+    source_server_idx: Option<usize>,
+    declared_size: u64,
+) {
     let len = bytes.len() as u64;
     let yenc_name = pipeline
         .current_filename_for_file_id(file_id.job_id, file_id)
@@ -290,10 +316,10 @@ async fn deliver_from(
                 },
                 raw_size: len,
                 encoding: SegmentEncoding::Yenc,
-                // Consistently wrong part, count, size and end must never override
+                // Consistently wrong part, count and end must never override
                 // usable begin plus actual bytes, even after the old threshold.
                 yenc_layout: YencLayoutAssertions {
-                    file_size: 6,
+                    file_size: declared_size,
                     part: Some(99),
                     total: Some(402),
                     begin: Some(offset + 1),
@@ -319,6 +345,59 @@ async fn deliver_from(
         )
         .await;
     settle_direct_demotion_work(pipeline).await;
+}
+
+/// An NZB that omits one segment number still numbers the rest densely, so the
+/// prefix sums it implies sit below the true offsets of every later article.
+/// Those articles must still be accepted, and the hole they leave must surface
+/// as a file that needs verification rather than as a clean completion.
+#[tokio::test]
+async fn sparse_segment_list_commits_every_listed_article_and_flags_the_hole() {
+    let temp = tempfile::tempdir().unwrap();
+    // Four listed segments of a five-part file: the third part is absent, so
+    // ordinals 2 and 3 truly begin at 12 and 16, past their prefix sums.
+    let (mut pipeline, file_id, _) = setup(&temp, 40221, &[5; 4]).await;
+    for (number, offset, bytes) in [
+        (0u32, 0u64, b"aaaa"),
+        (1, 4, b"bbbb"),
+        (2, 12, b"dddd"),
+        (3, 16, b"eeee"),
+    ] {
+        deliver_declared(
+            &mut pipeline,
+            file_id,
+            number,
+            offset,
+            bytes,
+            weaver_yenc::CrcVerification::Verified,
+            None,
+            20,
+        )
+        .await;
+    }
+    // The hole keeps the tail articles out of the contiguous run, so they
+    // settle through the quiescent drain rather than in stream.
+    pipeline.flush_quiescent_write_backlog().await;
+    assert!(
+        pipeline.segment_terminal_states.is_empty(),
+        "no listed article may be abandoned"
+    );
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        4
+    );
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.is_complete());
+    assert_eq!(file.placement_of(2), Some((12, 4)));
+    assert_eq!(file.placement_of(3), Some((16, 4)));
+    assert_eq!(file.decoded_coverage_end(), None, "the hole is visible");
+    assert!(
+        file.requires_file_verification(),
+        "a hole must reach repair, not clean completion"
+    );
 }
 
 #[tokio::test]
