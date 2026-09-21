@@ -96,6 +96,16 @@ async fn crc_mismatch_defers_only_to_matching_recovery_metadata() {
             metadata == "matching",
         );
         assert!(!pipeline.par2_can_recover_file_crc(id, damaged.len() as u64 + 1, declared_crc));
+        // The damaged byte opens the second article, so that article is the one
+        // whose own checksum cannot vouch for it. Its retry budget is spent, so
+        // no re-fetch is queued and the recovery-metadata decision is reached.
+        pipeline.decode_retries.insert(
+            SegmentId {
+                file_id: id,
+                segment_number: 1,
+            },
+            MAX_SEGMENT_RETRIES,
+        );
         for (number, part) in damaged.chunks(ARTICLE).enumerate() {
             submit_decoded_segment_with_part_crc_verified(
                 &mut pipeline,
@@ -105,18 +115,29 @@ async fn crc_mismatch_defers_only_to_matching_recovery_metadata() {
                 part,
                 name,
                 Some(declared_crc),
-                true,
+                number == 0,
             )
             .await;
         }
         pipeline
             .direct_unpack_shutdown("CRC recovery test cleanup")
             .await;
+        // A whole-file value nothing corroborates never ends the job; the file
+        // is held for verification and the terminal gate decides.
         let failed = matches!(
             job_status_for_assert(&pipeline, job),
             Some(JobStatus::Failed { .. })
         );
-        assert_eq!(failed, metadata != "matching", "{metadata}");
+        assert!(!failed, "{metadata}");
+        assert_eq!(
+            pipeline.jobs[&job]
+                .assembly
+                .file(id)
+                .unwrap()
+                .requires_file_verification(),
+            metadata != "matching",
+            "{metadata}"
+        );
         assert!(
             !pipeline.par2_verified.contains(&job),
             "downloaded damage is not verified"

@@ -1924,7 +1924,7 @@ async fn completing_file_removes_only_its_unverified_provenance_bucket() {
 }
 
 #[tokio::test]
-async fn completed_file_crc32_mismatch_fails_before_persisting_completion() {
+async fn completed_file_crc32_mismatch_yields_to_parts_that_all_verified() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20018);
@@ -1951,22 +1951,18 @@ async fn completed_file_crc32_mismatch_fails_before_persisting_completion() {
     )
     .await;
 
-    let status = job_status_for_assert(&pipeline, job_id).unwrap();
-    assert!(matches!(
-        &status,
-        JobStatus::Failed { error } if error.contains("whole-file CRC32 mismatch")
-    ));
-    assert!(!pipeline.jobs.contains_key(&job_id));
+    // The one article carried its own checksum and verified, so the bytes on
+    // disk are the bytes that were posted: the trailer's whole-file value is
+    // what is wrong, and it is discarded rather than ending the job.
+    let status = job_status_for_assert(&pipeline, job_id);
+    assert!(
+        !matches!(&status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
     assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(!pipeline.untrusted_file_crcs.contains(&file_id));
     assert!(!pipeline.file_hash_states.contains_key(&file_id));
     assert!(!pipeline.file_hash_reread_required.contains(&file_id));
-    assert!(
-        pipeline
-            .db
-            .load_complete_file_hashes(job_id)
-            .unwrap()
-            .is_empty()
-    );
 }
 
 #[tokio::test]
@@ -2013,8 +2009,9 @@ async fn single_server_whole_file_crc_mismatch_skips_recovery_and_leaves_the_fil
     .await;
 
     // The only server already produced the doubted bytes, so no re-fetch is
-    // queued: the mismatch falls through to the repair decision, which with
-    // no PAR2 in this job is the whole-file CRC failure.
+    // queued: the mismatch falls through to the repair decision, which with no
+    // PAR2 in this job holds the file for verification instead of ending the
+    // job — the bytes may yet be good, and repair evidence may yet arrive.
     assert!(!pipeline.file_crc_recoveries.contains_key(&file_id));
     assert!(
         pipeline
@@ -2022,11 +2019,23 @@ async fn single_server_whole_file_crc_mismatch_skips_recovery_and_leaves_the_fil
             .get(&job_id)
             .is_none_or(|state| state.download_queue.is_empty())
     );
+    // The decode seam no longer ends the job itself; the terminal delivery
+    // gate is what refuses a file still owed verification.
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
-    assert!(matches!(
-        &status,
-        JobStatus::Failed { error } if error.contains("whole-file CRC32 mismatch")
-    ));
+    assert!(
+        matches!(
+            &status,
+            JobStatus::Failed { error } if error.contains("require verification or repair")
+        ),
+        "{status:?}"
+    );
+    assert!(
+        pipeline
+            .db
+            .load_complete_file_hashes(job_id)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -2358,7 +2367,7 @@ async fn matching_whole_file_crc_accepts_unverified_part_without_retry() {
 }
 
 #[tokio::test]
-async fn whole_file_crc_recovery_fails_when_unverified_segment_budget_is_exhausted() {
+async fn whole_file_crc_recovery_holds_the_file_when_the_segment_budget_is_exhausted() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20903);
@@ -2396,11 +2405,16 @@ async fn whole_file_crc_recovery_fails_when_unverified_segment_budget_is_exhaust
     )
     .await;
 
+    // Held for verification at the decode seam; the terminal delivery gate is
+    // what refuses it, not a whole-file CRC failure.
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
-    assert!(matches!(
-        status,
-        JobStatus::Failed { error } if error.contains("whole-file CRC32 mismatch")
-    ));
+    assert!(
+        matches!(
+            &status,
+            JobStatus::Failed { error } if error.contains("require verification or repair")
+        ),
+        "{status:?}"
+    );
     assert!(!pipeline.file_crc_recoveries.contains_key(&file_id));
     assert!(!pipeline.unverified_segments.contains_key(&file_id));
 }

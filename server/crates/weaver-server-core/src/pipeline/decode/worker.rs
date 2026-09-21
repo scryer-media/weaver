@@ -3496,7 +3496,7 @@ impl Pipeline {
                     // completion gate's verification pass to read back.
                     self.block_crcs.note_file_len(file_id, total_bytes);
 
-                    let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
+                    let mut expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
                     let file_checksum = match self
                         .finalize_completed_file_hash(
                             file_id,
@@ -3531,20 +3531,49 @@ impl Pipeline {
                         && file_checksum.crc32 != expected_crc
                     {
                         self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                        match self
-                            .schedule_file_crc_recovery(file_id, expected_crc, file_checksum.crc32)
-                            .await
-                        {
-                            // Recovery rewrites this file: its handle stays.
-                            Ok(true) => return,
-                            Ok(false) => {}
-                            Err(error) => {
-                                crate::pipeline::release_cached_write_handle(file_path);
-                                self.fail_job(job_id, error);
-                                return;
+                        // Every part carried its own checksum and verified, and
+                        // the recorded placements tile the file exactly. The
+                        // bytes on disk are therefore the bytes that were
+                        // posted, and the trailer's whole-file value is what is
+                        // wrong — a poster mistake, not a download failure.
+                        let parts_prove_the_bytes = file_checksum.all_parts_crc_verified
+                            && self
+                                .jobs
+                                .get(&job_id)
+                                .and_then(|state| state.assembly.file(file_id))
+                                .is_some_and(|file| file.contiguous_placements_proven());
+                        if parts_prove_the_bytes {
+                            warn!(
+                                job_id = job_id.0,
+                                file_id = %file_id,
+                                expected_crc = format_args!("{expected_crc:08x}"),
+                                actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                "every part verified against its own checksum; discarding the posted whole-file CRC32"
+                            );
+                            self.expected_file_crcs.remove(&file_id);
+                            self.untrusted_file_crcs.remove(&file_id);
+                            // Complete exactly as a matching value would.
+                            expected_file_crc = None;
+                        } else {
+                            match self
+                                .schedule_file_crc_recovery(
+                                    file_id,
+                                    expected_crc,
+                                    file_checksum.crc32,
+                                )
+                                .await
+                            {
+                                // Recovery rewrites this file: its handle stays.
+                                Ok(true) => return,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    crate::pipeline::release_cached_write_handle(file_path);
+                                    self.fail_job(job_id, error);
+                                    return;
+                                }
                             }
-                        }
-                        if self.par2_can_recover_file_crc(file_id, total_bytes, expected_crc) {
+                            let par2_agrees =
+                                self.par2_can_recover_file_crc(file_id, total_bytes, expected_crc);
                             self.taint_direct_unpack_for_file(job_id, filename);
                             let file_index = file_id.file_index;
                             if let Err(error) = self
@@ -3558,23 +3587,35 @@ impl Pipeline {
                                 );
                                 return;
                             }
-                            warn!(
-                                job_id = job_id.0,
-                                file_id = %file_id,
-                                expected_crc = format_args!("{expected_crc:08x}"),
-                                actual_crc = format_args!("{:08x}", file_checksum.crc32),
-                                "whole-file CRC mismatch; matching PAR2 metadata requires repair before acceptance"
-                            );
-                        } else {
-                            crate::pipeline::release_cached_write_handle(file_path);
-                            self.fail_job(
-                                job_id,
-                                format!(
-                                    "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
-                                    file_checksum.crc32
-                                ),
-                            );
-                            return;
+                            if par2_agrees {
+                                warn!(
+                                    job_id = job_id.0,
+                                    file_id = %file_id,
+                                    expected_crc = format_args!("{expected_crc:08x}"),
+                                    actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                    "whole-file CRC mismatch; matching PAR2 metadata requires repair before acceptance"
+                                );
+                            } else {
+                                // A poster's whole-file value that nothing can
+                                // corroborate is not grounds for ending the job:
+                                // the bytes may still be good, and repair evidence
+                                // may still arrive. The file is held for
+                                // verification and the terminal gate decides.
+                                if let Some(file) = self
+                                    .jobs
+                                    .get_mut(&job_id)
+                                    .and_then(|state| state.assembly.file_mut(file_id))
+                                {
+                                    file.require_geometry_verification();
+                                }
+                                warn!(
+                                    job_id = job_id.0,
+                                    file_id = %file_id,
+                                    expected_crc = format_args!("{expected_crc:08x}"),
+                                    actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                    "whole-file CRC mismatch with no corroborating evidence; file requires verification"
+                                );
+                            }
                         }
                     }
                     self.ensure_par2_runtime(job_id)

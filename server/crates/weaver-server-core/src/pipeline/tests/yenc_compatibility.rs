@@ -288,6 +288,7 @@ async fn deliver_from(
         // Consistently wrong: the declared size must never override a usable
         // begin plus the bytes that actually decoded.
         6,
+        None,
     )
     .await;
 }
@@ -302,6 +303,7 @@ async fn deliver_declared(
     status: weaver_yenc::CrcVerification,
     source_server_idx: Option<usize>,
     declared_size: u64,
+    expected_file_crc: Option<u32>,
 ) {
     let len = bytes.len() as u64;
     let yenc_name = pipeline
@@ -328,7 +330,7 @@ async fn deliver_declared(
                 crc_valid: status != weaver_yenc::CrcVerification::Mismatch,
                 part_crc_verified: status == weaver_yenc::CrcVerification::Verified,
                 part_crc: par2_rs::checksum::crc32(bytes),
-                expected_file_crc: None,
+                expected_file_crc,
                 data: DecodedChunk::from(bytes.to_vec()),
                 yenc_name,
                 checkpoint_plan: weaver_yenc::CheckpointPlan::None,
@@ -372,6 +374,7 @@ async fn sparse_segment_list_commits_every_listed_article_and_flags_the_hole() {
             weaver_yenc::CrcVerification::Verified,
             None,
             20,
+            None,
         )
         .await;
     }
@@ -418,6 +421,91 @@ async fn conflicting_whole_file_crcs_drop_the_expectation_instead_of_failing() {
     pipeline.note_expected_file_crc(file_id, Some(0x1111_1111));
     assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
     assert!(!is_terminal_status(&pipeline.jobs[&file_id.job_id].status));
+}
+
+/// Every part verified against its own checksum and the placements tile the
+/// file exactly, so the bytes are what was posted: the trailer's whole-file
+/// value is the thing that is wrong.
+#[tokio::test]
+async fn wrong_whole_file_crc_yields_to_parts_that_all_verified() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40223, &[8, 8]).await;
+    for (number, offset, bytes) in [(0u32, 0u64, b"head"), (1, 4, b"tail")] {
+        deliver_declared(
+            &mut pipeline,
+            file_id,
+            number,
+            offset,
+            bytes,
+            weaver_yenc::CrcVerification::Verified,
+            None,
+            8,
+            Some(0xDEAD_BEEF),
+        )
+        .await;
+    }
+    let status = job_status_for_assert(&pipeline, file_id.job_id);
+    assert!(
+        !matches!(&status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"headtail");
+    assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(!pipeline.untrusted_file_crcs.contains(&file_id));
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        2
+    );
+}
+
+/// With a part that could not vouch for itself, nothing corroborates the
+/// poster's value — but that is still not grounds for ending the job.
+#[tokio::test(start_paused = true)]
+async fn wrong_whole_file_crc_without_proof_holds_the_file_for_verification() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _) = setup(&temp, 40224, &[8, 8]).await;
+    pipeline.jobs.get_mut(&file_id.job_id).unwrap().status = JobStatus::Paused;
+    // No re-fetch is possible for the part that could not vouch for itself.
+    pipeline.decode_retries.insert(
+        SegmentId {
+            file_id,
+            segment_number: 1,
+        },
+        MAX_SEGMENT_RETRIES,
+    );
+    for (number, offset, bytes, status) in [
+        (0u32, 0u64, b"head", weaver_yenc::CrcVerification::Verified),
+        (1, 4, b"tail", weaver_yenc::CrcVerification::Unverified),
+    ] {
+        deliver_declared(
+            &mut pipeline,
+            file_id,
+            number,
+            offset,
+            bytes,
+            status,
+            None,
+            8,
+            Some(0xDEAD_BEEF),
+        )
+        .await;
+    }
+    let status = job_status_for_assert(&pipeline, file_id.job_id);
+    assert!(
+        !matches!(&status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
+    assert!(
+        pipeline.jobs[&file_id.job_id]
+            .assembly
+            .file(file_id)
+            .unwrap()
+            .requires_file_verification()
+    );
+    assert_eq!(
+        pipeline.expected_file_crcs.get(&file_id),
+        Some(&0xDEAD_BEEF)
+    );
 }
 
 #[tokio::test]
