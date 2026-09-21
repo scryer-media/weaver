@@ -1494,6 +1494,7 @@ impl Pipeline {
                 crc_valid: true,
                 part_crc_verified: false,
                 part_crc: 0,
+                truncation_suspected: false,
                 expected_file_crc: None,
                 data,
                 yenc_name: String::new(),
@@ -1521,6 +1522,7 @@ impl Pipeline {
             crc_valid,
             part_crc_verified,
             part_crc,
+            truncation_suspected,
             expected_file_crc,
             data,
             yenc_name,
@@ -1695,15 +1697,26 @@ impl Pipeline {
                 );
                 return;
             }
-            let unresolved_replacement = !part_crc_verified
-                && self
-                    .jobs
-                    .get(&job_id)
-                    .and_then(|state| state.assembly.file(file_id))
-                    .is_some_and(|file| {
-                        file.segment_has_retained_damage(segment_id.segment_number)
-                    });
-            let retain_damage = !crc_valid || unresolved_replacement;
+            let held_damage = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .map(|file| {
+                    (
+                        file.segment_has_retained_damage(segment_id.segment_number),
+                        file.segment_damage_is_truncation_only(segment_id.segment_number),
+                    )
+                })
+                .unwrap_or((false, false));
+            // A copy whose own length is accounted for settles a body that was
+            // merely suspected of being cut short. It says nothing about a
+            // checksum that actually disagreed, so that damage still stands.
+            let unresolved_replacement =
+                !part_crc_verified && held_damage.0 && !(!truncation_suspected && held_damage.1);
+            let retain_damage = !crc_valid || truncation_suspected || unresolved_replacement;
+            // Suspicion must never soften damage a checksum already proved.
+            let damage_is_truncation_only =
+                crc_valid && truncation_suspected && !(held_damage.0 && !held_damage.1);
             let conflict = match self
                 .jobs
                 .get_mut(&job_id)
@@ -1712,7 +1725,9 @@ impl Pipeline {
                 Some(file) => {
                     // A late corrupt duplicate must not replace bytes already
                     // committed by a good response (or their placement).
-                    if !crc_valid && file.has_segment(segment_id.segment_number) {
+                    if (!crc_valid || truncation_suspected)
+                        && file.has_segment(segment_id.segment_number)
+                    {
                         return;
                     }
                     if retain_damage {
@@ -1770,7 +1785,12 @@ impl Pipeline {
                     .get_mut(&job_id)
                     .and_then(|state| state.assembly.file_mut(file_id))
                 {
-                    file.note_retained_damage(segment_id.segment_number, file_offset, decoded_size);
+                    file.note_retained_damage(
+                        segment_id.segment_number,
+                        file_offset,
+                        decoded_size,
+                        damage_is_truncation_only,
+                    );
                 }
                 let filename = self
                     .jobs
@@ -1803,6 +1823,7 @@ impl Pipeline {
                         } else {
                             weaver_yenc::CrcVerification::Mismatch
                         },
+                        truncation_suspected: damage_is_truncation_only,
                         write_spans: Vec::new(),
                     })),
                 };
@@ -3140,6 +3161,7 @@ impl Pipeline {
         if let Some(unresolved) = segment.damaged_source.as_ref() {
             let source = &unresolved.source;
             let status = unresolved.status;
+            let truncation_suspected = unresolved.truncation_suspected;
             let file_id = segment.segment_id.file_id;
             if let Some(file) = self
                 .jobs
@@ -3155,6 +3177,7 @@ impl Pipeline {
                     segment.segment_id.segment_number,
                     file_offset,
                     segment.decoded_size,
+                    unresolved.truncation_suspected,
                 );
             }
             // The disk owner completed this write before an alternate response
@@ -3165,6 +3188,9 @@ impl Pipeline {
                 match status {
                     weaver_yenc::CrcVerification::Mismatch => {
                         "yEnc CRC mismatch; decoded bytes retained for repair"
+                    }
+                    _ if truncation_suspected => {
+                        "yEnc article ended short with no checksum; decoded bytes retained while another server is asked"
                     }
                     _ => {
                         "unverified replacement of damaged yEnc bytes; verification still required"
@@ -3205,8 +3231,11 @@ impl Pipeline {
             if file_asm.placement_of(segment_id.segment_number).is_none() {
                 file_asm.record_placement(segment_id.segment_number, file_offset, decoded_size);
             }
-            let replaced_damage =
-                part_crc_verified && file_asm.clear_retained_damage(segment_id.segment_number);
+            // A verified copy settles any damage. An unverified one settles a
+            // body only suspected of being cut short, never a failed checksum.
+            let replaced_damage = (part_crc_verified
+                || file_asm.segment_damage_is_truncation_only(segment_id.segment_number))
+                && file_asm.clear_retained_damage(segment_id.segment_number);
             file_asm.note_part_verification(segment_id.segment_number, part_crc_verified);
             match file_asm.commit_segment(segment_id.segment_number, decoded_size) {
                 Ok(commit) => Ok((

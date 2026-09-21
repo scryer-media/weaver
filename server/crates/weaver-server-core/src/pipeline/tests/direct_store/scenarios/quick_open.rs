@@ -4401,6 +4401,7 @@ async fn damaged_article_waits_for_reconstruction_before_writing_and_retrying() 
                 crc_valid: false,
                 part_crc_verified: false,
                 part_crc: checksum::crc32(&damaged),
+                truncation_suspected: false,
                 expected_file_crc: None,
                 data: DecodedChunk::from(damaged.clone()),
                 yenc_name: volumes[1].0.clone(),

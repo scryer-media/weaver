@@ -166,6 +166,8 @@ impl Pipeline {
                             crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
                             decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
+                        let truncation_suspected =
+                            crate::pipeline::yenc_truncation_suspected(&decode_result);
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
@@ -175,6 +177,7 @@ impl Pipeline {
                                 encoding: SegmentEncoding::Yenc,
                                 yenc_layout,
                                 crc_valid,
+                                truncation_suspected,
                                 part_crc_verified,
                                 part_crc: decode_result.part_crc,
                                 expected_file_crc: decode_result.expected_file_crc,
@@ -236,6 +239,8 @@ impl Pipeline {
                             crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
                             decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
+                        let truncation_suspected =
+                            crate::pipeline::yenc_truncation_suspected(&decode_result);
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
@@ -245,6 +250,7 @@ impl Pipeline {
                                 encoding: SegmentEncoding::Yenc,
                                 yenc_layout,
                                 crc_valid,
+                                truncation_suspected,
                                 part_crc_verified,
                                 part_crc: decode_result.part_crc,
                                 expected_file_crc: decode_result.expected_file_crc,

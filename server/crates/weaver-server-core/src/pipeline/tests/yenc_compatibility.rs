@@ -65,6 +65,7 @@ async fn parked_damage_masks_accepted_and_reconstructed_ranges_after_reset() {
                 segment_number: 0,
             },
             damaged_source: Some(Box::new(RetainedArticleDamage {
+                truncation_suspected: false,
                 source: SegmentSource {
                     source_server_idx: None,
                     exclude_servers: Vec::new(),
@@ -289,6 +290,31 @@ async fn deliver_from(
         // begin plus the bytes that actually decoded.
         6,
         None,
+        false,
+    )
+    .await;
+}
+
+/// An article whose body looks cut short, with no checksum either way.
+async fn deliver_suspected(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    number: u32,
+    offset: u64,
+    bytes: &[u8],
+    source_server_idx: Option<usize>,
+) {
+    deliver_declared(
+        pipeline,
+        file_id,
+        number,
+        offset,
+        bytes,
+        weaver_yenc::CrcVerification::Unverified,
+        source_server_idx,
+        6,
+        None,
+        true,
     )
     .await;
 }
@@ -304,6 +330,7 @@ async fn deliver_declared(
     source_server_idx: Option<usize>,
     declared_size: u64,
     expected_file_crc: Option<u32>,
+    truncation_suspected: bool,
 ) {
     let len = bytes.len() as u64;
     let yenc_name = pipeline
@@ -330,6 +357,7 @@ async fn deliver_declared(
                 crc_valid: status != weaver_yenc::CrcVerification::Mismatch,
                 part_crc_verified: status == weaver_yenc::CrcVerification::Verified,
                 part_crc: par2_rs::checksum::crc32(bytes),
+                truncation_suspected,
                 expected_file_crc,
                 data: DecodedChunk::from(bytes.to_vec()),
                 yenc_name,
@@ -375,6 +403,7 @@ async fn sparse_segment_list_commits_every_listed_article_and_flags_the_hole() {
             None,
             20,
             None,
+            false,
         )
         .await;
     }
@@ -441,6 +470,7 @@ async fn wrong_whole_file_crc_yields_to_parts_that_all_verified() {
             None,
             8,
             Some(0xDEAD_BEEF),
+            false,
         )
         .await;
     }
@@ -487,6 +517,7 @@ async fn wrong_whole_file_crc_without_proof_holds_the_file_for_verification() {
             None,
             8,
             Some(0xDEAD_BEEF),
+            false,
         )
         .await;
     }
@@ -1213,4 +1244,181 @@ async fn real_wire_crc32_only_retry_clears_damage_through_every_adapter() {
         );
         assert_eq!(pipeline.metrics.bytes_committed.load(Ordering::Relaxed), 4);
     }
+}
+
+/// Build a yEnc article out of bytes that need no escaping.
+fn plain_article(headers: &[&str], body: &[u8], trailer: Option<&str>) -> Vec<u8> {
+    let mut article = Vec::new();
+    for header in headers {
+        article.extend_from_slice(header.as_bytes());
+        article.extend_from_slice(b"\r\n");
+    }
+    article.extend(body.iter().map(|byte| byte.wrapping_add(42)));
+    if let Some(trailer) = trailer {
+        article.extend_from_slice(b"\r\n");
+        article.extend_from_slice(trailer.as_bytes());
+        article.extend_from_slice(b"\r\n");
+    }
+    article
+}
+
+fn decoded(article: &[u8]) -> weaver_yenc::DecodeResult {
+    let mut output = vec![0u8; 4096];
+    weaver_yenc::decode(article, &mut output).unwrap()
+}
+
+/// A part whose declared span accounts for every byte that arrived is complete
+/// even without a trailer: there is nothing left for a missing `=yend` to hide.
+#[test]
+fn a_confirmed_length_survives_a_missing_trailer() {
+    let body = vec![0u8; 16];
+    let article = plain_article(
+        &[
+            "=ybegin part=2 line=128 size=64 name=sample.bin",
+            "=ypart begin=17 end=32",
+        ],
+        &body,
+        None,
+    );
+    assert!(!crate::pipeline::yenc_truncation_suspected(&decoded(
+        &article
+    )));
+}
+
+/// A body that stops short of its declared span, with no trailer and no
+/// checksum, is exactly the response another server should be asked for.
+#[test]
+fn a_short_body_without_a_trailer_is_suspected() {
+    let body = vec![0u8; 8];
+    let article = plain_article(
+        &[
+            "=ybegin part=2 line=128 size=64 name=sample.bin",
+            "=ypart begin=17 end=32",
+        ],
+        &body,
+        None,
+    );
+    let result = decoded(&article);
+    assert!(result.defects.ypart_size_mismatch);
+    assert!(crate::pipeline::yenc_truncation_suspected(&result));
+}
+
+/// A single-part article that neither ends with a trailer nor accounts for its
+/// declared size is suspect for the same reason.
+#[test]
+fn a_single_part_body_short_of_its_declared_size_is_suspected() {
+    let body = vec![0u8; 8];
+    let article = plain_article(&["=ybegin line=128 size=64 name=sample.bin"], &body, None);
+    assert!(crate::pipeline::yenc_truncation_suspected(&decoded(
+        &article
+    )));
+}
+
+/// A trailer that disagrees with the bytes delivered is evidence on its own.
+#[test]
+fn a_trailer_size_that_disagrees_is_suspected() {
+    let body = vec![0u8; 16];
+    let article = plain_article(
+        &[
+            "=ybegin part=2 line=128 size=64 name=sample.bin",
+            "=ypart begin=17 end=32",
+        ],
+        &body,
+        Some("=yend size=999 part=2"),
+    );
+    let result = decoded(&article);
+    assert!(result.defects.yend_size_mismatch);
+    assert!(crate::pipeline::yenc_truncation_suspected(&result));
+}
+
+/// A checksum that verifies proves the bytes whatever the size fields claim.
+#[test]
+fn a_verified_checksum_outranks_every_size_disagreement() {
+    let body = vec![0u8; 16];
+    let crc = par2_rs::checksum::crc32(&body);
+    let article = plain_article(
+        &[
+            "=ybegin part=2 line=128 size=64 name=sample.bin",
+            "=ypart begin=17 end=32",
+        ],
+        &body,
+        Some(&format!("=yend size=999 part=2 pcrc32={crc:08x}")),
+    );
+    let result = decoded(&article);
+    assert_eq!(result.crc_status, weaver_yenc::CrcVerification::Verified);
+    assert!(!crate::pipeline::yenc_truncation_suspected(&result));
+}
+
+/// Bytes that look cut short are written, never counted, and re-requested.
+/// They are not a checksum failure, so the CRC-error metric stays still.
+#[tokio::test(start_paused = true)]
+async fn suspected_truncation_is_retried_and_a_verified_copy_settles_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40225, &[8, 8]).await;
+    deliver_suspected(&mut pipeline, file_id, 0, 0, b"hea", Some(0)).await;
+    assert_eq!(std::fs::read(&path).unwrap(), b"hea");
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(!file.has_segment(0));
+    assert!(file.has_retained_damage());
+    assert_eq!(pipeline.metrics.crc_errors.load(Ordering::Relaxed), 0);
+    let retry = pipeline.retry_rx.recv().await.unwrap();
+    assert_eq!(
+        retry.work.segment_id,
+        SegmentId {
+            file_id,
+            segment_number: 0,
+        }
+    );
+    deliver_from(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        b"head",
+        weaver_yenc::CrcVerification::Verified,
+        Some(1),
+    )
+    .await;
+    deliver(&mut pipeline, file_id, 1, 4, b"tail", true).await;
+    assert_eq!(std::fs::read(path).unwrap(), b"headtail");
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.is_complete());
+    assert!(!file.has_retained_damage());
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(pipeline.metrics.crc_errors.load(Ordering::Relaxed), 0);
+}
+
+/// A later copy that accounts for its own length settles a body that was only
+/// suspected of being cut short, even though it carries no checksum either.
+#[tokio::test(start_paused = true)]
+async fn a_copy_with_a_confirmed_length_settles_suspected_truncation() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40226, &[8]).await;
+    deliver_suspected(&mut pipeline, file_id, 0, 0, b"hea", Some(0)).await;
+    let _retry = pipeline.retry_rx.recv().await.unwrap();
+    deliver_status(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        b"head",
+        weaver_yenc::CrcVerification::Unverified,
+    )
+    .await;
+    assert_eq!(std::fs::read(path).unwrap(), b"head");
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.has_segment(0));
+    assert!(!file.has_retained_damage());
 }

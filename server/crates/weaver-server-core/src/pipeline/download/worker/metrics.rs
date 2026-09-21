@@ -484,6 +484,9 @@ impl Pipeline {
                             encoding: SegmentEncoding::Yenc,
                             yenc_layout,
                             crc_valid: crate::pipeline::crc_not_mismatched(result.crc_status),
+                            truncation_suspected: crate::pipeline::yenc_truncation_suspected(
+                                &result,
+                            ),
                             part_crc_verified: result.crc_status
                                 == weaver_yenc::CrcVerification::Verified,
                             part_crc: result.part_crc,
@@ -516,6 +519,7 @@ impl Pipeline {
                         // "Not known bad" — there is nothing to check against,
                         // which is different from having checked and passed.
                         crc_valid: true,
+                        truncation_suspected: false,
                         part_crc_verified: false,
                         part_crc: 0,
                         expected_file_crc: None,

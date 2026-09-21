@@ -2195,6 +2195,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
                     crc_valid: true,
                     part_crc_verified: false,
                     part_crc: par2_rs::checksum::crc32(&decoded_payload),
+                    truncation_suspected: false,
                     expected_file_crc: None,
                     data: DecodedChunk::from(decoded_payload.clone()),
                     yenc_name: "owned.bin".to_string(),
