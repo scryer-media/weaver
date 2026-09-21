@@ -909,6 +909,8 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.expected_file_crcs
             .retain(|file_id, _| file_id.job_id != job_id);
+        self.untrusted_file_crcs
+            .retain(|file_id| file_id.job_id != job_id);
         self.file_hash_reread_required
             .retain(|file_id| file_id.job_id != job_id);
         self.unverified_segments

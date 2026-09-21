@@ -1442,6 +1442,39 @@ pub(super) fn crc_not_mismatched(status: weaver_yenc::CrcVerification) -> bool {
     status != weaver_yenc::CrcVerification::Mismatch
 }
 
+/// Whether an article that could not be checked also carries evidence that its
+/// body was cut short.
+///
+/// An unverifiable article is ordinarily accepted: absent a checksum there is
+/// nothing to fail it on. But a missing `=yend` — or a length the headers
+/// themselves disagree about — is evidence the response ended early, and
+/// silently accepting those bytes writes a hole into the file that no later
+/// stage can see. Such an article is worth asking another server for.
+///
+/// A verified checksum always wins: it proves the bytes whatever the size
+/// fields say. A mismatch keeps its own handling.
+pub(super) fn yenc_truncation_suspected(result: &weaver_yenc::DecodeResult) -> bool {
+    if result.crc_status != weaver_yenc::CrcVerification::Unverified {
+        return false;
+    }
+    let defects = result.defects;
+    // The codec treats any article carrying a part or a begin as multipart,
+    // and only fills in the size defect that matches that reading.
+    let multipart = result.metadata.part.is_some() || result.metadata.begin.is_some();
+    let multipart_length_confirmed = result.metadata.begin.is_some()
+        && result.metadata.end.is_some()
+        && !defects.ypart_size_mismatch;
+    let single_part_length_confirmed = !multipart
+        && !defects.missing_size
+        && !defects.invalid_size
+        && !defects.ybegin_size_mismatch;
+    let length_confirmed = multipart_length_confirmed || single_part_length_confirmed;
+    defects.ypart_size_mismatch
+        || defects.yend_size_mismatch
+        || defects.ybegin_size_mismatch
+        || (!result.has_trailer && !length_confirmed)
+}
+
 /// How a segment was encoded on the wire, and therefore what evidence it
 /// carries into the pipeline.
 ///
@@ -1650,6 +1683,10 @@ pub(super) struct DecodeResult {
     pub(super) encoding: SegmentEncoding,
     pub(super) yenc_layout: YencLayoutAssertions,
     pub(super) crc_valid: bool,
+    /// Evidence the body was cut short, with no checksum to say so. Such an
+    /// article is written but never counted as coverage: another server is
+    /// asked for it first. See [`yenc_truncation_suspected`].
+    pub(super) truncation_suspected: bool,
     pub(super) part_crc_verified: bool,
     pub(super) part_crc: u32,
     pub(super) expected_file_crc: Option<u32>,
@@ -1967,6 +2004,9 @@ impl From<Vec<Box<[u8]>>> for DecodedChunk {
 pub(super) struct RetainedArticleDamage {
     pub(super) source: SegmentSource,
     pub(super) status: weaver_yenc::CrcVerification,
+    /// Retained because the body looks cut short rather than because a
+    /// checksum failed. The two want different words in the log.
+    pub(super) truncation_suspected: bool,
     /// Payload-relative spans, resolved against live ownership at disk handoff.
     pub(super) write_spans: Vec<std::ops::Range<usize>>,
 }
@@ -2275,6 +2315,10 @@ pub struct Pipeline {
     pub(super) deferred_file_hash_ranges: HashMap<NzbFileId, BTreeMap<u64, DeferredFileHashRange>>,
     /// Expected whole-file yEnc CRC32 values observed from multipart `=yend crc32`.
     pub(super) expected_file_crcs: HashMap<NzbFileId, u32>,
+    /// Files whose parts disagreed about the whole-file CRC32. Some posters
+    /// write a running value, or zeros, on every part but the last, so the
+    /// field proves nothing for those files and every later value is ignored.
+    pub(super) untrusted_file_crcs: HashSet<NzbFileId>,
     /// Files that need a one-time disk reread because out-of-order persistence broke the stream.
     pub(super) file_hash_reread_required: HashSet<NzbFileId>,
     #[cfg(test)]
@@ -2683,6 +2727,10 @@ pub struct Pipeline {
     /// restarts whenever the cursor has moved, because a displacement behind a
     /// moving cursor is progress, not a cycle.
     pub(super) uu_park_requeues: HashMap<SegmentId, (u32, u32)>,
+    /// How often each article that declared no usable start has been sent back
+    /// for the ordinal before it. Like the park counter above, a livelock bound
+    /// and never a retry budget: the bytes are not at fault.
+    pub(super) unanchored_requeues: HashMap<SegmentId, u32>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.

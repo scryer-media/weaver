@@ -406,8 +406,12 @@ fn transport_interruption_is_not_a_missing_trailer() {
     assert!(decoder.decode_available(&mut input).unwrap().is_none());
 }
 
+/// A part whose `=ypart begin=` cannot be read still decodes: the bytes are
+/// intact, only their position is unknown. Every chunking must agree that the
+/// article is delivered, that the defect is recorded, and that no offset is
+/// invented for it.
 #[test]
-fn unusable_multipart_starts_remain_structural_errors() {
+fn unusable_multipart_starts_decode_without_a_position() {
     for range in [
         "=ypart end=8\r\n",
         "=ypart begin=0 end=8\r\n",
@@ -421,25 +425,34 @@ fn unusable_multipart_starts_remain_structural_errors() {
             PAYLOAD,
         );
         let mut output = vec![0; article.len()];
-        assert!(weaver_yenc::decode_nntp(&article, &mut output).is_err());
+        let result = weaver_yenc::decode_nntp(&article, &mut output).unwrap();
+        assert_eq!(&output[..result.bytes_written], PAYLOAD, "range={range:?}");
+        assert!(result.defects.invalid_ypart_begin, "range={range:?}");
+        assert_eq!(result.metadata.begin, None, "range={range:?}");
+        assert_eq!(result.metadata.end, None, "range={range:?}");
+        assert!(!result.metadata.file_offset_is_known(), "range={range:?}");
+        // No grid may be published against a position the article guessed.
+        assert!(result.segments.is_empty(), "range={range:?}");
+
         let response = wire(&article);
         for chunk_size in [1, response.len()] {
-            let mut src = BytesMut::new();
-            let mut decoder = FusedYencArticleDecoder::new();
-            let mut rejected = false;
-            for chunk in response.chunks(chunk_size) {
-                src.extend_from_slice(chunk);
-                match decoder.decode_available(&mut src) {
-                    Err(FusedYencError::Yenc(_)) => {
-                        rejected = true;
-                        break;
-                    }
-                    Err(error) => panic!("unexpected transport error: {error}"),
-                    Ok(Some(_)) => panic!("unusable multipart start was accepted"),
-                    Ok(None) => {}
-                }
-            }
-            assert!(rejected, "range={range:?}, chunk={chunk_size}");
+            let chunks: Vec<_> = response.chunks(chunk_size).collect();
+            let (decoded, left) = fused(&chunks);
+            assert!(left.is_empty(), "range={range:?}, chunk={chunk_size}");
+            assert_eq!(
+                decoded.to_data(),
+                PAYLOAD,
+                "range={range:?}, chunk={chunk_size}"
+            );
+            let result = decoded.yenc_result();
+            assert!(
+                result.defects.invalid_ypart_begin,
+                "range={range:?}, chunk={chunk_size}"
+            );
+            assert_eq!(
+                result.metadata.begin, None,
+                "range={range:?}, chunk={chunk_size}"
+            );
         }
     }
 }

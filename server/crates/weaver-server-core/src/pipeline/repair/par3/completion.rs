@@ -759,6 +759,7 @@ impl Pipeline {
             self.persisted_file_progress.remove(&id);
             self.file_hash_states.remove(&id);
             self.expected_file_crcs.remove(&id);
+            self.untrusted_file_crcs.remove(&id);
             self.file_hash_reread_required.remove(&id);
             if self.par3_virtual_volume(id).is_some() {
                 self.enqueue_par3_file(job_id, id)

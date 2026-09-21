@@ -519,10 +519,16 @@ impl FusedYencArticleDecoder {
     /// wire-chunk boundaries.
     fn begin_body(&mut self) {
         if let Some(metadata) = self.metadata.as_ref() {
-            self.decode_state.set_segment_plan(
-                metadata.article_file_offset(),
-                std::mem::take(&mut self.checkpoint_plan),
-            );
+            let plan = std::mem::take(&mut self.checkpoint_plan);
+            // An article that cannot say where it starts gets no grid: its
+            // checksums must never read as evidence about a guessed position.
+            let plan = if metadata.file_offset_is_known() {
+                plan
+            } else {
+                weaver_yenc::CheckpointPlan::None
+            };
+            self.decode_state
+                .set_segment_plan(metadata.article_file_offset(), plan);
         }
         self.state = FusedArticleState::Body;
     }

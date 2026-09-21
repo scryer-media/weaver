@@ -259,6 +259,7 @@ impl Pipeline {
             deferred_file_hash_data_bytes: 0,
             deferred_file_hash_ranges: HashMap::new(),
             expected_file_crcs: HashMap::new(),
+            untrusted_file_crcs: HashSet::new(),
             file_hash_reread_required: HashSet::new(),
             #[cfg(test)]
             try_update_archive_topology_calls: 0,
@@ -393,6 +394,7 @@ impl Pipeline {
             file_declared_size: HashMap::new(),
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
+            unanchored_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
             par3_runtime: None,
             par3_inside_probes: Default::default(),
@@ -740,6 +742,8 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.expected_file_crcs
             .retain(|file_id, _| file_id.job_id != job_id);
+        self.untrusted_file_crcs
+            .retain(|file_id| file_id.job_id != job_id);
         self.file_hash_reread_required
             .retain(|file_id| file_id.job_id != job_id);
         self.unverified_segments

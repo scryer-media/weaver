@@ -573,30 +573,41 @@ impl Pipeline {
         self.par2_set(file_id.job_id).is_none()
     }
 
+    /// Record the whole-file CRC32 a part's trailer claims.
+    ///
+    /// Parts that disagree do not make the download wrong: posters exist that
+    /// write a running checksum, or zeros, on every part but the last. The
+    /// only honest conclusion is that this file has no usable whole-file
+    /// expectation, so the value is dropped and the file is remembered as
+    /// untrusted for the rest of its life. The per-part `pcrc32` is unaffected
+    /// and remains the article-level verdict.
     pub(crate) fn note_expected_file_crc(
         &mut self,
         file_id: NzbFileId,
         expected_file_crc: Option<u32>,
-    ) -> Result<(), String> {
+    ) {
         let Some(expected_file_crc) = expected_file_crc else {
-            return Ok(());
+            return;
         };
+        if self.untrusted_file_crcs.contains(&file_id) {
+            return;
+        }
 
         match self.expected_file_crcs.entry(file_id) {
             std::collections::hash_map::Entry::Occupied(existing) => {
-                if *existing.get() == expected_file_crc {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "conflicting yEnc whole-file CRC32 for {file_id}: {:08x} vs {:08x}",
-                        existing.get(),
-                        expected_file_crc
-                    ))
+                if *existing.get() != expected_file_crc {
+                    warn!(
+                        file_id = %file_id,
+                        first = format_args!("{:08x}", existing.get()),
+                        second = format_args!("{expected_file_crc:08x}"),
+                        "parts disagree on the whole-file CRC32; ignoring it for this file"
+                    );
+                    existing.remove();
+                    self.untrusted_file_crcs.insert(file_id);
                 }
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(expected_file_crc);
-                Ok(())
             }
         }
     }
@@ -1483,6 +1494,7 @@ impl Pipeline {
                 crc_valid: true,
                 part_crc_verified: false,
                 part_crc: 0,
+                truncation_suspected: false,
                 expected_file_crc: None,
                 data,
                 yenc_name: String::new(),
@@ -1510,6 +1522,7 @@ impl Pipeline {
             crc_valid,
             part_crc_verified,
             part_crc,
+            truncation_suspected,
             expected_file_crc,
             data,
             yenc_name,
@@ -1639,8 +1652,32 @@ impl Pipeline {
                     }
                 }
             } else {
-                match validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
+                // Only consulted for an article that declared no usable start
+                // of its own: ordinal zero opens the file, and every other
+                // ordinal follows the one before it.
+                let sequential_anchor = if segment_id.segment_number == 0 {
+                    Some(0)
+                } else {
+                    self.jobs
+                        .get(&job_id)
+                        .and_then(|state| state.assembly.file(file_id))
+                        .and_then(|file| file.placement_of(segment_id.segment_number - 1))
+                        .map(|(offset, len)| offset.saturating_add(u64::from(len)))
+                };
+                match validate_yenc_layout(
+                    expected_layout,
+                    yenc_layout,
+                    decoded_len,
+                    sequential_anchor,
+                ) {
                     Ok(file_offset) => file_offset,
+                    Err(YencLayoutMismatch::PredecessorNotPlaced) => {
+                        // An ordering condition, not damage. The article comes
+                        // back from the same server, and spends no retry.
+                        drop(_cpu_scope);
+                        self.requeue_segment_awaiting_predecessor(segment_id);
+                        return;
+                    }
                     Err(mismatch) => {
                         let error = format_yenc_layout_mismatch(
                             mismatch,
@@ -1684,15 +1721,26 @@ impl Pipeline {
                 );
                 return;
             }
-            let unresolved_replacement = !part_crc_verified
-                && self
-                    .jobs
-                    .get(&job_id)
-                    .and_then(|state| state.assembly.file(file_id))
-                    .is_some_and(|file| {
-                        file.segment_has_retained_damage(segment_id.segment_number)
-                    });
-            let retain_damage = !crc_valid || unresolved_replacement;
+            let held_damage = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .map(|file| {
+                    (
+                        file.segment_has_retained_damage(segment_id.segment_number),
+                        file.segment_damage_is_truncation_only(segment_id.segment_number),
+                    )
+                })
+                .unwrap_or((false, false));
+            // A copy whose own length is accounted for settles a body that was
+            // merely suspected of being cut short. It says nothing about a
+            // checksum that actually disagreed, so that damage still stands.
+            let unresolved_replacement =
+                !part_crc_verified && held_damage.0 && !(!truncation_suspected && held_damage.1);
+            let retain_damage = !crc_valid || truncation_suspected || unresolved_replacement;
+            // Suspicion must never soften damage a checksum already proved.
+            let damage_is_truncation_only =
+                crc_valid && truncation_suspected && !(held_damage.0 && !held_damage.1);
             let conflict = match self
                 .jobs
                 .get_mut(&job_id)
@@ -1701,7 +1749,9 @@ impl Pipeline {
                 Some(file) => {
                     // A late corrupt duplicate must not replace bytes already
                     // committed by a good response (or their placement).
-                    if !crc_valid && file.has_segment(segment_id.segment_number) {
+                    if (!crc_valid || truncation_suspected)
+                        && file.has_segment(segment_id.segment_number)
+                    {
                         return;
                     }
                     if retain_damage {
@@ -1759,7 +1809,12 @@ impl Pipeline {
                     .get_mut(&job_id)
                     .and_then(|state| state.assembly.file_mut(file_id))
                 {
-                    file.note_retained_damage(segment_id.segment_number, file_offset, decoded_size);
+                    file.note_retained_damage(
+                        segment_id.segment_number,
+                        file_offset,
+                        decoded_size,
+                        damage_is_truncation_only,
+                    );
                 }
                 let filename = self
                     .jobs
@@ -1792,6 +1847,7 @@ impl Pipeline {
                         } else {
                             weaver_yenc::CrcVerification::Mismatch
                         },
+                        truncation_suspected: damage_is_truncation_only,
                         write_spans: Vec::new(),
                     })),
                 };
@@ -1835,11 +1891,7 @@ impl Pipeline {
                     .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id));
 
             self.note_recovery_count_from_yenc_name(job_id, file_id.file_index, &yenc_name);
-            if let Err(error) = self.note_expected_file_crc(file_id, expected_file_crc) {
-                self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                self.fail_job(job_id, error);
-                return;
-            }
+            self.note_expected_file_crc(file_id, expected_file_crc);
 
             if part_crc_verified {
                 crate::runtime::perf_probe::record(
@@ -2452,6 +2504,33 @@ impl Pipeline {
         );
     }
 
+    /// An article that could not say where it starts, arriving before the
+    /// ordinal it must follow. Ask for it again, without excluding the server
+    /// that served it and without spending its retry budget — nothing is wrong
+    /// with the bytes, they simply have nowhere to go yet.
+    fn requeue_segment_awaiting_predecessor(&mut self, segment_id: SegmentId) {
+        const MAX_ANCHOR_REQUEUES: u32 = 8;
+
+        let attempts = self.unanchored_requeues.entry(segment_id).or_insert(0);
+        *attempts += 1;
+        if *attempts <= MAX_ANCHOR_REQUEUES && self.push_requeued_segment(segment_id) {
+            debug!(
+                segment = %segment_id,
+                "article declared no usable start and its predecessor is unplaced; requeued without retry budget"
+            );
+            return;
+        }
+        // Bound reached: treat it as a real failure so the segment cannot
+        // cycle forever behind an ordinal that may never arrive.
+        self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.handle_decode_failure(
+            segment_id,
+            "article declared no usable start and its predecessor never arrived",
+            &[],
+            None,
+        );
+    }
+
     fn requeue_uu_segment_for_ordering(&mut self, segment_id: SegmentId) -> bool {
         const MAX_UU_PARK_REQUEUES: u32 = 8;
 
@@ -2473,6 +2552,24 @@ impl Pipeline {
             return false;
         }
 
+        if !self.push_requeued_segment(segment_id) {
+            return false;
+        }
+        crate::runtime::perf_probe::record(
+            "download.uu.park_requeue",
+            std::time::Duration::from_nanos(1),
+        );
+        debug!(
+            segment = %segment_id,
+            "uuencode part displaced by park pressure; requeued without retry budget"
+        );
+        true
+    }
+
+    /// Queue a segment again exactly as first dispatched: full retry budget,
+    /// no excluded server. Used where an article has to come back for an
+    /// ordering reason rather than because anything was wrong with it.
+    fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
         let completion_critical = self.segment_is_completion_critical(segment_id);
         let Some(state) = self.jobs.get_mut(&job_id) else {
@@ -2504,14 +2601,6 @@ impl Pipeline {
         };
         state.download_queue.push(work);
         self.update_queue_metrics();
-        crate::runtime::perf_probe::record(
-            "download.uu.park_requeue",
-            std::time::Duration::from_nanos(1),
-        );
-        debug!(
-            segment = %segment_id,
-            "uuencode part displaced by park pressure; requeued without retry budget"
-        );
         true
     }
 
@@ -3133,6 +3222,7 @@ impl Pipeline {
         if let Some(unresolved) = segment.damaged_source.as_ref() {
             let source = &unresolved.source;
             let status = unresolved.status;
+            let truncation_suspected = unresolved.truncation_suspected;
             let file_id = segment.segment_id.file_id;
             if let Some(file) = self
                 .jobs
@@ -3148,6 +3238,7 @@ impl Pipeline {
                     segment.segment_id.segment_number,
                     file_offset,
                     segment.decoded_size,
+                    unresolved.truncation_suspected,
                 );
             }
             // The disk owner completed this write before an alternate response
@@ -3158,6 +3249,9 @@ impl Pipeline {
                 match status {
                     weaver_yenc::CrcVerification::Mismatch => {
                         "yEnc CRC mismatch; decoded bytes retained for repair"
+                    }
+                    _ if truncation_suspected => {
+                        "yEnc article ended short with no checksum; decoded bytes retained while another server is asked"
                     }
                     _ => {
                         "unverified replacement of damaged yEnc bytes; verification still required"
@@ -3198,8 +3292,11 @@ impl Pipeline {
             if file_asm.placement_of(segment_id.segment_number).is_none() {
                 file_asm.record_placement(segment_id.segment_number, file_offset, decoded_size);
             }
-            let replaced_damage =
-                part_crc_verified && file_asm.clear_retained_damage(segment_id.segment_number);
+            // A verified copy settles any damage. An unverified one settles a
+            // body only suspected of being cut short, never a failed checksum.
+            let replaced_damage = (part_crc_verified
+                || file_asm.segment_damage_is_truncation_only(segment_id.segment_number))
+                && file_asm.clear_retained_damage(segment_id.segment_number);
             file_asm.note_part_verification(segment_id.segment_number, part_crc_verified);
             match file_asm.commit_segment(segment_id.segment_number, decoded_size) {
                 Ok(commit) => Ok((
@@ -3489,7 +3586,7 @@ impl Pipeline {
                     // completion gate's verification pass to read back.
                     self.block_crcs.note_file_len(file_id, total_bytes);
 
-                    let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
+                    let mut expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
                     let file_checksum = match self
                         .finalize_completed_file_hash(
                             file_id,
@@ -3524,20 +3621,49 @@ impl Pipeline {
                         && file_checksum.crc32 != expected_crc
                     {
                         self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                        match self
-                            .schedule_file_crc_recovery(file_id, expected_crc, file_checksum.crc32)
-                            .await
-                        {
-                            // Recovery rewrites this file: its handle stays.
-                            Ok(true) => return,
-                            Ok(false) => {}
-                            Err(error) => {
-                                crate::pipeline::release_cached_write_handle(file_path);
-                                self.fail_job(job_id, error);
-                                return;
+                        // Every part carried its own checksum and verified, and
+                        // the recorded placements tile the file exactly. The
+                        // bytes on disk are therefore the bytes that were
+                        // posted, and the trailer's whole-file value is what is
+                        // wrong — a poster mistake, not a download failure.
+                        let parts_prove_the_bytes = file_checksum.all_parts_crc_verified
+                            && self
+                                .jobs
+                                .get(&job_id)
+                                .and_then(|state| state.assembly.file(file_id))
+                                .is_some_and(|file| file.contiguous_placements_proven());
+                        if parts_prove_the_bytes {
+                            warn!(
+                                job_id = job_id.0,
+                                file_id = %file_id,
+                                expected_crc = format_args!("{expected_crc:08x}"),
+                                actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                "every part verified against its own checksum; discarding the posted whole-file CRC32"
+                            );
+                            self.expected_file_crcs.remove(&file_id);
+                            self.untrusted_file_crcs.remove(&file_id);
+                            // Complete exactly as a matching value would.
+                            expected_file_crc = None;
+                        } else {
+                            match self
+                                .schedule_file_crc_recovery(
+                                    file_id,
+                                    expected_crc,
+                                    file_checksum.crc32,
+                                )
+                                .await
+                            {
+                                // Recovery rewrites this file: its handle stays.
+                                Ok(true) => return,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    crate::pipeline::release_cached_write_handle(file_path);
+                                    self.fail_job(job_id, error);
+                                    return;
+                                }
                             }
-                        }
-                        if self.par2_can_recover_file_crc(file_id, total_bytes, expected_crc) {
+                            let par2_agrees =
+                                self.par2_can_recover_file_crc(file_id, total_bytes, expected_crc);
                             self.taint_direct_unpack_for_file(job_id, filename);
                             let file_index = file_id.file_index;
                             if let Err(error) = self
@@ -3551,23 +3677,35 @@ impl Pipeline {
                                 );
                                 return;
                             }
-                            warn!(
-                                job_id = job_id.0,
-                                file_id = %file_id,
-                                expected_crc = format_args!("{expected_crc:08x}"),
-                                actual_crc = format_args!("{:08x}", file_checksum.crc32),
-                                "whole-file CRC mismatch; matching PAR2 metadata requires repair before acceptance"
-                            );
-                        } else {
-                            crate::pipeline::release_cached_write_handle(file_path);
-                            self.fail_job(
-                                job_id,
-                                format!(
-                                    "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
-                                    file_checksum.crc32
-                                ),
-                            );
-                            return;
+                            if par2_agrees {
+                                warn!(
+                                    job_id = job_id.0,
+                                    file_id = %file_id,
+                                    expected_crc = format_args!("{expected_crc:08x}"),
+                                    actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                    "whole-file CRC mismatch; matching PAR2 metadata requires repair before acceptance"
+                                );
+                            } else {
+                                // A poster's whole-file value that nothing can
+                                // corroborate is not grounds for ending the job:
+                                // the bytes may still be good, and repair evidence
+                                // may still arrive. The file is held for
+                                // verification and the terminal gate decides.
+                                if let Some(file) = self
+                                    .jobs
+                                    .get_mut(&job_id)
+                                    .and_then(|state| state.assembly.file_mut(file_id))
+                                {
+                                    file.require_geometry_verification();
+                                }
+                                warn!(
+                                    job_id = job_id.0,
+                                    file_id = %file_id,
+                                    expected_crc = format_args!("{expected_crc:08x}"),
+                                    actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                    "whole-file CRC mismatch with no corroborating evidence; file requires verification"
+                                );
+                            }
                         }
                     }
                     self.ensure_par2_runtime(job_id)
@@ -3654,6 +3792,7 @@ impl Pipeline {
                     self.file_hash_states.remove(&file_id);
                     if expected_file_crc.is_none_or(|expected| expected == file_checksum.crc32) {
                         self.expected_file_crcs.remove(&file_id);
+                        self.untrusted_file_crcs.remove(&file_id);
                     }
                     self.file_hash_reread_required.remove(&file_id);
                     self.unverified_segments.remove(&file_id);

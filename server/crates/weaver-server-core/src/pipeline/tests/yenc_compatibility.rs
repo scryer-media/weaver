@@ -65,6 +65,7 @@ async fn parked_damage_masks_accepted_and_reconstructed_ranges_after_reset() {
                 segment_number: 0,
             },
             damaged_source: Some(Box::new(RetainedArticleDamage {
+                truncation_suspected: false,
                 source: SegmentSource {
                     source_server_idx: None,
                     exclude_servers: Vec::new(),
@@ -277,6 +278,60 @@ async fn deliver_from(
     status: weaver_yenc::CrcVerification,
     source_server_idx: Option<usize>,
 ) {
+    deliver_declared(
+        pipeline,
+        file_id,
+        number,
+        offset,
+        bytes,
+        status,
+        source_server_idx,
+        // Consistently wrong: the declared size must never override a usable
+        // begin plus the bytes that actually decoded.
+        6,
+        None,
+        false,
+    )
+    .await;
+}
+
+/// An article whose body looks cut short, with no checksum either way.
+async fn deliver_suspected(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    number: u32,
+    offset: u64,
+    bytes: &[u8],
+    source_server_idx: Option<usize>,
+) {
+    deliver_declared(
+        pipeline,
+        file_id,
+        number,
+        offset,
+        bytes,
+        weaver_yenc::CrcVerification::Unverified,
+        source_server_idx,
+        6,
+        None,
+        true,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_declared(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    number: u32,
+    offset: u64,
+    bytes: &[u8],
+    status: weaver_yenc::CrcVerification,
+    source_server_idx: Option<usize>,
+    declared_size: u64,
+    expected_file_crc: Option<u32>,
+    truncation_suspected: bool,
+) {
     let len = bytes.len() as u64;
     let yenc_name = pipeline
         .current_filename_for_file_id(file_id.job_id, file_id)
@@ -290,10 +345,10 @@ async fn deliver_from(
                 },
                 raw_size: len,
                 encoding: SegmentEncoding::Yenc,
-                // Consistently wrong part, count, size and end must never override
+                // Consistently wrong part, count and end must never override
                 // usable begin plus actual bytes, even after the old threshold.
                 yenc_layout: YencLayoutAssertions {
-                    file_size: 6,
+                    file_size: declared_size,
                     part: Some(99),
                     total: Some(402),
                     begin: Some(offset + 1),
@@ -302,7 +357,8 @@ async fn deliver_from(
                 crc_valid: status != weaver_yenc::CrcVerification::Mismatch,
                 part_crc_verified: status == weaver_yenc::CrcVerification::Verified,
                 part_crc: par2_rs::checksum::crc32(bytes),
-                expected_file_crc: None,
+                truncation_suspected,
+                expected_file_crc,
                 data: DecodedChunk::from(bytes.to_vec()),
                 yenc_name,
                 checkpoint_plan: weaver_yenc::CheckpointPlan::None,
@@ -319,6 +375,168 @@ async fn deliver_from(
         )
         .await;
     settle_direct_demotion_work(pipeline).await;
+}
+
+/// An NZB that omits one segment number still numbers the rest densely, so the
+/// prefix sums it implies sit below the true offsets of every later article.
+/// Those articles must still be accepted, and the hole they leave must surface
+/// as a file that needs verification rather than as a clean completion.
+#[tokio::test]
+async fn sparse_segment_list_commits_every_listed_article_and_flags_the_hole() {
+    let temp = tempfile::tempdir().unwrap();
+    // Four listed segments of a five-part file: the third part is absent, so
+    // ordinals 2 and 3 truly begin at 12 and 16, past their prefix sums.
+    let (mut pipeline, file_id, _) = setup(&temp, 40221, &[5; 4]).await;
+    for (number, offset, bytes) in [
+        (0u32, 0u64, b"aaaa"),
+        (1, 4, b"bbbb"),
+        (2, 12, b"dddd"),
+        (3, 16, b"eeee"),
+    ] {
+        deliver_declared(
+            &mut pipeline,
+            file_id,
+            number,
+            offset,
+            bytes,
+            weaver_yenc::CrcVerification::Verified,
+            None,
+            20,
+            None,
+            false,
+        )
+        .await;
+    }
+    // The hole keeps the tail articles out of the contiguous run, so they
+    // settle through the quiescent drain rather than in stream.
+    pipeline.flush_quiescent_write_backlog().await;
+    assert!(
+        pipeline.segment_terminal_states.is_empty(),
+        "no listed article may be abandoned"
+    );
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        4
+    );
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.is_complete());
+    assert_eq!(file.placement_of(2), Some((12, 4)));
+    assert_eq!(file.placement_of(3), Some((16, 4)));
+    assert_eq!(file.decoded_coverage_end(), None, "the hole is visible");
+    assert!(
+        file.requires_file_verification(),
+        "a hole must reach repair, not clean completion"
+    );
+}
+
+/// Posters exist that write a running whole-file checksum, or zeros, on every
+/// part but the last. That cannot be allowed to end the job.
+#[tokio::test]
+async fn conflicting_whole_file_crcs_drop_the_expectation_instead_of_failing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _) = setup(&temp, 40222, &[8, 8]).await;
+    pipeline.note_expected_file_crc(file_id, Some(0x1111_1111));
+    assert_eq!(
+        pipeline.expected_file_crcs.get(&file_id),
+        Some(&0x1111_1111)
+    );
+    pipeline.note_expected_file_crc(file_id, Some(0x2222_2222));
+    assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(pipeline.untrusted_file_crcs.contains(&file_id));
+    // Once untrusted, later parts cannot reinstate an expectation.
+    pipeline.note_expected_file_crc(file_id, Some(0x1111_1111));
+    assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(!is_terminal_status(&pipeline.jobs[&file_id.job_id].status));
+}
+
+/// Every part verified against its own checksum and the placements tile the
+/// file exactly, so the bytes are what was posted: the trailer's whole-file
+/// value is the thing that is wrong.
+#[tokio::test]
+async fn wrong_whole_file_crc_yields_to_parts_that_all_verified() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40223, &[8, 8]).await;
+    for (number, offset, bytes) in [(0u32, 0u64, b"head"), (1, 4, b"tail")] {
+        deliver_declared(
+            &mut pipeline,
+            file_id,
+            number,
+            offset,
+            bytes,
+            weaver_yenc::CrcVerification::Verified,
+            None,
+            8,
+            Some(0xDEAD_BEEF),
+            false,
+        )
+        .await;
+    }
+    let status = job_status_for_assert(&pipeline, file_id.job_id);
+    assert!(
+        !matches!(&status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"headtail");
+    assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(!pipeline.untrusted_file_crcs.contains(&file_id));
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        2
+    );
+}
+
+/// With a part that could not vouch for itself, nothing corroborates the
+/// poster's value — but that is still not grounds for ending the job.
+#[tokio::test(start_paused = true)]
+async fn wrong_whole_file_crc_without_proof_holds_the_file_for_verification() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _) = setup(&temp, 40224, &[8, 8]).await;
+    pipeline.jobs.get_mut(&file_id.job_id).unwrap().status = JobStatus::Paused;
+    // No re-fetch is possible for the part that could not vouch for itself.
+    pipeline.decode_retries.insert(
+        SegmentId {
+            file_id,
+            segment_number: 1,
+        },
+        MAX_SEGMENT_RETRIES,
+    );
+    for (number, offset, bytes, status) in [
+        (0u32, 0u64, b"head", weaver_yenc::CrcVerification::Verified),
+        (1, 4, b"tail", weaver_yenc::CrcVerification::Unverified),
+    ] {
+        deliver_declared(
+            &mut pipeline,
+            file_id,
+            number,
+            offset,
+            bytes,
+            status,
+            None,
+            8,
+            Some(0xDEAD_BEEF),
+            false,
+        )
+        .await;
+    }
+    let status = job_status_for_assert(&pipeline, file_id.job_id);
+    assert!(
+        !matches!(&status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
+    assert!(
+        pipeline.jobs[&file_id.job_id]
+            .assembly
+            .file(file_id)
+            .unwrap()
+            .requires_file_verification()
+    );
+    assert_eq!(
+        pipeline.expected_file_crcs.get(&file_id),
+        Some(&0xDEAD_BEEF)
+    );
 }
 
 #[tokio::test]
@@ -1026,4 +1244,284 @@ async fn real_wire_crc32_only_retry_clears_damage_through_every_adapter() {
         );
         assert_eq!(pipeline.metrics.bytes_committed.load(Ordering::Relaxed), 4);
     }
+}
+
+/// Build a yEnc article out of bytes that need no escaping.
+fn plain_article(headers: &[&str], body: &[u8], trailer: Option<&str>) -> Vec<u8> {
+    let mut article = Vec::new();
+    for header in headers {
+        article.extend_from_slice(header.as_bytes());
+        article.extend_from_slice(b"\r\n");
+    }
+    article.extend(body.iter().map(|byte| byte.wrapping_add(42)));
+    if let Some(trailer) = trailer {
+        article.extend_from_slice(b"\r\n");
+        article.extend_from_slice(trailer.as_bytes());
+        article.extend_from_slice(b"\r\n");
+    }
+    article
+}
+
+fn decoded(article: &[u8]) -> weaver_yenc::DecodeResult {
+    let mut output = vec![0u8; 4096];
+    weaver_yenc::decode(article, &mut output).unwrap()
+}
+
+/// A part whose declared span accounts for every byte that arrived is complete
+/// even without a trailer: there is nothing left for a missing `=yend` to hide.
+#[test]
+fn a_confirmed_length_survives_a_missing_trailer() {
+    let body = vec![0u8; 16];
+    let article = plain_article(
+        &[
+            "=ybegin part=2 line=128 size=64 name=sample.bin",
+            "=ypart begin=17 end=32",
+        ],
+        &body,
+        None,
+    );
+    assert!(!crate::pipeline::yenc_truncation_suspected(&decoded(
+        &article
+    )));
+}
+
+/// A body that stops short of its declared span, with no trailer and no
+/// checksum, is exactly the response another server should be asked for.
+#[test]
+fn a_short_body_without_a_trailer_is_suspected() {
+    let body = vec![0u8; 8];
+    let article = plain_article(
+        &[
+            "=ybegin part=2 line=128 size=64 name=sample.bin",
+            "=ypart begin=17 end=32",
+        ],
+        &body,
+        None,
+    );
+    let result = decoded(&article);
+    assert!(result.defects.ypart_size_mismatch);
+    assert!(crate::pipeline::yenc_truncation_suspected(&result));
+}
+
+/// A single-part article that neither ends with a trailer nor accounts for its
+/// declared size is suspect for the same reason.
+#[test]
+fn a_single_part_body_short_of_its_declared_size_is_suspected() {
+    let body = vec![0u8; 8];
+    let article = plain_article(&["=ybegin line=128 size=64 name=sample.bin"], &body, None);
+    assert!(crate::pipeline::yenc_truncation_suspected(&decoded(
+        &article
+    )));
+}
+
+/// A trailer that disagrees with the bytes delivered is evidence on its own.
+#[test]
+fn a_trailer_size_that_disagrees_is_suspected() {
+    let body = vec![0u8; 16];
+    let article = plain_article(
+        &[
+            "=ybegin part=2 line=128 size=64 name=sample.bin",
+            "=ypart begin=17 end=32",
+        ],
+        &body,
+        Some("=yend size=999 part=2"),
+    );
+    let result = decoded(&article);
+    assert!(result.defects.yend_size_mismatch);
+    assert!(crate::pipeline::yenc_truncation_suspected(&result));
+}
+
+/// A checksum that verifies proves the bytes whatever the size fields claim.
+#[test]
+fn a_verified_checksum_outranks_every_size_disagreement() {
+    let body = vec![0u8; 16];
+    let crc = par2_rs::checksum::crc32(&body);
+    let article = plain_article(
+        &[
+            "=ybegin part=2 line=128 size=64 name=sample.bin",
+            "=ypart begin=17 end=32",
+        ],
+        &body,
+        Some(&format!("=yend size=999 part=2 pcrc32={crc:08x}")),
+    );
+    let result = decoded(&article);
+    assert_eq!(result.crc_status, weaver_yenc::CrcVerification::Verified);
+    assert!(!crate::pipeline::yenc_truncation_suspected(&result));
+}
+
+/// Bytes that look cut short are written, never counted, and re-requested.
+/// They are not a checksum failure, so the CRC-error metric stays still.
+#[tokio::test(start_paused = true)]
+async fn suspected_truncation_is_retried_and_a_verified_copy_settles_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40225, &[8, 8]).await;
+    deliver_suspected(&mut pipeline, file_id, 0, 0, b"hea", Some(0)).await;
+    assert_eq!(std::fs::read(&path).unwrap(), b"hea");
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(!file.has_segment(0));
+    assert!(file.has_retained_damage());
+    assert_eq!(pipeline.metrics.crc_errors.load(Ordering::Relaxed), 0);
+    let retry = pipeline.retry_rx.recv().await.unwrap();
+    assert_eq!(
+        retry.work.segment_id,
+        SegmentId {
+            file_id,
+            segment_number: 0,
+        }
+    );
+    deliver_from(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        b"head",
+        weaver_yenc::CrcVerification::Verified,
+        Some(1),
+    )
+    .await;
+    deliver(&mut pipeline, file_id, 1, 4, b"tail", true).await;
+    assert_eq!(std::fs::read(path).unwrap(), b"headtail");
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.is_complete());
+    assert!(!file.has_retained_damage());
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(pipeline.metrics.crc_errors.load(Ordering::Relaxed), 0);
+}
+
+/// A later copy that accounts for its own length settles a body that was only
+/// suspected of being cut short, even though it carries no checksum either.
+#[tokio::test(start_paused = true)]
+async fn a_copy_with_a_confirmed_length_settles_suspected_truncation() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40226, &[8]).await;
+    deliver_suspected(&mut pipeline, file_id, 0, 0, b"hea", Some(0)).await;
+    let _retry = pipeline.retry_rx.recv().await.unwrap();
+    deliver_status(
+        &mut pipeline,
+        file_id,
+        0,
+        0,
+        b"head",
+        weaver_yenc::CrcVerification::Unverified,
+    )
+    .await;
+    assert_eq!(std::fs::read(path).unwrap(), b"head");
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.has_segment(0));
+    assert!(!file.has_retained_damage());
+}
+
+/// An article whose `=ypart begin=` could not be read: intact bytes with no
+/// position of their own.
+async fn deliver_unanchored(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    number: u32,
+    bytes: &[u8],
+) {
+    let len = bytes.len() as u64;
+    let yenc_name = pipeline
+        .current_filename_for_file_id(file_id.job_id, file_id)
+        .unwrap_or_else(|| "sample.bin".to_owned());
+    pipeline
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number: number,
+                },
+                raw_size: len,
+                encoding: SegmentEncoding::Yenc,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: 8,
+                    part: None,
+                    total: None,
+                    begin: None,
+                    end: None,
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: par2_rs::checksum::crc32(bytes),
+                truncation_suspected: false,
+                expected_file_crc: None,
+                data: DecodedChunk::from(bytes.to_vec()),
+                yenc_name,
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                // No grid may be published against a position the article
+                // could not state.
+                segments: Vec::new(),
+            },
+            SegmentSource {
+                source_server_idx: Some(0),
+                exclude_servers: Vec::new(),
+            },
+        )
+        .await;
+    settle_direct_demotion_work(pipeline).await;
+}
+
+/// A part with no usable start is laid immediately after the part before it.
+#[tokio::test]
+async fn an_article_without_a_start_follows_the_one_before_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40227, &[8, 8]).await;
+    deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    assert_eq!(std::fs::read(path).unwrap(), b"headtail");
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.is_complete());
+    assert_eq!(file.placement_of(1), Some((4, 4)));
+    assert!(pipeline.unanchored_requeues.is_empty());
+}
+
+/// Arriving before the part it must follow is an ordering condition, not
+/// damage: the article is asked for again on the same terms and lands once its
+/// predecessor is placed.
+#[tokio::test]
+async fn an_article_without_a_start_waits_for_its_predecessor() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40228, &[8, 8]).await;
+    let segment = SegmentId {
+        file_id,
+        segment_number: 1,
+    };
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    assert_eq!(pipeline.unanchored_requeues.get(&segment), Some(&1));
+    assert!(!pipeline.decode_retries.contains_key(&segment));
+    assert!(!pipeline.segment_terminal_states.contains_key(&segment));
+    assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 0);
+    let queued = pipeline.jobs[&file_id.job_id].download_queue.len();
+    assert_eq!(queued, 1);
+    assert!(
+        !pipeline.jobs[&file_id.job_id]
+            .assembly
+            .file(file_id)
+            .unwrap()
+            .has_segment(1)
+    );
+    deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    assert_eq!(std::fs::read(path).unwrap(), b"headtail");
+    assert!(
+        pipeline.jobs[&file_id.job_id]
+            .assembly
+            .file(file_id)
+            .unwrap()
+            .is_complete()
+    );
 }

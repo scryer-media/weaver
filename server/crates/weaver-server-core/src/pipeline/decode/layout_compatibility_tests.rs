@@ -47,7 +47,7 @@ fn reported_total_mismatch_preserves_crc_verified_bounded_payload() {
     };
     let actual = decoded_layout(244, 402, 6_108_962, 186_624_001, 768_000);
     assert_eq!(
-        validate_yenc_layout(expected, actual, 768_000),
+        validate_yenc_layout(expected, actual, 768_000, None),
         Ok(186_624_000)
     );
 }
@@ -62,7 +62,7 @@ fn stale_part_number_does_not_override_verified_byte_placement() {
         total: 4,
     };
     let actual = decoded_layout(99, 4, 4096, 1025, 1024);
-    assert_eq!(validate_yenc_layout(expected, actual, 1024), Ok(1024));
+    assert_eq!(validate_yenc_layout(expected, actual, 1024, None), Ok(1024));
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn stale_file_size_does_not_override_verified_bounded_range() {
         total: 4,
     };
     let actual = decoded_layout(2, 4, 8192, 1025, 1024);
-    assert_eq!(validate_yenc_layout(expected, actual, 1024), Ok(1024));
+    assert_eq!(validate_yenc_layout(expected, actual, 1024, None), Ok(1024));
 }
 
 #[test]
@@ -95,9 +95,9 @@ fn end_is_advisory_but_actual_file_end_remains_bounded() {
             begin: Some(101),
             end,
         };
-        assert_eq!(validate_yenc_layout(expected, actual, 50), Ok(100));
+        assert_eq!(validate_yenc_layout(expected, actual, 50, None), Ok(100));
         assert_eq!(
-            validate_yenc_layout(expected, actual, 51),
+            validate_yenc_layout(expected, actual, 51, None),
             Err(YencLayoutMismatch::EndAboveDeclaredFileSize)
         );
     }
@@ -120,13 +120,15 @@ fn actual_file_end_addition_is_checked() {
         end: None,
     };
     assert_eq!(
-        validate_yenc_layout(expected, actual, 4),
+        validate_yenc_layout(expected, actual, 4, None),
         Err(YencLayoutMismatch::EndAboveDeclaredFileSize)
     );
 }
 
+/// An article that declares no usable start never guesses an encoded offset:
+/// it is laid after the part before it, and waits if that part is not placed.
 #[test]
-fn missing_begin_never_guesses_an_encoded_multipart_offset() {
+fn missing_begin_follows_the_part_before_it() {
     let mut expected = ExpectedSegmentLayout {
         max_file_offset: 8,
         max_decoded_size: 8,
@@ -142,14 +144,15 @@ fn missing_begin_never_guesses_an_encoded_multipart_offset() {
         end: None,
     };
     assert_eq!(
-        validate_yenc_layout(expected, actual, 4),
-        Err(YencLayoutMismatch::InvalidBegin)
+        validate_yenc_layout(expected, actual, 4, None),
+        Err(YencLayoutMismatch::PredecessorNotPlaced)
     );
+    assert_eq!(validate_yenc_layout(expected, actual, 4, Some(4)), Ok(4));
     actual.begin = Some(5);
-    assert_eq!(validate_yenc_layout(expected, actual, 4), Ok(4));
+    assert_eq!(validate_yenc_layout(expected, actual, 4, None), Ok(4));
     actual.begin = None;
     expected.total = 1;
     expected.part = 1;
     expected.max_file_offset = 0;
-    assert_eq!(validate_yenc_layout(expected, actual, 4), Ok(0));
+    assert_eq!(validate_yenc_layout(expected, actual, 4, Some(0)), Ok(0));
 }

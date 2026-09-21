@@ -29,6 +29,11 @@ pub struct YencHeaderDefects {
     pub invalid_crc32: bool,
     /// The multipart end was missing or unusable; placement uses begin and decoded length.
     pub invalid_ypart_end: bool,
+    /// The multipart begin was missing, unparseable or zero. The article says
+    /// nothing about where it belongs, so [`YencMetadata::begin`] and
+    /// [`YencMetadata::end`] are both `None` and placement falls to the
+    /// caller, which knows the order the parts were listed in.
+    pub invalid_ypart_begin: bool,
     /// The declared multipart length differed from the bytes decoded.
     pub ypart_size_mismatch: bool,
     /// The trailer length differed from the bytes decoded.
@@ -58,6 +63,7 @@ impl YencHeaderDefects {
             invalid_pcrc32: self.invalid_pcrc32 || other.invalid_pcrc32,
             invalid_crc32: self.invalid_crc32 || other.invalid_crc32,
             invalid_ypart_end: self.invalid_ypart_end || other.invalid_ypart_end,
+            invalid_ypart_begin: self.invalid_ypart_begin || other.invalid_ypart_begin,
             ypart_size_mismatch: self.ypart_size_mismatch || other.ypart_size_mismatch,
             yend_size_mismatch: self.yend_size_mismatch || other.yend_size_mismatch,
             ybegin_size_mismatch: self.ybegin_size_mismatch || other.ybegin_size_mismatch,
@@ -115,6 +121,16 @@ impl YencMetadata {
     /// segment base against the offset the article was actually placed at, and
     /// a disagreement makes the segments tile nothing rather than publishing a
     /// block verdict computed on a misplaced grid.
+    /// Whether this article knows where in the file its bytes belong.
+    ///
+    /// A part whose `=ypart begin=` was missing, unparseable or zero decodes
+    /// perfectly well, but any offset derived from it is a guess. The CRC
+    /// checkpoint grid collapses for such an article rather than tiling a
+    /// file it cannot locate itself in.
+    pub fn file_offset_is_known(&self) -> bool {
+        !self.defects.invalid_ypart_begin
+    }
+
     pub fn article_file_offset(&self) -> u64 {
         match self.begin {
             Some(begin) => begin.saturating_sub(1),

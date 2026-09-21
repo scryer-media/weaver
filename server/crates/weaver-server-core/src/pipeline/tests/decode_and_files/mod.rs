@@ -71,6 +71,7 @@ pub(super) async fn submit_uu_segment_named(
                 crc_valid: true,
                 part_crc_verified: false,
                 part_crc: 0,
+                truncation_suspected: false,
                 expected_file_crc: None,
                 segments: Vec::new(),
                 data: DecodedChunk::from(data.to_vec()),
