@@ -394,6 +394,7 @@ impl Pipeline {
             file_declared_size: HashMap::new(),
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
+            unanchored_requeues: HashMap::new(),
             par2_runtime: HashMap::new(),
             par3_runtime: None,
             par3_inside_probes: Default::default(),

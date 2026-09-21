@@ -99,13 +99,16 @@ pub fn apply_ypart_line(line: &[u8], metadata: &mut YencMetadata) -> Result<(), 
             fields.end = Some(value);
         }
     });
-    let begin = required_u64_field(fields.begin, "begin")?;
-    if begin == 0 {
-        return Err(YencError::InvalidHeader {
-            field: "begin".to_string(),
-            reason: "multipart offsets are one-based".to_string(),
-        });
-    }
+    // A begin that is absent, unparseable or zero is not grounds to abandon an
+    // article that decodes perfectly: it only means this header cannot place
+    // the bytes. The caller places them from the order the parts were listed
+    // in instead.
+    let Some(begin) = tolerant_u64(fields.begin).0.filter(|begin| *begin > 0) else {
+        metadata.defects.invalid_ypart_begin = true;
+        metadata.begin = None;
+        metadata.end = None;
+        return Ok(());
+    };
     // Only begin determines placement. A stale end cannot invalidate useful
     // bytes, and must never enter unchecked length or allocation arithmetic.
     let end = tolerant_u64(fields.end).0.filter(|end| *end >= begin);
@@ -410,14 +413,6 @@ fn visit_fields<'a>(line: &'a [u8], mut visit: impl FnMut(&[u8], &'a [u8])) {
     }
 }
 
-fn required_field<'a>(field: Option<&'a [u8]>, label: &str) -> Result<&'a [u8], YencError> {
-    field.ok_or_else(|| YencError::MissingField(label.to_string()))
-}
-
-fn required_u64_field(field: Option<&[u8]>, label: &str) -> Result<u64, YencError> {
-    parse_u64_bytes(required_field(field, label)?, label)
-}
-
 /// Parse an unsigned decimal field value. Zero-alloc and overflow-checked:
 /// `None` for empty, non-digit, or wider-than-`u64` input.
 ///
@@ -440,15 +435,6 @@ fn parse_u64_opt(value: &[u8]) -> Option<u64> {
     }
 
     Some(parsed)
-}
-
-/// `parse_u64_opt` with a labelled error, for the two `=ypart` fields that are
-/// still genuinely required.
-fn parse_u64_bytes(value: &[u8], label: &str) -> Result<u64, YencError> {
-    parse_u64_opt(value).ok_or_else(|| YencError::InvalidHeader {
-        field: label.to_string(),
-        reason: format!("invalid integer: {}", bytes_to_string(value.trim_ascii())),
-    })
 }
 
 /// Parse a `crc32=`/`pcrc32=` hex value, zero-alloc and overflow-checked.

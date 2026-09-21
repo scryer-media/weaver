@@ -79,6 +79,20 @@ pub const fn max_decoded_len(input_len: usize) -> usize {
 /// [`crate::YencHeaderDefects::invalid_size`]), and it describes the whole
 /// *file* rather than this article's part. Size from `input.len()`, or use
 /// [`decode_nntp_append`], which sizes itself.
+/// Checkpoints tile a file from a known starting offset. An article that
+/// cannot say where it starts gets no grid at all, so nothing downstream reads
+/// its checksums as block evidence against a guessed position.
+pub(crate) fn collapse_plan_without_offset(
+    metadata: &YencMetadata,
+    plan: CheckpointPlan,
+) -> CheckpointPlan {
+    if metadata.file_offset_is_known() {
+        plan
+    } else {
+        CheckpointPlan::None
+    }
+}
+
 pub fn decode(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, YencError> {
     decode_with_options(input, output, DecodeOptions::default())
 }
@@ -282,7 +296,7 @@ pub fn decode_with_options(
     // The whole-buffer entry has no chunk boundaries to checkpoint against and
     // no PAR2 block size to checkpoint at, so it reports the same single
     // segment a streaming decode with no segment plan would.
-    let segments = if bytes_written > 0 {
+    let segments = if bytes_written > 0 && parsed.metadata.file_offset_is_known() {
         vec![Segment {
             file_offset: parsed.metadata.article_file_offset(),
             len: bytes_written as u64,
@@ -536,7 +550,7 @@ impl StreamingArticleDecoder {
                 .set_line_length_hint(Some(metadata.line_length));
             self.decode_state.set_segment_plan(
                 metadata.article_file_offset(),
-                std::mem::take(&mut self.checkpoint_plan),
+                collapse_plan_without_offset(metadata, std::mem::take(&mut self.checkpoint_plan)),
             );
             self.stage = StreamingStage::Body;
             return Ok(true);
@@ -555,7 +569,10 @@ impl StreamingArticleDecoder {
                     .set_line_length_hint(Some(parsed.metadata.line_length));
                 self.decode_state.set_segment_plan(
                     parsed.metadata.article_file_offset(),
-                    std::mem::take(&mut self.checkpoint_plan),
+                    collapse_plan_without_offset(
+                        &parsed.metadata,
+                        std::mem::take(&mut self.checkpoint_plan),
+                    ),
                 );
                 self.metadata = Some(parsed.metadata);
                 self.stage = StreamingStage::Body;

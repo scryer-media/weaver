@@ -69,6 +69,10 @@ pub(in crate::pipeline) enum YencLayoutMismatch {
     BeginAboveDeclaredPrefix,
     /// The claimed range ends past every envelope that could contain it.
     EndAboveDeclaredFileSize,
+    /// The article declared no usable start of its own, and the ordinal before
+    /// it has not been placed yet, so there is nothing to lay it after. This is
+    /// an ordering condition, not damage: the article comes back unchanged.
+    PredecessorNotPlaced,
 }
 
 #[inline]
@@ -109,8 +113,10 @@ pub(super) fn expected_segment_layout(
 /// decoded offset the segment may be written at.
 ///
 /// The offset comes from the article (`begin - 1`) because nothing else knows
-/// it. Only a single-article file may omit its range and use offset zero;
-/// encoded NZB prefixes cannot place multipart decoded bytes.
+/// it. An article that declares no usable start is laid immediately after the
+/// ordinal before it (`sequential_anchor`), which is the only thing left that
+/// knows where its bytes go; encoded NZB prefixes cannot place multipart
+/// decoded bytes.
 ///
 /// The NZB envelope is a bound, not a verdict. Segment ordinals are dense, so
 /// an NZB that skips a segment number gives every later article a prefix sum
@@ -127,6 +133,7 @@ pub(super) fn validate_yenc_layout(
     expected: ExpectedSegmentLayout,
     actual: YencLayoutAssertions,
     decoded_len: usize,
+    sequential_anchor: Option<u64>,
 ) -> Result<u64, YencLayoutMismatch> {
     // The NZB's own segment size only ever *raises* this ceiling: it is not a
     // rejection criterion, but a post that declares an article this large is
@@ -138,8 +145,10 @@ pub(super) fn validate_yenc_layout(
         Some(begin) => begin
             .checked_sub(1)
             .ok_or(YencLayoutMismatch::InvalidBegin)?,
-        None if expected.total == 1 && actual.part.is_none() && actual.end.is_none() => 0,
-        None => return Err(YencLayoutMismatch::InvalidBegin),
+        // An unusable `=ypart begin=` is a header defect, not a reason to
+        // abandon bytes that decoded perfectly: the ordinals are ordered, so
+        // the end of the part before this one is where these bytes belong.
+        None => sequential_anchor.ok_or(YencLayoutMismatch::PredecessorNotPlaced)?,
     };
     let end = file_offset
         .checked_add(decoded_len as u64)
@@ -242,7 +251,7 @@ mod tests {
         let file = assembly(&[4, 7]);
         let expected = expected_segment_layout(&file, 1).unwrap();
         assert_eq!(
-            validate_yenc_layout(expected, assertions(expected), 7),
+            validate_yenc_layout(expected, assertions(expected), 7, None),
             Ok(4)
         );
         assert_eq!(
@@ -256,6 +265,7 @@ mod tests {
                     end: None,
                 },
                 7,
+                None,
             ),
             Ok(4)
         );
@@ -282,6 +292,7 @@ mod tests {
                     end: Some(2000),
                 },
                 1000,
+                None,
             ),
             Ok(1000)
         );
@@ -293,9 +304,19 @@ mod tests {
         let expected = expected_segment_layout(&file, 1).unwrap();
         let valid = assertions(expected);
         let cases = [
+            // No usable start, and nothing placed to lay these bytes after.
             (
                 YencLayoutAssertions {
                     begin: None,
+                    ..valid
+                },
+                7,
+                YencLayoutMismatch::PredecessorNotPlaced,
+            ),
+            // One-based offsets: zero is not a position in a file.
+            (
+                YencLayoutAssertions {
+                    begin: Some(0),
                     ..valid
                 },
                 7,
@@ -334,7 +355,7 @@ mod tests {
         ];
         for (actual, decoded_len, expected_mismatch) in cases {
             assert_eq!(
-                validate_yenc_layout(expected, actual, decoded_len),
+                validate_yenc_layout(expected, actual, decoded_len, None),
                 Err(expected_mismatch)
             );
         }
@@ -360,6 +381,7 @@ mod tests {
                         end: Some(true_offset + 1000),
                     },
                     1000,
+                    None,
                 ),
                 Ok(true_offset)
             );
@@ -382,6 +404,7 @@ mod tests {
                     end: Some(2000),
                 },
                 1000,
+                None,
             ),
             Ok(1000)
         );
@@ -403,6 +426,7 @@ mod tests {
                     end: Some(2000),
                 },
                 1000,
+                None,
             ),
             Err(YencLayoutMismatch::BeginAboveDeclaredPrefix)
         );
@@ -418,6 +442,7 @@ mod tests {
                     end: None,
                 },
                 1000,
+                None,
             ),
             Err(YencLayoutMismatch::BeginAboveDeclaredPrefix)
         );
@@ -438,6 +463,7 @@ mod tests {
                     end: None,
                 },
                 1000,
+                None,
             ),
             Err(YencLayoutMismatch::BeginAboveDeclaredPrefix)
         );
@@ -471,6 +497,8 @@ mod tests {
                     end: None,
                 },
                 4,
+                // The only ordinal in the file opens it.
+                Some(0),
             ),
             Ok(0)
         );
@@ -497,6 +525,7 @@ mod tests {
                     end: Some(1),
                 },
                 1,
+                None,
             ),
             Err(YencLayoutMismatch::InvalidBegin)
         );
@@ -515,6 +544,7 @@ mod tests {
                     end: Some(u64::MAX),
                 },
                 1,
+                None,
             ),
             Err(YencLayoutMismatch::BeginAboveDeclaredPrefix)
         );

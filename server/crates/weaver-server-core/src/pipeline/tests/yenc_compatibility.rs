@@ -1422,3 +1422,106 @@ async fn a_copy_with_a_confirmed_length_settles_suspected_truncation() {
     assert!(file.has_segment(0));
     assert!(!file.has_retained_damage());
 }
+
+/// An article whose `=ypart begin=` could not be read: intact bytes with no
+/// position of their own.
+async fn deliver_unanchored(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    number: u32,
+    bytes: &[u8],
+) {
+    let len = bytes.len() as u64;
+    let yenc_name = pipeline
+        .current_filename_for_file_id(file_id.job_id, file_id)
+        .unwrap_or_else(|| "sample.bin".to_owned());
+    pipeline
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number: number,
+                },
+                raw_size: len,
+                encoding: SegmentEncoding::Yenc,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: 8,
+                    part: None,
+                    total: None,
+                    begin: None,
+                    end: None,
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: par2_rs::checksum::crc32(bytes),
+                truncation_suspected: false,
+                expected_file_crc: None,
+                data: DecodedChunk::from(bytes.to_vec()),
+                yenc_name,
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                // No grid may be published against a position the article
+                // could not state.
+                segments: Vec::new(),
+            },
+            SegmentSource {
+                source_server_idx: Some(0),
+                exclude_servers: Vec::new(),
+            },
+        )
+        .await;
+    settle_direct_demotion_work(pipeline).await;
+}
+
+/// A part with no usable start is laid immediately after the part before it.
+#[tokio::test]
+async fn an_article_without_a_start_follows_the_one_before_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40227, &[8, 8]).await;
+    deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    assert_eq!(std::fs::read(path).unwrap(), b"headtail");
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.is_complete());
+    assert_eq!(file.placement_of(1), Some((4, 4)));
+    assert!(pipeline.unanchored_requeues.is_empty());
+}
+
+/// Arriving before the part it must follow is an ordering condition, not
+/// damage: the article is asked for again on the same terms and lands once its
+/// predecessor is placed.
+#[tokio::test]
+async fn an_article_without_a_start_waits_for_its_predecessor() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40228, &[8, 8]).await;
+    let segment = SegmentId {
+        file_id,
+        segment_number: 1,
+    };
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    assert_eq!(pipeline.unanchored_requeues.get(&segment), Some(&1));
+    assert!(!pipeline.decode_retries.contains_key(&segment));
+    assert!(!pipeline.segment_terminal_states.contains_key(&segment));
+    assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 0);
+    let queued = pipeline.jobs[&file_id.job_id].download_queue.len();
+    assert_eq!(queued, 1);
+    assert!(
+        !pipeline.jobs[&file_id.job_id]
+            .assembly
+            .file(file_id)
+            .unwrap()
+            .has_segment(1)
+    );
+    deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    assert_eq!(std::fs::read(path).unwrap(), b"headtail");
+    assert!(
+        pipeline.jobs[&file_id.job_id]
+            .assembly
+            .file(file_id)
+            .unwrap()
+            .is_complete()
+    );
+}

@@ -470,6 +470,11 @@ impl Pipeline {
                 Ok(DownloadPayload::Decoded(match body {
                     weaver_nntp::fused_yenc::FusedArticleBody::Yenc(result) => {
                         record_checkpoint_observability(&result);
+                        // Block evidence needs a known starting offset. An
+                        // article whose own begin was unusable has none.
+                        let offset_known = result.metadata.file_offset_is_known();
+                        let truncation_suspected =
+                            crate::pipeline::yenc_truncation_suspected(&result);
                         let yenc_layout = YencLayoutAssertions {
                             file_size: result.metadata.size,
                             part: result.metadata.part,
@@ -484,9 +489,7 @@ impl Pipeline {
                             encoding: SegmentEncoding::Yenc,
                             yenc_layout,
                             crc_valid: crate::pipeline::crc_not_mismatched(result.crc_status),
-                            truncation_suspected: crate::pipeline::yenc_truncation_suspected(
-                                &result,
-                            ),
+                            truncation_suspected,
                             part_crc_verified: result.crc_status
                                 == weaver_yenc::CrcVerification::Verified,
                             part_crc: result.part_crc,
@@ -494,7 +497,11 @@ impl Pipeline {
                             data,
                             yenc_name: result.metadata.name,
                             checkpoint_plan: result.checkpoint_plan,
-                            segments: result.segments,
+                            segments: if offset_known {
+                                result.segments
+                            } else {
+                                Vec::new()
+                            },
                         }
                     }
                     // uuencode declares no offsets, no size and no checksum, so

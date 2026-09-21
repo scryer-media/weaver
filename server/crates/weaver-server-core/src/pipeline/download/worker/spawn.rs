@@ -168,6 +168,9 @@ impl Pipeline {
                             decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
                         let truncation_suspected =
                             crate::pipeline::yenc_truncation_suspected(&decode_result);
+                        // Block evidence needs a known starting offset. An
+                        // article whose own begin was unusable has none.
+                        let offset_known = decode_result.metadata.file_offset_is_known();
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
@@ -184,7 +187,11 @@ impl Pipeline {
                                 data: decoded,
                                 yenc_name: decode_result.metadata.name,
                                 checkpoint_plan: decode_result.checkpoint_plan,
-                                segments: decode_result.segments,
+                                segments: if offset_known {
+                                    decode_result.segments
+                                } else {
+                                    Vec::new()
+                                },
                             },
                             source: SegmentSource {
                                 source_server_idx,
@@ -241,6 +248,9 @@ impl Pipeline {
                             decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
                         let truncation_suspected =
                             crate::pipeline::yenc_truncation_suspected(&decode_result);
+                        // Block evidence needs a known starting offset. An
+                        // article whose own begin was unusable has none.
+                        let offset_known = decode_result.metadata.file_offset_is_known();
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
@@ -257,7 +267,11 @@ impl Pipeline {
                                 data: DecodedChunk::from(output),
                                 yenc_name: decode_result.metadata.name,
                                 checkpoint_plan: decode_result.checkpoint_plan,
-                                segments: decode_result.segments,
+                                segments: if offset_known {
+                                    decode_result.segments
+                                } else {
+                                    Vec::new()
+                                },
                             },
                             source: SegmentSource {
                                 source_server_idx,

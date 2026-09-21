@@ -1652,8 +1652,32 @@ impl Pipeline {
                     }
                 }
             } else {
-                match validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
+                // Only consulted for an article that declared no usable start
+                // of its own: ordinal zero opens the file, and every other
+                // ordinal follows the one before it.
+                let sequential_anchor = if segment_id.segment_number == 0 {
+                    Some(0)
+                } else {
+                    self.jobs
+                        .get(&job_id)
+                        .and_then(|state| state.assembly.file(file_id))
+                        .and_then(|file| file.placement_of(segment_id.segment_number - 1))
+                        .map(|(offset, len)| offset.saturating_add(u64::from(len)))
+                };
+                match validate_yenc_layout(
+                    expected_layout,
+                    yenc_layout,
+                    decoded_len,
+                    sequential_anchor,
+                ) {
                     Ok(file_offset) => file_offset,
+                    Err(YencLayoutMismatch::PredecessorNotPlaced) => {
+                        // An ordering condition, not damage. The article comes
+                        // back from the same server, and spends no retry.
+                        drop(_cpu_scope);
+                        self.requeue_segment_awaiting_predecessor(segment_id);
+                        return;
+                    }
                     Err(mismatch) => {
                         let error = format_yenc_layout_mismatch(
                             mismatch,
@@ -2480,6 +2504,33 @@ impl Pipeline {
         );
     }
 
+    /// An article that could not say where it starts, arriving before the
+    /// ordinal it must follow. Ask for it again, without excluding the server
+    /// that served it and without spending its retry budget — nothing is wrong
+    /// with the bytes, they simply have nowhere to go yet.
+    fn requeue_segment_awaiting_predecessor(&mut self, segment_id: SegmentId) {
+        const MAX_ANCHOR_REQUEUES: u32 = 8;
+
+        let attempts = self.unanchored_requeues.entry(segment_id).or_insert(0);
+        *attempts += 1;
+        if *attempts <= MAX_ANCHOR_REQUEUES && self.push_requeued_segment(segment_id) {
+            debug!(
+                segment = %segment_id,
+                "article declared no usable start and its predecessor is unplaced; requeued without retry budget"
+            );
+            return;
+        }
+        // Bound reached: treat it as a real failure so the segment cannot
+        // cycle forever behind an ordinal that may never arrive.
+        self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.handle_decode_failure(
+            segment_id,
+            "article declared no usable start and its predecessor never arrived",
+            &[],
+            None,
+        );
+    }
+
     fn requeue_uu_segment_for_ordering(&mut self, segment_id: SegmentId) -> bool {
         const MAX_UU_PARK_REQUEUES: u32 = 8;
 
@@ -2501,6 +2552,24 @@ impl Pipeline {
             return false;
         }
 
+        if !self.push_requeued_segment(segment_id) {
+            return false;
+        }
+        crate::runtime::perf_probe::record(
+            "download.uu.park_requeue",
+            std::time::Duration::from_nanos(1),
+        );
+        debug!(
+            segment = %segment_id,
+            "uuencode part displaced by park pressure; requeued without retry budget"
+        );
+        true
+    }
+
+    /// Queue a segment again exactly as first dispatched: full retry budget,
+    /// no excluded server. Used where an article has to come back for an
+    /// ordering reason rather than because anything was wrong with it.
+    fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
         let completion_critical = self.segment_is_completion_critical(segment_id);
         let Some(state) = self.jobs.get_mut(&job_id) else {
@@ -2532,14 +2601,6 @@ impl Pipeline {
         };
         state.download_queue.push(work);
         self.update_queue_metrics();
-        crate::runtime::perf_probe::record(
-            "download.uu.park_requeue",
-            std::time::Duration::from_nanos(1),
-        );
-        debug!(
-            segment = %segment_id,
-            "uuencode part displaced by park pressure; requeued without retry budget"
-        );
         true
     }
 
