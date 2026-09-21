@@ -1605,6 +1605,22 @@ fn pinned_rust_channel(ctx: &TaskContext) -> Result<String> {
         .ok_or_else(|| anyhow!("{} has no toolchain.channel", path.display()))
 }
 
+/// C compiler flags a musl clippy build needs for its vendored C code.
+///
+/// aarch64 gcc defaults to `-moutline-atomics`, whose helpers link against a
+/// glibc-only symbol, so every atomics probe in a C configure script (jemalloc's
+/// among them) fails under musl and the build concludes it has no atomics.
+fn musl_c_flags_env(target: &str) -> Vec<(String, String)> {
+    if !target.starts_with("aarch64-") {
+        return Vec::new();
+    }
+    let key = target.replace('-', "_");
+    ["CFLAGS", "CXXFLAGS"]
+        .into_iter()
+        .map(|name| (format!("{name}_{key}"), "-mno-outline-atomics".to_string()))
+        .collect()
+}
+
 fn linux_clippy_defaults(host_target: &str) -> (&'static str, &'static str) {
     if host_target.starts_with("aarch64-") {
         ("aarch64-unknown-linux-musl", "linux/arm64")
@@ -1645,6 +1661,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
         cargo_target_env_key(&linux_target, "RUSTFLAGS")
     );
     let linux_linker_env = format!("{}=musl-gcc", cargo_target_env_key(&linux_target, "LINKER"));
+    let linux_c_flags = musl_c_flags_env(&linux_target);
     let linux_clippy_script = format!(
         "set -euo pipefail; export PATH=\"/usr/local/cargo/bin:$PATH\"; apt-get update >/dev/null; apt-get install -y --no-install-recommends musl-tools >/dev/null; /usr/local/cargo/bin/rustup component add clippy; /usr/local/cargo/bin/rustup target add {linux_target}; cargo clippy --workspace --lib --bins --tests --examples --benches --target {linux_target} -- -D warnings"
     );
@@ -1690,11 +1707,11 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
                 &linux_rustflags_env,
                 "-e",
                 &linux_linker_env,
-                &linux_image,
-                "bash",
-                "-lc",
-                &linux_clippy_script,
             ]);
+            for (key, value) in &linux_c_flags {
+                command.args(["-e", &format!("{key}={value}")]);
+            }
+            command.args([&linux_image, "bash", "-lc", &linux_clippy_script]);
             run_checked(&mut command)?;
         } else if command_available("musl-gcc")? {
             let mut target_add = ctx.command("rustup");
@@ -1707,6 +1724,7 @@ fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
                 &linux_rustflags,
             );
             command.env(cargo_target_env_key(&linux_target, "LINKER"), "musl-gcc");
+            command.envs(linux_c_flags.iter().map(|(key, value)| (key, value)));
             command.args([
                 "clippy",
                 "--workspace",
