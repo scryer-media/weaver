@@ -308,14 +308,24 @@ impl UpdateCheckService {
     /// Whether the release API's last answer asked us to wait, and that wait
     /// has not run out yet.
     fn backing_off(&self) -> bool {
+        self.backoff_remaining().is_some()
+    }
+
+    /// How much of the release API's requested wait is left, if any.
+    fn backoff_remaining(&self) -> Option<Duration> {
         self.inner
             .backoff_until
             .lock()
             .expect("update-check backoff poisoned")
-            .is_some_and(|until| tokio::time::Instant::now() < until)
+            .and_then(|until| until.checked_duration_since(tokio::time::Instant::now()))
+            .filter(|remaining| !remaining.is_zero())
     }
 
     /// Run one check. Returns the server-requested backoff, if any.
+    ///
+    /// While an earlier answer — from this loop or from an operator's check —
+    /// asked us to back off, nothing is fetched and the rest of that wait is
+    /// returned instead.
     ///
     /// The `Err` arm reports the fetch failure to the caller for logging; the
     /// failure has already been folded into the published status by then.
@@ -324,6 +334,9 @@ impl UpdateCheckService {
             return Ok(None);
         }
         let _guard = self.inner.check_lock.lock().await;
+        if let Some(remaining) = self.backoff_remaining() {
+            return Ok(Some(remaining));
+        }
         self.check_once().await
     }
 

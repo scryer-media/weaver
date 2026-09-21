@@ -593,6 +593,35 @@ async fn check_now_waits_out_a_rate_limit_backoff() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_background_check_honours_a_backoff_an_operator_check_received() {
+    let (service, fetcher) = enabled_service_with(vec![
+        Ok(FetchOutcome::RateLimited {
+            retry_after: Some(Duration::from_secs(24 * 3600)),
+        }),
+        fetched(FUTURE_VERSION),
+    ]);
+
+    service.check_now().await;
+    assert_eq!(fetcher.calls(), 1);
+
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    let wait = service
+        .run_check()
+        .await
+        .expect("a held-back check is not an error");
+    assert_eq!(fetcher.calls(), 1, "no fetch inside the backoff window");
+    assert_eq!(wait, Some(Duration::from_secs(23 * 3600)));
+
+    tokio::time::advance(Duration::from_secs(23 * 3600)).await;
+    service.run_check().await.expect("check after the backoff");
+    assert_eq!(fetcher.calls(), 2);
+    assert_eq!(
+        service.status().latest_version.as_deref(),
+        Some(FUTURE_VERSION)
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn check_now_never_polls_when_checks_are_off() {
     let db = Database::open_in_memory().expect("in-memory database");
     let fetcher = ScriptedFetcher::new(vec![fetched(FUTURE_VERSION)]);
