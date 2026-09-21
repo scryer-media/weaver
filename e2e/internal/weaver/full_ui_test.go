@@ -12,6 +12,58 @@ import (
 	"time"
 )
 
+func TestPruneFullRunBundles(t *testing.T) {
+	root := t.TempDir()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	paths := make(map[string]string)
+	// Names intentionally disagree with start order. The live and failed-cleanup
+	// runs are older than the retention window and must still survive.
+	for index, name := range []string{"live", "cleanup-error", "z-old", "c-third", "b-second", "a-current"} {
+		path := filepath.Join(root, "weaver-e2e-full-"+name)
+		paths[name] = path
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		manifest := fullRunManifest{OwnerPID: index + 1, StartedAt: base.Add(time.Duration(index) * time.Hour), TempRoot: path,
+			Phases: []fullRunPhaseEntry{{Name: name}}}
+		body, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "full-run.json"), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "evidence.log"), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cleanupErr := errors.New("cleanup failed")
+	var cleaned []string
+	err := pruneFullRunBundles(root, func(pid int) bool { return pid == 1 || pid == 6 }, func(phase *fullPhaseContext) error {
+		cleaned = append(cleaned, phase.Name)
+		if phase.Name == "cleanup-error" {
+			return cleanupErr
+		}
+		return nil
+	})
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("error = %v, want cleanup failure", err)
+	}
+	if strings.Join(cleaned, ",") != "z-old,cleanup-error" {
+		t.Fatalf("unexpected cleanup: %v", cleaned)
+	}
+	for name, path := range paths {
+		body, err := os.ReadFile(filepath.Join(path, "evidence.log"))
+		if name == "z-old" {
+			if !os.IsNotExist(err) {
+				t.Fatalf("old bundle still exists: %v", err)
+			}
+		} else if err != nil || string(body) != name {
+			t.Fatalf("retained %s evidence changed: %q, %v", name, body, err)
+		}
+	}
+}
+
 func TestFullSeedJobsOverrideDefaultsWhenUnset(t *testing.T) {
 	t.Setenv("E2E_SEED_JOBS", "")
 

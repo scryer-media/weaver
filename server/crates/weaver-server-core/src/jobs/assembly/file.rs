@@ -1,7 +1,7 @@
 use crate::jobs::ids::NzbFileId;
 use bitvec::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use weaver_model::files::FileRole;
 
 use super::error::AssemblyError;
@@ -89,7 +89,7 @@ pub struct FileAssembly {
     /// persisted: a restart refetches from this ordinal until file verification
     /// or repair establishes completion.
     retained_damage_floor: Option<u64>,
-    damaged_segments: BTreeSet<u32>,
+    damaged_segments: BTreeMap<u32, (u64, u32)>,
     /// Existing durable prefix evidence, clipped whenever resumed bytes are rewritten.
     restored_prefix_end: u64,
     final_part_verified: bool,
@@ -141,7 +141,7 @@ impl FileAssembly {
             reconstructed_placements: BTreeMap::new(),
             has_duplicate_segments: false,
             retained_damage_floor: None,
-            damaged_segments: BTreeSet::new(),
+            damaged_segments: BTreeMap::new(),
             restored_prefix_end: 0,
             final_part_verified: false,
             geometry_requires_verification: false,
@@ -208,13 +208,9 @@ impl FileAssembly {
         self.placements.get(&segment_number).copied()
     }
 
-    pub(crate) fn note_retained_damage(&mut self, segment_number: u32) {
-        self.damaged_segments.insert(segment_number);
-        let floor = self
-            .placement_of(segment_number)
-            .map_or(self.segment_offset(segment_number), |(offset, _)| {
-                offset.min(self.segment_offset(segment_number))
-            });
+    pub(crate) fn note_retained_damage(&mut self, segment_number: u32, offset: u64, len: u32) {
+        self.damaged_segments.insert(segment_number, (offset, len));
+        let floor = offset.min(self.segment_offset(segment_number));
         self.retained_damage_floor = Some(
             self.retained_damage_floor
                 .map_or(floor, |old| old.min(floor)),
@@ -222,7 +218,17 @@ impl FileAssembly {
     }
 
     pub(crate) fn clear_retained_damage(&mut self, segment_number: u32) -> bool {
-        self.damaged_segments.remove(&segment_number)
+        self.damaged_segments.remove(&segment_number).is_some()
+    }
+
+    /// Only accepted bytes may exclude writes of a damaged candidate.
+    pub(crate) fn protected_write_ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        std::iter::once((0, self.restored_prefix_end)).chain(
+            self.placements
+                .values()
+                .chain(self.reconstructed_placements.values())
+                .map(|&(offset, len)| (offset, offset.saturating_add(u64::from(len)))),
+        )
     }
 
     pub(crate) fn has_retained_damage(&self) -> bool {
@@ -234,7 +240,7 @@ impl FileAssembly {
     }
 
     pub(crate) fn segment_has_retained_damage(&self, segment_number: u32) -> bool {
-        self.damaged_segments.contains(&segment_number)
+        self.damaged_segments.contains_key(&segment_number)
     }
 
     pub(crate) fn requires_file_verification(&self) -> bool {

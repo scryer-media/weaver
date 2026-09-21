@@ -2129,6 +2129,39 @@ fn write_segments_to_disk_blocking(
     result
 }
 
+fn write_damaged_segment(
+    file: &mut std::fs::File,
+    offset: u64,
+    data: &DecodedChunk,
+    spans: &[std::ops::Range<usize>],
+) -> std::io::Result<()> {
+    use std::io::Seek;
+    let mut chunks = Vec::new();
+    data.push_io_slices(&mut chunks);
+    let mut slices = Vec::new();
+    for span in spans {
+        slices.clear();
+        let mut chunk_start = 0;
+        for chunk in &chunks {
+            let chunk_end = chunk_start + chunk.len();
+            let start = span.start.max(chunk_start);
+            let end = span.end.min(chunk_end);
+            if start < end {
+                slices.push(std::io::IoSlice::new(
+                    &chunk[start - chunk_start..end - chunk_start],
+                ));
+            }
+            chunk_start = chunk_end;
+            if chunk_start >= span.end {
+                break;
+            }
+        }
+        file.seek(std::io::SeekFrom::Start(offset + span.start as u64))?;
+        write_all_vectored(file, &mut slices).map_err(|(error, _)| error)?;
+    }
+    Ok(())
+}
+
 fn write_segments_into_file(
     file: &mut std::fs::File,
     mut segments: Vec<(u64, BufferedDecodedSegment)>,
@@ -2145,11 +2178,25 @@ fn write_segments_into_file(
         if completed == segments.len() {
             return Ok(segments);
         }
+        if let Some(damage) = segments[completed].1.damaged_source.as_ref() {
+            let (offset, segment) = &segments[completed];
+            if let Err(error) =
+                write_damaged_segment(file, *offset, &segment.data, &damage.write_spans)
+            {
+                break error;
+            }
+            completed += 1;
+            next_file_offset = None;
+            continue;
+        }
         let run_start = completed;
         let run_offset = segments[run_start].0;
         let mut run_end = run_start;
         let mut run_len = 0u64;
-        while run_end < segments.len() && segments[run_end].0 == run_offset + run_len {
+        while run_end < segments.len()
+            && segments[run_end].0 == run_offset + run_len
+            && segments[run_end].1.damaged_source.is_none()
+        {
             run_len += segments[run_end].1.data.len_bytes() as u64;
             run_end += 1;
         }
@@ -2449,6 +2496,24 @@ pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
 mod disk_write_handle_cache_tests {
     use super::*;
     use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+
+    #[test]
+    fn masked_damage_writes_only_permitted_spans_and_propagates_io_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("masked.bin");
+        std::fs::write(&path, b"........").unwrap();
+        let data = DecodedChunk::from(vec![
+            b"abc".to_vec().into_boxed_slice(),
+            b"defgh".to_vec().into_boxed_slice(),
+        ]);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        write_damaged_segment(&mut file, 0, &data, &[1..4, 6..8]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b".bcd..gh");
+        let mut read_only = std::fs::File::open(&path).unwrap();
+        write_damaged_segment(&mut read_only, 0, &data, &[]).unwrap();
+        assert!(write_damaged_segment(&mut read_only, 0, &data, &[0..2, 4..6]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b".bcd..gh");
+    }
 
     fn segment(bytes: &[u8]) -> BufferedDecodedSegment {
         BufferedDecodedSegment {

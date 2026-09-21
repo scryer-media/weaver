@@ -1684,6 +1684,15 @@ impl Pipeline {
                 );
                 return;
             }
+            let unresolved_replacement = !part_crc_verified
+                && self
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|state| state.assembly.file(file_id))
+                    .is_some_and(|file| {
+                        file.segment_has_retained_damage(segment_id.segment_number)
+                    });
+            let retain_damage = !crc_valid || unresolved_replacement;
             let conflict = match self
                 .jobs
                 .get_mut(&job_id)
@@ -1695,19 +1704,23 @@ impl Pipeline {
                     if !crc_valid && file.has_segment(segment_id.segment_number) {
                         return;
                     }
-                    match file.placement_conflict(
-                        segment_id.segment_number,
-                        file_offset,
-                        decoded_size,
-                    ) {
-                        Some(other) => Some(other),
-                        None => {
-                            file.record_placement(
-                                segment_id.segment_number,
-                                file_offset,
-                                decoded_size,
-                            );
-                            None
+                    if retain_damage {
+                        None
+                    } else {
+                        match file.placement_conflict(
+                            segment_id.segment_number,
+                            file_offset,
+                            decoded_size,
+                        ) {
+                            Some(other) => Some(other),
+                            None => {
+                                file.record_placement(
+                                    segment_id.segment_number,
+                                    file_offset,
+                                    decoded_size,
+                                );
+                                None
+                            }
                         }
                     }
                 }
@@ -1729,15 +1742,7 @@ impl Pipeline {
                 return;
             }
 
-            let unresolved_replacement = !part_crc_verified
-                && self
-                    .jobs
-                    .get(&job_id)
-                    .and_then(|state| state.assembly.file(file_id))
-                    .is_some_and(|file| {
-                        file.segment_has_retained_damage(segment_id.segment_number)
-                    });
-            if !crc_valid || unresolved_replacement {
+            if retain_damage {
                 if !crc_valid {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1754,8 +1759,7 @@ impl Pipeline {
                     .get_mut(&job_id)
                     .and_then(|state| state.assembly.file_mut(file_id))
                 {
-                    file.record_placement(segment_id.segment_number, file_offset, decoded_size);
-                    file.note_retained_damage(segment_id.segment_number);
+                    file.note_retained_damage(segment_id.segment_number, file_offset, decoded_size);
                 }
                 let filename = self
                     .jobs
@@ -1781,14 +1785,15 @@ impl Pipeline {
                     yenc_name,
                     checkpoint_plan,
                     segments,
-                    damaged_source: Some(Box::new((
+                    damaged_source: Some(Box::new(RetainedArticleDamage {
                         source,
-                        if crc_valid {
+                        status: if crc_valid {
                             weaver_yenc::CrcVerification::Unverified
                         } else {
                             weaver_yenc::CrcVerification::Mismatch
                         },
-                    ))),
+                        write_spans: Vec::new(),
+                    })),
                 };
                 self.note_write_buffered(decoded_len, 1);
                 if self.demotion_sweep_owns_file(file_id) {
@@ -2709,6 +2714,70 @@ impl Pipeline {
         }
     }
 
+    /// Reconcile damage at handoff, after any demotion reset. Protect both
+    /// durable ownership and accepted writes still waiting in this batch/buffer.
+    fn prepare_damaged_writes(
+        &self,
+        file_id: NzbFileId,
+        batch: &mut [(u64, BufferedDecodedSegment)],
+    ) {
+        if !batch
+            .iter()
+            .any(|(_, segment)| segment.damaged_source.is_some())
+        {
+            return;
+        }
+        let mut protected: Vec<_> = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .into_iter()
+            .flat_map(|file| file.protected_write_ranges())
+            .collect();
+        let accepted = batch
+            .iter()
+            .map(|(offset, segment)| (*offset, segment))
+            .chain(
+                self.write_buffers
+                    .get(&file_id)
+                    .into_iter()
+                    .flat_map(|buffer| buffer.buffered_chunks()),
+            );
+        for (offset, segment) in accepted {
+            if segment.damaged_source.is_none() {
+                protected.push((offset, offset.saturating_add(segment.len_bytes() as u64)));
+            }
+        }
+        protected.sort_unstable();
+        for (offset, segment) in batch {
+            let Some(damage) = segment.damaged_source.as_mut() else {
+                continue;
+            };
+            damage.write_spans.clear();
+            let end = offset.saturating_add(segment.data.len_bytes() as u64);
+            let mut cursor = *offset;
+            for &(start, stop) in &protected {
+                if stop <= cursor {
+                    continue;
+                }
+                if start >= end {
+                    break;
+                }
+                if start > cursor {
+                    damage
+                        .write_spans
+                        .push((cursor - *offset) as usize..(start - *offset) as usize);
+                }
+                cursor = cursor.max(stop).min(end);
+            }
+            if cursor < end {
+                damage
+                    .write_spans
+                    .push((cursor - *offset) as usize..(end - *offset) as usize);
+            }
+        }
+    }
+
     pub(in crate::pipeline) async fn persist_ready_segments(
         &mut self,
         file_id: NzbFileId,
@@ -2747,6 +2816,8 @@ impl Pipeline {
             ready_bytes as u64,
         );
         self.invalidate_par3_source_write(file_id);
+        let mut ready = ready;
+        self.prepare_damaged_writes(file_id, &mut ready);
         let write_result = write_segments_to_disk(&file_path, ready).await;
         self.release_write_buffered(ready_bytes, ready_count);
 
@@ -2971,6 +3042,8 @@ impl Pipeline {
 
         let write_start = Instant::now();
         self.invalidate_par3_source_write(file_id);
+        let mut segments = segments;
+        self.prepare_damaged_writes(file_id, &mut segments);
         let write_result = write_segments_to_disk(&file_path, segments).await;
         // Hot-path safe: reuses the `write_start` this path already keeps for
         // the `disk_write_latency_us` gauge, so the histogram costs no extra
@@ -2999,7 +3072,9 @@ impl Pipeline {
             crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
             let segment_bytes = segment.len_bytes();
 
-            if let Some(write_buf) = self.write_buffers.get_mut(&file_id) {
+            if segment.damaged_source.is_none()
+                && let Some(write_buf) = self.write_buffers.get_mut(&file_id)
+            {
                 write_buf.mark_persisted(offset, segment_bytes);
             }
             self.metrics
@@ -3056,19 +3131,24 @@ impl Pipeline {
     ) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.commit_persisted_segment");
         if let Some(unresolved) = segment.damaged_source.as_ref() {
-            let (source, status) = unresolved.as_ref();
+            let source = &unresolved.source;
+            let status = unresolved.status;
             let file_id = segment.segment_id.file_id;
             if let Some(file) = self
                 .jobs
                 .get_mut(&file_id.job_id)
                 .and_then(|state| state.assembly.file_mut(file_id))
             {
-                file.record_placement(
+                // A parked corrupt duplicate may have been superseded while
+                // demotion owned the file. Its masked write proves no damage.
+                if file.has_segment(segment.segment_id.segment_number) {
+                    return;
+                }
+                file.note_retained_damage(
                     segment.segment_id.segment_number,
                     file_offset,
                     segment.decoded_size,
                 );
-                file.note_retained_damage(segment.segment_id.segment_number);
             }
             // The disk owner completed this write before an alternate response
             // can be scheduled. No assembly bit, successful event, checksum

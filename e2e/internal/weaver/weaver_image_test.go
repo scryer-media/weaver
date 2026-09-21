@@ -172,6 +172,10 @@ func TestParseRustToolchainChannel(t *testing.T) {
 func TestWeaverImagePlanDockerfilePublishedShape(t *testing.T) {
 	plan := weaverImagePlan{Toolchain: "1.97.1"}
 	dockerfile := plan.dockerfile()
+	builder, runtime, found := strings.Cut(dockerfile, "\nFROM debian:")
+	if !found || !strings.Contains(builder, "make pkg-config") || strings.Contains(runtime, "make pkg-config") {
+		t.Fatalf("jemalloc requires make in the builder only:\n%s", dockerfile)
+	}
 	if !strings.Contains(dockerfile, "cargo build --locked -p weaver") {
 		t.Fatalf("published dockerfile must restore --locked:\n%s", dockerfile)
 	}

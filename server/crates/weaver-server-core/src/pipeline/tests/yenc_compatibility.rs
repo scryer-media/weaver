@@ -1,5 +1,117 @@
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn retained_overlap_never_exhausts_clean_backup_in_either_order() {
+    use weaver_yenc::CrcVerification::{Mismatch, Verified};
+    for damage_first in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut pipeline, file_id, path) = setup(&temp, 40219, &[8, 8]).await;
+        pipeline.jobs.get_mut(&file_id.job_id).unwrap().status = JobStatus::Paused;
+        if damage_first {
+            deliver_from(&mut pipeline, file_id, 0, 0, b"bad!X", Mismatch, Some(0)).await;
+        }
+        deliver_from(&mut pipeline, file_id, 1, 4, b"tail", Verified, Some(1)).await;
+        if !damage_first {
+            deliver_from(&mut pipeline, file_id, 0, 0, b"bad!X", Mismatch, Some(0)).await;
+            assert_eq!(std::fs::read(&path).unwrap(), b"bad!");
+        }
+        let neighbor = SegmentId {
+            file_id,
+            segment_number: 1,
+        };
+        assert!(!pipeline.decode_retries.contains_key(&neighbor));
+        assert!(!pipeline.segment_terminal_states.contains_key(&neighbor));
+        deliver_from(&mut pipeline, file_id, 0, 0, b"head", Verified, Some(1)).await;
+        assert_eq!(std::fs::read(&path).unwrap(), b"headtail");
+        let file = pipeline.jobs[&file_id.job_id]
+            .assembly
+            .file(file_id)
+            .unwrap();
+        assert!(file.is_complete());
+        assert!(!file.has_retained_damage());
+        assert!(pipeline.segment_terminal_states.is_empty());
+        assert_eq!(pipeline.jobs[&file_id.job_id].failed_bytes, 0);
+        assert_eq!(
+            pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+            2
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn parked_damage_masks_accepted_and_reconstructed_ranges_after_reset() {
+    for reconstructed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut pipeline, file_id, path) = setup(&temp, 40220, &[8, 8]).await;
+        pipeline.jobs.get_mut(&file_id.job_id).unwrap().status = JobStatus::Paused;
+        deliver(&mut pipeline, file_id, 1, 4, b"tail", true).await;
+        let file = pipeline
+            .jobs
+            .get_mut(&file_id.job_id)
+            .unwrap()
+            .assembly
+            .file_mut(file_id)
+            .unwrap();
+        file.reset();
+        if reconstructed {
+            std::fs::write(&path, b"....tail").unwrap();
+            file.record_reconstructed_placement(1, 4, 4);
+        }
+        // This payload was parked before the reset; split chunks also exercise
+        // masking across chunk boundaries without making a contiguous copy.
+        let damaged = BufferedDecodedSegment {
+            segment_id: SegmentId {
+                file_id,
+                segment_number: 0,
+            },
+            damaged_source: Some(Box::new(RetainedArticleDamage {
+                source: SegmentSource {
+                    source_server_idx: None,
+                    exclude_servers: Vec::new(),
+                },
+                status: weaver_yenc::CrcVerification::Mismatch,
+                write_spans: Vec::new(),
+            })),
+            decoded_size: 5,
+            encoding: SegmentEncoding::Yenc,
+            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+            data: DecodedChunk::from(vec![
+                b"bad".to_vec().into_boxed_slice(),
+                b"!X".to_vec().into_boxed_slice(),
+            ]),
+            part_crc: 0,
+            part_crc_verified: false,
+            yenc_name: "sample.bin".into(),
+            segments: Vec::new(),
+        };
+        pipeline.note_write_buffered(5, 1);
+        let buffer = pipeline.write_buffers.get_mut(&file_id).unwrap();
+        buffer.insert(0, damaged);
+        let (ready, contiguous_end) = buffer.drain_ready_with_contiguous_end();
+        assert_eq!(contiguous_end, 0, "damage must not advance coverage");
+        assert_eq!(buffer.buffered_len(), 1, "clean tail remains parked");
+        pipeline
+            .persist_ready_segments(file_id, ready, contiguous_end)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            if reconstructed {
+                b"bad!tail".as_slice()
+            } else {
+                b"bad!".as_slice()
+            }
+        );
+        deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
+        assert_eq!(std::fs::read(&path).unwrap(), b"headtail");
+        assert_eq!(pipeline.write_buffered_bytes, 0);
+        assert_eq!(
+            pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+            2
+        );
+    }
+}
+
 #[tokio::test]
 async fn parked_article_restores_placement_after_assembly_reset() {
     let temp = tempfile::tempdir().unwrap();
@@ -153,6 +265,18 @@ async fn deliver_status(
     bytes: &[u8],
     status: weaver_yenc::CrcVerification,
 ) {
+    deliver_from(pipeline, file_id, number, offset, bytes, status, None).await;
+}
+
+async fn deliver_from(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    number: u32,
+    offset: u64,
+    bytes: &[u8],
+    status: weaver_yenc::CrcVerification,
+    source_server_idx: Option<usize>,
+) {
     let len = bytes.len() as u64;
     let yenc_name = pipeline
         .current_filename_for_file_id(file_id.job_id, file_id)
@@ -189,7 +313,7 @@ async fn deliver_status(
                 }],
             },
             SegmentSource {
-                source_server_idx: None,
+                source_server_idx,
                 exclude_servers: Vec::new(),
             },
         )

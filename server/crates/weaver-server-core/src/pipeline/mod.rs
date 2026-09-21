@@ -1964,11 +1964,18 @@ impl From<Vec<Box<[u8]>>> for DecodedChunk {
     }
 }
 
+pub(super) struct RetainedArticleDamage {
+    pub(super) source: SegmentSource,
+    pub(super) status: weaver_yenc::CrcVerification,
+    /// Payload-relative spans, resolved against live ownership at disk handoff.
+    pub(super) write_spans: Vec<std::ops::Range<usize>>,
+}
+
 pub(super) struct BufferedDecodedSegment {
     pub(super) segment_id: SegmentId,
     /// Unresolved damage is written before retrying. Retain the actual CRC
     /// status so a missing checksum is never reported as a mismatch.
-    pub(super) damaged_source: Option<Box<(SegmentSource, weaver_yenc::CrcVerification)>>,
+    pub(super) damaged_source: Option<Box<RetainedArticleDamage>>,
     pub(super) decoded_size: u32,
     /// Carried from the decoder so the durability seam can tell whether this
     /// segment is allowed to feed the dual-CRC grid.
@@ -1989,6 +1996,9 @@ pub(super) struct BufferedDecodedSegment {
 impl BufferedChunk for BufferedDecodedSegment {
     fn len_bytes(&self) -> usize {
         self.data.len_bytes()
+    }
+    fn contributes_to_coverage(&self) -> bool {
+        self.damaged_source.is_none()
     }
 }
 

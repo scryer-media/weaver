@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -776,10 +777,6 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	}
 	log.Printf("starting %s", options.logLabel)
 
-	if err := cleanupAbandonedFullRuns(); err != nil {
-		log.Printf("warning: cleanup abandoned full runs: %v", err)
-	}
-
 	tempRoot, err := os.MkdirTemp("", "weaver-e2e-full-")
 	if err != nil {
 		log.Fatalf("create full-suite temp root: %v", err)
@@ -796,6 +793,9 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	manifestPath := filepath.Join(tempRoot, "full-run.json")
 	if err := writeFullRunManifest(manifestPath, tempRoot, phases); err != nil {
 		log.Fatalf("write full-run manifest: %v", err)
+	}
+	if err := cleanupAbandonedFullRuns(); err != nil {
+		log.Printf("warning: cleanup abandoned full runs: %v", err)
 	}
 
 	// Fixtures first, before the dashboard takes the terminal: a fetch or a
@@ -882,11 +882,7 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	}
 
 	cleanupErrors = cleanupFullPhaseContexts(phases, keepStacks)
-	printFullSummary(options.summaryLabel, phases, phaseResults, cleanupErrors, tempRoot, seedResults, false, keepStacks || failed || len(cleanupErrors) > 0)
-	if !keepStacks && !failed && len(cleanupErrors) == 0 {
-		_ = os.Remove(manifestPath)
-		_ = os.RemoveAll(tempRoot)
-	}
+	printFullSummary(options.summaryLabel, phases, phaseResults, cleanupErrors, tempRoot, seedResults, false, true)
 	if failed {
 		os.Exit(1)
 	}
@@ -1731,11 +1727,22 @@ func writeFullRunManifest(path, tempRoot string, phases []*fullPhaseContext) err
 }
 
 func cleanupAbandonedFullRuns() error {
-	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "weaver-e2e-full-*", "full-run.json"))
+	return pruneFullRunBundles(os.TempDir(), processAlive, cleanupFullPhaseContext)
+}
+
+// Retain the newest three bundles, including the run that just wrote its
+// manifest. Live owners are protected even when they fall outside that window.
+func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*fullPhaseContext) error) error {
+	matches, err := filepath.Glob(filepath.Join(tempDir, "weaver-e2e-full-*", "full-run.json"))
 	if err != nil {
 		return err
 	}
 	var errs []error
+	type bundle struct {
+		path     string
+		manifest fullRunManifest
+	}
+	var bundles []bundle
 	for _, manifestPath := range matches {
 		body, err := os.ReadFile(manifestPath)
 		if err != nil {
@@ -1747,9 +1754,20 @@ func cleanupAbandonedFullRuns() error {
 			errs = append(errs, err)
 			continue
 		}
-		if manifest.OwnerPID > 0 && processAlive(manifest.OwnerPID) {
+		bundles = append(bundles, bundle{path: filepath.Dir(manifestPath), manifest: manifest})
+	}
+	sort.Slice(bundles, func(i, j int) bool {
+		if bundles[i].manifest.StartedAt.Equal(bundles[j].manifest.StartedAt) {
+			return bundles[i].path < bundles[j].path
+		}
+		return bundles[i].manifest.StartedAt.After(bundles[j].manifest.StartedAt)
+	})
+	for index, candidate := range bundles {
+		manifest := candidate.manifest
+		if index < 3 || (manifest.OwnerPID > 0 && alive(manifest.OwnerPID)) {
 			continue
 		}
+		cleaned := true
 		for _, entry := range manifest.Phases {
 			phase := &fullPhaseContext{
 				Name:             entry.Name,
@@ -1758,12 +1776,16 @@ func cleanupAbandonedFullRuns() error {
 				RunDir:           entry.RunDir,
 				RuntimePortsFile: entry.RuntimePortsFile,
 			}
-			if err := cleanupFullPhaseContext(phase); err != nil {
+			if err := cleanup(phase); err != nil {
 				errs = append(errs, fmt.Errorf("%s cleanup: %w", entry.Name, err))
+				cleaned = false
 			}
 		}
-		_ = os.Remove(manifestPath)
-		_ = os.RemoveAll(manifest.TempRoot)
+		if cleaned {
+			if err := os.RemoveAll(candidate.path); err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
 	return errors.Join(errs...)
 }
