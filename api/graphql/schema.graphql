@@ -540,6 +540,18 @@ type GlobalQueueState {
 	downloadBlock: DownloadBlock!
 }
 
+"""
+How many history rows carry one category.
+"""
+type HistoryCategoryCount {
+	"""
+	The category, or the empty string for rows with none — the same spelling
+	`HistoryPageInput.categories` takes back.
+	"""
+	category: String!
+	count: Int!
+}
+
 type HistoryCommandResult {
 	success: Boolean!
 	removedIds: [Int!]!
@@ -616,6 +628,16 @@ type HistoryPage {
 	items: [HistoryItem!]!
 	totalCount: Int!
 	counts: HistoryPageCounts!
+	"""
+	Every category present in history, with its row count.
+
+	Counted with the search applied but *before* the category and status
+	filters, so this answers "how many rows would that facet show me" for
+	each one — including the facets the current selection is hiding. A
+	caller that built its facet list out of `items` instead would watch the
+	other categories vanish the moment one was picked.
+	"""
+	categoryCounts: [HistoryCategoryCount!]!
 }
 
 type HistoryPageCounts {
@@ -1361,6 +1383,15 @@ type MutationRoot {
 	deleteSchedule(id: String!): [Schedule!]!
 	toggleSchedule(id: String!, enabled: Boolean!): [Schedule!]!
 	createDirectory(path: String!, name: String!): DirectoryBrowseResult!
+	"""
+	Check for a new release now instead of waiting for the next scheduled
+	check, and return what it found.
+
+	Nothing is fetched while the release API has asked Weaver to back off,
+	or when checks are turned off; the returned status's `lastError` says
+	which.
+	"""
+	checkForUpdates: UpdateStatus!
 	"""
 	Install the release the checker is currently advertising.
 
