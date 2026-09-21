@@ -51,6 +51,28 @@
   stale while the bytes themselves are fine, so they no longer gate placement;
   the offset is still bounded by the NZB's own envelope, and the checksums
   above still decide what is kept.
+- **A part header that cannot say where it starts no longer fails the
+  article.** A missing, unreadable or zero `begin` is recorded as a defect and
+  the part is laid immediately after the part before it; if that part is not
+  placed yet, the article is asked for again, with a bound on how often.
+- **An article the NZB cannot bound is accepted.** An NZB that skips a segment
+  number, or understates a segment's byte count, made every later article of
+  the file look out of place, so every server's copy was refused and the rest
+  of the file abandoned. A placement now has to fit the NZB or the article's
+  own declared file size, under fixed per-article and per-file ceilings, and a
+  declared segment larger than the per-article ceiling raises it.
+- **An article that looks cut short is fetched again from another server.** A
+  missing trailer, or a length the headers disagree about, was accepted when
+  there was no checksum to fail it on. Those bytes are now written but not
+  counted as coverage until a verified copy, or one whose own length adds up,
+  settles it.
+- **A whole-file CRC32 no longer ends a job.** Posters that write a running
+  checksum, or zeros, on every part but the last made the parts disagree, and
+  that disagreement failed the job; the file now drops its whole-file
+  expectation instead. When every part verified and the parts cover the file
+  exactly, a mismatching whole-file value is treated as the wrong one.
+  Otherwise the file is marked incomplete and left to verification and repair
+  rather than failing the job.
 - **Damaged bytes are written without the file reading as complete.** The file
   is marked as needing verification, and repair decides its fate, instead of
   known-bad bytes passing as finished output.
@@ -96,7 +118,9 @@
   found beneath the button. It shares a lock with the scheduled check, so a
   click during a running check waits for that check instead of fetching twice,
   respects the release API's rate-limit backoff, and does nothing when checks
-  are turned off.
+  are turned off. A backoff the release API asks of a manual check also holds
+  back the scheduled one, and the result under the button keeps following the
+  checker afterwards instead of freezing on the answer to the click.
 - **The "Update available" notice opens the in-app installer.** Both the rail
   block and the classic sidebar notice used to open the GitHub release page,
   sending an installation that can upgrade itself off to download the release
