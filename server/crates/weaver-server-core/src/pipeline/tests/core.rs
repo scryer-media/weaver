@@ -883,19 +883,6 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
     drain_decode_results(&mut pipeline, 2).await;
 
     assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
-    wait_until(|| {
-        pipeline
-            .buffers
-            .available(crate::runtime::buffers::BufferTier::Medium)
-            == 1
-    })
-    .await;
-    assert_eq!(
-        pipeline
-            .buffers
-            .available(crate::runtime::buffers::BufferTier::Medium),
-        1
-    );
     assert!(
         pipeline
             .metrics
@@ -938,6 +925,22 @@ async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
         })
         .await;
     drain_decode_results(&mut pipeline, 1).await;
+
+    // Eviction can write an owned article while a pooled one remains buffered.
+    // Closing the gap is what releases every writer-owned pool slot.
+    wait_until(|| {
+        pipeline
+            .buffers
+            .available(crate::runtime::buffers::BufferTier::Medium)
+            == 1
+    })
+    .await;
+    assert_eq!(
+        pipeline
+            .buffers
+            .available(crate::runtime::buffers::BufferTier::Medium),
+        1
+    );
 
     assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
     assert_eq!(pipeline.write_buffered_bytes, 0);

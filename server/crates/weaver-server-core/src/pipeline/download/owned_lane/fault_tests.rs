@@ -277,3 +277,120 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
         "STAT settled the batch"
     );
 }
+
+/// A parking lane asks the allocator to release its idle memory, exactly once.
+///
+/// The lane thread allocates the article buffers that the decode and writer
+/// threads free, so with a per-thread-heap allocator the freed pages pile up
+/// on a lane that has gone idle. The release is the lane's own last act before
+/// it reports itself parked, and it must not fire more than once per park:
+/// doing it per article or per refill would put a full heap collection on the
+/// hot path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parking_lane_releases_its_idle_thread_memory_once() {
+    static RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_release() {
+        RELEASES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // The hook is process-wide and installed once, so this test owns it for
+    // the whole binary; each test runs in its own process.
+    crate::runtime::thread_release::install_idle_thread_release(count_release);
+    let before = RELEASES.load(Ordering::SeqCst);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = socket.into_split();
+        writer.write_all(b"200 fixture ready\r\n").await.unwrap();
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line == "CAPABILITIES" {
+                writer
+                    .write_all(b"101 Capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                    .await
+                    .unwrap();
+            } else if line.starts_with("GROUP ") {
+                writer
+                    .write_all(b"211 1 1 1 alt.binaries.test\r\n")
+                    .await
+                    .unwrap();
+            } else if line.starts_with("BODY ") {
+                writer.write_all(b"430 no such article\r\n").await.unwrap();
+            } else if line == "QUIT" {
+                writer.write_all(b"205 bye\r\n").await.unwrap();
+                break;
+            } else {
+                writer.write_all(b"500 unsupported\r\n").await.unwrap();
+            }
+        }
+    });
+    let nntp = Arc::new(weaver_nntp::NntpClient::new(
+        weaver_nntp::client::NntpClientConfig::single(
+            weaver_nntp::ServerConfig {
+                host: "127.0.0.1".into(),
+                port,
+                tls: false,
+                ..Default::default()
+            },
+            1,
+        ),
+    ));
+    let (event_tx, mut events) = mpsc::channel(16);
+    let (refill_tx, mut refills) = mpsc::channel(16);
+    let (parked_tx, mut parks) = mpsc::channel(16);
+    let client = Arc::clone(&nntp);
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut cached = None;
+        run_owned_blocking_download_lane(
+            &mut cached,
+            OwnedLaneRun {
+                nntp: client,
+                event_tx,
+                refill_tx,
+                parked_tx,
+                initial_lease: test_lease(JobId(42), 0, vec![], vec![tail_work(0, 0)]),
+            },
+            None,
+        );
+    });
+    async {
+        let park = loop {
+            tokio::select! {
+                Some(request) = refills.recv() => {
+                    // No successor: the lease is done and the lane parks.
+                    let _ = request.response_tx.send(DownloadLaneRefillResponse {
+                        lease: None,
+                        park_reason: LaneParkReason::NoWork,
+                    });
+                }
+                Some(event) = events.recv() => {
+                    let OwnedDownloadLaneEvent::BatchComplete { ack, .. } = event else {
+                        panic!("unexpected acquisition failure");
+                    };
+                    if let Some(ack) = ack {
+                        assert_eq!(
+                            RELEASES.load(Ordering::SeqCst),
+                            before,
+                            "the release happens after the closing batch event, not before it"
+                        );
+                        ack.send(()).unwrap();
+                    }
+                }
+                Some(park) = parks.recv() => break park,
+            }
+        };
+        assert_eq!(park.reason, LaneParkReason::NoWork);
+    }
+    .await;
+    worker.await.unwrap();
+    server.await.unwrap();
+
+    assert_eq!(
+        RELEASES.load(Ordering::SeqCst) - before,
+        1,
+        "one park, one release"
+    );
+}

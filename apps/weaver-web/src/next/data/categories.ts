@@ -35,9 +35,10 @@ export interface CategoryEntry {
    * Rows this facet would show on its own, counted before any facet is
    * applied, so the numbers beside the other rows do not move as you select.
    *
-   * Omitted where the client cannot count truthfully: history is paginated on
-   * the server, so the only number available is "how many on this page", which
-   * is not the answer to the question a number there appears to answer.
+   * Omitted only while there is nothing to count from yet. A paginated list
+   * must not count its own page — "how many on this page" is not the answer to
+   * the question a number beside a facet asks — so it passes `counts` from the
+   * server instead.
    */
   count?: number;
 }
@@ -51,24 +52,53 @@ export function facetKey(row: Categorised): string {
   return row.category || UNCATEGORISED;
 }
 
+/** Rows per facet key. */
+function tally(rows: readonly Categorised[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const key = facetKey(row);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * The server's `(category, count)` pairs as a facet tally.
+ *
+ * The daemon spells "no category" as the empty string, the same way it takes
+ * it back in a filter; the rail spells it [`UNCATEGORISED`].
+ */
+export function countsByFacet(
+  pairs: readonly { category: string; count: number }[],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const { category, count } of pairs) {
+    counts.set(category || UNCATEGORISED, count);
+  }
+  return counts;
+}
+
 export function categoryFacets({
   configured,
   rows,
+  counts: tallied,
   extras = [],
 }: {
   configured: readonly ConfiguredCategory[];
   /** Rows to count, or omitted where no honest count is available. */
   rows?: readonly Categorised[];
+  /**
+   * Counts from somewhere other than the rows on hand, keyed by facet.
+   *
+   * A paginated list cannot count itself — the page is not the set — so its
+   * counts come from the server instead, and every category the server knows
+   * about is a facet whether or not this page happens to show one of its rows.
+   */
+  counts?: ReadonlyMap<string, number>;
   /** Category names to keep reachable even when nothing configured matches. */
   extras?: readonly string[];
 }): CategoryEntry[] {
-  const counts = rows === undefined ? undefined : new Map<string, number>();
-  if (counts && rows) {
-    for (const row of rows) {
-      const key = facetKey(row);
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-  }
+  const counts = tallied ?? (rows === undefined ? undefined : tally(rows));
 
   const configuredNames = new Set(configured.map((category) => category.name));
   const straggling = new Set<string>();
@@ -78,7 +108,16 @@ export function categoryFacets({
     }
   }
 
-  const entries: CategoryEntry[] = [{ key: null, label: "All categories", count: rows?.length }];
+  const entries: CategoryEntry[] = [
+    {
+      key: null,
+      label: "All categories",
+      count:
+        counts === undefined
+          ? undefined
+          : [...counts.values()].reduce((total, count) => total + count, 0),
+    },
+  ];
   const push = (name: string) => {
     entries.push({
       key: name,

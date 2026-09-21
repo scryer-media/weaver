@@ -2910,9 +2910,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8afaed7813bc141a610a7b156db5f63d99ec934ac9fbef1d5bcd4f331e94ee80"
+checksum = "73366e9d30fdcbf16afd2713675b359392bd04fc5020d3a9e8432ce479eb58e7"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -3368,9 +3368,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.5"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b445da3fea594f4e84d9508ba7082858e141faf00fa4288c687bb8c5594351aa"
+checksum = "1f4e3071967f671f618584179c4cb020d3180b82cb96aebca2ec5b9a925be00a"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -3387,9 +3387,9 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.4.1"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fb5b98d15b2131ab7f04f17da856efc2cd80c0cd000db2966cf0e27da739835"
+checksum = "2b4c4c9fa61c1181081494ea208f56def0969a46b538a5e89e1cb360c7821708"
 dependencies = [
  "blake3",
  "crc-fast",
@@ -3924,9 +3924,9 @@ dependencies = [
 
 [[package]]
 name = "reedsolomon-rs"
-version = "0.4.6"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1310cc920830f59859b6deb471129a6b05d2842b88b02e301cf5f58d7dce61a"
+checksum = "1f5c9886f0fb33841060092d2552aa1893edd77fad64143d31660edc8b3ae19a"
 dependencies = [
  "memmap2",
  "rayon",
@@ -4555,23 +4555,24 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.24.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e980173990e8c03f88d465045ea7150214ffbbfc7366ed57a71d2218aa8dc11c"
+checksum = "feed8acbf51cad27d70bc705c608bf2bd7d3cf0c41f688f6604aaad3546b92d5"
 dependencies = [
  "aes",
  "aws-lc-rs",
  "brotli",
  "bzip2",
+ "cap-std",
  "cbc",
  "flate2",
  "getrandom 0.4.3",
  "js-sys",
  "lz4_flex",
- "lzma-rust2",
  "lzma-turbo",
  "ppmd-rust",
  "wasm-bindgen",
+ "zeroize",
  "zstd 0.14.0",
 ]
 
@@ -5168,6 +5169,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]
@@ -5896,7 +5917,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.13.1"
+version = "0.13.3"
 dependencies = [
  "application-updater",
  "async-graphql",
@@ -5931,6 +5952,8 @@ dependencies = [
  "sevenz-turbo",
  "tar",
  "tempfile",
+ "tikv-jemalloc-sys",
+ "tikv-jemallocator",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
@@ -5954,14 +5977,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.13.1"
+version = "0.13.3"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.13.1"
+version = "0.13.3"
 dependencies = [
  "bytes",
  "criterion",
@@ -5989,7 +6012,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.13.1"
+version = "0.13.3"
 dependencies = [
  "quick-xml",
  "serde",
@@ -6000,7 +6023,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.13.1"
+version = "0.13.3"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6031,7 +6054,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.13.1"
+version = "0.13.3"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6105,7 +6128,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.13.1"
+version = "0.13.3"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6124,7 +6147,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.13.1"
+version = "0.13.3"
 dependencies = [
  "cc",
  "crc-fast",

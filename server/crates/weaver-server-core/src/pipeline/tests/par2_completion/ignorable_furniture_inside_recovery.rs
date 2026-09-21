@@ -3149,6 +3149,34 @@ async fn a_split_part_short_of_articles_does_not_fail_a_rejoined_job() {
     };
     posting.install(&mut pipeline, job_id).await;
 
+    let damaged_part = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    pipeline.decode_retries.insert(
+        SegmentId {
+            file_id: damaged_part,
+            segment_number: 1,
+        },
+        MAX_SEGMENT_RETRIES,
+    );
+    crate::pipeline::tests::yenc_compatibility::deliver(
+        &mut pipeline,
+        damaged_part,
+        1,
+        32,
+        &[0xee; 32],
+        false,
+    )
+    .await;
+    assert!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(damaged_part)
+            .unwrap()
+            .has_retained_damage()
+    );
+
     pipeline.check_job_completion(job_id).await;
     // Same detached verdict: the join is only vouched for once the analysis
     // message lands back on the pipeline task.
@@ -3186,6 +3214,13 @@ async fn a_split_part_short_of_articles_does_not_fail_a_rejoined_job() {
             .unwrap(),
         joined,
         "the delivered join must be the repaired bytes"
+    );
+    let names = delivered_entry_names(&delivered);
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with("Ivory.Meadow.mkv.")),
+        "damaged split inputs consumed by repair must not be delivered: {names:?}"
     );
 }
 

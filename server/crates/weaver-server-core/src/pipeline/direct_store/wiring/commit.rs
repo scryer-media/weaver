@@ -746,6 +746,7 @@ impl Pipeline {
         // `unverified_segments` naming articles a whole-file CRC recovery would
         // try to replace by rewriting a file that is not there.
         let expected_file_crc = self.expected_file_crcs.remove(&file_id);
+        self.untrusted_file_crcs.remove(&file_id);
         self.pending_file_progress.remove(&file_id);
         self.persisted_file_progress.remove(&file_id);
         self.file_hash_reread_required.remove(&file_id);

@@ -636,7 +636,6 @@ pub(super) enum DownloadError {
     Decode {
         raw_size: u64,
         error: String,
-        crc_mismatch: bool,
     },
 }
 
@@ -1443,6 +1442,39 @@ pub(super) fn crc_not_mismatched(status: weaver_yenc::CrcVerification) -> bool {
     status != weaver_yenc::CrcVerification::Mismatch
 }
 
+/// Whether an article that could not be checked also carries evidence that its
+/// body was cut short.
+///
+/// An unverifiable article is ordinarily accepted: absent a checksum there is
+/// nothing to fail it on. But a missing `=yend` — or a length the headers
+/// themselves disagree about — is evidence the response ended early, and
+/// silently accepting those bytes writes a hole into the file that no later
+/// stage can see. Such an article is worth asking another server for.
+///
+/// A verified checksum always wins: it proves the bytes whatever the size
+/// fields say. A mismatch keeps its own handling.
+pub(super) fn yenc_truncation_suspected(result: &weaver_yenc::DecodeResult) -> bool {
+    if result.crc_status != weaver_yenc::CrcVerification::Unverified {
+        return false;
+    }
+    let defects = result.defects;
+    // The codec treats any article carrying a part or a begin as multipart,
+    // and only fills in the size defect that matches that reading.
+    let multipart = result.metadata.part.is_some() || result.metadata.begin.is_some();
+    let multipart_length_confirmed = result.metadata.begin.is_some()
+        && result.metadata.end.is_some()
+        && !defects.ypart_size_mismatch;
+    let single_part_length_confirmed = !multipart
+        && !defects.missing_size
+        && !defects.invalid_size
+        && !defects.ybegin_size_mismatch;
+    let length_confirmed = multipart_length_confirmed || single_part_length_confirmed;
+    defects.ypart_size_mismatch
+        || defects.yend_size_mismatch
+        || defects.ybegin_size_mismatch
+        || (!result.has_trailer && !length_confirmed)
+}
+
 /// How a segment was encoded on the wire, and therefore what evidence it
 /// carries into the pipeline.
 ///
@@ -1651,6 +1683,10 @@ pub(super) struct DecodeResult {
     pub(super) encoding: SegmentEncoding,
     pub(super) yenc_layout: YencLayoutAssertions,
     pub(super) crc_valid: bool,
+    /// Evidence the body was cut short, with no checksum to say so. Such an
+    /// article is written but never counted as coverage: another server is
+    /// asked for it first. See [`yenc_truncation_suspected`].
+    pub(super) truncation_suspected: bool,
     pub(super) part_crc_verified: bool,
     pub(super) part_crc: u32,
     pub(super) expected_file_crc: Option<u32>,
@@ -1866,8 +1902,16 @@ impl Default for CompletedFileChecksumState {
 
 pub(super) enum DecodedChunk {
     Contiguous(Box<[u8]>),
-    Batches { chunks: Vec<Box<[u8]>>, len: usize },
+    Batches {
+        chunks: Vec<Box<[u8]>>,
+        len: usize,
+    },
     Shared(Arc<download::repeated::SharedArticle>),
+    /// Decoded straight into a pool slot and carried to the writer as-is, so
+    /// the article never needs a second heap allocation for its decoded
+    /// bytes. Dropping it returns the slot to the pool instead of freeing on
+    /// whichever thread finished with it.
+    Pooled(BufferHandle),
 }
 
 impl DecodedChunk {
@@ -1876,6 +1920,7 @@ impl DecodedChunk {
             Self::Contiguous(bytes) => bytes.len(),
             Self::Batches { len, .. } => *len,
             Self::Shared(body) => body.data.len_bytes(),
+            Self::Pooled(buffer) => buffer.len(),
         }
     }
 
@@ -1885,6 +1930,7 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => f(bytes),
+            Self::Pooled(buffer) => f(buffer.as_slice()),
             Self::Shared(body) => body.data.for_each_slice(f),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
@@ -1900,6 +1946,7 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => writer.write_all(bytes),
+            Self::Pooled(buffer) => writer.write_all(buffer.as_slice()),
             Self::Shared(body) => body.data.write_to(writer),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
@@ -1915,6 +1962,7 @@ impl DecodedChunk {
     pub(super) fn push_io_slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
         match self {
             Self::Contiguous(bytes) => out.push(std::io::IoSlice::new(bytes)),
+            Self::Pooled(buffer) => out.push(std::io::IoSlice::new(buffer.as_slice())),
             Self::Shared(body) => body.data.push_io_slices(out),
             Self::Batches { chunks, .. } => {
                 out.extend(chunks.iter().map(|chunk| std::io::IoSlice::new(chunk)));
@@ -1953,8 +2001,25 @@ impl From<Vec<Box<[u8]>>> for DecodedChunk {
     }
 }
 
+pub(super) struct RetainedArticleDamage {
+    pub(super) source: SegmentSource,
+    pub(super) status: weaver_yenc::CrcVerification,
+    /// Retained because the body looks cut short rather than because a
+    /// checksum failed. The two want different words in the log.
+    pub(super) truncation_suspected: bool,
+    /// The end the article's own header declared for its range, when it
+    /// declared a usable one. Carried so the record survives a demotion reset
+    /// that re-notes this damage at the durable handoff.
+    pub(super) declared_end: Option<u64>,
+    /// Payload-relative spans, resolved against live ownership at disk handoff.
+    pub(super) write_spans: Vec<std::ops::Range<usize>>,
+}
+
 pub(super) struct BufferedDecodedSegment {
     pub(super) segment_id: SegmentId,
+    /// Unresolved damage is written before retrying. Retain the actual CRC
+    /// status so a missing checksum is never reported as a mismatch.
+    pub(super) damaged_source: Option<Box<RetainedArticleDamage>>,
     pub(super) decoded_size: u32,
     /// Carried from the decoder so the durability seam can tell whether this
     /// segment is allowed to feed the dual-CRC grid.
@@ -1975,6 +2040,9 @@ pub(super) struct BufferedDecodedSegment {
 impl BufferedChunk for BufferedDecodedSegment {
     fn len_bytes(&self) -> usize {
         self.data.len_bytes()
+    }
+    fn contributes_to_coverage(&self) -> bool {
+        self.damaged_source.is_none()
     }
 }
 
@@ -2097,9 +2165,6 @@ pub(in crate::pipeline) enum SegmentTerminalState {
     RetriesExhausted,
     /// Bodies arrived but no attempt decoded into the declared placement.
     DecodeExhausted,
-    /// Retired without a wire outcome: the servers are serving a different
-    /// file under these message ids, so the declared bytes cannot arrive.
-    ForeignLayout,
 }
 
 /// What the settlement concluded a delivered job actually delivered.
@@ -2117,48 +2182,6 @@ pub(in crate::pipeline) struct TerminalReconciliation {
     pub(in crate::pipeline) health: u32,
     /// Files that left the accounting, and why.
     pub(in crate::pipeline) discards: Vec<crate::jobs::model::TerminalDiscard>,
-}
-
-/// The layout a refused article says its bytes belong to.
-///
-/// Two fields, and only the first is evidence. `=ypart total=` is part
-/// geometry — the NZB is authoritative for a file's part count, so an article
-/// that names a different one is describing a different file. `=ybegin size=`
-/// is a header real posters misstate all the time, so it corroborates a
-/// geometry disagreement and never triggers one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::pipeline) struct ForeignYencGeometry {
-    pub(in crate::pipeline) served_total: Option<u32>,
-    pub(in crate::pipeline) served_file_size: u64,
-}
-
-/// Per-file evidence that the servers hold a different file under this file's
-/// message ids.
-///
-/// One consistent foreign geometry across many distinct segments is not
-/// damage: a corrupt article disagrees with the declared layout in a way that
-/// varies article by article, while a message-id collision with a repost
-/// disagrees the *same* way every time, because every article really does
-/// belong to one other, coherent file. Varying geometries therefore keep the
-/// file fetching; agreeing ones retire it.
-#[derive(Debug)]
-pub(in crate::pipeline) struct ForeignLayoutWatch {
-    /// The geometry the current run of refusals agrees on. Replaced — and the
-    /// segment run restarted — the moment a refusal disagrees with it.
-    pub(in crate::pipeline) geometry: ForeignYencGeometry,
-    /// Distinct segment ordinals that refused with `geometry`.
-    pub(in crate::pipeline) segments: HashSet<u32>,
-    /// At least one refusal in the current run disagreed on *part* geometry
-    /// rather than only on the `=ybegin size=` header. Real posts misstate that
-    /// header, so a run made purely of size disagreements corroborates nothing
-    /// and must never retire a file on its own.
-    pub(in crate::pipeline) geometry_disagreed: bool,
-    /// A segment of this file decoded into the declared layout. Permanent:
-    /// the declared file demonstrably exists on the wire, so no amount of
-    /// later foreign evidence may retire it.
-    pub(in crate::pipeline) disarmed: bool,
-    /// The breaker already fired for this file.
-    pub(in crate::pipeline) tripped: bool,
 }
 
 /// The pipeline engine. Owns the scheduler loop and drives work through
@@ -2261,15 +2284,6 @@ pub struct Pipeline {
     /// The one terminal state each segment reached, and the only thing the
     /// per-job failed-byte ledger is derived from.
     pub(in crate::pipeline) segment_terminal_states: HashMap<SegmentId, SegmentTerminalState>,
-    /// Per-file watch on articles that decode against a layout the NZB never
-    /// declared. Empty for every ordinary job: an entry appears only once a
-    /// file has refused an article on part geometry.
-    pub(in crate::pipeline) foreign_layout_watches: HashMap<NzbFileId, ForeignLayoutWatch>,
-    /// Stands in for the `WEAVER_FOREIGN_LAYOUT_BREAKER` escape hatch, which is
-    /// read once per process and so cannot be exercised both ways in one test
-    /// binary.
-    #[cfg(test)]
-    pub(in crate::pipeline) foreign_layout_breaker_override: Option<bool>,
     /// What the claim census concluded for a job on its way out, keyed until
     /// the terminal record has been written from it.
     pub(in crate::pipeline) terminal_reconciliations: HashMap<JobId, TerminalReconciliation>,
@@ -2305,6 +2319,10 @@ pub struct Pipeline {
     pub(super) deferred_file_hash_ranges: HashMap<NzbFileId, BTreeMap<u64, DeferredFileHashRange>>,
     /// Expected whole-file yEnc CRC32 values observed from multipart `=yend crc32`.
     pub(super) expected_file_crcs: HashMap<NzbFileId, u32>,
+    /// Files whose parts disagreed about the whole-file CRC32. Some posters
+    /// write a running value, or zeros, on every part but the last, so the
+    /// field proves nothing for those files and every later value is ignored.
+    pub(super) untrusted_file_crcs: HashSet<NzbFileId>,
     /// Files that need a one-time disk reread because out-of-order persistence broke the stream.
     pub(super) file_hash_reread_required: HashSet<NzbFileId>,
     #[cfg(test)]
@@ -2713,6 +2731,22 @@ pub struct Pipeline {
     /// restarts whenever the cursor has moved, because a displacement behind a
     /// moving cursor is progress, not a cycle.
     pub(super) uu_park_requeues: HashMap<SegmentId, (u32, u32)>,
+    /// Articles that declared no usable start and arrived before the ordinal
+    /// they follow, held decoded until that ordinal is placed. Their bytes are
+    /// charged to the write-buffer ledger while they wait.
+    pub(super) unanchored_parked: HashMap<NzbFileId, BTreeMap<u32, (DecodeResult, SegmentSource)>>,
+    /// How often each article that declared no usable start has been sent back
+    /// for the ordinal before it because the park above had no room for it,
+    /// paired with how many ordinals of its file were placed when that count
+    /// was taken. Like the park counter above, a livelock bound and never a
+    /// retry budget: the bytes are not at fault, and the count restarts
+    /// whenever the file has placed another part.
+    pub(super) unanchored_requeues: HashMap<SegmentId, (u32, usize)>,
+    /// Ordinals that reached a terminal state while their damaged bytes stayed
+    /// on disk, and that something parked above is waiting to start after.
+    /// Booking a terminal state cannot write a part, so the release runs at the
+    /// next seam that can.
+    pub(super) pending_unanchored_release: Vec<SegmentId>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.

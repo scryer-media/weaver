@@ -99,27 +99,29 @@ pub fn apply_ypart_line(line: &[u8], metadata: &mut YencMetadata) -> Result<(), 
             fields.end = Some(value);
         }
     });
-    let begin = required_u64_field(fields.begin, "begin")?;
-    let end = required_u64_field(fields.end, "end")?;
-
-    // `end < begin` would make the part length negative; there is no sane
-    // recovery, so it stays a hard error (and keeps the length arithmetic from
-    // ever underflowing).
-    if end < begin {
-        return Err(YencError::InvalidHeader {
-            field: "end".to_string(),
-            reason: format!("end ({end}) < begin ({begin})"),
-        });
-    }
-    // Tolerate posters that declare `end > size`. The part
-    // length (end - begin + 1) is still authoritative and still verified
-    // against the decoded byte count, so record the inconsistency and continue.
-    if end > metadata.size {
+    // A begin that is absent, unparseable or zero is not grounds to abandon an
+    // article that decodes perfectly: it only means this header cannot place
+    // the bytes. The caller places them from the order the parts were listed
+    // in instead.
+    let Some(begin) = tolerant_u64(fields.begin).0.filter(|begin| *begin > 0) else {
+        metadata.defects.invalid_ypart_begin = true;
+        metadata.begin = None;
+        metadata.end = None;
+        return Ok(());
+    };
+    // Only begin determines placement. A stale end cannot invalidate useful
+    // bytes, and must never enter unchecked length or allocation arithmetic.
+    let end = tolerant_u64(fields.end).0.filter(|end| *end >= begin);
+    metadata.defects.invalid_ypart_end = end.is_none();
+    if !metadata.defects.missing_size
+        && !metadata.defects.invalid_size
+        && end.is_some_and(|end| end > metadata.size)
+    {
         metadata.defects.ypart_end_exceeds_size = true;
     }
 
     metadata.begin = Some(begin);
-    metadata.end = Some(end);
+    metadata.end = end;
     Ok(())
 }
 
@@ -211,12 +213,7 @@ pub struct ParsedHeaders {
 ///
 /// The keyword must be followed by ASCII whitespace or end-of-line, so junk
 /// lines that merely share a prefix (`=yb`, `=ybegin_notes`) never match.
-fn find_line_start(input: &[u8], keyword: &[u8]) -> Option<usize> {
-    find_line_start_within(input, keyword, usize::MAX)
-}
-
-/// [`find_line_start`], giving up once a candidate line would start past
-/// `max_start`.
+/// Give up once a candidate line would start past `max_start`.
 ///
 /// The bound matters for `=ybegin`: the streaming and fused decoders both stop
 /// scanning after [`crate::decode::MAX_HEADER_SCAN_BYTES`] of leading junk, and
@@ -416,14 +413,6 @@ fn visit_fields<'a>(line: &'a [u8], mut visit: impl FnMut(&[u8], &'a [u8])) {
     }
 }
 
-fn required_field<'a>(field: Option<&'a [u8]>, label: &str) -> Result<&'a [u8], YencError> {
-    field.ok_or_else(|| YencError::MissingField(label.to_string()))
-}
-
-fn required_u64_field(field: Option<&[u8]>, label: &str) -> Result<u64, YencError> {
-    parse_u64_bytes(required_field(field, label)?, label)
-}
-
 /// Parse an unsigned decimal field value. Zero-alloc and overflow-checked:
 /// `None` for empty, non-digit, or wider-than-`u64` input.
 ///
@@ -446,15 +435,6 @@ fn parse_u64_opt(value: &[u8]) -> Option<u64> {
     }
 
     Some(parsed)
-}
-
-/// `parse_u64_opt` with a labelled error, for the two `=ypart` fields that are
-/// still genuinely required.
-fn parse_u64_bytes(value: &[u8], label: &str) -> Result<u64, YencError> {
-    parse_u64_opt(value).ok_or_else(|| YencError::InvalidHeader {
-        field: label.to_string(),
-        reason: format!("invalid integer: {}", bytes_to_string(value.trim_ascii())),
-    })
 }
 
 /// Parse a `crc32=`/`pcrc32=` hex value, zero-alloc and overflow-checked.
@@ -534,11 +514,17 @@ pub fn parse_headers_with_options(
     let mut metadata = parse_ybegin_line(&input[ybegin_start..ybegin_line_end])?;
     metadata.defects.junk_before_ybegin = ybegin_start > 0;
 
-    // If multi-part, parse =ypart.
-    let data_start = if metadata.part.is_some() {
-        let ypart_start = find_line_start(&input[after_ybegin..], b"=ypart")
-            .map(|off| off + after_ybegin)
-            .ok_or(YencError::MissingField("=ypart".to_string()))?;
+    // A usable =ypart identifies multipart data even if part= was absent or
+    // malformed. Without part=, only recognize it before any payload bytes.
+    let optional_part = is_control_line(&input[after_ybegin..], b"=ypart");
+    let data_start = if metadata.part.is_some() || optional_part {
+        let ypart_start = find_line_start_within(
+            &input[after_ybegin..],
+            b"=ypart",
+            crate::decode::MAX_HEADER_SCAN_BYTES,
+        )
+        .map(|off| off + after_ybegin)
+        .ok_or(YencError::MissingField("=ypart".to_string()))?;
         let (ypart_line_end, after_ypart) = line_end(input, ypart_start);
 
         apply_ypart_line(&input[ypart_start..ypart_line_end], &mut metadata)?;
@@ -670,17 +656,16 @@ mod tests {
         assert!(!metadata.defects.any());
     }
 
-    /// `end < begin` stays a hard error: the part length would be negative, and
-    /// weaver's assembler places bytes by `begin`, so guessing would write a
-    /// corrupt file rather than fail an article.
+    /// A reversed end does not change placement by a valid begin.
     #[test]
-    fn apply_ypart_line_still_rejects_end_before_begin() {
+    fn apply_ypart_line_records_end_before_begin() {
         let mut metadata =
             parse_ybegin_line(b"=ybegin part=1 total=2 line=128 size=4096 name=test.bin\r\n")
                 .unwrap();
-        let err = apply_ypart_line(b"=ypart begin=100 end=50\r\n", &mut metadata).unwrap_err();
-
-        assert!(matches!(err, YencError::InvalidHeader { field, .. } if field == "end"));
+        apply_ypart_line(b"=ypart begin=100 end=50\r\n", &mut metadata).unwrap();
+        assert_eq!(metadata.begin, Some(100));
+        assert_eq!(metadata.end, None);
+        assert!(metadata.defects.invalid_ypart_end);
     }
 
     #[test]
@@ -1108,8 +1093,10 @@ mod tests {
                        =ypart begin=1000 end=500\r\n\
                        data\r\n\
                        =yend size=500\r\n";
-        let result = parse_headers(input);
-        assert!(matches!(result, Err(YencError::InvalidHeader { .. })));
+        let result = parse_headers(input).unwrap();
+        assert_eq!(result.metadata.begin, Some(1000));
+        assert_eq!(result.metadata.end, None);
+        assert!(result.metadata.defects.invalid_ypart_end);
     }
 
     #[test]

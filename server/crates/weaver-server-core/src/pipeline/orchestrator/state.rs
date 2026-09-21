@@ -191,14 +191,16 @@ impl Pipeline {
     }
 
     pub(crate) fn clear_job_write_backlog(&mut self, job_id: JobId) {
-        // Both maps, not just the write buffers: a completed uuencode file
+        // Every map, not just the write buffers: a completed uuencode file
         // keeps a tombstone entry in `uu_files` after its write buffer is gone
         // (it is what suppresses the restart checkpoint), and teardown is where
-        // that entry is finally dropped.
+        // that entry is finally dropped. A file can also hold nothing but
+        // parked articles still waiting for the part before them.
         let file_ids: std::collections::HashSet<NzbFileId> = self
             .write_buffers
             .keys()
             .chain(self.uu_files.keys())
+            .chain(self.unanchored_parked.keys())
             .copied()
             .filter(|file_id| file_id.job_id == job_id)
             .collect();
@@ -224,6 +226,17 @@ impl Pipeline {
             }
             self.uu_park_requeues
                 .retain(|segment_id, _| segment_id.file_id != file_id);
+            self.unanchored_requeues
+                .retain(|segment_id, _| segment_id.file_id != file_id);
+            self.pending_unanchored_release
+                .retain(|segment_id| segment_id.file_id != file_id);
+            if let Some(parked) = self.unanchored_parked.remove(&file_id) {
+                released_bytes += parked
+                    .values()
+                    .map(|(result, _)| result.data.len_bytes())
+                    .sum::<usize>();
+                released_segments += parked.len();
+            }
             self.file_prefix_16k.remove(&file_id);
             self.par3_inside_probes.remove(file_id);
             self.file_declared_size.remove(&file_id);

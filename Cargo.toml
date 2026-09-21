@@ -14,7 +14,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.13.1"
+version = "0.13.3"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -76,8 +76,8 @@ filetime = { version = "0.2.29", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 zstd = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-sevenz-turbo = { version = "0.24.0", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
-lzma-turbo = { version = "0.4.0", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
+sevenz-turbo = { version = "0.25.0", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
+lzma-turbo = { version = "0.5.0", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd", "socks"] }
 semver = { version = "1.0", default-features = false, features = ["serde", "std"] }
 httpdate = { version = "1.0", default-features = false }
@@ -114,13 +114,19 @@ windows-sys = { version = "0.61", default-features = false }
 #
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
-par2-rs = { version = "0.10.5", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "0.10.6", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
 # contention, so the caller parked waiting for memory nobody else held. It now
 # reports the ceiling it exceeded, which weaver settles as a terminal refusal.
-par3-rs = { version = "0.4.1", default-features = false }
+# 0.4.2 changes how an interleaved set's recovery carriers are cut and named —
+# by row rather than by global recovery index — and refuses a creation range
+# that names a partial row. Both land on the creation API, which weaver does
+# not use: it verifies and repairs sets other producers wrote.
+# 0.4.3 adds an opt-in `wasm-simd` feature for wasm builds. Weaver is native
+# and does not forward it.
+par3-rs = { version = "0.4.3", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x

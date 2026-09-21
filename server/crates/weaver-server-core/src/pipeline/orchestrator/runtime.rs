@@ -232,9 +232,6 @@ impl Pipeline {
             transport_failure_streaks: HashMap::new(),
             download_wait_by_job: HashMap::new(),
             segment_terminal_states: HashMap::new(),
-            foreign_layout_watches: HashMap::new(),
-            #[cfg(test)]
-            foreign_layout_breaker_override: None,
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),
@@ -262,6 +259,7 @@ impl Pipeline {
             deferred_file_hash_data_bytes: 0,
             deferred_file_hash_ranges: HashMap::new(),
             expected_file_crcs: HashMap::new(),
+            untrusted_file_crcs: HashSet::new(),
             file_hash_reread_required: HashSet::new(),
             #[cfg(test)]
             try_update_archive_topology_calls: 0,
@@ -396,6 +394,9 @@ impl Pipeline {
             file_declared_size: HashMap::new(),
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
+            unanchored_parked: HashMap::new(),
+            unanchored_requeues: HashMap::new(),
+            pending_unanchored_release: Vec::new(),
             par2_runtime: HashMap::new(),
             par3_runtime: None,
             par3_inside_probes: Default::default(),
@@ -650,6 +651,14 @@ impl Pipeline {
         if self.uu_files.contains_key(&file_id) {
             return;
         }
+        let contiguous_bytes_written = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .and_then(|file| file.retained_damage_floor())
+            .map_or(contiguous_bytes_written, |floor| {
+                contiguous_bytes_written.min(floor)
+            });
         let current = self
             .pending_file_progress
             .get(&file_id)
@@ -735,6 +744,8 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.expected_file_crcs
             .retain(|file_id, _| file_id.job_id != job_id);
+        self.untrusted_file_crcs
+            .retain(|file_id| file_id.job_id != job_id);
         self.file_hash_reread_required
             .retain(|file_id| file_id.job_id != job_id);
         self.unverified_segments
@@ -874,6 +885,16 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             self.pump_decode_queue();
+
+            // An ordinal can be retired from outside the result handlers — a
+            // server removed, work no lane may seat — and a part parked behind
+            // its damaged bytes must be written before completion is weighed,
+            // or the job would be judged with that part neither placed nor
+            // given up.
+            if !self.pending_unanchored_release.is_empty() {
+                self.release_settled_unanchored_runs().await;
+                self.pump_decode_queue();
+            }
 
             let pending_completion_checks = self.pending_completion_checks.len();
             for _ in 0..pending_completion_checks {
@@ -1144,8 +1165,31 @@ impl Pipeline {
     fn refresh_periodic_snapshot(&mut self) {
         self.checkpoint_server_attribution_if_due();
         self.sample_phase_progress();
+        self.publish_download_footprint_metrics();
         self.shared_state.refresh_metrics_snapshot();
         self.flush_pending_snapshot();
+    }
+
+    /// Publish the download side's memory footprint.
+    ///
+    /// Both readings are walks — the dispatch reservations for the bytes, the
+    /// job order for the ranking — so they are taken on the snapshot tick and
+    /// never on an article path. The reservation map is the authoritative
+    /// record of articles handed to a lane and not yet reconciled, which is
+    /// exactly the raw bytes the lanes are holding.
+    fn publish_download_footprint_metrics(&self) {
+        self.metrics.download_lane_inflight_bytes.store(
+            self.rate_limit_reservations.values().sum::<u64>(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let eligible = self.download_scheduler_eligible_jobs().len();
+        self.metrics
+            .download_jobs_eligible
+            .store(eligible, std::sync::atomic::Ordering::Relaxed);
+        self.metrics.download_jobs_hot.store(
+            usize::from(eligible > 0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// The pause demand, at the command seam.
@@ -2101,6 +2145,39 @@ fn write_segments_to_disk_blocking(
     result
 }
 
+fn write_damaged_segment(
+    file: &mut std::fs::File,
+    offset: u64,
+    data: &DecodedChunk,
+    spans: &[std::ops::Range<usize>],
+) -> std::io::Result<()> {
+    use std::io::Seek;
+    let mut chunks = Vec::new();
+    data.push_io_slices(&mut chunks);
+    let mut slices = Vec::new();
+    for span in spans {
+        slices.clear();
+        let mut chunk_start = 0;
+        for chunk in &chunks {
+            let chunk_end = chunk_start + chunk.len();
+            let start = span.start.max(chunk_start);
+            let end = span.end.min(chunk_end);
+            if start < end {
+                slices.push(std::io::IoSlice::new(
+                    &chunk[start - chunk_start..end - chunk_start],
+                ));
+            }
+            chunk_start = chunk_end;
+            if chunk_start >= span.end {
+                break;
+            }
+        }
+        file.seek(std::io::SeekFrom::Start(offset + span.start as u64))?;
+        write_all_vectored(file, &mut slices).map_err(|(error, _)| error)?;
+    }
+    Ok(())
+}
+
 fn write_segments_into_file(
     file: &mut std::fs::File,
     mut segments: Vec<(u64, BufferedDecodedSegment)>,
@@ -2117,11 +2194,25 @@ fn write_segments_into_file(
         if completed == segments.len() {
             return Ok(segments);
         }
+        if let Some(damage) = segments[completed].1.damaged_source.as_ref() {
+            let (offset, segment) = &segments[completed];
+            if let Err(error) =
+                write_damaged_segment(file, *offset, &segment.data, &damage.write_spans)
+            {
+                break error;
+            }
+            completed += 1;
+            next_file_offset = None;
+            continue;
+        }
         let run_start = completed;
         let run_offset = segments[run_start].0;
         let mut run_end = run_start;
         let mut run_len = 0u64;
-        while run_end < segments.len() && segments[run_end].0 == run_offset + run_len {
+        while run_end < segments.len()
+            && segments[run_end].0 == run_offset + run_len
+            && segments[run_end].1.damaged_source.is_none()
+        {
             run_len += segments[run_end].1.data.len_bytes() as u64;
             run_end += 1;
         }
@@ -2422,8 +2513,27 @@ mod disk_write_handle_cache_tests {
     use super::*;
     use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 
+    #[test]
+    fn masked_damage_writes_only_permitted_spans_and_propagates_io_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("masked.bin");
+        std::fs::write(&path, b"........").unwrap();
+        let data = DecodedChunk::from(vec![
+            b"abc".to_vec().into_boxed_slice(),
+            b"defgh".to_vec().into_boxed_slice(),
+        ]);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        write_damaged_segment(&mut file, 0, &data, &[1..4, 6..8]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b".bcd..gh");
+        let mut read_only = std::fs::File::open(&path).unwrap();
+        write_damaged_segment(&mut read_only, 0, &data, &[]).unwrap();
+        assert!(write_damaged_segment(&mut read_only, 0, &data, &[0..2, 4..6]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b".bcd..gh");
+    }
+
     fn segment(bytes: &[u8]) -> BufferedDecodedSegment {
         BufferedDecodedSegment {
+            damaged_source: None,
             encoding: SegmentEncoding::Yenc,
             segment_id: SegmentId {
                 file_id: NzbFileId {

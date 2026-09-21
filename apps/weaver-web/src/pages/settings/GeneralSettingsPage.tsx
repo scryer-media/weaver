@@ -30,6 +30,7 @@ import {
   type DuplicateAction,
   type DuplicatePolicy,
 } from "@/features/duplicates/duplicate-policy";
+import { useUpdateCheck } from "@/features/updates/use-update-check";
 
 const MAX_SPEED = 10 * 1024 * 1024 * 1024;
 
@@ -318,6 +319,8 @@ export function GeneralSettingsPage() {
         </Select>
       </SectionCard>
 
+      <UpdateCheckCard />
+
       <SectionCard title={t("settings.speedLimit")} description={t("settings.speedLimitDesc")}>
         <div className="space-y-5">
           <SettingsInnerBox>
@@ -532,5 +535,26 @@ function SettingField({
       )}
       <p className="mt-2 text-[12.5px] text-muted-foreground">{description}</p>
     </div>
+  );
+}
+
+/** A button that asks the release checker to look now, and what it last found. */
+function UpdateCheckCard() {
+  const t = useTranslate();
+  const { busy, summary, failed, check } = useUpdateCheck();
+  return (
+    <SectionCard
+      title={t("next.general.checkForUpdates")}
+      description={t("next.general.checkForUpdatesHelp")}
+    >
+      <div className="flex flex-col items-start gap-2">
+        <Button variant="outline" onClick={check} disabled={busy}>
+          {t("next.general.checkNow")}
+        </Button>
+        <span role="status" className={failed ? "text-sm text-destructive" : "text-sm text-muted-foreground"}>
+          {summary}
+        </span>
+      </div>
+    </SectionCard>
   );
 }

@@ -452,7 +452,6 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
             data: Err(DownloadError::Decode {
                 raw_size: 19,
                 error: "missing =ybegin header".to_string(),
-                crc_mismatch: false,
             }),
             attempts: Vec::new(),
             lane_observation: None,
@@ -513,6 +512,7 @@ async fn queued_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 crc_valid: true,
                 part_crc_verified: true,
                 part_crc: par2_rs::checksum::crc32(b"data"),
+                truncation_suspected: false,
                 expected_file_crc: None,
                 data: DecodedChunk::from(b"data".to_vec()),
                 yenc_name: filename.to_string(),
@@ -584,8 +584,10 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 encoding: SegmentEncoding::Yenc,
                 segment_id,
                 raw_size: 8,
+                // No declared size of its own, so nothing can justify a range
+                // that runs past every envelope the job knows.
                 yenc_layout: YencLayoutAssertions {
-                    file_size: 5,
+                    file_size: 0,
                     part: None,
                     total: None,
                     begin: None,
@@ -593,9 +595,10 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
                 },
                 crc_valid: true,
                 part_crc_verified: true,
-                part_crc: par2_rs::checksum::crc32(b"data"),
+                part_crc: par2_rs::checksum::crc32(b"data!"),
+                truncation_suspected: false,
                 expected_file_crc: None,
-                data: DecodedChunk::from(b"data".to_vec()),
+                data: DecodedChunk::from(b"data!".to_vec()),
                 yenc_name: filename.to_string(),
                 checkpoint_plan: weaver_yenc::CheckpointPlan::None,
                 segments: Vec::new(),
@@ -926,6 +929,7 @@ async fn fail_job_clears_write_backlog_accounting() {
         file_index: 0,
     };
     let buffered = BufferedDecodedSegment {
+        damaged_source: None,
         encoding: SegmentEncoding::Yenc,
         segment_id: SegmentId {
             file_id,
@@ -1340,6 +1344,7 @@ async fn disk_write_failure_fails_job_before_commit() {
                 crc_valid: true,
                 part_crc_verified: true,
                 part_crc: par2_rs::checksum::crc32(b"fail"),
+                truncation_suspected: false,
                 expected_file_crc: None,
                 segments: Vec::new(),
                 data: DecodedChunk::from(b"fail".to_vec()),
@@ -1805,6 +1810,7 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
                 crc_valid: true,
                 part_crc_verified: true,
                 part_crc: par2_rs::checksum::crc32(payload),
+                truncation_suspected: false,
                 expected_file_crc: Some(par2_rs::checksum::crc32(payload)),
                 segments: Vec::new(),
                 data: DecodedChunk::from(payload.to_vec()),
@@ -1922,7 +1928,7 @@ async fn completing_file_removes_only_its_unverified_provenance_bucket() {
 }
 
 #[tokio::test]
-async fn completed_file_crc32_mismatch_fails_before_persisting_completion() {
+async fn completed_file_crc32_mismatch_yields_to_parts_that_all_verified() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20018);
@@ -1949,22 +1955,18 @@ async fn completed_file_crc32_mismatch_fails_before_persisting_completion() {
     )
     .await;
 
-    let status = job_status_for_assert(&pipeline, job_id).unwrap();
-    assert!(matches!(
-        &status,
-        JobStatus::Failed { error } if error.contains("whole-file CRC32 mismatch")
-    ));
-    assert!(!pipeline.jobs.contains_key(&job_id));
+    // The one article carried its own checksum and verified, so the bytes on
+    // disk are the bytes that were posted: the trailer's whole-file value is
+    // what is wrong, and it is discarded rather than ending the job.
+    let status = job_status_for_assert(&pipeline, job_id);
+    assert!(
+        !matches!(&status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
     assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(!pipeline.untrusted_file_crcs.contains(&file_id));
     assert!(!pipeline.file_hash_states.contains_key(&file_id));
     assert!(!pipeline.file_hash_reread_required.contains(&file_id));
-    assert!(
-        pipeline
-            .db
-            .load_complete_file_hashes(job_id)
-            .unwrap()
-            .is_empty()
-    );
 }
 
 #[tokio::test]
@@ -2011,8 +2013,9 @@ async fn single_server_whole_file_crc_mismatch_skips_recovery_and_leaves_the_fil
     .await;
 
     // The only server already produced the doubted bytes, so no re-fetch is
-    // queued: the mismatch falls through to the repair decision, which with
-    // no PAR2 in this job is the whole-file CRC failure.
+    // queued: the mismatch falls through to the repair decision, which with no
+    // PAR2 in this job holds the file for verification instead of ending the
+    // job — the bytes may yet be good, and repair evidence may yet arrive.
     assert!(!pipeline.file_crc_recoveries.contains_key(&file_id));
     assert!(
         pipeline
@@ -2020,11 +2023,23 @@ async fn single_server_whole_file_crc_mismatch_skips_recovery_and_leaves_the_fil
             .get(&job_id)
             .is_none_or(|state| state.download_queue.is_empty())
     );
+    // The decode seam no longer ends the job itself; the terminal delivery
+    // gate is what refuses a file still owed verification.
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
-    assert!(matches!(
-        &status,
-        JobStatus::Failed { error } if error.contains("whole-file CRC32 mismatch")
-    ));
+    assert!(
+        matches!(
+            &status,
+            JobStatus::Failed { error } if error.contains("require verification or repair")
+        ),
+        "{status:?}"
+    );
+    assert!(
+        pipeline
+            .db
+            .load_complete_file_hashes(job_id)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -2356,7 +2371,7 @@ async fn matching_whole_file_crc_accepts_unverified_part_without_retry() {
 }
 
 #[tokio::test]
-async fn whole_file_crc_recovery_fails_when_unverified_segment_budget_is_exhausted() {
+async fn whole_file_crc_recovery_holds_the_file_when_the_segment_budget_is_exhausted() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20903);
@@ -2394,17 +2409,22 @@ async fn whole_file_crc_recovery_fails_when_unverified_segment_budget_is_exhaust
     )
     .await;
 
+    // Held for verification at the decode seam; the terminal delivery gate is
+    // what refuses it, not a whole-file CRC failure.
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
-    assert!(matches!(
-        status,
-        JobStatus::Failed { error } if error.contains("whole-file CRC32 mismatch")
-    ));
+    assert!(
+        matches!(
+            &status,
+            JobStatus::Failed { error } if error.contains("require verification or repair")
+        ),
+        "{status:?}"
+    );
     assert!(!pipeline.file_crc_recoveries.contains_key(&file_id));
     assert!(!pipeline.unverified_segments.contains_key(&file_id));
 }
 
 #[tokio::test]
-async fn conflicting_file_crc32_across_segments_fails_job() {
+async fn conflicting_file_crc32_across_segments_drops_the_expectation() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20019);
@@ -2437,21 +2457,19 @@ async fn conflicting_file_crc32_across_segments_fails_job() {
     )
     .await;
 
+    // Some posters write a running whole-file checksum, or zeros, on every
+    // part but the last. The parts themselves decoded, so the only honest
+    // conclusion is that this file has no usable whole-file expectation.
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
-    assert!(matches!(
-        &status,
-        JobStatus::Failed { error } if error.contains("conflicting yEnc whole-file CRC32")
-    ));
-    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(!matches!(&status, JobStatus::Failed { .. }), "{status:?}");
+    assert!(pipeline.jobs.contains_key(&job_id));
     assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
-    assert!(!pipeline.file_hash_states.contains_key(&file_id));
-    assert!(!pipeline.file_hash_reread_required.contains(&file_id));
     assert!(
-        pipeline
-            .db
-            .load_complete_file_hashes(job_id)
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(file_id)
             .unwrap()
-            .is_empty()
+            .is_complete()
     );
 }
 
@@ -2517,6 +2535,7 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
     };
     let buffered_payload = [9u8; 64];
     let buffered = BufferedDecodedSegment {
+        damaged_source: None,
         encoding: SegmentEncoding::Yenc,
         segment_id: SegmentId {
             file_id,
@@ -2539,6 +2558,13 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
     pipeline.note_write_buffered(buffered_len, 1);
 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    // This fixture inserts below the decoder, which normally records placement
+    // before handing the article to the write reorder buffer.
+    state
+        .assembly
+        .file_mut(file_id)
+        .unwrap()
+        .record_placement(0, 0, 64);
     state
         .assembly
         .file_mut(NzbFileId {
@@ -2642,6 +2668,7 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
         file_index: 0,
     };
     let buffered = BufferedDecodedSegment {
+        damaged_source: None,
         encoding: SegmentEncoding::Yenc,
         segment_id: SegmentId {
             file_id,

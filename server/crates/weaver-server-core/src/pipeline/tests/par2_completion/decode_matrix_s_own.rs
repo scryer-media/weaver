@@ -300,6 +300,7 @@ async fn retained_promoted_recovery_buffer_does_not_report_active_fetch() {
 
     let bytes = vec![7u8; 64];
     let buffered = BufferedDecodedSegment {
+        damaged_source: None,
         encoding: SegmentEncoding::Yenc,
         segment_id: recovery_segment,
         decoded_size: bytes.len() as u32,

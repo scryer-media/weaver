@@ -62,6 +62,7 @@ mod sequential_unpack;
 mod server_attribution;
 mod sfv_completion;
 mod terminal_settlement;
+mod yenc_compatibility;
 mod zip64;
 
 struct TestHarness {
@@ -2265,6 +2266,7 @@ async fn submit_decoded_segment_with_segments(
                 crc_valid: true,
                 part_crc_verified,
                 part_crc: par2_rs::checksum::crc32(data),
+                truncation_suspected: false,
                 expected_file_crc,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),
@@ -2332,6 +2334,7 @@ async fn settle_queued_decode(
                 crc_valid: true,
                 part_crc_verified: true,
                 part_crc: par2_rs::checksum::crc32(data),
+                truncation_suspected: false,
                 expected_file_crc: None,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),
@@ -2420,6 +2423,7 @@ async fn submit_decoded_segment_from_server(
                 crc_valid: true,
                 part_crc_verified,
                 part_crc: par2_rs::checksum::crc32(data),
+                truncation_suspected: false,
                 expected_file_crc,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),

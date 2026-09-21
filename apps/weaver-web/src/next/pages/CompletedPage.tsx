@@ -40,6 +40,7 @@ import { NextShell, RailBlock } from "../shell/NextShell";
 import { CategoryListBlock } from "../shell/rail-blocks";
 import {
   categoryFacets,
+  countsByFacet,
   facetsToCategories,
   NO_FACETS,
   toggleFacet,
@@ -118,6 +119,7 @@ interface HistoryPageResponse {
     items: HistoryRow[];
     totalCount: number;
     counts: { all: number; success: number; failure: number };
+    categoryCounts: { category: string; count: number }[];
   };
 }
 
@@ -294,16 +296,18 @@ export function CompletedPage() {
     };
   }, [midnight, sample]);
 
-  // No counts here: history is paginated on the server, so the only number
-  // this page could put beside a facet is "how many on the page you are
-  // looking at", which is not what a number there would be read as.
+  // The counts come from the daemon, not from this page: history is paginated
+  // on the server, so the rows on hand are neither the whole set to count nor
+  // the whole set of categories to offer. Counting them here would both
+  // understate every number and make the categories you are not looking at
+  // disappear the moment you picked one.
   const facetItems = useMemo(
     () =>
       categoryFacets({
         configured,
-        extras: rows.map((row) => row.category).filter((name): name is string => !!name),
+        counts: page ? countsByFacet(page.categoryCounts) : undefined,
       }),
-    [configured, rows],
+    [configured, page],
   );
 
   const volumes = systemInfo?.systemInfo?.configuredStorage ?? [];

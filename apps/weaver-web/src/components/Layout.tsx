@@ -45,6 +45,8 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { setUiVariant } from "@/lib/ui-variant";
 import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
+import { upgradesInApp } from "@/features/updates/application-upgrade";
+import { useApplicationUpgradeStatus } from "@/features/updates/application-upgrade-card";
 import { UpdateNotificationLink } from "@/features/updates/update-notification-link";
 import {
   Sheet,
@@ -441,6 +443,7 @@ export function Layout() {
       ? location.pathname === "/" || location.pathname.startsWith("/jobs")
       : location.pathname.startsWith(to);
   const settingsOpen = location.pathname.startsWith("/settings");
+  const upgradeInApp = upgradesInApp(useApplicationUpgradeStatus());
   const updateNotification = releaseNotification(
     updateStatusSubscriptionData?.updateStatusUpdates ?? updateStatusData?.updateStatus,
   );
@@ -544,6 +547,7 @@ export function Layout() {
               {updateNotification ? (
                 <UpdateNotificationLink
                   notification={updateNotification}
+                  inApp={upgradeInApp}
                   placement="desktop"
                   label={t("update.newVersion", { version: updateNotification.version })}
                   ariaLabel={t("update.newVersionAria", {
@@ -587,6 +591,7 @@ export function Layout() {
 
       <UpdateNotificationLink
         notification={updateNotification}
+        inApp={upgradeInApp}
         placement="mobile"
         label={
           updateNotification

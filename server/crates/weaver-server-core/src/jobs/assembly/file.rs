@@ -1,7 +1,7 @@
 use crate::jobs::ids::NzbFileId;
 use bitvec::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use weaver_model::files::FileRole;
 
 use super::error::AssemblyError;
@@ -80,9 +80,29 @@ pub struct FileAssembly {
     /// linear pass would cost O(segments) each time — hundreds of microseconds
     /// per article, and hundreds of KiB of memory traffic, on a large file.
     placements: BTreeMap<u32, (u64, u32)>,
+    /// Durable reconstruction proves coverage, but supplies no decoded CRC atoms.
+    reconstructed_placements: BTreeMap<u32, (u64, u32)>,
     /// A repeated article leaves no reliable proof that all writes had a
     /// single, unambiguous source. Keep fast PAR2 evidence conservative.
     has_duplicate_segments: bool,
+    /// Conservative restart ceiling after a damaged write. No damaged state is
+    /// persisted: a restart refetches from this ordinal until file verification
+    /// or repair establishes completion.
+    retained_damage_floor: Option<u64>,
+    damaged_segments: BTreeMap<u32, (u64, u32)>,
+    /// Damaged ordinals held only because the body looked cut short, with no
+    /// checksum to say either way. A later copy whose length is accounted for
+    /// may settle these; one held by a failed checksum may not.
+    truncation_only_damage: BTreeSet<u32>,
+    /// The layout boundary a damaged ordinal declared for itself, when its own
+    /// header carried a usable range. It is where the part after it begins no
+    /// matter how many bytes this one managed to decode, so it outranks the
+    /// retained extent as an anchor.
+    declared_damage_ends: BTreeMap<u32, u64>,
+    /// Existing durable prefix evidence, clipped whenever resumed bytes are rewritten.
+    restored_prefix_end: u64,
+    final_part_verified: bool,
+    geometry_requires_verification: bool,
     // Outputs without NZB articles have independent availability and contribute
     // no declared or received download bytes.
     repair_output_ready: Option<bool>,
@@ -127,7 +147,15 @@ impl FileAssembly {
             received: bitvec![0; total_segments as usize],
             received_bytes: 0,
             placements: BTreeMap::new(),
+            reconstructed_placements: BTreeMap::new(),
             has_duplicate_segments: false,
+            retained_damage_floor: None,
+            damaged_segments: BTreeMap::new(),
+            truncation_only_damage: BTreeSet::new(),
+            declared_damage_ends: BTreeMap::new(),
+            restored_prefix_end: 0,
+            final_part_verified: false,
+            geometry_requires_verification: false,
             repair_output_ready: None,
         }
     }
@@ -153,19 +181,19 @@ impl FileAssembly {
     /// induction, without comparing against any but its two neighbours.
     pub fn placement_conflict(&self, segment_number: u32, offset: u64, len: u32) -> Option<u32> {
         let end = offset.saturating_add(u64::from(len));
-        if let Some((previous, (previous_offset, previous_len))) =
-            self.placements.range(..segment_number).next_back()
-            && offset < previous_offset.saturating_add(u64::from(*previous_len))
-        {
-            return Some(*previous);
-        }
-        if let Some((next, (next_offset, _))) = self
-            .placements
-            .range(segment_number.saturating_add(1)..)
-            .next()
-            && end > *next_offset
-        {
-            return Some(*next);
+        for placements in [&self.placements, &self.reconstructed_placements] {
+            if let Some((previous, (previous_offset, previous_len))) =
+                placements.range(..segment_number).next_back()
+                && offset < previous_offset.saturating_add(u64::from(*previous_len))
+            {
+                return Some(*previous);
+            }
+            if let Some((next, (next_offset, _))) =
+                placements.range(segment_number.saturating_add(1)..).next()
+                && end > *next_offset
+            {
+                return Some(*next);
+            }
         }
         None
     }
@@ -173,7 +201,13 @@ impl FileAssembly {
     /// Record where a segment was placed. Re-recording the same ordinal is the
     /// ordinary duplicate/retry case and simply overwrites.
     pub fn record_placement(&mut self, segment_number: u32, offset: u64, len: u32) {
+        self.restored_prefix_end = self.restored_prefix_end.min(offset);
+        self.reconstructed_placements.remove(&segment_number);
         self.placements.insert(segment_number, (offset, len));
+    }
+
+    pub(crate) fn record_reconstructed_placement(&mut self, ordinal: u32, offset: u64, len: u32) {
+        self.reconstructed_placements.insert(ordinal, (offset, len));
     }
 
     /// Where an ordinal was placed, if it has arrived.
@@ -183,6 +217,163 @@ impl FileAssembly {
     /// has since moved past.
     pub fn placement_of(&self, segment_number: u32) -> Option<(u64, u32)> {
         self.placements.get(&segment_number).copied()
+    }
+
+    /// How many ordinals have a recorded placement.
+    pub(crate) fn placed_segment_count(&self) -> usize {
+        self.placements.len()
+    }
+
+    pub(crate) fn note_retained_damage(
+        &mut self,
+        segment_number: u32,
+        offset: u64,
+        len: u32,
+        truncation_only: bool,
+        declared_end: Option<u64>,
+    ) {
+        self.damaged_segments.insert(segment_number, (offset, len));
+        match declared_end {
+            Some(end) => {
+                self.declared_damage_ends.insert(segment_number, end);
+            }
+            None => {
+                self.declared_damage_ends.remove(&segment_number);
+            }
+        }
+        if truncation_only {
+            self.truncation_only_damage.insert(segment_number);
+        } else {
+            self.truncation_only_damage.remove(&segment_number);
+        }
+        let floor = offset.min(self.segment_offset(segment_number));
+        self.retained_damage_floor = Some(
+            self.retained_damage_floor
+                .map_or(floor, |old| old.min(floor)),
+        );
+    }
+
+    pub(crate) fn clear_retained_damage(&mut self, segment_number: u32) -> bool {
+        self.truncation_only_damage.remove(&segment_number);
+        self.declared_damage_ends.remove(&segment_number);
+        self.damaged_segments.remove(&segment_number).is_some()
+    }
+
+    /// The end offset a part may be laid after, when it declared no start of
+    /// its own and the ordinal before it is `segment_number`.
+    ///
+    /// A placement is the answer whenever there is one. Otherwise the ordinal
+    /// before it may still have left an extent behind: bytes that failed their
+    /// checksum are written and kept for repair, and once no further copy is
+    /// coming they mark the boundary just as a placement would. `settled` is
+    /// the pipeline's answer to whether another copy may still arrive, since
+    /// assembly does not know what is still being asked of which server; while
+    /// one may, nothing is laid after bytes a clean copy could displace.
+    ///
+    /// Trust runs: the damaged part's own declared range first, because that
+    /// is the layout the poster described regardless of how much of it decoded;
+    /// then its retained extent, but only when its length is believable — a
+    /// body that looked cut short says nothing about where the next one starts.
+    pub(crate) fn anchor_end_after(&self, segment_number: u32, settled: bool) -> Option<u64> {
+        if let Some((offset, len)) = self.placement_of(segment_number) {
+            return Some(offset.saturating_add(u64::from(len)));
+        }
+        if !settled {
+            return None;
+        }
+        let (offset, len) = *self.damaged_segments.get(&segment_number)?;
+        if let Some(declared_end) = self.declared_damage_ends.get(&segment_number) {
+            return Some(*declared_end);
+        }
+        if self.truncation_only_damage.contains(&segment_number) {
+            return None;
+        }
+        Some(offset.saturating_add(u64::from(len)))
+    }
+
+    /// Only accepted bytes may exclude writes of a damaged candidate.
+    pub(crate) fn protected_write_ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        std::iter::once((0, self.restored_prefix_end)).chain(
+            self.placements
+                .values()
+                .chain(self.reconstructed_placements.values())
+                .map(|&(offset, len)| (offset, offset.saturating_add(u64::from(len)))),
+        )
+    }
+
+    pub(crate) fn has_retained_damage(&self) -> bool {
+        !self.damaged_segments.is_empty()
+    }
+
+    pub(crate) fn retained_damage_floor(&self) -> Option<u64> {
+        self.retained_damage_floor
+    }
+
+    pub(crate) fn segment_has_retained_damage(&self, segment_number: u32) -> bool {
+        self.damaged_segments.contains_key(&segment_number)
+    }
+
+    /// Whether the damage held for this ordinal is only a suspicion that the
+    /// body was cut short, rather than a checksum that disagreed.
+    pub(crate) fn segment_damage_is_truncation_only(&self, segment_number: u32) -> bool {
+        self.truncation_only_damage.contains(&segment_number)
+    }
+
+    pub(crate) fn requires_file_verification(&self) -> bool {
+        self.has_retained_damage() || self.geometry_requires_verification
+    }
+
+    pub(crate) fn require_geometry_verification(&mut self) {
+        self.geometry_requires_verification = true;
+    }
+
+    pub(crate) fn clear_geometry_verification(&mut self) {
+        self.geometry_requires_verification = false;
+    }
+
+    pub(crate) fn note_restored_prefix(&mut self, end: u64) {
+        self.restored_prefix_end = end;
+    }
+
+    pub(crate) fn note_part_verification(&mut self, ordinal: u32, verified: bool) {
+        if ordinal.checked_add(1) == Some(self.total_segments) {
+            self.final_part_verified = verified;
+        }
+    }
+
+    pub(crate) fn final_part_verified(&self) -> bool {
+        self.final_part_verified
+    }
+
+    /// Actual coverage, including the untouched restored prefix. NZB encoded
+    /// sizes and progress totals are never used as decoded file lengths.
+    pub(crate) fn decoded_coverage_end(&self) -> Option<u64> {
+        if !self.is_complete() || self.has_retained_damage() {
+            return None;
+        }
+        let final_ordinal = self.total_segments.checked_sub(1)?;
+        self.placements
+            .get(&final_ordinal)
+            .or_else(|| self.reconstructed_placements.get(&final_ordinal))?;
+        let mut cursor = self.restored_prefix_end;
+        let mut decoded = self.placements.iter().peekable();
+        let mut rebuilt = self.reconstructed_placements.iter().peekable();
+        while decoded.peek().is_some() || rebuilt.peek().is_some() {
+            let (_, (offset, len)) = if rebuilt.peek().is_none_or(|(rebuilt_ordinal, _)| {
+                decoded
+                    .peek()
+                    .is_some_and(|(ordinal, _)| ordinal < rebuilt_ordinal)
+            }) {
+                decoded.next()?
+            } else {
+                rebuilt.next()?
+            };
+            if *offset != cursor {
+                return None;
+            }
+            cursor = cursor.checked_add(u64::from(*len))?;
+        }
+        Some(cursor)
     }
 
     /// Record that a segment has been received and decoded.
@@ -229,7 +420,15 @@ impl FileAssembly {
         self.received.fill(false);
         self.received_bytes = 0;
         self.placements.clear();
+        self.reconstructed_placements.clear();
         self.has_duplicate_segments = false;
+        self.retained_damage_floor = None;
+        self.damaged_segments.clear();
+        self.truncation_only_damage.clear();
+        self.declared_damage_ends.clear();
+        self.restored_prefix_end = 0;
+        self.final_part_verified = false;
+        self.geometry_requires_verification = false;
     }
 
     /// Declare the file fully received.
@@ -250,6 +449,11 @@ impl FileAssembly {
     /// use it as one. The bytes actually written are the sum of the recorded
     /// placements; `contiguous_placements_proven` is what reasons about those.
     pub fn mark_complete(&mut self) {
+        self.damaged_segments.clear();
+        self.truncation_only_damage.clear();
+        self.declared_damage_ends.clear();
+        self.retained_damage_floor = None;
+        self.geometry_requires_verification = false;
         if let Some(ready) = &mut self.repair_output_ready {
             *ready = true;
         }
@@ -279,7 +483,11 @@ impl FileAssembly {
             return false;
         }
         self.received.set(segment_number as usize, false);
-        if let Some((_, len)) = self.placements.remove(&segment_number) {
+        let placement = self
+            .placements
+            .remove(&segment_number)
+            .or_else(|| self.reconstructed_placements.remove(&segment_number));
+        if let Some((_, len)) = placement {
             self.received_bytes = self.received_bytes.saturating_sub(len as u64);
         }
         if let Some(ready) = &mut self.repair_output_ready {

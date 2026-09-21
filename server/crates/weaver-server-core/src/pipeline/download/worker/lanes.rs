@@ -158,6 +158,23 @@ impl Pipeline {
             }
         }
         self.skip_failed_uu_segment(seg_id);
+        // This ordinal will not be asked for again, which is the last thing
+        // assembly was waiting to know about any damaged bytes it kept: once
+        // no cleaner copy can displace them, they end where the part behind
+        // them begins. The run stays parked and is released through the
+        // ordinary commit path, which cannot run from here.
+        //
+        // With nothing to measure from, held articles that could only be
+        // placed after this one have lost their anchor for good. The run is
+        // taken out of the park before any of it is booked, so each booking
+        // below finds nothing further to release.
+        if self.settled_segment_anchors_successor(seg_id) {
+            self.pending_unanchored_release.push(seg_id);
+        } else {
+            for dependent in self.take_unanchored_dependents(seg_id) {
+                self.give_up_unanchored(dependent);
+            }
+        }
         self.check_health(job_id);
         true
     }
@@ -168,6 +185,42 @@ impl Pipeline {
             .get(&seg_id.file_id.job_id)
             .and_then(|state| state.assembly.file(seg_id.file_id))
             .is_some_and(|file| file.has_segment(seg_id.segment_number))
+    }
+
+    /// Whether an ordinal that has just reached a terminal state still tells
+    /// the part behind it where to start, and something is waiting to be told.
+    fn settled_segment_anchors_successor(&self, seg_id: SegmentId) -> bool {
+        let Some(successor) = seg_id.segment_number.checked_add(1) else {
+            return false;
+        };
+        if !self
+            .unanchored_parked
+            .get(&seg_id.file_id)
+            .is_some_and(|parked| parked.contains_key(&successor))
+        {
+            return false;
+        }
+        self.jobs
+            .get(&seg_id.file_id.job_id)
+            .and_then(|state| state.assembly.file(seg_id.file_id))
+            .is_some_and(|file| file.anchor_end_after(seg_id.segment_number, true).is_some())
+    }
+
+    /// A verified late replacement settles a previously damaged ordinal once.
+    pub(in crate::pipeline) fn clear_replaced_damage_failure(&mut self, segment_id: SegmentId) {
+        if self.segment_terminal_states.remove(&segment_id).is_none() {
+            return;
+        }
+        let bytes = self.health_counted_segment_bytes(segment_id);
+        let file_has_failures = self.file_terminal_failed_bytes(segment_id.file_id) > 0;
+        if let Some(state) = self.jobs.get_mut(&segment_id.file_id.job_id) {
+            state.failed_bytes = state.failed_bytes.saturating_sub(bytes);
+            if !file_has_failures {
+                state
+                    .health_failing_files
+                    .remove(&segment_id.file_id.file_index);
+            }
+        }
     }
 
     /// The job's failed bytes as the terminal states alone define them.
@@ -269,8 +322,6 @@ impl Pipeline {
             state.health_failing_files.clear();
             state.early_recovery_requested_blocks = 0;
         }
-        self.foreign_layout_watches
-            .retain(|file_id, _| file_id.job_id != job_id);
         self.files_counted_missing
             .retain(|file_id| file_id.job_id != job_id);
     }

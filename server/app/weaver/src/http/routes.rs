@@ -169,7 +169,8 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         )
         .route(
             "/api/jobs/{job_id}/output-file",
-            post(super::jobs::job_output_file_download_handler),
+            get(super::jobs::job_output_file_download_get_handler)
+                .post(super::jobs::job_output_file_download_handler),
         )
         .route(
             "/api/backup/status",

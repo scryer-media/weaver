@@ -26,23 +26,28 @@ import {
  * installation someone else manages (a container, Homebrew, winget, a Windows
  * service) says so instead of offering a button that would be refused.
  */
-/**
- * Upgrade state and the install action, shared by the classic card and the
- * Next UI's System Info section so both offer the same button for the same
- * release.
- */
-export function useApplicationUpgrade() {
+/** The server's upgrade state, kept live. */
+export function useApplicationUpgradeStatus(): ApplicationUpgradeStatus | undefined {
   const [{ data: queryData }] = useQuery<{
     applicationUpgradeStatus: ApplicationUpgradeStatus;
   }>({ query: APPLICATION_UPGRADE_STATUS_QUERY, requestPolicy: "cache-and-network" });
   const [{ data: liveData }] = useSubscription<{
     applicationUpgradeUpdates: ApplicationUpgradeStatus;
   }>({ query: APPLICATION_UPGRADE_SUBSCRIPTION });
+  return liveData?.applicationUpgradeUpdates ?? queryData?.applicationUpgradeStatus;
+}
+
+/**
+ * Upgrade state and the install action, shared by the classic card and the
+ * Next UI's System Info section so both offer the same button for the same
+ * release.
+ */
+export function useApplicationUpgrade() {
+  const status = useApplicationUpgradeStatus();
   const [, startUpgrade] = useMutation(START_APPLICATION_UPGRADE_MUTATION);
   const [startError, setStartError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
 
-  const status = liveData?.applicationUpgradeUpdates ?? queryData?.applicationUpgradeStatus;
   const installable = status ? installableUpgrade(status) : null;
   const run = status ? (status.activeRun ?? status.latestRun) : null;
 

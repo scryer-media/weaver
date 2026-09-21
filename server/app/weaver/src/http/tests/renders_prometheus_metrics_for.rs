@@ -53,6 +53,11 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
         rendered.contains("weaver_pipeline_download_lane_states_active{state=\"awaiting_work\"} 0")
     );
     assert!(rendered.contains("weaver_pipeline_download_lanes_active_total 3"));
+    // The memory-footprint series: the lanes' share of the resident set, the
+    // dispatch ranking behind it, and the pool the article buffers come from.
+    assert!(rendered.contains("weaver_pipeline_download_lane_inflight_bytes 6291456"));
+    assert!(rendered.contains("weaver_pipeline_download_jobs_eligible 4"));
+    assert!(rendered.contains("weaver_pipeline_download_jobs_hot 1"));
     assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"no_work\"} 35"));
     assert!(rendered.contains("weaver_pipeline_download_lane_parks_total{reason=\"pressure\"} 36"));
     assert!(
@@ -236,6 +241,9 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_scheduler_handouts_total_hot: 0,
         download_scheduler_handouts_total_spill: 0,
         download_scheduler_handouts_total_probe: 0,
+        download_lane_inflight_bytes: 0,
+        download_jobs_eligible: 0,
+        download_jobs_hot: 0,
         download_lanes_active: 0,
         download_lanes_sequential_active: 0,
         download_lanes_depth2_active: 0,
@@ -1319,4 +1327,54 @@ async fn response_compression_supports_deflate() {
             .and_then(|value| value.to_str().ok()),
         Some("deflate")
     );
+}
+
+/// The pool the article buffers are carved from, and the process total they
+/// are part of.
+///
+/// Reported in bytes rather than in buffers: the three tiers hold different
+/// buffer sizes, so only bytes add up to a share of the resident set.
+#[test]
+fn renders_the_buffer_pool_and_the_process_resident_set() {
+    use weaver_server_core::runtime::buffers::BufferPoolMetrics;
+
+    let snapshot = populated_metrics_snapshot();
+    let pool = BufferPoolMetrics {
+        small_in_use: 2,
+        small_total: 8,
+        medium_in_use: 1,
+        medium_total: 4,
+        large_in_use: 0,
+        large_total: 2,
+        wait_count: 9,
+    };
+    let process = weaver_server_core::operations::instrumentation::ProcessMetricsSnapshot {
+        resident_memory_bytes: Some(542 * 1024 * 1024),
+        ..Default::default()
+    };
+
+    let block = manual_pause_block();
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.build = Default::default();
+    input.buffer_pool = Some(&pool);
+    input.process = Some(&process);
+    let rendered = metrics::render_prometheus_metrics_input(&input);
+
+    assert_valid_prometheus_exposition(&rendered);
+    for expected in [
+        // 2 × 512 KiB, 8 × 512 KiB.
+        "weaver_runtime_buffer_pool_in_use_bytes{tier=\"small\"} 1048576",
+        "weaver_runtime_buffer_pool_total_bytes{tier=\"small\"} 4194304",
+        "weaver_runtime_buffer_pool_in_use_bytes{tier=\"medium\"} 1048576",
+        "weaver_runtime_buffer_pool_total_bytes{tier=\"medium\"} 4194304",
+        "weaver_runtime_buffer_pool_in_use_bytes{tier=\"large\"} 0",
+        "weaver_runtime_buffer_pool_total_bytes{tier=\"large\"} 8388608",
+        "weaver_runtime_buffer_pool_waits_total 9",
+        "process_resident_memory_bytes 568328192",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "exposition is missing {expected:?}:\n{rendered}"
+        );
+    }
 }

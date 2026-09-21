@@ -152,12 +152,10 @@ impl Pipeline {
                             end: decode_result.metadata.end,
                         };
 
-                        let decoded = {
-                            let _cpu_scope = crate::runtime::perf_probe::cpu_scope(
-                                "download.decode.copy_to_owned",
-                            );
-                            DecodedChunk::from(output.as_slice().to_vec())
-                        };
+                        // The pool slot travels to the writer as the decoded
+                        // payload; it comes back to the pool when the write
+                        // batch drops it.
+                        let decoded = DecodedChunk::Pooled(output);
 
                         let _profile_scope =
                             crate::runtime::perf_probe::scope("download.decode.send_success");
@@ -167,7 +165,12 @@ impl Pipeline {
                         let crc_valid =
                             crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
-                            decode_result.expected_part_crc.is_some() && crc_valid;
+                            decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
+                        let truncation_suspected =
+                            crate::pipeline::yenc_truncation_suspected(&decode_result);
+                        // Block evidence needs a known starting offset. An
+                        // article whose own begin was unusable has none.
+                        let offset_known = decode_result.metadata.file_offset_is_known();
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
@@ -177,13 +180,18 @@ impl Pipeline {
                                 encoding: SegmentEncoding::Yenc,
                                 yenc_layout,
                                 crc_valid,
+                                truncation_suspected,
                                 part_crc_verified,
                                 part_crc: decode_result.part_crc,
                                 expected_file_crc: decode_result.expected_file_crc,
                                 data: decoded,
                                 yenc_name: decode_result.metadata.name,
                                 checkpoint_plan: decode_result.checkpoint_plan,
-                                segments: decode_result.segments,
+                                segments: if offset_known {
+                                    decode_result.segments
+                                } else {
+                                    Vec::new()
+                                },
                             },
                             source: SegmentSource {
                                 source_server_idx,
@@ -196,9 +204,6 @@ impl Pipeline {
                         );
                     }
                     Err(e) => {
-                        if let weaver_yenc::YencError::CrcMismatch { .. } = &e {
-                            metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                        }
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");
@@ -240,7 +245,12 @@ impl Pipeline {
                         let crc_valid =
                             crate::pipeline::crc_not_mismatched(decode_result.crc_status);
                         let part_crc_verified =
-                            decode_result.expected_part_crc.is_some() && crc_valid;
+                            decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
+                        let truncation_suspected =
+                            crate::pipeline::yenc_truncation_suspected(&decode_result);
+                        // Block evidence needs a known starting offset. An
+                        // article whose own begin was unusable has none.
+                        let offset_known = decode_result.metadata.file_offset_is_known();
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
@@ -250,13 +260,18 @@ impl Pipeline {
                                 encoding: SegmentEncoding::Yenc,
                                 yenc_layout,
                                 crc_valid,
+                                truncation_suspected,
                                 part_crc_verified,
                                 part_crc: decode_result.part_crc,
                                 expected_file_crc: decode_result.expected_file_crc,
                                 data: DecodedChunk::from(output),
                                 yenc_name: decode_result.metadata.name,
                                 checkpoint_plan: decode_result.checkpoint_plan,
-                                segments: decode_result.segments,
+                                segments: if offset_known {
+                                    decode_result.segments
+                                } else {
+                                    Vec::new()
+                                },
                             },
                             source: SegmentSource {
                                 source_server_idx,
@@ -269,9 +284,6 @@ impl Pipeline {
                         );
                     }
                     Err(e) => {
-                        if let weaver_yenc::YencError::CrcMismatch { .. } = &e {
-                            metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                        }
                         let error = e.to_string();
                         metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         warn!(segment = %segment_id, error = %error, "yEnc decode failed");
@@ -327,14 +339,14 @@ impl Pipeline {
                 continue;
             }
 
+            // Pool slots now stay with the decoded article until it is
+            // written, so an empty tier is not a reason to hold decode back:
+            // fall through to an owned buffer and keep the lane moving.
             let tier = crate::runtime::buffers::BufferTier::for_size(work.raw.len());
-            let Some(output) = self.buffers.try_acquire(tier) else {
-                remaining.push_back(work);
-                continue;
-            };
+            let output = self.buffers.try_acquire(tier);
 
             self.note_decode_started(work.segment_id, work.raw.len() as u64);
-            self.spawn_decode_task(work, Some(output));
+            self.spawn_decode_task(work, output);
             available_decode_slots -= 1;
         }
 

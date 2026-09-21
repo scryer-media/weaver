@@ -100,6 +100,10 @@ pub enum RefusalReason {
     /// chase that cannot start, and extraction awaits a started chase without a
     /// deadline.
     NoChaseCapacity,
+    /// Another job currently outranks this one for article dispatch. This job
+    /// is only being served the scraps the hot job leaves, so its chase would
+    /// hold a worker and a staging tree for a download that is not moving.
+    JobNotHot,
 }
 
 impl RefusalReason {
@@ -112,6 +116,7 @@ impl RefusalReason {
             Self::LengthOverflow => "length_overflow",
             Self::BudgetUnavailable => "budget_unavailable",
             Self::NoChaseCapacity => "no_chase_capacity",
+            Self::JobNotHot => "job_not_hot",
         }
     }
 }
@@ -194,6 +199,16 @@ pub struct ChaseOutcome {
     pub completed_bytes: u64,
     /// Repair rewrote a source file after this chase read it.
     pub tainted: bool,
+    /// The recovery data had reported damage in this set when the chase
+    /// finished, and no repair had lifted the report.
+    ///
+    /// A gated reader is only ever served vouched bytes, so a chase that
+    /// finishes under a standing report read the damaged range *before* the
+    /// report arrived — a short set decodes in the gap between its last commit
+    /// and the verdict for it. Its members are built on bytes the recovery data
+    /// calls wrong, and the report is still evidence finalize has to weigh once
+    /// the worker is gone.
+    pub damage_reported: bool,
 }
 
 impl ChaseOutcome {
@@ -227,6 +242,7 @@ pub struct DirectUnpackCounters {
     pub refused_length_overflow: u64,
     pub refused_budget_unavailable: u64,
     pub refused_no_chase_capacity: u64,
+    pub refused_job_not_hot: u64,
     pub completed: u64,
     pub demoted_download_ended: u64,
     pub demoted_part_unreadable: u64,
@@ -264,6 +280,7 @@ impl DirectUnpackCounters {
             RefusalReason::LengthOverflow => self.refused_length_overflow += 1,
             RefusalReason::BudgetUnavailable => self.refused_budget_unavailable += 1,
             RefusalReason::NoChaseCapacity => self.refused_no_chase_capacity += 1,
+            RefusalReason::JobNotHot => self.refused_job_not_hot += 1,
         }
     }
 
@@ -496,6 +513,14 @@ impl DirectUnpackRuntime {
     #[cfg(test)]
     pub(crate) fn latched_reason(&self, job_id: JobId, set_name: &str) -> Option<&'static str> {
         self.latched.get(&(job_id, set_name.to_string())).copied()
+    }
+
+    /// Whether an armed chase's worker has returned but not yet been reaped.
+    #[cfg(test)]
+    pub(crate) fn armed_worker_finished(&self, job_id: JobId, set_name: &str) -> bool {
+        self.armed
+            .get(&(job_id, set_name.to_string()))
+            .is_some_and(|armed| armed.handle.is_finished())
     }
 
     #[cfg(test)]
@@ -873,6 +898,19 @@ impl Pipeline {
         );
     }
 
+    /// Whether another job currently outranks this one for article dispatch.
+    ///
+    /// A job the scheduler does not list at all — nothing left to download, or
+    /// a queue that has already drained — is not outranked by anybody: the
+    /// question only has an answer while the job is competing for articles.
+    fn direct_unpack_job_is_outranked(&self, job_id: JobId) -> bool {
+        let eligible = self.download_scheduler_eligible_jobs();
+        let Some(hot_job) = eligible.first() else {
+            return false;
+        };
+        *hot_job != job_id && eligible.contains(&job_id)
+    }
+
     fn arm_prepared_direct_unpack(
         &mut self,
         job_id: JobId,
@@ -882,6 +920,20 @@ impl Pipeline {
         format: ChaseFormat,
     ) {
         if self.direct_unpack.repairing_jobs.contains(&job_id) {
+            return;
+        }
+        // A different volume can trigger arming after damaged bytes arrived.
+        // Check the whole input set before exposing any of its files to a chase.
+        if self.jobs.get(&job_id).is_some_and(|state| {
+            state.assembly.files().any(|file| {
+                file.requires_file_verification()
+                    && paths.iter().any(|path| {
+                        path == &state
+                            .working_dir
+                            .join(self.current_filename_for_file(job_id, file))
+                    })
+            })
+        }) {
             return;
         }
         // A paused worker still owns this staging path until it is joined and
@@ -894,6 +946,31 @@ impl Pipeline {
         {
             return;
         }
+        // Arming belongs to the job the scheduler is actually feeding.
+        //
+        // Articles are handed out from the hot job, and from one spill job
+        // behind it when the hot job is blocked. A queued job therefore
+        // receives just enough of its opening bytes — its head wave — to look
+        // armable long before it will be downloaded, and submitting a batch of
+        // NZBs used to arm every one of them at once: a chase worker, a
+        // staging tree, a coverage map and an extraction budget per job, all
+        // held for a download that is not moving.
+        //
+        // Counted and deliberately NOT latched, exactly like the capacity
+        // refusal below: being outranked is a fact about this instant. The
+        // candidate stays pending, and the commits that follow the job
+        // becoming hot arm it then.
+        if self.direct_unpack_job_is_outranked(job_id) {
+            debug!(
+                job_id = job_id.0,
+                set_name, "direct unpack is not arming a job the scheduler is not serving yet"
+            );
+            self.direct_unpack
+                .counters
+                .record_refusal(RefusalReason::JobNotHot);
+            return;
+        }
+
         let end_header_bytes = match format {
             ChaseFormat::SevenZip { end_header_bytes } => end_header_bytes,
             ChaseFormat::Zip
@@ -1232,6 +1309,10 @@ impl Pipeline {
         let Some(file_asm) = state.assembly.file(file_id) else {
             return;
         };
+
+        if file_asm.requires_file_verification() {
+            return;
+        }
 
         if file_asm.is_complete() {
             self.publish_completed_part_to_chase(job_id, file_id);
@@ -2360,6 +2441,10 @@ impl Pipeline {
                 Ok(result) => result,
                 Err(error) => Err(format!("direct-unpack worker panicked: {error}")),
             };
+            // Read after the worker is gone, so the answer cannot change under
+            // it: the gate only lifts through a repair or a clean verdict, and
+            // both act on armed sets.
+            let damage_reported = result.is_ok() && armed.coverage.is_gated();
 
             match &result {
                 Ok(outcome) => {
@@ -2372,6 +2457,14 @@ impl Pipeline {
                         elapsed_ms = elapsed.as_millis() as u64,
                         "direct unpack completed"
                     );
+                    if damage_reported {
+                        info!(
+                            job_id = key.0.0,
+                            set_name = %key.1,
+                            "direct unpack finished under a standing damage report — it read the \
+                             damaged range before the report arrived, so the report outlives it"
+                        );
+                    }
                 }
                 Err(error) => {
                     // A part that vanished under the reader is a rename racing
@@ -2417,6 +2510,7 @@ impl Pipeline {
                     total_bytes: armed.counters.total_bytes.load(Ordering::Relaxed),
                     completed_bytes: armed.counters.completed_bytes.load(Ordering::Relaxed),
                     tainted: false,
+                    damage_reported,
                 },
             );
         }
@@ -2958,20 +3052,37 @@ impl Pipeline {
     /// repair that pass would summon; skipping the pass on the strength of the
     /// claim would leave it waiting for nothing.
     ///
-    /// Only *armed* sets count. A draining set has been aborted and will be
+    /// A draining set does not count. It has been aborted and will be
     /// materialized and decoded conventionally, where damage surfaces as a
     /// failed extraction and takes the repair path finalize already has for
     /// that.
+    ///
+    /// A *finished* set counts for as long as its outcome is still installable:
+    /// one that completed under a standing report decoded the damaged range, and
+    /// dropping the report with the worker would let those members be installed
+    /// on the strength of the archive's type alone.
     pub(in crate::pipeline) fn direct_unpack_gated_sets(&self, job_id: JobId) -> Vec<String> {
-        if self.direct_unpack.armed.is_empty() {
+        if self.direct_unpack.armed.is_empty() && self.direct_unpack.outcomes.is_empty() {
             return Vec::new();
         }
-        self.direct_unpack
+        let armed = self
+            .direct_unpack
             .armed
             .iter()
             .filter(|((armed_job, _), armed)| *armed_job == job_id && armed.coverage.is_gated())
-            .map(|((_, set_name), _)| set_name.clone())
-            .collect()
+            .map(|((_, set_name), _)| set_name.clone());
+        // A chase that finished under a standing report carries it until a
+        // repair or a clean verdict retires the outcome. Tainting is how both
+        // do that, so a tainted outcome has already been answered.
+        let finished = self
+            .direct_unpack
+            .outcomes
+            .iter()
+            .filter(|((outcome_job, _), outcome)| {
+                *outcome_job == job_id && outcome.damage_reported && !outcome.tainted
+            })
+            .map(|((_, set_name), _)| set_name.clone());
+        armed.chain(finished).collect()
     }
 
     /// Mark a set as parked through a repair, without going through the
@@ -3179,9 +3290,6 @@ impl Pipeline {
         job_id: JobId,
         set_id: par2_rs::RecoverySetId,
     ) {
-        if self.direct_unpack.armed.is_empty() {
-            return;
-        }
         let gated = self.direct_unpack_gated_sets(job_id);
         if gated.is_empty() {
             return;
@@ -3225,6 +3333,27 @@ impl Pipeline {
                 continue;
             }
             let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) else {
+                // A finished chase has no frontier to reopen. What it decoded
+                // was reported damaged as it streamed and what is on disk now
+                // verifies clean, so the two are not known to be the same
+                // bytes: the members are retired and the set is decoded again
+                // from the files the verdict describes.
+                if let Some(outcome) = self
+                    .direct_unpack
+                    .outcomes
+                    .get_mut(&(job_id, set_name.clone()))
+                    && !outcome.tainted
+                {
+                    outcome.tainted = true;
+                    info!(
+                        job_id = job_id.0,
+                        set_name,
+                        recovery_set_id = %set_id,
+                        "recovery data verified this set clean after its chase finished under \
+                         a damage report; the chase outcome is retired"
+                    );
+                    record_event("retired_after_clean_verification");
+                }
                 continue;
             };
             let coverage = Arc::clone(&armed.coverage);

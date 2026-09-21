@@ -573,30 +573,41 @@ impl Pipeline {
         self.par2_set(file_id.job_id).is_none()
     }
 
+    /// Record the whole-file CRC32 a part's trailer claims.
+    ///
+    /// Parts that disagree do not make the download wrong: posters exist that
+    /// write a running checksum, or zeros, on every part but the last. The
+    /// only honest conclusion is that this file has no usable whole-file
+    /// expectation, so the value is dropped and the file is remembered as
+    /// untrusted for the rest of its life. The per-part `pcrc32` is unaffected
+    /// and remains the article-level verdict.
     pub(crate) fn note_expected_file_crc(
         &mut self,
         file_id: NzbFileId,
         expected_file_crc: Option<u32>,
-    ) -> Result<(), String> {
+    ) {
         let Some(expected_file_crc) = expected_file_crc else {
-            return Ok(());
+            return;
         };
+        if self.untrusted_file_crcs.contains(&file_id) {
+            return;
+        }
 
         match self.expected_file_crcs.entry(file_id) {
             std::collections::hash_map::Entry::Occupied(existing) => {
-                if *existing.get() == expected_file_crc {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "conflicting yEnc whole-file CRC32 for {file_id}: {:08x} vs {:08x}",
-                        existing.get(),
-                        expected_file_crc
-                    ))
+                if *existing.get() != expected_file_crc {
+                    warn!(
+                        file_id = %file_id,
+                        first = format_args!("{:08x}", existing.get()),
+                        second = format_args!("{expected_file_crc:08x}"),
+                        "parts disagree on the whole-file CRC32; ignoring it for this file"
+                    );
+                    existing.remove();
+                    self.untrusted_file_crcs.insert(file_id);
                 }
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(expected_file_crc);
-                Ok(())
             }
         }
     }
@@ -1234,6 +1245,10 @@ impl Pipeline {
             }
         }
 
+        // A decode that exhausted this ordinal's servers may have settled the
+        // damaged bytes a parked part was waiting to start after.
+        self.release_settled_unanchored_runs().await;
+
         self.pump_decode_queue();
 
         // The download-result path already ran the drain sequence for this
@@ -1287,6 +1302,13 @@ impl Pipeline {
                 error,
                 "decode failed for inactive job — not retrying"
             );
+            return;
+        }
+
+        if self.segment_terminal_states.contains_key(&segment_id) {
+            // A later metadata probe still needs its unavailable marker, while
+            // the existing terminal booking and metrics remain unchanged.
+            self.book_terminal_segment(segment_id, SegmentTerminalState::DecodeExhausted);
             return;
         }
 
@@ -1415,8 +1437,9 @@ impl Pipeline {
         }
     }
 
-    /// Commit a decoded segment, then release any uuencode parts its arrival
-    /// unblocked.
+    /// Commit a decoded segment, then release any parked parts its arrival
+    /// unblocked: uuencode parts behind the sequential cursor, and yEnc parts
+    /// that could not say where they start.
     ///
     /// Sequential assembly means one part's placement can make the next one
     /// placeable, and that one the next again. Released parts re-enter through
@@ -1429,6 +1452,7 @@ impl Pipeline {
         source: SegmentSource,
     ) {
         let file_id = result.segment_id.file_id;
+        let segment_number = result.segment_id.segment_number;
         let is_uu = result.encoding.is_uu();
         if is_uu {
             // Ahead of the commit, because the routing seam inside is what a
@@ -1440,6 +1464,15 @@ impl Pipeline {
         self.handle_decode_success_inner(result, source).await;
 
         if !is_uu {
+            let mut placed = segment_number;
+            while let Some((result, source)) = self.take_unanchored_successor(file_id, placed) {
+                placed = result.segment_id.segment_number;
+                self.handle_decode_success_inner(result, source).await;
+            }
+            // Bytes kept for repair are settled by the booking their own
+            // retries end in, which happens inside the commit above and cannot
+            // write the parts it unblocks.
+            self.release_settled_unanchored_runs().await;
             return;
         }
         loop {
@@ -1476,6 +1509,7 @@ impl Pipeline {
                 crc_valid: true,
                 part_crc_verified: false,
                 part_crc: 0,
+                truncation_suspected: false,
                 expected_file_crc: None,
                 data,
                 yenc_name: String::new(),
@@ -1497,12 +1531,13 @@ impl Pipeline {
         let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_success");
         let DecodeResult {
             segment_id,
-            raw_size: _,
+            raw_size,
             encoding,
             yenc_layout,
             crc_valid,
             part_crc_verified,
             part_crc,
+            truncation_suspected,
             expected_file_crc,
             data,
             yenc_name,
@@ -1546,6 +1581,9 @@ impl Pipeline {
                 }
             };
             let decoded_len = data.len_bytes();
+            // Set when this part starts where damaged bytes kept for repair
+            // were judged to end, rather than after a placement.
+            let mut anchored_on_settled_damage = false;
 
             // uuencode cannot be placed by the yEnc layout rules. An article
             // declares no range, so the validator's no-range arm falls back to
@@ -1632,12 +1670,63 @@ impl Pipeline {
                     }
                 }
             } else {
-                match validate_yenc_layout(expected_layout, yenc_layout, decoded_len) {
-                    Ok(file_offset) => {
-                        // The declared file exists on the wire. Nothing this
-                        // file's articles say afterwards may retire it.
-                        self.disarm_foreign_layout_watch(file_id);
-                        file_offset
+                // Only consulted for an article that declared no usable start
+                // of its own: ordinal zero opens the file, and every other
+                // ordinal follows the one before it.
+                let sequential_anchor = if segment_id.segment_number == 0 {
+                    Some(0)
+                } else {
+                    let predecessor = segment_id.segment_number - 1;
+                    // A part given up with damaged bytes still on disk knows
+                    // where it ended; assembly only needs to be told that no
+                    // further copy of it is coming.
+                    let settled = self.segment_terminal_states.contains_key(&SegmentId {
+                        file_id,
+                        segment_number: predecessor,
+                    });
+                    let file = self
+                        .jobs
+                        .get(&job_id)
+                        .and_then(|state| state.assembly.file(file_id));
+                    let anchor = file.and_then(|file| file.anchor_end_after(predecessor, settled));
+                    // An anchor the part before it never placed is one read off
+                    // bytes that are being kept only for repair — and it is
+                    // used only by an article that named no start of its own.
+                    anchored_on_settled_damage = anchor.is_some()
+                        && yenc_layout.begin.is_none()
+                        && file.is_some_and(|file| file.placement_of(predecessor).is_none());
+                    anchor
+                };
+                match validate_yenc_layout(
+                    expected_layout,
+                    yenc_layout,
+                    decoded_len,
+                    sequential_anchor,
+                ) {
+                    Ok(file_offset) => file_offset,
+                    Err(YencLayoutMismatch::PredecessorNotPlaced) => {
+                        // An ordering condition, not damage. The article waits,
+                        // decoded, for the part before it, and spends no retry.
+                        drop(_cpu_scope);
+                        self.park_or_requeue_unanchored(
+                            DecodeResult {
+                                segment_id,
+                                raw_size,
+                                encoding,
+                                yenc_layout,
+                                crc_valid,
+                                part_crc_verified,
+                                part_crc,
+                                truncation_suspected,
+                                expected_file_crc,
+                                data,
+                                yenc_name,
+                                checkpoint_plan,
+                                segments,
+                            },
+                            source,
+                        );
+                        return;
                     }
                     Err(mismatch) => {
                         let error = format_yenc_layout_mismatch(
@@ -1648,7 +1737,6 @@ impl Pipeline {
                         );
                         self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                         drop(_cpu_scope);
-                        self.note_yenc_layout_refusal(segment_id, mismatch, yenc_layout);
                         self.handle_decode_failure(
                             segment_id,
                             &error,
@@ -1663,36 +1751,86 @@ impl Pipeline {
             // sizes are yEnc-encoded and run ~3% large.
             let decoded_size = decoded_len as u32;
 
-            // One bounded memcpy for the obfuscation binder, and for the
-            // overwhelming majority of articles not even that — the first thing
-            // it does is compare `file_offset` against 16 KiB and return.
-            self.note_par2_binding_declared_size(file_id, yenc_layout.file_size);
-            self.note_par2_binding_prefix(file_id, file_offset, &data);
-
             // The per-segment bounds above cannot see across segments, so they
             // would still let an article claim a range an earlier ordinal
             // already owns. Check against this segment's neighbours and record
             // the placement in the same borrow: this is per-article work on the
             // orchestrator thread, so it is two range probes and one insert.
+            if !crc_valid
+                && self
+                    .file_crc_recoveries
+                    .get(&file_id)
+                    .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id))
+            {
+                drop(_cpu_scope);
+                self.handle_decode_failure(
+                    segment_id,
+                    "CRC mismatch during whole-file recovery",
+                    &source.exclude_servers,
+                    source.source_server_idx,
+                );
+                return;
+            }
+            let held_damage = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .map(|file| {
+                    (
+                        file.segment_has_retained_damage(segment_id.segment_number),
+                        file.segment_damage_is_truncation_only(segment_id.segment_number),
+                    )
+                })
+                .unwrap_or((false, false));
+            // A copy whose own length is accounted for settles a body that was
+            // merely suspected of being cut short. It says nothing about a
+            // checksum that actually disagreed, so that damage still stands.
+            let unresolved_replacement =
+                !part_crc_verified && held_damage.0 && !(!truncation_suspected && held_damage.1);
+            let retain_damage = !crc_valid || truncation_suspected || unresolved_replacement;
+            // Suspicion must never soften damage a checksum already proved.
+            let damage_is_truncation_only =
+                crc_valid && truncation_suspected && !(held_damage.0 && !held_damage.1);
+            // Where this article said its range ends, which is where the next
+            // ordinal starts even if these bytes are kept only for repair.
+            let declared_end = declared_part_end(expected_layout, yenc_layout);
             let conflict = match self
                 .jobs
                 .get_mut(&job_id)
                 .and_then(|state| state.assembly.file_mut(file_id))
             {
                 Some(file) => {
-                    match file.placement_conflict(
-                        segment_id.segment_number,
-                        file_offset,
-                        decoded_size,
-                    ) {
-                        Some(other) => Some(other),
-                        None => {
-                            file.record_placement(
-                                segment_id.segment_number,
-                                file_offset,
-                                decoded_size,
-                            );
-                            None
+                    // A late corrupt duplicate must not replace bytes already
+                    // committed by a good response (or their placement).
+                    if (!crc_valid || truncation_suspected)
+                        && file.has_segment(segment_id.segment_number)
+                    {
+                        return;
+                    }
+                    if retain_damage {
+                        None
+                    } else {
+                        match file.placement_conflict(
+                            segment_id.segment_number,
+                            file_offset,
+                            decoded_size,
+                        ) {
+                            Some(other) => Some(other),
+                            None => {
+                                file.record_placement(
+                                    segment_id.segment_number,
+                                    file_offset,
+                                    decoded_size,
+                                );
+                                if anchored_on_settled_damage {
+                                    // The tiling is now only as good as the
+                                    // boundary damaged bytes were judged to
+                                    // have, so completion stays gated on a
+                                    // repair verdict for this file.
+                                    file.require_geometry_verification();
+                                }
+                                None
+                            }
                         }
                     }
                 }
@@ -1714,6 +1852,93 @@ impl Pipeline {
                 return;
             }
 
+            if retain_damage {
+                if !crc_valid {
+                    self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                drop(_cpu_scope);
+                self.demote_direct_sets_for_article(
+                    file_id,
+                    crate::pipeline::direct_store::router::DemotionReason::PartChecksumMismatch,
+                )
+                .await;
+                // Demotion may reset assembly; record damage after it has
+                // transferred this volume back to conventional assembly.
+                if let Some(file) = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .and_then(|state| state.assembly.file_mut(file_id))
+                {
+                    file.note_retained_damage(
+                        segment_id.segment_number,
+                        file_offset,
+                        decoded_size,
+                        damage_is_truncation_only,
+                        declared_end,
+                    );
+                }
+                let filename = self
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|state| state.assembly.file(file_id))
+                    .map(|file| self.current_filename_for_file(job_id, file));
+                if let Some(filename) = filename {
+                    self.direct_unpack_abort_sets_containing(
+                        job_id,
+                        &filename,
+                        "damaged yEnc article retained for repair",
+                    );
+                }
+                self.invalidate_par2_session_for_file_write(file_id);
+                self.mark_file_hash_reread_required_for(file_id, "retained_damage");
+                let segment = BufferedDecodedSegment {
+                    segment_id,
+                    decoded_size,
+                    encoding,
+                    data,
+                    part_crc,
+                    part_crc_verified: false,
+                    yenc_name,
+                    checkpoint_plan,
+                    segments,
+                    damaged_source: Some(Box::new(RetainedArticleDamage {
+                        source,
+                        status: if crc_valid {
+                            weaver_yenc::CrcVerification::Unverified
+                        } else {
+                            weaver_yenc::CrcVerification::Mismatch
+                        },
+                        truncation_suspected: damage_is_truncation_only,
+                        declared_end,
+                        write_spans: Vec::new(),
+                    })),
+                };
+                self.note_write_buffered(decoded_len, 1);
+                if self.demotion_sweep_owns_file(file_id) {
+                    // The existing sweep handback drains these bytes only
+                    // after reconstruction has stopped owning the file.
+                    self.write_buffers
+                        .entry(file_id)
+                        .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending))
+                        .insert(file_offset, segment);
+                } else if let Err(error) = self
+                    .persist_out_of_order_segments(
+                        file_id,
+                        vec![(file_offset, segment)],
+                        OutOfOrderPersistReason::QuiescentFlush,
+                    )
+                    .await
+                {
+                    self.fail_job_for_disk_write(error, "damaged article write failed");
+                }
+                return;
+            }
+
+            // Only usable data may establish the obfuscated file's prefix.
+            // Damaged candidates never enter the first-wins binding caches.
+            self.note_par2_binding_declared_size(file_id, yenc_layout.file_size);
+            self.note_par2_binding_prefix(file_id, file_offset, &data);
+
             self.metrics
                 .bytes_decoded
                 .fetch_add(u64::from(decoded_size), Ordering::Relaxed);
@@ -1728,15 +1953,8 @@ impl Pipeline {
                     .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id));
 
             self.note_recovery_count_from_yenc_name(job_id, file_id.file_index, &yenc_name);
-            if let Err(error) = self.note_expected_file_crc(file_id, expected_file_crc) {
-                self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                self.fail_job(job_id, error);
-                return;
-            }
+            self.note_expected_file_crc(file_id, expected_file_crc);
 
-            if !crc_valid {
-                self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-            }
             if part_crc_verified {
                 crate::runtime::perf_probe::record(
                     "download.yenc_part_crc.verified",
@@ -1818,6 +2036,7 @@ impl Pipeline {
             }
 
             let mut buffered_segment = BufferedDecodedSegment {
+                damaged_source: None,
                 segment_id,
                 decoded_size,
                 encoding,
@@ -2064,25 +2283,19 @@ impl Pipeline {
         if file_offset >= crate::pipeline::PAR2_HASH_16K_BYTES as u64 {
             return;
         }
-        let (prefix_complete, header_became_available) = {
+        let (prefix_complete, header_became_available, replaced_prefix) = {
             let prefix = self.file_prefix_16k.entry(file_id).or_default();
             let captured = prefix.len() as u64;
             let header_was_incomplete = prefix.len() < par2_rs::packet::header::HEADER_SIZE;
-            // A gap the buffer cannot close, or a range already wholly captured.
+            // A gap cannot establish a contiguous prefix.
             if file_offset > captured {
                 return;
             }
-            let mut skip = (captured - file_offset) as usize;
-            if skip >= data.len_bytes() {
-                return;
+            let replaced_prefix = file_offset < captured;
+            if replaced_prefix {
+                prefix.truncate(file_offset as usize);
             }
             data.for_each_slice(|slice| {
-                if skip >= slice.len() {
-                    skip -= slice.len();
-                    return;
-                }
-                let slice = &slice[skip..];
-                skip = 0;
                 let room = crate::pipeline::PAR2_HASH_16K_BYTES.saturating_sub(prefix.len());
                 if room == 0 {
                     return;
@@ -2091,7 +2304,9 @@ impl Pipeline {
             });
             (
                 prefix.len() == crate::pipeline::PAR2_HASH_16K_BYTES,
-                header_was_incomplete && prefix.len() >= par2_rs::packet::header::HEADER_SIZE,
+                (header_was_incomplete || replaced_prefix)
+                    && prefix.len() >= par2_rs::packet::header::HEADER_SIZE,
+                replaced_prefix,
             )
         };
         if header_became_available {
@@ -2100,12 +2315,12 @@ impl Pipeline {
                 self.file_declared_size.get(&file_id).copied(),
             );
         }
-        if prefix_complete {
+        if prefix_complete || replaced_prefix {
             self.refresh_par2_md5_substitution_binding(file_id);
         }
     }
 
-    /// Retain the first usable yEnc total for content-binding corroboration.
+    /// Retain the first yEnc size hint for metadata probing, never identity rejection.
     fn note_par2_binding_declared_size(&mut self, file_id: NzbFileId, declared_size: u64) {
         if declared_size == 0 {
             return;
@@ -2351,6 +2566,210 @@ impl Pipeline {
         );
     }
 
+    /// An article that could not say where it starts, arriving before the
+    /// ordinal it must follow.
+    ///
+    /// The bytes are fine; they simply have nowhere to go yet. They are held,
+    /// decoded, until the predecessor is placed, and released through the same
+    /// commit path the moment it is — so an out-of-order arrival costs memory
+    /// for a while, not another fetch. The hold is bounded by the same soft
+    /// write threshold and per-file part count as the uuencode reorder park, and
+    /// is never spilled: an article that does not fit is asked for again
+    /// instead, without its retry budget.
+    fn park_or_requeue_unanchored(&mut self, result: DecodeResult, source: SegmentSource) {
+        let segment_id = result.segment_id;
+        let file_id = segment_id.file_id;
+        let ordinal = segment_id.segment_number;
+        let predecessor = SegmentId {
+            file_id,
+            segment_number: ordinal.saturating_sub(1),
+        };
+        if self.segment_terminal_states.contains_key(&predecessor) {
+            // The part it must follow was given up leaving nothing to measure
+            // from — no placement and no extent this article could follow, or
+            // the anchor would have been found above and these bytes placed.
+            // Waiting is pointless and a fetch would bring back the same
+            // article.
+            self.give_up_unanchored(segment_id);
+            return;
+        }
+        let bytes = result.data.len_bytes();
+        let replaced_bytes = self
+            .unanchored_parked
+            .get(&file_id)
+            .and_then(|parked| parked.get(&ordinal))
+            .map(|(parked, _)| parked.data.len_bytes());
+        let parked_parts = self
+            .unanchored_parked
+            .get(&file_id)
+            .map_or(0, BTreeMap::len);
+        let (_, _, write_soft, _) = self.download_pressure_limits();
+        let resident = self
+            .write_buffered_bytes
+            .saturating_sub(replaced_bytes.unwrap_or(0))
+            .saturating_add(bytes);
+        let fits = (resident as u64) < write_soft
+            && (replaced_bytes.is_some() || parked_parts < self.uu_park_max_segments);
+        if !fits {
+            self.requeue_segment_awaiting_predecessor(segment_id);
+            return;
+        }
+        if let Some(replaced_bytes) = replaced_bytes {
+            self.release_write_buffered(replaced_bytes, 1);
+        }
+        self.note_write_buffered(bytes, 1);
+        self.unanchored_parked
+            .entry(file_id)
+            .or_default()
+            .insert(ordinal, (result, source));
+        debug!(
+            segment = %segment_id,
+            "article declared no usable start and its predecessor is unplaced; held until it is"
+        );
+    }
+
+    /// The parked article that directly follows `predecessor`, once
+    /// `predecessor` has an end for it to start at: a placement, or — once no
+    /// further copy of it is coming — the extent its damaged bytes occupy. A
+    /// part that left neither behind anchors nothing and releases nothing.
+    fn take_unanchored_successor(
+        &mut self,
+        file_id: NzbFileId,
+        predecessor: u32,
+    ) -> Option<(DecodeResult, SegmentSource)> {
+        if self.unanchored_parked.is_empty() {
+            return None;
+        }
+        let successor = predecessor.checked_add(1)?;
+        if !self
+            .unanchored_parked
+            .get(&file_id)
+            .is_some_and(|parked| parked.contains_key(&successor))
+        {
+            return None;
+        }
+        let settled = self.segment_terminal_states.contains_key(&SegmentId {
+            file_id,
+            segment_number: predecessor,
+        });
+        let anchored = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .is_some_and(|file| file.anchor_end_after(predecessor, settled).is_some());
+        if !anchored {
+            return None;
+        }
+        let parked = self.unanchored_parked.get_mut(&file_id)?;
+        let entry = parked.remove(&successor)?;
+        if parked.is_empty() {
+            self.unanchored_parked.remove(&file_id);
+        }
+        self.release_write_buffered(entry.0.data.len_bytes(), 1);
+        Some(entry)
+    }
+
+    /// Parked articles that were waiting on `segment_id`, which has just been
+    /// given up. Each of them anchors on the one before it, so the whole run
+    /// after it has lost its only way to be placed.
+    pub(crate) fn take_unanchored_dependents(&mut self, segment_id: SegmentId) -> Vec<SegmentId> {
+        let file_id = segment_id.file_id;
+        let Some(parked) = self.unanchored_parked.get_mut(&file_id) else {
+            return Vec::new();
+        };
+        let mut released = Vec::new();
+        let mut released_bytes = 0usize;
+        let mut next = segment_id.segment_number;
+        while let Some(ordinal) = next.checked_add(1) {
+            let Some((result, _)) = parked.remove(&ordinal) else {
+                break;
+            };
+            released_bytes = released_bytes.saturating_add(result.data.len_bytes());
+            released.push(result.segment_id);
+            next = ordinal;
+        }
+        if parked.is_empty() {
+            self.unanchored_parked.remove(&file_id);
+        }
+        if !released.is_empty() {
+            self.release_write_buffered(released_bytes, released.len());
+        }
+        released
+    }
+
+    /// Release the articles held behind an ordinal that has just settled for
+    /// good with its damaged bytes left on disk.
+    ///
+    /// The booking that settles an ordinal is not a place where a decoded part
+    /// can be written, so it only notes which ordinals it unblocked; the run
+    /// behind each of them is released here, through the same commit path
+    /// every other part takes, and each part placed anchors the next.
+    pub(crate) async fn release_settled_unanchored_runs(&mut self) {
+        while let Some(settled) = self.pending_unanchored_release.pop() {
+            let file_id = settled.file_id;
+            let mut anchor = settled.segment_number;
+            while let Some((result, source)) = self.take_unanchored_successor(file_id, anchor) {
+                anchor = result.segment_id.segment_number;
+                self.handle_decode_success_inner(result, source).await;
+            }
+        }
+    }
+
+    /// Retire an unanchored article whose predecessor was given up. It is
+    /// booked like any other article that never decoded into a placement, so
+    /// repair accounts for it and the job does not wait on it.
+    pub(crate) fn give_up_unanchored(&mut self, segment_id: SegmentId) {
+        warn!(
+            segment = %segment_id,
+            "article declared no usable start and the part before it was given up; leaving it to repair"
+        );
+        self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .segments_failed_permanent
+            .fetch_add(1, Ordering::Relaxed);
+        self.book_terminal_segment(segment_id, SegmentTerminalState::DecodeExhausted);
+    }
+
+    /// The fallback when an unanchored article cannot be held: ask for it
+    /// again, without excluding the server that served it and without spending
+    /// its retry budget. The bound counts attempts since the file last placed
+    /// anything, so a long file that is steadily filling in never exhausts it,
+    /// while an article behind an ordinal that never arrives still stops.
+    fn requeue_segment_awaiting_predecessor(&mut self, segment_id: SegmentId) {
+        const MAX_ANCHOR_REQUEUES: u32 = 8;
+
+        let placed = self
+            .jobs
+            .get(&segment_id.file_id.job_id)
+            .and_then(|state| state.assembly.file(segment_id.file_id))
+            .map_or(0, |file| file.placed_segment_count());
+        let (attempts, seen_placed) = self
+            .unanchored_requeues
+            .entry(segment_id)
+            .or_insert((0, placed));
+        if *seen_placed != placed {
+            *seen_placed = placed;
+            *attempts = 0;
+        }
+        *attempts += 1;
+        if *attempts <= MAX_ANCHOR_REQUEUES && self.push_requeued_segment(segment_id) {
+            debug!(
+                segment = %segment_id,
+                "article declared no usable start and its predecessor is unplaced; requeued without retry budget"
+            );
+            return;
+        }
+        // Bound reached: treat it as a real failure so the segment cannot
+        // cycle forever behind an ordinal that may never arrive.
+        self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.handle_decode_failure(
+            segment_id,
+            "article declared no usable start and its predecessor never arrived",
+            &[],
+            None,
+        );
+    }
+
     fn requeue_uu_segment_for_ordering(&mut self, segment_id: SegmentId) -> bool {
         const MAX_UU_PARK_REQUEUES: u32 = 8;
 
@@ -2372,6 +2791,24 @@ impl Pipeline {
             return false;
         }
 
+        if !self.push_requeued_segment(segment_id) {
+            return false;
+        }
+        crate::runtime::perf_probe::record(
+            "download.uu.park_requeue",
+            std::time::Duration::from_nanos(1),
+        );
+        debug!(
+            segment = %segment_id,
+            "uuencode part displaced by park pressure; requeued without retry budget"
+        );
+        true
+    }
+
+    /// Queue a segment again exactly as first dispatched: full retry budget,
+    /// no excluded server. Used where an article has to come back for an
+    /// ordering reason rather than because anything was wrong with it.
+    fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
         let completion_critical = self.segment_is_completion_critical(segment_id);
         let Some(state) = self.jobs.get_mut(&job_id) else {
@@ -2403,14 +2840,6 @@ impl Pipeline {
         };
         state.download_queue.push(work);
         self.update_queue_metrics();
-        crate::runtime::perf_probe::record(
-            "download.uu.park_requeue",
-            std::time::Duration::from_nanos(1),
-        );
-        debug!(
-            segment = %segment_id,
-            "uuencode part displaced by park pressure; requeued without retry budget"
-        );
         true
     }
 
@@ -2613,6 +3042,70 @@ impl Pipeline {
         }
     }
 
+    /// Reconcile damage at handoff, after any demotion reset. Protect both
+    /// durable ownership and accepted writes still waiting in this batch/buffer.
+    fn prepare_damaged_writes(
+        &self,
+        file_id: NzbFileId,
+        batch: &mut [(u64, BufferedDecodedSegment)],
+    ) {
+        if !batch
+            .iter()
+            .any(|(_, segment)| segment.damaged_source.is_some())
+        {
+            return;
+        }
+        let mut protected: Vec<_> = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .into_iter()
+            .flat_map(|file| file.protected_write_ranges())
+            .collect();
+        let accepted = batch
+            .iter()
+            .map(|(offset, segment)| (*offset, segment))
+            .chain(
+                self.write_buffers
+                    .get(&file_id)
+                    .into_iter()
+                    .flat_map(|buffer| buffer.buffered_chunks()),
+            );
+        for (offset, segment) in accepted {
+            if segment.damaged_source.is_none() {
+                protected.push((offset, offset.saturating_add(segment.len_bytes() as u64)));
+            }
+        }
+        protected.sort_unstable();
+        for (offset, segment) in batch {
+            let Some(damage) = segment.damaged_source.as_mut() else {
+                continue;
+            };
+            damage.write_spans.clear();
+            let end = offset.saturating_add(segment.data.len_bytes() as u64);
+            let mut cursor = *offset;
+            for &(start, stop) in &protected {
+                if stop <= cursor {
+                    continue;
+                }
+                if start >= end {
+                    break;
+                }
+                if start > cursor {
+                    damage
+                        .write_spans
+                        .push((cursor - *offset) as usize..(start - *offset) as usize);
+                }
+                cursor = cursor.max(stop).min(end);
+            }
+            if cursor < end {
+                damage
+                    .write_spans
+                    .push((cursor - *offset) as usize..(end - *offset) as usize);
+            }
+        }
+    }
+
     pub(in crate::pipeline) async fn persist_ready_segments(
         &mut self,
         file_id: NzbFileId,
@@ -2651,6 +3144,8 @@ impl Pipeline {
             ready_bytes as u64,
         );
         self.invalidate_par3_source_write(file_id);
+        let mut ready = ready;
+        self.prepare_damaged_writes(file_id, &mut ready);
         let write_result = write_segments_to_disk(&file_path, ready).await;
         self.release_write_buffered(ready_bytes, ready_count);
 
@@ -2875,6 +3370,8 @@ impl Pipeline {
 
         let write_start = Instant::now();
         self.invalidate_par3_source_write(file_id);
+        let mut segments = segments;
+        self.prepare_damaged_writes(file_id, &mut segments);
         let write_result = write_segments_to_disk(&file_path, segments).await;
         // Hot-path safe: reuses the `write_start` this path already keeps for
         // the `disk_write_latency_us` gauge, so the histogram costs no extra
@@ -2903,7 +3400,9 @@ impl Pipeline {
             crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
             let segment_bytes = segment.len_bytes();
 
-            if let Some(write_buf) = self.write_buffers.get_mut(&file_id) {
+            if segment.damaged_source.is_none()
+                && let Some(write_buf) = self.write_buffers.get_mut(&file_id)
+            {
                 write_buf.mark_persisted(offset, segment_bytes);
             }
             self.metrics
@@ -2959,7 +3458,52 @@ impl Pipeline {
         hash_mode: SegmentHashMode,
     ) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.commit_persisted_segment");
+        if let Some(unresolved) = segment.damaged_source.as_ref() {
+            let source = &unresolved.source;
+            let status = unresolved.status;
+            let truncation_suspected = unresolved.truncation_suspected;
+            let file_id = segment.segment_id.file_id;
+            if let Some(file) = self
+                .jobs
+                .get_mut(&file_id.job_id)
+                .and_then(|state| state.assembly.file_mut(file_id))
+            {
+                // A parked corrupt duplicate may have been superseded while
+                // demotion owned the file. Its masked write proves no damage.
+                if file.has_segment(segment.segment_id.segment_number) {
+                    return;
+                }
+                file.note_retained_damage(
+                    segment.segment_id.segment_number,
+                    file_offset,
+                    segment.decoded_size,
+                    unresolved.truncation_suspected,
+                    unresolved.declared_end,
+                );
+            }
+            // The disk owner completed this write before an alternate response
+            // can be scheduled. No assembly bit, successful event, checksum
+            // evidence or completed-file row may be produced for these bytes.
+            self.handle_decode_failure(
+                segment.segment_id,
+                match status {
+                    weaver_yenc::CrcVerification::Mismatch => {
+                        "yEnc CRC mismatch; decoded bytes retained for repair"
+                    }
+                    _ if truncation_suspected => {
+                        "yEnc article ended short with no checksum; decoded bytes retained while another server is asked"
+                    }
+                    _ => {
+                        "unverified replacement of damaged yEnc bytes; verification still required"
+                    }
+                },
+                &source.exclude_servers,
+                source.source_server_idx,
+            );
+            return;
+        }
         let BufferedDecodedSegment {
+            damaged_source: _,
             segment_id,
             decoded_size,
             encoding,
@@ -2982,18 +3526,34 @@ impl Pipeline {
                 return;
             };
 
+            // A demotion can reset assembly while this accepted article is
+            // parked in the write buffer. Restore its measured placement at
+            // the durable handoff, before deciding whether coverage is whole.
+            if file_asm.placement_of(segment_id.segment_number).is_none() {
+                file_asm.record_placement(segment_id.segment_number, file_offset, decoded_size);
+            }
+            // A verified copy settles any damage. An unverified one settles a
+            // body only suspected of being cut short, never a failed checksum.
+            let replaced_damage = (part_crc_verified
+                || file_asm.segment_damage_is_truncation_only(segment_id.segment_number))
+                && file_asm.clear_retained_damage(segment_id.segment_number);
+            file_asm.note_part_verification(segment_id.segment_number, part_crc_verified);
             match file_asm.commit_segment(segment_id.segment_number, decoded_size) {
                 Ok(commit) => Ok((
                     commit.file_complete,
                     file_asm.received_bytes(),
                     commit.was_duplicate,
+                    replaced_damage,
                 )),
                 Err(e) => Err(e),
             }
         };
 
         match commit_result {
-            Ok((file_complete, total_bytes, was_duplicate)) => {
+            Ok((file_complete, total_bytes, was_duplicate, replaced_damage)) => {
+                if replaced_damage {
+                    self.clear_replaced_damage_failure(segment_id);
+                }
                 if !was_duplicate {
                     self.metrics
                         .bytes_committed
@@ -3181,6 +3741,83 @@ impl Pipeline {
                         }
                     }
 
+                    let total_bytes = if encoding.is_uu() {
+                        total_bytes
+                    } else {
+                        let file = self
+                            .jobs
+                            .get(&job_id)
+                            .and_then(|state| state.assembly.file(file_id));
+                        let end = file.and_then(|file| file.decoded_coverage_end());
+                        let final_verified = file.is_some_and(|file| file.final_part_verified());
+                        let disk_len = match tokio::fs::metadata(file_path).await {
+                            Ok(metadata) => metadata.len(),
+                            Err(error) => {
+                                self.fail_job_for_disk_write(
+                                    SegmentWriteError::new(file_id, error),
+                                    "completed file metadata failed",
+                                );
+                                return;
+                            }
+                        };
+                        let safe_end = end
+                            .filter(|end| disk_len == *end || (disk_len > *end && final_verified));
+                        let Some(end) = safe_end else {
+                            // A file geometry problem does not make the last
+                            // verified article a failed download. Keep its
+                            // successful ledger entry and require file repair.
+                            if let Some(file) = self
+                                .jobs
+                                .get_mut(&job_id)
+                                .and_then(|state| state.assembly.file_mut(file_id))
+                            {
+                                file.require_geometry_verification();
+                            }
+                            self.mark_file_hash_reread_required_for(file_id, "incomplete_geometry");
+                            self.direct_unpack_abort_sets_containing(
+                                job_id,
+                                filename,
+                                "file geometry requires verification",
+                            );
+                            self.schedule_job_completion_check(job_id);
+                            return;
+                        };
+                        if disk_len > end {
+                            // The verified final article and contiguous ranges
+                            // prove this suffix is stale, including after a
+                            // restart. No interior bytes are zeroed or removed.
+                            crate::pipeline::release_cached_write_handle(file_path);
+                            let truncate = async {
+                                tokio::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(file_path)
+                                    .await?
+                                    .set_len(end)
+                                    .await
+                            }
+                            .await;
+                            if let Err(error) = truncate {
+                                self.fail_job_for_disk_write(
+                                    SegmentWriteError::new(file_id, error),
+                                    "stale suffix truncate failed",
+                                );
+                                return;
+                            }
+                            self.mark_file_hash_reread_required_for(
+                                file_id,
+                                "stale_suffix_removed",
+                            );
+                        }
+                        if let Some(file) = self
+                            .jobs
+                            .get_mut(&job_id)
+                            .and_then(|state| state.assembly.file_mut(file_id))
+                        {
+                            file.clear_geometry_verification();
+                        }
+                        end
+                    };
+
                     // The file's length is what makes its short final block
                     // closable: until now that block's extent was undecided.
                     // Blocks the grid could not claim in stream (including the
@@ -3189,7 +3826,7 @@ impl Pipeline {
                     // completion gate's verification pass to read back.
                     self.block_crcs.note_file_len(file_id, total_bytes);
 
-                    let expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
+                    let mut expected_file_crc = self.expected_file_crcs.get(&file_id).copied();
                     let file_checksum = match self
                         .finalize_completed_file_hash(
                             file_id,
@@ -3224,20 +3861,49 @@ impl Pipeline {
                         && file_checksum.crc32 != expected_crc
                     {
                         self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                        match self
-                            .schedule_file_crc_recovery(file_id, expected_crc, file_checksum.crc32)
-                            .await
-                        {
-                            // Recovery rewrites this file: its handle stays.
-                            Ok(true) => return,
-                            Ok(false) => {}
-                            Err(error) => {
-                                crate::pipeline::release_cached_write_handle(file_path);
-                                self.fail_job(job_id, error);
-                                return;
+                        // Every part carried its own checksum and verified, and
+                        // the recorded placements tile the file exactly. The
+                        // bytes on disk are therefore the bytes that were
+                        // posted, and the trailer's whole-file value is what is
+                        // wrong — a poster mistake, not a download failure.
+                        let parts_prove_the_bytes = file_checksum.all_parts_crc_verified
+                            && self
+                                .jobs
+                                .get(&job_id)
+                                .and_then(|state| state.assembly.file(file_id))
+                                .is_some_and(|file| file.contiguous_placements_proven());
+                        if parts_prove_the_bytes {
+                            warn!(
+                                job_id = job_id.0,
+                                file_id = %file_id,
+                                expected_crc = format_args!("{expected_crc:08x}"),
+                                actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                "every part verified against its own checksum; discarding the posted whole-file CRC32"
+                            );
+                            self.expected_file_crcs.remove(&file_id);
+                            self.untrusted_file_crcs.remove(&file_id);
+                            // Complete exactly as a matching value would.
+                            expected_file_crc = None;
+                        } else {
+                            match self
+                                .schedule_file_crc_recovery(
+                                    file_id,
+                                    expected_crc,
+                                    file_checksum.crc32,
+                                )
+                                .await
+                            {
+                                // Recovery rewrites this file: its handle stays.
+                                Ok(true) => return,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    crate::pipeline::release_cached_write_handle(file_path);
+                                    self.fail_job(job_id, error);
+                                    return;
+                                }
                             }
-                        }
-                        if self.par2_can_recover_file_crc(file_id, total_bytes, expected_crc) {
+                            let par2_agrees =
+                                self.par2_can_recover_file_crc(file_id, total_bytes, expected_crc);
                             self.taint_direct_unpack_for_file(job_id, filename);
                             let file_index = file_id.file_index;
                             if let Err(error) = self
@@ -3251,23 +3917,35 @@ impl Pipeline {
                                 );
                                 return;
                             }
-                            warn!(
-                                job_id = job_id.0,
-                                file_id = %file_id,
-                                expected_crc = format_args!("{expected_crc:08x}"),
-                                actual_crc = format_args!("{:08x}", file_checksum.crc32),
-                                "whole-file CRC mismatch; matching PAR2 metadata requires repair before acceptance"
-                            );
-                        } else {
-                            crate::pipeline::release_cached_write_handle(file_path);
-                            self.fail_job(
-                                job_id,
-                                format!(
-                                    "yEnc whole-file CRC32 mismatch for {filename}: expected {expected_crc:08x}, actual {:08x}",
-                                    file_checksum.crc32
-                                ),
-                            );
-                            return;
+                            if par2_agrees {
+                                warn!(
+                                    job_id = job_id.0,
+                                    file_id = %file_id,
+                                    expected_crc = format_args!("{expected_crc:08x}"),
+                                    actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                    "whole-file CRC mismatch; matching PAR2 metadata requires repair before acceptance"
+                                );
+                            } else {
+                                // A poster's whole-file value that nothing can
+                                // corroborate is not grounds for ending the job:
+                                // the bytes may still be good, and repair evidence
+                                // may still arrive. The file is held for
+                                // verification and the terminal gate decides.
+                                if let Some(file) = self
+                                    .jobs
+                                    .get_mut(&job_id)
+                                    .and_then(|state| state.assembly.file_mut(file_id))
+                                {
+                                    file.require_geometry_verification();
+                                }
+                                warn!(
+                                    job_id = job_id.0,
+                                    file_id = %file_id,
+                                    expected_crc = format_args!("{expected_crc:08x}"),
+                                    actual_crc = format_args!("{:08x}", file_checksum.crc32),
+                                    "whole-file CRC mismatch with no corroborating evidence; file requires verification"
+                                );
+                            }
                         }
                     }
                     self.ensure_par2_runtime(job_id)
@@ -3354,6 +4032,7 @@ impl Pipeline {
                     self.file_hash_states.remove(&file_id);
                     if expected_file_crc.is_none_or(|expected| expected == file_checksum.crc32) {
                         self.expected_file_crcs.remove(&file_id);
+                        self.untrusted_file_crcs.remove(&file_id);
                     }
                     self.file_hash_reread_required.remove(&file_id);
                     self.unverified_segments.remove(&file_id);

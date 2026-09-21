@@ -950,16 +950,20 @@ impl Pipeline {
                         && file_asm.commit_segment(*segment_number, len as u32).is_ok()
                     {
                         kept_bytes = kept_bytes.saturating_add(len);
+                        file_asm.note_part_verification(
+                            *segment_number,
+                            verified.contains(segment_number),
+                        );
                         if verified.contains(segment_number) {
+                            // Coverage is durable, but reconstruction must not
+                            // manufacture streamed PAR2 checksum evidence.
+                            file_asm.record_reconstructed_placement(
+                                *segment_number,
+                                offset,
+                                len as u32,
+                            );
                             materialized_extents.push((offset, len));
                         } else {
-                            // A handed-off article arrived through the ordinary
-                            // writer, which recorded where it landed; the blanket
-                            // reset above erased that record. Put it back from the
-                            // set's own geometry — the same offset the writer used,
-                            // since both derive it from the volume's article
-                            // extents — so a later duplicate re-places at the copy
-                            // already on disk instead of at a cursor-derived offset.
                             file_asm.record_placement(*segment_number, offset, len as u32);
                         }
                     }

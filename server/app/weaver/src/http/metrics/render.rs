@@ -70,6 +70,9 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) process: Option<&'a ProcessMetricsSnapshot>,
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
+    /// The article buffer pool's occupancy. Absent in the render tests that
+    /// build no pool.
+    pub(crate) buffer_pool: Option<&'a weaver_server_core::runtime::buffers::BufferPoolMetrics>,
 }
 
 impl<'a> PrometheusRenderInput<'a> {
@@ -106,6 +109,7 @@ impl<'a> PrometheusRenderInput<'a> {
             job_lifecycle: None,
             pipeline_histograms: None,
             db_runtime: None,
+            buffer_pool: None,
             process: None,
             disk_space: &[],
             http_metrics: None,
@@ -156,6 +160,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         process,
         disk_space,
         http_metrics,
+        buffer_pool,
     } = *input;
 
     let mut out = Encoder::new();
@@ -226,6 +231,9 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
     if let Some(db) = db_runtime {
         render_db_runtime(&mut out, db);
+    }
+    if let Some(pool) = buffer_pool {
+        render_buffer_pool(&mut out, pool);
     }
     if let Some(process) = process {
         render_process(&mut out, process, start_time_seconds);
@@ -771,6 +779,17 @@ fn render_lanes(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     }
     out.sample(&f::LANES_ACTIVE_TOTAL, &[], snapshot.download_lanes_active);
     out.sample(&f::LANES, &[], snapshot.download_lanes_active);
+    out.sample(
+        &f::LANE_INFLIGHT_BYTES,
+        &[],
+        snapshot.download_lane_inflight_bytes,
+    );
+    out.sample(
+        &f::DOWNLOAD_JOBS_ELIGIBLE,
+        &[],
+        snapshot.download_jobs_eligible,
+    );
+    out.sample(&f::DOWNLOAD_JOBS_HOT, &[], snapshot.download_jobs_hot);
 
     for (reason, value) in [
         ("no_work", snapshot.download_lane_parks_no_work_total),
@@ -1340,6 +1359,52 @@ fn render_db_runtime(out: &mut Encoder, db: &DbRuntimeMetricsSnapshot) {
         &[("engine", db.engine)],
         &db.op_duration,
     );
+}
+
+/// The pre-allocated article buffer pool, in bytes rather than in buffers.
+///
+/// Bytes, because the question this answers is how much of the process's
+/// resident set the pool accounts for; the tiers have different buffer sizes,
+/// so a count of buffers does not add up to anything.
+fn render_buffer_pool(
+    out: &mut Encoder,
+    pool: &weaver_server_core::runtime::buffers::BufferPoolMetrics,
+) {
+    use weaver_server_core::runtime::buffers::BufferTier;
+
+    for (tier, label, in_use, total) in [
+        (
+            BufferTier::Small,
+            "small",
+            pool.small_in_use,
+            pool.small_total,
+        ),
+        (
+            BufferTier::Medium,
+            "medium",
+            pool.medium_in_use,
+            pool.medium_total,
+        ),
+        (
+            BufferTier::Large,
+            "large",
+            pool.large_in_use,
+            pool.large_total,
+        ),
+    ] {
+        let size = tier.size_bytes();
+        out.sample(
+            &f::BUFFER_POOL_IN_USE_BYTES,
+            &[("tier", label)],
+            in_use.saturating_mul(size),
+        );
+        out.sample(
+            &f::BUFFER_POOL_TOTAL_BYTES,
+            &[("tier", label)],
+            total.saturating_mul(size),
+        );
+    }
+    out.sample(&f::BUFFER_POOL_WAITS, &[], pool.wait_count);
 }
 
 /// Standard `process_*` collector series.

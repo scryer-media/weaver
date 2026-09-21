@@ -511,6 +511,10 @@ impl Pipeline {
         let segment_id = result.segment_id;
         let lane_id = result.lane_id;
         self.process_download_done_inner(result).await;
+        // A wire outcome that retired this ordinal may have settled damaged
+        // bytes a parked part was waiting to start after. Booking cannot write
+        // a part; this seam can.
+        self.release_settled_unanchored_runs().await;
         self.finish_checkpoint_progress_article(lane_id, segment_id);
     }
 
@@ -725,11 +729,7 @@ impl Pipeline {
                 )
                 .await;
             }
-            Err(DownloadError::Decode {
-                raw_size,
-                error,
-                crc_mismatch,
-            }) => {
+            Err(DownloadError::Decode { raw_size, error }) => {
                 let raw_size_for_event = raw_size.min(u64::from(u32::MAX)) as u32;
                 self.metrics
                     .bytes_downloaded
@@ -738,9 +738,6 @@ impl Pipeline {
                     .segments_downloaded
                     .fetch_add(1, Ordering::Relaxed);
                 self.note_job_wire_bytes(result.segment_id, raw_size, attributed_server_idx);
-                if crc_mismatch {
-                    self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                }
                 self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
 
                 self.send_segment_event(|| PipelineEvent::ArticleDownloaded {

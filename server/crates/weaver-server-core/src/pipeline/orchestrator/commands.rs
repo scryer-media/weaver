@@ -202,8 +202,6 @@ impl Pipeline {
                         self.download_wait_by_job.remove(&job_id);
                         self.segment_terminal_states
                             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-                        self.foreign_layout_watches
-                            .retain(|file_id, _| file_id.job_id != job_id);
                         self.rate_limit_reservations
                             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
                         self.job_last_download_activity.remove(&job_id);
@@ -223,6 +221,12 @@ impl Pipeline {
                             state.spec.category.as_deref().unwrap_or(""),
                             Some(state.created_at.elapsed()),
                         );
+
+                        // Same boundary as a job that completed or failed: the
+                        // cancelled job's article pages are free and unwanted,
+                        // so hand them back rather than holding a job-sized
+                        // working set until the purge clock runs out.
+                        crate::runtime::thread_release::release_job_completion_memory();
 
                         let working_dir = state.working_dir.clone();
                         let staging_dir = state.staging_dir.clone();

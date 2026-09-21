@@ -41,6 +41,10 @@ export const NEXT_HISTORY_PAGE_QUERY = gql`
         success
         failure
       }
+      categoryCounts {
+        category
+        count
+      }
     }
   }
 `;

@@ -818,6 +818,14 @@ impl ServerTransferControl {
             .min(RATE_SCHEDULE_TARGET_MASK)
     }
 
+    /// The instant, on the same scale as [`Self::rate_now_micros`], that the
+    /// last reservation scheduled. Tests compare reservations and waits
+    /// against this rather than against wall-clock durations.
+    #[cfg(test)]
+    fn rate_schedule_target_micros(&self) -> u64 {
+        self.rate_schedule.load(Ordering::Acquire) & RATE_SCHEDULE_TARGET_MASK
+    }
+
     fn reconfigure_rate(&self, rate_bytes_per_sec: u64) {
         let _waiters = self
             .rate_wait_lock
@@ -1425,26 +1433,56 @@ mod tests {
         );
         let mut warmup = control.try_reserve(0).unwrap();
         assert_eq!(warmup.record_async(20_000).await, Duration::ZERO);
+        let scheduled_before = control.rate_schedule_target_micros();
 
+        // Each waiter reports the schedule clock it saw on return, so the
+        // assertions below can talk about where in the shared schedule that
+        // waiter landed. Which of the two reserves first is a race, so they
+        // are compared as a sorted pair rather than individually.
         let barrier = Arc::new(Barrier::new(3));
         let async_barrier = Arc::clone(&barrier);
+        let async_control = Arc::clone(&control);
         let mut async_permit = control.try_reserve(0).unwrap();
         let async_waiter = tokio::spawn(async move {
             async_barrier.wait();
-            async_permit.record_async(2_000).await
+            let waited = async_permit.record_async(2_000).await;
+            (async_control.rate_now_micros(), waited)
         });
         let blocking_barrier = Arc::clone(&barrier);
+        let blocking_control = Arc::clone(&control);
         let mut blocking_permit = control.try_reserve(0).unwrap();
         let blocking_waiter = tokio::task::spawn_blocking(move || {
             blocking_barrier.wait();
-            blocking_permit.record_blocking(2_000)
+            let waited = blocking_permit.record_blocking(2_000);
+            (blocking_control.rate_now_micros(), waited)
         });
 
         barrier.wait();
-        let mut waits = [async_waiter.await.unwrap(), blocking_waiter.await.unwrap()];
-        waits.sort_unstable();
-        assert!(waits[0] >= Duration::from_millis(50), "waits={waits:?}");
-        assert!(waits[1] >= Duration::from_millis(150), "waits={waits:?}");
+        let mut returns = [async_waiter.await.unwrap(), blocking_waiter.await.unwrap()];
+        returns.sort_unstable();
+
+        // Three properties say the budget is shared: one schedule absorbed
+        // both reservations, and each waiter returned no earlier than the
+        // instant that schedule handed it -- the first one a whole charge
+        // after the warmup, the second a charge after that. None of them is a
+        // duration threshold. The waited durations themselves are not
+        // assertable, because each also measures how long the runtime took to
+        // put that waiter on a core, which on a busy machine outlasts the wait
+        // under test and drives the reported duration to zero.
+        let cost = rate_cost_micros(2_000, 20_000);
+        let scheduled_after = control.rate_schedule_target_micros();
+        assert!(
+            scheduled_after >= scheduled_before.saturating_add(2 * cost),
+            "one schedule must carry both reservations, returns={returns:?}"
+        );
+        assert!(
+            returns[0].0 >= scheduled_before.saturating_add(cost),
+            "the first waiter returned before its scheduled instant, returns={returns:?}"
+        );
+        assert!(
+            returns[1].0 >= scheduled_after,
+            "the second waiter returned before its scheduled instant, returns={returns:?}"
+        );
     }
 
     #[tokio::test]

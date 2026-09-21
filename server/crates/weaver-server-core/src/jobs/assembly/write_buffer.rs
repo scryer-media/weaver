@@ -4,6 +4,9 @@ use crate::runtime::buffers::BufferHandle;
 
 pub trait BufferedChunk {
     fn len_bytes(&self) -> usize;
+    fn contributes_to_coverage(&self) -> bool {
+        true
+    }
 }
 
 impl BufferedChunk for Vec<u8> {
@@ -111,7 +114,9 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
                 PendingChunk::Buffered(buf) => {
                     let len = buf.len_bytes();
                     self.forget_buffered(len);
-                    self.write_cursor += len as u64;
+                    if buf.contributes_to_coverage() {
+                        self.write_cursor += len as u64;
+                    }
                     ready.push((off, buf));
                 }
                 PendingChunk::Persisted { len } => {
@@ -205,6 +210,20 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
 
     pub fn buffered_bytes(&self) -> usize {
         self.buffered_bytes
+    }
+
+    pub(crate) fn buffered_chunks(&self) -> impl Iterator<Item = (u64, &T)> {
+        self.pending
+            .iter()
+            .filter_map(|(&offset, entry)| match entry {
+                PendingChunk::Buffered(chunk) => Some((offset, chunk)),
+                PendingChunk::Persisted { .. } => None,
+            })
+            .chain(
+                self.redundant
+                    .iter()
+                    .map(|(offset, chunk)| (*offset, chunk)),
+            )
     }
 
     /// Sparse ranges whose writes have completed. Buffered/released chunks

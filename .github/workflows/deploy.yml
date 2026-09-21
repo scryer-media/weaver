@@ -733,6 +733,10 @@ jobs:
           else
             export CC_x86_64_unknown_linux_musl="musl-gcc"
           fi
+          # jemalloc fixes its page size when it is compiled, and a binary
+          # built for a smaller page than the kernel it runs on will not work.
+          # Pinned per target so the artifact never inherits a runner's page size.
+          export JEMALLOC_SYS_WITH_LG_PAGE=12
           mold -run cargo build -p weaver --release --locked --target x86_64-unknown-linux-musl
       - name: Verify native libraries are statically bundled
         run: |
@@ -770,8 +774,12 @@ jobs:
       AWS_LC_SYS_STATIC: "1"
       AWS_LC_SYS_SMALL: "0"
       AWS_LC_SYS_CMAKE_BUILDER: "0"
-      CFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
-      CXXFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      # Ubuntu's aarch64 gcc defaults to -moutline-atomics, which drags
+      # libgcc's lse-init.o into every link that touches an atomic. That object
+      # calls __getauxval, which glibc has and musl does not, so the link fails
+      # and any configure probe using atomics reports the feature missing.
+      CFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
+      CXXFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -820,6 +828,11 @@ jobs:
           else
             export CC_aarch64_unknown_linux_musl="musl-gcc"
           fi
+          # jemalloc fixes its page size when it is compiled, and a binary built
+          # for a smaller page than the kernel it runs on will not work. arm64
+          # Linux ships both 4 KiB and 64 KiB kernels, so this portable artifact
+          # is built for the larger one, which runs correctly on both.
+          export JEMALLOC_SYS_WITH_LG_PAGE=16
           mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
       - name: Verify native libraries are statically bundled
         run: |
@@ -848,7 +861,8 @@ jobs:
 
   rust-package-darwin-x86_64-portable:
     name: rust-package-darwin-x86_64-portable
-    runs-on: macos-26
+    # Intel image: this artifact is built natively, never cross-arch.
+    runs-on: macos-15-intel
     timeout-minutes: 90
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
@@ -911,6 +925,10 @@ jobs:
             export CC="clang"
             export CXX="clang++"
           fi
+          # jemalloc fixes its page size when it is compiled, and a binary
+          # built for a smaller page than the kernel it runs on will not work.
+          # Pinned per target so the artifact never inherits a runner's page size.
+          export JEMALLOC_SYS_WITH_LG_PAGE=12
           cargo build -p weaver --bins --release --locked --target x86_64-apple-darwin
       - name: Verify native libraries are statically bundled
         run: |
@@ -923,10 +941,10 @@ jobs:
             echo "release binary dynamically links a bundled native library" >&2
             exit 1
           fi
-      # There is deliberately no WebKit smoke test in this job: the runners
-      # are Apple silicon, so an x86_64 weaver-tray would have to launch WebKit
-      # under Rosetta. The wrapper source is identical across the two targets,
-      # so the arm64 job's run is what proves the wiring.
+      # There is deliberately no WebKit smoke test in this job. The wrapper
+      # source is identical across the two targets, so the arm64 job's run is
+      # what proves the wiring. This job could run one now that it builds on
+      # an Intel image rather than under Rosetta, but that has never run here.
       - name: Assemble Weaver.app
         run: |
           version="$(cargo metadata --format-version 1 --no-deps \
@@ -1075,8 +1093,15 @@ jobs:
           if [ "$SIGNED" = "true" ]; then
             codesign --verify --deep --verbose "$mount_point/Weaver.app"
           fi
+      # The installer fetches a release asset from GitHub, and one gateway
+      # error there otherwise costs the whole release run. One more attempt.
       - name: Install Syft
-        id: syft
+        id: syft_first
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - name: Install Syft (second attempt)
+        id: syft_retry
+        if: steps.syft_first.outcome == 'failure'
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
@@ -1084,7 +1109,7 @@ jobs:
       - name: Generate bundle SBOM
         run: |
           set -euo pipefail
-          "${{ steps.syft.outputs.cmd }}" "dir:dist/app/Weaver.app" \
+          "${{ steps.syft_retry.outputs.cmd || steps.syft_first.outputs.cmd }}" "dir:dist/app/Weaver.app" \
             -o "spdx-json=weaver-darwin-x86_64.spdx.json"
           test -s weaver-darwin-x86_64.spdx.json
       - name: Upload release package
@@ -1165,6 +1190,9 @@ jobs:
             export CC="clang"
             export CXX="clang++"
           fi
+          # jemalloc fixes its page size when it is compiled; Apple Silicon is
+          # 16 KiB. Pinned so the artifact never inherits a runner's page size.
+          export JEMALLOC_SYS_WITH_LG_PAGE=14
           cargo build -p weaver --bins --release --locked --target aarch64-apple-darwin
       - name: Verify native libraries are statically bundled
         run: |
@@ -1331,8 +1359,15 @@ jobs:
           if [ "$SIGNED" = "true" ]; then
             codesign --verify --deep --verbose "$mount_point/Weaver.app"
           fi
+      # The installer fetches a release asset from GitHub, and one gateway
+      # error there otherwise costs the whole release run. One more attempt.
       - name: Install Syft
-        id: syft
+        id: syft_first
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - name: Install Syft (second attempt)
+        id: syft_retry
+        if: steps.syft_first.outcome == 'failure'
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
@@ -1340,7 +1375,7 @@ jobs:
       - name: Generate bundle SBOM
         run: |
           set -euo pipefail
-          "${{ steps.syft.outputs.cmd }}" "dir:dist/app/Weaver.app" \
+          "${{ steps.syft_retry.outputs.cmd || steps.syft_first.outputs.cmd }}" "dir:dist/app/Weaver.app" \
             -o "spdx-json=weaver-darwin-arm64.spdx.json"
           test -s weaver-darwin-arm64.spdx.json
       - name: Upload release package
@@ -2978,8 +3013,15 @@ jobs:
           pattern: weaver-*-${{ github.run_id }}
           path: artifacts
           merge-multiple: true
+      # The installer fetches a release asset from GitHub, and one gateway
+      # error there otherwise costs the whole release run. One more attempt.
       - name: Install Syft
-        id: syft
+        id: syft_first
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - name: Install Syft (second attempt)
+        id: syft_retry
+        if: steps.syft_first.outcome == 'failure'
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       - name: Generate archive SBOMs and SLSA subject list
         run: |
@@ -3002,7 +3044,7 @@ jobs:
           mapfile -t bundle_sboms < <(find artifacts -maxdepth 1 -type f -name 'weaver-darwin-*.spdx.json' -printf '%f\n' | sort)
           test "${#bundle_sboms[@]}" -eq 2
           for archive in "${archives[@]}"; do
-            "${{ steps.syft.outputs.cmd }}" "file:artifacts/${archive}" \
+            "${{ steps.syft_retry.outputs.cmd || steps.syft_first.outputs.cmd }}" "file:artifacts/${archive}" \
               -o "spdx-json=release-inputs/${archive%.*}.spdx.json"
           done
           {

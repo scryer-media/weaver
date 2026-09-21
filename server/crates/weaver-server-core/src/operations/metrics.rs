@@ -322,6 +322,15 @@ pub struct PipelineMetrics {
     pub download_scheduler_handouts_total_spill: AtomicU64,
     /// Handouts made for a probe rather than for payload throughput.
     pub download_scheduler_handouts_total_probe: AtomicU64,
+    /// Raw article bytes dispatched to lanes and not yet answered, summed
+    /// across every lane. Sampled on the metrics tick from the dispatch
+    /// reservations, never maintained on an article path.
+    pub download_lane_inflight_bytes: AtomicU64,
+    /// Jobs competing for articles right now: the hot job plus every job
+    /// behind it that still has something this pipeline could fetch.
+    pub download_jobs_eligible: AtomicUsize,
+    /// One while a hot job exists, zero while nothing is being downloaded.
+    pub download_jobs_hot: AtomicUsize,
     pub download_lanes_active: AtomicUsize,
     pub download_lanes_sequential_active: AtomicUsize,
     pub download_lanes_depth2_active: AtomicUsize,
@@ -462,6 +471,9 @@ impl PipelineMetrics {
             download_scheduler_handouts_total_hot: AtomicU64::new(0),
             download_scheduler_handouts_total_spill: AtomicU64::new(0),
             download_scheduler_handouts_total_probe: AtomicU64::new(0),
+            download_lane_inflight_bytes: AtomicU64::new(0),
+            download_jobs_eligible: AtomicUsize::new(0),
+            download_jobs_hot: AtomicUsize::new(0),
             download_lanes_active: AtomicUsize::new(0),
             download_lanes_sequential_active: AtomicUsize::new(0),
             download_lanes_depth2_active: AtomicUsize::new(0),
@@ -725,6 +737,9 @@ impl PipelineMetrics {
             download_scheduler_handouts_total_probe: self
                 .download_scheduler_handouts_total_probe
                 .load(Ordering::Relaxed),
+            download_lane_inflight_bytes: self.download_lane_inflight_bytes.load(Ordering::Relaxed),
+            download_jobs_eligible: self.download_jobs_eligible.load(Ordering::Relaxed),
+            download_jobs_hot: self.download_jobs_hot.load(Ordering::Relaxed),
             download_lanes_active: self.download_lanes_active.load(Ordering::Relaxed),
             download_lanes_sequential_active: self
                 .download_lanes_sequential_active
@@ -938,6 +953,9 @@ pub struct MetricsSnapshot {
     pub download_scheduler_handouts_total_hot: u64,
     pub download_scheduler_handouts_total_spill: u64,
     pub download_scheduler_handouts_total_probe: u64,
+    pub download_lane_inflight_bytes: u64,
+    pub download_jobs_eligible: usize,
+    pub download_jobs_hot: usize,
     pub download_lanes_active: usize,
     pub download_lanes_sequential_active: usize,
     pub download_lanes_depth2_active: usize,

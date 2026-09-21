@@ -156,6 +156,7 @@ pub(crate) struct PrometheusMetricsExporter {
     transfer_policy:
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     config: SharedConfig,
+    buffers: Arc<weaver_server_core::runtime::buffers::BufferPool>,
     build: BuildInfo,
 }
 
@@ -168,6 +169,7 @@ impl PrometheusMetricsExporter {
             weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry,
         >,
         config: SharedConfig,
+        buffers: Arc<weaver_server_core::runtime::buffers::BufferPool>,
     ) -> Self {
         let build = BuildInfo::new(db.engine_name());
         process_start_epoch_seconds();
@@ -177,6 +179,7 @@ impl PrometheusMetricsExporter {
             nntp_pool,
             transfer_policy,
             config,
+            buffers,
             build,
         }
     }
@@ -266,6 +269,8 @@ impl PrometheusMetricsExporter {
         input.process = Some(&process);
         input.disk_space = &disk_space;
         input.http_metrics = Some(&http_metrics);
+        let buffer_pool = self.buffers.metrics();
+        input.buffer_pool = Some(&buffer_pool);
         render::render_prometheus_metrics_input(&input)
     }
 }

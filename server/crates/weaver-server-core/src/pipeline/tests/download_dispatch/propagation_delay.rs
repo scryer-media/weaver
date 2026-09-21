@@ -1376,6 +1376,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
                 crc_valid: true,
                 part_crc_verified: false,
                 part_crc: par2_rs::checksum::crc32(&payload),
+                truncation_suspected: false,
                 expected_file_crc: None,
                 data: DecodedChunk::from(payload.clone()),
                 yenc_name: filename.to_string(),

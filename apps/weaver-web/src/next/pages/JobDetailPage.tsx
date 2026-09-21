@@ -16,7 +16,9 @@ import {
   RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
+import { authHeaders } from "@/graphql/client";
 import { useTranslate } from "@/lib/context/translate-context";
+import { openUrlAsDownload, readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
 import {
@@ -71,8 +73,8 @@ import { NextShell, RailBlock } from "../shell/NextShell";
 // The relative-size bar is the one cell here carrying no value of its own, so
 // it is the one that goes when a phone cannot hold four tracks.
 const FILE_COLUMNS = {
-  base: "minmax(0, 1fr) 62px 46px",
-  sm: "minmax(0, 1fr) 68px 54px",
+  base: "minmax(0, 1fr) 62px 74px 46px",
+  sm: "minmax(0, 1fr) 68px 82px 54px",
 };
 
 // A log needs its clock and its message; the machine-readable kind is what a
@@ -236,7 +238,11 @@ export function JobDetailPage() {
     [job?.status, now, snapshot?.jobTimeline, t],
   );
 
-  const files = filesData?.jobOutputFiles?.files ?? [];
+  // The two dot-files weaver drops to mark a job's own directory are
+  // bookkeeping, not output: listing them offers a download the server refuses.
+  const files = (filesData?.jobOutputFiles?.files ?? []).filter(
+    (file) => file.name !== ".weaver-job-dir" && file.name !== ".weaver-output-dir",
+  );
   const outputDir = filesData?.jobOutputFiles?.outputDir || job?.outputDir || null;
   const duplicate = duplicateData?.duplicateSnapshot ?? null;
 
@@ -328,6 +334,44 @@ export function JobDetailPage() {
     void refetch({ requestPolicy: "network-only" });
   };
 
+  /**
+   * The job's own NZB, fetched rather than linked: the endpoint wants the
+   * session's auth header, which a plain anchor cannot carry.
+   */
+  const downloadNzb = async () => {
+    if (!job) {
+      return;
+    }
+    const title = job.originalTitle.trim() || job.name || job.displayTitle;
+    setBusy(true);
+    try {
+      const response = await fetch(new URL(`api/jobs/${job.id}/nzb`, document.baseURI).href, {
+        headers: authHeaders(),
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        throw new Error(await readDownloadErrorMessage(response, t("next.job.nzbFailed")));
+      }
+      await saveResponseAsDownload(response, `${title}.nzb`);
+      setReport(t("next.job.nzbSaved", { name: title }));
+    } catch (error) {
+      setReport(error instanceof Error ? error.message : t("next.job.nzbFailed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * An output file, fetched by navigation so the browser streams it straight
+   * to disk: these run to gigabytes, which is no size to hold in a blob.
+   */
+  const downloadOutputFile = (file: OutputFile) => {
+    const url = new URL(`api/jobs/${jobId}/output-file`, document.baseURI);
+    url.searchParams.set("path", file.path);
+    openUrlAsDownload(url.href);
+    setReport(t("next.job.fileSaving", { name: file.name }));
+  };
+
   const copyLog = () => {
     const text = events
       .map(
@@ -360,6 +404,16 @@ export function JobDetailPage() {
             <StateChip label={statusLabel(progress.status)} tone={failed ? "bad" : "ok"} />
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <SecondaryButton
+              icon="downloadFile"
+              size="compact"
+              disabled={busy}
+              onClick={() => {
+                void downloadNzb();
+              }}
+            >
+              {t("next.job.downloadNzb")}
+            </SecondaryButton>
             {/* Only while scripts run: a job waiting for a script slot reports itself as queued. */}
             {job.status === "POST_PROCESSING" ? (
               <SecondaryButton
@@ -561,7 +615,7 @@ export function JobDetailPage() {
               job.optionalRecoveryBytes === 0
                 ? "text-wv-muted"
                 : job.optionalRecoveryDownloadedBytes > 0
-                  ? "text-wv-warn"
+                  ? undefined
                   : "text-wv-accent"
             }
             note={
@@ -619,6 +673,14 @@ export function JobDetailPage() {
                 <div className="text-right font-wv-mono text-[12px] text-wv-muted">
                   {formatSize(file.sizeBytes)}
                 </div>
+                <button
+                  type="button"
+                  title={t("next.job.downloadFileTitle", { name: file.name })}
+                  onClick={() => downloadOutputFile(file)}
+                  className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
+                >
+                  {t("next.job.download")}
+                </button>
                 <button
                   type="button"
                   title={t("next.job.copyPathTitle")}

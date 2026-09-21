@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   downloadPercent,
   installableUpgrade,
+  upgradesInApp,
   type ApplicationUpgradeRun,
   type ApplicationUpgradeStatus,
 } from "../src/features/updates/application-upgrade.ts";
@@ -73,4 +74,16 @@ test("download progress waits for a known size", () => {
   assert.equal(downloadPercent(run({ downloadedBytes: 50, totalBytes: 200 })), 25);
   // A server that over-reports cannot push the bar past the end.
   assert.equal(downloadPercent(run({ downloadedBytes: 300, totalBytes: 200 })), 100);
+});
+
+test("a release notice goes to the installer only on an installation that upgrades itself", () => {
+  assert.equal(upgradesInApp(status()), true);
+  assert.equal(upgradesInApp(status({ updateAvailable: false, activeRun: run() })), true);
+  assert.equal(
+    upgradesInApp(status({ eligible: false, managementOwner: "HOMEBREW" })),
+    false,
+    "a managed install upgrades through its manager, so the notice keeps the release page",
+  );
+  assert.equal(upgradesInApp(status({ updateAvailable: false })), false);
+  assert.equal(upgradesInApp(undefined), false, "unknown state keeps the release page");
 });

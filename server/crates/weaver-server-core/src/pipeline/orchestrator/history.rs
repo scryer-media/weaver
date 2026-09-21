@@ -331,6 +331,12 @@ impl Pipeline {
             Some(state.created_at.elapsed()),
         );
 
+        // The job's article buffers are all free by now; the allocator is only
+        // still holding their pages because it was told to recycle them within
+        // a job. Nothing will ask for them again, so give them back here
+        // instead of leaving a job-sized working set resident.
+        crate::runtime::thread_release::release_job_completion_memory();
+
         let now = timestamp_secs() as i64;
         let elapsed_secs = state.created_at.elapsed().as_secs() as i64;
         let created_at = now - elapsed_secs;

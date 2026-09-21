@@ -1944,6 +1944,7 @@ async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
             .unwrap()
             .record_placement(segment_number, offset, bytes.len() as u32);
         let buffered = BufferedDecodedSegment {
+            damaged_source: None,
             encoding: SegmentEncoding::Yenc,
             segment_id: SegmentId {
                 file_id,
@@ -2035,8 +2036,8 @@ async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
                 .file(protected_file)
                 .unwrap()
                 .placement_of(ordinal),
-            None,
-            "base demotion must not seed placements for reconstructed or parked articles"
+            (ordinal == 1).then_some((tail_start as u64, tail.len() as u32)),
+            "only the parked article's durable write supplies decoded placement evidence"
         );
     }
     assert!(
@@ -4344,5 +4345,95 @@ async fn a_virtual_volume_reads_back_the_volume_the_conventional_gate_would_have
     assert!(
         crate::pipeline::direct_store::provider::is_hole(&error),
         "the bytes that never arrived must read as a hole, got {error}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn damaged_article_waits_for_reconstruction_before_writing_and_retrying() {
+    let volumes = demotion_fixture_volumes("Silver.Horizon.S01E29.mkv");
+    let temp = tempfile::tempdir().unwrap();
+    let job_id = JobId(41291);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let working_dir = insert_active_job(
+        &mut pipeline,
+        job_id,
+        direct_store_job_spec("Damaged article handback", &volumes),
+    )
+    .await;
+    for (file_index, segment_number) in [(0, 0), (0, 1), (1, 0)] {
+        take_queued_segment(
+            &mut pipeline,
+            job_id,
+            SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number,
+            },
+        );
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let segment_id = SegmentId {
+        file_id,
+        segment_number: 1,
+    };
+    take_queued_segment(&mut pipeline, job_id, segment_id);
+    let (start, end) = article_extent(volumes[1].1.len(), 1, 2);
+    let mut damaged = volumes[1].1[start..end].to_vec();
+    damaged[0] ^= 1;
+    let len = damaged.len() as u64;
+    pipeline
+        .handle_decode_success(
+            DecodeResult {
+                segment_id,
+                raw_size: len,
+                encoding: SegmentEncoding::Yenc,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: volumes[1].1.len() as u64,
+                    part: Some(2),
+                    total: Some(2),
+                    begin: Some(start as u64 + 1),
+                    end: Some(end as u64),
+                },
+                crc_valid: false,
+                part_crc_verified: false,
+                part_crc: checksum::crc32(&damaged),
+                truncation_suspected: false,
+                expected_file_crc: None,
+                data: DecodedChunk::from(damaged.clone()),
+                yenc_name: volumes[1].0.clone(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                segments: Vec::new(),
+            },
+            SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
+            },
+        )
+        .await;
+    assert!(pipeline.demotion_sweep_owns_file(file_id));
+    assert_eq!(pipeline.write_buffers[&file_id].buffered_len(), 1);
+    assert!(
+        !pipeline
+            .pending_retries_by_segment
+            .contains_key(&segment_id)
+    );
+    pipeline.flush_quiescent_write_backlog().await;
+    assert_eq!(pipeline.write_buffers[&file_id].buffered_len(), 1);
+    settle_direct_demotion_work(&mut pipeline).await;
+    pipeline.flush_quiescent_write_backlog().await;
+    let bytes = std::fs::read(working_dir.join(&volumes[1].0)).unwrap();
+    assert_eq!(&bytes[start..end], damaged.as_slice());
+    let file = pipeline.jobs[&job_id].assembly.file(file_id).unwrap();
+    assert!(!file.has_segment(1));
+    assert!(file.has_retained_damage());
+    let retry = pipeline.retry_rx.recv().await.unwrap();
+    assert_eq!(retry.work.segment_id, segment_id);
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[1].0)).unwrap(),
+        bytes
     );
 }

@@ -135,26 +135,53 @@ fn internal_upload_err(e: impl std::fmt::Display) -> (axum::http::StatusCode, St
 
 fn cors_layer(
     security: &RuntimeSecurityConfig,
+    base_url: &str,
 ) -> Result<CorsLayer, Box<dyn std::error::Error + Send + Sync>> {
-    if security.cors_allowed_origins.is_empty() {
-        return Ok(CorsLayer::new());
-    }
-
     let origins = security
         .cors_allowed_origins
         .iter()
         .map(|origin| HeaderValue::from_str(origin))
         .collect::<Result<Vec<_>, _>>()?;
+    let credential_origins = origins.clone();
+    let rpc_paths = [format!("{base_url}/jsonrpc"), format!("{base_url}/xmlrpc")];
 
     Ok(CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
+        .allow_origin(AllowOrigin::predicate(move |origin, request| {
+            origins.contains(origin)
+                || (rpc_paths.iter().any(|path| path == request.uri.path())
+                    && browser_extension_origin(origin))
+        }))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::HeaderName::from_static("x-api-key"),
         ])
-        .allow_credentials(true))
+        // Extension RPC clients supply an explicit API key. Browser cookies
+        // remain confined to the operator's configured web origins.
+        .allow_credentials(tower_http::cors::AllowCredentials::predicate(
+            move |origin, _| credential_origins.contains(origin),
+        )))
+}
+
+fn browser_extension_origin(origin: &HeaderValue) -> bool {
+    let Some(url) = origin
+        .to_str()
+        .ok()
+        .and_then(|origin| reqwest::Url::parse(origin).ok())
+    else {
+        return false;
+    };
+    matches!(
+        url.scheme(),
+        "chrome-extension" | "moz-extension" | "safari-web-extension"
+    ) && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.path().is_empty()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 /// Runs the HTTP server on a listener the caller already bound. Binding
@@ -166,7 +193,7 @@ pub async fn run_server(
     listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = runtime.base_url.clone();
-    let cors = cors_layer(&runtime.security)?;
+    let cors = cors_layer(&runtime.security, &base_url)?;
     let host_security = runtime.security.clone();
     let app = routes::build_router(runtime)
         .layer(compression_layer())

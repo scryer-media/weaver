@@ -1634,6 +1634,12 @@ fn run_owned_blocking_download_lane(
     if !keep_cached_lane {
         park_cached_lane(cached_lane);
     }
+    // The article buffers this thread allocated are freed by the decode and
+    // writer threads, so under a per-thread-heap allocator their pages sit on
+    // this lane's heap until it allocates again. A parked lane never does, so
+    // the release has to happen here, on the lane thread, once per park —
+    // never per article or per refill, where it would cost throughput.
+    crate::runtime::thread_release::release_idle_thread_memory();
     let _ = parked_tx.blocking_send(DownloadLaneParked {
         lane_id: park_context.lane_id,
         job_id: park_context.job_id,
@@ -2342,8 +2348,7 @@ mod tests {
             ))),
             Err(DownloadError::Decode {
                 raw_size: 128,
-                error: "crc mismatch".to_string(),
-                crc_mismatch: true,
+                error: "invalid yEnc header".to_string(),
             }),
         ] {
             assert!(

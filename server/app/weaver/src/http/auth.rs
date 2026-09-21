@@ -166,6 +166,33 @@ fn canonical_browser_origin(headers: &HeaderMap) -> Result<String, StatusCode> {
     Ok(url.origin().ascii_serialization())
 }
 
+/// Same-origin GETs normally omit Origin. Use their Referer to keep session
+/// discovery consistent with the mandatory Origin check on browser writes.
+fn browser_session_origin_matches(headers: &HeaderMap, session_origin: &str) -> bool {
+    if headers.contains_key(header::ORIGIN) {
+        return canonical_browser_origin(headers).ok().as_deref() == Some(session_origin);
+    }
+    let mut values = headers.get_all(header::REFERER).iter();
+    let Some(value) = values.next() else {
+        return true;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Some(url) = value
+        .to_str()
+        .ok()
+        .and_then(|value| reqwest::Url::parse(value).ok())
+    else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.origin().ascii_serialization() == session_origin
+}
+
 /// Whether a canonical browser origin names the same host and port as the
 /// request's authority. Either side may leave out the scheme's default port,
 /// so both are compared as the port the origin's scheme would actually use:
@@ -393,12 +420,7 @@ pub(super) async fn resolve_caller(
             {
                 return Err(StatusCode::UNAUTHORIZED);
             }
-            // Navigation GETs legitimately omit Origin. If a browser does send
-            // one, it must remain bound to the origin established at login.
-            if headers.contains_key(header::ORIGIN)
-                && canonical_browser_origin(headers).ok().as_deref()
-                    != Some(session.origin.as_str())
-            {
+            if !browser_session_origin_matches(headers, &session.origin) {
                 return Err(StatusCode::FORBIDDEN);
             }
             return Ok(ResolvedCaller {
@@ -1498,8 +1520,7 @@ pub(super) async fn csrf_handler(
     let Some(session) = session else {
         return super::error_response(StatusCode::UNAUTHORIZED, "authentication required");
     };
-    if (headers.contains_key(header::ORIGIN)
-        && canonical_browser_origin(&headers).ok().as_deref() != Some(session.origin.as_str()))
+    if !browser_session_origin_matches(&headers, &session.origin)
         || (session.remembered && !security.remembered_client_allowed(Some(peer_addr), &headers))
     {
         return super::error_response(StatusCode::FORBIDDEN, "browser verification required");
@@ -1641,6 +1662,89 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn browser_session_discovery_matches_the_page_origin() {
+        let db = Database::open_in_memory().unwrap();
+        let cache = LoginAuthCache::default();
+        let secret = [7; 32];
+        cache.replace(Some(weaver_server_core::auth::CachedLoginAuth::new(
+            "admin", "unused", secret,
+        )));
+        let security = RuntimeSecurityConfig::default();
+        security.apply_stored_access_policy_revision(None, None, false);
+        let token = "browser-session-origin-test";
+        let csrf = derive_browser_csrf_token(token, &secret);
+        let now = epoch_seconds();
+        db.create_browser_session(&BrowserSession {
+            token_hash: hash_to_hex(hash_api_key(token)),
+            csrf_verifier: hash_to_hex(hash_api_key(&csrf)),
+            origin: "http://localhost:8080".into(),
+            client_ip: None,
+            remembered: false,
+            created_at: now,
+            expires_at: now + 3_600,
+            revoked_at: None,
+        })
+        .unwrap();
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        for (port, authenticated) in [(8080, true), (9090, false)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                format!("{SESSION_COOKIE_NAME}={token}").parse().unwrap(),
+            );
+            headers.insert(
+                header::REFERER,
+                format!("http://localhost:{port}/settings/security?createApiKey=1")
+                    .parse()
+                    .unwrap(),
+            );
+            let status = auth_status_handler(
+                Extension(db.clone()),
+                Extension(ApiKeyCache::default()),
+                Extension(cache.clone()),
+                Extension(security.clone()),
+                None,
+                Some(Extension(ConnectInfo(peer))),
+                headers.clone(),
+            )
+            .await;
+            assert_eq!(status.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(status.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(status["authenticated"], authenticated);
+            let response = csrf_handler(
+                ConnectInfo(peer),
+                Extension(db.clone()),
+                Extension(cache.clone()),
+                Extension(security.clone()),
+                headers.clone(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                if authenticated {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+            headers.insert(
+                header::ORIGIN,
+                format!("http://localhost:{port}").parse().unwrap(),
+            );
+            headers.insert("x-weaver-csrf", csrf.parse().unwrap());
+            assert_eq!(
+                validate_browser_csrf(&db, &security, &headers)
+                    .await
+                    .is_ok(),
+                authenticated
+            );
+        }
     }
 
     #[tokio::test]

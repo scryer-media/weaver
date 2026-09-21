@@ -279,7 +279,7 @@ impl Pipeline {
         (decoded.io.decoded_bytes_written, elapsed)
     }
 
-    pub(in crate::pipeline::download) fn download_data_from_decoded_trace(
+    pub(in crate::pipeline) fn download_data_from_decoded_trace(
         segment_id: SegmentId,
         trace: weaver_nntp::client::DecodedBodyTrace,
     ) -> (
@@ -470,6 +470,11 @@ impl Pipeline {
                 Ok(DownloadPayload::Decoded(match body {
                     weaver_nntp::fused_yenc::FusedArticleBody::Yenc(result) => {
                         record_checkpoint_observability(&result);
+                        // Block evidence needs a known starting offset. An
+                        // article whose own begin was unusable has none.
+                        let offset_known = result.metadata.file_offset_is_known();
+                        let truncation_suspected =
+                            crate::pipeline::yenc_truncation_suspected(&result);
                         let yenc_layout = YencLayoutAssertions {
                             file_size: result.metadata.size,
                             part: result.metadata.part,
@@ -484,14 +489,19 @@ impl Pipeline {
                             encoding: SegmentEncoding::Yenc,
                             yenc_layout,
                             crc_valid: crate::pipeline::crc_not_mismatched(result.crc_status),
-                            part_crc_verified: result.expected_part_crc.is_some()
-                                && crate::pipeline::crc_not_mismatched(result.crc_status),
+                            truncation_suspected,
+                            part_crc_verified: result.crc_status
+                                == weaver_yenc::CrcVerification::Verified,
                             part_crc: result.part_crc,
                             expected_file_crc: result.expected_file_crc,
                             data,
                             yenc_name: result.metadata.name,
                             checkpoint_plan: result.checkpoint_plan,
-                            segments: result.segments,
+                            segments: if offset_known {
+                                result.segments
+                            } else {
+                                Vec::new()
+                            },
                         }
                     }
                     // uuencode declares no offsets, no size and no checksum, so
@@ -516,6 +526,7 @@ impl Pipeline {
                         // "Not known bad" — there is nothing to check against,
                         // which is different from having checked and passed.
                         crc_valid: true,
+                        truncation_suspected: false,
                         part_crc_verified: false,
                         part_crc: 0,
                         expected_file_crc: None,
@@ -530,11 +541,9 @@ impl Pipeline {
                 Err(DownloadError::from_nntp(error))
             }
             Err(weaver_nntp::client::DecodedBodyError::Decode { raw_size, error }) => {
-                let crc_mismatch = matches!(error, weaver_yenc::YencError::CrcMismatch { .. });
                 Err(DownloadError::Decode {
                     raw_size: raw_size as u64,
                     error: error.to_string(),
-                    crc_mismatch,
                 })
             }
         };

@@ -1320,6 +1320,11 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
     let member_name = "Silver.Horizon.S01E22.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 193) as u8).collect();
     let volumes = single_member_store_set(member_name, &payload, 3);
+    assert_eq!(
+        volumes[1].1.len(),
+        volumes[2].1.len(),
+        "actual lengths must not resolve this name ambiguity"
+    );
     let par2_bytes = par2_index_over_volumes(&volumes);
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1346,7 +1351,7 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
         None,
     )
     .await;
-    // Volume 0's identity now carries a canonical name that is *another*
+    // Volume 1's identity now carries a canonical name that is *another*
     // volume's PAR2 name, so its candidate set spans two descriptions of the
     // same recovery set and `resolve_par2_file_binding` refuses to pick one.
     // This is the shape a rewritten identity produces in the wild; the recovery
@@ -1358,12 +1363,12 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
         .unwrap()
         .file_identities
         .insert(
-            0,
+            1,
             crate::jobs::record::ActiveFileIdentity {
-                file_index: 0,
-                source_filename: volumes[0].0.clone(),
-                current_filename: volumes[0].0.clone(),
-                canonical_filename: Some(volumes[1].0.clone()),
+                file_index: 1,
+                source_filename: volumes[1].0.clone(),
+                current_filename: volumes[1].0.clone(),
+                canonical_filename: Some(volumes[2].0.clone()),
                 classification: None,
                 classification_source: crate::jobs::record::FileIdentitySource::Par2,
             },
@@ -1372,17 +1377,17 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
         pipeline
             .resolve_par2_file_binding(NzbFileId {
                 job_id,
-                file_index: 0
+                file_index: 1
             })
             .is_none(),
-        "non-vacuity: volume 0's name candidates must match two descriptions, so no \
+        "non-vacuity: volume 1's name candidates must match two descriptions, so no \
          single PAR2 identity can be chosen for it"
     );
     assert!(
         pipeline
             .resolve_par2_file_binding(NzbFileId {
                 job_id,
-                file_index: 1
+                file_index: 0
             })
             .is_some(),
         "and the rest of the set must still bind, so the demotion below is about the \
@@ -1420,7 +1425,7 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
         .get_mut(&job_id)
         .unwrap()
         .file_identities
-        .remove(&0);
+        .remove(&1);
     drain_rar_refreshes(&mut pipeline).await;
     drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
     let output_root =
