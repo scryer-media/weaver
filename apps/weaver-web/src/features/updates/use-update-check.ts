@@ -1,6 +1,10 @@
-import { useState } from "react";
-import { useMutation, useQuery } from "urql";
-import { CHECK_FOR_UPDATES_MUTATION, UPDATE_STATUS_QUERY } from "@/graphql/queries";
+import { useEffect, useState } from "react";
+import { useMutation, useQuery, useSubscription } from "urql";
+import {
+  CHECK_FOR_UPDATES_MUTATION,
+  UPDATE_STATUS_QUERY,
+  UPDATE_STATUS_SUBSCRIPTION,
+} from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { UpdateStatus } from "./update-notification";
 
@@ -16,13 +20,25 @@ export function useUpdateCheck(): {
 } {
   const t = useTranslate();
   const [{ data }] = useQuery<{ updateStatus: UpdateStatus }>({ query: UPDATE_STATUS_QUERY });
+  const [{ data: live }] = useSubscription<{ updateStatusUpdates: UpdateStatus }>({
+    query: UPDATE_STATUS_SUBSCRIPTION,
+  });
   const [checkState, checkForUpdates] = useMutation<{ checkForUpdates: UpdateStatus }>(
     CHECK_FOR_UPDATES_MUTATION,
   );
   const [checked, setChecked] = useState<UpdateStatus | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
 
-  const status = checked ?? data?.updateStatus ?? null;
+  // A manual check's answer only stands until the checker says something newer.
+  const liveStatus = live?.updateStatusUpdates;
+  useEffect(() => {
+    if (liveStatus) {
+      setChecked(null);
+      setFailure(null);
+    }
+  }, [liveStatus]);
+
+  const status = checked ?? liveStatus ?? data?.updateStatus ?? null;
   const busy = checkState.fetching || status?.checking === true;
 
   const check = () => {
