@@ -7,7 +7,7 @@
 //! others.
 
 use super::*;
-use crate::pipeline::download::scheduler::{Handout, YieldReason};
+use crate::pipeline::download::scheduler::{Handout, LaneShare, YieldReason};
 
 const SERVER_A: usize = 0;
 const SERVER_B: usize = 1;
@@ -29,7 +29,63 @@ fn taken(handout: Handout) -> Vec<DownloadWork> {
         Handout::Works(works) => works,
         Handout::Idle => Vec::new(),
         Handout::Yield(reason) => panic!("a whole-link gate fired unexpectedly: {reason:?}"),
+        Handout::Saturated { below } => {
+            panic!("a caller with no lane share was reported saturated below {below}")
+        }
     }
+}
+
+/// A lane booked as holding `holds` of `job_id`'s articles, at `depth`.
+fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usize) -> LaneShare {
+    let lane_id = Pipeline::next_download_lane_id();
+    let outstanding = (0..holds)
+        .map(|index| {
+            let segment_id = SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: u32::MAX,
+                },
+                segment_number: index as u32,
+            };
+            let work = DownloadWork {
+                segment_id,
+                message_id: MessageId::new(&format!("held-{}-{index}@share.test", job_id.0)),
+                groups: Arc::from(Vec::new()),
+                priority: 0,
+                byte_estimate: 512,
+                retry_count: 0,
+                is_recovery: false,
+                completion_critical: false,
+                exclude_servers: Vec::new(),
+                avoid_server: None,
+            };
+            (segment_id, work)
+        })
+        .collect();
+    pipeline.download_lane_owners.insert(
+        lane_id,
+        DownloadLaneOwner {
+            job_id,
+            mode: DownloadLaneMode::Sequential,
+            completion_critical: false,
+            server_idx: Some(SERVER_A),
+            connection: true,
+            ip_replacement: false,
+            outstanding,
+        },
+    );
+    LaneShare { lane_id, depth }
+}
+
+/// Ask as `lane`.
+fn ask_as_lane(
+    pipeline: &mut Pipeline,
+    server_idx: usize,
+    want: usize,
+    lane: LaneShare,
+) -> Handout {
+    let pressure = pipeline.refresh_download_pressure();
+    pipeline.next_works_for_lane(server_idx, want, Some(lane), None, pressure)
 }
 
 /// The job every article in a handout came from, proving a handout never
@@ -614,5 +670,146 @@ async fn the_guard_counters_account_for_a_shuffled_multi_server_run() {
             .download_scheduler_handouts_total_probe
             .load(Ordering::Relaxed),
         0
+    );
+}
+
+/// Rule 7: a lane holds its share of a job. One hundred connections asking
+/// for a runway each would reserve a six-hundred-article job among the first
+/// twenty; the share holds each of them to the job divided over the link.
+#[tokio::test]
+async fn a_small_job_is_shared_over_every_connection() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner.set_connection_limit(100);
+    let hot = JobId(71301);
+    let next = JobId(71302);
+    add_job(&mut pipeline, hot, "Sixty Second Reel", 600).await;
+    add_job(&mut pipeline, next, "Sixty Second Reel Two", 600).await;
+
+    assert_eq!(
+        pipeline.lane_share_of_job(hot, 8),
+        9,
+        "600 / 100 rounds up to 6, floored at depth + 1"
+    );
+    let lane = lane_holding(&mut pipeline, hot, 0, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
+    assert_eq!(works.len(), 9, "a runway ask is held to the share");
+    assert_eq!(single_job(&works), hot);
+
+    // Sixty fresh lanes at that share leave the hot job with work for the
+    // rest; none of them is sent on to the next job.
+    for _ in 0..60 {
+        let lane = lane_holding(&mut pipeline, hot, 0, 8);
+        let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
+        assert_eq!(single_job(&works), hot);
+    }
+    assert!(
+        queued(&pipeline, hot) > 0,
+        "the hot job is not reserved whole"
+    );
+    assert_eq!(queued(&pipeline, next), 600, "the next job is untouched");
+    assert_eq!(handouts_spill(&pipeline), 0);
+}
+
+/// A lane already at its share is reported busy, not sent on to the next
+/// job — the link must not open a second job while the hot one still has
+/// work for other lanes.
+#[tokio::test]
+async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner.set_connection_limit(100);
+    let hot = JobId(71311);
+    let next = JobId(71312);
+    add_job(&mut pipeline, hot, "Held Share Reel", 600).await;
+    add_job(&mut pipeline, next, "Held Share Reel Two", 600).await;
+
+    let share = pipeline.lane_share_of_job(hot, 8);
+    let full = lane_holding(&mut pipeline, hot, share, 8);
+    match ask_as_lane(&mut pipeline, SERVER_A, 18, full) {
+        Handout::Saturated { below } => assert_eq!(below, share),
+        other => panic!(
+            "a lane at its share must be saturated, got {:?}",
+            taken(other).len()
+        ),
+    }
+    assert_eq!(queued(&pipeline, hot), 600);
+    assert_eq!(queued(&pipeline, next), 600);
+    assert_eq!(handouts_spill(&pipeline), 0);
+
+    // Holding fewer than the share opens the difference.
+    let short = lane_holding(&mut pipeline, hot, share - 2, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, short));
+    assert_eq!(works.len(), 2);
+    assert_eq!(single_job(&works), hot);
+
+    // Articles of another job do not count against this one's share.
+    let elsewhere = lane_holding(&mut pipeline, next, share, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, elsewhere));
+    assert_eq!(works.len(), share);
+    assert_eq!(single_job(&works), hot);
+}
+
+/// A large job's share is beyond any runway, so its lanes are served exactly
+/// as before: the full ask, every time.
+#[tokio::test]
+async fn a_large_job_hands_out_the_whole_runway() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner.set_connection_limit(100);
+    let hot = JobId(71321);
+    add_job(&mut pipeline, hot, "Long Haul Pack", 20_000).await;
+
+    assert_eq!(pipeline.lane_share_of_job(hot, 8), 200);
+    let lane = lane_holding(&mut pipeline, hot, 30, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
+    assert_eq!(works.len(), 18);
+}
+
+/// The share is measured against the job that would serve the lane. A lane at
+/// its share of a job it cannot fetch from — retention rules this server out
+/// — is not held on that job's account: the walk goes on, as rule 3 says.
+#[tokio::test]
+async fn saturation_is_only_charged_by_a_job_that_could_serve_the_lane() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner.set_connection_limit(100);
+    let hot = JobId(71331);
+    let next = JobId(71332);
+    add_job(&mut pipeline, hot, "Elsewhere Only Reel", 600).await;
+    add_job(&mut pipeline, next, "Here Too Reel", 600).await;
+    rewrite_queue(&mut pipeline, hot, |work| {
+        work.exclude_servers = vec![SERVER_A];
+    });
+
+    let share = pipeline.lane_share_of_job(hot, 8);
+    let lane = lane_holding(&mut pipeline, hot, share, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
+    assert_eq!(
+        single_job(&works),
+        next,
+        "the blocked hot job does not hold the lane"
+    );
+    assert_eq!(handouts_spill(&pipeline), 1);
+}
+
+/// A lane's share is a floor of a full pipe plus one even for a job with a
+/// handful of articles, so a tiny job still fills a pipelined socket.
+#[tokio::test]
+async fn the_share_never_starves_a_pipe() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner.set_connection_limit(100);
+    let hot = JobId(71341);
+    add_job(&mut pipeline, hot, "Three Article Note", 3).await;
+
+    assert_eq!(pipeline.lane_share_of_job(hot, 8), 9);
+    assert_eq!(pipeline.lane_share_of_job(hot, 1), 2);
+    let lane = lane_holding(&mut pipeline, hot, 0, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
+    assert_eq!(
+        works.len(),
+        3,
+        "everything the job has, well inside the floor"
     );
 }

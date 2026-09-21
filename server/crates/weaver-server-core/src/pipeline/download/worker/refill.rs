@@ -16,7 +16,7 @@
 //! `NoWork`, keeps its socket cached, and the pool's idle loop takes over.
 
 use super::*;
-use crate::pipeline::download::scheduler::{Handout, YieldReason};
+use crate::pipeline::download::scheduler::{Handout, LaneShare, YieldReason};
 
 /// How long a refill that found nothing waits in the actor before its lane is
 /// told to park. A fixed window: long enough to ride out a decode or a
@@ -28,6 +28,10 @@ pub(in crate::pipeline) const DOWNLOAD_REFILL_IDLE_HOLD: Duration = Duration::fr
 pub(crate) struct HeldDownloadRefill {
     request: DownloadLaneRefillRequest,
     since: Instant,
+    /// Set for a lane that was at its share of a job rather than out of work:
+    /// the request is answered again once the lane holds fewer articles than
+    /// this. Such a lane is fetching, not idle, so its hold has no deadline.
+    wake_below: Option<usize>,
 }
 
 impl Pipeline {
@@ -108,9 +112,57 @@ impl Pipeline {
         }
         let now = Instant::now();
         let held = std::mem::take(&mut self.held_download_refills);
-        for HeldDownloadRefill { request, since } in held {
-            self.answer_download_lane_refill(request, now, Some(since));
+        for HeldDownloadRefill {
+            request,
+            since,
+            wake_below,
+        } in held
+        {
+            let Some(below) = wake_below else {
+                self.answer_download_lane_refill(request, now, Some(since));
+                continue;
+            };
+            // A lane still at its share costs one owner lookup per pass, not
+            // a walk of the queues. Total holdings bound the per-job count,
+            // so a lane below the share in total is below it for any job. A
+            // lane that is gone falls through and is told so by the answer
+            // path.
+            if !request.response_tx.is_closed()
+                && self.download_lane_holdings(request.lane_id) >= below
+            {
+                self.held_download_refills.push(HeldDownloadRefill {
+                    request,
+                    since,
+                    wake_below,
+                });
+                continue;
+            }
+            // Whatever this answer finds, the lane was busy until now: an
+            // idle hold that starts here starts its own window.
+            self.answer_download_lane_refill(request, now, None);
         }
+    }
+
+    /// Articles `lane_id` has been handed and not yet produced a result for.
+    pub(in crate::pipeline) fn download_lane_holdings(&self, lane_id: u64) -> usize {
+        self.download_lane_owners
+            .get(&lane_id)
+            .map_or(0, |owner| owner.outstanding.len())
+    }
+
+    /// [`Self::download_lane_holdings`], counting only `job_id`'s articles.
+    pub(in crate::pipeline) fn download_lane_holdings_of_job(
+        &self,
+        lane_id: u64,
+        job_id: JobId,
+    ) -> usize {
+        self.download_lane_owners.get(&lane_id).map_or(0, |owner| {
+            owner
+                .outstanding
+                .keys()
+                .filter(|segment| segment.file_id.job_id == job_id)
+                .count()
+        })
     }
 
     /// Every held refill is parked now. Used when the pool is reset and the
@@ -174,10 +226,31 @@ impl Pipeline {
         );
         let want = self.download_refill_want(lane_mode);
         let spill_in_flight = self.spill_job_in_flight_on(server_idx);
-        let works = match self.next_works(server_idx, want, spill_in_flight, pressure) {
+        let lane_share = LaneShare {
+            lane_id,
+            depth: lane_mode.max_depth(),
+        };
+        let works = match self.next_works_for_lane(
+            server_idx,
+            want,
+            Some(lane_share),
+            spill_in_flight,
+            pressure,
+        ) {
             Handout::Works(works) => works,
             Handout::Idle => {
                 self.hold_or_park_idle_download_lane_refill(request, pressure, held_since, now);
+                return;
+            }
+            Handout::Saturated { below } => {
+                // The lane keeps fetching what it holds with this ask
+                // outstanding, and blocks on it only once its pipe is dry —
+                // by which point it is below any share and has been answered.
+                self.held_download_refills.push(HeldDownloadRefill {
+                    request,
+                    since: held_since.unwrap_or(now),
+                    wake_below: Some(below),
+                });
                 return;
             }
             Handout::Yield(reason) => {
@@ -335,8 +408,11 @@ impl Pipeline {
             self.park_download_lane_refill(request, LaneParkReason::NoWork, held_since, now);
             return;
         }
-        self.held_download_refills
-            .push(HeldDownloadRefill { request, since });
+        self.held_download_refills.push(HeldDownloadRefill {
+            request,
+            since,
+            wake_below: None,
+        });
     }
 
     /// Cut one lease for `server_idx` the way a dispatch pass would: one
