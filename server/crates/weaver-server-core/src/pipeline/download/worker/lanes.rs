@@ -158,6 +158,12 @@ impl Pipeline {
             }
         }
         self.skip_failed_uu_segment(seg_id);
+        // Held articles that could only be placed after this one have lost
+        // their anchor. The run is taken out of the park before any of it is
+        // booked, so each booking below finds nothing further to release.
+        for dependent in self.take_unanchored_dependents(seg_id) {
+            self.give_up_unanchored(dependent);
+        }
         self.check_health(job_id);
         true
     }

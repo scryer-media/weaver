@@ -213,6 +213,11 @@ impl FileAssembly {
         self.placements.get(&segment_number).copied()
     }
 
+    /// How many ordinals have a recorded placement.
+    pub(crate) fn placed_segment_count(&self) -> usize {
+        self.placements.len()
+    }
+
     pub(crate) fn note_retained_damage(
         &mut self,
         segment_number: u32,

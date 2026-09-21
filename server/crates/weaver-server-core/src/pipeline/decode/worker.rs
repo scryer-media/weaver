@@ -1433,8 +1433,9 @@ impl Pipeline {
         }
     }
 
-    /// Commit a decoded segment, then release any uuencode parts its arrival
-    /// unblocked.
+    /// Commit a decoded segment, then release any parked parts its arrival
+    /// unblocked: uuencode parts behind the sequential cursor, and yEnc parts
+    /// that could not say where they start.
     ///
     /// Sequential assembly means one part's placement can make the next one
     /// placeable, and that one the next again. Released parts re-enter through
@@ -1447,6 +1448,7 @@ impl Pipeline {
         source: SegmentSource,
     ) {
         let file_id = result.segment_id.file_id;
+        let segment_number = result.segment_id.segment_number;
         let is_uu = result.encoding.is_uu();
         if is_uu {
             // Ahead of the commit, because the routing seam inside is what a
@@ -1458,6 +1460,11 @@ impl Pipeline {
         self.handle_decode_success_inner(result, source).await;
 
         if !is_uu {
+            let mut placed = segment_number;
+            while let Some((result, source)) = self.take_unanchored_successor(file_id, placed) {
+                placed = result.segment_id.segment_number;
+                self.handle_decode_success_inner(result, source).await;
+            }
             return;
         }
         loop {
@@ -1516,7 +1523,7 @@ impl Pipeline {
         let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_success");
         let DecodeResult {
             segment_id,
-            raw_size: _,
+            raw_size,
             encoding,
             yenc_layout,
             crc_valid,
@@ -1672,10 +1679,27 @@ impl Pipeline {
                 ) {
                     Ok(file_offset) => file_offset,
                     Err(YencLayoutMismatch::PredecessorNotPlaced) => {
-                        // An ordering condition, not damage. The article comes
-                        // back from the same server, and spends no retry.
+                        // An ordering condition, not damage. The article waits,
+                        // decoded, for the part before it, and spends no retry.
                         drop(_cpu_scope);
-                        self.requeue_segment_awaiting_predecessor(segment_id);
+                        self.park_or_requeue_unanchored(
+                            DecodeResult {
+                                segment_id,
+                                raw_size,
+                                encoding,
+                                yenc_layout,
+                                crc_valid,
+                                part_crc_verified,
+                                part_crc,
+                                truncation_suspected,
+                                expected_file_crc,
+                                data,
+                                yenc_name,
+                                checkpoint_plan,
+                                segments,
+                            },
+                            source,
+                        );
                         return;
                     }
                     Err(mismatch) => {
@@ -2505,13 +2529,164 @@ impl Pipeline {
     }
 
     /// An article that could not say where it starts, arriving before the
-    /// ordinal it must follow. Ask for it again, without excluding the server
-    /// that served it and without spending its retry budget — nothing is wrong
-    /// with the bytes, they simply have nowhere to go yet.
+    /// ordinal it must follow.
+    ///
+    /// The bytes are fine; they simply have nowhere to go yet. They are held,
+    /// decoded, until the predecessor is placed, and released through the same
+    /// commit path the moment it is — so an out-of-order arrival costs memory
+    /// for a while, not another fetch. The hold is bounded by the same soft
+    /// write threshold and per-file part count as the uuencode reorder park, and
+    /// is never spilled: an article that does not fit is asked for again
+    /// instead, without its retry budget.
+    fn park_or_requeue_unanchored(&mut self, result: DecodeResult, source: SegmentSource) {
+        let segment_id = result.segment_id;
+        let file_id = segment_id.file_id;
+        let ordinal = segment_id.segment_number;
+        let predecessor = SegmentId {
+            file_id,
+            segment_number: ordinal.saturating_sub(1),
+        };
+        if self.segment_terminal_states.contains_key(&predecessor) {
+            // The part it must follow was already given up, so there is no
+            // offset to wait for and a fetch would bring back the same article.
+            self.give_up_unanchored(segment_id);
+            return;
+        }
+        let bytes = result.data.len_bytes();
+        let replaced_bytes = self
+            .unanchored_parked
+            .get(&file_id)
+            .and_then(|parked| parked.get(&ordinal))
+            .map(|(parked, _)| parked.data.len_bytes());
+        let parked_parts = self
+            .unanchored_parked
+            .get(&file_id)
+            .map_or(0, BTreeMap::len);
+        let (_, _, write_soft, _) = self.download_pressure_limits();
+        let resident = self
+            .write_buffered_bytes
+            .saturating_sub(replaced_bytes.unwrap_or(0))
+            .saturating_add(bytes);
+        let fits = (resident as u64) < write_soft
+            && (replaced_bytes.is_some() || parked_parts < self.uu_park_max_segments);
+        if !fits {
+            self.requeue_segment_awaiting_predecessor(segment_id);
+            return;
+        }
+        if let Some(replaced_bytes) = replaced_bytes {
+            self.release_write_buffered(replaced_bytes, 1);
+        }
+        self.note_write_buffered(bytes, 1);
+        self.unanchored_parked
+            .entry(file_id)
+            .or_default()
+            .insert(ordinal, (result, source));
+        debug!(
+            segment = %segment_id,
+            "article declared no usable start and its predecessor is unplaced; held until it is"
+        );
+    }
+
+    /// The parked article that directly follows `placed`, once `placed` has
+    /// actually been placed. A part committed as damage or dropped leaves no
+    /// placement, so nothing can anchor on it and nothing is released.
+    fn take_unanchored_successor(
+        &mut self,
+        file_id: NzbFileId,
+        placed: u32,
+    ) -> Option<(DecodeResult, SegmentSource)> {
+        if self.unanchored_parked.is_empty() {
+            return None;
+        }
+        let successor = placed.checked_add(1)?;
+        if !self
+            .unanchored_parked
+            .get(&file_id)
+            .is_some_and(|parked| parked.contains_key(&successor))
+        {
+            return None;
+        }
+        let is_placed = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .is_some_and(|file| file.placement_of(placed).is_some());
+        if !is_placed {
+            return None;
+        }
+        let parked = self.unanchored_parked.get_mut(&file_id)?;
+        let entry = parked.remove(&successor)?;
+        if parked.is_empty() {
+            self.unanchored_parked.remove(&file_id);
+        }
+        self.release_write_buffered(entry.0.data.len_bytes(), 1);
+        Some(entry)
+    }
+
+    /// Parked articles that were waiting on `segment_id`, which has just been
+    /// given up. Each of them anchors on the one before it, so the whole run
+    /// after it has lost its only way to be placed.
+    pub(crate) fn take_unanchored_dependents(&mut self, segment_id: SegmentId) -> Vec<SegmentId> {
+        let file_id = segment_id.file_id;
+        let Some(parked) = self.unanchored_parked.get_mut(&file_id) else {
+            return Vec::new();
+        };
+        let mut released = Vec::new();
+        let mut released_bytes = 0usize;
+        let mut next = segment_id.segment_number;
+        while let Some(ordinal) = next.checked_add(1) {
+            let Some((result, _)) = parked.remove(&ordinal) else {
+                break;
+            };
+            released_bytes = released_bytes.saturating_add(result.data.len_bytes());
+            released.push(result.segment_id);
+            next = ordinal;
+        }
+        if parked.is_empty() {
+            self.unanchored_parked.remove(&file_id);
+        }
+        if !released.is_empty() {
+            self.release_write_buffered(released_bytes, released.len());
+        }
+        released
+    }
+
+    /// Retire an unanchored article whose predecessor was given up. It is
+    /// booked like any other article that never decoded into a placement, so
+    /// repair accounts for it and the job does not wait on it.
+    pub(crate) fn give_up_unanchored(&mut self, segment_id: SegmentId) {
+        warn!(
+            segment = %segment_id,
+            "article declared no usable start and the part before it was given up; leaving it to repair"
+        );
+        self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .segments_failed_permanent
+            .fetch_add(1, Ordering::Relaxed);
+        self.book_terminal_segment(segment_id, SegmentTerminalState::DecodeExhausted);
+    }
+
+    /// The fallback when an unanchored article cannot be held: ask for it
+    /// again, without excluding the server that served it and without spending
+    /// its retry budget. The bound counts attempts since the file last placed
+    /// anything, so a long file that is steadily filling in never exhausts it,
+    /// while an article behind an ordinal that never arrives still stops.
     fn requeue_segment_awaiting_predecessor(&mut self, segment_id: SegmentId) {
         const MAX_ANCHOR_REQUEUES: u32 = 8;
 
-        let attempts = self.unanchored_requeues.entry(segment_id).or_insert(0);
+        let placed = self
+            .jobs
+            .get(&segment_id.file_id.job_id)
+            .and_then(|state| state.assembly.file(segment_id.file_id))
+            .map_or(0, |file| file.placed_segment_count());
+        let (attempts, seen_placed) = self
+            .unanchored_requeues
+            .entry(segment_id)
+            .or_insert((0, placed));
+        if *seen_placed != placed {
+            *seen_placed = placed;
+            *attempts = 0;
+        }
         *attempts += 1;
         if *attempts <= MAX_ANCHOR_REQUEUES && self.push_requeued_segment(segment_id) {
             debug!(
