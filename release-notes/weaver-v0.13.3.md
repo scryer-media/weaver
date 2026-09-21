@@ -1,8 +1,7 @@
-# Weaver 0.13.2 release notes
+# Weaver 0.13.3 release notes
 
-> **0.13.2 was never released.** The tag was cut, but its release build failed
-> and no artifacts were published. Every change below ships in
-> [0.13.3](weaver-v0.13.3.md) instead, together with two further yEnc fixes.
+0.13.2 was tagged but never published, so 0.13.3 is the first release to
+carry its changes. Everything below is new since 0.13.1.
 
 ## Highlights
 
@@ -57,8 +56,16 @@
   above still decide what is kept.
 - **A part header that cannot say where it starts no longer fails the
   article.** A missing, unreadable or zero `begin` is recorded as a defect and
-  the part is laid immediately after the part before it; if that part is not
-  placed yet, the article is asked for again, with a bound on how often.
+  the part is laid immediately after the part before it. Such an article is
+  still read as one part of a multi-part file even when it carries no part
+  number, so its part CRC is checked as a part CRC and no whole-file size
+  check is applied to it.
+- **A part that arrives before the part it follows waits for it.** The
+  decoded article is held in memory, within the same bounds as other
+  out-of-order parts, and written the moment its predecessor is placed, so an
+  out-of-order download no longer fetches it again or gives it up after a
+  fixed number of tries. If the predecessor is given up, the parts waiting on
+  it are handed to repair with it.
 - **An article the NZB cannot bound is accepted.** An NZB that skips a segment
   number, or understates a segment's byte count, made every later article of
   the file look out of place, so every server's copy was refused and the rest
