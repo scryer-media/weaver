@@ -3432,6 +3432,69 @@ async fn split_7z_job_with_par2(
     (pipeline, set_name)
 }
 
+/// A chase that finishes before the damage report for its last bytes arrives
+/// still forces the authoritative PAR2 pass, and its members are not installed.
+///
+/// A short set decodes in the gap between its final commit and the recovery
+/// verdict for it. The report then lands on a worker that has already returned,
+/// and reaping it used to drop the report with it: finalize saw no gated set,
+/// let the strong-decode claim stand, and installed members decoded from the
+/// damaged range.
+#[tokio::test]
+async fn a_chase_that_finished_under_a_damage_report_still_forces_the_par2_pass() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(42003);
+    let (mut pipeline, set_name) = split_7z_job_with_par2(&temp_dir, job_id, false).await;
+    let mut verify_events = pipeline.event_tx.subscribe();
+    let coverage = pipeline
+        .direct_unpack
+        .armed_coverage(job_id, set_name)
+        .expect("the finished worker has not been reaped yet");
+    // Wait on the worker itself, not on a clock: the report has to land after
+    // the decode returned and before the controller reaps it.
+    while !pipeline
+        .direct_unpack
+        .armed_worker_finished(job_id, set_name)
+    {
+        tokio::task::yield_now().await;
+    }
+    coverage.cap_at_damage(0, 0);
+
+    pipeline.reap_direct_unpack().await;
+    let outcome = pipeline
+        .direct_unpack
+        .outcome(job_id, set_name)
+        .expect("reaped into an outcome");
+    assert!(outcome.result.is_ok());
+    assert!(outcome.damage_reported, "the report outlives the worker");
+    assert_eq!(
+        pipeline.direct_unpack_gated_sets(job_id),
+        vec![set_name.to_string()],
+        "a finished chase under a standing report is still evidence"
+    );
+
+    pipeline.check_job_completion(job_id).await;
+    settle_par2_analysis_work(&mut pipeline).await;
+
+    assert_eq!(
+        drain_job_verification_started(&mut verify_events, job_id),
+        1,
+        "the authoritative pass must run for a chase that read reported damage"
+    );
+    // The files on disk verify clean, which says nothing about what the chase
+    // decoded while the report stood: the outcome is retired, not installed.
+    assert!(
+        pipeline
+            .direct_unpack
+            .outcome(job_id, set_name)
+            .is_none_or(|outcome| outcome.tainted),
+        "members decoded under a damage report are never installed"
+    );
+    assert!(pipeline.direct_unpack_gated_sets(job_id).is_empty());
+
+    pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
 /// A chase gated on recovery-reported damage forces the authoritative PAR2
 /// pass, over the strong-decode claim that would otherwise skip it.
 ///

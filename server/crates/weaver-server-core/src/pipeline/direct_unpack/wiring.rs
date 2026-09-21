@@ -199,6 +199,16 @@ pub struct ChaseOutcome {
     pub completed_bytes: u64,
     /// Repair rewrote a source file after this chase read it.
     pub tainted: bool,
+    /// The recovery data had reported damage in this set when the chase
+    /// finished, and no repair had lifted the report.
+    ///
+    /// A gated reader is only ever served vouched bytes, so a chase that
+    /// finishes under a standing report read the damaged range *before* the
+    /// report arrived — a short set decodes in the gap between its last commit
+    /// and the verdict for it. Its members are built on bytes the recovery data
+    /// calls wrong, and the report is still evidence finalize has to weigh once
+    /// the worker is gone.
+    pub damage_reported: bool,
 }
 
 impl ChaseOutcome {
@@ -503,6 +513,14 @@ impl DirectUnpackRuntime {
     #[cfg(test)]
     pub(crate) fn latched_reason(&self, job_id: JobId, set_name: &str) -> Option<&'static str> {
         self.latched.get(&(job_id, set_name.to_string())).copied()
+    }
+
+    /// Whether an armed chase's worker has returned but not yet been reaped.
+    #[cfg(test)]
+    pub(crate) fn armed_worker_finished(&self, job_id: JobId, set_name: &str) -> bool {
+        self.armed
+            .get(&(job_id, set_name.to_string()))
+            .is_some_and(|armed| armed.handle.is_finished())
     }
 
     #[cfg(test)]
@@ -2423,6 +2441,10 @@ impl Pipeline {
                 Ok(result) => result,
                 Err(error) => Err(format!("direct-unpack worker panicked: {error}")),
             };
+            // Read after the worker is gone, so the answer cannot change under
+            // it: the gate only lifts through a repair or a clean verdict, and
+            // both act on armed sets.
+            let damage_reported = result.is_ok() && armed.coverage.is_gated();
 
             match &result {
                 Ok(outcome) => {
@@ -2435,6 +2457,14 @@ impl Pipeline {
                         elapsed_ms = elapsed.as_millis() as u64,
                         "direct unpack completed"
                     );
+                    if damage_reported {
+                        info!(
+                            job_id = key.0.0,
+                            set_name = %key.1,
+                            "direct unpack finished under a standing damage report — it read the \
+                             damaged range before the report arrived, so the report outlives it"
+                        );
+                    }
                 }
                 Err(error) => {
                     // A part that vanished under the reader is a rename racing
@@ -2480,6 +2510,7 @@ impl Pipeline {
                     total_bytes: armed.counters.total_bytes.load(Ordering::Relaxed),
                     completed_bytes: armed.counters.completed_bytes.load(Ordering::Relaxed),
                     tainted: false,
+                    damage_reported,
                 },
             );
         }
@@ -3021,20 +3052,37 @@ impl Pipeline {
     /// repair that pass would summon; skipping the pass on the strength of the
     /// claim would leave it waiting for nothing.
     ///
-    /// Only *armed* sets count. A draining set has been aborted and will be
+    /// A draining set does not count. It has been aborted and will be
     /// materialized and decoded conventionally, where damage surfaces as a
     /// failed extraction and takes the repair path finalize already has for
     /// that.
+    ///
+    /// A *finished* set counts for as long as its outcome is still installable:
+    /// one that completed under a standing report decoded the damaged range, and
+    /// dropping the report with the worker would let those members be installed
+    /// on the strength of the archive's type alone.
     pub(in crate::pipeline) fn direct_unpack_gated_sets(&self, job_id: JobId) -> Vec<String> {
-        if self.direct_unpack.armed.is_empty() {
+        if self.direct_unpack.armed.is_empty() && self.direct_unpack.outcomes.is_empty() {
             return Vec::new();
         }
-        self.direct_unpack
+        let armed = self
+            .direct_unpack
             .armed
             .iter()
             .filter(|((armed_job, _), armed)| *armed_job == job_id && armed.coverage.is_gated())
-            .map(|((_, set_name), _)| set_name.clone())
-            .collect()
+            .map(|((_, set_name), _)| set_name.clone());
+        // A chase that finished under a standing report carries it until a
+        // repair or a clean verdict retires the outcome. Tainting is how both
+        // do that, so a tainted outcome has already been answered.
+        let finished = self
+            .direct_unpack
+            .outcomes
+            .iter()
+            .filter(|((outcome_job, _), outcome)| {
+                *outcome_job == job_id && outcome.damage_reported && !outcome.tainted
+            })
+            .map(|((_, set_name), _)| set_name.clone());
+        armed.chain(finished).collect()
     }
 
     /// Mark a set as parked through a repair, without going through the
@@ -3242,9 +3290,6 @@ impl Pipeline {
         job_id: JobId,
         set_id: par2_rs::RecoverySetId,
     ) {
-        if self.direct_unpack.armed.is_empty() {
-            return;
-        }
         let gated = self.direct_unpack_gated_sets(job_id);
         if gated.is_empty() {
             return;
@@ -3288,6 +3333,27 @@ impl Pipeline {
                 continue;
             }
             let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) else {
+                // A finished chase has no frontier to reopen. What it decoded
+                // was reported damaged as it streamed and what is on disk now
+                // verifies clean, so the two are not known to be the same
+                // bytes: the members are retired and the set is decoded again
+                // from the files the verdict describes.
+                if let Some(outcome) = self
+                    .direct_unpack
+                    .outcomes
+                    .get_mut(&(job_id, set_name.clone()))
+                    && !outcome.tainted
+                {
+                    outcome.tainted = true;
+                    info!(
+                        job_id = job_id.0,
+                        set_name,
+                        recovery_set_id = %set_id,
+                        "recovery data verified this set clean after its chase finished under \
+                         a damage report; the chase outcome is retired"
+                    );
+                    record_event("retired_after_clean_verification");
+                }
                 continue;
             };
             let coverage = Arc::clone(&armed.coverage);
