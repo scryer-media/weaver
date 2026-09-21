@@ -2007,6 +2007,10 @@ pub(super) struct RetainedArticleDamage {
     /// Retained because the body looks cut short rather than because a
     /// checksum failed. The two want different words in the log.
     pub(super) truncation_suspected: bool,
+    /// The end the article's own header declared for its range, when it
+    /// declared a usable one. Carried so the record survives a demotion reset
+    /// that re-notes this damage at the durable handoff.
+    pub(super) declared_end: Option<u64>,
     /// Payload-relative spans, resolved against live ownership at disk handoff.
     pub(super) write_spans: Vec<std::ops::Range<usize>>,
 }
@@ -2738,6 +2742,11 @@ pub struct Pipeline {
     /// retry budget: the bytes are not at fault, and the count restarts
     /// whenever the file has placed another part.
     pub(super) unanchored_requeues: HashMap<SegmentId, (u32, usize)>,
+    /// Ordinals that reached a terminal state while their damaged bytes stayed
+    /// on disk, and that something parked above is waiting to start after.
+    /// Booking a terminal state cannot write a part, so the release runs at the
+    /// next seam that can.
+    pub(super) pending_unanchored_release: Vec<SegmentId>,
     /// Authoritative PAR2 runtime state per job.
     pub(super) par2_runtime: HashMap<JobId, Par2RuntimeState>,
     /// Allocated only for PAR3 carrier candidates; PAR2 sessions remain native.

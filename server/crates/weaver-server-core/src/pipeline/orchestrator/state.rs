@@ -228,6 +228,8 @@ impl Pipeline {
                 .retain(|segment_id, _| segment_id.file_id != file_id);
             self.unanchored_requeues
                 .retain(|segment_id, _| segment_id.file_id != file_id);
+            self.pending_unanchored_release
+                .retain(|segment_id| segment_id.file_id != file_id);
             if let Some(parked) = self.unanchored_parked.remove(&file_id) {
                 released_bytes += parked
                     .values()

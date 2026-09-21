@@ -171,6 +171,33 @@ pub(super) fn validate_yenc_layout(
     Ok(file_offset)
 }
 
+/// The layout boundary this article declares for itself, when it declares a
+/// usable one that fits the same envelopes a placement is bounded by.
+///
+/// This is where the *next* ordinal starts, and it is knowable even when the
+/// article's own bytes are damaged: the poster described the range, the decoder
+/// only failed to reproduce all of it. Bounding it here means a damaged part
+/// cannot hand the part behind it an offset further into the file than either
+/// the article's own declared length or the NZB envelope could contain.
+#[inline]
+pub(super) fn declared_part_end(
+    expected: ExpectedSegmentLayout,
+    actual: YencLayoutAssertions,
+) -> Option<u64> {
+    let begin = actual.begin?;
+    let end = actual.end?;
+    if end < begin {
+        return None;
+    }
+    if actual.file_size != 0
+        && actual.file_size <= MAX_DECLARED_FILE_BYTES
+        && end <= actual.file_size
+    {
+        return Some(end);
+    }
+    (end <= expected.max_file_size).then_some(end)
+}
+
 #[cold]
 #[inline(never)]
 pub(super) fn format_authoritative_layout_error(error: AuthoritativeLayoutError) -> String {

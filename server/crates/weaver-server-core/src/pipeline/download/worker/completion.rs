@@ -511,6 +511,10 @@ impl Pipeline {
         let segment_id = result.segment_id;
         let lane_id = result.lane_id;
         self.process_download_done_inner(result).await;
+        // A wire outcome that retired this ordinal may have settled damaged
+        // bytes a parked part was waiting to start after. Booking cannot write
+        // a part; this seam can.
+        self.release_settled_unanchored_runs().await;
         self.finish_checkpoint_progress_article(lane_id, segment_id);
     }
 

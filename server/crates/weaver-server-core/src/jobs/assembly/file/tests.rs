@@ -125,7 +125,7 @@ fn damaged_checkpoint_stops_before_actual_bytes_and_stays_conservative() {
     let mut asm = make_assembly(vec![14, 8]);
     asm.record_placement(0, 0, 10);
     asm.commit_segment(0, 10).unwrap();
-    asm.note_retained_damage(1, 10, 5, false);
+    asm.note_retained_damage(1, 10, 5, false, None);
     assert_eq!(asm.placement_of(1), None);
     assert_eq!(asm.placement_conflict(2, 14, 4), None);
     assert_eq!(asm.retained_damage_floor(), Some(10));
