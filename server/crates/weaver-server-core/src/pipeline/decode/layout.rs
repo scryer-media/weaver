@@ -16,7 +16,8 @@ mod compatibility_tests;
 /// These fields are therefore ceilings, not values, and only the envelope the
 /// NZB *can* prove — never a rejection criterion on their own, because the
 /// segment list can skip numbers and the byte counts can be understated:
-/// * `max_decoded_size` — the segment's declared size, kept for diagnostics.
+/// * `max_decoded_size` — the segment's declared size. It can only raise the
+///   absolute per-article ceiling, never lower it.
 /// * `max_file_offset` — the encoded prefix sum up to this segment, valid only
 ///   when the NZB listed every segment of the file.
 /// * `max_file_size` — the encoded total, the same bound applied to the file.
@@ -47,8 +48,10 @@ pub(super) enum AuthoritativeLayoutError {
 /// The NZB's per-segment byte count cannot serve as this bound: it is
 /// indexer-supplied and routinely understated, and rejecting on it abandons
 /// articles that decode perfectly. What is needed here is only a sanity
-/// ceiling — a value no honest post reaches — so a hostile article cannot
-/// claim an unbounded length. Reference decoders clamp at the same figure.
+/// ceiling — a value no ordinary post reaches — so a hostile article cannot
+/// claim an unbounded length. Reference decoders refuse at the same figure.
+/// A segment the NZB itself declares to be larger raises it rather than being
+/// refused by it.
 pub(super) const MAX_ARTICLE_DECODED_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Largest whole-file length an article's own `=ybegin size=` may assert
@@ -125,7 +128,10 @@ pub(super) fn validate_yenc_layout(
     actual: YencLayoutAssertions,
     decoded_len: usize,
 ) -> Result<u64, YencLayoutMismatch> {
-    if decoded_len as u64 > MAX_ARTICLE_DECODED_BYTES {
+    // The NZB's own segment size only ever *raises* this ceiling: it is not a
+    // rejection criterion, but a post that declares an article this large is
+    // not making an unbounded claim either.
+    if decoded_len as u64 > MAX_ARTICLE_DECODED_BYTES.max(u64::from(expected.max_decoded_size)) {
         return Err(YencLayoutMismatch::DecodedSizeAboveCeiling);
     }
     let file_offset = match actual.begin {
