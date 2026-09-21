@@ -94,6 +94,11 @@ pub struct FileAssembly {
     /// checksum to say either way. A later copy whose length is accounted for
     /// may settle these; one held by a failed checksum may not.
     truncation_only_damage: BTreeSet<u32>,
+    /// The layout boundary a damaged ordinal declared for itself, when its own
+    /// header carried a usable range. It is where the part after it begins no
+    /// matter how many bytes this one managed to decode, so it outranks the
+    /// retained extent as an anchor.
+    declared_damage_ends: BTreeMap<u32, u64>,
     /// Existing durable prefix evidence, clipped whenever resumed bytes are rewritten.
     restored_prefix_end: u64,
     final_part_verified: bool,
@@ -147,6 +152,7 @@ impl FileAssembly {
             retained_damage_floor: None,
             damaged_segments: BTreeMap::new(),
             truncation_only_damage: BTreeSet::new(),
+            declared_damage_ends: BTreeMap::new(),
             restored_prefix_end: 0,
             final_part_verified: false,
             geometry_requires_verification: false,
@@ -224,8 +230,17 @@ impl FileAssembly {
         offset: u64,
         len: u32,
         truncation_only: bool,
+        declared_end: Option<u64>,
     ) {
         self.damaged_segments.insert(segment_number, (offset, len));
+        match declared_end {
+            Some(end) => {
+                self.declared_damage_ends.insert(segment_number, end);
+            }
+            None => {
+                self.declared_damage_ends.remove(&segment_number);
+            }
+        }
         if truncation_only {
             self.truncation_only_damage.insert(segment_number);
         } else {
@@ -240,7 +255,40 @@ impl FileAssembly {
 
     pub(crate) fn clear_retained_damage(&mut self, segment_number: u32) -> bool {
         self.truncation_only_damage.remove(&segment_number);
+        self.declared_damage_ends.remove(&segment_number);
         self.damaged_segments.remove(&segment_number).is_some()
+    }
+
+    /// The end offset a part may be laid after, when it declared no start of
+    /// its own and the ordinal before it is `segment_number`.
+    ///
+    /// A placement is the answer whenever there is one. Otherwise the ordinal
+    /// before it may still have left an extent behind: bytes that failed their
+    /// checksum are written and kept for repair, and once no further copy is
+    /// coming they mark the boundary just as a placement would. `settled` is
+    /// the pipeline's answer to whether another copy may still arrive, since
+    /// assembly does not know what is still being asked of which server; while
+    /// one may, nothing is laid after bytes a clean copy could displace.
+    ///
+    /// Trust runs: the damaged part's own declared range first, because that
+    /// is the layout the poster described regardless of how much of it decoded;
+    /// then its retained extent, but only when its length is believable — a
+    /// body that looked cut short says nothing about where the next one starts.
+    pub(crate) fn anchor_end_after(&self, segment_number: u32, settled: bool) -> Option<u64> {
+        if let Some((offset, len)) = self.placement_of(segment_number) {
+            return Some(offset.saturating_add(u64::from(len)));
+        }
+        if !settled {
+            return None;
+        }
+        let (offset, len) = *self.damaged_segments.get(&segment_number)?;
+        if let Some(declared_end) = self.declared_damage_ends.get(&segment_number) {
+            return Some(*declared_end);
+        }
+        if self.truncation_only_damage.contains(&segment_number) {
+            return None;
+        }
+        Some(offset.saturating_add(u64::from(len)))
     }
 
     /// Only accepted bytes may exclude writes of a damaged candidate.
@@ -377,6 +425,7 @@ impl FileAssembly {
         self.retained_damage_floor = None;
         self.damaged_segments.clear();
         self.truncation_only_damage.clear();
+        self.declared_damage_ends.clear();
         self.restored_prefix_end = 0;
         self.final_part_verified = false;
         self.geometry_requires_verification = false;
@@ -402,6 +451,7 @@ impl FileAssembly {
     pub fn mark_complete(&mut self) {
         self.damaged_segments.clear();
         self.truncation_only_damage.clear();
+        self.declared_damage_ends.clear();
         self.retained_damage_floor = None;
         self.geometry_requires_verification = false;
         if let Some(ready) = &mut self.repair_output_ready {

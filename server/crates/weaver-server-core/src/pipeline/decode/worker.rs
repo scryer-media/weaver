@@ -1245,6 +1245,10 @@ impl Pipeline {
             }
         }
 
+        // A decode that exhausted this ordinal's servers may have settled the
+        // damaged bytes a parked part was waiting to start after.
+        self.release_settled_unanchored_runs().await;
+
         self.pump_decode_queue();
 
         // The download-result path already ran the drain sequence for this
@@ -1465,6 +1469,10 @@ impl Pipeline {
                 placed = result.segment_id.segment_number;
                 self.handle_decode_success_inner(result, source).await;
             }
+            // Bytes kept for repair are settled by the booking their own
+            // retries end in, which happens inside the commit above and cannot
+            // write the parts it unblocks.
+            self.release_settled_unanchored_runs().await;
             return;
         }
         loop {
@@ -1573,6 +1581,9 @@ impl Pipeline {
                 }
             };
             let decoded_len = data.len_bytes();
+            // Set when this part starts where damaged bytes kept for repair
+            // were judged to end, rather than after a placement.
+            let mut anchored_on_settled_damage = false;
 
             // uuencode cannot be placed by the yEnc layout rules. An article
             // declares no range, so the validator's no-range arm falls back to
@@ -1665,11 +1676,26 @@ impl Pipeline {
                 let sequential_anchor = if segment_id.segment_number == 0 {
                     Some(0)
                 } else {
-                    self.jobs
+                    let predecessor = segment_id.segment_number - 1;
+                    // A part given up with damaged bytes still on disk knows
+                    // where it ended; assembly only needs to be told that no
+                    // further copy of it is coming.
+                    let settled = self.segment_terminal_states.contains_key(&SegmentId {
+                        file_id,
+                        segment_number: predecessor,
+                    });
+                    let file = self
+                        .jobs
                         .get(&job_id)
-                        .and_then(|state| state.assembly.file(file_id))
-                        .and_then(|file| file.placement_of(segment_id.segment_number - 1))
-                        .map(|(offset, len)| offset.saturating_add(u64::from(len)))
+                        .and_then(|state| state.assembly.file(file_id));
+                    let anchor = file.and_then(|file| file.anchor_end_after(predecessor, settled));
+                    // An anchor the part before it never placed is one read off
+                    // bytes that are being kept only for repair — and it is
+                    // used only by an article that named no start of its own.
+                    anchored_on_settled_damage = anchor.is_some()
+                        && yenc_layout.begin.is_none()
+                        && file.is_some_and(|file| file.placement_of(predecessor).is_none());
+                    anchor
                 };
                 match validate_yenc_layout(
                     expected_layout,
@@ -1765,6 +1791,9 @@ impl Pipeline {
             // Suspicion must never soften damage a checksum already proved.
             let damage_is_truncation_only =
                 crc_valid && truncation_suspected && !(held_damage.0 && !held_damage.1);
+            // Where this article said its range ends, which is where the next
+            // ordinal starts even if these bytes are kept only for repair.
+            let declared_end = declared_part_end(expected_layout, yenc_layout);
             let conflict = match self
                 .jobs
                 .get_mut(&job_id)
@@ -1793,6 +1822,13 @@ impl Pipeline {
                                     file_offset,
                                     decoded_size,
                                 );
+                                if anchored_on_settled_damage {
+                                    // The tiling is now only as good as the
+                                    // boundary damaged bytes were judged to
+                                    // have, so completion stays gated on a
+                                    // repair verdict for this file.
+                                    file.require_geometry_verification();
+                                }
                                 None
                             }
                         }
@@ -1838,6 +1874,7 @@ impl Pipeline {
                         file_offset,
                         decoded_size,
                         damage_is_truncation_only,
+                        declared_end,
                     );
                 }
                 let filename = self
@@ -1872,6 +1909,7 @@ impl Pipeline {
                             weaver_yenc::CrcVerification::Mismatch
                         },
                         truncation_suspected: damage_is_truncation_only,
+                        declared_end,
                         write_spans: Vec::new(),
                     })),
                 };
@@ -2547,8 +2585,11 @@ impl Pipeline {
             segment_number: ordinal.saturating_sub(1),
         };
         if self.segment_terminal_states.contains_key(&predecessor) {
-            // The part it must follow was already given up, so there is no
-            // offset to wait for and a fetch would bring back the same article.
+            // The part it must follow was given up leaving nothing to measure
+            // from — no placement and no extent this article could follow, or
+            // the anchor would have been found above and these bytes placed.
+            // Waiting is pointless and a fetch would bring back the same
+            // article.
             self.give_up_unanchored(segment_id);
             return;
         }
@@ -2587,18 +2628,19 @@ impl Pipeline {
         );
     }
 
-    /// The parked article that directly follows `placed`, once `placed` has
-    /// actually been placed. A part committed as damage or dropped leaves no
-    /// placement, so nothing can anchor on it and nothing is released.
+    /// The parked article that directly follows `predecessor`, once
+    /// `predecessor` has an end for it to start at: a placement, or — once no
+    /// further copy of it is coming — the extent its damaged bytes occupy. A
+    /// part that left neither behind anchors nothing and releases nothing.
     fn take_unanchored_successor(
         &mut self,
         file_id: NzbFileId,
-        placed: u32,
+        predecessor: u32,
     ) -> Option<(DecodeResult, SegmentSource)> {
         if self.unanchored_parked.is_empty() {
             return None;
         }
-        let successor = placed.checked_add(1)?;
+        let successor = predecessor.checked_add(1)?;
         if !self
             .unanchored_parked
             .get(&file_id)
@@ -2606,12 +2648,16 @@ impl Pipeline {
         {
             return None;
         }
-        let is_placed = self
+        let settled = self.segment_terminal_states.contains_key(&SegmentId {
+            file_id,
+            segment_number: predecessor,
+        });
+        let anchored = self
             .jobs
             .get(&file_id.job_id)
             .and_then(|state| state.assembly.file(file_id))
-            .is_some_and(|file| file.placement_of(placed).is_some());
-        if !is_placed {
+            .is_some_and(|file| file.anchor_end_after(predecessor, settled).is_some());
+        if !anchored {
             return None;
         }
         let parked = self.unanchored_parked.get_mut(&file_id)?;
@@ -2649,6 +2695,24 @@ impl Pipeline {
             self.release_write_buffered(released_bytes, released.len());
         }
         released
+    }
+
+    /// Release the articles held behind an ordinal that has just settled for
+    /// good with its damaged bytes left on disk.
+    ///
+    /// The booking that settles an ordinal is not a place where a decoded part
+    /// can be written, so it only notes which ordinals it unblocked; the run
+    /// behind each of them is released here, through the same commit path
+    /// every other part takes, and each part placed anchors the next.
+    pub(crate) async fn release_settled_unanchored_runs(&mut self) {
+        while let Some(settled) = self.pending_unanchored_release.pop() {
+            let file_id = settled.file_id;
+            let mut anchor = settled.segment_number;
+            while let Some((result, source)) = self.take_unanchored_successor(file_id, anchor) {
+                anchor = result.segment_id.segment_number;
+                self.handle_decode_success_inner(result, source).await;
+            }
+        }
     }
 
     /// Retire an unanchored article whose predecessor was given up. It is
@@ -3414,6 +3478,7 @@ impl Pipeline {
                     file_offset,
                     segment.decoded_size,
                     unresolved.truncation_suspected,
+                    unresolved.declared_end,
                 );
             }
             // The disk owner completed this write before an alternate response

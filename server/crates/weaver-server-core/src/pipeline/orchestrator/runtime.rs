@@ -396,6 +396,7 @@ impl Pipeline {
             uu_park_requeues: HashMap::new(),
             unanchored_parked: HashMap::new(),
             unanchored_requeues: HashMap::new(),
+            pending_unanchored_release: Vec::new(),
             par2_runtime: HashMap::new(),
             par3_runtime: None,
             par3_inside_probes: Default::default(),
@@ -884,6 +885,16 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             self.pump_decode_queue();
+
+            // An ordinal can be retired from outside the result handlers — a
+            // server removed, work no lane may seat — and a part parked behind
+            // its damaged bytes must be written before completion is weighed,
+            // or the job would be judged with that part neither placed nor
+            // given up.
+            if !self.pending_unanchored_release.is_empty() {
+                self.release_settled_unanchored_runs().await;
+                self.pump_decode_queue();
+            }
 
             let pending_completion_checks = self.pending_completion_checks.len();
             for _ in 0..pending_completion_checks {
