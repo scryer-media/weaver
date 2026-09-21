@@ -400,6 +400,26 @@ async fn sparse_segment_list_commits_every_listed_article_and_flags_the_hole() {
     );
 }
 
+/// Posters exist that write a running whole-file checksum, or zeros, on every
+/// part but the last. That cannot be allowed to end the job.
+#[tokio::test]
+async fn conflicting_whole_file_crcs_drop_the_expectation_instead_of_failing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _) = setup(&temp, 40222, &[8, 8]).await;
+    pipeline.note_expected_file_crc(file_id, Some(0x1111_1111));
+    assert_eq!(
+        pipeline.expected_file_crcs.get(&file_id),
+        Some(&0x1111_1111)
+    );
+    pipeline.note_expected_file_crc(file_id, Some(0x2222_2222));
+    assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(pipeline.untrusted_file_crcs.contains(&file_id));
+    // Once untrusted, later parts cannot reinstate an expectation.
+    pipeline.note_expected_file_crc(file_id, Some(0x1111_1111));
+    assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
+    assert!(!is_terminal_status(&pipeline.jobs[&file_id.job_id].status));
+}
+
 #[tokio::test]
 async fn stale_metadata_assembles_twenty_parts_without_abandonment() {
     let temp = tempfile::tempdir().unwrap();

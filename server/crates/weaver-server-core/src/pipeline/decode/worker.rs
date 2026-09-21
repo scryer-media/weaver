@@ -573,30 +573,41 @@ impl Pipeline {
         self.par2_set(file_id.job_id).is_none()
     }
 
+    /// Record the whole-file CRC32 a part's trailer claims.
+    ///
+    /// Parts that disagree do not make the download wrong: posters exist that
+    /// write a running checksum, or zeros, on every part but the last. The
+    /// only honest conclusion is that this file has no usable whole-file
+    /// expectation, so the value is dropped and the file is remembered as
+    /// untrusted for the rest of its life. The per-part `pcrc32` is unaffected
+    /// and remains the article-level verdict.
     pub(crate) fn note_expected_file_crc(
         &mut self,
         file_id: NzbFileId,
         expected_file_crc: Option<u32>,
-    ) -> Result<(), String> {
+    ) {
         let Some(expected_file_crc) = expected_file_crc else {
-            return Ok(());
+            return;
         };
+        if self.untrusted_file_crcs.contains(&file_id) {
+            return;
+        }
 
         match self.expected_file_crcs.entry(file_id) {
             std::collections::hash_map::Entry::Occupied(existing) => {
-                if *existing.get() == expected_file_crc {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "conflicting yEnc whole-file CRC32 for {file_id}: {:08x} vs {:08x}",
-                        existing.get(),
-                        expected_file_crc
-                    ))
+                if *existing.get() != expected_file_crc {
+                    warn!(
+                        file_id = %file_id,
+                        first = format_args!("{:08x}", existing.get()),
+                        second = format_args!("{expected_file_crc:08x}"),
+                        "parts disagree on the whole-file CRC32; ignoring it for this file"
+                    );
+                    existing.remove();
+                    self.untrusted_file_crcs.insert(file_id);
                 }
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(expected_file_crc);
-                Ok(())
             }
         }
     }
@@ -1835,11 +1846,7 @@ impl Pipeline {
                     .is_some_and(|recovery| recovery.pending_segments.contains(&segment_id));
 
             self.note_recovery_count_from_yenc_name(job_id, file_id.file_index, &yenc_name);
-            if let Err(error) = self.note_expected_file_crc(file_id, expected_file_crc) {
-                self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
-                self.fail_job(job_id, error);
-                return;
-            }
+            self.note_expected_file_crc(file_id, expected_file_crc);
 
             if part_crc_verified {
                 crate::runtime::perf_probe::record(
@@ -3654,6 +3661,7 @@ impl Pipeline {
                     self.file_hash_states.remove(&file_id);
                     if expected_file_crc.is_none_or(|expected| expected == file_checksum.crc32) {
                         self.expected_file_crcs.remove(&file_id);
+                        self.untrusted_file_crcs.remove(&file_id);
                     }
                     self.file_hash_reread_required.remove(&file_id);
                     self.unverified_segments.remove(&file_id);

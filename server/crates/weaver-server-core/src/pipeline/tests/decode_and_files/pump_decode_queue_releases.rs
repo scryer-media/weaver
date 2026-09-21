@@ -2406,7 +2406,7 @@ async fn whole_file_crc_recovery_fails_when_unverified_segment_budget_is_exhaust
 }
 
 #[tokio::test]
-async fn conflicting_file_crc32_across_segments_fails_job() {
+async fn conflicting_file_crc32_across_segments_drops_the_expectation() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20019);
@@ -2439,21 +2439,19 @@ async fn conflicting_file_crc32_across_segments_fails_job() {
     )
     .await;
 
+    // Some posters write a running whole-file checksum, or zeros, on every
+    // part but the last. The parts themselves decoded, so the only honest
+    // conclusion is that this file has no usable whole-file expectation.
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
-    assert!(matches!(
-        &status,
-        JobStatus::Failed { error } if error.contains("conflicting yEnc whole-file CRC32")
-    ));
-    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(!matches!(&status, JobStatus::Failed { .. }), "{status:?}");
+    assert!(pipeline.jobs.contains_key(&job_id));
     assert!(!pipeline.expected_file_crcs.contains_key(&file_id));
-    assert!(!pipeline.file_hash_states.contains_key(&file_id));
-    assert!(!pipeline.file_hash_reread_required.contains(&file_id));
     assert!(
-        pipeline
-            .db
-            .load_complete_file_hashes(job_id)
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(file_id)
             .unwrap()
-            .is_empty()
+            .is_complete()
     );
 }
 

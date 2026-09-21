@@ -2275,6 +2275,10 @@ pub struct Pipeline {
     pub(super) deferred_file_hash_ranges: HashMap<NzbFileId, BTreeMap<u64, DeferredFileHashRange>>,
     /// Expected whole-file yEnc CRC32 values observed from multipart `=yend crc32`.
     pub(super) expected_file_crcs: HashMap<NzbFileId, u32>,
+    /// Files whose parts disagreed about the whole-file CRC32. Some posters
+    /// write a running value, or zeros, on every part but the last, so the
+    /// field proves nothing for those files and every later value is ignored.
+    pub(super) untrusted_file_crcs: HashSet<NzbFileId>,
     /// Files that need a one-time disk reread because out-of-order persistence broke the stream.
     pub(super) file_hash_reread_required: HashSet<NzbFileId>,
     #[cfg(test)]
