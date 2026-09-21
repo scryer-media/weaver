@@ -1093,8 +1093,15 @@ jobs:
           if [ "$SIGNED" = "true" ]; then
             codesign --verify --deep --verbose "$mount_point/Weaver.app"
           fi
+      # The installer fetches a release asset from GitHub, and one gateway
+      # error there otherwise costs the whole release run. One more attempt.
       - name: Install Syft
-        id: syft
+        id: syft_first
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - name: Install Syft (second attempt)
+        id: syft_retry
+        if: steps.syft_first.outcome == 'failure'
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
@@ -1102,7 +1109,7 @@ jobs:
       - name: Generate bundle SBOM
         run: |
           set -euo pipefail
-          "${{ steps.syft.outputs.cmd }}" "dir:dist/app/Weaver.app" \
+          "${{ steps.syft_retry.outputs.cmd || steps.syft_first.outputs.cmd }}" "dir:dist/app/Weaver.app" \
             -o "spdx-json=weaver-darwin-x86_64.spdx.json"
           test -s weaver-darwin-x86_64.spdx.json
       - name: Upload release package
@@ -1352,8 +1359,15 @@ jobs:
           if [ "$SIGNED" = "true" ]; then
             codesign --verify --deep --verbose "$mount_point/Weaver.app"
           fi
+      # The installer fetches a release asset from GitHub, and one gateway
+      # error there otherwise costs the whole release run. One more attempt.
       - name: Install Syft
-        id: syft
+        id: syft_first
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - name: Install Syft (second attempt)
+        id: syft_retry
+        if: steps.syft_first.outcome == 'failure'
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
@@ -1361,7 +1375,7 @@ jobs:
       - name: Generate bundle SBOM
         run: |
           set -euo pipefail
-          "${{ steps.syft.outputs.cmd }}" "dir:dist/app/Weaver.app" \
+          "${{ steps.syft_retry.outputs.cmd || steps.syft_first.outputs.cmd }}" "dir:dist/app/Weaver.app" \
             -o "spdx-json=weaver-darwin-arm64.spdx.json"
           test -s weaver-darwin-arm64.spdx.json
       - name: Upload release package
@@ -2999,8 +3013,15 @@ jobs:
           pattern: weaver-*-${{ github.run_id }}
           path: artifacts
           merge-multiple: true
+      # The installer fetches a release asset from GitHub, and one gateway
+      # error there otherwise costs the whole release run. One more attempt.
       - name: Install Syft
-        id: syft
+        id: syft_first
+        continue-on-error: true
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - name: Install Syft (second attempt)
+        id: syft_retry
+        if: steps.syft_first.outcome == 'failure'
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       - name: Generate archive SBOMs and SLSA subject list
         run: |
@@ -3023,7 +3044,7 @@ jobs:
           mapfile -t bundle_sboms < <(find artifacts -maxdepth 1 -type f -name 'weaver-darwin-*.spdx.json' -printf '%f\n' | sort)
           test "${#bundle_sboms[@]}" -eq 2
           for archive in "${archives[@]}"; do
-            "${{ steps.syft.outputs.cmd }}" "file:artifacts/${archive}" \
+            "${{ steps.syft_retry.outputs.cmd || steps.syft_first.outputs.cmd }}" "file:artifacts/${archive}" \
               -o "spdx-json=release-inputs/${archive%.*}.spdx.json"
           done
           {
