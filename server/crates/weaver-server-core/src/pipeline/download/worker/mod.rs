@@ -319,12 +319,25 @@ impl Pipeline {
             let spill_in_flight = self.spill_job_in_flight_on(server_idx);
             let lane_mode = self.download_lane_mode_for_server(server_idx, pressure, true);
             let want = self.download_refill_want(lane_mode);
-            let works = match self.next_works(server_idx, want, spill_in_flight, pressure) {
-                Handout::Idle => continue,
+            // The lane does not exist yet, so it holds nothing: `lane_id` is
+            // taken before the ask so the share is measured against it, and
+            // the scheduler cannot find it saturated.
+            let lane_id = Self::next_download_lane_id();
+            let lane_share = crate::pipeline::download::scheduler::LaneShare {
+                lane_id,
+                depth: lane_mode.max_depth(),
+            };
+            let works = match self.next_works_for_lane(
+                server_idx,
+                want,
+                Some(lane_share),
+                spill_in_flight,
+                pressure,
+            ) {
+                Handout::Idle | Handout::Saturated { .. } => continue,
                 Handout::Yield(_) => return DispatchAttempt::StopAll,
                 Handout::Works(works) => works,
             };
-            let lane_id = Self::next_download_lane_id();
             let Some(lease) =
                 self.lease_for_handout(lane_id, server_idx, lane_mode, pressure, works)
             else {

@@ -259,7 +259,7 @@ impl Pipeline {
             pressure,
         ) {
             Handout::Works(works) => works,
-            Handout::Idle | Handout::Yield(_) => return None,
+            Handout::Idle | Handout::Yield(_) | Handout::Saturated { .. } => return None,
         };
         let handout_job = works.first()?.segment_id.file_id.job_id;
         // Recovery articles are what a repair is waiting on, and critical

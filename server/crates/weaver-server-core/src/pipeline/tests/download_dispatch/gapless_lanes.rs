@@ -534,3 +534,93 @@ async fn a_lane_between_leases_outlives_the_job_it_last_served() {
     );
     assert_eq!(pipeline.active_download_connections, 1);
 }
+
+/// A lane at its share of the hot job is neither refused nor sent on to the
+/// next job: its ask waits, and is answered as soon as its holdings fall
+/// below the share. Rule 7 of the scheduler, seen from the lane's side.
+#[tokio::test]
+async fn a_saturated_refill_waits_for_the_lane_to_drain_below_its_share() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner.set_connection_limit(100);
+    let hot = JobId(41301);
+    let next = JobId(41302);
+    insert_active_job(
+        &mut pipeline,
+        hot,
+        segmented_job_spec("Shared Reel", "payload.bin", &vec![512u32; 600]),
+    )
+    .await;
+    insert_active_job(
+        &mut pipeline,
+        next,
+        segmented_job_spec("Shared Reel Two", "payload.bin", &vec![512u32; 600]),
+    )
+    .await;
+    let lane_id = book_connected_lane(&mut pipeline, hot, false);
+    let share = pipeline.lane_share_of_job(hot, 1);
+
+    // Fill the lane to its share, one refill at a time; each is answered
+    // from the hot job, and none is sent on to the next.
+    let mut first_segment = None;
+    while pipeline.download_lane_holdings(lane_id) < share {
+        let (response_tx, response_rx) = oneshot::channel();
+        pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
+        let lease = response_rx
+            .await
+            .unwrap()
+            .lease
+            .expect("a lane below its share is served");
+        assert_eq!(lease.job_id, hot);
+        first_segment.get_or_insert(lease.works[0].segment_id);
+    }
+    assert_eq!(pipeline.download_lane_holdings(lane_id), share);
+    let drained = first_segment.unwrap();
+
+    // At its share, the next ask is held: no lease, no park, and the next
+    // job is not opened for it.
+    let parked_before = pipeline
+        .metrics
+        .download_lane_refill_parked_total
+        .load(Ordering::Relaxed);
+    let (response_tx, mut response_rx) = oneshot::channel();
+    pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
+    assert!(
+        response_rx.try_recv().is_err(),
+        "a saturated lane's ask is held, not answered"
+    );
+    assert_eq!(pipeline.held_download_refills.len(), 1);
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_lane_refill_parked_total
+            .load(Ordering::Relaxed),
+        parked_before
+    );
+    assert_eq!(pipeline.jobs.get(&next).unwrap().download_queue.len(), 600);
+
+    // Servicing the hold while the lane still holds its share changes
+    // nothing; the ask stays held past any idle deadline because the lane is
+    // busy, not idle.
+    pipeline.service_held_download_refills();
+    assert!(response_rx.try_recv().is_err());
+    assert_eq!(pipeline.held_download_refills.len(), 1);
+
+    // One result lands: the lane is below its share and the ask is answered
+    // with exactly the difference, from the hot job.
+    pipeline
+        .download_lane_owners
+        .get_mut(&lane_id)
+        .unwrap()
+        .outstanding
+        .remove(&drained);
+    pipeline.service_held_download_refills();
+    let lease = response_rx
+        .await
+        .unwrap()
+        .lease
+        .expect("a lane below its share is served on the next service pass");
+    assert_eq!(lease.job_id, hot);
+    assert_eq!(lease.works.len(), 1);
+    assert!(pipeline.held_download_refills.is_empty());
+}

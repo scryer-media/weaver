@@ -528,7 +528,7 @@ async fn ip_replacement_trial_starts_when_every_connection_is_busy() {
 }
 
 #[tokio::test]
-async fn dispatch_downloads_fills_the_second_lane_from_the_next_job_once_the_hot_job_is_drained() {
+async fn dispatch_downloads_shares_a_small_hot_job_across_both_lanes_before_the_next_job() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -572,10 +572,12 @@ async fn dispatch_downloads_fills_the_second_lane_from_the_next_job_once_the_hot
 
     pipeline.dispatch_downloads();
 
-    assert_eq!(pipeline.active_downloads, 4);
+    assert_eq!(pipeline.active_downloads, 3);
     assert_eq!(pipeline.active_download_connections, 2);
-    // The hot job's whole queue fits in one handout, so the second lane would
-    // have nothing to do; rather than sit idle it takes the next job.
+    // The hot job's three articles are two lanes' share, not one handout: the
+    // second lane takes what the first left rather than opening the next
+    // job beside a hot job it could still be fetching. The next job waits
+    // for the first lane that finds the hot job drained.
     assert_eq!(
         pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
         0
@@ -587,12 +589,12 @@ async fn dispatch_downloads_fills_the_second_lane_from_the_next_job_once_the_hot
             .unwrap()
             .download_queue
             .len(),
-        0
+        1
     );
     assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&3));
     assert_eq!(
         pipeline.active_downloads_by_job.get(&secondary_job_id),
-        Some(&1)
+        None
     );
 }
 
