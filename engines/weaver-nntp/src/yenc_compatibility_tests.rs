@@ -406,6 +406,46 @@ fn transport_interruption_is_not_a_missing_trailer() {
     assert!(decoder.decode_available(&mut input).unwrap().is_none());
 }
 
+/// An `=ypart` line marks a slice of a larger file even when neither `=ybegin
+/// part=` nor a usable `begin=` came with it. The whole-file size must not be
+/// held against the slice, `pcrc32` is what checks it, and the file-wide
+/// `crc32` must survive as the whole-file expectation rather than being
+/// replaced by the part's own checksum.
+#[test]
+fn an_unplaceable_part_without_a_part_number_is_still_a_part() {
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(PAYLOAD);
+    let crc = crc.finalize();
+    let file_crc = crc ^ 0x5a5a_5a5a;
+    let article = article(
+        "=ybegin line=128 size=16 name=sample.bin\r\n",
+        "=ypart end=8\r\n",
+        &format!("=yend size=8 pcrc32={crc:08x} crc32={file_crc:08x}\r\n"),
+        PAYLOAD,
+    );
+    let check = |result: &weaver_yenc::DecodeResult, how: &str| {
+        assert!(result.defects.invalid_ypart_begin, "{how}");
+        assert!(!result.defects.ybegin_size_mismatch, "{how}");
+        assert_eq!(result.crc_status, CrcVerification::Verified, "{how}");
+        assert_eq!(result.expected_part_crc, Some(crc), "{how}");
+        assert_eq!(result.expected_file_crc, Some(file_crc), "{how}");
+    };
+
+    let mut output = vec![0; article.len()];
+    let result = weaver_yenc::decode_nntp(&article, &mut output).unwrap();
+    assert_eq!(&output[..result.bytes_written], PAYLOAD);
+    check(&result, "whole buffer");
+
+    let response = wire(&article);
+    for chunk_size in [1, response.len()] {
+        let chunks: Vec<_> = response.chunks(chunk_size).collect();
+        let (decoded, left) = fused(&chunks);
+        assert!(left.is_empty(), "chunk={chunk_size}");
+        assert_eq!(decoded.to_data(), PAYLOAD, "chunk={chunk_size}");
+        check(decoded.yenc_result(), &format!("chunk={chunk_size}"));
+    }
+}
+
 /// A part whose `=ypart begin=` cannot be read still decodes: the bytes are
 /// intact, only their position is unknown. Every chunking must agree that the
 /// article is delivered, that the defect is recorded, and that no offset is

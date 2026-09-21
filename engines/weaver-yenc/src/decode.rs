@@ -209,7 +209,11 @@ fn finalize_decode(
         None => (None, None, None, YencHeaderDefects::default(), false),
     };
     let mut defects = metadata.defects.merged(yend_defects);
-    let multipart = metadata.part.is_some() || metadata.begin.is_some();
+    // An `=ypart` line makes the article one part of a larger file even when
+    // its range could not be read: its bytes are a slice, so the `=ybegin`
+    // size and the `=yend crc32` describe the whole file, not this article.
+    let multipart =
+        metadata.part.is_some() || metadata.begin.is_some() || metadata.defects.invalid_ypart_begin;
     defects.yend_size_mismatch = yend_size.is_some_and(|size| size != bytes_written as u64);
     if let (Some(begin), Some(end)) = (metadata.begin, metadata.end) {
         defects.ypart_size_mismatch =
