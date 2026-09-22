@@ -577,6 +577,28 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_article_hands_over_its_payload_as_views_of_the_one_body() {
+        let root = tempfile::tempdir().unwrap();
+        let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
+        let id = work().segment_id;
+        let bytes = [91u8; 2048];
+        let (_cache, replayed) =
+            CachedBody::store(decoded(id, &bytes), Some(0), root.path(), &memory, 7).unwrap();
+        let DecodedChunk::Shared(body) = &replayed.data else {
+            panic!("a stored body replays shared")
+        };
+        let pieces = replayed.data.pieces();
+        let inner = body.data.pieces();
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].as_ref(), bytes.as_slice());
+        assert_eq!(
+            pieces[0].as_ptr(),
+            inner[0].as_ptr(),
+            "a shared article hands out the body's own buffer, never a copy"
+        );
+    }
+
+    #[test]
     fn changed_cache_bytes_are_never_replayed_as_verified() {
         let root = tempfile::tempdir().unwrap();
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));

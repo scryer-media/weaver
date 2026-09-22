@@ -201,7 +201,7 @@ pub(super) struct PayloadLease {
     registry: Arc<Mutex<BTreeMap<usize, Weak<PayloadLease>>>>,
     key: usize,
     // Owning the allocation prevents pointer reuse while a lease is live.
-    _bytes: Arc<[u8]>,
+    _bytes: bytes::Bytes,
     _payload: Reservation,
     _metadata: Reservation,
 }
@@ -241,7 +241,7 @@ impl Budgets {
         (self.metadata.used() as u64).saturating_add(self.payload.used() as u64)
     }
 
-    pub fn retain(&self, bytes: &Arc<[u8]>) -> EngineResult<Arc<PayloadLease>> {
+    pub fn retain(&self, bytes: &bytes::Bytes) -> EngineResult<Arc<PayloadLease>> {
         let mut allocations = self
             .allocations
             .lock()
@@ -255,7 +255,7 @@ impl Budgets {
         let lease = Arc::new(PayloadLease {
             registry: Arc::clone(&self.allocations),
             key,
-            _bytes: Arc::clone(bytes),
+            _bytes: bytes.clone(),
             _payload: payload,
             _metadata: metadata,
         });

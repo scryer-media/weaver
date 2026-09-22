@@ -60,9 +60,9 @@ use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::pipeline::diagnostics::DirectSetCounts;
 use crate::pipeline::{
-    BufferedDecodedSegment, DecodedChunk, DirectDemotionWork, DirectDemotionWorkDone,
-    DirectPostRepairCarry, DirectPostRepairWork, DirectPostRepairWorkDone, DirectToleratedWork,
-    DirectToleratedWorkDone, Pipeline,
+    BufferedDecodedSegment, DirectDemotionWork, DirectDemotionWorkDone, DirectPostRepairCarry,
+    DirectPostRepairWork, DirectPostRepairWorkDone, DirectToleratedWork, DirectToleratedWorkDone,
+    Pipeline,
 };
 
 /// Read chunk for the restart gate re-arm. Matches the reconstruction sweep's:
@@ -2554,10 +2554,4 @@ fn read_restart_seeded_runs(
         checksums.push(hasher.finalize() as u32);
     }
     Ok(checksums)
-}
-
-fn contiguous_bytes(data: &DecodedChunk) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len_bytes());
-    data.for_each_slice(|slice| out.extend_from_slice(slice));
-    out
 }

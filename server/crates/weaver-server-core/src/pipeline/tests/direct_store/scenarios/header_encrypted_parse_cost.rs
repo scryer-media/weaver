@@ -54,7 +54,7 @@ fn route_in_pieces(router: &mut DirectSetRouter, volumes: &[(String, Vec<u8>)]) 
     for (index, (_, image)) in volumes.iter().enumerate() {
         for (piece, bytes) in image.chunks(PIECE_BYTES).enumerate() {
             router
-                .route(index as u32, (piece * PIECE_BYTES) as u64, bytes)
+                .route_bytes(index as u32, (piece * PIECE_BYTES) as u64, bytes)
                 .expect("a `-hp` volume routes as it arrives");
             pieces += 1;
         }
@@ -146,7 +146,7 @@ async fn a_walk_is_repeated_only_once_it_could_answer_differently() {
     // returns `EncryptedArchive`, which is what sends the volume's type-4
     // record to the header ring, and the retry is the walk that reads it.
     router
-        .route(0, 0, &image[..PIECE_BYTES])
+        .route_bytes(0, 0, &image[..PIECE_BYTES])
         .expect("the volume's first piece routes");
     let after_first = router.parse_walks();
     assert_eq!(
@@ -162,7 +162,7 @@ async fn a_walk_is_repeated_only_once_it_could_answer_differently() {
     let mut pieces = 1;
     for &offset in middle {
         router
-            .route(0, offset as u64, &image[offset..offset + PIECE_BYTES])
+            .route_bytes(0, offset as u64, &image[offset..offset + PIECE_BYTES])
             .expect("the volume's middle pieces route");
         pieces += 1;
     }
@@ -177,7 +177,7 @@ async fn a_walk_is_repeated_only_once_it_could_answer_differently() {
     // The tail piece carries the end-of-archive record, so the image now
     // reaches the offset the walk asked for, and the walk runs and reads it.
     router
-        .route(0, *last as u64, &image[*last..])
+        .route_bytes(0, *last as u64, &image[*last..])
         .expect("the volume's tail piece routes");
     assert_eq!(
         router.parse_walks(),

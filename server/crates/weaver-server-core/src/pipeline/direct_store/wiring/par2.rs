@@ -2525,7 +2525,7 @@ impl Pipeline {
                     .iter()
                     .flat_map(|span| span.chunks.iter().cloned())
                     .collect();
-                let mut lead_in: Vec<(u32, u64, std::sync::Arc<[u8]>)> = spans
+                let mut lead_in: Vec<(u32, u64, bytes::Bytes)> = spans
                     .iter()
                     .flat_map(|span| [span.lead_in.clone(), span.lead_out.clone()])
                     .flatten()
@@ -2578,7 +2578,7 @@ impl Pipeline {
         set_index: usize,
         volume_index: u32,
         lengths: &std::collections::BTreeMap<u32, u64>,
-    ) -> Vec<(u32, u64, std::sync::Arc<[u8]>)> {
+    ) -> Vec<(u32, u64, bytes::Bytes)> {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Vec::new();
         };
@@ -2599,7 +2599,7 @@ impl Pipeline {
             if std::io::Read::read_exact(&mut reader, &mut bytes).is_err() {
                 continue;
             }
-            edges.push((volume, offset, std::sync::Arc::from(bytes.as_slice())));
+            edges.push((volume, offset, bytes::Bytes::from(bytes)));
         }
         edges
     }

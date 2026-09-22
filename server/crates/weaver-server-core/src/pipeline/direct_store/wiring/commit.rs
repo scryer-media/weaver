@@ -43,10 +43,11 @@ impl Pipeline {
         let decoded_size = segment.decoded_size;
         let part_crc = segment.part_crc;
         // The dual-CRC grid's half of the article, carried past routing to the
-        // commit seam. `contiguous_bytes` gives the router a contiguous view
-        // while the original decoded buffer stays owned here for fallback.
+        // commit seam. The router is handed refcounted views of the decoder's
+        // own buffers rather than a flattened copy, and `segment` keeps its
+        // decoded data intact for the conventional fallback on demotion.
         let part_crc_verified = segment.part_crc_verified;
-        let bytes = contiguous_bytes(&segment.data);
+        let pieces = segment.data.pieces();
 
         let routed = {
             let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
@@ -62,7 +63,7 @@ impl Pipeline {
                 file_offset,
                 u64::from(decoded_size),
             );
-            set.route(volume_index, file_offset, &bytes)
+            set.route(volume_index, file_offset, &pieces)
         };
         let spans = match routed {
             Ok(spans) => spans,
@@ -86,7 +87,7 @@ impl Pipeline {
             return DirectRouteOutcome::Conventional(segment);
         }
 
-        drop(bytes);
+        drop(pieces);
 
         self.commit_direct_segment(
             segment_id,
@@ -203,7 +204,7 @@ impl Pipeline {
         // `record_value` is a no-op unless the profiler is on.
         let (member_bytes, envelope_bytes) =
             spans.iter().fold((0u64, 0u64), |(member, envelope), span| {
-                let len = span.bytes.len() as u64;
+                let len = span.len();
                 match span.destination {
                     DirectDestination::Member { .. } => (member + len, envelope),
                     DirectDestination::Envelope { .. } => (member, envelope + len),
@@ -414,7 +415,7 @@ impl Pipeline {
             .map(|(member_id, _, partial)| (member_id, partial.to_string()))
             .collect();
 
-        let mut grouped: HashMap<PathBuf, Vec<(u64, Vec<u8>)>> = HashMap::new();
+        let mut grouped: HashMap<PathBuf, Vec<(u64, Vec<bytes::Bytes>)>> = HashMap::new();
         for span in spans {
             // The two roots part company here, and this is the seam the whole
             // split exists for: member payload is written straight into the
@@ -437,6 +438,8 @@ impl Pipeline {
             grouped
                 .entry(path)
                 .or_default()
+                // Refcount bumps, not payload: the views the router handed out
+                // are what reaches the write syscall.
                 .push((span.destination_offset, span.bytes.clone()));
         }
         let mut batches: crate::pipeline::orchestrator::DirectWriteBatches =

@@ -1162,3 +1162,221 @@ mod par2_fileaccess_adapter_over;
 mod par3_source_access;
 mod recording_test_doubles;
 mod repair_transactions;
+
+/// [`straddle_router`] against a real working directory, so the set's holds
+/// scratch can be created.
+fn straddle_router_in(dir: &Path, member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
+    let plan = DirectSetPlan {
+        set_name: SET.to_string(),
+        volumes: [(0u32, 0u32)].into_iter().collect(),
+        files: [(0u32, 0u32)].into_iter().collect(),
+        identity: None,
+        working_dir: dir.to_path_buf(),
+        destination_dir: dir.join("staging"),
+    };
+    let mut router = DirectSetRouter::new(plan);
+    let facts = std::collections::BTreeMap::from([(
+        0u32,
+        volume_facts(0, false, {
+            let mut only = member_facts(
+                STRADDLE_MEMBER,
+                header_bytes,
+                member.len() as u64,
+                member.len() as u64,
+            );
+            only.data_crc32 = Some(par2_rs::checksum::crc32(member));
+            vec![only]
+        }),
+    )]);
+    router.restore_layout(&facts).expect("the facts rebuild");
+    let member_id = router
+        .member_partials()
+        .first()
+        .map(|(member_id, _, _)| *member_id)
+        .expect("the member was adopted");
+    (router, member_id)
+}
+
+/// The bytes a routed span carries, joined — what the vectored write puts on
+/// disk, in the order it puts it there.
+fn span_bytes(span: &super::router::RoutedSpan) -> Vec<u8> {
+    span.bytes.iter().flat_map(|piece| piece.to_vec()).collect()
+}
+
+const TOUCH_MEMBER_BYTES: usize = 400;
+
+const TOUCH_HEADER_BYTES: u64 = 64;
+
+/// One volume image whose member starts at [`TOUCH_HEADER_BYTES`].
+fn touch_once_image() -> Vec<u8> {
+    (0..TOUCH_HEADER_BYTES as usize + TOUCH_MEMBER_BYTES)
+        .map(|index| ((index * 31 + 7) % 251) as u8)
+        .collect()
+}
+
+#[test]
+fn a_run_drained_across_three_staged_pieces_is_byte_exact_and_composes_identically() {
+    let image = touch_once_image();
+    let member = &image[TOUCH_HEADER_BYTES as usize..];
+    let (mut router, member_id) = straddle_router(member, TOUCH_HEADER_BYTES);
+
+    // Three pieces, the way a batched decode hands the article over. The first
+    // boundary falls *inside* the first piece — the member starts at 64 and the
+    // piece runs to 150 — so the drained run starts mid-piece and then straddles
+    // the other two.
+    let pieces: Vec<bytes::Bytes> = [0usize..150, 150..300, 300..image.len()]
+        .into_iter()
+        .map(|range| bytes::Bytes::copy_from_slice(&image[range]))
+        .collect();
+    router.stage_pieces_for_test(0, 0, &pieces);
+    let spans = router.drain_for_test(0).expect("the drain routes");
+
+    let member_span = spans
+        .iter()
+        .find(|span| {
+            matches!(span.destination, super::router::DirectDestination::Member { member_id: id } if id == member_id)
+        })
+        .expect("the member run drained");
+    assert_eq!(
+        member_span.bytes.len(),
+        3,
+        "the run spans three staged pieces and is handed over as three views"
+    );
+    assert_eq!(member_span.len(), TOUCH_MEMBER_BYTES as u64);
+    assert_eq!(span_bytes(member_span), member);
+    assert_eq!(
+        super::router::crc32_over_pieces(&member_span.bytes),
+        par2_rs::checksum::crc32(member),
+        "composing over the pieces must give the value a single slice gives"
+    );
+    assert!(
+        router.all_members_verified(),
+        "the member's own gate composes over the same pieces"
+    );
+}
+
+#[test]
+fn a_paged_piece_inside_a_run_reads_back_as_one_piece_and_the_bytes_are_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = touch_once_image();
+    let member = &image[TOUCH_HEADER_BYTES as usize..];
+    let (mut router, member_id) = straddle_router_in(dir.path(), member, TOUCH_HEADER_BYTES);
+
+    // Sized so exactly the middle piece pages: the budget leaves room for the
+    // two 100-byte views and not for the 200-byte one between them.
+    let pieces: Vec<bytes::Bytes> = [0usize..100, 100..300, 300..400]
+        .into_iter()
+        .map(|range| bytes::Bytes::copy_from_slice(&member[range]))
+        .collect();
+    router.stage_pieces_for_test(0, TOUCH_HEADER_BYTES, &pieces);
+    router.set_holds_budget(200);
+    router
+        .page_holds_for_test()
+        .expect("the middle piece pages");
+
+    let spans = router.drain_for_test(0).expect("the drain routes");
+    let member_span = spans
+        .iter()
+        .find(|span| {
+            matches!(span.destination, super::router::DirectDestination::Member { member_id: id } if id == member_id)
+        })
+        .expect("the member run drained");
+    assert_eq!(
+        member_span.bytes.len(),
+        3,
+        "a paged chunk costs one positioned read and becomes one piece of its own"
+    );
+    assert_eq!(member_span.bytes[1].len(), 200);
+    assert_eq!(span_bytes(member_span), member);
+    assert!(router.all_members_verified());
+}
+
+#[test]
+fn a_routed_span_reports_the_length_of_every_piece_it_carries() {
+    let span = super::router::RoutedSpan {
+        destination: super::router::DirectDestination::Envelope { volume_index: 3 },
+        destination_offset: 512,
+        volume_index: 3,
+        source_offset: 512,
+        bytes: vec![
+            bytes::Bytes::from_static(b"first"),
+            bytes::Bytes::new(),
+            bytes::Bytes::from_static(b"second-piece"),
+        ],
+    };
+    assert_eq!(span.len(), 17);
+    assert_eq!(
+        span.len(),
+        span_bytes(&span).len() as u64,
+        "the reported length is the length of what is written"
+    );
+}
+
+#[tokio::test]
+async fn every_decoded_chunk_shape_hands_over_its_payload_without_copying_it() {
+    use crate::pipeline::DecodedChunk;
+    use crate::runtime::buffers::{BufferPool, BufferPoolConfig, BufferTier};
+
+    let contiguous = DecodedChunk::from(b"one contiguous article".to_vec());
+    let pieces = contiguous.pieces();
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(pieces[0].as_ref(), b"one contiguous article");
+    let DecodedChunk::Contiguous(held) = &contiguous else {
+        panic!("a single buffer stays contiguous");
+    };
+    assert_eq!(
+        pieces[0].as_ptr(),
+        held.as_ptr(),
+        "the piece is the decoded buffer, not a copy of it"
+    );
+
+    let boxes: Vec<Box<[u8]>> = vec![
+        b"alpha".to_vec().into_boxed_slice(),
+        b"bravo-batch".to_vec().into_boxed_slice(),
+        b"charlie".to_vec().into_boxed_slice(),
+    ];
+    let expected: Vec<*const u8> = boxes.iter().map(|chunk| chunk.as_ptr()).collect();
+    let batched = DecodedChunk::from(boxes);
+    let pieces = batched.pieces();
+    assert_eq!(pieces.len(), 3);
+    let actual: Vec<*const u8> = pieces.iter().map(|piece| piece.as_ptr()).collect();
+    assert_eq!(
+        actual, expected,
+        "each batch reaches the router as the very allocation the decoder produced"
+    );
+    assert_eq!(
+        pieces
+            .iter()
+            .flat_map(|piece| piece.to_vec())
+            .collect::<Vec<u8>>(),
+        b"alphabravo-batchcharlie".to_vec()
+    );
+
+    let pool = BufferPool::new(BufferPoolConfig {
+        small_count: 1,
+        medium_count: 0,
+        large_count: 0,
+    });
+    let mut handle = pool.acquire(BufferTier::Small).await;
+    let payload: Vec<u8> = (0..4096u32).map(|index| (index % 251) as u8).collect();
+    handle.as_mut_slice().expect("sole owner")[..payload.len()].copy_from_slice(&payload);
+    handle.set_len(payload.len());
+    let slot = handle.as_slice().as_ptr();
+    let pooled = DecodedChunk::Pooled(handle);
+    let pieces = pooled.pieces();
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(pieces[0].len(), payload.len());
+    assert_eq!(
+        pieces[0].as_ptr(),
+        slot,
+        "a pooled article is handed over as a view of its slot"
+    );
+    assert_eq!(pieces[0].as_ref(), payload.as_slice());
+
+    // The slot stays out of the pool while a view of it lives, and comes back
+    // when the last one drops.
+    drop(pooled);
+    assert_eq!(pool.metrics().small_in_use, 1);
+    drop(pieces);
+    assert_eq!(pool.metrics().small_in_use, 0);
+}

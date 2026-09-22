@@ -28,15 +28,31 @@ fn access(
 #[test]
 fn par3_large_shared_held_images_and_readers_release_every_payload_owner() {
     use super::super::provider::HeldRun;
-    let bytes: Arc<[u8]> = vec![0x5a; 24 << 20].into();
-    let weak = Arc::downgrade(&bytes);
+    // The liveness probe rides in the view's owner rather than in the buffer:
+    // `Bytes` keeps its owner alive until the last view of it drops, so the
+    // marker's strong count answers exactly the question this test asks.
+    struct Payload {
+        data: Vec<u8>,
+        _marker: Arc<()>,
+    }
+    impl AsRef<[u8]> for Payload {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+    let marker = Arc::new(());
+    let weak = Arc::downgrade(&marker);
+    let bytes = bytes::Bytes::from_owner(Payload {
+        data: vec![0x5a; 24 << 20],
+        _marker: marker,
+    });
     let mut volume = provider_fixture(ByteRanges::new()).volume;
     volume.len = bytes.len() as u64;
     volume.extents.clear();
     volume.partials = Arc::default();
     volume.held = Arc::new(vec![
-        HeldRun::memory(0, Arc::clone(&bytes), 0, 12 << 20),
-        HeldRun::memory(12 << 20, Arc::clone(&bytes), 12 << 20, 12 << 20),
+        HeldRun::memory(0, bytes.clone(), 0, 12 << 20),
+        HeldRun::memory(12 << 20, bytes.clone(), 12 << 20, 12 << 20),
     ]);
     let options = ExecutionOptions::default();
     let cache = Arc::new(ReaderCache::default());

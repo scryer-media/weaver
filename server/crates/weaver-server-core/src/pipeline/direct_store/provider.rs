@@ -81,6 +81,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::Bytes;
 use unrar_rs::{ReadSeek, VolumeProvider, VolumeProviderError};
 
 use super::ByteRanges;
@@ -112,7 +113,7 @@ pub(crate) struct HeldRun {
 #[derive(Debug, Clone)]
 enum HeldSource {
     /// `len` bytes at `offset` inside the router's own staged buffer.
-    Memory { bytes: Arc<[u8]>, offset: u64 },
+    Memory { bytes: Bytes, offset: u64 },
     /// `len` bytes at `offset` inside the pinned scratch image.
     Scratch {
         pin: Arc<HoldsScratchPin>,
@@ -121,7 +122,7 @@ enum HeldSource {
 }
 
 impl HeldRun {
-    pub(crate) fn memory(start: u64, bytes: Arc<[u8]>, offset: u64, len: u64) -> Self {
+    pub(crate) fn memory(start: u64, bytes: Bytes, offset: u64, len: u64) -> Self {
         debug_assert!(offset.saturating_add(len) <= bytes.len() as u64);
         Self {
             start,
@@ -342,7 +343,7 @@ impl VirtualVolume {
 
     /// Even a short range can pin a whole allocation. Callers must lease the
     /// allocation, not just the readable length, while any image retains it.
-    pub(crate) fn retained_payloads(&self) -> impl Iterator<Item = &Arc<[u8]>> {
+    pub(crate) fn retained_payloads(&self) -> impl Iterator<Item = &Bytes> {
         self.held.iter().filter_map(|run| match &run.source {
             HeldSource::Memory { bytes, .. } => Some(bytes),
             HeldSource::Scratch { .. } => None,

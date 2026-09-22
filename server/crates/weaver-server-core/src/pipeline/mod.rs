@@ -1901,9 +1901,9 @@ impl Default for CompletedFileChecksumState {
 }
 
 pub(super) enum DecodedChunk {
-    Contiguous(Box<[u8]>),
+    Contiguous(Bytes),
     Batches {
-        chunks: Vec<Box<[u8]>>,
+        chunks: Vec<Bytes>,
         len: usize,
     },
     Shared(Arc<download::repeated::SharedArticle>),
@@ -1957,6 +1957,42 @@ impl DecodedChunk {
         }
     }
 
+    /// This chunk's payload as refcounted views of the decoder's own buffers,
+    /// in order. No byte is copied: every piece either shares the decoded
+    /// allocation or borrows the pool slot, which stays out of the pool until
+    /// the last view drops.
+    ///
+    /// The direct-store router keeps these for the life of a hold, so the
+    /// article's buffer is the only copy of its bytes anywhere between the
+    /// decode and the write syscall.
+    pub(super) fn pieces(&self) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        self.push_pieces(&mut out);
+        out
+    }
+
+    fn push_pieces(&self, out: &mut Vec<Bytes>) {
+        match self {
+            Self::Contiguous(bytes) => {
+                if !bytes.is_empty() {
+                    out.push(bytes.clone());
+                }
+            }
+            // `from_owner` keeps the handle — and therefore the slot — alive for
+            // as long as any view of it lives, which is exactly the lifetime the
+            // router needs and the pool already understands.
+            Self::Pooled(buffer) => {
+                if !buffer.is_empty() {
+                    out.push(Bytes::from_owner(buffer.clone()));
+                }
+            }
+            Self::Shared(body) => body.data.push_pieces(out),
+            Self::Batches { chunks, .. } => {
+                out.extend(chunks.iter().filter(|chunk| !chunk.is_empty()).cloned());
+            }
+        }
+    }
+
     /// Appends this chunk's slices, in order, for a vectored write that
     /// covers several contiguous chunks with one syscall.
     pub(super) fn push_io_slices<'a>(&'a self, out: &mut Vec<std::io::IoSlice<'a>>) {
@@ -1983,15 +2019,21 @@ impl Pipeline {
 
 impl From<Vec<u8>> for DecodedChunk {
     fn from(value: Vec<u8>) -> Self {
-        Self::Contiguous(value.into_boxed_slice())
+        Self::Contiguous(Bytes::from(value))
     }
 }
 
 impl From<Vec<Box<[u8]>>> for DecodedChunk {
-    fn from(mut chunks: Vec<Box<[u8]>>) -> Self {
-        chunks.retain(|chunk| !chunk.is_empty());
+    fn from(chunks: Vec<Box<[u8]>>) -> Self {
+        // `Bytes::from(Box<[u8]>)` adopts the allocation, so the decoder's
+        // batches reach the writer and the router without being copied once.
+        let mut chunks: Vec<Bytes> = chunks
+            .into_iter()
+            .filter(|chunk| !chunk.is_empty())
+            .map(Bytes::from)
+            .collect();
         match chunks.len() {
-            0 => Self::Contiguous(Vec::new().into_boxed_slice()),
+            0 => Self::Contiguous(Bytes::new()),
             1 => Self::Contiguous(chunks.pop().expect("single chunk")),
             _ => {
                 let len = chunks.iter().map(|chunk| chunk.len()).sum();

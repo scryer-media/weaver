@@ -566,7 +566,7 @@ impl DirectSet {
         &mut self,
         volume_index: u32,
         spans: &[super::router::RepairedChunk],
-        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        lead_in: &[(u32, u64, bytes::Bytes)],
         whole_volume: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         match self
@@ -611,7 +611,7 @@ impl DirectSet {
         &mut self,
         volume: u32,
         chunks: &[super::router::RepairedChunk],
-        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        lead_in: &[(u32, u64, bytes::Bytes)],
         finish: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         match self
@@ -649,9 +649,9 @@ impl DirectSet {
         &mut self,
         volume_index: u32,
         source_offset: u64,
-        data: &[u8],
+        pieces: &[bytes::Bytes],
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
-        let spans = self.router.route(volume_index, source_offset, data);
+        let spans = self.router.route(volume_index, source_offset, pieces);
         match spans {
             Ok(spans) => {
                 if !spans.is_empty() {

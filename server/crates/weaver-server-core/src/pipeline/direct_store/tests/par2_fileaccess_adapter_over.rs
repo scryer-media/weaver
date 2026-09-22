@@ -1131,7 +1131,7 @@ fn a_drain_run_straddling_repaired_and_duplicate_bytes_splits_at_the_boundary() 
         .drain_for_test(0)
         .expect("the straddling drain routes");
     assert_eq!(
-        spans.iter().map(|span| span.bytes.len()).sum::<usize>(),
+        spans.iter().map(|span| span.len()).sum::<u64>(),
         300,
         "both halves must still reach the member's partial — the bug was never \
          about the bytes, only about what the composition then claims about them"
@@ -1194,7 +1194,7 @@ fn bounded_stale_gap_reads_make_progress_without_a_whole_plan() {
     router
         .route_repaired_batch(
             0,
-            &[(64 + 200, Arc::from(&repaired[200..]))],
+            &[(64 + 200, bytes::Bytes::copy_from_slice(&repaired[200..]))],
             &[],
             false,
             true,
@@ -1237,7 +1237,13 @@ fn unread_stale_gap_cannot_release_a_replacement_transaction() {
     router.drain_for_test(0).unwrap();
     router.begin_repair_transaction(vec![0]).unwrap();
     router
-        .route_repaired_batch(0, &[(264, Arc::from(&bytes[200..]))], &[], false, true)
+        .route_repaired_batch(
+            0,
+            &[(264, bytes::Bytes::copy_from_slice(&bytes[200..]))],
+            &[],
+            false,
+            true,
+        )
         .unwrap();
     assert!(router.has_stale_gaps());
     assert_eq!(

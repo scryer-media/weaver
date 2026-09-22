@@ -811,7 +811,7 @@ impl DirectSetRouter {
                 let len = end - start;
                 let run = match chunk {
                     StagedChunk::Memory(bytes) => {
-                        HeldRun::memory(start, std::sync::Arc::clone(bytes), inside, len)
+                        HeldRun::memory(start, bytes.clone(), inside, len)
                     }
                     StagedChunk::Scratch { offset, .. } => {
                         // A scratch chunk with no image to pin cannot happen —

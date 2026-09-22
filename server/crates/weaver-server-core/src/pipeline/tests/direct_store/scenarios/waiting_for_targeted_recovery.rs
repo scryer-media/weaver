@@ -1536,7 +1536,7 @@ async fn failed_direct_repair_placement(sparse_failure: bool) {
     let before = set.volume_coverage(1);
     let clean_coverage = set.volume_coverage(0);
     let envelope = working_dir.join(set.plan().envelope_relative_path(1));
-    let spans = set.router.route(1, 0, &volumes[1].1).unwrap();
+    let spans = set.router.route_bytes(1, 0, &volumes[1].1).unwrap();
     assert!(!spans.is_empty());
     if sparse_failure {
         pipeline

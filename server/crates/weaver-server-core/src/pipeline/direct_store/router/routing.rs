@@ -14,7 +14,7 @@ impl DirectSetRouter {
         &mut self,
         volume_index: u32,
         source_offset: u64,
-        data: &[u8],
+        pieces: &[Bytes],
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         if let Some(reason) = self.demoted {
             return Err(reason);
@@ -24,7 +24,7 @@ impl DirectSetRouter {
         }
 
         let staging = self.staging.entry(volume_index).or_default();
-        staging.stage(source_offset, data);
+        staging.stage(source_offset, pieces);
 
         self.try_parse_volume(volume_index)?;
         // Every volume, not just this one: a header landing here is exactly what
@@ -45,6 +45,18 @@ impl DirectSetRouter {
             return Err(self.fail(reason));
         }
         Ok(spans)
+    }
+
+    /// [`Self::route`] over one contiguous buffer, for tests that build an
+    /// article's bytes as a single slice.
+    #[cfg(test)]
+    pub(crate) fn route_bytes(
+        &mut self,
+        volume_index: u32,
+        source_offset: u64,
+        data: &[u8],
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        self.route(volume_index, source_offset, &[Bytes::copy_from_slice(data)])
     }
 
     /// Re-enters the router with a span a PAR2 repair rebuilt.
@@ -98,7 +110,7 @@ impl DirectSetRouter {
         &mut self,
         volume_index: u32,
         chunks: &[RepairedChunk],
-        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        lead_in: &[(u32, u64, Bytes)],
         whole_volume: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         if self.repair_batch_in_progress() {
@@ -182,7 +194,7 @@ impl DirectSetRouter {
         &mut self,
         volume_index: u32,
         chunks: &[RepairedChunk],
-        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        lead_in: &[(u32, u64, Bytes)],
         whole_volume: bool,
         finish: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
@@ -225,7 +237,7 @@ impl DirectSetRouter {
         &mut self,
         volume_index: u32,
         chunks: &[RepairedChunk],
-        lead_in: &[(u32, u64, std::sync::Arc<[u8]>)],
+        lead_in: &[(u32, u64, Bytes)],
         whole_volume: bool,
         finish: bool,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
@@ -242,7 +254,7 @@ impl DirectSetRouter {
                 if data.is_empty() {
                     continue;
                 }
-                staging.stage_repaired(*source_offset, std::sync::Arc::clone(data));
+                staging.stage_repaired(*source_offset, data.clone());
                 staged = true;
             }
         }
@@ -262,7 +274,7 @@ impl DirectSetRouter {
             self.staging
                 .entry(*volume)
                 .or_default()
-                .stage_lead_in(*source_offset, std::sync::Arc::clone(data));
+                .stage_lead_in(*source_offset, data.clone());
         }
         if !staged {
             return Ok(Vec::new());
@@ -1730,16 +1742,19 @@ impl DirectSetRouter {
                 let mut moved = 0u64;
                 while moved < extent.len {
                     let take = (extent.len - moved).min(MIGRATION_SPAN_BYTES);
-                    let mut bytes = vec![0u8; take as usize];
+                    let mut buffer = vec![0u8; take as usize];
                     if read_at(
                         &file,
                         extent.logical_offset.saturating_add(moved),
-                        &mut bytes,
+                        &mut buffer,
                     )
                     .is_err()
                     {
                         return Err(refuse(self));
                     }
+                    // A migration reads from disk, so this buffer is the only
+                    // hand its bytes pass through on the way back out.
+                    let bytes = vec![Bytes::from(buffer)];
                     let offset = extent.physical_offset.saturating_add(moved);
                     spans.push(RoutedSpan {
                         destination: DirectDestination::Envelope {
@@ -2131,15 +2146,22 @@ impl DirectSetRouter {
     /// it the run is a PAR2 repair of those very bytes, so the composition is
     /// **overwritten** and whatever the rewrite half-covered becomes a stale
     /// gap the caller must re-read.
+    ///
+    /// `pieces` is the run in order. Its length and its CRC32 are taken over the
+    /// concatenation the pieces describe — composed run by run with
+    /// [`weaver_yenc::crc32_combine`], which is the same value a single slice
+    /// would give and is how every other composition in this file is built.
     pub(super) fn note_member_bytes(
         &mut self,
         member_id: u32,
         volume_index: u32,
         logical_offset: u64,
-        bytes: &[u8],
+        pieces: &[Bytes],
         replace: bool,
     ) -> Result<(), DemotionReason> {
-        let len = bytes.len() as u64;
+        let len = pieces.iter().fold(0u64, |total, piece| {
+            total.saturating_add(piece.len() as u64)
+        });
         let Some(layout_index) = self.layout_index_for_member(member_id) else {
             return Ok(());
         };
@@ -2155,7 +2177,7 @@ impl DirectSetRouter {
             // Wholly duplicate: never advance a gate twice.
             return Ok(());
         }
-        let crc = par2_rs::checksum::crc32(bytes);
+        let crc = crc32_over_pieces(pieces);
         let part_relative = logical_offset.saturating_sub(part_logical_offset);
         if replace {
             let gaps =
@@ -2199,4 +2221,21 @@ impl DirectSetRouter {
         self.gate_part(member_id, volume_index)?;
         self.try_verify_member(member_id)
     }
+}
+
+/// CRC32 of the concatenation `pieces` describes, composed piece by piece.
+///
+/// Identical by construction to hashing the joined bytes: `crc32_combine` is
+/// the same operation the member and volume compositions already rely on, so a
+/// run that arrives as three views and one that arrives as one slice produce
+/// the same value and the gates cannot tell them apart.
+pub(crate) fn crc32_over_pieces(pieces: &[Bytes]) -> u32 {
+    let mut crc = 0u32;
+    for piece in pieces {
+        if piece.is_empty() {
+            continue;
+        }
+        crc = weaver_yenc::crc32_combine(crc, par2_rs::checksum::crc32(piece), piece.len() as u64);
+    }
+    crc
 }
