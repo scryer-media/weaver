@@ -244,7 +244,6 @@ async fn submit_volume_article_declaring(
             },
         )
         .await;
-    settle_direct_demotion_work(pipeline).await;
 }
 
 /// What one 7z gate run produced.
@@ -283,39 +282,126 @@ fn bytes_on_disk(root: &std::path::Path) -> u64 {
 
 const ARTICLES_PER_VOLUME: usize = 2;
 
-/// Services the pipeline's own queues until the job is terminal, taking each
-/// completion tap as it is offered rather than waiting on any of them: a 7z set
-/// can reach the end of a run with nothing owed on a given channel, and a
-/// blocking read of one would then never return.
-async fn drive_sevenz_to_terminal(
+/// Every distinct shape the job's direct sets passed through, in the order it
+/// was seen.
+///
+/// A verdict is not a state a set rests in. Demoting one hands its volumes
+/// back and retires the set, so a run that states a refusal usually has
+/// nothing left to read it off by the time it ends. Asking the live list
+/// afterwards therefore asks whether the read happened to fall inside that
+/// window — a question about how busy the machine was, not about what the
+/// router decided. This is the record the window cannot close on.
+#[derive(Default)]
+struct SetWitness {
+    seen: Vec<String>,
+}
+
+impl SetWitness {
+    /// Takes the sets' shape as it stands, keeping it when it differs from the
+    /// last one taken.
+    fn observe(&mut self, pipeline: &Pipeline, job_id: JobId) {
+        let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+        if self.seen.last() != Some(&shape) {
+            self.seen.push(shape);
+        }
+    }
+
+    /// Whether any shape the run passed through carried `marker`.
+    fn contains(&self, marker: &str) -> bool {
+        self.seen.iter().any(|shape| shape.contains(marker))
+    }
+
+    fn render(&self) -> String {
+        self.seen.join(" then ")
+    }
+}
+
+/// Drains the asynchronous work a verdict starts of its own accord, recording
+/// the sets on either side of it.
+///
+/// Both of these wait on a channel rather than on a number of turns, so what
+/// they leave behind is the same whatever else the machine is running.
+async fn settle_sevenz_verdict(pipeline: &mut Pipeline, job_id: JobId, witness: &mut SetWitness) {
+    witness.observe(pipeline, job_id);
+    settle_direct_post_repair_work(pipeline).await;
+    witness.observe(pipeline, job_id);
+    settle_direct_demotion_work(pipeline).await;
+    witness.observe(pipeline, job_id);
+}
+
+/// Everything a turn would have to change for the run to have moved at all.
+///
+/// Nothing in it is a clock. A turn that leaves all of it identical moved
+/// nothing, and because the turn that produced it first drained every channel
+/// and waited out everything in flight, there is nothing left for a further
+/// turn to pick up.
+fn sevenz_run_fingerprint(pipeline: &Pipeline, job_id: JobId, working_bytes: u64) -> String {
+    format!(
+        "{:?}|{:?}|{}|{:?}|{}|{}|{working_bytes}",
+        job_status_for_assert(pipeline, job_id),
+        pipeline.direct_store.sets_for(job_id),
+        pipeline.inflight_moves.len(),
+        pipeline
+            .inflight_extractions
+            .get(&job_id)
+            .map(|sets| sets.len()),
+        pipeline.direct_demotion_in_flight.len(),
+        pipeline.pending_completion_checks.len(),
+    )
+}
+
+/// Services the pipeline's own queues until the run has produced what the
+/// caller came for.
+///
+/// Three things end it and none of them is a number of turns. A job that
+/// reaches a terminal status is finished. A run whose whole subject is a
+/// verdict ends as soon as `awaited` appears in the witness. And a turn that
+/// drained every channel, waited out everything in flight and still changed
+/// nothing has proved there is no further progress to be had. Counting turns
+/// instead would make the outcome a function of how loaded the machine is:
+/// a demotion sweeps and hands back off-thread, and a fixed count can stop on
+/// either side of that.
+async fn drive_sevenz(
     pipeline: &mut Pipeline,
     job_id: JobId,
     working_dir: &std::path::Path,
     peak_working_bytes: &mut u64,
+    awaited: Option<&str>,
+    witness: &mut SetWitness,
 ) {
-    for _ in 0..256 {
+    loop {
+        let before = sevenz_run_fingerprint(pipeline, job_id, *peak_working_bytes);
         while let Ok(done) = pipeline.rar_refresh_done_rx.try_recv() {
             pipeline.handle_rar_refresh_done(done).await;
         }
         pump_pipeline_runtime_queues(pipeline).await;
         *peak_working_bytes = (*peak_working_bytes).max(bytes_on_disk(working_dir));
         pipeline.check_job_completion(job_id).await;
+        settle_sevenz_verdict(pipeline, job_id, witness).await;
         if matches!(
             job_status_for_assert(pipeline, job_id),
             Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
         ) {
             return;
         }
+        if awaited.is_some_and(|marker| witness.contains(marker)) {
+            return;
+        }
+        // Waited for when the job owes one, taken when it is already there, and
+        // otherwise a turn yielded to whatever is running behind this one.
+        if let Some(done) = next_owed_extraction(pipeline, job_id).await {
+            pipeline.handle_extraction_done(done).await;
+            continue;
+        }
         if let Ok(done) = pipeline.move_done_rx.try_recv() {
             pipeline.handle_move_to_complete_done(done).await;
             continue;
         }
-        if let Ok(done) = pipeline.extract_done_rx.try_recv() {
-            pipeline.handle_extraction_done(done).await;
-            continue;
-        }
-        tokio::task::yield_now().await;
         *peak_working_bytes = (*peak_working_bytes).max(bytes_on_disk(working_dir));
+        witness.observe(pipeline, job_id);
+        if sevenz_run_fingerprint(pipeline, job_id, *peak_working_bytes) == before {
+            return;
+        }
     }
 }
 
@@ -342,6 +428,25 @@ async fn run_sevenz_gate_declaring(
     arrivals: &[(u32, u32)],
     wanted: &[&str],
 ) -> SevenZipOutcome {
+    run_sevenz_gate_awaiting(job_id, volumes, declared, arrivals, wanted, None).await
+}
+
+/// [`run_sevenz_gate_declaring`] for a run whose subject is a verdict rather
+/// than a finished job.
+///
+/// `awaited` is the substring of a set's shape the caller is going to assert
+/// on. A demotion leaves the job needing volumes this harness has no server to
+/// refetch from, so such a run never reaches a terminal status and there is
+/// nothing else for it to stop on; naming the verdict is what makes the stop
+/// an observation rather than a guess.
+async fn run_sevenz_gate_awaiting(
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    declared: &BTreeMap<u32, u64>,
+    arrivals: &[(u32, u32)],
+    wanted: &[&str],
+    awaited: Option<&str>,
+) -> SevenZipOutcome {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -350,6 +455,10 @@ async fn run_sevenz_gate_declaring(
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
     let mut peak_working_bytes = 0u64;
+    // Observed from the first article on, not only once the arrivals are done:
+    // a container can be refused on the very article that states its geometry,
+    // and the set it is refused on is gone by the end of the loop.
+    let mut witness = SetWitness::default();
     for (file_index, segment_number) in arrivals {
         match declared.get(file_index) {
             Some(stated) => {
@@ -379,16 +488,26 @@ async fn run_sevenz_gate_declaring(
         // directory holds while a set is mid-flight is the measurement this
         // subsystem exists to move, and it is unobservable once the whole set
         // has landed and finalized inside one drain.
+        witness.observe(&pipeline, job_id);
         pump_pipeline_runtime_queues(&mut pipeline).await;
+        settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
         peak_working_bytes = peak_working_bytes.max(bytes_on_disk(&working_dir));
     }
-    drive_sevenz_to_terminal(&mut pipeline, job_id, &working_dir, &mut peak_working_bytes).await;
+    drive_sevenz(
+        &mut pipeline,
+        job_id,
+        &working_dir,
+        &mut peak_working_bytes,
+        awaited,
+        &mut witness,
+    )
+    .await;
     let sets = format!(
-        "status={:?} inflight_extractions={:?} inflight_moves={} sets={:?}",
+        "status={:?} inflight_extractions={:?} inflight_moves={} sets={}",
         job_status_for_assert(&pipeline, job_id),
         pipeline.inflight_extractions.get(&job_id).map(|s| s.len()),
         pipeline.inflight_moves.len(),
-        pipeline.direct_store.sets_for(job_id)
+        witness.render()
     );
 
     let output_root =
@@ -916,9 +1035,18 @@ async fn a_sevenz_set_restarts_without_materializing_a_volume() {
         .await;
     }
     let mut peak_working_bytes = 0u64;
-    drive_sevenz_to_terminal(&mut pipeline, job_id, &working_dir, &mut peak_working_bytes).await;
+    let mut witness = SetWitness::default();
+    drive_sevenz(
+        &mut pipeline,
+        job_id,
+        &working_dir,
+        &mut peak_working_bytes,
+        None,
+        &mut witness,
+    )
+    .await;
 
-    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    let sets = witness.render();
     assert!(
         !volumes
             .iter()
@@ -1300,8 +1428,17 @@ async fn sevenz_store_probes_the_container_ends_rather_than_staging_it() {
     }
 
     let mut peak_working_bytes = 0u64;
-    drive_sevenz_to_terminal(&mut pipeline, job_id, &working_dir, &mut peak_working_bytes).await;
-    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    let mut witness = SetWitness::default();
+    drive_sevenz(
+        &mut pipeline,
+        job_id,
+        &working_dir,
+        &mut peak_working_bytes,
+        None,
+        &mut witness,
+    )
+    .await;
+    let sets = witness.render();
     assert!(
         peak_staged < capacity,
         "the set must never have held the container it could not hold\nsets: {sets}"
@@ -1362,6 +1499,7 @@ async fn sevenz_store_declines_an_end_header_it_cannot_parse() {
     // them both volumes have declared their lengths, so the container's map is
     // as readable as it is ever going to be — while half of it is still
     // outstanding.
+    let mut witness = SetWitness::default();
     for (file_index, segment_number) in [(0, 0), (1, 1)] {
         submit_volume_article_of(
             &mut pipeline,
@@ -1372,9 +1510,10 @@ async fn sevenz_store_declines_an_end_header_it_cannot_parse() {
             ARTICLES_PER_VOLUME,
         )
         .await;
+        witness.observe(&pipeline, job_id);
     }
-    settle_direct_post_repair_work(&mut pipeline).await;
-    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
+    let sets = witness.render();
     assert!(
         sets.contains("Demoted"),
         "an unreadable end header must be refused while the rest is outstanding\nsets: {sets}"
@@ -1405,6 +1544,7 @@ async fn sevenz_store_opens_a_header_encrypted_container_with_the_job_password()
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     let spec = sevenz_job_spec_with_password(&volumes, ARTICLES_PER_VOLUME, "silver");
     insert_active_job(&mut pipeline, job_id, spec).await;
+    let mut witness = SetWitness::default();
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article_of(
             &mut pipeline,
@@ -1415,9 +1555,10 @@ async fn sevenz_store_opens_a_header_encrypted_container_with_the_job_password()
             ARTICLES_PER_VOLUME,
         )
         .await;
+        witness.observe(&pipeline, job_id);
     }
-    settle_direct_post_repair_work(&mut pipeline).await;
-    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
+    let sets = witness.render();
     assert!(
         sets.contains("EncryptedContent"),
         "the keyed header must be read, and its encrypted content reported\nsets: {sets}"
@@ -1450,6 +1591,7 @@ async fn header_encrypted_verdict(
     let mut spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
     spec.password = spec_password.map(str::to_owned);
     insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, nzb_zstd).await;
+    let mut witness = SetWitness::default();
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article_of(
             &mut pipeline,
@@ -1460,9 +1602,10 @@ async fn header_encrypted_verdict(
             ARTICLES_PER_VOLUME,
         )
         .await;
+        witness.observe(&pipeline, job_id);
     }
-    settle_direct_post_repair_work(&mut pipeline).await;
-    format!("{:?}", pipeline.direct_store.sets_for(job_id))
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
+    witness.render()
 }
 
 /// The key is in the NZB's meta and the spec carries an operator's guess.
@@ -1543,6 +1686,7 @@ async fn sevenz_set_with_a_stranded_volume(job_id: JobId, stranded: u32) -> (Str
     // One at a time, in dispatch order: an article leaves the queue when it is
     // leased and its result lands after that, so the set is only ever starved
     // of everything at the very end.
+    let mut owed = SetWitness::default();
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         if file_index == stranded {
             continue;
@@ -1564,8 +1708,9 @@ async fn sevenz_set_with_a_stranded_volume(job_id: JobId, stranded: u32) -> (Str
             ARTICLES_PER_VOLUME,
         )
         .await;
+        owed.observe(&pipeline, job_id);
     }
-    let while_owed = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    let while_owed = owed.render();
     // The stranded volume's articles are leased last and never come back, so
     // the set runs out of everything here rather than while the rest was still
     // arriving. The job advance that follows is the seam the verdict is taken
@@ -1585,9 +1730,12 @@ async fn sevenz_set_with_a_stranded_volume(job_id: JobId, stranded: u32) -> (Str
         );
     }
     pipeline.check_job_completion(job_id).await;
-    settle_direct_post_repair_work(&mut pipeline).await;
-    let starved = format!("{:?}", pipeline.direct_store.sets_for(job_id));
-    (while_owed, starved)
+    // Taken through a witness rather than off the live list: the verdict this
+    // seam reaches retires the set that carries it, and which side of that the
+    // read lands on is not something the test is entitled to assume.
+    let mut starved = SetWitness::default();
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut starved).await;
+    (while_owed, starved.render())
 }
 
 /// The map lives in the last volume's last article. With that volume
@@ -1723,14 +1871,13 @@ async fn sevenz_store_refuses_a_start_header_claiming_more_parts_than_can_exist(
     let spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
     insert_active_job(&mut pipeline, job_id, spec).await;
 
+    let mut witness = SetWitness::default();
     submit_volume_article_of(&mut pipeline, job_id, &volumes, 0, 0, ARTICLES_PER_VOLUME).await;
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
 
-    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    let sets = witness.render();
     assert!(
-        pipeline
-            .direct_store
-            .set(job_id, 0)
-            .is_some_and(|set| set.is_demoted()),
+        witness.contains("Demoted"),
         "the claim must be refused on the article that makes it\nsets: {sets}"
     );
     assert!(
@@ -1759,12 +1906,13 @@ async fn sevenz_store_demotes_a_container_whose_part_size_hint_is_wrong() {
     let volumes = split_volumes(&archive, 3);
     let overstated = BTreeMap::from([(0, volumes[0].1.len() as u64 + 1)]);
 
-    let outcome = run_sevenz_gate_declaring(
+    let outcome = run_sevenz_gate_awaiting(
         JobId(9_618),
         &volumes,
         &overstated,
         &in_order_arrivals(volumes.len()),
         &[MEMBER],
+        Some("VolumeSize"),
     )
     .await;
     assert!(
@@ -1793,12 +1941,13 @@ async fn sevenz_store_refuses_a_container_whose_first_volume_states_no_length() 
     let volumes = split_volumes(&archive, 2);
     let unstated = BTreeMap::from([(0, 0)]);
 
-    let outcome = run_sevenz_gate_declaring(
+    let outcome = run_sevenz_gate_awaiting(
         JobId(9_619),
         &volumes,
         &unstated,
         &in_order_arrivals(volumes.len()),
         &[MEMBER],
+        Some("VolumeHintUnusable"),
     )
     .await;
     assert!(
@@ -1838,6 +1987,7 @@ async fn sevenz_store_demotes_a_volume_that_decodes_shorter_than_the_map_placed_
     let spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
+    let mut witness = SetWitness::default();
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         if (file_index, segment_number) == (1, ARTICLES_PER_VOLUME as u32 - 1) {
             let (filename, bytes) = &volumes[1];
@@ -1855,6 +2005,7 @@ async fn sevenz_store_demotes_a_volume_that_decodes_shorter_than_the_map_placed_
                 None,
             )
             .await;
+            witness.observe(&pipeline, job_id);
             continue;
         }
         submit_volume_article_of(
@@ -1866,9 +2017,11 @@ async fn sevenz_store_demotes_a_volume_that_decodes_shorter_than_the_map_placed_
             ARTICLES_PER_VOLUME,
         )
         .await;
+        witness.observe(&pipeline, job_id);
     }
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
 
-    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    let sets = witness.render();
     assert!(
         sets.contains("Demoted") && sets.contains("VolumeSize"),
         "a volume shorter than its place in the map must demote the set\nsets: {sets}"
