@@ -74,6 +74,11 @@ pub(crate) mod crypt;
 /// follows the host's memory.
 pub(crate) const DEFAULT_HOLDS_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The longest staged residue that is copied out of its decoder buffer
+/// unconditionally once its article has drained, so a sliver never keeps a
+/// pool slot pinned. See [`DirectSetRouter::release_article_views`].
+pub(crate) const HOLD_VIEW_COPY_LIMIT_BYTES: u64 = 64 * 1024;
+
 /// The **explicit** scratch ceiling, counted against the disk acceptance target
 /// rather than derived from RAM the way the oracle's auto 4×-RAM rule is.
 ///
@@ -959,7 +964,11 @@ impl StagedChunk {
     /// not expose the allocation behind a view, so any such figure would be a
     /// guess dressed as a measurement. Paging drops the view, which frees the
     /// slot exactly when it was the last one, and the budget keeps meaning what
-    /// it meant before views existed.
+    /// it meant before views existed. What keeps the understatement bounded is
+    /// [`VolumeStaging::copy_out_views`]: a short residue is copied out of its
+    /// slot as soon as its article has drained, and every residue is when the
+    /// pool is scarce, so a view never outlives its article unless the slot
+    /// it pins is one the pool can spare.
     fn resident_len(&self) -> u64 {
         match self {
             Self::Memory(bytes) => bytes.len() as u64,
@@ -2008,6 +2017,43 @@ impl VolumeStaging {
                     .insert(start, chunk.slice_of(start - offset, end - start));
             }
         }
+    }
+
+    /// Replaces the RAM-resident chunks inside `[offset, offset + len)` that
+    /// are no longer than `up_to` bytes with owned copies, and returns how
+    /// many bytes were copied.
+    ///
+    /// A chunk staged by [`Self::stage`] is a view of the decoder's buffer,
+    /// and while the view lives the pool slot behind it cannot be reused. For
+    /// a run that drains in the same call that is the point — the write reads
+    /// the slot directly. For what the drain leaves behind it is a liability:
+    /// a fifteen-byte cipher tail, a header run the parser keeps, or a hold
+    /// waiting on an article that has not arrived, each keeps a whole slot
+    /// out of the pool for as long as it stays staged, and the holds budget
+    /// — which counts range length, see [`StagedChunk::resident_len`] —
+    /// cannot see it. Copying a short residue is cheaper than the slot it
+    /// frees; copying a long one is what every hold cost before views
+    /// existed, and is worth it exactly when the pool is running dry. The
+    /// caller says which by choosing `up_to`.
+    fn copy_out_views(&mut self, offset: u64, len: u64, up_to: u64) -> u64 {
+        let end = offset.saturating_add(len);
+        let targets: Vec<u64> = self
+            .chunks
+            .range(..end)
+            .filter(|(start, chunk)| {
+                start.saturating_add(chunk.len()) > offset
+                    && matches!(chunk, StagedChunk::Memory(bytes) if (bytes.len() as u64) <= up_to)
+            })
+            .map(|(start, _)| *start)
+            .collect();
+        let mut copied = 0u64;
+        for start in targets {
+            if let Some(StagedChunk::Memory(bytes)) = self.chunks.get_mut(&start) {
+                copied = copied.saturating_add(bytes.len() as u64);
+                *bytes = Bytes::copy_from_slice(bytes);
+            }
+        }
+        copied
     }
 
     /// Whether `[offset, offset + len)` was force-staged by a repair, so the
