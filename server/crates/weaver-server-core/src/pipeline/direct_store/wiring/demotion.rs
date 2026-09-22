@@ -905,6 +905,14 @@ impl Pipeline {
             handoffs,
         )
         .await;
+        // Only a volume the sweep wrote end to end leaves the materialization
+        // account here. One with holes stays in it on purpose: the account is
+        // what gives its missing articles a single rescue lineage if they ever
+        // lose the queue entries the reconciliation above just gave them, and
+        // settling here would take that away. What the account must never do is
+        // wait without end, and that is the backstop's job — once nothing in
+        // the job's pipeline can move, a pending file's holes are damage and
+        // are booked as such.
         if outcome.complete && outcome.contiguous >= plan.len {
             self.direct_store.settle_materialized_file(file_id);
         }

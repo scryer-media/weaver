@@ -24,6 +24,9 @@ enum OutOfOrderPersistReason {
     GlobalWriteBacklog,
     QuiescentFlush,
     DirectUnpack,
+    /// A demoted volume handed back to the conventional path, whose buffer is
+    /// emptied outright rather than to a threshold.
+    HandedBackVolume,
 }
 
 impl OutOfOrderPersistReason {
@@ -33,6 +36,7 @@ impl OutOfOrderPersistReason {
             Self::GlobalWriteBacklog => "download.write_buffer.out_of_order.global_write_backlog",
             Self::QuiescentFlush => "download.write_buffer.out_of_order.quiescent_flush",
             Self::DirectUnpack => "download.write_buffer.out_of_order.direct_unpack",
+            Self::HandedBackVolume => "download.write_buffer.out_of_order.handed_back_volume",
         }
     }
 }
@@ -3234,6 +3238,46 @@ impl Pipeline {
         }
     }
 
+    /// Empty a file's write buffer outright, whatever its pending thresholds
+    /// say.
+    ///
+    /// The threshold drains exist to bound memory while a file is still
+    /// arriving, and they deliberately leave a small buffer alone. A volume a
+    /// demotion sweep has just handed back is not still arriving on that path:
+    /// what it accepted and did not persist is bytes no durable floor accounts
+    /// for, and a file resting in "accepted but not durable" is exactly what
+    /// leaves the materialization gate holding an owner nothing clears. So its
+    /// buffer is emptied, not trimmed.
+    async fn drain_file_write_buffer(
+        &mut self,
+        file_id: NzbFileId,
+    ) -> Result<(), SegmentWriteError> {
+        // Same hold as every other flush: the sweep owns the image while it
+        // runs, and committing over it would complete the assembly against
+        // bytes the sweep is still rewriting.
+        if self.demotion_sweep_owns_file(file_id) {
+            return Ok(());
+        }
+        loop {
+            let batch = {
+                let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
+                    return Ok(());
+                };
+                write_buf.take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
+            };
+            if batch.is_empty() {
+                self.remove_empty_write_buffer(file_id);
+                return Ok(());
+            }
+            self.persist_out_of_order_segments(
+                file_id,
+                batch,
+                OutOfOrderPersistReason::HandedBackVolume,
+            )
+            .await?;
+        }
+    }
+
     async fn relieve_global_write_backlog(&mut self) -> Result<(), SegmentWriteError> {
         self.relieve_global_write_backlog_to(self.write_backlog_budget_bytes)
             .await
@@ -3273,7 +3317,7 @@ impl Pipeline {
     /// on their queued work lifts here too, so dispatch is owed a pass.
     pub(crate) async fn relieve_handed_back_write_backlog(&mut self, volume_files: &[NzbFileId]) {
         for file_id in volume_files {
-            if let Err(error) = self.enforce_file_write_backlog(*file_id).await {
+            if let Err(error) = self.drain_file_write_buffer(*file_id).await {
                 self.fail_job_for_disk_write(
                     error,
                     "failed to relieve a handed-back volume's write backlog",

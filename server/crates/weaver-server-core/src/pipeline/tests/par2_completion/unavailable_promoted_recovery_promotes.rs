@@ -842,13 +842,12 @@ async fn health_below_critical_without_par2_still_fails() {
     ));
 }
 
-#[tokio::test]
-async fn health_below_critical_with_par2_defers_to_completion() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30025);
-    let spec = JobSpec {
-        name: "PAR2 Health Defers".to_string(),
+/// A job whose two payload files are protected by one single-block recovery
+/// volume: enough advertised recovery for the deferral, little enough real
+/// recovery for the ceiling.
+fn par2_health_job_spec(name: &str) -> JobSpec {
+    JobSpec {
+        name: name.to_string(),
         password: None,
         total_bytes: 300,
         category: None,
@@ -891,7 +890,15 @@ async fn health_below_critical_with_par2_defers_to_completion() {
                 }],
             },
         ],
-    };
+    }
+}
+
+#[tokio::test]
+async fn health_below_critical_with_par2_defers_to_completion() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30025);
+    let spec = par2_health_job_spec("PAR2 Health Defers");
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     {
@@ -906,6 +913,44 @@ async fn health_below_critical_with_par2_defers_to_completion() {
         Some(JobStatus::Failed { .. })
     ));
     assert!(pipeline.pending_completion_checks.contains(&job_id));
+}
+
+/// Recovery data that cannot be obtained is not recovery data.
+///
+/// The deferral used to ride on the byte count the posting *advertises* for
+/// its recovery files, which a dead posting advertises exactly as a live one
+/// does. A job whose recovery articles are all answered for therefore waited
+/// out its whole retry budget on repair that could never be attempted.
+#[tokio::test]
+async fn health_below_critical_without_obtainable_recovery_fails_now() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30026);
+    let spec = par2_health_job_spec("PAR2 Health Cannot Be Obtained");
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // The only recovery article the posting has is missing on every server.
+    pipeline.book_failed_segment(SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 2,
+        },
+        segment_number: 0,
+    });
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.failed_bytes = 200;
+    }
+
+    pipeline.check_health(job_id);
+
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Failed { .. })
+        ),
+        "a job with nothing left to repair from must not wait for a repair"
+    );
 }
 
 #[tokio::test]

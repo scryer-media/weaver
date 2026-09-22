@@ -1559,7 +1559,7 @@ fn a_long_hold_keeps_its_view_unless_the_pool_is_scarce() {
     );
     assert_eq!(pool.metrics().small_in_use, 0);
     assert!(
-        pool.is_scarce(crate::runtime::buffers::BufferTier::Small) == false,
+        !pool.is_scarce(crate::runtime::buffers::BufferTier::Small),
         "the returned slot is the whole pool, so it is no longer scarce"
     );
 }

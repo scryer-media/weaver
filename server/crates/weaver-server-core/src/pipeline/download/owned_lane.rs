@@ -45,6 +45,14 @@ pub(crate) struct OwnedDownloadLanePool {
 /// already happened. It is taken at lease boundaries only — never per article.
 struct OwnedLanePoolShared {
     workers: Vec<OwnedLaneWorkerSlot>,
+    /// Jobs whose probe batch asked every lane and got no pickup.
+    ///
+    /// Read by the dispatch eligibility walk, which withholds the job's next
+    /// handout while it is in here, so the next lane to come free finds no
+    /// work waiting for it and takes the probe instead. No lane is reserved
+    /// and no count changes: the job simply stops being offered the one
+    /// handout its own probe is waiting behind.
+    probe_starved_jobs: std::collections::HashSet<u64>,
     /// Runs that arrived while every worker was busy. Whichever worker
     /// finishes first drains this before it publishes itself idle, so a lease
     /// never sits behind one busy worker's private channel.
@@ -125,6 +133,10 @@ impl IdleOwnedLane {
 #[derive(Clone)]
 pub(crate) struct OwnedLaneProbeHandle {
     shared: Arc<std::sync::Mutex<OwnedLanePoolShared>>,
+    /// The job whose release this probe is sampling. A starved batch asks
+    /// dispatch to hold *this* job back, because it is the job holding every
+    /// lane the batch could have used.
+    job_id: u64,
 }
 
 impl OwnedLaneProbeHandle {
@@ -195,17 +207,47 @@ impl OwnedLaneProbeHandle {
         }
 
         let request: Arc<[String]> = Arc::from(message_ids.to_vec());
+        if let Some(outcome) = self
+            .ask_lanes(&candidates, &request, message_ids.len())
+            .await
+        {
+            return Some(outcome);
+        }
+
+        // Nobody picked the batch up. The job whose release this probe is
+        // sampling is the job holding the lanes, so the only way the batch
+        // gets one is for that job to stop being handed the next article.
+        // Dispatch withholds it while this guard stands, which means the next
+        // lane to come free finds nothing queued for it and takes the probe.
+        // Bounded by the same pickup timeout, and released whatever happens.
+        let _yield = self.hold_dispatch_for_starved_probe();
+        self.ask_lanes(&candidates, &request, message_ids.len())
+            .await
+    }
+
+    /// Put one batch to every candidate lane at once and fold their answers.
+    ///
+    /// `None` when not one of them answered, which is what separates "no lane
+    /// would take it" from "the lanes took it and it was inconclusive".
+    async fn ask_lanes(
+        &self,
+        candidates: &[(usize, std_mpsc::Sender<OwnedLanePoolCommand>, Duration)],
+        request: &Arc<[String]>,
+        batch_len: usize,
+    ) -> Option<LaneProbeOutcome> {
         // A `JoinSet` rather than detached tasks: dropping it aborts whatever
         // is still outstanding, which is what tells a worker that has not
         // picked the request up to leave it alone — the same contract the
         // dropped pickup receiver carries.
         let mut asking = tokio::task::JoinSet::new();
         for (server, sender, pickup) in candidates {
-            let batch = Arc::clone(&request);
+            let batch = Arc::clone(request);
+            let sender = sender.clone();
+            let (server, pickup) = (*server, *pickup);
             asking.spawn(async move { (server, Self::ask_lane(sender, batch, pickup).await) });
         }
 
-        let mut exists = vec![false; message_ids.len()];
+        let mut exists = vec![false; batch_len];
         let mut servers_settled: Vec<usize> = Vec::new();
         let mut answered = false;
         let mut inconclusive = false;
@@ -218,8 +260,7 @@ impl OwnedLaneProbeHandle {
                 inconclusive = true;
                 debug!(
                     server,
-                    batch_len = message_ids.len(),
-                    "owned lane probe: server left the batch unverified"
+                    batch_len, "owned lane probe: server left the batch unverified"
                 );
                 continue;
             }
@@ -238,6 +279,21 @@ impl OwnedLaneProbeHandle {
             },
             servers_settled,
         })
+    }
+
+    /// Ask dispatch to withhold this job's next handout until the guard drops.
+    pub(in crate::pipeline) fn hold_dispatch_for_starved_probe(&self) -> StarvedProbeYield {
+        lock_pool(&self.shared)
+            .probe_starved_jobs
+            .insert(self.job_id);
+        debug!(
+            job_id = self.job_id,
+            "owned lane probe: no lane picked the batch up; holding this job's next handout"
+        );
+        StarvedProbeYield {
+            shared: Arc::clone(&self.shared),
+            job_id: self.job_id,
+        }
     }
 
     /// Puts one batch to one lane and waits for its verdict.
@@ -359,6 +415,24 @@ impl OwnedLaneProbeHandle {
             result.exists[*slot] = found;
         }
         result
+    }
+}
+
+/// The withheld handout, for as long as a starved probe batch needs it.
+///
+/// A guard rather than a pair of calls so the hold cannot outlive the batch:
+/// every way out of the retry — an answer, a second timeout, a dropped future
+/// — releases it.
+pub(in crate::pipeline) struct StarvedProbeYield {
+    shared: Arc<std::sync::Mutex<OwnedLanePoolShared>>,
+    job_id: u64,
+}
+
+impl Drop for StarvedProbeYield {
+    fn drop(&mut self) {
+        lock_pool(&self.shared)
+            .probe_starved_jobs
+            .remove(&self.job_id);
     }
 }
 
@@ -536,6 +610,7 @@ impl OwnedDownloadLanePool {
             shared: Arc::new(std::sync::Mutex::new(OwnedLanePoolShared {
                 workers: Vec::new(),
                 queued_runs: VecDeque::new(),
+                probe_starved_jobs: std::collections::HashSet::new(),
             })),
             #[cfg(test)]
             reset_calls: AtomicUsize::new(0),
@@ -559,10 +634,17 @@ impl OwnedDownloadLanePool {
         shared.workers.truncate(worker_count);
     }
 
-    pub(crate) fn probe_handle(&self) -> OwnedLaneProbeHandle {
+    pub(crate) fn probe_handle(&self, job_id: u64) -> OwnedLaneProbeHandle {
         OwnedLaneProbeHandle {
             shared: Arc::clone(&self.shared),
+            job_id,
         }
+    }
+
+    /// Whether this job's probe is waiting for a lane none of them would give
+    /// it. Read by the dispatch eligibility walk.
+    pub(crate) fn probe_is_starved_by(&self, job_id: u64) -> bool {
+        lock_pool(&self.shared).probe_starved_jobs.contains(&job_id)
     }
 
     /// The servers of the connections idle workers are keeping, one entry
@@ -1993,9 +2075,11 @@ mod tests {
         }
 
         let probe = OwnedLaneProbeHandle {
+            job_id: 0,
             shared: Arc::new(std::sync::Mutex::new(OwnedLanePoolShared {
                 workers,
                 queued_runs: VecDeque::new(),
+                probe_starved_jobs: std::collections::HashSet::new(),
             })),
         };
         let outcome = probe
@@ -2537,6 +2621,7 @@ mod routing_tests {
                 })
                 .collect(),
             queued_runs: VecDeque::new(),
+            probe_starved_jobs: std::collections::HashSet::new(),
         }
     }
 
@@ -2844,7 +2929,7 @@ mod probe_tests {
     #[tokio::test]
     async fn a_worker_without_a_cached_lane_declines_the_probe() {
         let pool = OwnedDownloadLanePool::new(1);
-        let handle = pool.probe_handle();
+        let handle = pool.probe_handle(0);
         quiesce(&pool).await;
         // Idle, but holding nothing: the state a worker is in before its
         // first lease, and after a park that dropped the socket.
@@ -2864,7 +2949,7 @@ mod probe_tests {
     #[tokio::test]
     async fn a_busy_worker_without_a_connection_is_not_asked() {
         let pool = OwnedDownloadLanePool::new(2);
-        let handle = pool.probe_handle();
+        let handle = pool.probe_handle(0);
         quiesce(&pool).await;
 
         assert!(handle.idle_workers().is_empty());
@@ -2900,8 +2985,9 @@ mod probe_tests {
         let shared = Arc::new(std::sync::Mutex::new(OwnedLanePoolShared {
             workers,
             queued_runs: VecDeque::new(),
+            probe_starved_jobs: std::collections::HashSet::new(),
         }));
-        (OwnedLaneProbeHandle { shared }, receivers)
+        (OwnedLaneProbeHandle { shared, job_id: 0 }, receivers)
     }
 
     /// Answer the next probe on `receiver` with `exists`, off the runtime.
@@ -2991,7 +3077,7 @@ mod probe_tests {
     async fn an_empty_batch_needs_no_lane() {
         let pool = OwnedDownloadLanePool::new(1);
         let outcome = pool
-            .probe_handle()
+            .probe_handle(0)
             .probe(&[])
             .await
             .expect("an empty batch is always answerable");
@@ -3004,7 +3090,7 @@ mod probe_tests {
     #[tokio::test]
     async fn the_probe_handle_tracks_pool_resizes() {
         let mut pool = OwnedDownloadLanePool::new(1);
-        let handle = pool.probe_handle();
+        let handle = pool.probe_handle(0);
         pool.resize(4);
         quiesce(&pool).await;
         set_idle(&pool, 3, Some(test_idle_lane(0)));
