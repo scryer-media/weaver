@@ -64,7 +64,7 @@ fn transaction_checks(corrupt: bool) {
         }
         let spans = set
             .router
-            .route_repaired_batch(volume, &[(64, Arc::from(data))], &[], false, true)
+            .route_repaired_batch(volume, &[(64, bytes::Bytes::from(data))], &[], false, true)
             .expect("even a bad first volume defers its gate until the set is replaced");
         set.record_writes(&spans, Instant::now());
         assert!(set.router.repair_batch_in_progress());
@@ -102,7 +102,13 @@ fn replacement_transactions_reject_invalid_plans_and_wrong_volume_order() {
     set.begin_repair_transaction(vec![0, 1]).unwrap();
     assert!(
         set.router
-            .route_repaired_batch(1, &[(64, Arc::from([42; 400]))], &[], false, true)
+            .route_repaired_batch(
+                1,
+                &[(64, bytes::Bytes::from_static(&[42; 400]))],
+                &[],
+                false,
+                true
+            )
             .is_err()
     );
     assert!(set.router.repair_batch_in_progress());
@@ -154,7 +160,13 @@ fn complete_direct_set_waits_for_native_verdict_application() {
     for volume in 0..2 {
         let spans = set
             .router
-            .route_repaired_batch(volume, &[(64, Arc::from([42; 400]))], &[], false, true)
+            .route_repaired_batch(
+                volume,
+                &[(64, bytes::Bytes::from_static(&[42; 400]))],
+                &[],
+                false,
+                true,
+            )
             .unwrap();
         set.record_writes(&spans, Instant::now());
         set.note_volume_complete(volume, 464).unwrap();
@@ -181,7 +193,12 @@ fn par3_archive_checksum_deferral_accepts_verified_replacement_bytes() {
     router.stage_for_test(0, 64, &[41; 400]);
     router.drain_for_test(0).unwrap();
     router
-        .route_repaired(0, &[(64, Arc::from([42; 400]))], &[], false)
+        .route_repaired(
+            0,
+            &[(64, bytes::Bytes::from_static(&[42; 400]))],
+            &[],
+            false,
+        )
         .unwrap();
     router.settle_par3_verification().unwrap();
     assert!(router.all_members_verified());

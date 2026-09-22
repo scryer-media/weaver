@@ -1694,7 +1694,7 @@ enum DiskWriteCommand {
     /// partial and the set's envelope, and neither piece is a segment.
     RawBatch {
         path: std::path::PathBuf,
-        writes: Vec<(u64, Vec<u8>)>,
+        writes: Vec<(u64, Vec<bytes::Bytes>)>,
         queued_at: Instant,
         response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
     },
@@ -1801,7 +1801,7 @@ impl DiskWriteOwnerPool {
     fn submit_raw_batch(
         &self,
         path: std::path::PathBuf,
-        writes: Vec<(u64, Vec<u8>)>,
+        writes: Vec<(u64, Vec<bytes::Bytes>)>,
     ) -> tokio::sync::oneshot::Receiver<std::io::Result<()>> {
         let (response, response_rx) = tokio::sync::oneshot::channel();
         let sender_index = self.owner_index_for_path(&path);
@@ -2259,12 +2259,10 @@ fn write_segments_into_file(
 /// Writes every slice in order, retrying short and interrupted writes. On
 /// failure, reports how many bytes landed before the error so the caller can
 /// account for the fully-written prefix.
-fn write_all_vectored(
-    file: &mut std::fs::File,
+fn write_all_vectored<W: std::io::Write>(
+    file: &mut W,
     mut slices: &mut [std::io::IoSlice<'_>],
 ) -> Result<(), (std::io::Error, usize)> {
-    use std::io::Write;
-
     let mut written = 0usize;
     std::io::IoSlice::advance_slices(&mut slices, 0);
     while !slices.is_empty() {
@@ -2289,10 +2287,42 @@ fn write_all_vectored(
     Ok(())
 }
 
+/// How many `IoSlice`s one `write_vectored` is given. `IOV_MAX` is 1024 on the
+/// platforms with a real vectored write, and a routed run can carry more pieces
+/// than that — one per decoded batch of every article in it. The budget keeps
+/// each syscall inside the limit, and the loop around it is what makes the
+/// count irrelevant: a run drains over as many calls as it takes.
+const WRITE_IOV_BUDGET: usize = 256;
+
+/// One contiguous run, written in order at the current file position.
+///
+/// Chunked at [`WRITE_IOV_BUDGET`] and written in sequence, so the position
+/// carries from one chunk to the next and no chunk needs a seek of its own.
+/// `write_all_vectored` handles a short write inside a chunk, advancing across
+/// piece boundaries, so a writer that takes an arbitrary number of bytes per
+/// call still sees every byte exactly once and in order.
+fn write_run_vectored<W: std::io::Write>(
+    file: &mut W,
+    slices: &mut [std::io::IoSlice<'_>],
+) -> Result<(), (std::io::Error, usize)> {
+    let mut written = 0usize;
+    for chunk in slices.chunks_mut(WRITE_IOV_BUDGET) {
+        // Measured before the call: `advance_slices` shortens the element it
+        // stopped inside, so the chunk no longer describes its own length once
+        // the write has run.
+        let chunk_len: usize = chunk.iter().map(|slice| slice.len()).sum();
+        if let Err((error, partial)) = write_all_vectored(file, chunk) {
+            return Err((error, written + partial));
+        }
+        written += chunk_len;
+    }
+    Ok(())
+}
+
 fn write_raw_batch_blocking(
     handles: &mut DiskWriteHandleCache,
     path: std::path::PathBuf,
-    writes: Vec<(u64, Vec<u8>)>,
+    writes: Vec<(u64, Vec<bytes::Bytes>)>,
     queued_at: Instant,
 ) -> std::io::Result<()> {
     use std::io::Seek;
@@ -2309,9 +2339,18 @@ fn write_raw_batch_blocking(
         let run_offset = writes[index].0;
         let mut run_len = 0u64;
         slices.clear();
+        // One seek per contiguous run, as before: the pieces of a write are
+        // contiguous by construction and adjacent writes are coalesced by the
+        // offset comparison, so the run is still the unit the file position
+        // follows.
         while index < writes.len() && writes[index].0 == run_offset + run_len {
-            slices.push(std::io::IoSlice::new(&writes[index].1));
-            run_len += writes[index].1.len() as u64;
+            for piece in &writes[index].1 {
+                if piece.is_empty() {
+                    continue;
+                }
+                slices.push(std::io::IoSlice::new(piece));
+                run_len += piece.len() as u64;
+            }
             index += 1;
         }
         if next_offset != Some(run_offset)
@@ -2320,7 +2359,7 @@ fn write_raw_batch_blocking(
             handles.discard(&path);
             return Err(source);
         }
-        if let Err((source, _)) = write_all_vectored(file, &mut slices) {
+        if let Err((source, _)) = write_run_vectored(file, &mut slices) {
             handles.discard(&path);
             return Err(source);
         }
@@ -2330,8 +2369,12 @@ fn write_raw_batch_blocking(
 }
 
 /// One routed article's fragments, grouped into one sub-batch per destination
-/// file: `(destination path, [(offset, bytes)])`.
-pub(crate) type DirectWriteBatches = Vec<(std::path::PathBuf, Vec<(u64, Vec<u8>)>)>;
+/// file: `(destination path, [(offset, pieces)])`.
+///
+/// A fragment's payload is a list of refcounted views of the decoder's own
+/// buffers rather than an owned copy, and the owner thread writes the views
+/// directly with a vectored write.
+pub(crate) type DirectWriteBatches = Vec<(std::path::PathBuf, Vec<(u64, Vec<bytes::Bytes>)>)>;
 
 /// Writes one routed article's fragments to **every** destination it touches,
 /// fanning the per-path sub-batches out to their owner threads and joining them
@@ -2512,6 +2555,103 @@ pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
 mod disk_write_handle_cache_tests {
     use super::*;
     use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+
+    /// Accepts a fixed number of bytes per call, whatever it was offered, so a
+    /// write lands in the middle of an `IoSlice` and the next call has to
+    /// resume there.
+    struct ShortWriter {
+        per_call: usize,
+        written: Vec<u8>,
+        calls: usize,
+    }
+
+    impl std::io::Write for ShortWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            let take = buffer.len().min(self.per_call);
+            self.written.extend_from_slice(&buffer[..take]);
+            self.calls += 1;
+            Ok(take)
+        }
+
+        fn write_vectored(&mut self, slices: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+            let mut budget = self.per_call;
+            let mut taken = 0usize;
+            for slice in slices {
+                if budget == 0 {
+                    break;
+                }
+                let take = slice.len().min(budget);
+                self.written.extend_from_slice(&slice[..take]);
+                budget -= take;
+                taken += take;
+            }
+            self.calls += 1;
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_run_of_more_pieces_than_one_syscall_takes_is_written_whole_and_in_order() {
+        // More pieces than the iovec budget, so the run needs several vectored
+        // calls, and a per-call byte count that lands inside a piece rather than
+        // on its boundary, so every call has to resume mid-slice.
+        let pieces: Vec<bytes::Bytes> = (0..WRITE_IOV_BUDGET * 3 + 7)
+            .map(|index| {
+                let len = 1 + index % 13;
+                bytes::Bytes::from(vec![(index % 251) as u8; len])
+            })
+            .collect();
+        let expected: Vec<u8> = pieces.iter().flat_map(|piece| piece.to_vec()).collect();
+        let mut slices: Vec<std::io::IoSlice<'_>> = pieces
+            .iter()
+            .map(|piece| std::io::IoSlice::new(piece))
+            .collect();
+        let mut writer = ShortWriter {
+            per_call: 17,
+            written: Vec::new(),
+            calls: 0,
+        };
+        write_run_vectored(&mut writer, &mut slices).expect("the run drains");
+        assert_eq!(
+            writer.written, expected,
+            "every byte of every piece lands exactly once, in order"
+        );
+        assert!(
+            writer.calls > expected.len() / 17,
+            "a writer that takes 17 bytes a call cannot have drained the run in fewer"
+        );
+    }
+
+    #[test]
+    fn a_run_written_through_the_batch_seam_lands_at_its_offset_in_one_seek() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("envelope.bin");
+        std::fs::write(&path, vec![0u8; 16]).unwrap();
+        let mut handles = DiskWriteHandleCache::default();
+        // Two contiguous runs and a gap: 4..8 and 8..12 coalesce, 14..16 does
+        // not, and the sub-batch arrives sorted by offset as the commit seam
+        // sorts it.
+        let writes = vec![
+            (
+                4u64,
+                vec![
+                    bytes::Bytes::from_static(b"ab"),
+                    bytes::Bytes::from_static(b"cd"),
+                ],
+            ),
+            (8u64, vec![bytes::Bytes::from_static(b"efgh")]),
+            (14u64, vec![bytes::Bytes::from_static(b"zz")]),
+        ];
+        write_raw_batch_blocking(&mut handles, path.clone(), writes, Instant::now()).unwrap();
+        let mut expected = vec![0u8; 16];
+        expected[4..12].copy_from_slice(b"abcdefgh");
+        expected[14..16].copy_from_slice(b"zz");
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
 
     #[test]
     fn masked_damage_writes_only_permitted_spans_and_propagates_io_errors() {

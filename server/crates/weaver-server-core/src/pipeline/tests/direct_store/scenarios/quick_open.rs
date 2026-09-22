@@ -2624,7 +2624,7 @@ async fn a_malformed_chain_demotion_leaves_a_partial_crc_atom_provisional() {
                     destination_offset: start as u64,
                     volume_index: 1,
                     source_offset: start as u64,
-                    bytes: vec![0xA5; partial_len],
+                    bytes: vec![bytes::Bytes::from(vec![0xA5; partial_len])],
                 }],
                 std::time::Instant::now(),
             );

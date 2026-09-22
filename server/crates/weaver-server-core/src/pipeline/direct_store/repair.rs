@@ -84,7 +84,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use par2_rs::{FileId, Par2FileSet, VerificationResult};
 
@@ -693,7 +692,7 @@ fn read_span_chunked(
         file.read_exact(&mut buffer[..want])?;
         let chunk = &buffer[..want];
         crc32 = weaver_yenc::crc32_combine(crc32, par2_rs::checksum::crc32(chunk), want as u64);
-        chunks.push((cursor, Arc::from(chunk)));
+        chunks.push((cursor, bytes::Bytes::copy_from_slice(chunk)));
         cursor = cursor.saturating_add(want as u64);
     }
     Ok(Some(RepairedSpan {

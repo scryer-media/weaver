@@ -184,6 +184,11 @@ impl DirectSetRouter {
                 unpacked_size,
                 replace,
             )?;
+            // The decrypt already produced these buffers; adopting them keeps
+            // the encrypted path's one unavoidable copy — the decryption
+            // itself — from becoming two.
+            let plain = Bytes::from(plain);
+            let cipher = Bytes::from(cipher);
             if destination_len > 0 {
                 self.record_routed_extent(
                     volume_index,
@@ -199,7 +204,7 @@ impl DirectSetRouter {
                     destination_offset: start,
                     volume_index,
                     source_offset: physical,
-                    bytes: plain[..destination_len as usize].to_vec(),
+                    bytes: vec![plain.slice(..destination_len as usize)],
                 });
             }
             // The tail padding's **source** bytes. Their plaintext is never a
@@ -216,7 +221,7 @@ impl DirectSetRouter {
                     destination_offset: physical + destination_len,
                     volume_index,
                     source_offset: physical + destination_len,
-                    bytes: cipher[destination_len as usize..].to_vec(),
+                    bytes: vec![cipher.slice(destination_len as usize..)],
                 });
             }
             routed.push((physical, piece_len));
@@ -389,7 +394,7 @@ impl DirectSetRouter {
         }
         self.staging
             .get(&volume_index)
-            .and_then(|staging| staging.slice(offset, len, &self.scratch))
+            .and_then(|staging| staging.slice_contiguous(offset, len, &self.scratch))
     }
 
     /// Feeds one decrypted run into the integrity gates.

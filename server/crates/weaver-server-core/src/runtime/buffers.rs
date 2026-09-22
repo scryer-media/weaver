@@ -372,6 +372,19 @@ impl BufferHandle {
     }
 }
 
+/// Lets a decoded slot be handed out as a refcounted byte view without a copy:
+/// the view owns a clone of this handle, so the slot returns to the pool when
+/// the last view of it drops rather than when the decoder is finished.
+///
+/// The valid length is fixed before the handle leaves the decoder — the only
+/// writer is the sole owner, which `as_mut_slice` enforces — so every call here
+/// answers the same bytes.
+impl AsRef<[u8]> for BufferHandle {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 impl Drop for BufferInner {
     fn drop(&mut self) {
         // Take the slot out and return it to the pool.
