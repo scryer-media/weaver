@@ -281,6 +281,60 @@ impl Pipeline {
         job_id: JobId,
         set_id: par2_rs::RecoverySetId,
     ) -> u32 {
+        self.recovery_block_capacity_where(job_id, set_id, |_| true)
+    }
+
+    /// The set's block capacity counted over the recovery files that could
+    /// still be read.
+    ///
+    /// [`Self::total_recovery_block_capacity`] credits an unread volume with
+    /// the blocks its filename advertises, which is the right answer for
+    /// repair arithmetic that will read the volume before it banks on it. A
+    /// health deferral banks on it first: it waits *because* of that capacity.
+    /// A volume whose every article is already retired advertises exactly what
+    /// an intact one does and can never deliver a block of it, so here it
+    /// counts for nothing. A file with an article delivered, or one still on
+    /// its way, keeps its count.
+    pub(in crate::pipeline) fn obtainable_recovery_block_capacity(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+    ) -> u32 {
+        self.recovery_block_capacity_where(job_id, set_id, |file_index| {
+            self.recovery_file_could_still_be_read(job_id, file_index)
+        })
+    }
+
+    /// Whether any article of a recovery file has arrived or could still
+    /// arrive.
+    fn recovery_file_could_still_be_read(&self, job_id: JobId, file_index: u32) -> bool {
+        let file_id = NzbFileId { job_id, file_index };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let Some(file) = state.spec.files.get(file_index as usize) else {
+            return false;
+        };
+        let assembly = state.assembly.file(file_id);
+        file.segments.iter().any(|segment| {
+            let delivered = assembly.is_some_and(|file| file.has_segment(segment.ordinal));
+            delivered
+                || self.par2_discovery_article_may_arrive(
+                    SegmentId {
+                        file_id,
+                        segment_number: segment.ordinal,
+                    },
+                    delivered,
+                )
+        })
+    }
+
+    fn recovery_block_capacity_where(
+        &self,
+        job_id: JobId,
+        set_id: par2_rs::RecoverySetId,
+        keep: impl Fn(u32) -> bool,
+    ) -> u32 {
         let Some(state) = self.jobs.get(&job_id) else {
             return 0;
         };
@@ -303,6 +357,7 @@ impl Pipeline {
                     .is_some_and(|file| file.recovery_set_packets_read || file.recovery_blocks > 0)
             })
             .map(|(file_index, _)| file_index as u32)
+            .filter(|file_index| keep(*file_index))
             .filter(|file_index| self.recovery_file_serves_set(job_id, *file_index, set_id))
             .filter_map(|file_index| self.recovery_block_count_for(job_id, file_index, set_id))
             .map(|(blocks, _)| blocks)

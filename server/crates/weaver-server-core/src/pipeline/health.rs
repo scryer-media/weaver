@@ -197,7 +197,8 @@ impl Pipeline {
     /// read off a filename:
     ///
     /// * a served recovery set — blocks its volumes can supply, at the set's
-    ///   own slice size;
+    ///   own slice size, counting only volumes with an article delivered or
+    ///   still able to arrive;
     /// * discovery candidates that are still live: no verdict yet, and at least
     ///   one article that could still arrive. Nothing is known about their
     ///   contents, so they contribute their declared article bytes.
@@ -209,7 +210,8 @@ impl Pipeline {
             let slice_size = self
                 .par2_set_for(job_id, set_id)
                 .map_or(0, |set| set.slice_size);
-            u64::from(self.total_recovery_block_capacity(job_id, set_id)).saturating_mul(slice_size)
+            u64::from(self.obtainable_recovery_block_capacity(job_id, set_id))
+                .saturating_mul(slice_size)
         });
         let candidates = self.par2_metadata_candidate_indices(job_id);
         if served.is_none() && candidates.is_empty() {
