@@ -264,6 +264,16 @@ impl BufferPool {
         }
     }
 
+    /// Whether a tier is close to running out: a quarter or less of its
+    /// slots are free. Readers that can trade a copy for a slot — the direct
+    /// store copying a hold out of the decoder buffer it arrived in — do so
+    /// when this is true, so that slots pinned by long-lived holds come back
+    /// before decoding falls through to fresh allocations.
+    pub fn is_scarce(&self, tier: BufferTier) -> bool {
+        let tp = self.tier_pool(tier);
+        self.available(tier).saturating_mul(4) <= tp.total
+    }
+
     /// Number of available (not in use) buffers for a tier.
     pub fn available(&self, tier: BufferTier) -> usize {
         let tp = self.tier_pool(tier);

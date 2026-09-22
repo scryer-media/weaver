@@ -1458,6 +1458,165 @@ fn a_routed_span_reports_the_length_of_every_piece_it_carries() {
     );
 }
 
+/// A router with a plan and no layout: everything staged into it is a hold,
+/// because nothing can be mapped until a header parse binds the layout.
+fn layoutless_router() -> DirectSetRouter {
+    DirectSetRouter::new(DirectSetPlan {
+        set_name: SET.to_string(),
+        volumes: [(0u32, 0u32)].into_iter().collect(),
+        files: [(0u32, 0u32)].into_iter().collect(),
+        identity: None,
+        working_dir: std::path::PathBuf::from("/nonexistent"),
+        destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
+    })
+}
+
+/// One pooled article of `len` bytes from a pool with a single small slot,
+/// handed over the way the routing seam hands it: as a view of the slot.
+fn pooled_article(
+    len: usize,
+) -> (
+    std::sync::Arc<crate::runtime::buffers::BufferPool>,
+    Vec<bytes::Bytes>,
+) {
+    use crate::runtime::buffers::{BufferPool, BufferPoolConfig, BufferTier};
+    let pool = BufferPool::new(BufferPoolConfig {
+        small_count: 1,
+        medium_count: 0,
+        large_count: 0,
+    });
+    let mut handle = pool
+        .try_acquire(BufferTier::Small)
+        .expect("the slot is free");
+    let payload: Vec<u8> = (0..len as u32).map(|index| (index % 251) as u8).collect();
+    handle.as_mut_slice().expect("sole owner")[..len].copy_from_slice(&payload);
+    handle.set_len(len);
+    let pieces = crate::pipeline::DecodedChunk::Pooled(handle).pieces();
+    (pool, pieces)
+}
+
+#[test]
+fn a_short_hold_is_copied_out_of_its_slot_once_the_article_has_drained() {
+    let (pool, pieces) = pooled_article(4096);
+    let mut router = layoutless_router();
+    router.stage_pieces_for_test(0, 0, &pieces);
+    assert!(
+        router
+            .drain_for_test(0)
+            .expect("nothing to route")
+            .is_empty(),
+        "with no layout the article is held whole"
+    );
+    drop(pieces);
+    assert_eq!(
+        pool.metrics().small_in_use,
+        1,
+        "the held view keeps the slot out of the pool"
+    );
+
+    let copied = router.release_article_views(0, 0, 4096, false);
+    assert_eq!(
+        copied, 4096,
+        "a residue under the limit is copied unconditionally"
+    );
+    assert_eq!(
+        pool.metrics().small_in_use,
+        0,
+        "the copy released the slot while the hold stays staged"
+    );
+    assert_eq!(
+        router.release_article_views(0, 0, 4096, true),
+        4096,
+        "an owned chunk cannot be told from a view, so it is copied again — harmless, and rare"
+    );
+}
+
+#[test]
+fn a_long_hold_keeps_its_view_unless_the_pool_is_scarce() {
+    const LEN: usize = 128 * 1024;
+    let (pool, pieces) = pooled_article(LEN);
+    let mut router = layoutless_router();
+    router.stage_pieces_for_test(0, 0, &pieces);
+    assert!(
+        router
+            .drain_for_test(0)
+            .expect("nothing to route")
+            .is_empty()
+    );
+    drop(pieces);
+
+    assert_eq!(
+        router.release_article_views(0, 0, LEN as u64, false),
+        0,
+        "a hold longer than the limit keeps its view while the pool has slots to spare"
+    );
+    assert_eq!(pool.metrics().small_in_use, 1);
+
+    assert_eq!(
+        router.release_article_views(0, 0, LEN as u64, true),
+        LEN as u64,
+        "a scarce pool buys its slot back with the copy holds always cost before views"
+    );
+    assert_eq!(pool.metrics().small_in_use, 0);
+    assert!(
+        pool.is_scarce(crate::runtime::buffers::BufferTier::Small) == false,
+        "the returned slot is the whole pool, so it is no longer scarce"
+    );
+}
+
+#[test]
+fn copying_a_hold_out_only_touches_the_article_it_was_asked_about() {
+    let (pool, pieces) = pooled_article(4096);
+    let mut router = layoutless_router();
+    router.stage_pieces_for_test(0, 0, &pieces);
+    // A second, unrelated hold further along the volume.
+    router.stage_pieces_for_test(0, 1 << 20, &[bytes::Bytes::from_static(b"elsewhere")]);
+    assert!(
+        router
+            .drain_for_test(0)
+            .expect("nothing to route")
+            .is_empty()
+    );
+    drop(pieces);
+
+    assert_eq!(
+        router.release_article_views(0, 1 << 20, 9, true),
+        9,
+        "only the chunks inside the asked-for range are copied"
+    );
+    assert_eq!(
+        pool.metrics().small_in_use,
+        1,
+        "the other article's slot is untouched"
+    );
+    assert_eq!(router.release_article_views(0, 0, 4096, false), 4096);
+    assert_eq!(pool.metrics().small_in_use, 0);
+}
+
+#[test]
+fn a_pool_is_scarce_at_a_quarter_free_and_not_above_it() {
+    use crate::runtime::buffers::{BufferPool, BufferPoolConfig, BufferTier};
+    let pool = BufferPool::new(BufferPoolConfig {
+        small_count: 8,
+        medium_count: 0,
+        large_count: 0,
+    });
+    let mut held = Vec::new();
+    while pool.available(BufferTier::Small) > 2 {
+        assert!(!pool.is_scarce(BufferTier::Small));
+        held.push(pool.try_acquire(BufferTier::Small).expect("a slot is free"));
+    }
+    assert!(
+        pool.is_scarce(BufferTier::Small),
+        "two of eight free is a quarter"
+    );
+    held.pop();
+    assert!(
+        !pool.is_scarce(BufferTier::Small),
+        "three of eight free is not"
+    );
+}
+
 #[tokio::test]
 async fn every_decoded_chunk_shape_hands_over_its_payload_without_copying_it() {
     use crate::pipeline::DecodedChunk;

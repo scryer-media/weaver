@@ -47,6 +47,34 @@ impl DirectSetRouter {
         Ok(spans)
     }
 
+    /// Copies what [`Self::route`] left staged from one article out of the
+    /// decoder buffers it arrived in, so the buffers can go back to the pool.
+    ///
+    /// Called by the routing seam once the article's spans are in hand. With
+    /// `pool_scarce` false only residues up to [`HOLD_VIEW_COPY_LIMIT_BYTES`]
+    /// are copied — the cipher tails, retained header runs and trimmed
+    /// slivers that would otherwise pin a slot for a few bytes. With it true
+    /// every residue is, which is the cost holds always had before the router
+    /// took views, paid exactly when a stalled set would otherwise hold the
+    /// pool hostage and push every decode onto a fresh allocation. Returns the
+    /// bytes copied.
+    pub(crate) fn release_article_views(
+        &mut self,
+        volume_index: u32,
+        source_offset: u64,
+        len: u64,
+        pool_scarce: bool,
+    ) -> u64 {
+        let up_to = if pool_scarce {
+            u64::MAX
+        } else {
+            HOLD_VIEW_COPY_LIMIT_BYTES
+        };
+        self.staging.get_mut(&volume_index).map_or(0, |staging| {
+            staging.copy_out_views(source_offset, len, up_to)
+        })
+    }
+
     /// [`Self::route`] over one contiguous buffer, for tests that build an
     /// article's bytes as a single slice.
     #[cfg(test)]

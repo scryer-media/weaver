@@ -645,6 +645,18 @@ impl DirectSet {
 
     /// Routes one decoded source span. A demotion is returned rather than
     /// panicking: the caller abandons direct output for the whole set.
+    /// [`DirectSetRouter::release_article_views`].
+    pub(crate) fn release_article_views(
+        &mut self,
+        volume_index: u32,
+        source_offset: u64,
+        len: u64,
+        pool_scarce: bool,
+    ) -> u64 {
+        self.router
+            .release_article_views(volume_index, source_offset, len, pool_scarce)
+    }
+
     pub(crate) fn route(
         &mut self,
         volume_index: u32,

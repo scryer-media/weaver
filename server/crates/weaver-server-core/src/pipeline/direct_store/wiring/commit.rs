@@ -48,6 +48,13 @@ impl Pipeline {
         // decoded data intact for the conventional fallback on demotion.
         let part_crc_verified = segment.part_crc_verified;
         let pieces = segment.data.pieces();
+        // Read before the set is borrowed: whether the tier this article's
+        // buffer came from can spare a slot to whatever the router keeps.
+        let pool_scarce = self
+            .buffers
+            .is_scarce(crate::runtime::buffers::BufferTier::for_size(
+                decoded_size as usize,
+            ));
 
         let routed = {
             let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
@@ -63,7 +70,20 @@ impl Pipeline {
                 file_offset,
                 u64::from(decoded_size),
             );
-            set.route(volume_index, file_offset, &pieces)
+            let routed = set.route(volume_index, file_offset, &pieces);
+            if routed.is_ok() {
+                // What the drain left staged — a held tail, a header run the
+                // parser keeps — must not keep the decoder's slot out of the
+                // pool: short residues leave it now, all of them when the
+                // pool is scarce.
+                set.release_article_views(
+                    volume_index,
+                    file_offset,
+                    u64::from(decoded_size),
+                    pool_scarce,
+                );
+            }
+            routed
         };
         let spans = match routed {
             Ok(spans) => spans,
