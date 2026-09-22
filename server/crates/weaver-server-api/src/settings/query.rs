@@ -37,11 +37,9 @@ impl SettingsQuery {
         &self,
         ctx: &Context<'_>,
     ) -> Result<crate::settings::types::HardwareProfileSettings> {
-        use weaver_server_core::runtime::HardwareProfile;
-
         let config = ctx.data::<SharedConfig>()?;
         let system = ctx.data::<crate::context::SystemRuntimeContext>()?;
-        let profile = system
+        let probe = system
             .profile
             .read()
             .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
@@ -52,18 +50,9 @@ impl SettingsQuery {
         })
         .await;
 
-        Ok(crate::settings::types::HardwareProfileSettings {
-            selected: selected.map(Into::into),
-            recommended: HardwareProfile::recommended(&profile).into(),
-            available: HardwareProfile::available(&profile)
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-            detected: crate::settings::types::DetectedHardware {
-                memory_bytes: HardwareProfile::effective_memory_bytes(&profile),
-                cores: HardwareProfile::effective_cores(&profile) as u32,
-            },
-        })
+        Ok(crate::settings::types::HardwareProfileSettings::resolve(
+            selected, &probe,
+        ))
     }
 
     /// Whether first-run setup is still owed to this install.

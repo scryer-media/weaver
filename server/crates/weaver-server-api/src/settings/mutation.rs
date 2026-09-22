@@ -78,18 +78,10 @@ impl SettingsMutation {
         // sized at startup and keep their size until the next one.
         handle.set_sevenz_decode_memory_bytes(chosen.tuning(&detected).sevenz_decode_memory_bytes);
 
-        Ok(crate::settings::types::HardwareProfileSettings {
-            selected: Some(profile),
-            recommended: HardwareProfile::recommended(&detected).into(),
-            available: HardwareProfile::available(&detected)
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-            detected: crate::settings::types::DetectedHardware {
-                memory_bytes: HardwareProfile::effective_memory_bytes(&detected),
-                cores: HardwareProfile::effective_cores(&detected) as u32,
-            },
-        })
+        Ok(crate::settings::types::HardwareProfileSettings::resolve(
+            Some(chosen),
+            &detected,
+        ))
     }
 
     /// Update general settings.

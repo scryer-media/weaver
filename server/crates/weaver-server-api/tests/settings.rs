@@ -530,8 +530,9 @@ async fn security_upgrade_notice_is_not_owed_on_the_current_access_model() {
     assert!(!security_upgrade_notice_pending(&h).await);
 }
 
-const HARDWARE_PROFILE_FIELDS: &str =
-    "{ selected recommended available detected { memoryBytes cores } }";
+const HARDWARE_PROFILE_FIELDS: &str = "{ selected recommended available \
+     options { profile sevenzDecodeMemoryBytes decodeThreads extractThreads maxConcurrentDownloads } \
+     detected { memoryBytes cores } }";
 
 #[tokio::test]
 async fn the_machine_is_offered_only_the_profiles_it_can_honour() {
@@ -555,6 +556,28 @@ async fn the_machine_is_offered_only_the_profiles_it_can_honour() {
         8 * 1024 * 1024 * 1024
     );
     assert_eq!(profile["detected"]["cores"].as_u64().unwrap(), 4);
+
+    // The cards' numbers come from the server's table, so an interface never
+    // keeps its own copy of them.
+    assert_eq!(
+        profile["options"],
+        serde_json::json!([
+            {
+                "profile": "EFFICIENT",
+                "sevenzDecodeMemoryBytes": 512 * 1024 * 1024,
+                "decodeThreads": 2,
+                "extractThreads": 1,
+                "maxConcurrentDownloads": 10,
+            },
+            {
+                "profile": "BALANCED",
+                "sevenzDecodeMemoryBytes": 1024 * 1024 * 1024,
+                "decodeThreads": 4,
+                "extractThreads": 2,
+                "maxConcurrentDownloads": null,
+            },
+        ])
+    );
 }
 
 #[tokio::test]

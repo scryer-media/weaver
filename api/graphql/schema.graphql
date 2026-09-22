@@ -559,6 +559,31 @@ enum HardwareProfileGql {
 }
 
 """
+What one profile would do on this machine, so an interface can say what a
+card means without keeping its own copy of the numbers.
+"""
+type HardwareProfileOption {
+	profile: HardwareProfileGql!
+	"""
+	Memory one 7z extraction may hold while decoding.
+	"""
+	sevenzDecodeMemoryBytes: Int!
+	"""
+	Articles decoded at once.
+	"""
+	decodeThreads: Int!
+	"""
+	Threads shared by extraction, repair and post-processing.
+	"""
+	extractThreads: Int!
+	"""
+	Downloads in flight at once, or null when the configured connection
+	count is the only limit.
+	"""
+	maxConcurrentDownloads: Int
+}
+
+"""
 The hardware-profile choice, and everything needed to present it: an
 interface with one available profile has nothing to ask and hides the
 question entirely.
@@ -577,6 +602,10 @@ type HardwareProfileSettings {
 	Every profile this machine can honour, least demanding first.
 	"""
 	available: [HardwareProfileGql!]!
+	"""
+	What each available profile would do here, in the same order.
+	"""
+	options: [HardwareProfileOption!]!
 	detected: DetectedHardware!
 }
 

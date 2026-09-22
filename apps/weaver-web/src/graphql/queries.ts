@@ -1350,6 +1350,45 @@ export const UPDATE_SETTINGS_MUTATION = gql`
   ${ISP_BANDWIDTH_CAP_FIELDS}
 `;
 
+// --- Hardware profile ---
+
+const HARDWARE_PROFILE_FIELDS = gql`
+  fragment HardwareProfileFields on HardwareProfileSettings {
+    selected
+    recommended
+    available
+    options {
+      profile
+      sevenzDecodeMemoryBytes
+      decodeThreads
+      extractThreads
+      maxConcurrentDownloads
+    }
+    detected {
+      memoryBytes
+      cores
+    }
+  }
+`;
+
+export const HARDWARE_PROFILE_QUERY = gql`
+  query HardwareProfile {
+    hardwareProfile {
+      ...HardwareProfileFields
+    }
+  }
+  ${HARDWARE_PROFILE_FIELDS}
+`;
+
+export const SET_HARDWARE_PROFILE_MUTATION = gql`
+  mutation SetHardwareProfile($profile: HardwareProfileGql!) {
+    setHardwareProfile(profile: $profile) {
+      ...HardwareProfileFields
+    }
+  }
+  ${HARDWARE_PROFILE_FIELDS}
+`;
+
 // --- First-run setup ---
 
 export const FIRST_RUN_SETUP_QUERY = gql`
