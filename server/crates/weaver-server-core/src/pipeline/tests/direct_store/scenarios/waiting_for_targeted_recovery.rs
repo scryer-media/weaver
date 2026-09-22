@@ -461,6 +461,85 @@ async fn damage_beyond_every_advertised_recovery_block_never_waits() {
 }
 
 #[tokio::test]
+async fn a_recovery_volume_retired_on_every_server_counts_for_no_obtainable_capacity() {
+    // The advertised count and the obtainable count answer different
+    // questions. Repair arithmetic reads a volume before it banks on it, so an
+    // unread volume's filename is a fair prediction there. A health deferral
+    // banks first: it waits for the very capacity it is counting, and a volume
+    // whose every article is already answered for will never deliver a block
+    // of what its filename promises. The advertised count is left alone; the
+    // health ceiling stops crediting the volume the moment its last article is
+    // retired.
+    let member_name = "Silver.Horizon.S02E06.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 199) as u8).collect();
+    let (volumes, index_bytes, recovery_bytes) =
+        recovery_in_a_separate_volume(member_name, &payload, 4, &[1]);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41116);
+    let (mut pipeline, _working_dir, _index_file_index, recovery_file_index) =
+        direct_job_with_undownloaded_recovery(
+            &temp_dir,
+            job_id,
+            &volumes,
+            &index_bytes,
+            RECOVERY_VOLUME_NAME,
+            &recovery_bytes,
+        )
+        .await;
+
+    let par2_set =
+        par2_rs::Par2FileSet::from_files(&[&index_bytes]).expect("fixture index must parse");
+    let recovery_set_id = par2_set.recovery_set_id;
+    install_test_par2_runtime(&mut pipeline, job_id, par2_set, &[]);
+    let advertised = pipeline.total_recovery_block_capacity(job_id, recovery_set_id);
+    assert!(
+        advertised > 0,
+        "non-vacuity: the volume advertises recovery"
+    );
+    assert_eq!(
+        pipeline.obtainable_recovery_block_capacity(job_id, recovery_set_id),
+        advertised,
+        "an unread volume nothing has answered for is still obtainable"
+    );
+
+    let recovery_segments: Vec<SegmentId> = pipeline
+        .jobs
+        .get(&job_id)
+        .expect("job is active")
+        .spec
+        .files[recovery_file_index as usize]
+        .segments
+        .iter()
+        .map(|segment| SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: recovery_file_index,
+            },
+            segment_number: segment.ordinal,
+        })
+        .collect();
+    assert!(
+        !recovery_segments.is_empty(),
+        "the volume has articles to retire"
+    );
+    for segment_id in recovery_segments {
+        pipeline.book_failed_segment(segment_id);
+    }
+
+    assert_eq!(
+        pipeline.total_recovery_block_capacity(job_id, recovery_set_id),
+        advertised,
+        "the advertised count is a filename fact and does not move"
+    );
+    assert_eq!(
+        pipeline.obtainable_recovery_block_capacity(job_id, recovery_set_id),
+        0,
+        "but nothing of it can be had once every article is retired"
+    );
+}
+
+#[tokio::test]
 async fn a_direct_set_still_receiving_articles_neither_repairs_nor_waits_nor_demotes() {
     // The settle guard, unchanged and now load-bearing twice over. A set with
     // articles outstanding has holes where its missing ranges will go, and PAR2

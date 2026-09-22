@@ -731,9 +731,9 @@ impl Pipeline {
                 self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
             // Two renderings of the same facts: the announced line carries the
             // counted form, and the diagnostic level keeps the per-volume
-            // indexes. The counted form is also what the fingerprint below is
-            // taken over, so a set whose suspect *list* is unchanged cannot
-            // re-announce the checkpoint through a rendering difference alone.
+            // indexes. The fingerprint below is taken over the full form, so a
+            // suspect volume changing identity behind an unchanged count still
+            // announces, while a repeat of the same list does not.
             let mut rar_set_state = self
                 .rar_sets
                 .iter()

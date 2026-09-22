@@ -877,11 +877,13 @@ impl Pipeline {
 
     /// How many of a job's files lead with their first article.
     ///
-    ///
-    /// The wave exists to sample the post, not to reshape the job: a bounded
-    /// number of leading files answers "is this post still on the server" just
-    /// as well as every file would, and leaves the rest of the queue in the
-    /// order the rest of the pipeline was built around.
+    /// The wave exists to sample the post, not to reshape the job. A bounded
+    /// number of leading files answers "is this post still on the server" as
+    /// well as every file would, and every extra file in the wave costs the
+    /// direct store: the head of a later volume arrives long before the
+    /// sequential frontier reaches it, so it sits in a hold for the whole
+    /// stretch of volumes ahead of it. Thirty-two holds is a sample; a hold
+    /// per volume of a large set is a second copy of the download.
     const FIRST_ARTICLE_SAMPLE_FILES: usize = 32;
 
     pub(crate) fn build_job_assembly(
