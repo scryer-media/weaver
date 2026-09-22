@@ -111,14 +111,14 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(efficient.sevenz_decode_memory_bytes, 512 * MIB);
     assert_eq!(efficient.extraction_memory_bytes, 8 * GIB);
     assert_eq!(efficient.decode_threads, 2);
-    assert_eq!(efficient.extract_threads, 1);
+    assert_eq!(efficient.extract_threads, 4);
     assert_eq!(efficient.max_concurrent_downloads_cap, Some(10));
 
     let balanced = HardwareProfile::Balanced.tuning(&large);
     assert_eq!(balanced.sevenz_decode_memory_bytes, GIB);
     assert_eq!(balanced.extraction_memory_bytes, 16 * GIB);
     assert_eq!(balanced.decode_threads, 4);
-    assert_eq!(balanced.extract_threads, 4);
+    assert_eq!(balanced.extract_threads, 8);
     assert_eq!(balanced.max_concurrent_downloads_cap, None);
 
     let performance = HardwareProfile::Performance.tuning(&large);
@@ -127,6 +127,27 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.decode_threads, 16);
     assert_eq!(performance.extract_threads, 8);
     assert_eq!(performance.max_concurrent_downloads_cap, None);
+}
+
+#[test]
+fn the_smallest_profile_still_extracts_with_every_core_it_can_spare() {
+    // The allowance is what holds memory down, so the smallest profile buys
+    // back the wall time threads are free to give it.
+    let board = machine(4, 8);
+    assert_eq!(HardwareProfile::Efficient.tuning(&board).extract_threads, 2);
+
+    let cramped = machine(8, 2);
+    assert_eq!(
+        HardwareProfile::Efficient.tuning(&cramped).extract_threads,
+        4
+    );
+    assert_eq!(
+        HardwareProfile::Efficient
+            .tuning(&cramped)
+            .sevenz_decode_memory_bytes,
+        512 * MIB,
+        "more threads never widen the allowance that bounds them"
+    );
 }
 
 #[test]

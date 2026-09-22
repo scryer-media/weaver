@@ -566,7 +566,7 @@ async fn the_machine_is_offered_only_the_profiles_it_can_honour() {
                 "profile": "EFFICIENT",
                 "sevenzDecodeMemoryBytes": 512 * 1024 * 1024,
                 "decodeThreads": 2,
-                "extractThreads": 1,
+                "extractThreads": 2,
                 "maxConcurrentDownloads": 10,
             },
             {

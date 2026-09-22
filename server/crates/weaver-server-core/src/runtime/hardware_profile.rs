@@ -177,6 +177,22 @@ impl HardwareProfile {
     }
 
     /// Every derived limit, resolved against this machine.
+    ///
+    /// The two extraction knobs are independent, which is why the smallest
+    /// profile is not the single-threaded one. Memory is bounded by
+    /// `sevenz_decode_memory_bytes` alone: the decoder sizes its window from
+    /// that allowance and then runs as many workers as it is given inside it,
+    /// so at the efficient profile's allowance extra threads cost nothing in
+    /// memory and buy most of the wall time back — decoding a large archive
+    /// with one thread takes roughly twice as long as with two, and a single
+    /// thread is the slowest arrangement at every allowance. Threads are
+    /// therefore scaled with the machine's cores at every profile, and only
+    /// the allowance separates them.
+    ///
+    /// An incompressible stream — a video payload, the common case — needs no
+    /// help here: the decoder narrows itself to a couple of workers on that
+    /// shape whatever it is offered, so the wider counts below are spent only
+    /// on the archives that can use them.
     pub fn tuning(self, probe: &SystemProfile) -> ProfileTuning {
         let row = self.row();
         let memory = Self::effective_memory_bytes(probe);
@@ -190,9 +206,8 @@ impl HardwareProfile {
                 Self::Performance => cores.min(16),
             },
             extract_threads: match self {
-                Self::Efficient => 1,
-                Self::Balanced => (cores / 2).clamp(1, 4),
-                Self::Performance => (cores / 2).clamp(1, 8),
+                Self::Efficient => (cores / 2).clamp(1, 4),
+                Self::Balanced | Self::Performance => (cores / 2).clamp(1, 8),
             },
             max_concurrent_downloads_cap: row.max_concurrent_downloads_cap,
         }

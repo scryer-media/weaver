@@ -77,7 +77,7 @@ fn the_efficient_profile_caps_downloads_without_reducing_a_smaller_pool() {
     let p = tuner.params();
     assert_eq!(p.max_concurrent_downloads, 10);
     assert_eq!(p.decode_thread_count, 2);
-    assert_eq!(p.extract_thread_count, 1);
+    assert_eq!(p.extract_thread_count, 4);
 
     // A connection pool smaller than the cap is still the binding limit.
     tuner.set_connection_limit(4);
