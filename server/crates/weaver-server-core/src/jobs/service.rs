@@ -875,6 +875,15 @@ impl Pipeline {
         Ok(())
     }
 
+    /// How many of a job's files lead with their first article.
+    ///
+    ///
+    /// The wave exists to sample the post, not to reshape the job: a bounded
+    /// number of leading files answers "is this post still on the server" just
+    /// as well as every file would, and leaves the rest of the queue in the
+    /// order the rest of the pipeline was built around.
+    const FIRST_ARTICLE_SAMPLE_FILES: usize = 32;
+
     pub(crate) fn build_job_assembly(
         job_id: JobId,
         spec: &JobSpec,
@@ -921,12 +930,6 @@ impl Pipeline {
                 }
             }
 
-            let target_queue = if is_recovery {
-                &mut recovery_queue
-            } else {
-                &mut download_queue
-            };
-
             // An unclassifiable file's head segment jumps the data queue: the
             // offset-zero article carries the archive signature and the whole
             // identity-fingerprint window, so on an obfuscated post the head
@@ -972,6 +975,20 @@ impl Pipeline {
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).max())
             .flatten();
 
+            // Every file's lowest ordinal is its first article, and first
+            // articles lead the payload: one article per file is the cheapest
+            // sample of whether the post is still on the server at all, and
+            // sampling every file beats reading one file's worth of articles
+            // before anything else is asked for.
+            //
+            // Recovery volumes stay out of the sample. Their articles are
+            // parked until something promotes them, so they cannot answer in
+            // the first round trips, and a sample that waits on an article
+            // nothing has asked for is a sample that never completes.
+            let first_segment = (!is_recovery && file_index < Self::FIRST_ARTICLE_SAMPLE_FILES)
+                .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
+                .flatten();
+
             // One shared group list per file; every segment's work item holds
             // a reference to it rather than its own copy.
             let groups: std::sync::Arc<[String]> =
@@ -981,15 +998,24 @@ impl Pipeline {
                     file_id,
                     segment_number: seg.ordinal,
                 };
+                let is_first_article = first_segment == Some(seg.ordinal);
                 let priority =
                     if head_segment == Some(seg.ordinal) || tail_segment == Some(seg.ordinal) {
                         2
                     } else {
                         priority
                     };
+                if is_first_article {
+                    download_queue.note_first_article(segment_id);
+                }
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
                 } else {
+                    let target_queue = if is_recovery {
+                        &mut recovery_queue
+                    } else {
+                        &mut download_queue
+                    };
                     target_queue.push(DownloadWork {
                         segment_id,
                         message_id: MessageId::new(&seg.message_id),

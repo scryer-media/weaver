@@ -175,6 +175,10 @@ impl Pipeline {
                 self.give_up_unanchored(dependent);
             }
         }
+        // The first-article sample is read before the health arithmetic: when
+        // it can answer, it answers about the whole post rather than about a
+        // byte count, and it needs no probe of its own to do it.
+        self.note_first_article_settled(seg_id);
         self.check_health(job_id);
         true
     }

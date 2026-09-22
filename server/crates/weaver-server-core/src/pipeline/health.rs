@@ -866,6 +866,80 @@ impl Pipeline {
         );
     }
 
+    /// The smallest number of files a first-article verdict is worth taking.
+    ///
+    /// One article per file is a sample, and a sample of a handful of files
+    /// says very little: a two-file post whose first file is missing is an
+    /// ordinary damaged post, not a dead one.
+    const FIRST_ARTICLE_GATE_MIN_FILES: usize = 10;
+
+    /// How much of the sample has to be missing before the post is called dead,
+    /// in hundredths. Short of this the ordinary health path rules, because a
+    /// post with real recovery data behind it can survive a great deal.
+    const FIRST_ARTICLE_GATE_MISSING_PCT: usize = 80;
+
+    /// One article of a file has reached its verdict — delivered, or answered
+    /// for by every server. When it is that file's first article, and it was
+    /// the last one outstanding, the sample is complete and can be read.
+    pub(in crate::pipeline) fn note_first_article_settled(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        if !self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.download_queue.is_first_article(segment_id))
+        {
+            return;
+        }
+        self.evaluate_first_article_gate(job_id);
+    }
+
+    /// Reads the first-article sample once it is complete.
+    ///
+    /// A post whose every file answers "no such article" on the very first
+    /// article of each of them is not a post that is going to complete, and
+    /// nothing later in the pipeline can learn that any sooner: the recovery
+    /// arithmetic needs a recovery set that this post cannot supply either.
+    /// Failing here costs one article per file and no lane of its own.
+    fn evaluate_first_article_gate(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let sample: Vec<SegmentId> = state.download_queue.first_articles().collect();
+        let total = sample.len();
+        if total < Self::FIRST_ARTICLE_GATE_MIN_FILES {
+            return;
+        }
+        let mut missing = 0usize;
+        for segment_id in sample {
+            let delivered = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(segment_id.file_id))
+                .is_some_and(|file| file.has_segment(segment_id.segment_number));
+            if delivered {
+                continue;
+            }
+            match self.segment_terminal_states.get(&segment_id) {
+                // The article was put to every server and none of them had it.
+                Some(SegmentTerminalState::Missing) => missing += 1,
+                // Any other verdict is about this article, not about the post.
+                Some(_) => {}
+                // Still outstanding: the sample is not complete yet.
+                None => return,
+            }
+        }
+        if missing * 100 < total * Self::FIRST_ARTICLE_GATE_MISSING_PCT {
+            return;
+        }
+        self.fail_job(
+            job_id,
+            format!(
+                "aborted: {missing} of {total} first articles are missing, \
+                 the post cannot complete"
+            ),
+        );
+    }
+
     /// Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
         tracing::error!(job_id = job_id.0, reason = %error, "job failed");
