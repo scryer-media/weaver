@@ -91,6 +91,24 @@ pub(crate) enum SevenZipRefusal {
     /// while its map is being read has no layout and no overlay, so its
     /// volumes have to be real.
     UnsafeDestination,
+    /// A volume that will never state its length: no article of it is queued,
+    /// in flight or awaiting a retry, and none of the ones that arrived carried
+    /// a yEnc header.
+    ///
+    /// A container's map is read against the concatenation of its volumes, so
+    /// one length nobody will ever state withholds the map from the *whole*
+    /// set — however much of every other volume is already here. Nothing else
+    /// ends that wait: the budget ceilings only fire on a set big enough to
+    /// reach them, and a small set would sit unresolved with no article
+    /// outstanding to change its mind.
+    ///
+    /// The RAR analogue is [`super::DemotionReason::UnparsableVolume`], which
+    /// says the same thing one volume at a time — a header walk shown its
+    /// ceiling and still holding no member is never going to hold one. This is
+    /// that verdict for a format whose layout is one fact about every volume at
+    /// once, and it is reached by the set running out of articles rather than
+    /// by it spending a ceiling.
+    UnreadableVolumeLength,
     /// The volumes' declared lengths and the start header's own coordinates do
     /// not describe one container.
     VolumeSize,
@@ -109,6 +127,7 @@ impl SevenZipRefusal {
             Self::AntiItem => "7z_anti_item",
             Self::Redirection => "7z_redirection",
             Self::UnsafeDestination => "7z_unsafe_destination",
+            Self::UnreadableVolumeLength => "7z_unreadable_volume_length",
             Self::VolumeSize => "7z_volume_size",
             Self::Geometry => "7z_geometry",
         }
@@ -655,6 +674,16 @@ impl ContainerImage {
         self.holed
     }
 
+    /// Puts the image back at its first byte with nothing recorded, so the read
+    /// that follows is judged only on itself. What one pass over a keyed
+    /// container learned about holes says nothing about the next pass, which
+    /// stops in a different place or not at all.
+    pub(super) fn restart(&mut self) -> std::io::Result<()> {
+        self.image.seek(SeekFrom::Start(0))?;
+        self.holed = false;
+        Ok(())
+    }
+
     /// Reads exactly `len` bytes at `offset`, or `None` when any of them is a
     /// hole the volumes have not delivered.
     pub(super) fn read_exact_at(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
@@ -710,16 +739,28 @@ pub(super) enum ParseOutcome {
 /// — and "the reader hit a hole in a container that is entirely present", which
 /// is a container whose own coordinates point outside itself.
 ///
-/// `password` is the set's candidate, offered so that a header-encrypted
-/// container opens instead of being refused unread. A container with no
-/// encrypted header ignores it, exactly as a plaintext set's parse did before
-/// there was one to offer.
+/// `passwords` are the job's archive-password candidates, in the harvest's own
+/// priority order, so that a header-encrypted container opens instead of being
+/// refused unread. The list is the same one the `-hp` gate proves a RAR set's
+/// headers against, and for the same reason: a set whose key is the NZB-meta
+/// password while the spec carries an operator's guess would otherwise refuse
+/// for a password that was sitting right there.
+///
+/// Tried in order, after one attempt with no key at all — the overwhelming
+/// majority of containers have no encrypted header, and for those the first
+/// attempt is the only one. A container with no encrypted header ignores a key
+/// entirely, so the no-key attempt is not a special case so much as the first
+/// candidate.
+///
+/// The list is bounded at four by construction — `Explicit`, `NzbMeta`,
+/// `FilenameConvention`, at most one each, plus the no-key attempt — so the
+/// work this loop can do is bounded however many times the reader is asked.
 pub(super) fn parse_container(
     mut image: ContainerImage,
     total: u64,
     max_end_header_bytes: u64,
     image_complete: bool,
-    password: Option<&str>,
+    passwords: &[&str],
 ) -> ParseOutcome {
     let Some(prefix) = image.read_exact_at(0, SIGNATURE_HEADER_LEN as usize) else {
         return ParseOutcome::Incomplete;
@@ -756,30 +797,50 @@ pub(super) fn parse_container(
         max_end_header_bytes,
         ..Default::default()
     };
-    let key = match password {
-        Some(secret) if !secret.is_empty() => sevenz_turbo::Password::new(secret),
-        _ => sevenz_turbo::Password::empty(),
-    };
-    let archive = match sevenz_turbo::Archive::read_with_limits(&mut image, &key, &limits) {
-        Ok(archive) => archive,
-        // `-mhe`: the end header is itself an encrypted block, so nothing in it
-        // names a member without a key. Reached with no candidate to offer, or
-        // with one the header's own check refuted. Stated as its own refusal
-        // rather than as a parse failure because it is a property of the
-        // archive that no further byte changes, and because it is the one
-        // refusal an operator can act on.
-        Err(sevenz_turbo::Error::PasswordRequired)
-        | Err(sevenz_turbo::Error::MaybeBadPassword(_)) => {
-            return ParseOutcome::Refused(SevenZipRefusal::EncryptedHeader);
+    let mut opened = None;
+    for attempt in std::iter::once(None).chain(passwords.iter().copied().map(Some)) {
+        let key = match attempt {
+            Some(secret) if !secret.is_empty() => sevenz_turbo::Password::new(secret),
+            _ => sevenz_turbo::Password::empty(),
+        };
+        // Each attempt reads the image from the top, and reads its own answer
+        // about whether it stopped at a hole. Carrying either across would have
+        // a later candidate judged on an earlier one's reading.
+        if image.restart().is_err() {
+            return ParseOutcome::Refused(SevenZipRefusal::Geometry);
         }
-        // A compressed end header keeps its packed bytes just before itself, so
-        // a reader that got this far can still be short of them. That is the
-        // one parse failure another article can change, and it is a failure
-        // only because the image stopped at a hole. Every other one is a
-        // verdict now: waiting on it spends the whole holds budget to arrive at
-        // the same answer.
-        Err(_) if !image_complete && image.holed() => return ParseOutcome::Incomplete,
-        Err(_) => return ParseOutcome::Refused(SevenZipRefusal::Geometry),
+        match sevenz_turbo::Archive::read_with_limits(&mut image, &key, &limits) {
+            Ok(archive) => {
+                opened = Some(archive);
+                break;
+            }
+            // `-mhe`: the end header is itself an encrypted block, so nothing in
+            // it names a member without a key. This candidate is refuted; the
+            // next one is tried, and running out of them is the refusal below.
+            Err(sevenz_turbo::Error::PasswordRequired)
+            | Err(sevenz_turbo::Error::MaybeBadPassword(_)) => continue,
+            // A compressed end header keeps its packed bytes just before itself,
+            // so a reader that got this far can still be short of them. That is
+            // the one parse failure another article can change, and it is a
+            // failure only because the image stopped at a hole. Every other one
+            // is a verdict now: waiting on it spends the whole holds budget to
+            // arrive at the same answer.
+            //
+            // Judged on the spot rather than after the loop, because it is a
+            // statement about the *bytes* and not about the key: a truncated
+            // image refutes nothing, and letting the remaining candidates run
+            // against it would report a wrong password for a container nobody
+            // has finished reading.
+            Err(_) if !image_complete && image.holed() => return ParseOutcome::Incomplete,
+            Err(_) => return ParseOutcome::Refused(SevenZipRefusal::Geometry),
+        }
+    }
+    // Every candidate the job has was refuted, which for `-mhe` is the whole
+    // verdict: it is a property of the archive that no further byte changes,
+    // and it is the one refusal an operator can act on. Stated once, for the
+    // list as a whole, exactly as the `-hp` gate states it for a RAR set.
+    let Some(archive) = opened else {
+        return ParseOutcome::Refused(SevenZipRefusal::EncryptedHeader);
     };
     match container_facts(&archive) {
         Ok(facts) => ParseOutcome::Facts(Box::new(facts)),

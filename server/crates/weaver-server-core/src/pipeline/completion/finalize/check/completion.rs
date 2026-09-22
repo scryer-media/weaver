@@ -249,6 +249,15 @@ impl Pipeline {
     /// CRC failures occur, recovery files are promoted for download and repair
     /// runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+        // A container set waiting on a volume length nothing will ever state
+        // holds its volumes off the conventional path forever, and holding them
+        // is exactly what keeps this gate from ruling. Asked here because this
+        // is the one seam every advance of a job reaches, including the ones
+        // that end a download without completing a file. One iteration over the
+        // job's direct sets, and nothing at all for a job with no container
+        // set still routing.
+        self.demote_direct_sets_awaiting_an_unreadable_length(job_id)
+            .await;
         let current_status = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;

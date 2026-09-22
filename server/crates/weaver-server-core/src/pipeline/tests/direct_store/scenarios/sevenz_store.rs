@@ -1327,6 +1327,168 @@ async fn sevenz_store_opens_a_header_encrypted_container_with_the_job_password()
     );
 }
 
+/// Drives a `-mhe` container to a verdict with the job's password picture set
+/// by its spec and its persisted NZB, which is what the harvest reads.
+async fn header_encrypted_verdict(
+    job_id: JobId,
+    archive_password: &str,
+    spec_password: Option<&str>,
+    nzb_zstd: Vec<u8>,
+) -> String {
+    let member = payload(59, 30_000);
+    let archive = build_7z_shaped(
+        &[Entry::file(MEMBER, member)],
+        EncoderMethod::COPY,
+        Some(archive_password),
+        true,
+    );
+    let volumes = split_volumes(&archive, 2);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let mut spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
+    spec.password = spec_password.map(str::to_owned);
+    insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, nzb_zstd).await;
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES_PER_VOLUME,
+        )
+        .await;
+    }
+    settle_direct_post_repair_work(&mut pipeline).await;
+    format!("{:?}", pipeline.direct_store.sets_for(job_id))
+}
+
+/// The key is in the NZB's meta and the spec carries an operator's guess.
+///
+/// The spec's password is only the *first* of the job's candidates. Reading it
+/// alone refuses a container for a password the job was holding all along —
+/// which is the same reason the `-hp` gate is offered the whole harvest rather
+/// than `spec.password`. Reaching the content refusal is the proof the meta
+/// candidate was tried after the guess was refuted.
+#[tokio::test]
+async fn sevenz_store_opens_a_container_keyed_by_the_nzb_meta_password() {
+    let sets = header_encrypted_verdict(
+        JobId(9_612),
+        "horizon",
+        Some("not-the-password"),
+        sample_nzb_zstd_with_password("horizon"),
+    )
+    .await;
+    assert!(
+        sets.contains("EncryptedContent"),
+        "the meta candidate must be tried after the spec's guess\nsets: {sets}"
+    );
+    assert!(
+        !sets.contains("EncryptedHeader"),
+        "a container one of the job's candidates opens must not refuse\nsets: {sets}"
+    );
+}
+
+/// No candidate the job holds opens the header.
+///
+/// `EncryptedHeader` is then the whole verdict, and it is stated once for the
+/// list rather than per candidate — the same shape the `-hp` gate's
+/// `NoVerifiedCandidate` has, and sticky for the same reason: the set demotes,
+/// and the conventional extractor asks the same list again with nothing left
+/// for this router to add.
+#[tokio::test]
+async fn sevenz_store_refuses_a_container_no_candidate_opens() {
+    let sets = header_encrypted_verdict(
+        JobId(9_613),
+        "horizon",
+        Some("not-the-password"),
+        sample_nzb_zstd_with_password("also-wrong"),
+    )
+    .await;
+    assert!(
+        sets.contains("EncryptedHeader"),
+        "every candidate refuted is the refusal\nsets: {sets}"
+    );
+    assert!(
+        !sets.contains("EncryptedContent"),
+        "a header nothing opened states nothing about its content\nsets: {sets}"
+    );
+}
+
+/// A volume whose every article is terminally missing states no length, and a
+/// container's map cannot be read until every volume has stated one.
+///
+/// Nothing else ends that wait. The probe planner skips a volume with nothing
+/// left to ask for, so the gate stays shut with no request outstanding to
+/// reopen it, and the holds ceilings only fire on a set big enough to reach
+/// them — this one is far too small. Before the sweep this was a job parked at
+/// its last article for good.
+#[tokio::test]
+async fn a_sevenz_set_whose_volume_can_never_state_its_length_demotes() {
+    const VOLUMES: usize = 3;
+    /// The volume nothing will deliver. Not the last one: the tail carries the
+    /// end header, and a set that never sees its map for *that* reason would
+    /// pass this test without the length gate existing.
+    const STRANDED: u32 = 1;
+
+    let member = payload(61, 36_000);
+    let archive = build_7z(
+        &[Entry::file(MEMBER, member.clone())],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, VOLUMES);
+    let job_id = JobId(9_614);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    // Every article of the stranded volume leaves the queue and never comes
+    // back — no result, no retry — which is what a terminally unavailable
+    // article looks like from here.
+    for segment_number in 0..ARTICLES_PER_VOLUME as u32 {
+        let segment_id = SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: STRANDED,
+            },
+            segment_number,
+        };
+        take_queued_segment(&mut pipeline, job_id, segment_id);
+    }
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if file_index == STRANDED {
+            continue;
+        }
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES_PER_VOLUME,
+        )
+        .await;
+    }
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        sets.contains("UnreadableVolumeLength"),
+        "a length no article will state must end the set's wait\nsets: {sets}"
+    );
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.is_demoted()),
+        "the set must leave direct mode rather than hold its volumes\nsets: {sets}"
+    );
+}
+
 /// The completion gate's installed-members clause is 7z-only, in both of a RAR
 /// direct set's states.
 ///

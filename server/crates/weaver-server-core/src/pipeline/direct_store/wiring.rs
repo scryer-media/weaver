@@ -50,7 +50,8 @@ use tracing::{debug, info, warn};
 use super::barrier::{BarrierDemand, BarrierDrain, DatabaseCoveragePersist, DestinationSync};
 use super::plan::{DirectSetPlan, IdentityPlanFacts};
 use super::reconstruct::{ReconstructionFailure, VolumeReconstruction};
-use super::router::{DemotionReason, DirectDestination, RoutedSpan};
+use super::router::sevenz::SevenZipRefusal;
+use super::router::{DemotionReason, DirectDestination, HeaderProbe, RoutedSpan};
 use super::set::DirectSet;
 use super::sparse::SparseMarking;
 use super::{DirectStoreGate, DirectStoreSettings};
@@ -2320,6 +2321,103 @@ impl Pipeline {
         }
         for set_index in condemned_header_sets {
             self.condemn_header_set(job_id, set_index).await;
+        }
+    }
+
+    /// Ends the wait of a container set that is waiting for a length no article
+    /// will ever state.
+    ///
+    /// A container's map is read against the concatenation of its volumes, so
+    /// the parse gate opens only once *every* volume has stated its length —
+    /// one article each. A volume whose articles are all terminally unavailable
+    /// states nothing, and the set has no other way to learn what it withholds:
+    /// the probe planner skips a volume with nothing left to ask for, so the
+    /// gate stays shut with no request outstanding to reopen it. On a set large
+    /// enough to reach them the holds ceilings would eventually end it; on a
+    /// small one nothing would, and the job would sit at its last article
+    /// forever.
+    ///
+    /// The verdict is the demotion the set would have reached the slow way. Its
+    /// volumes materialize and the conventional path takes them, which is also
+    /// where the missing articles become a repair the recovery set can answer.
+    ///
+    /// Judged against the same evidence the probe planner admits on, and one
+    /// conservative addition: a released lane result is attributable only to
+    /// the job, so while any is outstanding no volume is called unreachable —
+    /// the article it answers may be the one that would have stated the length.
+    pub(crate) async fn demote_direct_sets_awaiting_an_unreadable_length(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if self
+            .pending_released_download_result_bytes_by_job
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+            != 0
+        {
+            return;
+        }
+        let stranded: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                set.plan().format == super::plan::SetFormat::SevenZip
+                    && !set.is_demoted()
+                    && !set.is_finalized()
+            })
+            .filter(|(_, set)| {
+                let HeaderProbe::Container { fronts, .. } = set.header_probe() else {
+                    return false;
+                };
+                fronts.iter().any(|volume| {
+                    let Some(file_index) = set.plan().volumes.get(volume).copied() else {
+                        return false;
+                    };
+                    let file_id = NzbFileId { job_id, file_index };
+                    let queued = state.download_queue.queued_count_for_file(file_id) != 0;
+                    let retrying = self
+                        .pending_retries_by_segment
+                        .iter()
+                        .any(|(id, count)| id.file_id == file_id && *count != 0);
+                    let downloading = self
+                        .active_downloads_by_file
+                        .get(&file_id)
+                        .is_some_and(|count| *count != 0);
+                    let decoding = self
+                        .active_decodes_by_file
+                        .get(&file_id)
+                        .is_some_and(|count| *count != 0);
+                    let reserved = self
+                        .rate_limit_reservations
+                        .keys()
+                        .any(|segment| segment.file_id == file_id);
+                    let awaiting_decode = self
+                        .active_decode_bytes
+                        .keys()
+                        .any(|segment| segment.file_id == file_id)
+                        || self
+                            .pending_decode
+                            .iter()
+                            .any(|work| work.segment_id.file_id == file_id);
+                    !(queued || retrying || downloading || decoding || reserved || awaiting_decode)
+                })
+            })
+            .map(|(set_index, _)| set_index)
+            .collect();
+        for set_index in stranded {
+            warn!(
+                job_id = job_id.0,
+                set_index, "a container volume will never state its length"
+            );
+            self.demote_direct_set(
+                job_id,
+                set_index,
+                DemotionReason::SevenZip(SevenZipRefusal::UnreadableVolumeLength),
+            )
+            .await;
         }
     }
 

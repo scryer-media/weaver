@@ -2417,16 +2417,26 @@ impl DirectSetRouter {
         {
             self.parse_walks = self.parse_walks.saturating_add(1);
         }
-        // The set's own candidate, which is what opens a `-mhe` container's end
-        // header. `None` on a plaintext set, and unused by a reader that finds
-        // no encrypted header to apply it to.
-        let password = self.crypt.password().map(str::to_string);
+        // The job's whole archive-password harvest, in its own priority order —
+        // what opens a `-mhe` container's end header, and the same list the
+        // `-hp` gate proves a RAR set's headers against.
+        //
+        // The spec's password is the harvest's `Explicit` entry, so it is
+        // already here; it is appended only for the job whose harvest could not
+        // be read at all, where it is the one candidate in hand and was what
+        // this parse used before the rest of the list reached it.
+        let mut passwords = self.header_crypt.candidates();
+        if let Some(spec) = self.crypt.password()
+            && !passwords.contains(&spec)
+        {
+            passwords.push(spec);
+        }
         match sevenz::parse_container(
             image,
             total,
             MAX_HEADER_PREFIX_BYTES,
             image_complete,
-            password.as_deref(),
+            &passwords,
         ) {
             sevenz::ParseOutcome::Incomplete => {
                 // Still waiting. The holds budget and the scratch ceiling bound
