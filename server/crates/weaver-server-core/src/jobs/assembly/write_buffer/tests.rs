@@ -467,3 +467,124 @@ fn replayed_stream_releases_every_charged_byte() {
     );
     assert_eq!(ledger.outstanding_segments, 0);
 }
+
+#[test]
+fn resumed_cursor_drains_the_part_that_follows_the_prefix() {
+    let mut buf = WriteReorderBuffer::<Vec<u8>>::new(4);
+    let mut ledger = BacklogLedger::default();
+
+    // The parts below 900 are already on disk and are never fetched again, so
+    // the first arrival is the one that starts where they stop.
+    buf.resume_at(900);
+
+    let ready = insert_and_drain(&mut buf, &mut ledger, 900, vec![1u8; 100]);
+    assert_eq!(offsets(&ready), vec![900]);
+    let (ready, contiguous_end) = {
+        ledger.note(100);
+        buf.insert(1000, vec![2u8; 100]);
+        buf.drain_ready_with_contiguous_end()
+    };
+    ledger.release(&ready);
+    assert_eq!(offsets(&ready), vec![1000]);
+    assert_eq!(
+        contiguous_end, 1100,
+        "the contiguous end must be measured from the resumed prefix, not from zero"
+    );
+    ledger.assert_balanced(&buf);
+}
+
+#[test]
+fn resumed_cursor_absorbs_out_of_order_arrivals_ahead_of_the_prefix() {
+    let mut buf = WriteReorderBuffer::<Vec<u8>>::new(4);
+    let mut ledger = BacklogLedger::default();
+
+    // The part after the prefix is not always the first to decode.
+    let ready = insert_and_drain(&mut buf, &mut ledger, 1000, vec![2u8; 100]);
+    assert!(
+        ready.is_empty(),
+        "nothing is sequenced before the cursor is"
+    );
+
+    buf.resume_at(900);
+    ledger.note(100);
+    buf.insert(900, vec![1u8; 100]);
+    let (ready, contiguous_end) = buf.drain_ready_with_contiguous_end();
+    ledger.release(&ready);
+    assert_eq!(offsets(&ready), vec![900, 1000]);
+    assert_eq!(contiguous_end, 1100);
+    ledger.assert_balanced(&buf);
+}
+
+#[test]
+fn a_part_below_the_resumed_cursor_is_a_duplicate_arrival() {
+    let mut buf = WriteReorderBuffer::<Vec<u8>>::new(4);
+    let mut ledger = BacklogLedger::default();
+    buf.resume_at(900);
+
+    // Its range is already on disk: it is handed straight back, and it never
+    // takes a place in the ordered map where it would stall every later drain.
+    let ready = insert_and_drain(&mut buf, &mut ledger, 400, vec![9u8; 100]);
+    assert_eq!(offsets(&ready), vec![400]);
+
+    let ready = insert_and_drain(&mut buf, &mut ledger, 900, vec![1u8; 100]);
+    assert_eq!(offsets(&ready), vec![900]);
+    ledger.assert_balanced(&buf);
+}
+
+#[test]
+fn resumed_cursor_hands_back_parts_queued_below_it() {
+    let mut buf = WriteReorderBuffer::<Vec<u8>>::new(4);
+    let mut ledger = BacklogLedger::default();
+
+    // Queued while the cursor still stood at zero, then overtaken by the
+    // resumed prefix: the bytes were charged to the backlog and must come back.
+    ledger.note(100);
+    buf.insert(400, vec![9u8; 100]);
+    buf.resume_at(900);
+
+    let ready = insert_and_drain(&mut buf, &mut ledger, 900, vec![1u8; 100]);
+    assert_eq!(offsets(&ready), vec![400, 900]);
+    ledger.assert_balanced(&buf);
+    assert_eq!(ledger.outstanding_bytes, 0);
+}
+
+#[test]
+fn a_persisted_marker_below_the_resumed_cursor_is_ignored() {
+    let mut buf = WriteReorderBuffer::<Vec<u8>>::new(4);
+    let mut ledger = BacklogLedger::default();
+    buf.resume_at(900);
+    buf.mark_persisted(400, 100);
+
+    let ready = insert_and_drain(&mut buf, &mut ledger, 900, vec![1u8; 100]);
+    assert_eq!(offsets(&ready), vec![900]);
+    assert_eq!(
+        buf.drain_ready_with_contiguous_end().1,
+        1000,
+        "a marker the cursor already spans must not re-enter the ordered map"
+    );
+}
+
+#[test]
+fn resuming_is_forward_only_and_idempotent() {
+    let mut buf = WriteReorderBuffer::<Vec<u8>>::new(4);
+    let mut ledger = BacklogLedger::default();
+    buf.resume_at(900);
+    let ready = insert_and_drain(&mut buf, &mut ledger, 900, vec![1u8; 100]);
+    assert_eq!(offsets(&ready), vec![900]);
+
+    // A second copy of the same article re-declares the same prefix. The
+    // cursor has already moved past it and must not be dragged back.
+    buf.resume_at(900);
+    let (ready, contiguous_end) = buf.drain_ready_with_contiguous_end();
+    assert!(ready.is_empty());
+    assert_eq!(contiguous_end, 1000);
+}
+
+#[test]
+fn a_fresh_file_still_starts_at_zero() {
+    let mut buf = WriteReorderBuffer::<Vec<u8>>::new(4);
+    let mut ledger = BacklogLedger::default();
+    let ready = insert_and_drain(&mut buf, &mut ledger, 0, vec![1u8; 100]);
+    assert_eq!(offsets(&ready), vec![0]);
+    assert_eq!(buf.drain_ready_with_contiguous_end().1, 100);
+}

@@ -101,6 +101,12 @@ pub struct FileAssembly {
     declared_damage_ends: BTreeMap<u32, u64>,
     /// Existing durable prefix evidence, clipped whenever resumed bytes are rewritten.
     restored_prefix_end: u64,
+    /// How many leading ordinals the resumed prefix already covers, so the
+    /// first ordinal that still has to be fetched can be named. Unlike
+    /// [`restored_prefix_end`](Self::restored_prefix_end) this is an ordinal
+    /// count and never moves, which is what a byte offset derived from
+    /// DECLARED sizes cannot be trusted to be.
+    restored_segments: u32,
     final_part_verified: bool,
     geometry_requires_verification: bool,
     // Outputs without NZB articles have independent availability and contribute
@@ -154,6 +160,7 @@ impl FileAssembly {
             truncation_only_damage: BTreeSet::new(),
             declared_damage_ends: BTreeMap::new(),
             restored_prefix_end: 0,
+            restored_segments: 0,
             final_part_verified: false,
             geometry_requires_verification: false,
             repair_output_ready: None,
@@ -333,6 +340,21 @@ impl FileAssembly {
 
     pub(crate) fn note_restored_prefix(&mut self, end: u64) {
         self.restored_prefix_end = end;
+        self.restored_segments = self.received.count_ones() as u32;
+    }
+
+    /// The first ordinal a resumed file still has to fetch, if it resumed at
+    /// all and is not already whole.
+    ///
+    /// A restart commits the resumed prefix as a run of leading ordinals and
+    /// queues nothing below it, so that run's length names the part whose
+    /// decoded offset is where the bytes on disk stop. Nothing else can: the
+    /// prefix is measured in an NZB's DECLARED segment sizes, which are
+    /// ENCODED and therefore always a little larger than the decoded bytes the
+    /// file actually holds.
+    pub(crate) fn resume_anchor_ordinal(&self) -> Option<u32> {
+        (self.restored_segments > 0 && self.restored_segments < self.total_segments)
+            .then_some(self.restored_segments)
     }
 
     pub(crate) fn note_part_verification(&mut self, ordinal: u32, verified: bool) {
@@ -427,6 +449,7 @@ impl FileAssembly {
         self.truncation_only_damage.clear();
         self.declared_damage_ends.clear();
         self.restored_prefix_end = 0;
+        self.restored_segments = 0;
         self.final_part_verified = false;
         self.geometry_requires_verification = false;
     }

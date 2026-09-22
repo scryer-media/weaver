@@ -1141,6 +1141,12 @@ impl Pipeline {
                     // passing through the conventional writer. Seed its sparse
                     // markers so a later missing article bridges the cursor;
                     // only the contiguous floor is persisted across restart.
+                    // No resumed-prefix positioning here, and none is owed: the
+                    // rebuild above resets the assembly, which drops any
+                    // resumed prefix, and a routed volume never had one — its
+                    // coverage lives in the direct checkpoint, not in a
+                    // contiguous file floor. The markers seeded below are this
+                    // buffer's whole account of what is already on disk.
                     let write_buf = self
                         .write_buffers
                         .entry(file_id)

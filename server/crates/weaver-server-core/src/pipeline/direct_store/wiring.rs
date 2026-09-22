@@ -2026,13 +2026,9 @@ impl Pipeline {
                         {
                             file.record_placement(segment_number, offset, decoded_size);
                         }
-                        let max_pending = self.write_buf_max_pending;
-                        let buffer = self
-                            .write_buffers
-                            .entry(file_id)
-                            .or_insert_with(|| WriteReorderBuffer::new(max_pending));
                         let len = segment.len_bytes();
-                        buffer.insert(offset, segment);
+                        self.write_buffer_for_article(file_id, segment_number, offset)
+                            .insert(offset, segment);
                         self.note_write_buffered(len, 1);
                     }
                 }

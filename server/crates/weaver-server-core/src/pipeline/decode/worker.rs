@@ -1921,9 +1921,7 @@ impl Pipeline {
                 if self.demotion_sweep_owns_file(file_id) {
                     // The existing sweep handback drains these bytes only
                     // after reconstruction has stopped owning the file.
-                    self.write_buffers
-                        .entry(file_id)
-                        .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending))
+                    self.write_buffer_for_article(file_id, segment_id.segment_number, file_offset)
                         .insert(file_offset, segment);
                 } else if let Err(error) = self
                     .persist_out_of_order_segments(
@@ -2212,10 +2210,8 @@ impl Pipeline {
             let ready = {
                 let _cpu_scope =
                     crate::runtime::perf_probe::cpu_scope("download.write_buffer.insert_drain");
-                let write_buf = self
-                    .write_buffers
-                    .entry(file_id)
-                    .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending));
+                let write_buf =
+                    self.write_buffer_for_article(file_id, segment_id.segment_number, file_offset);
                 write_buf.insert(file_offset, buffered_segment);
                 if sweep_outstanding {
                     (Vec::new(), 0)
@@ -3467,6 +3463,42 @@ impl Pipeline {
         }
         self.remove_empty_write_buffer(file_id);
         Ok(())
+    }
+
+    /// The file's write reorder buffer, created on demand and positioned for
+    /// the article about to be inserted.
+    ///
+    /// Every insert goes through here for one reason: a file that resumed
+    /// after a restart already holds its leading parts on disk and never
+    /// fetches them again, so a buffer whose cursor started at zero would
+    /// never release anything in order. Its bytes would only ever reach disk
+    /// through backlog eviction, whose out-of-order writes record no contiguous
+    /// coverage — and the contiguous coverage is what the file's durable floor,
+    /// and with it the restart guard's lead, is made of. The offset where the
+    /// resumed prefix ends is knowable only from the part that directly follows
+    /// it, so the buffer adopts that part's offset the first time it decodes.
+    pub(in crate::pipeline) fn write_buffer_for_article(
+        &mut self,
+        file_id: NzbFileId,
+        segment_number: u32,
+        file_offset: u64,
+    ) -> &mut WriteReorderBuffer<BufferedDecodedSegment> {
+        let resume_cursor = self
+            .jobs
+            .get(&file_id.job_id)
+            .and_then(|state| state.assembly.file(file_id))
+            .and_then(crate::jobs::assembly::FileAssembly::resume_anchor_ordinal)
+            .filter(|anchor| *anchor == segment_number)
+            .map(|_| file_offset);
+        let max_pending = self.write_buf_max_pending;
+        let write_buf = self
+            .write_buffers
+            .entry(file_id)
+            .or_insert_with(|| WriteReorderBuffer::new(max_pending));
+        if let Some(cursor) = resume_cursor {
+            write_buf.resume_at(cursor);
+        }
+        write_buf
     }
 
     fn remove_empty_write_buffer(&mut self, file_id: NzbFileId) {

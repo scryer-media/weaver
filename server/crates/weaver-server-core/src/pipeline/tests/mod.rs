@@ -57,6 +57,7 @@ mod par2_multiset_grid;
 mod par3_completion;
 mod par3_recovery;
 mod rar_extraction;
+mod restart_resume_floor;
 mod restore_history;
 mod sequential_unpack;
 mod server_attribution;
