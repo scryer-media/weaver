@@ -649,6 +649,12 @@ func applyTerminalStateCheck(dbPath string, jobID int, slug string, status strin
 				return "HEALTH_PROBE_ASSERTION_ERROR", err.Error()
 			}
 		}
+		if err == nil && scenario.logAssertion() != nil {
+			if err := assertLogScenario(jobID, scenario.logAssertion()); err != nil {
+				log.Printf("  %s: log runtime assertion failed after %s: %v", slug, status, err)
+				return "LOG_ASSERTION_ERROR", err.Error()
+			}
+		}
 	}
 	return status, ""
 }
@@ -716,6 +722,74 @@ func assertHealthProbeScenario(jobID int, assertion *ScenarioHealthProbeAssertio
 		)
 	}
 	return nil
+}
+
+// assertLogScenario reads weaver's log for the job and holds each named
+// message to its contract.
+func assertLogScenario(jobID int, assertion *ScenarioLogAssertion) error {
+	if assertion == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(localWeaverLogPath())
+	if err != nil {
+		return fmt.Errorf("read weaver log: %w", err)
+	}
+	return assertLogLines(string(raw), jobID, assertion)
+}
+
+// assertLogLines is assertLogScenario over log text already in hand.
+func assertLogLines(raw string, jobID int, assertion *ScenarioLogAssertion) error {
+	if assertion == nil {
+		return nil
+	}
+	wantJobID := strconv.Itoa(jobID)
+	for _, line := range assertion.Lines {
+		message := strings.TrimSpace(line.Message)
+		if message == "" {
+			return errors.New("a log line assertion names no message")
+		}
+		wantLevel := strings.ToUpper(strings.TrimSpace(line.Level))
+		count := 0
+		previousPayload := ""
+		for _, rawLine := range strings.Split(raw, "\n") {
+			clean := ansiEscape.ReplaceAllString(rawLine, "")
+			if directLogJobID(clean) != wantJobID || !strings.Contains(clean, message) {
+				continue
+			}
+			level, payload := splitWeaverLogLine(clean)
+			if wantLevel != "" && level != wantLevel {
+				continue
+			}
+			count++
+			if line.ForbidConsecutiveRepeats && count > 1 && payload == previousPayload {
+				return fmt.Errorf(
+					"%q was announced twice running with nothing new to say: %s",
+					message, payload,
+				)
+			}
+			previousPayload = payload
+		}
+		if count < line.MinCount {
+			return fmt.Errorf("%q appeared %d time(s), fewer than the %d required", message, count, line.MinCount)
+		}
+		if line.MaxCount != nil && count > *line.MaxCount {
+			return fmt.Errorf("%q appeared %d time(s), more than the %d allowed", message, count, *line.MaxCount)
+		}
+	}
+	return nil
+}
+
+// splitWeaverLogLine takes an ANSI-stripped weaver log line apart into its
+// level token and its payload: everything after the timestamp, which is what
+// two announcements of the same state have in common.
+func splitWeaverLogLine(clean string) (level string, payload string) {
+	fields := strings.Fields(clean)
+	if len(fields) < 2 {
+		return "", strings.TrimSpace(clean)
+	}
+	level = strings.ToUpper(fields[1])
+	payload = strings.TrimSpace(strings.TrimPrefix(clean, fields[0]))
+	return level, payload
 }
 
 func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertion) error {

@@ -1,0 +1,28 @@
+{
+  "slug": "dead-post-recovery-unobtainable",
+  "title": "Ember.Latitude.S03E05.2026.1080p.WEB-DL.H264-DEADPOST",
+  "description": "The same dead posting with too few files to be judged on its leading articles: four RAR volumes and five PAR2 sidecars, every article deleted from both servers. The health verdict has to decide it. The NZB advertises fifteen recovery blocks, and a deferral on that advertisement alone would hold the job for as long as it takes to prove every article missing; the deferral must instead ask whether any of that recovery can still be obtained — the metadata discovery probes its candidates, they are retired, discovery closes, and the health failure lands on the next check.",
+  "category": "2000",
+  "expected_outcome": "health_failure",
+  "expectedErrorContains": "below critical",
+  "fixtureAssets": [
+    "par2-multivolume/archive.part1.rar",
+    "par2-multivolume/archive.part2.rar",
+    "par2-multivolume/archive.part3.rar",
+    "par2-multivolume/archive.part4.rar",
+    "par2-multivolume/archive.rar.par2",
+    "par2-multivolume/archive.rar.vol00+1.par2",
+    "par2-multivolume/archive.rar.vol01+2.par2",
+    "par2-multivolume/archive.rar.vol03+4.par2",
+    "par2-multivolume/archive.rar.vol07+8.par2"
+  ],
+  "deleteSubjectContains": [
+    ".rar",
+    ".par2"
+  ],
+  "runtimeAssertions": {
+    "healthProbe": {
+      "forbidInconclusive": true
+    }
+  }
+}
