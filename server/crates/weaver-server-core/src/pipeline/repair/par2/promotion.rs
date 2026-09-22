@@ -142,6 +142,30 @@ impl Pipeline {
             || write_buffered
     }
 
+    /// Whether a discovery candidate's article could still turn up.
+    ///
+    /// The terminal ledger is the authority, not
+    /// `unavailable_promoted_recovery_segments`. That set records only the
+    /// failures booked while the file was *already* a promoted carrier or a
+    /// queued candidate — the guard on the marking seam says as much — so a
+    /// candidate whose articles were retired during the ordinary pass is
+    /// absent from it entirely. A posting whose every recovery volume is gone
+    /// retires all of them that way, long before discovery picks two of them
+    /// to ask about; discovery then waits on articles that reached a terminal
+    /// state before it ever queued them, `work_is_queued` never clears, and
+    /// the job waits on a bounded discovery that cannot close.
+    pub(in crate::pipeline) fn par2_discovery_article_may_arrive(
+        &self,
+        segment_id: SegmentId,
+        delivered: bool,
+    ) -> bool {
+        !delivered
+            && !self.segment_terminal_states.contains_key(&segment_id)
+            && !self
+                .unavailable_promoted_recovery_segments
+                .contains(&segment_id)
+    }
+
     pub(super) fn file_is_completion_critical(&self, file_id: NzbFileId) -> bool {
         self.par2_runtime(file_id.job_id)
             .and_then(|runtime| runtime.files.get(&file_id.file_index))
@@ -421,19 +445,20 @@ impl Pipeline {
                         .jobs
                         .get(&job_id)
                         .and_then(|state| state.assembly.file(file_id));
-                    let probe_may_arrive =
-                        self.par2_runtime(job_id)
-                            .and_then(|runtime| runtime.files.get(&file_index))
-                            .is_some_and(|file| {
-                                file.discovery_probe_ordinals.iter().any(|ordinal| {
-                                    !self.unavailable_promoted_recovery_segments.contains(
-                                        &SegmentId {
-                                            file_id,
-                                            segment_number: *ordinal,
-                                        },
-                                    ) && !assembly.is_some_and(|file| file.has_segment(*ordinal))
-                                })
-                            });
+                    let probe_may_arrive = self
+                        .par2_runtime(job_id)
+                        .and_then(|runtime| runtime.files.get(&file_index))
+                        .is_some_and(|file| {
+                            file.discovery_probe_ordinals.iter().any(|ordinal| {
+                                self.par2_discovery_article_may_arrive(
+                                    SegmentId {
+                                        file_id,
+                                        segment_number: *ordinal,
+                                    },
+                                    assembly.is_some_and(|file| file.has_segment(*ordinal)),
+                                )
+                            })
+                        });
                     if set_ids.is_empty()
                         && prefix.is_none_or(Vec::is_empty)
                         && !self.promoted_recovery_file_is_complete(job_id, file_index)
@@ -474,12 +499,13 @@ impl Pipeline {
                             .get(file_index as usize)
                             .is_some_and(|file| {
                                 file.segments.iter().any(|segment| {
-                                    !self.unavailable_promoted_recovery_segments.contains(
-                                        &SegmentId {
+                                    self.par2_discovery_article_may_arrive(
+                                        SegmentId {
                                             file_id,
                                             segment_number: segment.ordinal,
                                         },
-                                    ) && !has_segment(segment.ordinal)
+                                        has_segment(segment.ordinal),
+                                    )
                                 })
                             })
                     });
@@ -908,10 +934,7 @@ impl Pipeline {
                 file_id: NzbFileId { job_id, file_index },
                 segment_number: ordinal,
             };
-            if self
-                .unavailable_promoted_recovery_segments
-                .contains(&segment_id)
-            {
+            if !self.par2_discovery_article_may_arrive(segment_id, false) {
                 continue;
             }
             probe = Some(segment_id);

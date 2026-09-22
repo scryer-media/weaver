@@ -273,6 +273,17 @@ impl Pipeline {
                 {
                     return None;
                 }
+                // A job whose own health probe asked every lane for a pickup
+                // and got none stands down for one handout. The probe rides
+                // the download lanes, so a job holding all of them starves the
+                // batch that is trying to decide whether its release exists at
+                // all — and the busier it is, the longer it holds them. No
+                // lane is reserved: the job is simply not offered work while
+                // the batch is waiting, so the next lane to come free takes
+                // the batch.
+                if self.owned_download_lane_pool.probe_is_starved_by(job_id.0) {
+                    return None;
+                }
                 Some((Self::job_dispatch_priority(state), index, *job_id))
             })
             .collect::<Vec<_>>();

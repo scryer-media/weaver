@@ -4561,3 +4561,74 @@ async fn damaged_article_waits_for_reconstruction_before_writing_and_retrying() 
         bytes
     );
 }
+
+/// Once nothing in a job's pipeline can move, a demoted volume that is still
+/// waiting is waiting for nothing.
+///
+/// The gate only ever asked *who owns this article*, never *can that owner
+/// still finish*. An owner that had been dropped — a retry whose carrier is
+/// gone, a handoff whose article never came back — therefore held the whole
+/// recovery set behind it, and the job sat in `Downloading` with every counter
+/// at zero until it was cancelled. With no sweep in flight, nothing queued, no
+/// download, decode, retry or released result outstanding, the missing
+/// articles are holes, and holes are what the recovery pass exists to read.
+#[tokio::test]
+async fn a_demoted_volume_owned_by_nothing_that_can_finish_is_settled_as_damaged() {
+    let member_name = "Copper.Meridian.S02E04.mkv";
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 3);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41041);
+    let (mut pipeline, working_dir, _) =
+        demote_mid_download(&temp_dir, job_id, &volumes, |_, working_dir| {
+            let envelope = working_dir.join("silver.horizon.f0.vol00000.envelope");
+            assert!(envelope.exists(), "the envelope must exist to be deleted");
+            std::fs::remove_file(&envelope).unwrap();
+        })
+        .await;
+    let _ = working_dir;
+
+    let missing = queued_segments(&mut pipeline, job_id);
+    assert!(
+        !missing.is_empty(),
+        "precondition: the refused volume has articles to account for"
+    );
+    let missing_ids = missing
+        .iter()
+        .map(|(file_index, segment_number)| SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: *file_index,
+            },
+            segment_number: *segment_number,
+        })
+        .collect::<Vec<_>>();
+
+    // A retry whose carrier is gone: the per-segment book still names an owner
+    // while the job's own counters say nothing is outstanding.
+    for segment_id in &missing_ids {
+        pipeline.pending_retries_by_segment.insert(*segment_id, 1);
+    }
+    let pending_before = pipeline.direct_store.pending_materialization_files(job_id);
+    assert_eq!(
+        pending_before,
+        volumes.len(),
+        "precondition: every demoted volume is still in the materialization account"
+    );
+
+    let set_id = par2_rs::RecoverySetId::from_bytes([41; 16]);
+    assert!(
+        pipeline.demoted_materializations_ready_for_par2(job_id, set_id),
+        "an owner that cannot finish must not hold the recovery set"
+    );
+    assert_eq!(
+        pipeline.direct_store.pending_materialization_files(job_id),
+        0,
+        "every demoted volume leaves the materialization account"
+    );
+    assert!(
+        pipeline.demoted_materializations_ready_for_par2(job_id, set_id),
+        "and the release is stable: nothing re-enters the account"
+    );
+}

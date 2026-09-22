@@ -74,6 +74,23 @@ impl ProbeTally {
     }
 }
 
+/// What a job could still get hold of to repair itself with.
+#[derive(Debug, Clone, Copy, Default)]
+struct ObtainableRecovery {
+    /// Whether any recovery is reachable at all.
+    obtainable: bool,
+    /// The most damage the reachable recovery could cover, when that is
+    /// knowable, and `None` while it is not.
+    ///
+    /// It is knowable once a set has been parsed: its blocks and its slice size
+    /// are facts. Before that there is only a filename's claim, and the
+    /// critical-health line is already derived from exactly that claim — capping
+    /// on it a second time would refuse every deferral this gate exists to make,
+    /// because a job is below critical only once its damage has already passed
+    /// what its filenames advertise.
+    ceiling: Option<u64>,
+}
+
 impl Pipeline {
     fn health_tracked_bytes(total_bytes: u64, par2_bytes: u64) -> u64 {
         total_bytes.saturating_sub(par2_bytes)
@@ -171,6 +188,77 @@ impl Pipeline {
             .div_ceil(slice_size)
             .saturating_add(damaged_files);
         Some(blocks.min(u64::from(u32::MAX)) as u32)
+    }
+
+    /// Whether this job's declared recovery is still *obtainable*, and how many
+    /// bytes of it there could be.
+    ///
+    /// Two sources, both of them things the pipeline has observed rather than
+    /// read off a filename:
+    ///
+    /// * a served recovery set — blocks its volumes can supply, at the set's
+    ///   own slice size;
+    /// * discovery candidates that are still live: no verdict yet, and at least
+    ///   one article that could still arrive. Nothing is known about their
+    ///   contents, so they contribute their declared article bytes.
+    ///
+    /// Neither is the NZB's static PAR2 byte count, which is what a posting
+    /// whose every recovery volume is already dead still reports in full.
+    fn obtainable_recovery(&self, job_id: JobId) -> ObtainableRecovery {
+        let served = self.par2_served_set_id(job_id).map(|set_id| {
+            let slice_size = self
+                .par2_set_for(job_id, set_id)
+                .map_or(0, |set| set.slice_size);
+            u64::from(self.total_recovery_block_capacity(job_id, set_id)).saturating_mul(slice_size)
+        });
+        let candidates = self.par2_metadata_candidate_indices(job_id);
+        if served.is_none() && candidates.is_empty() {
+            // Nothing served and no recovery file to ask about: this says
+            // nothing either way, so the declared count stands as it did.
+            return ObtainableRecovery {
+                obtainable: true,
+                ceiling: None,
+            };
+        }
+        let live_candidates = candidates
+            .into_iter()
+            .filter(|(file_index, _, _)| self.par2_discovery_candidate_is_live(job_id, *file_index))
+            .map(|(_, _, bytes)| bytes)
+            .fold(0u64, u64::saturating_add);
+        ObtainableRecovery {
+            obtainable: served.is_some_and(|bytes| bytes > 0) || live_candidates > 0,
+            ceiling: served.map(|bytes| bytes.saturating_add(live_candidates)),
+        }
+    }
+
+    /// Whether a discovery candidate could still produce metadata.
+    ///
+    /// A candidate that has reached a verdict has nothing left to give, and one
+    /// whose every article has reached a terminal state can never reach one.
+    fn par2_discovery_candidate_is_live(&self, job_id: JobId, file_index: u32) -> bool {
+        if self
+            .par2_discovery_state_for_candidate(job_id, file_index)
+            .candidate_probe_is_terminal()
+        {
+            return false;
+        }
+        let file_id = NzbFileId { job_id, file_index };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let Some(file) = state.spec.files.get(file_index as usize) else {
+            return false;
+        };
+        let assembly = state.assembly.file(file_id);
+        file.segments.iter().any(|segment| {
+            self.par2_discovery_article_may_arrive(
+                SegmentId {
+                    file_id,
+                    segment_number: segment.ordinal,
+                },
+                assembly.is_some_and(|file| file.has_segment(segment.ordinal)),
+            )
+        })
     }
 
     /// Whether a loaded recovery set already answers the question a probe would
@@ -418,29 +506,70 @@ impl Pipeline {
         }
 
         if health <= critical && par2_bytes > 0 {
-            let entered = self.note_health_deferral(job_id, HealthDeferralKind::Par2Recovery);
-            if entered {
-                info!(
-                    job_id = job_id.0,
-                    health_pct = health as f64 / 10.0,
-                    critical_pct = critical as f64 / 10.0,
-                    failed_bytes,
-                    total_bytes = total,
-                    par2_bytes,
-                    "deferring health failure to PAR2 recovery evaluation"
-                );
-            } else {
-                debug!(
-                    job_id = job_id.0,
-                    health_pct = health as f64 / 10.0,
-                    critical_pct = critical as f64 / 10.0,
-                    failed_bytes,
-                    total_bytes = total,
-                    par2_bytes,
-                    "deferring health failure to PAR2 recovery evaluation"
-                );
+            // `par2_bytes` is the NZB's declared recovery size, fixed at job
+            // creation from the filenames. It says a posting *advertised*
+            // recovery, never that any of it can still be had — and a posting
+            // whose every recovery volume is already dead advertises exactly
+            // what an intact one does. Deferring on the advertisement alone is
+            // what let a release nobody uploaded hold its lanes for as long as
+            // it took to prove each of its articles missing one at a time.
+            //
+            // Two conditions replace it. Recovery has to be *obtainable*: a
+            // served set, or a discovery candidate that could still answer.
+            // And the deferral is capped — past the point where the damage
+            // exceeds every recovery byte this job could ever obtain, waiting
+            // for that recovery cannot change the verdict.
+            let recovery = self.obtainable_recovery(job_id);
+            if recovery.obtainable
+                && recovery
+                    .ceiling
+                    .is_none_or(|ceiling| failed_bytes <= ceiling)
+            {
+                let entered = self.note_health_deferral(job_id, HealthDeferralKind::Par2Recovery);
+                if entered {
+                    info!(
+                        job_id = job_id.0,
+                        health_pct = health as f64 / 10.0,
+                        critical_pct = critical as f64 / 10.0,
+                        failed_bytes,
+                        total_bytes = total,
+                        par2_bytes,
+                        obtainable_recovery_bytes = recovery.ceiling,
+                        "deferring health failure to PAR2 recovery evaluation"
+                    );
+                } else {
+                    debug!(
+                        job_id = job_id.0,
+                        health_pct = health as f64 / 10.0,
+                        critical_pct = critical as f64 / 10.0,
+                        failed_bytes,
+                        total_bytes = total,
+                        par2_bytes,
+                        obtainable_recovery_bytes = recovery.ceiling,
+                        "deferring health failure to PAR2 recovery evaluation"
+                    );
+                }
+                self.schedule_job_completion_check(job_id);
+                return;
             }
-            self.schedule_job_completion_check(job_id);
+            self.clear_health_deferral(job_id);
+            warn!(
+                job_id = job_id.0,
+                health_pct = health as f64 / 10.0,
+                critical_pct = critical as f64 / 10.0,
+                failed_bytes,
+                total_bytes = total,
+                par2_bytes,
+                obtainable_recovery_bytes = recovery.ceiling,
+                obtainable_recovery = recovery.obtainable,
+                "aborting job: health below critical threshold"
+            );
+            let error = format!(
+                "health {:.1}% below critical {:.1}%",
+                health as f64 / 10.0,
+                critical as f64 / 10.0
+            );
+            self.fail_job(job_id, error);
             return;
         }
 
@@ -1026,7 +1155,7 @@ impl Pipeline {
         // that wanted a connection of its own had to take a permit off an idle
         // lane and then pay a full cold dial for it. Asking the lane to run
         // the STAT batch on the socket it is already holding costs neither.
-        let owned_lane_probe = self.owned_download_lane_pool.probe_handle();
+        let owned_lane_probe = self.owned_download_lane_pool.probe_handle(job_id.0);
 
         info!(
             job_id = job_id.0,

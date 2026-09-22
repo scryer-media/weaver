@@ -304,6 +304,7 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
             busy_server: None,
         }],
         queued_runs: VecDeque::new(),
+        probe_starved_jobs: std::collections::HashSet::new(),
     }));
     let client = Arc::clone(&nntp);
     let worker_shared = Arc::clone(&shared);

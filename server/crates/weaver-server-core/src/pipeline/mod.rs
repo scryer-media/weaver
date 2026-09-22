@@ -972,6 +972,15 @@ pub(super) struct Par2FileRuntime {
     /// read back short, and then takes more articles before stranding again has
     /// more on disk than the first read saw.
     pub(super) salvaged_at_received_bytes: Option<u64>,
+    /// A read-back of this volume has already been reported as failed.
+    ///
+    /// A read that cannot be parsed leaves no `salvaged_at_received_bytes`
+    /// mark — deliberately, so the next articles to land bring the volume back
+    /// for another look rather than writing it off. The gate is re-entered on
+    /// a timer, though, so the same unparseable volume is looked at again and
+    /// again with nothing having changed. The attempt still repeats; only its
+    /// report is latched to the first one.
+    pub(super) readback_failure_reported: bool,
     /// How many validated recovery blocks this file contributed to each set it
     /// carries packets for.
     ///

@@ -729,13 +729,25 @@ impl Pipeline {
                 exhausted_rar_activity.unwrap_or((0, false, false));
             let only_archive_residuals =
                 self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id);
+            // Two renderings of the same facts: the announced line carries the
+            // counted form, and the diagnostic level keeps the per-volume
+            // indexes. The counted form is also what the fingerprint below is
+            // taken over, so a set whose suspect *list* is unchanged cannot
+            // re-announce the checkpoint through a rendering difference alone.
             let mut rar_set_state = self
                 .rar_sets
                 .iter()
                 .filter(|((rar_job_id, _), _)| *rar_job_id == job_id)
-                .map(|((_, set_name), set_state)| summarize_rar_set_phase(set_name, set_state))
+                .map(|((_, set_name), set_state)| {
+                    (
+                        summarize_rar_set_phase(set_name, set_state, RarSetPhaseDetail::Counted),
+                        summarize_rar_set_phase(set_name, set_state, RarSetPhaseDetail::Full),
+                    )
+                })
                 .collect::<Vec<_>>();
             rar_set_state.sort();
+            let (rar_set_state, verbose_rar_set_state): (Vec<String>, Vec<String>) =
+                rar_set_state.into_iter().unzip();
             let mut failed_extractions = self
                 .failed_extractions
                 .get(&job_id)
@@ -745,40 +757,80 @@ impl Pipeline {
                 .collect::<Vec<_>>();
             failed_extractions.sort();
 
-            info!(
-                job_id = job_id.0,
-                status = ?current_status,
-                complete_data_files,
-                total_data_files,
-                failed_bytes,
-                par2_loaded,
-                has_crc_failures,
-                rar_waiting_for_missing_volumes,
-                pending_rar_refresh,
-                has_active_rar_workers,
-                inflight_extractions,
-                has_active_extraction_tasks,
-                only_archive_residuals,
-                queued_downloads = promoted_recovery.download_queue_len,
-                download_queue_has_recovery = promoted_recovery.download_queue_has_recovery,
-                queued_promoted_recovery = promoted_recovery.download_queue_promoted_recovery,
-                parked_recovery = promoted_recovery.recovery_queue_len,
-                parked_promoted_recovery = promoted_recovery.parked_promoted_recovery,
-                promoted_par2_files = promoted_recovery.promoted_par2_files,
-                incomplete_promoted_par2_files = promoted_recovery.incomplete_promoted_par2_files,
-                active_promoted_downloads = promoted_recovery.active_promoted_downloads,
-                pending_promoted_retries = promoted_recovery.pending_promoted_retries,
-                pending_promoted_decode = promoted_recovery.pending_promoted_decode,
-                active_promoted_decodes = promoted_recovery.active_promoted_decodes,
-                write_buffered_promoted_recovery =
-                    promoted_recovery.write_buffered_promoted_recovery,
-                unavailable_promoted_recovery_segments =
-                    promoted_recovery.unavailable_promoted_recovery_segments,
-                promoted_recovery_pending = promoted_recovery.has_pending_work(),
-                failed_extractions = ?failed_extractions,
-                rar_set_state = ?rar_set_state,
-                "RAR completion checkpoint"
-            );
+            // The checkpoint is re-entered on every scheduled completion check,
+            // and a job that is waiting re-enters it with the same answer each
+            // time. Announcing it is worth doing when it has something new to
+            // say; repeating it is what drowns every other line in the log.
+            // The fingerprint covers the whole payload of the line bar the
+            // timestamp, so any movement — a volume landing, a worker
+            // starting, a recovery segment going unavailable — announces
+            // again, and standing still does not.
+            let announce = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                format!("{current_status:?}").hash(&mut hasher);
+                complete_data_files.hash(&mut hasher);
+                total_data_files.hash(&mut hasher);
+                failed_bytes.hash(&mut hasher);
+                par2_loaded.hash(&mut hasher);
+                has_crc_failures.hash(&mut hasher);
+                rar_waiting_for_missing_volumes.hash(&mut hasher);
+                pending_rar_refresh.hash(&mut hasher);
+                has_active_rar_workers.hash(&mut hasher);
+                inflight_extractions.hash(&mut hasher);
+                has_active_extraction_tasks.hash(&mut hasher);
+                only_archive_residuals.hash(&mut hasher);
+                promoted_recovery.hash(&mut hasher);
+                failed_extractions.hash(&mut hasher);
+                verbose_rar_set_state.hash(&mut hasher);
+                self.note_rar_completion_checkpoint(job_id, hasher.finish())
+            };
+
+            macro_rules! rar_completion_checkpoint {
+                ($level:ident, $sets:expr) => {
+                    $level!(
+                        job_id = job_id.0,
+                        status = ?current_status,
+                        complete_data_files,
+                        total_data_files,
+                        failed_bytes,
+                        par2_loaded,
+                        has_crc_failures,
+                        rar_waiting_for_missing_volumes,
+                        pending_rar_refresh,
+                        has_active_rar_workers,
+                        inflight_extractions,
+                        has_active_extraction_tasks,
+                        only_archive_residuals,
+                        queued_downloads = promoted_recovery.download_queue_len,
+                        download_queue_has_recovery = promoted_recovery.download_queue_has_recovery,
+                        queued_promoted_recovery = promoted_recovery.download_queue_promoted_recovery,
+                        parked_recovery = promoted_recovery.recovery_queue_len,
+                        parked_promoted_recovery = promoted_recovery.parked_promoted_recovery,
+                        promoted_par2_files = promoted_recovery.promoted_par2_files,
+                        incomplete_promoted_par2_files =
+                            promoted_recovery.incomplete_promoted_par2_files,
+                        active_promoted_downloads = promoted_recovery.active_promoted_downloads,
+                        pending_promoted_retries = promoted_recovery.pending_promoted_retries,
+                        pending_promoted_decode = promoted_recovery.pending_promoted_decode,
+                        active_promoted_decodes = promoted_recovery.active_promoted_decodes,
+                        write_buffered_promoted_recovery =
+                            promoted_recovery.write_buffered_promoted_recovery,
+                        unavailable_promoted_recovery_segments =
+                            promoted_recovery.unavailable_promoted_recovery_segments,
+                        promoted_recovery_pending = promoted_recovery.has_pending_work(),
+                        failed_extractions = ?failed_extractions,
+                        rar_set_state = ?$sets,
+                        "RAR completion checkpoint"
+                    )
+                };
+            }
+
+            if announce {
+                rar_completion_checkpoint!(info, rar_set_state);
+            } else {
+                rar_completion_checkpoint!(debug, verbose_rar_set_state);
+            }
         }
 
         if has_incomplete_data_files
@@ -994,13 +1046,40 @@ impl Pipeline {
             let par2_set_id = self.par2_served_set_id(job_id);
 
             if let Some(set_id) = par2_set_id
-                && !self.demoted_materializations_ready_for_par2(job_id, set_id)
+                && let Some(blocked) = self.demoted_materialization_block_for_par2(job_id, set_id)
             {
-                debug!(
-                    job_id = job_id.0,
-                    recovery_set_id = %set_id,
-                    "deferring PAR2 settlement — a demoted direct set is still materializing"
-                );
+                // Announced, and announced with a name. This gate forces the
+                // job back to `Downloading` and returns, so a job held here
+                // shows as downloading with nothing downloading; without the
+                // file and the reason there is nothing in the log to read the
+                // hold off. Rate-limited on the reason itself, so a job that
+                // really is materializing says it once rather than on every
+                // checkpoint.
+                let announce = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    blocked.hash(&mut hasher);
+                    self.note_demoted_materialization_block(job_id, hasher.finish())
+                };
+                if announce {
+                    warn!(
+                        job_id = job_id.0,
+                        recovery_set_id = %set_id,
+                        set_index = blocked.set_index(),
+                        file_index = blocked.file_index(),
+                        reason = %blocked.reason(),
+                        "deferring PAR2 settlement — a demoted direct set is still materializing"
+                    );
+                } else {
+                    debug!(
+                        job_id = job_id.0,
+                        recovery_set_id = %set_id,
+                        set_index = blocked.set_index(),
+                        file_index = blocked.file_index(),
+                        reason = %blocked.reason(),
+                        "deferring PAR2 settlement — a demoted direct set is still materializing"
+                    );
+                }
                 self.transition_postprocessing_status(
                     job_id,
                     JobStatus::Downloading,
