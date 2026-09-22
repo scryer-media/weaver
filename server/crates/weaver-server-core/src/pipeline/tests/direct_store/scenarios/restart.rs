@@ -1451,6 +1451,110 @@ async fn a_restored_direct_set_beside_a_split_archive_still_runs_the_authoritati
 
 /// The last holds failure mode: the scratch file cannot be opened at all.
 #[tokio::test]
+async fn a_restart_inside_a_handback_window_refuses_the_row_and_keeps_the_rebuilt_volume() {
+    // The per-volume handback writes a rebuilt volume's completed-file row
+    // while the set's coverage row is still standing for its siblings. A crash
+    // in that window must not resume the set as direct over a volume the
+    // conventional path now owns: the row is refused, the rebuilt volume keeps
+    // its bytes, and the rest of the set redownloads.
+    let member_name = "Silver.Horizon.S01E28.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41063);
+    let (mut pipeline, working_dir, _) =
+        demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+            &temp_dir,
+            job_id,
+            &volumes,
+            DemotionReason::HoldsBudgetExceeded,
+            true,
+            |_, _| {},
+        )
+        .await;
+
+    // The sweep's first message: volume 0, whole. Its handback records it
+    // complete; the coverage row stays.
+    let done = pipeline
+        .direct_demotion_done_rx
+        .recv()
+        .await
+        .expect("the demotion completion channel should stay open");
+    assert!(matches!(
+        &done.progress,
+        crate::pipeline::DirectDemotionProgress::Volume(outcome) if outcome.volume_index == 0
+    ));
+    pipeline.handle_direct_demotion_done(done).await;
+    assert!(
+        !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "non-vacuity: the row must still be standing when the crash hits"
+    );
+    let (persisted_progress, persisted_complete) =
+        pipeline.db.load_active_file_runtime(job_id).unwrap();
+    assert!(
+        persisted_complete.contains(&0),
+        "non-vacuity: the rebuilt volume's completed-file row is durable"
+    );
+    let file_progress = persisted_progress;
+    let complete_files = persisted_complete
+        .into_iter()
+        .map(|file_index| NzbFileId { job_id, file_index })
+        .collect();
+    drop(pipeline);
+
+    let (mut restarted, _, _) = new_direct_pipeline(&temp_dir).await;
+    restarted.direct_store.set_gate(DirectStoreGate::Enabled);
+    restarted
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: direct_store_job_spec("Silver Horizon", &volumes),
+            complete_files,
+            file_progress,
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working_dir.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        restarted
+            .db
+            .load_direct_coverage(job_id)
+            .unwrap()
+            .is_empty(),
+        "the row that still claimed a volume with conventional bytes is refused and deleted"
+    );
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(volumes[0].1.as_slice()),
+        "the rebuilt volume keeps its bytes"
+    );
+    assert_eq!(
+        peek_queued_segments(&mut restarted, job_id),
+        vec![(1, 0), (1, 1), (2, 0), (2, 1)],
+        "the rebuilt volume is not fetched again; the siblings the row was still \
+         claiming are"
+    );
+    assert!(
+        !direct_partial(&temp_dir, job_id, member_name).exists(),
+        "the refused set's routed output is swept"
+    );
+}
+
+#[tokio::test]
 async fn a_scratch_io_failure_demotes_the_set() {
     let member_name = "Silver.Horizon.S01E36.mkv";
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 149) as u8).collect();

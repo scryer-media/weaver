@@ -1401,6 +1401,29 @@ async fn demote_mid_download_leaving_the_sweep_outstanding(
     reason: DemotionReason,
     before_demotion: impl FnOnce(&mut Pipeline, &std::path::Path),
 ) -> (Pipeline, std::path::PathBuf, u64) {
+    demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+        temp_dir,
+        job_id,
+        volumes,
+        reason,
+        false,
+        before_demotion,
+    )
+    .await
+}
+
+/// [`demote_mid_download_leaving_the_sweep_outstanding`] with the set's
+/// coverage checkpointed before the demotion when `checkpoint` is set — so the
+/// row the sweep's finish retires, and a crash inside the handback would leave
+/// standing, actually exists.
+async fn demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    reason: DemotionReason,
+    checkpoint: bool,
+    before_demotion: impl FnOnce(&mut Pipeline, &std::path::Path),
+) -> (Pipeline, std::path::PathBuf, u64) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     let spec = direct_store_job_spec("Silver Horizon", volumes);
@@ -1441,6 +1464,15 @@ async fn demote_mid_download_leaving_the_sweep_outstanding(
         "volume 0's bytes were routed before the demotion"
     );
 
+    if checkpoint {
+        pipeline
+            .demand_direct_store_barriers(job_id, BarrierDemand::PhaseChange)
+            .await;
+        assert!(
+            !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+            "non-vacuity: the set must have checkpointed before the demotion"
+        );
+    }
     before_demotion(&mut pipeline, &working_dir);
     pipeline.demote_direct_set(job_id, 0, reason).await;
     (pipeline, working_dir, OTHER_FILE_BYTES)

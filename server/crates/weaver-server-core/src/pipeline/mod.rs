@@ -1247,22 +1247,43 @@ pub(super) struct DirectDemotionWork {
     pub(super) submitted_at: std::time::Instant,
     /// The reconciliation's half of the snapshot — the volume targets, their
     /// article geometry, and the articles the decode seam took ownership of at
-    /// the demotion instant. Owned by the ticket and moved out with it when it
-    /// lands.
+    /// the demotion instant. Owned by the ticket; the per-volume handbacks
+    /// consume it target by target, and the finish takes what is left.
     pub(super) plan: direct_store::wiring::DemotedSweepPlan,
+    /// How many of the plan's targets the sweep has reported and the actor
+    /// has handed back, in target order.
+    pub(super) handed_back: usize,
+    /// File indices of the volumes already handed back to the conventional
+    /// path. A file named here is no longer sweep-owned: its articles are
+    /// dispatched, written and completed like any other file's, even though
+    /// the ticket stays open until the sweep has finished its siblings.
+    pub(super) released: HashSet<u32>,
+    /// The running account of the handback, totalled for the ticket's final
+    /// log line and metrics.
+    pub(super) summary: direct_store::wiring::ReconstructionSummary,
 }
 
+/// One message from a demotion sweep to the actor.
+///
+/// Streamed per volume rather than batched, because the sweep is bounded only
+/// by the archive and every volume it has not finished is held out of
+/// dispatch: a batch would hold the whole set — on a large archive over a slow
+/// working directory, the whole job — for the entire sweep. Each volume's
+/// floor, rows and requeue land as its outcome arrives; the set's coverage row,
+/// which is one row for the set, is retired by the finish.
 pub(super) struct DirectDemotionWorkDone {
     pub(super) job_id: JobId,
     pub(super) work_id: u64,
     pub(super) set_index: usize,
-    /// One outcome per volume, in the order the plan's targets name them.
-    ///
-    /// Carried as one batch rather than streamed per volume: the volumes are
-    /// judged independently inside the sweep, but the durable bookkeeping is
-    /// not independent — the set's coverage row may only be retired once
-    /// *every* volume's floor is committed, and there is one row for the set.
-    pub(super) rebuilt: Vec<direct_store::reconstruct::ReconstructedVolume>,
+    pub(super) progress: DirectDemotionProgress,
+}
+
+pub(super) enum DirectDemotionProgress {
+    /// The next volume, in the order the plan's targets name them.
+    Volume(direct_store::reconstruct::ReconstructedVolume),
+    /// The sweep returned. `panicked` means some targets never got an outcome;
+    /// each of those is handed back as a volume that kept nothing.
+    Finished { panicked: bool },
 }
 
 /// The pre-repair verdict and the repair's own write set, carried across a

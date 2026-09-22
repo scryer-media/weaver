@@ -88,14 +88,23 @@ impl Pipeline {
     /// must not have the file classified, probed or entered into the archive
     /// topology over an image the sweep has not finished; the handback replays
     /// the completion hook for every volume once the ticket lands.
+    ///
+    /// A volume the sweep has finished and the actor has handed back is not
+    /// owned any more, ticket or no ticket: the sweep never returns to a
+    /// volume once its outcome is reported, and the handback has seeded and
+    /// drained everything that was parked for it.
     pub(crate) fn demotion_sweep_owns_file(&self, file_id: NzbFileId) -> bool {
         self.direct_demotion_in_flight
             .get(&file_id.job_id)
             .is_some_and(|sets| {
-                sets.keys().any(|set_index| {
-                    self.direct_store
-                        .set(file_id.job_id, *set_index)
-                        .is_some_and(|set| set.plan().volume_for_file(file_id.file_index).is_some())
+                sets.iter().any(|(set_index, work)| {
+                    !work.released.contains(&file_id.file_index)
+                        && self
+                            .direct_store
+                            .set(file_id.job_id, *set_index)
+                            .is_some_and(|set| {
+                                set.plan().volume_for_file(file_id.file_index).is_some()
+                            })
                 })
             })
     }
@@ -108,7 +117,10 @@ impl Pipeline {
     /// spill it, since a flush would commit over the image the sweep is
     /// still rebuilding. Fetching more of them while the sweep runs only
     /// grows that parked backlog toward the write-pressure latch, which then
-    /// stops every other file too. Dispatch skips them until the handback.
+    /// stops every other file too. Dispatch skips them until *their* handback:
+    /// the sweep reports one volume at a time, and a volume it has finished
+    /// goes back into dispatch while the rest are still being rebuilt, so a
+    /// long sweep over a slow working directory never idles the whole job.
     pub(crate) fn demotion_sweep_held_file_indices(&self, job_id: JobId) -> Option<Vec<u32>> {
         let sets = self.direct_demotion_in_flight.get(&job_id)?;
         let held: Vec<u32> = sets
@@ -118,6 +130,7 @@ impl Pipeline {
                     .volume_files
                     .iter()
                     .map(|file_id| file_id.file_index)
+                    .filter(|file_index| !work.released.contains(file_index))
             })
             .collect();
         (!held.is_empty()).then_some(held)
