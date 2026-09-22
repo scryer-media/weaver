@@ -226,6 +226,10 @@ pub(crate) enum ReconstructionFailure {
     /// because the alternative is a volume that is right everywhere except one
     /// block and a floor published over it.
     EncryptedPostedBytes,
+    /// The sweep returned — panicked, or short of its targets — without ever
+    /// reporting this volume, so nothing it may have written to the file is
+    /// vouched for.
+    SweepUnreported { volume_index: u32 },
 }
 
 impl ReconstructionFailure {
@@ -238,6 +242,7 @@ impl ReconstructionFailure {
             Self::WriteFailed { .. } => "write_failed",
             Self::SparseMarkFailed { .. } => "sparse_mark_failed",
             Self::EncryptedPostedBytes => "encrypted_posted_bytes",
+            Self::SweepUnreported { .. } => "sweep_unreported",
         }
     }
 }
@@ -285,6 +290,10 @@ impl std::fmt::Display for ReconstructionFailure {
                 formatter,
                 "an encrypted member the set routed cannot reproduce its posted bytes"
             ),
+            Self::SweepUnreported { volume_index } => write!(
+                formatter,
+                "the reconstruction sweep returned without reporting volume {volume_index}"
+            ),
         }
     }
 }
@@ -319,25 +328,38 @@ pub(crate) fn reconstruct_volumes(
     volumes: &[VolumeReconstruction],
     sparse: SparseMarking,
 ) -> Vec<ReconstructedVolume> {
-    volumes
-        .iter()
-        .map(
-            |volume| match reconstruct_volume(provider, volume, sparse) {
-                Ok(outcome) => outcome,
-                Err(failure) => {
-                    let _ = std::fs::remove_file(&volume.path);
-                    ReconstructedVolume {
-                        volume_index: volume.volume_index,
-                        contiguous: 0,
-                        verified: ByteRanges::new(),
-                        complete: false,
-                        md5: None,
-                        failure: Some(failure),
-                    }
+    let mut rebuilt = Vec::with_capacity(volumes.len());
+    reconstruct_volumes_each(provider, volumes, sparse, |outcome| rebuilt.push(outcome));
+    rebuilt
+}
+
+/// [`reconstruct_volumes`], handing each outcome over as soon as its volume
+/// is final — written, checked, and never touched by this sweep again — so a
+/// caller can put the volume back into service while its siblings are still
+/// being rebuilt.
+pub(crate) fn reconstruct_volumes_each(
+    provider: &HybridVolumeProvider,
+    volumes: &[VolumeReconstruction],
+    sparse: SparseMarking,
+    mut on_volume: impl FnMut(ReconstructedVolume),
+) {
+    for volume in volumes {
+        let outcome = match reconstruct_volume(provider, volume, sparse) {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                let _ = std::fs::remove_file(&volume.path);
+                ReconstructedVolume {
+                    volume_index: volume.volume_index,
+                    contiguous: 0,
+                    verified: ByteRanges::new(),
+                    complete: false,
+                    md5: None,
+                    failure: Some(failure),
                 }
-            },
-        )
-        .collect()
+            }
+        };
+        on_volume(outcome);
+    }
 }
 
 fn reconstruct_volume(

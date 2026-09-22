@@ -2124,6 +2124,130 @@ async fn a_demotion_returns_before_its_reconstruction_sweep_finishes() {
     );
 }
 
+/// Receives the sweep's next message for `job_id` and hands it to the actor,
+/// returning which volume it reported, or `None` for the finish.
+async fn hand_back_next_swept_volume(pipeline: &mut Pipeline) -> Option<u32> {
+    let done = pipeline
+        .direct_demotion_done_rx
+        .recv()
+        .await
+        .expect("the demotion completion channel should stay open");
+    let reported = match &done.progress {
+        crate::pipeline::DirectDemotionProgress::Volume(outcome) => Some(outcome.volume_index),
+        crate::pipeline::DirectDemotionProgress::Finished { .. } => None,
+    };
+    pipeline.handle_direct_demotion_done(done).await;
+    reported
+}
+
+#[tokio::test]
+async fn a_volume_the_sweep_has_finished_goes_back_into_dispatch_before_its_siblings() {
+    // The sweep is bounded only by the archive, and over a slow working
+    // directory a large set takes minutes. Every volume it has not finished is
+    // held out of dispatch — its articles could only be parked — but a volume
+    // it *has* finished is an ordinary file from that moment, and holding it
+    // until the last sibling lands idles the whole job for the whole sweep.
+    let member_name = "Silver.Horizon.S01E27.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41062);
+    let (mut pipeline, working_dir, _) =
+        demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+            &temp_dir,
+            job_id,
+            &volumes,
+            DemotionReason::HoldsBudgetExceeded,
+            true,
+            |_, _| {},
+        )
+        .await;
+    let file = |file_index: u32| NzbFileId { job_id, file_index };
+
+    assert_eq!(
+        pipeline.demotion_sweep_held_file_indices(job_id),
+        Some(vec![0, 1, 2]),
+        "before the sweep reports anything, every volume of the set is held"
+    );
+    assert!(
+        !pipeline.job_has_dispatchable_work_for_test(job_id),
+        "and the job — whose queue is nothing but those volumes — has nothing to hand out"
+    );
+
+    assert_eq!(hand_back_next_swept_volume(&mut pipeline).await, Some(0));
+    assert_eq!(
+        pipeline.demotion_sweep_held_file_indices(job_id),
+        Some(vec![1, 2]),
+        "the volume the sweep finished is released while its siblings stay held"
+    );
+    assert!(
+        !pipeline.demotion_sweep_owns_file(file(0)),
+        "and it is no longer sweep-owned, so its writes and its completion hook run"
+    );
+    assert!(pipeline.demotion_sweep_owns_file(file(1)));
+    assert_eq!(
+        std::fs::read(working_dir.join(&volumes[0].0))
+            .ok()
+            .as_deref(),
+        Some(volumes[0].1.as_slice()),
+        "the released volume is on disk byte for byte"
+    );
+    assert!(
+        pipeline.jobs[&job_id]
+            .assembly
+            .file(file(0))
+            .unwrap()
+            .is_complete(),
+        "and complete in the assembly"
+    );
+    assert!(
+        direct_partial(&temp_dir, job_id, member_name).exists(),
+        "the routed output the sweep is still reading from is not deleted for one volume"
+    );
+    assert!(
+        !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "nor is the set's coverage row retired: it is one row for the set"
+    );
+    assert!(
+        !pipeline.job_has_dispatchable_work_for_test(job_id),
+        "volume 0 was whole, so releasing it hands out nothing on its own"
+    );
+
+    assert_eq!(hand_back_next_swept_volume(&mut pipeline).await, Some(1));
+    assert_eq!(
+        pipeline.demotion_sweep_held_file_indices(job_id),
+        Some(vec![2])
+    );
+    assert!(
+        pipeline.job_has_dispatchable_work_for_test(job_id),
+        "volume 1 was half covered: its handback requeues the half the sweep could not \
+         vouch for, and that article is dispatchable while volume 2 is still being swept"
+    );
+    assert!(
+        pipeline
+            .direct_demotion_in_flight
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains_key(&0)),
+        "with the ticket still open for the sibling"
+    );
+
+    assert_eq!(hand_back_next_swept_volume(&mut pipeline).await, Some(2));
+    assert_eq!(hand_back_next_swept_volume(&mut pipeline).await, None);
+    assert!(
+        pipeline.direct_demotion_in_flight.is_empty(),
+        "the finish retires the ticket"
+    );
+    assert!(
+        !direct_partial(&temp_dir, job_id, member_name).exists(),
+        "deletes the routed output"
+    );
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "and retires the coverage row"
+    );
+    assert_eq!(pipeline.demotion_sweep_held_file_indices(job_id), None);
+}
+
 #[tokio::test]
 async fn the_archive_hook_leaves_a_volume_alone_while_its_demotion_sweep_is_outstanding() {
     // A demoted set's volumes stop being direct source files at the demotion,

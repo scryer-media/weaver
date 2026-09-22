@@ -60,9 +60,9 @@ use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::pipeline::diagnostics::DirectSetCounts;
 use crate::pipeline::{
-    BufferedDecodedSegment, DirectDemotionWork, DirectDemotionWorkDone, DirectPostRepairCarry,
-    DirectPostRepairWork, DirectPostRepairWorkDone, DirectToleratedWork, DirectToleratedWorkDone,
-    Pipeline,
+    BufferedDecodedSegment, DirectDemotionProgress, DirectDemotionWork, DirectDemotionWorkDone,
+    DirectPostRepairCarry, DirectPostRepairWork, DirectPostRepairWorkDone, DirectToleratedWork,
+    DirectToleratedWorkDone, Pipeline,
 };
 
 /// Read chunk for the restart gate re-arm. Matches the reconstruction sweep's:
@@ -662,7 +662,7 @@ impl DestinationSync for PreSyncedDestinations {
 /// what actually says how much the demotion cost, because a volume count cannot
 /// tell a whole volume off the wire from one missing article.
 #[derive(Debug, Default)]
-struct ReconstructionSummary {
+pub(crate) struct ReconstructionSummary {
     /// Volumes that came out of the sweep with a verified contiguous prefix.
     materialized: usize,
     /// Volumes the sweep could not rebuild in full, and the first reason each

@@ -115,6 +115,12 @@ pub(crate) enum CoverageRejection {
     UnclassifiableVolume {
         volume_index: u32,
     },
+    /// A volume the row still claims already has bytes in a conventional
+    /// file: a demotion's per-volume handback was interrupted before the row
+    /// retired. Two images of one volume are never reconciled.
+    ConventionalBytes {
+        file_index: u32,
+    },
 }
 
 impl std::fmt::Display for CoverageRejection {
@@ -161,6 +167,10 @@ impl std::fmt::Display for CoverageRejection {
             Self::ProbeFailed { error } => write!(
                 formatter,
                 "direct-store destination probe did not complete: {error}"
+            ),
+            Self::ConventionalBytes { file_index } => write!(
+                formatter,
+                "direct-store checkpoint claims NZB file {file_index}, which already has conventional bytes on disk"
             ),
             Self::UnclassifiableVolume { volume_index } => write!(
                 formatter,
@@ -718,7 +728,45 @@ impl Pipeline {
         }
 
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
-        let outcome = restore_job(gate, job_id, &roots, rows, &expected, &mut persist).await;
+        let mut outcome = restore_job(gate, job_id, &roots, rows, &expected, &mut persist).await;
+        // A row is only as trustworthy as the invariant it was written under:
+        // a volume binds while none of its bytes live in a conventional file.
+        // A demotion's handback breaks that on purpose, one volume at a time —
+        // each rebuilt volume gets a conventional floor or a completed-file
+        // row the moment the sweep finishes it, while the set's one coverage
+        // row stands until the sweep finishes them all. A crash inside that
+        // window leaves a row that still claims volumes the conventional path
+        // now owns. Refused whole, never reconciled: the volumes with
+        // conventional bytes keep them, and the rest redownload, which is what
+        // the demotion was about to cost anyway.
+        for plan in &admitted {
+            if !outcome.accepted.contains_key(&plan.set_name) {
+                continue;
+            }
+            let Some(file_index) = plan.files.keys().copied().find(|file_index| {
+                conventional_floors
+                    .get(file_index)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+            }) else {
+                continue;
+            };
+            outcome.accepted.remove(&plan.set_name);
+            restored.remove(&plan.set_name);
+            if let Err(error) = persist.delete(job_id, &plan.set_name) {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    set_name = %plan.set_name,
+                    error = %error,
+                    "failed to delete a direct-store coverage row refused for conventional bytes"
+                );
+            }
+            outcome.rejected.push((
+                plan.set_name.clone(),
+                CoverageRejection::ConventionalBytes { file_index },
+            ));
+        }
         for (set_name, rejection) in &outcome.rejected {
             crate::runtime::perf_probe::record_owned(
                 "direct_store.restart.rejected".to_string(),
