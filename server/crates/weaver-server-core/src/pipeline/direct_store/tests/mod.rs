@@ -1158,6 +1158,152 @@ fn encrypted_crypt_router_partial(
     (router, cipher)
 }
 
+/// The write path's cost account: one pass over the member's cipher stream,
+/// whatever shape the articles arrive in.
+///
+/// The transform is the one thing an encrypted member pays that a plain one
+/// does not, so the way it silently becomes expensive is by running twice over
+/// bytes it has already resolved — a straddling block re-derived by both of
+/// its halves, a held span re-decrypted when it is finally released. Neither
+/// changes a single output byte, which is why this is asked of an accounting
+/// counter and not of the member's contents.
+///
+/// The articles are deliberately not block-aligned, so every boundary in the
+/// run is a straddling cipher block with one half in each article.
+#[test]
+fn the_write_transform_decrypts_each_cipher_byte_once() {
+    const HEADER: u64 = 1024;
+    const ARTICLE: usize = 7_000;
+    let plain: Vec<u8> = (0..300_000u32).map(|index| (index % 251) as u8).collect();
+    let (mut router, cipher) = encrypted_crypt_router_partial(&plain, HEADER, 0);
+
+    let mut routed_plain = 0u64;
+    let mut offset = 0usize;
+    while offset < cipher.len() {
+        let take = ARTICLE.min(cipher.len() - offset);
+        router.stage_for_test(0, HEADER + offset as u64, &cipher[offset..offset + take]);
+        for span in router
+            .drain_for_test(0)
+            .expect("the encrypted drain routes")
+        {
+            if matches!(
+                span.destination,
+                crate::pipeline::direct_store::router::DirectDestination::Member { .. }
+            ) {
+                routed_plain += span.len();
+            }
+        }
+        offset += take;
+    }
+
+    assert_eq!(
+        routed_plain,
+        plain.len() as u64,
+        "every member byte routes exactly once"
+    );
+    assert_eq!(
+        router.decrypted_bytes(),
+        cipher.len() as u64,
+        "the transform ran over the member's cipher stream once and no more"
+    );
+}
+
+/// Stages one encrypted member out of order and reports what the write path
+/// copied out of staging.
+///
+/// `order` names the spans of each window in arrival order, so a window whose
+/// first span arrives last leaves every span behind it waiting on a CBC
+/// predecessor that is not here. The drain runs after every arrival, which is
+/// what the set's own routing does: one gap must not cost a pass over the run
+/// behind it per article landing anywhere in the set.
+fn encrypted_out_of_order_copy_bytes(windows: usize, order: &[usize]) -> (u64, u64, u64) {
+    const HEADER: u64 = 1021;
+    let spans = order.len();
+    let plain: Vec<u8> = (0..299_993u32).map(|index| (index % 251) as u8).collect();
+    let (mut router, cipher) = encrypted_crypt_router_partial(&plain, HEADER, 0);
+    let span_len = cipher.len() / (windows * spans);
+
+    let mut routed_plain = 0u64;
+    for window in 0..windows {
+        let window_start = window * spans * span_len;
+        for position in order {
+            let from = window_start + position * span_len;
+            let to = if window + 1 == windows && position + 1 == spans {
+                cipher.len()
+            } else {
+                from + span_len
+            };
+            router.stage_for_test(0, HEADER + from as u64, &cipher[from..to]);
+            for span in router
+                .drain_for_test(0)
+                .expect("the encrypted drain routes")
+            {
+                if matches!(
+                    span.destination,
+                    crate::pipeline::direct_store::router::DirectDestination::Member { .. }
+                ) {
+                    routed_plain += span.len();
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        routed_plain,
+        plain.len() as u64,
+        "every member byte routes exactly once"
+    );
+    (
+        router.staged_copy_bytes(),
+        cipher.len() as u64,
+        spans as u64 * windows as u64,
+    )
+}
+
+/// The write path resolves a run before it materializes it.
+///
+/// A held run is one whose CBC predecessor has not arrived. Nothing about it
+/// can be routed, so every byte pulled out of staging on its behalf is a copy
+/// made and thrown away — and the drain of a set revisits every staged volume
+/// on every article, so a run that is copied before it is resolved is copied
+/// again on each arrival, for as long as the gap in front of it lasts. That
+/// turns one missing article into a pass over the whole run behind it per
+/// article received.
+///
+/// Counted rather than timed: the routed bytes are identical either way, which
+/// is exactly why only an accounting counter can tell the two apart. The
+/// allowance is a cipher block per edge of each span — the genuinely small
+/// reads that assemble a straddling block — and the articles are deliberately
+/// unaligned, so every boundary in the run is such a block.
+#[test]
+fn a_held_encrypted_run_is_not_copied_out_of_staging() {
+    let (copied, cipher_len, spans) =
+        encrypted_out_of_order_copy_bytes(6, &[1, 2, 3, 4, 5, 6, 7, 0]);
+    let allowance = cipher_len + 64 * spans;
+    assert!(
+        copied <= allowance,
+        "the write path copied {copied} bytes for a {cipher_len}-byte member; one pass plus an \
+         edge block per span is {allowance}"
+    );
+}
+
+/// The same, with the gap held open while a long run piles up behind it.
+///
+/// Twenty-four spans arrive before the one that unblocks them, so a path that
+/// re-copies the pending run on every arrival pays the whole triangle rather
+/// than the member.
+#[test]
+fn a_long_run_behind_one_gap_is_not_recopied_per_arrival() {
+    let order: Vec<usize> = (1..25).chain(std::iter::once(0)).collect();
+    let (copied, cipher_len, spans) = encrypted_out_of_order_copy_bytes(1, &order);
+    let allowance = cipher_len + 64 * spans;
+    assert!(
+        copied <= allowance,
+        "the write path copied {copied} bytes for a {cipher_len}-byte member; one pass plus an \
+         edge block per span is {allowance}"
+    );
+}
+
 mod par2_fileaccess_adapter_over;
 mod par3_source_access;
 mod recording_test_doubles;
