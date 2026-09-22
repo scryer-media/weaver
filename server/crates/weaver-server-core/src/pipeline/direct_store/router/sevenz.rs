@@ -81,6 +81,16 @@ pub(crate) enum SevenZipRefusal {
     /// An entry the header marks as a symlink or other redirection. Its
     /// "content" is a link target, not a file body.
     Redirection,
+    /// An entry name the reader's own path check refuses: absolute, escaping,
+    /// or otherwise not a name that may become a destination.
+    ///
+    /// Distinct from [`super::DemotionReason::UnsafeDestination`], which says the same
+    /// thing about a RAR member and answers [`super::VolumeDemand::Virtual`] for it:
+    /// that set has a layout, so the conventional extractor can read its
+    /// volumes off the overlay and refuse the path itself. A container refused
+    /// while its map is being read has no layout and no overlay, so its
+    /// volumes have to be real.
+    UnsafeDestination,
     /// The volumes' declared lengths and the start header's own coordinates do
     /// not describe one container.
     VolumeSize,
@@ -98,6 +108,7 @@ impl SevenZipRefusal {
             Self::EncryptedHeader => "7z_encrypted_header",
             Self::AntiItem => "7z_anti_item",
             Self::Redirection => "7z_redirection",
+            Self::UnsafeDestination => "7z_unsafe_destination",
             Self::VolumeSize => "7z_volume_size",
             Self::Geometry => "7z_geometry",
         }
@@ -174,6 +185,11 @@ pub(crate) struct SevenZipEntryFacts {
     /// Last-modified time as the header states it (100 ns ticks since 1601), or
     /// `None` when the header states none.
     pub(crate) modified: Option<u64>,
+    /// Last-access time on the same scale, likewise only when stated. 7z keeps
+    /// each time behind its own presence bit, and an entry written by a tool
+    /// that recorded none has none to restore.
+    #[serde(default)]
+    pub(crate) accessed: Option<u64>,
 }
 
 /// Everything one 7z container's end header states, plus the volume lengths the
@@ -194,6 +210,7 @@ pub(crate) struct SevenZipDatalessEntry {
     pub(crate) name: String,
     pub(crate) is_directory: bool,
     pub(crate) modified: Option<u64>,
+    pub(crate) accessed: Option<u64>,
 }
 
 /// The container map, resolved against the volumes' lengths.
@@ -258,6 +275,7 @@ impl SevenZipLayout {
                     name: entry.name.clone(),
                     is_directory: entry.is_directory,
                     modified: entry.modified,
+                    accessed: entry.accessed,
                 }),
             }
         }
@@ -513,7 +531,7 @@ pub(super) fn container_facts(
         // The reader's own name check, applied before a name reaches a
         // destination policy that would have to guess what the writer meant.
         if file.unsafe_path_reason().is_some() {
-            return Err(SevenZipRefusal::Geometry);
+            return Err(SevenZipRefusal::UnsafeDestination);
         }
         if !seen.insert(file.name.as_str()) {
             // Two entries claiming one name resolve by write order in an
@@ -523,6 +541,7 @@ pub(super) fn container_facts(
         let modified = file
             .has_last_modified_date
             .then(|| file.last_modified_date.into());
+        let accessed = file.has_access_date.then(|| file.access_date.into());
         if !file.has_stream || file.is_directory {
             entries.push(SevenZipEntryFacts {
                 name: file.name.clone(),
@@ -531,6 +550,7 @@ pub(super) fn container_facts(
                 crc32: None,
                 is_directory: file.is_directory,
                 modified,
+                accessed,
             });
             continue;
         }
@@ -559,6 +579,7 @@ pub(super) fn container_facts(
             crc32: file.has_crc.then_some(file.crc as u32),
             is_directory: false,
             modified,
+            accessed,
         });
     }
 
@@ -607,6 +628,7 @@ fn coder_refusal(block: &sevenz_turbo::Block) -> SevenZipRefusal {
 pub(super) struct ContainerImage {
     image: SparseImage,
     total: u64,
+    holed: bool,
 }
 
 impl ContainerImage {
@@ -618,7 +640,19 @@ impl ContainerImage {
         Self {
             image: SparseImage::over_volumes(volumes, scratch),
             total,
+            holed: false,
         }
+    }
+
+    /// Whether a read stopped short of the container's end on a byte the
+    /// volumes have not delivered.
+    ///
+    /// A sparse image answers a hole the way a file answers its end, so a
+    /// reader cannot tell the two apart and reports whichever parse error the
+    /// truncation produced. This says which one it was, and so whether the
+    /// error is a verdict on the container or only on how much of it is here.
+    pub(super) fn holed(&self) -> bool {
+        self.holed
     }
 
     /// Reads exactly `len` bytes at `offset`, or `None` when any of them is a
@@ -633,7 +667,11 @@ impl ContainerImage {
 
 impl Read for ContainerImage {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        self.image.read(out)
+        let taken = self.image.read(out)?;
+        if taken == 0 && !out.is_empty() && self.image.stream_position()? < self.total {
+            self.holed = true;
+        }
+        Ok(taken)
     }
 }
 
@@ -671,11 +709,17 @@ pub(super) enum ParseOutcome {
 /// the difference between "the reader hit a hole" — wait, the article is coming
 /// — and "the reader hit a hole in a container that is entirely present", which
 /// is a container whose own coordinates point outside itself.
+///
+/// `password` is the set's candidate, offered so that a header-encrypted
+/// container opens instead of being refused unread. A container with no
+/// encrypted header ignores it, exactly as a plaintext set's parse did before
+/// there was one to offer.
 pub(super) fn parse_container(
     mut image: ContainerImage,
     total: u64,
     max_end_header_bytes: u64,
     image_complete: bool,
+    password: Option<&str>,
 ) -> ParseOutcome {
     let Some(prefix) = image.read_exact_at(0, SIGNATURE_HEADER_LEN as usize) else {
         return ParseOutcome::Incomplete;
@@ -712,24 +756,29 @@ pub(super) fn parse_container(
         max_end_header_bytes,
         ..Default::default()
     };
-    let archive = match sevenz_turbo::Archive::read_with_limits(
-        &mut image,
-        &sevenz_turbo::Password::empty(),
-        &limits,
-    ) {
+    let key = match password {
+        Some(secret) if !secret.is_empty() => sevenz_turbo::Password::new(secret),
+        _ => sevenz_turbo::Password::empty(),
+    };
+    let archive = match sevenz_turbo::Archive::read_with_limits(&mut image, &key, &limits) {
         Ok(archive) => archive,
         // `-mhe`: the end header is itself an encrypted block, so nothing in it
-        // names a member. Stated as its own refusal rather than as a parse
-        // failure because it is a property of the archive that no further byte
-        // changes, and because it is the one refusal an operator can act on.
+        // names a member without a key. Reached with no candidate to offer, or
+        // with one the header's own check refuted. Stated as its own refusal
+        // rather than as a parse failure because it is a property of the
+        // archive that no further byte changes, and because it is the one
+        // refusal an operator can act on.
         Err(sevenz_turbo::Error::PasswordRequired)
         | Err(sevenz_turbo::Error::MaybeBadPassword(_)) => {
             return ParseOutcome::Refused(SevenZipRefusal::EncryptedHeader);
         }
         // A compressed end header keeps its packed bytes just before itself, so
-        // a reader that got this far can still be short of them. While anything
-        // is outstanding that is a hole and not a verdict.
-        Err(_) if !image_complete => return ParseOutcome::Incomplete,
+        // a reader that got this far can still be short of them. That is the
+        // one parse failure another article can change, and it is a failure
+        // only because the image stopped at a hole. Every other one is a
+        // verdict now: waiting on it spends the whole holds budget to arrive at
+        // the same answer.
+        Err(_) if !image_complete && image.holed() => return ParseOutcome::Incomplete,
         Err(_) => return ParseOutcome::Refused(SevenZipRefusal::Geometry),
     };
     match container_facts(&archive) {

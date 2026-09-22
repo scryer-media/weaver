@@ -2344,23 +2344,35 @@ impl DirectSetRouter {
         if self.layout.is_some() {
             return HeaderProbe::Settled;
         }
-        // The signature header is the first 32 bytes of volume zero, and it is
-        // what names the end header. Until it is readable there is nothing to
-        // aim the tail probe at.
-        if self.sevenz_start.is_none() {
-            return HeaderProbe::Earliest;
-        }
+        // A part boundary is a volume boundary, so the map cannot be read until
+        // every volume's length is known — and a volume states its length in
+        // the yEnc header of any one of its articles. Name each volume that has
+        // not stated one yet, so the set reaches its parse with one article per
+        // volume rather than with every volume ahead of the last staged whole.
+        let fronts: Vec<u32> = self
+            .plan
+            .volumes
+            .keys()
+            .copied()
+            .filter(|volume| !self.declared_volume_sizes.contains_key(volume))
+            .collect();
         // The end header is the last `next_header_size` bytes of the container,
         // so it is the *last* article of the last volume that carries its end —
         // and, when it spans more than one article, the ones before that. The
         // queue is asked for the highest-numbered article still outstanding,
         // which walks backwards on its own as each one lands: no coordinate is
         // needed, and none could be trusted anyway, since an article's byte
-        // range is only known once it has been decoded.
-        match self.plan.volumes.keys().next_back().copied() {
-            Some(volume) => HeaderProbe::Latest { volume },
-            None => HeaderProbe::Settled,
+        // range is only known once it has been decoded. It is worth asking for
+        // only once the signature header has named an end header to find.
+        let tail = self
+            .sevenz_start
+            .is_some()
+            .then(|| self.plan.volumes.keys().next_back().copied())
+            .flatten();
+        if fronts.is_empty() && tail.is_none() {
+            return HeaderProbe::Settled;
         }
+        HeaderProbe::Container { fronts, tail }
     }
 
     /// Reads the container's map, if enough of it has arrived.
@@ -2405,7 +2417,17 @@ impl DirectSetRouter {
         {
             self.parse_walks = self.parse_walks.saturating_add(1);
         }
-        match sevenz::parse_container(image, total, MAX_HEADER_PREFIX_BYTES, image_complete) {
+        // The set's own candidate, which is what opens a `-mhe` container's end
+        // header. `None` on a plaintext set, and unused by a reader that finds
+        // no encrypted header to apply it to.
+        let password = self.crypt.password().map(str::to_string);
+        match sevenz::parse_container(
+            image,
+            total,
+            MAX_HEADER_PREFIX_BYTES,
+            image_complete,
+            password.as_deref(),
+        ) {
             sevenz::ParseOutcome::Incomplete => {
                 // Still waiting. The holds budget and the scratch ceiling bound
                 // that wait — every byte staged while the layout is unknown is
@@ -2497,14 +2519,16 @@ impl DirectSetRouter {
 
 /// What a set wants the download scheduler to fetch next while its layout is
 /// unresolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HeaderProbe {
     /// Nothing outstanding: the layout is known.
     Settled,
     /// The earliest queued article of the earliest volume whose headers are
     /// still unread.
     Earliest,
-    /// The **highest-numbered** queued article of one volume. The 7z tail
-    /// probe: a container's map is the last thing in it.
-    Latest { volume: u32 },
+    /// A container read at both ends at once: the **earliest** queued article
+    /// of each volume in `fronts`, because one article states its volume's
+    /// length, and the **highest-numbered** queued article of `tail`, because
+    /// a container's map is the last thing in it.
+    Container { fronts: Vec<u32>, tail: Option<u32> },
 }

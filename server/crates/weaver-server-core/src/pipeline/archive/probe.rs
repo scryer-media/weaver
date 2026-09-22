@@ -335,8 +335,9 @@ impl Pipeline {
         }
     }
 
-    /// Whether this archive file is a source volume of a direct set that has
-    /// already put its members where the extractor would have put them.
+    /// Whether this archive file is a source volume of a finalized **7z**
+    /// direct set — one that has already put its members where the extractor
+    /// would have put them.
     ///
     /// A direct set never enters the archive topology: its volumes are never
     /// written, so nothing ever probes one, and the completion hook that is
@@ -346,16 +347,25 @@ impl Pipeline {
     /// counting its volumes as archives still waiting for a topology would
     /// leave the job blocked on a description that will never be built, of
     /// work that is already done.
-    fn direct_set_already_installed(
+    ///
+    /// **RAR sets are excluded deliberately, in both states.** A job whose
+    /// archives are all RAR never reaches this readiness check at all — the
+    /// completion gate sends it to the RAR check instead — so a RAR direct set
+    /// has never needed the clause; and a mixed job's RAR sets reach it on a
+    /// path that has been answering for them since before there was a 7z
+    /// layout. Narrowing to the format that needs it is what keeps this from
+    /// being a change to how a RAR set completes.
+    pub(in crate::pipeline) fn direct_set_already_installed(
         &self,
         job_id: JobId,
         file: &crate::jobs::assembly::FileAssembly,
     ) -> bool {
         let file_index = file.file_id().file_index;
-        self.direct_store
-            .sets_for(job_id)
-            .iter()
-            .any(|set| set.is_finalized() && set.plan().volume_for_file(file_index).is_some())
+        self.direct_store.sets_for(job_id).iter().any(|set| {
+            set.plan().format == crate::pipeline::direct_store::plan::SetFormat::SevenZip
+                && set.is_finalized()
+                && set.plan().volume_for_file(file_index).is_some()
+        })
     }
 
     pub(crate) fn extraction_readiness_for_job(&self, job_id: JobId) -> ExtractionReadiness {

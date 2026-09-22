@@ -27,16 +27,35 @@ fn installed_tolerated_members(targets: &[ToleratedTarget]) -> Result<ToleratedE
     Ok(result)
 }
 
-/// An archive's recorded modification time, in Windows FILETIME ticks, put on
-/// a file weaver has just created. Best effort: the entry exists either way,
-/// and a filesystem that refuses the time still holds the right bytes.
-fn apply_archive_modified(path: &std::path::Path, filetime_ticks: u64) {
+/// One of an archive's recorded times, in Windows FILETIME ticks.
+fn archive_filetime(filetime_ticks: u64) -> filetime::FileTime {
     const TICKS_PER_SECOND: u64 = 10_000_000;
     const EPOCH_OFFSET_SECONDS: i64 = 11_644_473_600;
     let seconds = (filetime_ticks / TICKS_PER_SECOND) as i64 - EPOCH_OFFSET_SECONDS;
     let nanos = ((filetime_ticks % TICKS_PER_SECOND) * 100) as u32;
-    let time = filetime::FileTime::from_unix_time(seconds, nanos);
-    let _ = filetime::set_file_mtime(path, time);
+    filetime::FileTime::from_unix_time(seconds, nanos)
+}
+
+/// An archive's recorded times put on an entry weaver has just created.
+///
+/// The pair the conventional extractor restores: the modification time, which
+/// every writer records, and the access time when the header carries one.
+/// Neither is invented — an entry whose header states no modification time
+/// keeps the time of its creation here, exactly as it does there. Best effort:
+/// the entry exists either way, and a filesystem that refuses a time still
+/// holds the right bytes.
+fn apply_archive_times(path: &std::path::Path, modified: Option<u64>, accessed: Option<u64>) {
+    let Some(modified) = modified.map(archive_filetime) else {
+        return;
+    };
+    match accessed.map(archive_filetime) {
+        Some(accessed) => {
+            let _ = filetime::set_file_times(path, accessed, modified);
+        }
+        None => {
+            let _ = filetime::set_file_mtime(path, modified);
+        }
+    }
 }
 
 impl Pipeline {
@@ -1369,16 +1388,12 @@ impl Pipeline {
             if entry.is_directory {
                 dataless_directories.push((entry, destination));
             } else {
-                if let Some(modified) = entry.modified {
-                    apply_archive_modified(destination, modified);
-                }
+                apply_archive_times(destination, entry.modified, entry.accessed);
                 self.record_direct_extracted(job_id, entry.name.clone());
             }
         }
         for (entry, destination) in dataless_directories {
-            if let Some(modified) = entry.modified {
-                apply_archive_modified(destination, modified);
-            }
+            apply_archive_times(destination, entry.modified, entry.accessed);
             self.record_direct_extracted(job_id, entry.name.clone());
         }
 

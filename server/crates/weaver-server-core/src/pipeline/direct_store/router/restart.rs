@@ -257,13 +257,21 @@ impl DirectSetRouter {
         decoded_len: Option<u64>,
     ) {
         let source_complete = decoded_len.is_some();
-        let confirmed = restored_volume_is_confirmed(
-            covered,
-            decoded_len,
-            self.volume_facts
-                .get(&volume_index)
-                .is_some_and(|facts| facts.more_volumes),
-        );
+        // A container has one map for every volume, so a restored layout is
+        // the confirmation — there is no per-volume walk that could have
+        // stopped short, and the derivation below reads facts a 7z set does
+        // not keep. A set whose map did not come back has no layout, and its
+        // volumes stay unconfirmed until the refetched tail parses.
+        let confirmed = match self.plan.format {
+            SetFormat::SevenZip => self.layout.is_some(),
+            SetFormat::Rar => restored_volume_is_confirmed(
+                covered,
+                decoded_len,
+                self.volume_facts
+                    .get(&volume_index)
+                    .is_some_and(|facts| facts.more_volumes),
+            ),
+        };
         let tail_base = self
             .volume_facts
             .get(&volume_index)
@@ -432,8 +440,17 @@ impl DirectSetRouter {
     /// The volumes the router holds parsed facts for — the volumes whose bytes
     /// it can classify. The restore seam validates a checkpoint's claims
     /// against this.
+    ///
+    /// What "facts" means is per format, and it is the same split
+    /// [`Self::remark_dirty_fact`] makes: a RAR volume's facts are its own
+    /// parsed headers, while a container volume's are the declared length that
+    /// places it in the concatenation — the map itself is one container-wide
+    /// fact and says nothing about which volumes have been seen.
     pub(crate) fn fact_volumes(&self) -> std::collections::HashSet<u32> {
-        self.volume_facts.keys().copied().collect()
+        match self.plan.format {
+            SetFormat::Rar => self.volume_facts.keys().copied().collect(),
+            SetFormat::SevenZip => self.declared_volume_sizes.keys().copied().collect(),
+        }
     }
 
     /// Whether any member is still carrying restart-seeded, unverified coverage.
