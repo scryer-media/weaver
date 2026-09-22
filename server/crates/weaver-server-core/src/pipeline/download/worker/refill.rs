@@ -16,7 +16,7 @@
 //! `NoWork`, keeps its socket cached, and the pool's idle loop takes over.
 
 use super::*;
-use crate::pipeline::download::scheduler::{Handout, LaneShare, YieldReason};
+use crate::pipeline::download::scheduler::{Handout, LaneShare, SaturationWake, YieldReason};
 
 /// How long a refill that found nothing waits in the actor before its lane is
 /// told to park. A fixed window: long enough to ride out a decode or a
@@ -28,10 +28,10 @@ pub(in crate::pipeline) const DOWNLOAD_REFILL_IDLE_HOLD: Duration = Duration::fr
 pub(crate) struct HeldDownloadRefill {
     request: DownloadLaneRefillRequest,
     since: Instant,
-    /// Set for a lane that was at its share of a job rather than out of work:
-    /// the request is answered again once the lane holds fewer articles than
-    /// this. Such a lane is fetching, not idle, so its hold has no deadline.
-    wake_below: Option<usize>,
+    /// Set for a lane that was saturated rather than out of work: the request
+    /// is answered again once the lane has fetched down to the wake's count.
+    /// Such a lane is fetching, not idle, so its hold has no deadline.
+    wake: Option<SaturationWake>,
 }
 
 impl Pipeline {
@@ -115,25 +115,27 @@ impl Pipeline {
         for HeldDownloadRefill {
             request,
             since,
-            wake_below,
+            wake,
         } in held
         {
-            let Some(below) = wake_below else {
+            let Some(SaturationWake { of, below }) = wake else {
                 self.answer_download_lane_refill(request, now, Some(since));
                 continue;
             };
-            // A lane still at its share costs one owner lookup per pass, not
-            // a walk of the queues. Total holdings bound the per-job count,
-            // so a lane below the share in total is below it for any job. A
-            // lane that is gone falls through and is told so by the answer
-            // path.
-            if !request.response_tx.is_closed()
-                && self.download_lane_holdings(request.lane_id) >= below
-            {
+            // A lane still saturated costs one owner lookup per pass, not a
+            // walk of the queues. Only the articles the wake names count, so
+            // a lane at its share of one job is not held past that by the
+            // tail of another it is still carrying. A lane that is gone
+            // falls through and is told so by the answer path.
+            let holding = match of {
+                Some(job_id) => self.download_lane_holdings_of_job(request.lane_id, job_id),
+                None => self.download_lane_holdings(request.lane_id),
+            };
+            if !request.response_tx.is_closed() && holding >= below {
                 self.held_download_refills.push(HeldDownloadRefill {
                     request,
                     since,
-                    wake_below,
+                    wake,
                 });
                 continue;
             }
@@ -242,14 +244,19 @@ impl Pipeline {
                 self.hold_or_park_idle_download_lane_refill(request, pressure, held_since, now);
                 return;
             }
-            Handout::Saturated { below } => {
+            Handout::Saturated(wake) => {
                 // The lane keeps fetching what it holds with this ask
-                // outstanding, and blocks on it only once its pipe is dry —
-                // by which point it is below any share and has been answered.
+                // outstanding. It blocks on the answer only once its pipe is
+                // dry, or on a park after returning every article it still
+                // holds — either way it is below any wake count by then and
+                // the hold has been answered.
+                self.metrics
+                    .download_lane_refill_saturated_total
+                    .fetch_add(1, Ordering::Relaxed);
                 self.held_download_refills.push(HeldDownloadRefill {
                     request,
                     since: held_since.unwrap_or(now),
-                    wake_below: Some(below),
+                    wake: Some(wake),
                 });
                 return;
             }
@@ -411,7 +418,7 @@ impl Pipeline {
         self.held_download_refills.push(HeldDownloadRefill {
             request,
             since,
-            wake_below: None,
+            wake: None,
         });
     }
 

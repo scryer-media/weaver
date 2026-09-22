@@ -999,6 +999,7 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         download_lane_refill_granted_total: 44,
         download_lane_refill_parked_total: 45,
         download_lane_refill_deferred_total: 0,
+        download_lane_refill_saturated_total: 0,
         download_pipeline_trial_success_total: 46,
         download_pipeline_trial_failure_total: 47,
         download_pipeline_proof_pass_total: 48,
