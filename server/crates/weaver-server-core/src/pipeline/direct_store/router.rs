@@ -1973,6 +1973,29 @@ impl VolumeStaging {
         Some(out)
     }
 
+    /// Whether `[offset, offset + len)` is wholly staged, without reading a
+    /// byte of it.
+    ///
+    /// The blocked-run gate's question. [`Self::slice`] answers it too, but
+    /// only by materializing the range — and for a paged chunk that is a
+    /// positioned read as well. The gate runs on every drain of a held run, so
+    /// it gets the walk without the bytes.
+    fn holds(&self, offset: u64, len: u64) -> bool {
+        let mut cursor = offset;
+        let end = offset.saturating_add(len);
+        while cursor < end {
+            let Some((start, chunk)) = self.chunks.range(..=cursor).next_back() else {
+                return false;
+            };
+            let inside = cursor - start;
+            if inside >= chunk.len() {
+                return false;
+            }
+            cursor = cursor.saturating_add((chunk.len() - inside).min(end - cursor));
+        }
+        true
+    }
+
     /// [`Self::slice`] flattened into one owned buffer, for the callers that
     /// need a contiguous range rather than a run of writes — the cipher
     /// assembly, which decrypts in place, and the readers that hash a range.
@@ -2288,6 +2311,14 @@ pub(crate) struct DirectSetRouter {
     /// set that held from one that never had to.
     #[cfg(test)]
     blocks_held: u64,
+    /// Cipher bytes the encrypted write path has pulled out of staging into a
+    /// contiguous buffer. Every one of them is a copy, and a copy made for a
+    /// run that then turns out to be undecryptable is a copy thrown away, so
+    /// this is the number that says whether the path resolves a run before it
+    /// materializes it. Shared-reference interior mutability because the read
+    /// happens on `&self`.
+    #[cfg(test)]
+    staged_copy_bytes: std::sync::atomic::AtomicU64,
     /// How many Quick Open cross-check walks this set has run, so a test can
     /// prove a cache the library never adopted does not cost a second parse.
     #[cfg(test)]
@@ -2413,6 +2444,8 @@ impl DirectSetRouter {
             member_ciphers_builds: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             blocks_held: 0,
+            #[cfg(test)]
+            staged_copy_bytes: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             quick_open_walks: 0,
             #[cfg(test)]
@@ -2546,10 +2579,31 @@ impl DirectSetRouter {
         self.blocks_held
     }
 
+    /// Cipher bytes copied out of staging by the encrypted write path so far.
+    /// Test-only; see the field.
+    #[cfg(test)]
+    pub(crate) fn staged_copy_bytes(&self) -> u64 {
+        self.staged_copy_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Quick Open cross-check walks run so far. Test-only; see the field.
     #[cfg(test)]
     pub(crate) fn quick_open_walks(&self) -> u64 {
         self.quick_open_walks
+    }
+
+    /// Cipher bytes every encrypted member of this set has run the write-side
+    /// transform over, repeats included. One pass over a member's cipher
+    /// stream plus its edge blocks is the whole cost the write path may have;
+    /// anything more is the transform re-doing work. Test-only.
+    #[cfg(test)]
+    pub(crate) fn decrypted_bytes(&self) -> u64 {
+        self.members
+            .values()
+            .filter_map(|member| member.crypt.as_ref())
+            .map(MemberCrypt::decrypted_bytes)
+            .sum()
     }
 
     /// Header walks over a staged image run so far. Test-only; see the field.

@@ -2038,6 +2038,14 @@ impl DirectSetRouter {
                         logical_offset,
                         len,
                     } => {
+                        // Asked before the slice is mapped to anything: a run
+                        // whose CBC predecessor has not arrived cannot be
+                        // routed, and this drain runs over every staged volume
+                        // on every article the set receives.
+                        if self.encrypted_slice_is_blocked(member_index, logical_offset, len) {
+                            cursor = cursor.saturating_add(len);
+                            continue;
+                        }
                         let staging = self.staging.get(&volume_index);
                         let replace =
                             staging.is_some_and(|staging| staging.is_repaired(cursor, len));
