@@ -127,14 +127,13 @@ impl Pipeline {
                     // volume they answer; wait for them rather than probe a
                     // volume whose article is already on its way back.
                     DirectHeaderProbe::Container { .. } if released != 0 => Vec::new(),
-                    // Unlike the single-article walk above, these articles are
-                    // independent of one another: each one names its own
-                    // volume's length, and none of them has to land before the
-                    // next is worth asking for. Asking for them together is
-                    // what keeps a set from staging every volume ahead of the
-                    // last one before it can read its map. The bound is one
-                    // article in flight per volume, plus the tail's.
-                    DirectHeaderProbe::Container { fronts, tail } => {
+                    // Two articles, at the two ends of the set, and independent
+                    // of one another: volume zero's front carries the part size
+                    // and the start header, the tail carries the map. Asking
+                    // for both together is what keeps a set from staging every
+                    // volume ahead of the last one before it can read its map.
+                    // The bound is one article in flight per end.
+                    DirectHeaderProbe::Container { front, tail } => {
                         let mut inflight: HashSet<u32> = HashSet::new();
                         let mut note = |file: NzbFileId| {
                             if owns(file) {
@@ -170,16 +169,13 @@ impl Pipeline {
                                 .filter(|file| unresolved(file) && !inflight.contains(file))
                                 .copied()
                         };
-                        let mut probes = Vec::with_capacity(fronts.len().saturating_add(1));
-                        for volume in &fronts {
-                            let Some(file) = probeable(volume) else {
-                                continue;
-                            };
-                            if let Some(work) = state.download_queue.peek_first_matching(|work| {
+                        let mut probes = Vec::with_capacity(2);
+                        if let Some(file) = front.as_ref().and_then(probeable)
+                            && let Some(work) = state.download_queue.peek_first_matching(|work| {
                                 work.segment_id.file_id.file_index == file
-                            }) {
-                                probes.push(work.segment_id);
-                            }
+                            })
+                        {
+                            probes.push(work.segment_id);
                         }
                         if let Some(file) = tail.as_ref().and_then(probeable)
                             && let Some(work) = state.download_queue.peek_last_matching(|work| {

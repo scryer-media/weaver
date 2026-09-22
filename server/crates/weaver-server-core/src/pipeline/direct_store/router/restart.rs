@@ -173,10 +173,12 @@ impl DirectSetRouter {
             // over the refetched tail.
             return Ok(());
         };
-        // Incomplete lengths cannot place a single part boundary, so a set
-        // missing one restores nothing rather than restoring a layout whose
-        // offsets are off by whatever that volume's length would have been.
-        if self.plan.expected_volume_count() != Some(self.declared_volume_sizes.len()) {
+        // The geometry is the part size and the total, and both come back off
+        // these rows: volume zero's cached length is the one, the map's own
+        // cached total is the other. A set missing either restores nothing
+        // rather than a layout whose boundaries are guesses, and parses again
+        // over its refetched front and tail.
+        if !self.declared_volume_sizes.contains_key(&0) || container.total == 0 {
             return Ok(());
         }
         self.adopt_container_facts(container)

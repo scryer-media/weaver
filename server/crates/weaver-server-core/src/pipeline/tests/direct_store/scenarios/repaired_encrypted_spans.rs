@@ -66,7 +66,7 @@ fn route_all(router: &mut DirectSetRouter, volumes: &[(String, Vec<u8>)]) {
             .route_bytes(index as u32, 0, bytes)
             .expect("an undamaged encrypted volume routes");
         router
-            .note_volume_complete(index as u32)
+            .note_volume_complete(index as u32, bytes.len() as u64)
             .expect("the volume's articles are all in");
     }
 }
@@ -365,7 +365,7 @@ async fn a_repaired_hole_completes_an_encrypted_part_and_passes_its_gate() {
             .route_bytes(index as u32, 0, bytes)
             .expect("the remaining volumes route");
         router
-            .note_volume_complete(index as u32)
+            .note_volume_complete(index as u32, bytes.len() as u64)
             .expect("their articles are all in");
     }
     assert!(
@@ -420,7 +420,7 @@ async fn a_repaired_volume_tail_reroutes(volumes: Vec<(String, Vec<u8>)>, payloa
             .route_bytes(index as u32, 0, bytes)
             .expect("the intact volumes route");
         router
-            .note_volume_complete(index as u32)
+            .note_volume_complete(index as u32, bytes.len() as u64)
             .expect("their articles are all in");
     }
     assert!(
@@ -521,7 +521,7 @@ async fn a_repaired_leading_slice_of_a_multi_article_encrypted_volume_reroutes()
                 .expect("an undamaged encrypted volume routes");
         }
         router
-            .note_volume_complete(index as u32)
+            .note_volume_complete(index as u32, bytes.len() as u64)
             .expect("the volume's articles are all in");
     }
     assert!(
@@ -553,7 +553,9 @@ async fn repair_batches_rebuild_a_wholly_missing_last_volume() {
     router.note_par2_available(true);
     for (index, (_, bytes)) in volumes[..2].iter().enumerate() {
         router.route_bytes(index as u32, 0, bytes).unwrap();
-        router.note_volume_complete(index as u32).unwrap();
+        router
+            .note_volume_complete(index as u32, bytes.len() as u64)
+            .unwrap();
     }
     let image = &volumes[2].1;
     let mut written = 0;
@@ -657,7 +659,7 @@ async fn a_second_damaged_volume_waits_for_its_own_rewrite() {
                 .expect("an undamaged encrypted volume routes");
         }
         router
-            .note_volume_complete(index as u32)
+            .note_volume_complete(index as u32, bytes.len() as u64)
             .expect("the volume's articles are all in");
     }
     assert!(
@@ -773,7 +775,7 @@ fn repair_two_slices(batched: bool, encrypted: bool) {
                 .expect("an undamaged volume routes");
         }
         router
-            .note_volume_complete(index as u32)
+            .note_volume_complete(index as u32, bytes.len() as u64)
             .expect("the volume's articles are all in");
     }
     assert!(
@@ -858,7 +860,9 @@ async fn replacement_edges_include_unrouted_neighbour_tails() {
                 .unwrap();
         } else {
             router.route_bytes(index as u32, 0, bytes).unwrap();
-            router.note_volume_complete(index as u32).unwrap();
+            router
+                .note_volume_complete(index as u32, bytes.len() as u64)
+                .unwrap();
         }
     }
     let plans: Vec<_> = (0..2)
@@ -897,7 +901,9 @@ async fn replacement_edges_include_unrouted_neighbour_tails() {
         router
             .route_repaired_batch(volume as u32, &[(0, bytes)], &edges, true, true)
             .unwrap();
-        router.note_volume_complete(volume as u32).unwrap();
+        router
+            .note_volume_complete(volume as u32, volumes[volume].1.len() as u64)
+            .unwrap();
         assert!(!router.all_members_verified());
     }
     router.finish_repair_transaction().unwrap();

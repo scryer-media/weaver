@@ -2324,18 +2324,22 @@ impl Pipeline {
         }
     }
 
-    /// Ends the wait of a container set that is waiting for a length no article
-    /// will ever state.
+    /// Ends the wait of a container set whose map will never be read.
     ///
-    /// A container's map is read against the concatenation of its volumes, so
-    /// the parse gate opens only once *every* volume has stated its length —
-    /// one article each. A volume whose articles are all terminally unavailable
-    /// states nothing, and the set has no other way to learn what it withholds:
-    /// the probe planner skips a volume with nothing left to ask for, so the
-    /// gate stays shut with no request outstanding to reopen it. On a set large
-    /// enough to reach them the holds ceilings would eventually end it; on a
-    /// small one nothing would, and the job would sit at its last article
-    /// forever.
+    /// A 7z set resolves its layout from two ends — volume zero's front, which
+    /// states the part size and carries the start header, and the tail, which
+    /// carries the map. Whichever of those is missing, the symptom is one and
+    /// the same: a parse that is not settled, with no article left anywhere in
+    /// the set that could settle it. The probe planner asks for nothing it
+    /// cannot get, so the gate stays shut with no request outstanding to
+    /// reopen it. On a set large enough to reach them the holds ceilings would
+    /// eventually end it; on a small one nothing would, and the job would sit
+    /// at its last article forever.
+    ///
+    /// Judged for the whole set rather than per volume, because that is the
+    /// shape of the question: nothing outstanding anywhere means nothing can
+    /// change the parse, whether what is missing is volume zero, a volume in
+    /// the middle or the tail.
     ///
     /// The verdict is the demotion the set would have reached the slow way. Its
     /// volumes materialize and the conventional path takes them, which is also
@@ -2343,9 +2347,9 @@ impl Pipeline {
     ///
     /// Judged against the same evidence the probe planner admits on, and one
     /// conservative addition: a released lane result is attributable only to
-    /// the job, so while any is outstanding no volume is called unreachable —
-    /// the article it answers may be the one that would have stated the length.
-    pub(crate) async fn demote_direct_sets_awaiting_an_unreadable_length(&mut self, job_id: JobId) {
+    /// the job, so while any is outstanding nothing is called unreachable — the
+    /// article it answers may be the one that would have settled the parse.
+    pub(crate) async fn demote_direct_sets_with_an_unreadable_map(&mut self, job_id: JobId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
@@ -2367,16 +2371,14 @@ impl Pipeline {
                 set.plan().format == super::plan::SetFormat::SevenZip
                     && !set.is_demoted()
                     && !set.is_finalized()
+                    && matches!(set.header_probe(), HeaderProbe::Container { .. })
             })
             .filter(|(_, set)| {
-                let HeaderProbe::Container { fronts, .. } = set.header_probe() else {
-                    return false;
-                };
-                fronts.iter().any(|volume| {
-                    let Some(file_index) = set.plan().volumes.get(volume).copied() else {
-                        return false;
+                set.plan().volumes.values().all(|file_index| {
+                    let file_id = NzbFileId {
+                        job_id,
+                        file_index: *file_index,
                     };
-                    let file_id = NzbFileId { job_id, file_index };
                     let queued = state.download_queue.queued_count_for_file(file_id) != 0;
                     let retrying = self
                         .pending_retries_by_segment
@@ -2410,12 +2412,12 @@ impl Pipeline {
         for set_index in stranded {
             warn!(
                 job_id = job_id.0,
-                set_index, "a container volume will never state its length"
+                set_index, "a container map will never be read"
             );
             self.demote_direct_set(
                 job_id,
                 set_index,
-                DemotionReason::SevenZip(SevenZipRefusal::UnreadableVolumeLength),
+                DemotionReason::SevenZip(SevenZipRefusal::UnreadableMap),
             )
             .await;
         }

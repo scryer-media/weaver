@@ -184,6 +184,69 @@ fn sevenz_job_spec(volumes: &[(String, Vec<u8>)], articles: usize) -> JobSpec {
     }
 }
 
+/// [`submit_volume_article_of`] with the article's yEnc header stating a file
+/// size of the caller's choosing.
+///
+/// `0` is what the decoder reports for an article whose `=ybegin` carries no
+/// `size=` at all, so it is how a volume that states nothing is posted here.
+async fn submit_volume_article_declaring(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    file_index: u32,
+    segment_number: u32,
+    declared_file_len: u64,
+) {
+    let (filename, bytes) = &volumes[file_index as usize];
+    let (start, end) = article_extent(bytes.len(), segment_number, ARTICLES_PER_VOLUME);
+    let data = &bytes[start..end];
+    let file_id = NzbFileId { job_id, file_index };
+    let total_segments = pipeline
+        .jobs
+        .get(&job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("active test file assembly")
+        .total_segments();
+    let checkpoint_plan = pipeline.par2_checkpoint_plan(job_id);
+    pipeline
+        .handle_decode_success(
+            DecodeResult {
+                encoding: SegmentEncoding::Yenc,
+                segment_id: SegmentId {
+                    file_id,
+                    segment_number,
+                },
+                raw_size: data.len() as u64,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: declared_file_len,
+                    part: Some(segment_number + 1),
+                    total: Some(total_segments),
+                    begin: Some(start as u64 + 1),
+                    end: Some((start + data.len()) as u64),
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: par2_rs::checksum::crc32(data),
+                truncation_suspected: false,
+                expected_file_crc: None,
+                data: DecodedChunk::from(data.to_vec()),
+                yenc_name: filename.to_string(),
+                checkpoint_plan,
+                segments: vec![weaver_yenc::Segment {
+                    file_offset: start as u64,
+                    len: data.len() as u64,
+                    crc32: par2_rs::checksum::crc32(data),
+                }],
+            },
+            SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
+            },
+        )
+        .await;
+    settle_direct_demotion_work(pipeline).await;
+}
+
 /// What one 7z gate run produced.
 struct SevenZipOutcome {
     status: Option<JobStatus>,
@@ -262,6 +325,23 @@ async fn run_sevenz_gate(
     arrivals: &[(u32, u32)],
     wanted: &[&str],
 ) -> SevenZipOutcome {
+    run_sevenz_gate_declaring(job_id, volumes, &BTreeMap::new(), arrivals, wanted).await
+}
+
+/// [`run_sevenz_gate`] with the length some volumes' articles *declare* chosen
+/// by the caller, by volume index.
+///
+/// The NZB stays honest and every article carries its real bytes; what changes
+/// is the one number a container's geometry is hinted by. `=ybegin size=` is a
+/// declaration, not a measurement, and this is the only way to post one that
+/// is wrong without also making the posting inconsistent with itself.
+async fn run_sevenz_gate_declaring(
+    job_id: JobId,
+    volumes: &[(String, Vec<u8>)],
+    declared: &BTreeMap<u32, u64>,
+    arrivals: &[(u32, u32)],
+    wanted: &[&str],
+) -> SevenZipOutcome {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
@@ -271,15 +351,30 @@ async fn run_sevenz_gate(
 
     let mut peak_working_bytes = 0u64;
     for (file_index, segment_number) in arrivals {
-        submit_volume_article_of(
-            &mut pipeline,
-            job_id,
-            volumes,
-            *file_index,
-            *segment_number,
-            ARTICLES_PER_VOLUME,
-        )
-        .await;
+        match declared.get(file_index) {
+            Some(stated) => {
+                submit_volume_article_declaring(
+                    &mut pipeline,
+                    job_id,
+                    volumes,
+                    *file_index,
+                    *segment_number,
+                    *stated,
+                )
+                .await;
+            }
+            None => {
+                submit_volume_article_of(
+                    &mut pipeline,
+                    job_id,
+                    volumes,
+                    *file_index,
+                    *segment_number,
+                    ARTICLES_PER_VOLUME,
+                )
+                .await;
+            }
+        }
         // Serviced between arrivals rather than only at the end: what the
         // directory holds while a set is mid-flight is the measurement this
         // subsystem exists to move, and it is unobservable once the whole set
@@ -614,9 +709,12 @@ async fn sevenz_store_declines_what_it_cannot_route() {
     }
 }
 
-/// A volume whose posted length disagrees with what the container's own
-/// geometry implies. Nothing downstream can place a byte after that, so the
-/// set is declined rather than routed against a map that does not close.
+/// A volume whose posted length disagrees with the place the geometry gives
+/// it. The part size and the total are volume zero's to state; every other
+/// volume's declaration is checked against them, and the first one that
+/// disagrees ends the route before a byte is written against a map that does
+/// not close. Here the container carries 64 bytes past its own end header, so
+/// the last volume is that much longer than its place allows.
 #[tokio::test]
 async fn sevenz_store_declines_a_volume_whose_length_does_not_close_the_container() {
     let member = payload(19, 30_000);
@@ -1064,24 +1162,27 @@ const SIGNATURE_HEADER_LEN: usize = 32;
 
 /// What makes a split container routable at all rather than merely readable.
 ///
-/// A container states its map at the tail, and its volume boundaries one
-/// volume at a time — each volume declares its own length on any one of its
-/// articles, and the map cannot be resolved until every one of them has. A set
-/// that simply waited for those lengths to turn up in dispatch order would
-/// hold every volume ahead of the last as holds: the whole container staged
-/// before a byte routes, which is the opposite of what direct routing is for.
-/// So admission reaches past its own retention limit for exactly the articles
-/// the parse needs — the first of every volume that has not declared a length,
-/// and the last of the last volume, which carries the end header.
+/// A split container is a byte split at a fixed part size, so its whole
+/// geometry follows from two facts, and volume zero's front carries both: the
+/// part size is that volume's own yEnc length, and the total is in the 32-byte
+/// start header at its offset zero. Everything else — where each volume begins
+/// in container coordinates, how long the short tail is — is arithmetic over
+/// those two. The one thing they do not give is the map, which sits in the end
+/// header at the very last byte of the set.
 ///
-/// The arrangement below is what makes that visible. The first volume's
-/// articles arrive before the limit tightens and stage as holds, because there
-/// is no map to route them against; from there nothing fits, and the only
-/// articles the set can be handed are the ones it reaches past the limit for.
-/// A probe that named one volume at a time would stop at the last volume and
-/// leave the middle ones' lengths unstated forever.
+/// So the set reaches past its own retention limit for two articles and no
+/// others: volume zero's front and the last volume's tail. Nothing is asked of
+/// the volumes in between, and nothing they could say would be waited on — a
+/// set that waited for every volume to declare a length would hold the whole
+/// container as holds before a byte routed, which is the opposite of what
+/// direct routing is for.
+///
+/// The arrangement below is what makes that visible. Volume zero's articles
+/// arrive before the limit tightens and stage as holds, because there is no map
+/// to route them against; from there nothing fits, and the only article the set
+/// can be handed is the one it reaches past the limit for.
 #[tokio::test]
-async fn sevenz_store_probes_one_article_per_volume_rather_than_staging_the_container() {
+async fn sevenz_store_probes_the_container_ends_rather_than_staging_it() {
     const VOLUMES: usize = 4;
     const ARTICLES: usize = 20;
     /// Articles of the first volume that land before the limit tightens.
@@ -1205,21 +1306,21 @@ async fn sevenz_store_probes_one_article_per_volume_rather_than_staging_the_cont
         peak_staged < capacity,
         "the set must never have held the container it could not hold\nsets: {sets}"
     );
-    // The first volume has already stated its length, so what is left is one
-    // article for each of the other three — whichever of that volume's queued
-    // articles comes up first, since any of them states its length — and the
-    // last volume's last article, which is where the end header is.
-    let mut probed: Vec<u32> = probed_volumes.iter().map(|(volume, _)| *volume).collect();
-    probed.sort_unstable();
-    assert_eq!(
-        probed,
-        vec![1, 2, 3, 3],
-        "the parse must cost one article per undeclared volume plus the tail\nprobed: \
+    // Volume zero arrived before the limit tightened, so both geometry facts
+    // were already in hand and its front was never probed for. What is left is
+    // the far end of the set, and nothing in between: the middle volumes are
+    // placed by arithmetic, so the parse spends no article on either of them.
+    assert!(
+        probed_volumes
+            .iter()
+            .all(|(volume, _)| *volume == VOLUMES as u32 - 1),
+        "the parse must reach past the limit for the tail and for nothing else\nprobed: \
          {probed_volumes:?}\nsets: {sets}"
     );
     assert!(
         probed_volumes.contains(&(VOLUMES as u32 - 1, ARTICLES as u32 - 1)),
-        "one of them must be the article the end header is in\nprobed: {probed_volumes:?}"
+        "and the article it reaches for must be the one the end header is in\nprobed: \
+         {probed_volumes:?}"
     );
     assert_eq!(over_limit, probed_volumes.len());
     let output_root =
@@ -1416,22 +1517,16 @@ async fn sevenz_store_refuses_a_container_no_candidate_opens() {
     );
 }
 
-/// A volume whose every article is terminally missing states no length, and a
-/// container's map cannot be read until every volume has stated one.
+/// Runs a three-volume container with one volume terminally unavailable.
 ///
-/// Nothing else ends that wait. The probe planner skips a volume with nothing
-/// left to ask for, so the gate stays shut with no request outstanding to
-/// reopen it, and the holds ceilings only fire on a set big enough to reach
-/// them — this one is far too small. Before the sweep this was a job parked at
-/// its last article for good.
-#[tokio::test]
-async fn a_sevenz_set_whose_volume_can_never_state_its_length_demotes() {
+/// Every article of the set leaves the queue, the way leasing one empties it;
+/// the stranded volume's simply never come back — no result, no retry — which
+/// is what an article nothing will ever deliver looks like from here.
+///
+/// Returns the set's state twice: with the rest of the container landed and
+/// the stranded volume still owed, and again once nothing is owed at all.
+async fn sevenz_set_with_a_stranded_volume(job_id: JobId, stranded: u32) -> (String, String) {
     const VOLUMES: usize = 3;
-    /// The volume nothing will deliver. Not the last one: the tail carries the
-    /// end header, and a set that never sees its map for *that* reason would
-    /// pass this test without the length gate existing.
-    const STRANDED: u32 = 1;
-
     let member = payload(61, 36_000);
     let archive = build_7z(
         &[Entry::file(MEMBER, member.clone())],
@@ -1439,30 +1534,27 @@ async fn a_sevenz_set_whose_volume_can_never_state_its_length_demotes() {
         None,
     );
     let volumes = split_volumes(&archive, VOLUMES);
-    let job_id = JobId(9_614);
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     let spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
     insert_active_job(&mut pipeline, job_id, spec).await;
 
-    // Every article of the stranded volume leaves the queue and never comes
-    // back — no result, no retry — which is what a terminally unavailable
-    // article looks like from here.
-    for segment_number in 0..ARTICLES_PER_VOLUME as u32 {
-        let segment_id = SegmentId {
-            file_id: NzbFileId {
-                job_id,
-                file_index: STRANDED,
-            },
-            segment_number,
-        };
-        take_queued_segment(&mut pipeline, job_id, segment_id);
-    }
+    // One at a time, in dispatch order: an article leaves the queue when it is
+    // leased and its result lands after that, so the set is only ever starved
+    // of everything at the very end.
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
-        if file_index == STRANDED {
+        if file_index == stranded {
             continue;
         }
+        take_queued_segment(
+            &mut pipeline,
+            job_id,
+            SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number,
+            },
+        );
         submit_volume_article_of(
             &mut pipeline,
             job_id,
@@ -1473,19 +1565,76 @@ async fn a_sevenz_set_whose_volume_can_never_state_its_length_demotes() {
         )
         .await;
     }
+    let while_owed = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    // The stranded volume's articles are leased last and never come back, so
+    // the set runs out of everything here rather than while the rest was still
+    // arriving. The job advance that follows is the seam the verdict is taken
+    // at, and in a running server every path to "nothing more is owed" reaches
+    // it — an exhausted retry, a closing pass, a finished article.
+    for segment_number in 0..ARTICLES_PER_VOLUME as u32 {
+        take_queued_segment(
+            &mut pipeline,
+            job_id,
+            SegmentId {
+                file_id: NzbFileId {
+                    job_id,
+                    file_index: stranded,
+                },
+                segment_number,
+            },
+        );
+    }
+    pipeline.check_job_completion(job_id).await;
     settle_direct_post_repair_work(&mut pipeline).await;
+    let starved = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    (while_owed, starved)
+}
 
-    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+/// The map lives in the last volume's last article. With that volume
+/// terminally unavailable there is nothing left that could ever read it.
+///
+/// Nothing else ends that wait. The probe planner skips a volume with nothing
+/// left to ask for, so the gate stays shut with no request outstanding to
+/// reopen it, and the holds ceilings only fire on a set big enough to reach
+/// them — this one is far too small. Before the sweep this was a job parked at
+/// its last article for good.
+#[tokio::test]
+async fn a_sevenz_set_whose_tail_never_arrives_demotes() {
+    let (_, sets) = sevenz_set_with_a_stranded_volume(JobId(9_614), 2).await;
     assert!(
-        sets.contains("UnreadableVolumeLength"),
-        "a length no article will state must end the set's wait\nsets: {sets}"
+        sets.contains("Demoted") && sets.contains("UnreadableMap"),
+        "a map no article will deliver must end the set's wait\nsets: {sets}"
+    );
+}
+
+/// Volume zero carries both facts the geometry is derived from, so a set that
+/// never receives it never places its map either — the same verdict, reached
+/// from the other end of the container.
+#[tokio::test]
+async fn a_sevenz_set_whose_first_volume_never_arrives_demotes() {
+    let (_, sets) = sevenz_set_with_a_stranded_volume(JobId(9_615), 0).await;
+    assert!(
+        sets.contains("Demoted") && sets.contains("UnreadableMap"),
+        "a geometry no article will state must end the set's wait\nsets: {sets}"
+    );
+}
+
+/// A volume in the middle is a different case, and the distinction is the
+/// whole point of deriving the geometry from two facts instead of from every
+/// volume's declared length: nothing in the middle is needed to read the map.
+/// This set reads its map, routes what it has, and carries the shortfall
+/// forward as the ordinary one it is — bytes that have not arrived — rather
+/// than being parked waiting for a length it was never going to be told.
+#[tokio::test]
+async fn a_sevenz_set_missing_a_middle_volume_still_reads_its_map() {
+    let (while_owed, starved) = sevenz_set_with_a_stranded_volume(JobId(9_616), 1).await;
+    assert!(
+        while_owed.contains("Routing") && !while_owed.contains("Demoted"),
+        "the map reads with nothing heard from the middle\nsets: {while_owed}"
     );
     assert!(
-        pipeline
-            .direct_store
-            .set(job_id, 0)
-            .is_some_and(|set| set.is_demoted()),
-        "the set must leave direct mode rather than hold its volumes\nsets: {sets}"
+        !starved.contains("UnreadableMap"),
+        "and running out of articles is not a verdict on a map already read\nsets: {starved}"
     );
 }
 
@@ -1540,5 +1689,196 @@ async fn a_rar_direct_set_is_never_counted_as_installed() {
     assert!(
         !any_installed(&pipeline, job_id),
         "a finalized RAR direct set must stay invisible to the 7z clause\nsets: {sets}"
+    );
+}
+
+/// The same container with its signature header pointing at an end header far
+/// beyond anything that was posted.
+fn overstate_next_header_offset(archive: &[u8]) -> Vec<u8> {
+    let mut out = archive.to_vec();
+    out[12..20].copy_from_slice(&(1u64 << 50).to_le_bytes());
+    out
+}
+
+/// A start header is read before a single byte of it has been checked against
+/// anything, so the part count it implies is arithmetic over two numbers a bad
+/// posting is free to have made up. The ceiling is what keeps a container
+/// claiming a petabyte from asking this router to plan a map for it.
+///
+/// The verdict lands on volume zero's very first article — the one that carries
+/// both facts — so nothing of the set is ever held against the claim.
+#[tokio::test]
+async fn sevenz_store_refuses_a_start_header_claiming_more_parts_than_can_exist() {
+    let member = payload(71, 30_000);
+    let archive = overstate_next_header_offset(&build_7z(
+        &[Entry::file(MEMBER, member.clone())],
+        EncoderMethod::COPY,
+        None,
+    ));
+    let volumes = split_volumes(&archive, 2);
+    let job_id = JobId(9_617);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    submit_volume_article_of(&mut pipeline, job_id, &volumes, 0, 0, ARTICLES_PER_VOLUME).await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.is_demoted()),
+        "the claim must be refused on the article that makes it\nsets: {sets}"
+    );
+    assert!(
+        sets.contains("VolumeSize"),
+        "and refused as a geometry this router will not plan for\nsets: {sets}"
+    );
+}
+
+/// Volume zero's yEnc length is a hint, not a fact this router may fail a job
+/// over.
+///
+/// Weaver does not validate a posting's declared sizes anywhere else — the
+/// `=yend` CRC is the acceptance test — and a container is no exception. The
+/// hint is used to place the map; every disagreement with it costs the set its
+/// route and nothing more, with the job left to the conventional path. Here
+/// volume zero overstates itself by a byte, which the next volume's own
+/// declaration contradicts.
+#[tokio::test]
+async fn sevenz_store_demotes_a_container_whose_part_size_hint_is_wrong() {
+    let member = payload(73, 36_000);
+    let archive = build_7z(
+        &[Entry::file(MEMBER, member.clone())],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, 3);
+    let overstated = BTreeMap::from([(0, volumes[0].1.len() as u64 + 1)]);
+
+    let outcome = run_sevenz_gate_declaring(
+        JobId(9_618),
+        &volumes,
+        &overstated,
+        &in_order_arrivals(volumes.len()),
+        &[MEMBER],
+    )
+    .await;
+    assert!(
+        outcome.sets.contains("Demoted") && outcome.sets.contains("VolumeSize"),
+        "a hint the posting contradicts must demote the set\nsets: {}",
+        outcome.sets
+    );
+    assert!(
+        !matches!(outcome.status, Some(JobStatus::Failed { .. })),
+        "and must cost the set its route rather than the job its download\nsets: {}",
+        outcome.sets
+    );
+}
+
+/// With no length stated for volume zero there is no part size, and with no
+/// part size there is no map to place — this route needs the hint, and the
+/// conventional path does not. So the set steps aside rather than guessing.
+#[tokio::test]
+async fn sevenz_store_refuses_a_container_whose_first_volume_states_no_length() {
+    let member = payload(79, 36_000);
+    let archive = build_7z(
+        &[Entry::file(MEMBER, member.clone())],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, 2);
+    let unstated = BTreeMap::from([(0, 0)]);
+
+    let outcome = run_sevenz_gate_declaring(
+        JobId(9_619),
+        &volumes,
+        &unstated,
+        &in_order_arrivals(volumes.len()),
+        &[MEMBER],
+    )
+    .await;
+    assert!(
+        outcome.sets.contains("VolumeHintUnusable"),
+        "a container with no part size states nothing this route can use\nsets: {}",
+        outcome.sets
+    );
+    assert!(
+        !matches!(outcome.status, Some(JobStatus::Failed { .. })),
+        "and the conventional path must take it from there\nsets: {}",
+        outcome.sets
+    );
+}
+
+/// What a volume actually decoded to is the authority; the declaration was only
+/// ever the early warning.
+///
+/// A volume that ends shorter than the map placed it means every byte routed
+/// after its boundary went somewhere wrong, so the check is deliberately not
+/// conditional on having routed nothing yet: the set demotes, and the members
+/// it was part-way through writing are not shipped.
+#[tokio::test]
+async fn sevenz_store_demotes_a_volume_that_decodes_shorter_than_the_map_placed_it() {
+    /// Bytes withheld from the middle volume's last article.
+    const SHORT_BY: usize = 8;
+    let member = payload(83, 36_000);
+    let archive = build_7z(
+        &[Entry::file(MEMBER, member.clone())],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, 3);
+    let job_id = JobId(9_620);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) == (1, ARTICLES_PER_VOLUME as u32 - 1) {
+            let (filename, bytes) = &volumes[1];
+            let (start, end) = article_extent(bytes.len(), segment_number, ARTICLES_PER_VOLUME);
+            submit_decoded_segment(
+                &mut pipeline,
+                NzbFileId {
+                    job_id,
+                    file_index: 1,
+                },
+                segment_number,
+                start as u64,
+                &bytes[start..end - SHORT_BY],
+                filename,
+                None,
+            )
+            .await;
+            continue;
+        }
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES_PER_VOLUME,
+        )
+        .await;
+    }
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(
+        sets.contains("Demoted") && sets.contains("VolumeSize"),
+        "a volume shorter than its place in the map must demote the set\nsets: {sets}"
+    );
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    assert!(
+        [output_root.join(MEMBER), working_dir.join(MEMBER)]
+            .iter()
+            .all(|path| !path.exists()),
+        "and the member it was writing must not be shipped\nsets: {sets}"
     );
 }

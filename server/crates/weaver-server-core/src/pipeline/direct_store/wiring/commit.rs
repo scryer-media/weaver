@@ -97,7 +97,7 @@ impl Pipeline {
             ));
 
         // Before the route, because routing is what parses: a container whose
-        // last volume has just declared its length may become readable in this
+        // volume zero has just declared its length may become readable in this
         // very call.
         let declared = match self.direct_store.set_mut(job_id, set_index) {
             Some(set) => set.note_declared_volume_size(volume_index, declared_volume_len),

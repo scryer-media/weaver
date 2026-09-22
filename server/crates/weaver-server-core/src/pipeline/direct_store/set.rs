@@ -757,7 +757,7 @@ impl DirectSet {
         if let Some(barrier) = self.barrier.as_mut() {
             barrier.note_volume_complete(volume_index, decoded_len);
         }
-        match self.router.note_volume_complete(volume_index) {
+        match self.router.note_volume_complete(volume_index, decoded_len) {
             Ok(spans) => {
                 if !spans.is_empty() {
                     self.latched_direct = true;

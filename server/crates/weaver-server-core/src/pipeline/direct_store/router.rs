@@ -2277,6 +2277,18 @@ pub(crate) struct DirectSetRouter {
     /// What the container's signature header said about where its end header
     /// lives. 7z only, and read once.
     sevenz_start: Option<sevenz::StartHeader>,
+    /// The geometry the layout was resolved against, kept so that every
+    /// volume's decoded length can be checked against it as the volume
+    /// completes. That check is the authoritative one — a yEnc `size=` is a
+    /// hint, and what decodes is the fact.
+    sevenz_geometry: Option<sevenz::ContainerGeometry>,
+    /// What each volume actually decoded to, recorded as it completed.
+    ///
+    /// A volume can finish arriving before the map is read — the tail it lives
+    /// in may be the last thing to land — so the check cannot only run forwards
+    /// from the geometry. These are what the geometry is held against the
+    /// moment it exists.
+    sevenz_decoded_volume_lengths: BTreeMap<u32, u64>,
     /// The container map a 7z parse produced, kept for the restart cache.
     sevenz_facts: Option<sevenz::SevenZipContainerFacts>,
     /// The newest accepted header facts per volume.
@@ -2526,6 +2538,8 @@ impl DirectSetRouter {
             layout: None,
             declared_volume_sizes: BTreeMap::new(),
             sevenz_start: None,
+            sevenz_geometry: None,
+            sevenz_decoded_volume_lengths: BTreeMap::new(),
             sevenz_facts: None,
             volume_facts: BTreeMap::new(),
             dirty_facts: std::collections::BTreeSet::new(),

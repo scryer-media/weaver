@@ -28,11 +28,13 @@
 //!   and the container's every member is known, or nothing is. That is what
 //!   makes the layout here a one-shot build with `chain_complete` already true,
 //!   where the RAR builder grows volume by volume.
-//! - **The geometry has to close before anything is trusted.** The start header
-//!   states where the end header begins and how long it is; the volumes state
-//!   their own lengths. Those three numbers must agree that the end header
-//!   finishes exactly at the container's last byte, or the file the NZB posted
-//!   is not the file the header describes.
+//! - **The geometry is two facts, and everything else is arithmetic.** The
+//!   part size is volume zero's own length; the total is where the start
+//!   header's coordinates put the end of the end header. Every volume boundary
+//!   follows from those two, so no other volume has to be heard from before a
+//!   container offset becomes a (volume, offset) pair. What the volumes go on
+//!   to state about themselves is checked against that, never waited on: a
+//!   disagreement demotes the set, it does not fail the job.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -91,26 +93,54 @@ pub(crate) enum SevenZipRefusal {
     /// while its map is being read has no layout and no overlay, so its
     /// volumes have to be real.
     UnsafeDestination,
-    /// A volume that will never state its length: no article of it is queued,
-    /// in flight or awaiting a retry, and none of the ones that arrived carried
-    /// a yEnc header.
+    /// Volume zero states no length this router can place a map against: none
+    /// at all, or zero.
     ///
-    /// A container's map is read against the concatenation of its volumes, so
-    /// one length nobody will ever state withholds the map from the *whole*
-    /// set — however much of every other volume is already here. Nothing else
-    /// ends that wait: the budget ceilings only fire on a set big enough to
-    /// reach them, and a small set would sit unresolved with no article
-    /// outstanding to change its mind.
+    /// A split container is a byte split at a fixed part size, and volume
+    /// zero's length is the only statement of what that size is. Without it
+    /// every container offset is unplaceable, so the set is not routable
+    /// direct and says so before it holds anything beyond its probe articles.
+    ///
+    /// Not a judgement on the posting. A yEnc `size=` is advisory — weaver does
+    /// not validate it, and a volume with none is still perfectly downloadable
+    /// — so this refuses *this route* and hands the set to the conventional
+    /// path, which needs no such hint.
+    VolumeHintUnusable,
+    /// The map is still unread and nothing is left that could change that: no
+    /// article of the set is queued, retrying, downloading, decoding, reserved
+    /// or pending decode, and no released lane result is outstanding.
+    ///
+    /// Covers a missing volume zero, a missing volume anywhere in the middle
+    /// and a missing tail alike, because all three come to the same thing —
+    /// a parse that is not settled and no article left that could settle it.
+    /// Nothing else ends that wait: the budget ceilings only fire on a set big
+    /// enough to reach them, and a small set would sit unresolved forever.
     ///
     /// The RAR analogue is [`super::DemotionReason::UnparsableVolume`], which
     /// says the same thing one volume at a time — a header walk shown its
     /// ceiling and still holding no member is never going to hold one. This is
-    /// that verdict for a format whose layout is one fact about every volume at
-    /// once, and it is reached by the set running out of articles rather than
-    /// by it spending a ceiling.
-    UnreadableVolumeLength,
-    /// The volumes' declared lengths and the start header's own coordinates do
-    /// not describe one container.
+    /// that verdict for a format whose layout is one fact about the whole
+    /// concatenation, and it is reached by the set running out of articles
+    /// rather than by it spending a ceiling.
+    UnreadableMap,
+    /// A volume whose length is not the one the container's own coordinates
+    /// require of it.
+    ///
+    /// The container's geometry is two facts: the part size volume zero states,
+    /// and the total the start header's own coordinates give. Together they say
+    /// exactly how long every volume must be. This is raised when something
+    /// disagrees with that — a volume's declared length when it arrives, a
+    /// volume's **decoded** length when it completes, a part count that does
+    /// not match the set's, or a total the hint cannot divide into a sane
+    /// number of parts.
+    ///
+    /// The decoded check is the authoritative one and it is deliberately not
+    /// conditional on having routed nothing yet: a set that routed against a
+    /// wrong part size wrote its members' bytes at offsets no reader will look
+    /// for them at, and the demotion is what stops those bytes from shipping.
+    /// The declared check is only an earlier chance at the same verdict — a
+    /// yEnc `size=` is advisory, so its agreement proves nothing and its
+    /// disagreement is merely the first evidence to arrive.
     VolumeSize,
     /// The header's coordinates do not describe one archive: members that
     /// overlap, run backwards, reach past the container, leave a block's packed
@@ -127,7 +157,8 @@ impl SevenZipRefusal {
             Self::AntiItem => "7z_anti_item",
             Self::Redirection => "7z_redirection",
             Self::UnsafeDestination => "7z_unsafe_destination",
-            Self::UnreadableVolumeLength => "7z_unreadable_volume_length",
+            Self::VolumeHintUnusable => "7z_volume_hint_unusable",
+            Self::UnreadableMap => "7z_unreadable_map",
             Self::VolumeSize => "7z_volume_size",
             Self::Geometry => "7z_geometry",
         }
@@ -181,6 +212,93 @@ impl StartHeader {
     }
 }
 
+/// The most parts a container may be split into before its own start header is
+/// believed.
+///
+/// A start header is read before a single byte of it has been checked against
+/// anything, so `total / part_size` is arithmetic over two numbers a bad
+/// posting is free to have made up. Without a ceiling a header declaring a
+/// total near `u64::MAX` asks this router to plan for more volumes than the
+/// job has articles. Well clear of any real posting: the largest split sets
+/// seen in the wild are a few thousand parts.
+pub(super) const MAX_CONTAINER_PARTS: u64 = 100_000;
+
+/// What a split container's geometry is, derived from the two facts that state
+/// it.
+///
+/// A split 7z is a pure byte split at a fixed size, so the whole concatenation
+/// is described by the part size and the total — and every volume's length
+/// follows. That is what lets a set place its map without having heard from
+/// every volume: it needs volume zero and the tail, not the whole set.
+///
+/// `part_size` is a **hint**. It comes from volume zero's yEnc `size=`, which
+/// weaver does not validate anywhere else and which a posting is free to state
+/// wrongly or not at all. Everything here is therefore provisional until the
+/// volumes decode: see [`SevenZipRefusal::VolumeSize`] for what happens when
+/// the bytes disagree with the plan derived from the hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ContainerGeometry {
+    /// Volume zero's declared length, which every volume but the last has.
+    pub(super) part_size: u64,
+    /// The container's length, from the start header's own coordinates: the
+    /// end header is the last thing in a 7z file, so where it ends is where the
+    /// file ends.
+    pub(super) total: u64,
+    /// How many volumes that is.
+    pub(super) parts: u64,
+}
+
+impl ContainerGeometry {
+    /// Derives the geometry, or says why these two numbers do not describe one
+    /// container.
+    pub(super) fn derive(part_size: u64, start: &StartHeader) -> Result<Self, SevenZipRefusal> {
+        let total = start.end_header_end().ok_or(SevenZipRefusal::VolumeSize)?;
+        Self::derive_from_total(part_size, total)
+    }
+
+    /// The same derivation from a total already in hand — the restore path,
+    /// where the start header's own bytes are long gone.
+    pub(super) fn derive_from_total(part_size: u64, total: u64) -> Result<Self, SevenZipRefusal> {
+        if part_size == 0 {
+            return Err(SevenZipRefusal::VolumeHintUnusable);
+        }
+        let total = total.max(1);
+        let parts = total.div_ceil(part_size);
+        if parts > MAX_CONTAINER_PARTS {
+            return Err(SevenZipRefusal::VolumeSize);
+        }
+        Ok(Self {
+            part_size,
+            total,
+            parts,
+        })
+    }
+
+    /// How long volume `volume_index` must be, or `None` for a volume this
+    /// geometry does not have.
+    ///
+    /// Every part is `part_size` except the last, which is whatever is left —
+    /// which is how a split writer produces the short tail real sets have.
+    pub(super) fn expected_len(&self, volume_index: u32) -> Option<u64> {
+        let index = u64::from(volume_index);
+        if index >= self.parts {
+            return None;
+        }
+        if index + 1 == self.parts {
+            return Some(self.total - (self.parts - 1) * self.part_size);
+        }
+        Some(self.part_size)
+    }
+
+    /// Every volume's length, dense from volume zero, in the shape
+    /// [`SevenZipLayout::build`] resolves coordinates against.
+    pub(super) fn lengths(&self) -> BTreeMap<u32, u64> {
+        (0..self.parts as u32)
+            .filter_map(|volume| Some((volume, self.expected_len(volume)?)))
+            .collect()
+    }
+}
+
 /// One entry the end header names, in container coordinates.
 ///
 /// This is the durable form: it is what the restart cache stores and what the
@@ -216,6 +334,18 @@ pub(crate) struct SevenZipEntryFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SevenZipContainerFacts {
     pub(crate) entries: Vec<SevenZipEntryFacts>,
+    /// The container's length, as the start header's coordinates gave it.
+    ///
+    /// Cached because the start header is not: its 32 bytes sit below the
+    /// published floors and are never refetched, so a restored set has no way
+    /// to re-read them. With this and volume zero's cached length the geometry
+    /// is derivable again, which is what turns the map's container offsets back
+    /// into the (volume, offset) pairs everything downstream is expressed in.
+    ///
+    /// Zero means a row written before the geometry was cached; such a set
+    /// restores no layout and parses again over its refetched tail.
+    #[serde(default)]
+    pub(crate) total: u64,
 }
 
 /// One dataless entry finalization creates rather than routes.
@@ -232,7 +362,7 @@ pub(crate) struct SevenZipDatalessEntry {
     pub(crate) accessed: Option<u64>,
 }
 
-/// The container map, resolved against the volumes' lengths.
+/// The container map, resolved against the geometry's volume lengths.
 ///
 /// Built once, complete, from the end header. There is no growing it: a 7z
 /// container states its whole map in one place, so either this exists and is
@@ -241,7 +371,7 @@ pub(crate) struct SevenZipDatalessEntry {
 pub(super) struct SevenZipLayout {
     /// Container offset each volume begins at, dense from volume zero.
     bases: Vec<u64>,
-    /// Each volume's declared length, in the same order.
+    /// Each volume's length, in the same order.
     lengths: Vec<u64>,
     /// Data-bearing entries, in ascending container order, with their parts
     /// already cut at the volume boundaries.
@@ -251,12 +381,13 @@ pub(super) struct SevenZipLayout {
 }
 
 impl SevenZipLayout {
-    /// Resolves the container's entries against the volumes' declared lengths.
+    /// Resolves the container's entries against the volume lengths the
+    /// geometry puts there.
     ///
-    /// `lengths` must be dense from volume zero; the caller does not build a
-    /// layout before every volume has stated its length, because a member's
-    /// part boundaries are the volume boundaries and a missing length moves
-    /// every boundary after it.
+    /// `lengths` must be dense from volume zero, and is: they are derived from
+    /// the part size and the total rather than collected from the volumes, so
+    /// every boundary is known as soon as those two facts are, whether or not
+    /// the volume that sits at it has been heard from.
     pub(super) fn build(
         lengths: &BTreeMap<u32, u64>,
         facts: &SevenZipContainerFacts,
@@ -614,7 +745,7 @@ pub(super) fn container_facts(
         }
     }
 
-    Ok(SevenZipContainerFacts { entries })
+    Ok(SevenZipContainerFacts { entries, total: 0 })
 }
 
 /// Which refusal a non-`Copy` block earns.
@@ -843,7 +974,12 @@ pub(super) fn parse_container(
         return ParseOutcome::Refused(SevenZipRefusal::EncryptedHeader);
     };
     match container_facts(&archive) {
-        Ok(facts) => ParseOutcome::Facts(Box::new(facts)),
+        // Stamped here rather than inside `container_facts`, which reads the
+        // end header and never sees the start header's coordinates.
+        Ok(mut facts) => {
+            facts.total = total;
+            ParseOutcome::Facts(Box::new(facts))
+        }
         Err(refusal) => ParseOutcome::Refused(refusal),
     }
 }
