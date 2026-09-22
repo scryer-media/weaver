@@ -1954,6 +1954,7 @@ async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
             data: DecodedChunk::from(bytes.to_vec()),
             part_crc: checksum::crc32(bytes),
             part_crc_verified: true,
+            declared_file_len: 0,
             yenc_name: name.to_string(),
             checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             segments: Vec::new(),

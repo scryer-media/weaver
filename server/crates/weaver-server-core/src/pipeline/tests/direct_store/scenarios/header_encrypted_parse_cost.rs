@@ -30,6 +30,7 @@ const PIECE_BYTES: usize = 512;
 fn parse_cost_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
     let plan = DirectSetPlan {
         set_name: "silver.horizon".to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: (0..volumes.len() as u32)
             .map(|index| (index, index))
             .collect(),

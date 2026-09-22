@@ -2094,6 +2094,11 @@ pub(super) struct BufferedDecodedSegment {
     pub(super) data: DecodedChunk,
     pub(super) part_crc: u32,
     pub(super) part_crc_verified: bool,
+    /// The whole-file length this article's yEnc header declares. Carried so
+    /// a segment parked in the write buffer still states its file's length
+    /// when it is replayed later, which is the only thing a byte-split
+    /// container needs before it can place anything.
+    pub(super) declared_file_len: u64,
     pub(super) yenc_name: String,
     /// Block-aligned CRC32 segments carried from the decoder to the evidence
     /// collector, which runs after the bytes are durable.

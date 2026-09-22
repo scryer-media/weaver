@@ -408,6 +408,7 @@ fn direct_active_job() -> crate::ActiveJob {
 fn envelope_plan() -> DirectSetPlan {
     DirectSetPlan {
         set_name: "Silver.Horizon.S01E05".to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32), (1, 1)].into_iter().collect(),
         files: [(0u32, 0u32), (1, 1)].into_iter().collect(),
         identity: None,
@@ -877,7 +878,20 @@ fn member_facts(
     }
 }
 
+/// Cached facts for one RAR volume, in the envelope restore reads them from.
 fn volume_facts(
+    volume_number: u32,
+    more_volumes: bool,
+    members: Vec<unrar_rs::RarVolumeMemberFacts>,
+) -> crate::pipeline::direct_store::restart::DirectVolumeFacts {
+    crate::pipeline::direct_store::restart::DirectVolumeFacts::Rar(Box::new(rar_volume_facts(
+        volume_number,
+        more_volumes,
+        members,
+    )))
+}
+
+fn rar_volume_facts(
     volume_number: u32,
     more_volumes: bool,
     members: Vec<unrar_rs::RarVolumeMemberFacts>,
@@ -915,6 +929,7 @@ const REARM_MEMBER: &str = "Silver.Horizon.S01E04.mkv";
 fn rearm_router() -> DirectSetRouter {
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
         files: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
         identity: None,
@@ -1024,6 +1039,7 @@ const HOLE_SLICE_SIZE: u64 = 64;
 fn straddle_router(member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
@@ -1114,6 +1130,7 @@ fn encrypted_crypt_router_partial(
 
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
@@ -1314,6 +1331,7 @@ mod repair_transactions;
 fn straddle_router_in(dir: &Path, member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
@@ -1463,6 +1481,7 @@ fn a_routed_span_reports_the_length_of_every_piece_it_carries() {
 fn layoutless_router() -> DirectSetRouter {
     DirectSetRouter::new(DirectSetPlan {
         set_name: SET.to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
@@ -1559,7 +1578,7 @@ fn a_long_hold_keeps_its_view_unless_the_pool_is_scarce() {
     );
     assert_eq!(pool.metrics().small_in_use, 0);
     assert!(
-        pool.is_scarce(crate::runtime::buffers::BufferTier::Small) == false,
+        !pool.is_scarce(crate::runtime::buffers::BufferTier::Small),
         "the returned slot is the whole pool, so it is no longer scarce"
     );
 }

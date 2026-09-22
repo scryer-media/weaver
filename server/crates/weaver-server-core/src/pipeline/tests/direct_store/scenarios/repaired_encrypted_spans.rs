@@ -22,6 +22,7 @@ const REPAIR_MEMBER: &str = "Silver.Horizon.S02E01.mkv";
 fn encrypted_router(volumes: &[(String, Vec<u8>)], password: &str) -> DirectSetRouter {
     let plan = DirectSetPlan {
         set_name: "silver.horizon".to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: (0..volumes.len() as u32)
             .map(|index| (index, index))
             .collect(),
@@ -686,6 +687,7 @@ async fn a_second_damaged_volume_waits_for_its_own_rewrite() {
 fn plain_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
     DirectSetRouter::new(DirectSetPlan {
         set_name: "silver.horizon".to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: (0..volumes.len() as u32)
             .map(|index| (index, index))
             .collect(),

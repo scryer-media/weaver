@@ -75,6 +75,7 @@ async fn parked_damage_masks_accepted_and_reconstructed_ranges_after_reset() {
                 write_spans: Vec::new(),
             })),
             decoded_size: 5,
+            declared_file_len: 0,
             encoding: SegmentEncoding::Yenc,
             checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             data: DecodedChunk::from(vec![

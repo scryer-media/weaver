@@ -307,6 +307,7 @@ async fn retained_promoted_recovery_buffer_does_not_report_active_fetch() {
         data: DecodedChunk::from(bytes.clone()),
         part_crc: par2_rs::checksum::crc32(&bytes),
         part_crc_verified: true,
+        declared_file_len: 0,
         yenc_name: "silver-horizon.par2".to_string(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),

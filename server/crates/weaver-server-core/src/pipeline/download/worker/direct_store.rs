@@ -1,4 +1,5 @@
 use super::*;
+use crate::pipeline::direct_store::router::HeaderProbe as DirectHeaderProbe;
 
 pub(in crate::pipeline::download) struct DirectStoreAdmission {
     files: HashSet<u32>,
@@ -90,29 +91,50 @@ impl Pipeline {
                 let probe = if busy {
                     None
                 } else {
-                    set.plan()
-                        .volumes
-                        .iter()
-                        .filter(|(_, file)| {
-                            state.download_queue.queued_count_for_file(NzbFileId {
-                                job_id,
-                                file_index: **file,
-                            }) != 0
-                                || self.pending_retries_by_segment.iter().any(|(id, count)| {
-                                    id.file_id.job_id == job_id
-                                        && id.file_id.file_index == **file
-                                        && *count != 0
-                                })
-                        })
-                        .min_by_key(|(volume, _)| {
-                            (!set.router.volume_needs_header(**volume), **volume)
-                        })
-                        .and_then(|(_, file)| {
-                            state.download_queue.peek_first_matching(|work| {
-                                work.segment_id.file_id.file_index == *file
+                    let unresolved = |file: &u32| {
+                        state.download_queue.queued_count_for_file(NzbFileId {
+                            job_id,
+                            file_index: *file,
+                        }) != 0
+                            || self.pending_retries_by_segment.iter().any(|(id, count)| {
+                                id.file_id.job_id == job_id
+                                    && id.file_id.file_index == *file
+                                    && *count != 0
                             })
-                        })
-                        .map(|work| work.segment_id)
+                    };
+                    // Which end of which volume resolves this set's layout. For
+                    // RAR it is always the front of the earliest volume whose
+                    // headers are unread; for a 7z container whose signature
+                    // header has been read it is the *tail*, because that is
+                    // where a 7z states its map.
+                    match set.header_probe() {
+                        DirectHeaderProbe::Settled => None,
+                        DirectHeaderProbe::Latest { volume } => set
+                            .plan()
+                            .volumes
+                            .get(&volume)
+                            .filter(|file| unresolved(file))
+                            .and_then(|file| {
+                                state.download_queue.peek_last_matching(|work| {
+                                    work.segment_id.file_id.file_index == *file
+                                })
+                            })
+                            .map(|work| work.segment_id),
+                        DirectHeaderProbe::Earliest => set
+                            .plan()
+                            .volumes
+                            .iter()
+                            .filter(|(_, file)| unresolved(file))
+                            .min_by_key(|(volume, _)| {
+                                (!set.router.volume_needs_header(**volume), **volume)
+                            })
+                            .and_then(|(_, file)| {
+                                state.download_queue.peek_first_matching(|work| {
+                                    work.segment_id.file_id.file_index == *file
+                                })
+                            })
+                            .map(|work| work.segment_id),
+                    }
                 };
                 DirectStoreAdmission {
                     files,

@@ -2686,6 +2686,7 @@ mod disk_write_handle_cache_tests {
             data: DecodedChunk::from(bytes.to_vec()),
             part_crc: 0,
             part_crc_verified: false,
+            declared_file_len: 0,
             yenc_name: String::new(),
             checkpoint_plan: weaver_yenc::CheckpointPlan::None,
             segments: Vec::new(),

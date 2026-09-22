@@ -4,6 +4,7 @@ use super::*;
 fn transaction_set() -> DirectSet {
     let plan = DirectSetPlan {
         set_name: SET.into(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0, 0), (1, 1)].into(),
         files: [(0, 0), (1, 1)].into(),
         identity: None,

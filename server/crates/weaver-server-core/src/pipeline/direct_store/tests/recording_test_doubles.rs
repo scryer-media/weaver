@@ -2257,6 +2257,7 @@ fn two_sets_of_one_job_never_share_a_derived_path() {
     let first = envelope_plan();
     let mut second = DirectSetPlan {
         set_name: "Silver.Horizon/S01E05".to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 2u32), (1, 3)].into_iter().collect(),
         files: [(0u32, 2u32), (1, 3)].into_iter().collect(),
         identity: None,
@@ -2467,6 +2468,7 @@ fn destination_names_stay_inside_the_filename_ceiling_with_their_suffix() {
     let long = "S".repeat(400);
     let plan = DirectSetPlan {
         set_name: long.clone(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: [(0u32, 0u32), (7, 7)].into_iter().collect(),
         files: [(0u32, 0u32), (7, 7)].into_iter().collect(),
         identity: None,

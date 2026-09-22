@@ -1531,6 +1531,7 @@ impl Pipeline {
             .map(|roster| roster.volumes.len() as u32)?;
         let plan = DirectSetPlan {
             set_name: set_name.clone(),
+            format: crate::pipeline::direct_store::plan::SetFormat::Rar,
             volumes: BTreeMap::from([(volume_index, file_index)]),
             files: HashMap::from([(file_index, volume_index)]),
             identity: Some(IdentityPlanFacts {
@@ -1890,6 +1891,7 @@ impl Pipeline {
             let password = state.spec.password.clone();
             let plan = DirectSetPlan {
                 set_name: format!("obfuscated-set.f{file_index}"),
+                format: crate::pipeline::direct_store::plan::SetFormat::Rar,
                 volumes: BTreeMap::from([(volume_number, file_index)]),
                 files: HashMap::from([(file_index, volume_number)]),
                 identity: Some(IdentityPlanFacts {
@@ -1943,6 +1945,7 @@ impl Pipeline {
         let password = state.spec.password.clone();
         let plan = DirectSetPlan {
             set_name: format!("obfuscated-archive.f{file_index}"),
+            format: crate::pipeline::direct_store::plan::SetFormat::Rar,
             volumes: BTreeMap::from([(0, file_index)]),
             files: HashMap::from([(file_index, 0)]),
             identity: Some(IdentityPlanFacts {
@@ -2004,8 +2007,15 @@ impl Pipeline {
             for (offset, segment) in parked {
                 let segment_number = segment.segment_id.segment_number;
                 let decoded_size = segment.decoded_size;
+                let declared_file_len = segment.declared_file_len;
                 match self
-                    .handle_direct_decode_success(set_index, volume_index, segment, offset)
+                    .handle_direct_decode_success(
+                        set_index,
+                        volume_index,
+                        segment,
+                        offset,
+                        declared_file_len,
+                    )
                     .await
                 {
                     DirectRouteOutcome::Routed => {

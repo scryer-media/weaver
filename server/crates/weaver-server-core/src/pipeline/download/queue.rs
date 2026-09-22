@@ -401,6 +401,26 @@ impl DownloadQueue {
         None
     }
 
+    /// The **highest-numbered** queued segment of the matching work, ignoring
+    /// dispatch priority.
+    ///
+    /// The one caller is the direct-store header probe over a 7z set, whose map
+    /// lives in the last bytes of the last volume. It cannot ask for "the
+    /// article covering offset X": a yEnc article's byte range is only known
+    /// once it has been decoded, and the NZB's own `bytes=` is an *encoded*
+    /// size. Segment order is the only ordering that exists before a byte
+    /// lands, and because a landed article leaves the queue, asking for the
+    /// highest one still queued walks backwards from the tail on its own.
+    pub fn peek_last_matching(
+        &self,
+        mut matches: impl FnMut(&DownloadWork) -> bool,
+    ) -> Option<&DownloadWork> {
+        self.iter()
+            .map(|Reverse(item)| &item.work)
+            .filter(|work| matches(work))
+            .max_by_key(|work| work.segment_id.segment_number)
+    }
+
     /// The head of one dispatch class without removing it, in O(1).
     ///
     /// For decisions that are about the *shape* of the work rather than the

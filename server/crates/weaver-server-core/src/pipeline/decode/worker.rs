@@ -1898,6 +1898,7 @@ impl Pipeline {
                     data,
                     part_crc,
                     part_crc_verified: false,
+                    declared_file_len: yenc_layout.file_size,
                     yenc_name,
                     checkpoint_plan,
                     segments,
@@ -2043,6 +2044,7 @@ impl Pipeline {
                 data,
                 part_crc,
                 part_crc_verified,
+                declared_file_len: yenc_layout.file_size,
                 yenc_name,
                 checkpoint_plan,
                 segments,
@@ -2139,6 +2141,7 @@ impl Pipeline {
                             volume_index,
                             buffered_segment,
                             file_offset,
+                            yenc_layout.file_size,
                         )
                         .await;
                     match outcome {
@@ -3510,6 +3513,7 @@ impl Pipeline {
             data,
             part_crc,
             part_crc_verified,
+            declared_file_len: _,
             yenc_name,
             checkpoint_plan,
             segments,
