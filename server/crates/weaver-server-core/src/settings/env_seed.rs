@@ -1090,6 +1090,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let existing = Config {
             data_dir: "/db".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,

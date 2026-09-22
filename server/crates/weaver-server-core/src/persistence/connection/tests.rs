@@ -2126,6 +2126,7 @@ async fn postgres_runtime_smoke_when_configured() {
 
     let config = Config {
         data_dir: "/tmp/weaver-pg".to_string(),
+        hardware_profile: None,
         intermediate_dir: Some("/tmp/weaver-pg/intermediate".to_string()),
         complete_dir: Some("/tmp/weaver-pg/complete".to_string()),
         buffer_pool: Some(BufferPoolOverrides {

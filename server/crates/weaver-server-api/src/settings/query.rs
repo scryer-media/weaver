@@ -29,6 +29,43 @@ impl SettingsQuery {
             .await,
         )
     }
+    /// The hardware profile in force, and the profiles this machine can
+    /// honour. Judged against the live probe, so a container that was given
+    /// more memory since startup is offered what it has now.
+    #[graphql(guard = "AdminGuard")]
+    async fn hardware_profile(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::types::HardwareProfileSettings> {
+        use weaver_server_core::runtime::HardwareProfile;
+
+        let config = ctx.data::<SharedConfig>()?;
+        let system = ctx.data::<crate::context::SystemRuntimeContext>()?;
+        let profile = system
+            .profile
+            .read()
+            .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
+            .clone();
+
+        let selected = with_timed_config_read(config, "settings.query.hardwareProfile", |cfg| {
+            cfg.hardware_profile
+        })
+        .await;
+
+        Ok(crate::settings::types::HardwareProfileSettings {
+            selected: selected.map(Into::into),
+            recommended: HardwareProfile::recommended(&profile).into(),
+            available: HardwareProfile::available(&profile)
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            detected: crate::settings::types::DetectedHardware {
+                memory_bytes: HardwareProfile::effective_memory_bytes(&profile),
+                cores: HardwareProfile::effective_cores(&profile) as u32,
+            },
+        })
+    }
+
     /// Whether first-run setup is still owed to this install.
     #[graphql(guard = "AdminGuard")]
     async fn first_run_setup(

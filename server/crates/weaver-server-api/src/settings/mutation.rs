@@ -21,6 +21,77 @@ pub(crate) struct SettingsMutation;
 
 #[Object]
 impl SettingsMutation {
+    /// Choose how hard Weaver leans on this machine.
+    ///
+    /// A profile the machine cannot honour is refused by name rather than
+    /// quietly downgraded, so an operator who asked for more is told what the
+    /// hardware is short of.
+    #[graphql(guard = "AdminGuard")]
+    async fn set_hardware_profile(
+        &self,
+        ctx: &Context<'_>,
+        profile: crate::settings::types::HardwareProfileGql,
+    ) -> Result<crate::settings::types::HardwareProfileSettings> {
+        use weaver_server_core::runtime::HardwareProfile;
+        use weaver_server_core::settings::HARDWARE_PROFILE_SETTING;
+
+        let config = ctx.data::<SharedConfig>()?;
+        let db = ctx.data::<Database>()?;
+        let handle = ctx.data::<SchedulerHandle>()?;
+        let system = ctx.data::<crate::context::SystemRuntimeContext>()?;
+        let _mutation_guard = SETTINGS_MUTATION_GUARD.lock().await;
+
+        let detected = system
+            .profile
+            .read()
+            .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
+            .clone();
+        let chosen: HardwareProfile = profile.into();
+        if let Some(requirement) = chosen.unmet_requirement(&detected) {
+            return Err(async_graphql::Error::new(requirement));
+        }
+
+        let persist = {
+            let db = db.clone();
+            let stored = chosen.as_str();
+            async move {
+                spawn_blocking_db(
+                    "settings.mutation.set_hardware_profile.persist",
+                    move || -> std::result::Result<(), weaver_server_core::StateError> {
+                        db.set_setting(HARDWARE_PROFILE_SETTING, stored)
+                    },
+                )
+                .await
+            }
+        };
+        persist_then_update_config(
+            config,
+            "settings.mutation.set_hardware_profile",
+            persist,
+            |cfg| {
+                cfg.hardware_profile = Some(chosen);
+            },
+        )
+        .await?;
+
+        // Memory limits reach the next job that starts; the thread pools were
+        // sized at startup and keep their size until the next one.
+        handle.set_sevenz_decode_memory_bytes(chosen.tuning(&detected).sevenz_decode_memory_bytes);
+
+        Ok(crate::settings::types::HardwareProfileSettings {
+            selected: Some(profile),
+            recommended: HardwareProfile::recommended(&detected).into(),
+            available: HardwareProfile::available(&detected)
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            detected: crate::settings::types::DetectedHardware {
+                memory_bytes: HardwareProfile::effective_memory_bytes(&detected),
+                cores: HardwareProfile::effective_cores(&detected) as u32,
+            },
+        })
+    }
+
     /// Update general settings.
     #[graphql(guard = "AdminGuard")]
     async fn update_settings(
@@ -615,6 +686,7 @@ mod tests {
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
             data_dir: "/tmp/weaver".to_string(),
+            hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
             buffer_pool: None,

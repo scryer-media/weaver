@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use crate::bandwidth::IspBandwidthCapConfig;
 use crate::categories::CategoryConfig;
 use crate::jobs::DuplicatePolicy;
+use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
 use crate::watch_folder::WatchFolderConfig;
 
@@ -63,6 +64,10 @@ pub struct Config {
     /// "every default".
     #[serde(default)]
     pub delivery_naming: Option<DeliveryNamingOverrides>,
+    /// How hard Weaver leans on this machine. Absent means the operator has
+    /// never chosen one, and the machine's recommendation stands in.
+    #[serde(default)]
+    pub hardware_profile: Option<HardwareProfile>,
     /// Prometheus exposition knobs.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -395,6 +400,7 @@ mod tests {
             direct_store: None,
             direct_unpack: None,
             delivery_naming: None,
+            hardware_profile: None,
             metrics: Default::default(),
             config_path: None,
         }

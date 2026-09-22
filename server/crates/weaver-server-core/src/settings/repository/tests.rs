@@ -86,6 +86,7 @@ fn config_roundtrip() {
 
     let config = Config {
         data_dir: "/tmp/weaver".to_string(),
+        hardware_profile: None,
         intermediate_dir: Some("/tmp/intermediate".to_string()),
         complete_dir: Some("/tmp/complete".to_string()),
         buffer_pool: None,

@@ -26,6 +26,7 @@ async fn open_artifact_pool(path: &Path) -> sqlx::SqlitePool {
 fn sample_config() -> Config {
     Config {
         data_dir: "/old/data".into(),
+        hardware_profile: None,
         intermediate_dir: Some("/old/data/intermediate".into()),
         complete_dir: Some("/old/data/complete".into()),
         buffer_pool: None,

@@ -744,6 +744,7 @@ fn build_service_with_security(
 ) -> RssService {
     let config = Arc::new(RwLock::new(Config {
         data_dir: data_dir.display().to_string(),
+        hardware_profile: None,
         intermediate_dir: None,
         complete_dir: None,
         buffer_pool: None,

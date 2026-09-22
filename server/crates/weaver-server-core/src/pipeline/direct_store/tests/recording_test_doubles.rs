@@ -1915,6 +1915,7 @@ fn settings_resolve_reads_the_config_table() {
 
     let mut config = crate::settings::Config {
         data_dir: "/tmp/weaver-direct-store".to_string(),
+        hardware_profile: None,
         intermediate_dir: None,
         complete_dir: None,
         buffer_pool: None,

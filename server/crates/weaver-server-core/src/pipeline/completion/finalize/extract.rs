@@ -2424,6 +2424,9 @@ impl Pipeline {
         let pp_pool = self.pp_pool.clone();
         let sevenz_decode_threads =
             u32::try_from(pp_pool.current_num_threads()).unwrap_or(u32::MAX);
+        // Read when the extraction is admitted, so a hardware profile chosen
+        // since the last job took its allowance applies to this one.
+        let sevenz_decode_memory = self.shared_state.sevenz_decode_memory_bytes();
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
 
         // Whatever the chase left behind. Taken here, on the orchestrator, but
@@ -2463,7 +2466,10 @@ impl Pipeline {
                     // the ceiling using retained state at admission, rather than the stale
                     // snapshot from budget construction. Other active decoders still make
                     // this wait; metadata growth cannot permanently strand the allowance.
-                    let _memory_permit = budget.reserve_memory_ceiling_wait()?;
+                    // The profile's allowance bounds it, so one archive no longer takes
+                    // everything the ceiling permits.
+                    let _memory_permit =
+                        budget.reserve_memory_ceiling_wait_capped(sevenz_decode_memory)?;
                     if file_paths.is_empty() {
                         return Err(format!("no 7z files found for set '{set_name_owned}'"));
                     }

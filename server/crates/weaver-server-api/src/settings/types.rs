@@ -4,8 +4,60 @@ use weaver_server_core::bandwidth::{
     IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday,
 };
 use weaver_server_core::jobs::DuplicatePolicy;
+use weaver_server_core::runtime::HardwareProfile;
 
 use crate::jobs::types::DuplicateActionGql;
+
+/// How hard Weaver leans on the machine it runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+pub enum HardwareProfileGql {
+    Efficient,
+    Balanced,
+    Performance,
+}
+
+impl From<HardwareProfile> for HardwareProfileGql {
+    fn from(value: HardwareProfile) -> Self {
+        match value {
+            HardwareProfile::Efficient => Self::Efficient,
+            HardwareProfile::Balanced => Self::Balanced,
+            HardwareProfile::Performance => Self::Performance,
+        }
+    }
+}
+
+impl From<HardwareProfileGql> for HardwareProfile {
+    fn from(value: HardwareProfileGql) -> Self {
+        match value {
+            HardwareProfileGql::Efficient => Self::Efficient,
+            HardwareProfileGql::Balanced => Self::Balanced,
+            HardwareProfileGql::Performance => Self::Performance,
+        }
+    }
+}
+
+/// What the machine this Weaver runs on can actually use, after any container
+/// limit. The numbers the profile requirements are judged against.
+#[derive(Debug, Clone, Copy, SimpleObject)]
+pub struct DetectedHardware {
+    pub memory_bytes: u64,
+    pub cores: u32,
+}
+
+/// The hardware-profile choice, and everything needed to present it: an
+/// interface with one available profile has nothing to ask and hides the
+/// question entirely.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct HardwareProfileSettings {
+    /// The operator's choice, or null when they have never made one and the
+    /// recommendation is standing in.
+    pub selected: Option<HardwareProfileGql>,
+    /// The most capable profile this machine can honour.
+    pub recommended: HardwareProfileGql,
+    /// Every profile this machine can honour, least demanding first.
+    pub available: Vec<HardwareProfileGql>,
+    pub detected: DetectedHardware,
+}
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct GeneralSettings {

@@ -2,12 +2,17 @@ use crate::StateError;
 use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
 use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
+use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
     DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
+
+/// The key the chosen hardware profile is stored under. Absent until an
+/// operator picks one.
+pub const HARDWARE_PROFILE_SETTING: &str = "hardware_profile";
 
 impl Database {
     /// Load a full `Config` from the settings and servers tables.
@@ -238,6 +243,12 @@ impl Database {
             .unwrap_or(default_duplicate_policy.normalized_name),
         };
 
+        // Absent — and unparseable, from a hand-edited value — both mean "never
+        // chosen", which the runtime answers with the machine's recommendation.
+        let hardware_profile = settings
+            .get(HARDWARE_PROFILE_SETTING)
+            .and_then(|value| HardwareProfile::parse(value));
+
         let metrics = MetricsConfig {
             per_job_series: settings
                 .get("metrics.per_job_series")
@@ -263,6 +274,7 @@ impl Database {
             direct_store,
             direct_unpack,
             delivery_naming,
+            hardware_profile,
             metrics,
             config_path: None,
         })
@@ -426,6 +438,12 @@ impl Database {
             if let Some(v) = retry.multiplier {
                 self.set_setting("retry.multiplier", &v.to_string())?;
             }
+        }
+
+        // Only a chosen profile is written: an absent key is what tells the
+        // settings page the recommendation has not been confirmed yet.
+        if let Some(profile) = config.hardware_profile {
+            self.set_setting(HARDWARE_PROFILE_SETTING, profile.as_str())?;
         }
 
         self.set_setting(
