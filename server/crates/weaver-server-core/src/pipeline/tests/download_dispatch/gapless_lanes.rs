@@ -563,7 +563,10 @@ async fn a_saturated_refill_waits_for_the_lane_to_drain_below_its_share() {
     // Fill the lane to its share, one refill at a time; each is answered
     // from the hot job, and none is sent on to the next.
     let mut first_segment = None;
-    while pipeline.download_lane_holdings(lane_id) < share {
+    for _ in 0..share {
+        if pipeline.download_lane_holdings(lane_id) >= share {
+            break;
+        }
         let (response_tx, response_rx) = oneshot::channel();
         pipeline.handle_download_lane_refill_request(refill_request_on(lane_id, 0, response_tx));
         let lease = response_rx

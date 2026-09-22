@@ -7,7 +7,7 @@
 //! others.
 
 use super::*;
-use crate::pipeline::download::scheduler::{Handout, LaneShare, YieldReason};
+use crate::pipeline::download::scheduler::{Handout, LaneShare, SaturationWake, YieldReason};
 
 const SERVER_A: usize = 0;
 const SERVER_B: usize = 1;
@@ -29,8 +29,8 @@ fn taken(handout: Handout) -> Vec<DownloadWork> {
         Handout::Works(works) => works,
         Handout::Idle => Vec::new(),
         Handout::Yield(reason) => panic!("a whole-link gate fired unexpectedly: {reason:?}"),
-        Handout::Saturated { below } => {
-            panic!("a caller with no lane share was reported saturated below {below}")
+        Handout::Saturated(wake) => {
+            panic!("a caller with no lane share was reported saturated: {wake:?}")
         }
     }
 }
@@ -709,6 +709,45 @@ async fn a_small_job_is_shared_over_every_connection() {
     );
     assert_eq!(queued(&pipeline, next), 600, "the next job is untouched");
     assert_eq!(handouts_spill(&pipeline), 0);
+
+    // The lanes after those empty the hot job's queue: every article of it
+    // is now out on a lane. The next job becomes the hot one, but a lane
+    // still full of the first is not sent on to it — it waits for its own
+    // pipe to drain, and the next job stays untouched.
+    let mut lanes = Vec::new();
+    for _ in 0..40 {
+        if queued(&pipeline, hot) == 0 {
+            break;
+        }
+        let lane = lane_holding(&mut pipeline, hot, 0, 8);
+        let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
+        assert_eq!(single_job(&works), hot);
+        lanes.push((lane, works));
+    }
+    assert_eq!(queued(&pipeline, hot), 0, "the hot job has left the queue");
+    // The last lane took the remainder; the first took a full share.
+    let (lane, works) = lanes.swap_remove(0);
+    assert_eq!(works.len(), 9);
+    let held = lane_holding(&mut pipeline, hot, works.len(), lane.depth);
+    match ask_as_lane(&mut pipeline, SERVER_A, 18, held) {
+        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9 }),
+        other => panic!(
+            "a full lane does not open the next job, got {:?}",
+            taken(other).len()
+        ),
+    }
+    assert_eq!(
+        queued(&pipeline, next),
+        600,
+        "the next job is still untouched"
+    );
+    assert_eq!(handouts_spill(&pipeline), 0);
+
+    // Below a full pipe it opens the next job, with a share of that job.
+    let draining = lane_holding(&mut pipeline, hot, 8, 8);
+    let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, draining));
+    assert_eq!(single_job(&works), next);
+    assert_eq!(works.len(), 9);
 }
 
 /// A lane already at its share is reported busy, not sent on to the next
@@ -727,7 +766,13 @@ async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
     let share = pipeline.lane_share_of_job(hot, 8);
     let full = lane_holding(&mut pipeline, hot, share, 8);
     match ask_as_lane(&mut pipeline, SERVER_A, 18, full) {
-        Handout::Saturated { below } => assert_eq!(below, share),
+        Handout::Saturated(wake) => assert_eq!(
+            wake,
+            SaturationWake {
+                of: Some(hot),
+                below: share
+            }
+        ),
         other => panic!(
             "a lane at its share must be saturated, got {:?}",
             taken(other).len()
@@ -743,11 +788,44 @@ async fn a_lane_at_its_share_is_saturated_rather_than_spilled() {
     assert_eq!(works.len(), 2);
     assert_eq!(single_job(&works), hot);
 
-    // Articles of another job do not count against this one's share.
-    let elsewhere = lane_holding(&mut pipeline, next, share, 8);
+    // Articles of another job do not count against this one's share: a
+    // lane carrying a tail of the next job, below a full pipe, is served the
+    // whole share of the hot one.
+    let elsewhere = lane_holding(&mut pipeline, next, 8, 8);
     let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, elsewhere));
     assert_eq!(works.len(), share);
     assert_eq!(single_job(&works), hot);
+
+    // A lane with a full pipe of another job holds nothing of the hot one
+    // and is not opened to it: it waits on its own pipe, not on any share.
+    let full_elsewhere = lane_holding(&mut pipeline, next, 17, 8);
+    match ask_as_lane(&mut pipeline, SERVER_A, 18, full_elsewhere) {
+        Handout::Saturated(wake) => assert_eq!(wake, SaturationWake { of: None, below: 9 }),
+        other => panic!(
+            "a full lane does not open another job, got {:?}",
+            taken(other).len()
+        ),
+    }
+}
+
+/// The share is measured against the job's unfetched articles, queued and
+/// out on lanes alike, so it is the same for the last lane to ask as for the
+/// first instead of shrinking as the queue drains.
+#[tokio::test]
+async fn the_share_counts_articles_already_out_on_lanes() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.tuner.set_connection_limit(100);
+    let hot = JobId(71341);
+    add_job(&mut pipeline, hot, "Half Fetched Pack", 10_000).await;
+
+    assert_eq!(pipeline.lane_share_of_job(hot, 8), 100);
+    pipeline.active_downloads_by_job.insert(hot, 10_000);
+    assert_eq!(
+        pipeline.lane_share_of_job(hot, 8),
+        200,
+        "articles out on lanes are still the job's to spread"
+    );
 }
 
 /// A large job's share is beyond any runway, so its lanes are served exactly
@@ -784,6 +862,22 @@ async fn saturation_is_only_charged_by_a_job_that_could_serve_the_lane() {
 
     let share = pipeline.lane_share_of_job(hot, 8);
     let lane = lane_holding(&mut pipeline, hot, share, 8);
+    match ask_as_lane(&mut pipeline, SERVER_A, 18, lane) {
+        Handout::Saturated(wake) => assert_eq!(
+            wake,
+            SaturationWake { of: None, below: 9 },
+            "the walk went on to the next job; only the lane's full pipe holds it"
+        ),
+        other => panic!(
+            "a full lane does not open the next job, got {:?}",
+            taken(other).len()
+        ),
+    }
+    assert_eq!(handouts_spill(&pipeline), 0);
+
+    // With room in its pipe the lane is served from the next job outright:
+    // the blocked hot job never charges it.
+    let lane = lane_holding(&mut pipeline, hot, share - 1, 8);
     let works = taken(ask_as_lane(&mut pipeline, SERVER_A, 18, lane));
     assert_eq!(
         single_job(&works),

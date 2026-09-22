@@ -268,6 +268,7 @@ fn renders_prometheus_download_observed_limiter_states() {
         download_lane_refill_granted_total: 0,
         download_lane_refill_parked_total: 0,
         download_lane_refill_deferred_total: 0,
+        download_lane_refill_saturated_total: 0,
         download_pipeline_trial_success_total: 0,
         download_pipeline_trial_failure_total: 0,
         download_pipeline_proof_pass_total: 0,
@@ -596,7 +597,7 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
         &rendered,
         "weaver_pipeline_download_lane_refills_total",
         "result",
-        &["granted", "parked", "deferred"],
+        &["granted", "parked", "deferred", "saturated"],
     );
     assert_label_set(
         &rendered,

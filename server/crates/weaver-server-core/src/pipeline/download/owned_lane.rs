@@ -1603,6 +1603,23 @@ fn run_owned_blocking_download_lane(
         }
     };
 
+    // Return what this lane still holds before waiting on its refill. A
+    // refill from a saturated lane is held in the actor until the lane has
+    // fetched down below its share, and a lane parking here with a full
+    // pending tail never will: its holdings only fall once these articles are
+    // back in the queue. Returning them first is what lets the actor answer.
+    let unrequested_works = pending
+        .into_iter()
+        .map(|(work, _)| work)
+        .collect::<Vec<_>>();
+    let _ = send_owned_batch(
+        &event_tx,
+        park_context.lane_id,
+        Vec::new(),
+        unrequested_works,
+        weaver_nntp::blocking::BlockingLaneStats::default(),
+        false,
+    );
     if let Some(granted_context) = drain_pending_refill(
         pending_refill.take(),
         &event_tx,
@@ -1614,10 +1631,6 @@ fn run_owned_blocking_download_lane(
         booked_mode = granted_context.mode;
         park_context = Arc::new(granted_context);
     }
-    let unrequested_works = pending
-        .into_iter()
-        .map(|(work, _)| work)
-        .collect::<Vec<_>>();
     // The final event is the ordering barrier: its acknowledgement is what
     // guarantees every streamed result reached the orchestrator before the
     // park message arrives on the other channel and releases the connection.
@@ -1626,7 +1639,7 @@ fn run_owned_blocking_download_lane(
         &event_tx,
         park_context.lane_id,
         Vec::new(),
-        unrequested_works,
+        Vec::new(),
         stats,
         true,
     );
@@ -1656,7 +1669,8 @@ fn run_owned_blocking_download_lane(
 /// Consume a prefetched refill response on a park/error path so its leased
 /// works are returned to the queue instead of being dropped. The orchestrator
 /// answers every refill request (or drops the sender on shutdown), so this
-/// cannot hang.
+/// cannot hang — provided the lane has already returned the articles it was
+/// holding, since a saturated lane's answer waits on exactly that.
 fn drain_pending_refill(
     pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>>,
     event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,

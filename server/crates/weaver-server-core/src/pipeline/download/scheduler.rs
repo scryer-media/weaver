@@ -57,11 +57,17 @@
 //!    empty while most of it has yet to be fetched, rule 3 sends every other
 //!    connection on to the next job, and the link ends up spread over jobs it
 //!    was supposed to finish one at a time. So what a lane may hold of a job
-//!    is that job's queue divided over the connections the link has, never
-//!    less than a full pipe plus the article behind it. A lane already at its
-//!    share is not blocked and does not spill: it is [`Handout::Saturated`],
-//!    and asks again once it has fetched down below the share. A large job's
-//!    share is far beyond any runway, so nothing changes for it.
+//!    is that job's unfetched articles — queued, plus those out on lanes —
+//!    divided over the connections the link has, never less than a full pipe
+//!    plus the article behind it. And a lane opens a job it holds nothing of
+//!    only once its whole pipe is below that same floor: a lane still full of
+//!    one job does not pre-lease the next one, whether the walk reached it
+//!    because the first job's queue ran dry or because this lane's share of it
+//!    is out. A lane held by either rule is not blocked and does not spill: it
+//!    is [`Handout::Saturated`], and asks again once it has fetched down below
+//!    the count the rule named. A large job's share is far beyond any runway,
+//!    so nothing changes for it until its queue empties, when the boundary
+//!    rule takes over.
 //!
 //! There is nothing else: no newsgroup dimension, no equal-priority rule, no
 //! requirement that one handout be all recovery or all payload, and no loans
@@ -93,9 +99,19 @@ pub(in crate::pipeline) enum Handout {
     /// A whole-link gate is shut; this is not about any job's queue.
     Yield(YieldReason),
     /// The job this lane would be served from has work for it, but the lane
-    /// already holds its share of that job. It is busy, not idle: answer it
-    /// again once it holds fewer than `below` articles.
-    Saturated { below: usize },
+    /// already holds its share of that job, or a full pipe of some other. It
+    /// is busy, not idle: answer it again once the wake's count holds.
+    Saturated(SaturationWake),
+}
+
+/// What a saturated lane is waiting to fetch down to before it is asked
+/// about again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::pipeline) struct SaturationWake {
+    /// The job whose articles are counted; every job's when `None`.
+    pub(in crate::pipeline) of: Option<JobId>,
+    /// Answer the lane again once it holds fewer than this many of them.
+    pub(in crate::pipeline) below: usize,
 }
 
 /// The asking lane, so what it already holds of a job can be set against
@@ -120,7 +136,7 @@ pub(in crate::pipeline) enum YieldReason {
 /// What one job yields to one lane.
 enum ShareTaken {
     Works(Vec<DownloadWork>),
-    Saturated { below: usize },
+    Saturated(SaturationWake),
     Blocked,
 }
 
@@ -179,7 +195,7 @@ impl Pipeline {
 
         match self.take_lane_share(*hot_job, server_idx, want, lane, pressure) {
             ShareTaken::Works(works) => return self.record_handout(HandoutKind::Hot, works),
-            ShareTaken::Saturated { below } => return Handout::Saturated { below },
+            ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
             ShareTaken::Blocked => {}
         }
 
@@ -196,7 +212,7 @@ impl Pipeline {
                 ShareTaken::Works(works) => {
                     return self.record_handout(HandoutKind::Spill, works);
                 }
-                ShareTaken::Saturated { below } => return Handout::Saturated { below },
+                ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
                 ShareTaken::Blocked => {}
             }
         }
@@ -206,7 +222,7 @@ impl Pipeline {
                 ShareTaken::Works(works) => {
                     return self.record_handout(HandoutKind::Spill, works);
                 }
-                ShareTaken::Saturated { below } => return Handout::Saturated { below },
+                ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
                 ShareTaken::Blocked => {}
             }
         }
@@ -314,17 +330,36 @@ impl Pipeline {
         // it. Articles of another job it is still carrying say nothing about
         // how this one is spread over the link.
         let holds = self.download_lane_holdings_of_job(lane.lane_id, job_id);
-        let room = share.saturating_sub(holds);
-        if room == 0 {
+        let full_pipe = lane.depth.max(1) + 1;
+        let wake = if holds == 0 && self.download_lane_holdings(lane.lane_id) >= full_pipe {
+            // A lane still full of another job does not open this one. The
+            // share above is what keeps one job spread over the link; this
+            // is what keeps a job that has left the queue — every article of
+            // it out on lanes — from pulling the next job onto every lane
+            // that carries a piece of it.
+            Some(SaturationWake {
+                of: None,
+                below: full_pipe,
+            })
+        } else if holds >= share {
+            Some(SaturationWake {
+                of: Some(job_id),
+                below: share,
+            })
+        } else {
+            None
+        };
+        if let Some(wake) = wake {
             // Only a job that would actually have served this lane may hold it:
             // one that is blocked here must let the walk go on, or a lane at
             // its share of a job it cannot fetch from would shut out the rest.
             return if self.job_has_servable_work_for_server(job_id, server_idx, pressure) {
-                ShareTaken::Saturated { below: share }
+                ShareTaken::Saturated(wake)
             } else {
                 ShareTaken::Blocked
             };
         }
+        let room = share - holds;
         let works = self.take_servable_works(job_id, server_idx, want.min(room), pressure);
         if works.is_empty() {
             ShareTaken::Blocked

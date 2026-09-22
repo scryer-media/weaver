@@ -355,6 +355,7 @@ pub struct PipelineMetrics {
     pub download_lane_refill_granted_total: AtomicU64,
     pub download_lane_refill_parked_total: AtomicU64,
     pub download_lane_refill_deferred_total: AtomicU64,
+    pub download_lane_refill_saturated_total: AtomicU64,
     pub download_pipeline_trial_success_total: AtomicU64,
     pub download_pipeline_trial_failure_total: AtomicU64,
     pub download_pipeline_proof_pass_total: AtomicU64,
@@ -498,6 +499,7 @@ impl PipelineMetrics {
             download_lane_refill_granted_total: AtomicU64::new(0),
             download_lane_refill_parked_total: AtomicU64::new(0),
             download_lane_refill_deferred_total: AtomicU64::new(0),
+            download_lane_refill_saturated_total: AtomicU64::new(0),
             download_pipeline_trial_success_total: AtomicU64::new(0),
             download_pipeline_trial_failure_total: AtomicU64::new(0),
             download_pipeline_proof_pass_total: AtomicU64::new(0),
@@ -802,6 +804,9 @@ impl PipelineMetrics {
             download_lane_refill_deferred_total: self
                 .download_lane_refill_deferred_total
                 .load(Ordering::Relaxed),
+            download_lane_refill_saturated_total: self
+                .download_lane_refill_saturated_total
+                .load(Ordering::Relaxed),
             download_pipeline_trial_success_total: self
                 .download_pipeline_trial_success_total
                 .load(Ordering::Relaxed),
@@ -980,6 +985,7 @@ pub struct MetricsSnapshot {
     pub download_lane_refill_granted_total: u64,
     pub download_lane_refill_parked_total: u64,
     pub download_lane_refill_deferred_total: u64,
+    pub download_lane_refill_saturated_total: u64,
     pub download_pipeline_trial_success_total: u64,
     pub download_pipeline_trial_failure_total: u64,
     pub download_pipeline_proof_pass_total: u64,

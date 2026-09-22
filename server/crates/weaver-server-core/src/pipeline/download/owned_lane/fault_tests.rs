@@ -104,6 +104,128 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
     );
 }
 
+/// A lane that parks with articles still in hand returns them before it
+/// waits on its outstanding refill.
+///
+/// The actor holds a saturated lane's refill until the lane's holdings fall
+/// below its share, and a lane parking on a transport fault with a full
+/// pending tail only gets there by returning that tail. Waiting first would
+/// leave the two sides each waiting on the other: the refill never answered,
+/// the articles never requeued, the connection slot never released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parking_lane_returns_its_tail_before_waiting_on_its_refill() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (close_tx, close_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = socket.into_split();
+        writer.write_all(b"200 fixture ready\r\n").await.unwrap();
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line == "CAPABILITIES" {
+                writer
+                    .write_all(b"101 Capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                    .await
+                    .unwrap();
+            } else if line.starts_with("GROUP ") {
+                writer
+                    .write_all(b"211 1 1 1 alt.binaries.test\r\n")
+                    .await
+                    .unwrap();
+            } else if line.starts_with("BODY ") {
+                close_rx.await.unwrap();
+                break;
+            } else {
+                writer.write_all(b"500 unsupported\r\n").await.unwrap();
+            }
+        }
+    });
+    let nntp = Arc::new(weaver_nntp::NntpClient::new(
+        weaver_nntp::client::NntpClientConfig::single(
+            weaver_nntp::ServerConfig {
+                host: "127.0.0.1".into(),
+                port,
+                tls: false,
+                ..Default::default()
+            },
+            1,
+        ),
+    ));
+    let (event_tx, mut events) = mpsc::channel(16);
+    let (refill_tx, mut refills) = mpsc::channel(16);
+    let (parked_tx, mut parks) = mpsc::channel(16);
+    let client = Arc::clone(&nntp);
+    // Three articles on a sequential lane: one goes on the wire and two stay
+    // in hand, and three is within the deadline that asks ahead.
+    let works = (0..3).map(|segment| tail_work(segment, 0)).collect();
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut cached = None;
+        run_owned_blocking_download_lane(
+            &mut cached,
+            OwnedLaneRun {
+                nntp: client,
+                event_tx,
+                refill_tx,
+                parked_tx,
+                initial_lease: test_lease(JobId(42), 0, vec![], works),
+            },
+            None,
+        );
+    });
+    async {
+        let request = refills.recv().await.expect("the lane asks ahead for its next batch");
+        close_tx.send(()).unwrap();
+        // The refill stays unanswered, as a saturated lane's does, until the
+        // lane has handed back the two articles it never issued.
+        let mut returned = 0;
+        let mut faulted = 0;
+        while returned < 2 {
+            let OwnedDownloadLaneEvent::BatchComplete { results, unrequested_works, ack, .. } =
+                events.recv().await.unwrap()
+            else {
+                panic!("unexpected acquisition failure");
+            };
+            faulted += results.len();
+            returned += unrequested_works.len();
+            if let Some(ack) = ack {
+                ack.send(()).unwrap();
+            }
+        }
+        assert_eq!(returned, 2, "the unissued tail comes back whole");
+        assert_eq!(faulted, 1, "the issued article faults before the tail is returned");
+        assert!(parks.try_recv().is_err(), "the lane has not parked yet");
+        assert!(
+            request
+                .response_tx
+                .send(DownloadLaneRefillResponse {
+                    lease: None,
+                    park_reason: LaneParkReason::NoWork,
+                })
+                .is_ok(),
+            "the lane is still waiting on its refill"
+        );
+        let park = loop {
+            tokio::select! {
+                Some(event) = events.recv() => {
+                    let OwnedDownloadLaneEvent::BatchComplete { unrequested_works, ack, .. } = event else {
+                        panic!("unexpected acquisition failure");
+                    };
+                    assert!(unrequested_works.is_empty(), "nothing is returned twice");
+                    if let Some(ack) = ack {
+                        ack.send(()).unwrap();
+                    }
+                }
+                Some(park) = parks.recv() => break park,
+            }
+        };
+        assert!(park.release_connection_slot);
+    }
+    .await;
+    worker.await.unwrap();
+    server.await.unwrap();
+}
+
 /// A probe reaching a lane mid-lease is answered once the ring drains.
 ///
 /// The lane has three BODY responses outstanding when the probe arrives. The
