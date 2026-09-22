@@ -681,6 +681,10 @@ impl Pipeline {
             }
         };
         let (file_complete, was_duplicate) = commit;
+        // Delivery is a verdict on this article too, and the sample that
+        // decides whether the post is there at all is only complete once every
+        // first article has one.
+        self.note_first_article_settled(segment_id);
         if was_duplicate {
             // A duplicate must not advance CRC composition, coverage or
             // progress twice. Counted because a run where this is *never* zero

@@ -3598,6 +3598,10 @@ impl Pipeline {
                 if replaced_damage {
                     self.clear_replaced_damage_failure(segment_id);
                 }
+                // Delivery is a verdict on this article too, and the sample
+                // that decides whether the post is there at all is only
+                // complete once every first article has one.
+                self.note_first_article_settled(segment_id);
                 if !was_duplicate {
                     self.metrics
                         .bytes_committed

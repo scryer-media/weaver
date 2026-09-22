@@ -41,18 +41,28 @@ pub struct DownloadWork {
 ///    metadata discovery, the direct-store identity probe wave;
 /// 1. promoted PAR2 recovery blocks, which share the payload's connections and
 ///    lead it, because a repair cannot start until they land;
-/// 2. ordinary payload.
+/// 2. first articles — one article per file, marked by the owner of the queue.
+///    They lead the payload so that the first round trips of a job sample
+///    every file in it rather than the first file in it, which is what makes
+///    "this post is not there any more" answerable in seconds instead of
+///    after a whole file's worth of articles;
+/// 3. ordinary payload.
 ///
-/// Classes 0 and 1 live in the completion-critical heap and 2 in the ordinary
-/// one, so the split is what `pop` reads; the rank orders 0 against 1 inside
-/// the critical heap ahead of the per-file priority.
+/// Classes 0 and 1 live in the completion-critical heap and 2 and 3 in the
+/// ordinary one, so the split is what `pop` reads; the rank orders the classes
+/// inside each heap ahead of the per-file priority.
 const COMPLETION_RANK_CRITICAL: u8 = 0;
 const COMPLETION_RANK_PROMOTED_RECOVERY: u8 = 1;
-const COMPLETION_RANK_ORDINARY: u8 = 2;
+const COMPLETION_RANK_FIRST_ARTICLE: u8 = 2;
+const COMPLETION_RANK_ORDINARY: u8 = 3;
 
-fn completion_rank_for(work: &DownloadWork) -> u8 {
+fn completion_rank_for(work: &DownloadWork, first_article: bool) -> u8 {
     if !work.completion_critical {
-        COMPLETION_RANK_ORDINARY
+        if first_article {
+            COMPLETION_RANK_FIRST_ARTICLE
+        } else {
+            COMPLETION_RANK_ORDINARY
+        }
     } else if work.is_recovery {
         COMPLETION_RANK_PROMOTED_RECOVERY
     } else {
@@ -134,6 +144,11 @@ pub struct DownloadQueue {
     /// volume binding, chase gating), so that re-installing an unchanged plan
     /// still re-asserts it over those keys, as a rebuild always did.
     file_priority_plan_stale: bool,
+    /// One article per file — the lowest ordinal each file has. Held here
+    /// rather than on the work item so that every path that puts an article
+    /// back, including a requeue after a lane gave one up, lands it in the
+    /// leading class again without having to know it was a first article.
+    first_articles: std::collections::HashSet<SegmentId>,
 }
 
 impl DownloadQueue {
@@ -148,7 +163,24 @@ impl DownloadQueue {
             file_priority_plan: HashMap::new(),
             file_priority_plan_protected: 0,
             file_priority_plan_stale: false,
+            first_articles: std::collections::HashSet::new(),
         }
+    }
+
+    /// Marks an article as its file's first, which is the class it is served
+    /// in from now on, however often it is requeued.
+    pub fn note_first_article(&mut self, segment_id: SegmentId) {
+        self.first_articles.insert(segment_id);
+    }
+
+    pub fn is_first_article(&self, segment_id: SegmentId) -> bool {
+        self.first_articles.contains(&segment_id)
+    }
+
+    /// Every article this queue holds as a first article, whether or not it is
+    /// still queued.
+    pub fn first_articles(&self) -> impl Iterator<Item = SegmentId> + '_ {
+        self.first_articles.iter().copied()
     }
 
     pub fn push(&mut self, work: DownloadWork) {
@@ -177,8 +209,9 @@ impl DownloadQueue {
             .entry(work.segment_id.file_id)
             .or_default() += 1;
         let completion_critical = work.completion_critical;
+        let first_article = self.first_articles.contains(&work.segment_id);
         let item = Reverse(PrioritizedWork {
-            completion_rank: completion_rank_for(&work),
+            completion_rank: completion_rank_for(&work, first_article),
             priority,
             rank,
             sequence,
@@ -584,7 +617,10 @@ impl DownloadQueue {
                 pw.rank = rank;
                 pw.work.priority = priority;
                 pw.work.completion_critical = true;
-                pw.completion_rank = completion_rank_for(&pw.work);
+                pw.completion_rank = completion_rank_for(
+                    &pw.work,
+                    self.first_articles.contains(&pw.work.segment_id),
+                );
                 promoted += 1;
             }
             if pw.work.completion_critical {

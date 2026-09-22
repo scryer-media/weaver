@@ -22,6 +22,7 @@ mod checkpoint_progress;
 mod dispatch_ineligible_log;
 mod dispatch_server_order;
 mod emits_download_pipeline_drained;
+mod first_article_gate;
 mod gapless_lanes;
 mod lane_depth_seeding;
 mod lane_failure_visibility;
