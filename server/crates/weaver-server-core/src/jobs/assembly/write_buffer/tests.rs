@@ -467,3 +467,25 @@ fn replayed_stream_releases_every_charged_byte() {
     );
     assert_eq!(ledger.outstanding_segments, 0);
 }
+
+/// A duplicate that arrives after its file completed meets a fresh buffer
+/// whose cursor is back at zero. Told it is a duplicate, the buffer hands it
+/// straight back for an idempotent rewrite instead of parking it above a
+/// cursor no neighbour will ever advance.
+#[test]
+fn a_known_duplicate_never_waits_on_the_cursor() {
+    let mut buf = WriteReorderBuffer::new(4);
+    let mut ledger = BacklogLedger::default();
+    ledger.note(3);
+    buf.insert_duplicate(6_028, vec![7, 8, 9]);
+    assert_eq!(buf.buffered_len(), 1);
+    let ready = buf.drain_ready_with_contiguous_end();
+    ledger.release(&ready.0);
+    ledger.assert_balanced(&buf);
+    assert_eq!(offsets(&ready.0), vec![6_028]);
+    assert_eq!(
+        ready.1, 0,
+        "a rewrite of bytes already on disk says nothing new about the cursor"
+    );
+    assert!(buf.is_empty());
+}

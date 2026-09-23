@@ -155,6 +155,17 @@ fn split_volumes(archive: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
 /// offset) pair. The test harness drives the yEnc layout from the assembly's
 /// total, so the spec is where the true length has to be put.
 fn sevenz_job_spec(volumes: &[(String, Vec<u8>)], articles: usize) -> JobSpec {
+    sevenz_job_spec_stating(volumes, articles, |decoded| decoded)
+}
+
+/// [`sevenz_job_spec`] with each segment's `bytes=` passed through `stated`,
+/// for a test that needs the NZB to say something other than the exact decoded
+/// length — an encoded size, the way a real NZB states it.
+fn sevenz_job_spec_stating(
+    volumes: &[(String, Vec<u8>)],
+    articles: usize,
+    stated: impl Fn(u32) -> u32,
+) -> JobSpec {
     JobSpec {
         name: "Silver Horizon".to_string(),
         password: None,
@@ -174,7 +185,7 @@ fn sevenz_job_spec(volumes: &[(String, Vec<u8>)], articles: usize) -> JobSpec {
                         let (start, end) = article_extent(bytes.len(), segment_number, articles);
                         segment_spec! {
                             number: segment_number,
-                            bytes: (end - start) as u32,
+                            bytes: stated((end - start) as u32),
                             message_id: format!("sevenz-{index}-{segment_number}@example.com"),
                         }
                     })
@@ -941,6 +952,167 @@ fn strip_member_crcs(archive: &[u8], member: &[u8]) -> Vec<u8> {
 /// confirmed by its map rather than by a per-volume walk it never had.
 #[tokio::test]
 async fn a_sevenz_set_restarts_without_materializing_a_volume() {
+    restart_a_sevenz_set(
+        JobId(9_607),
+        ARTICLES_PER_VOLUME,
+        (1, 1),
+        |decoded| decoded,
+        &[(1, 1)],
+    )
+    .await;
+}
+
+/// The same restart with the NZB stating its segments the way a real one does:
+/// the yEnc-**encoded** size, a few percent over the payload.
+///
+/// Restore commits the skipped segments into the assembly at that stated size,
+/// so the restored volumes read a few percent longer than the part size the
+/// geometry requires. The length check is the authoritative one for a
+/// container volume, and taken at that number it would demote a set whose
+/// bytes are exactly where the map placed them — a whole-set materialization
+/// and redownload after every restart, for arithmetic. A restored volume's
+/// honest length is its coverage end, which is what the check must be given.
+///
+/// Four articles a volume, the last one withheld: the decoded floor vouches
+/// for the first two at their **encoded** size, the restore asks for the other
+/// two (the third is durable, but the encoded walk cannot prove it — the
+/// documented cost of the floor convention, shared with every format), and the
+/// volume completes at an encoded prefix plus a decoded remainder, a few
+/// hundred bytes over what the map says it is.
+#[tokio::test]
+async fn a_restarted_sevenz_set_is_not_demoted_for_its_encoded_segment_sizes() {
+    let witness = restart_a_sevenz_set(
+        JobId(9_621),
+        4,
+        (1, 3),
+        |decoded| decoded * 103 / 100 + 64,
+        &[(1, 2), (1, 3)],
+    )
+    .await;
+    assert!(
+        !witness.contains("Demoted"),
+        "a restored volume's stated size must never be held against the geometry\nsets: {}",
+        witness.render()
+    );
+}
+
+/// The wholly missing volume again, protected by PAR3 rather than PAR2. The
+/// 7z set's geometry and map are the same; what differs is the repair seam —
+/// PAR3's readback routes the rebuilt volume slice by slice and confirms it
+/// through `note_volume_complete` itself — so both the middle and the tail
+/// absence are driven through it.
+async fn a_wholly_missing_sevenz_volume_under_par3(
+    job_id: JobId,
+    missing: u32,
+) -> Par3RepairOutcome {
+    let member = payload(37, 30_000);
+    let second = payload(41, 6_000);
+    let archive = build_7z(
+        &[
+            Entry::file(MEMBER, member.clone()),
+            Entry::file(SECOND_MEMBER, second.clone()),
+        ],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, 3);
+    let carriers = par3_carriers_over(&volumes, PAR2_SLICE_BYTES, 96);
+    let spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
+    let outcome = run_direct_set_with_par3(
+        job_id,
+        spec,
+        &volumes,
+        ARTICLES_PER_VOLUME,
+        Some(missing),
+        &carriers,
+    )
+    .await;
+    assert!(
+        matches!(outcome.status, Some(JobStatus::Complete)),
+        "the job must complete, got {:?} with sets {}",
+        outcome.status,
+        outcome.shapes()
+    );
+    for (name, expected) in [(MEMBER, &member), (SECOND_MEMBER, &second)] {
+        assert_eq!(
+            outcome.member(name).as_ref(),
+            Some(expected),
+            "{name} must be published whole\nsets: {}",
+            outcome.shapes()
+        );
+    }
+    let published: Vec<String> = std::fs::read_dir(&outcome.output_root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| {
+                    let len = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                    format!("{} ({len} B)", entry.file_name().to_string_lossy())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !volumes
+            .iter()
+            .any(|(filename, _)| outcome.output_root.join(filename).exists()),
+        "no volume may be published by name; published = {published:?}, finalized = {}, \
+         materialized = {}, scratch left = {}\nsets: {}",
+        outcome.finalized,
+        outcome.materialized,
+        outcome.repair_scratch_left,
+        outcome.shapes()
+    );
+    outcome
+}
+
+#[tokio::test]
+async fn sevenz_store_par3_rebuilds_a_wholly_missing_middle_volume() {
+    let outcome = a_wholly_missing_sevenz_volume_under_par3(JobId(9_623), 1).await;
+    assert!(
+        !outcome.demoted(),
+        "a missing middle volume is rebuilt into the live set\nsets: {}",
+        outcome.shapes()
+    );
+    assert_eq!(
+        outcome.finalized,
+        1,
+        "the set must commit its own partials\nsets: {}",
+        outcome.shapes()
+    );
+    assert!(
+        !outcome.volume_file_seen,
+        "no source volume may appear under its own name\nsets: {}",
+        outcome.shapes()
+    );
+}
+
+#[tokio::test]
+async fn sevenz_store_par3_rebuilds_a_wholly_missing_tail_volume() {
+    // The tail holds the end header, so the set never learns its map and is
+    // demoted for an unreadable one; the repair then lands on disk and the
+    // conventional extractor publishes the members.
+    let outcome = a_wholly_missing_sevenz_volume_under_par3(JobId(9_624), 2).await;
+    assert!(
+        outcome.demoted(),
+        "a 7z set whose end header never arrives cannot stay direct\nsets: {}",
+        outcome.shapes()
+    );
+}
+
+/// Downloads all but one mid-container article, shuts down, restores, and
+/// drives the restored set to its end; returns the shapes it passed through.
+///
+/// `expected_queue` is what the restore may ask for again: the withheld
+/// article, plus whatever durable neighbours the encoded-size walk cannot
+/// prove covered.
+async fn restart_a_sevenz_set(
+    job_id: JobId,
+    articles: usize,
+    withheld: (u32, u32),
+    stated: impl Fn(u32) -> u32 + Copy,
+    expected_queue: &[(u32, u32)],
+) -> SetWitness {
     let member = payload(29, 60_000);
     let archive = build_7z(
         &[Entry::file(MEMBER, member.clone())],
@@ -948,21 +1120,19 @@ async fn a_sevenz_set_restarts_without_materializing_a_volume() {
         None,
     );
     let volumes = split_volumes(&archive, 3);
-    let job_id = JobId(9_607);
     let temp_dir = tempfile::tempdir().unwrap();
 
     // Everything but one mid-container article, so the tail — and with it the
     // end header — is already parsed when the process goes down.
-    let withheld = (1, 1);
-    let arrivals: Vec<(u32, u32)> = in_order_arrivals(volumes.len())
-        .into_iter()
+    let arrivals: Vec<(u32, u32)> = (0..volumes.len() as u32)
+        .flat_map(|file_index| (0..articles as u32).map(move |article| (file_index, article)))
         .filter(|arrival| *arrival != withheld)
         .collect();
 
     let working_dir = {
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-        let spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
+        let spec = sevenz_job_spec_stating(&volumes, articles, stated);
         let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
         for (file_index, segment_number) in &arrivals {
             submit_volume_article_of(
@@ -971,7 +1141,7 @@ async fn a_sevenz_set_restarts_without_materializing_a_volume() {
                 &volumes,
                 *file_index,
                 *segment_number,
-                ARTICLES_PER_VOLUME,
+                articles,
             )
             .await;
             pump_pipeline_runtime_queues(&mut pipeline).await;
@@ -988,7 +1158,7 @@ async fn a_sevenz_set_restarts_without_materializing_a_volume() {
         .restore_job(RestoreJobRequest {
             job_id,
             job_hash: [0; 32],
-            spec: sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME),
+            spec: sevenz_job_spec_stating(&volumes, articles, stated),
             complete_files: HashSet::new(),
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
@@ -1010,10 +1180,9 @@ async fn a_sevenz_set_restarts_without_materializing_a_volume() {
 
     let queued = peek_queued_segments(&mut pipeline, job_id);
     assert_eq!(
-        queued,
-        vec![withheld],
+        queued, expected_queue,
         "a restored 7z set must re-derive its layout from the cached container map and ask \
-         only for the article that never arrived"
+         only for the article that never arrived (and any the floor walk cannot vouch for)"
     );
     assert!(
         pipeline
@@ -1030,7 +1199,7 @@ async fn a_sevenz_set_restarts_without_materializing_a_volume() {
             &volumes,
             file_index,
             segment_number,
-            ARTICLES_PER_VOLUME,
+            articles,
         )
         .await;
     }
@@ -1063,6 +1232,7 @@ async fn a_sevenz_set_restarts_without_materializing_a_volume() {
         Some(member.as_slice()),
         "the member must survive the restart byte for byte\nsets: {sets}"
     );
+    witness
 }
 
 /// A member the archive records no checksum for publishes on the recovery
@@ -1176,6 +1346,237 @@ async fn sevenz_store_member_without_crc_finalizes_on_par2() {
         Some(JobStatus::Complete),
         "sets: {sets}"
     );
+}
+
+/// What a run with one whole volume withheld and a recovery set on hand left
+/// behind.
+struct MissingVolumeRun {
+    pipeline: Pipeline,
+    _temp_dir: tempfile::TempDir,
+    output_root: std::path::PathBuf,
+    witness: SetWitness,
+    volumes: Vec<(String, Vec<u8>)>,
+    members: Vec<(&'static str, Vec<u8>)>,
+    job_id: JobId,
+}
+
+/// Downloads every article of a three-volume set except those of
+/// `missing_volume`, hands the job its recovery set, and drives it to a
+/// terminal status.
+async fn run_with_a_wholly_missing_volume(job_id: JobId, missing_volume: u32) -> MissingVolumeRun {
+    let member = payload(37, 30_000);
+    let second = payload(41, 6_000);
+    let archive = build_7z(
+        &[
+            Entry::file(MEMBER, member.clone()),
+            Entry::file(SECOND_MEMBER, second.clone()),
+        ],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, 3);
+    let par2_bytes = repairable_par2_index(&volumes, 96);
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+
+    let mut spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
+    let index_file_index = append_par2_index(&mut spec, &par2_bytes);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let mut witness = SetWitness::default();
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if file_index == missing_volume {
+            continue;
+        }
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES_PER_VOLUME,
+        )
+        .await;
+        witness.observe(&pipeline, job_id);
+    }
+
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    assert_eq!(
+        pipeline.direct_store.finalized_sets, 0,
+        "no set may commit before the recovery set has spoken"
+    );
+
+    submit_decoded_segment(
+        &mut pipeline,
+        NzbFileId {
+            job_id,
+            file_index: index_file_index,
+        },
+        0,
+        0,
+        &par2_bytes,
+        "silver.horizon.par2",
+        None,
+    )
+    .await;
+
+    // The harness delivered the other volumes' articles without leasing them,
+    // and the missing volume's are never coming with no server to say so. Both
+    // are what a leased article looks like from here: gone from the queue and
+    // either answered or not. Re-leased every turn, because a probe that wants
+    // the tail re-asks for it and a refetch re-asks for everything, and
+    // "nothing more is coming" is what every PAR2 gate waits for before reading
+    // a hole as damage. A re-asked article of a volume the wire *does* hold is
+    // answered again, the way a refetch is.
+    let lease_the_queue = |pipeline: &mut Pipeline| -> Vec<(u32, u32)> {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.recovery_queue = crate::DownloadQueue::new();
+        state
+            .download_queue
+            .drain_all()
+            .into_iter()
+            .filter(|work| work.segment_id.file_id.file_index < volumes.len() as u32)
+            .map(|work| {
+                (
+                    work.segment_id.file_id.file_index,
+                    work.segment_id.segment_number,
+                )
+            })
+            .collect()
+    };
+    lease_the_queue(&mut pipeline);
+    for _ in 0..48 {
+        if matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ) {
+            break;
+        }
+        for (file_index, segment_number) in lease_the_queue(&mut pipeline) {
+            if file_index == missing_volume {
+                continue;
+            }
+            submit_volume_article_of(
+                &mut pipeline,
+                job_id,
+                &volumes,
+                file_index,
+                segment_number,
+                ARTICLES_PER_VOLUME,
+            )
+            .await;
+        }
+        drain_rar_refreshes(&mut pipeline).await;
+        pipeline.check_job_completion(job_id).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        settle_inflight_moves(&mut pipeline).await;
+        witness.observe(&pipeline, job_id);
+        if let Some(done) = next_owed_extraction(&mut pipeline, job_id).await {
+            pipeline.handle_extraction_done(done).await;
+            pump_pipeline_runtime_queues(&mut pipeline).await;
+            settle_inflight_moves(&mut pipeline).await;
+        }
+    }
+    witness.observe(&pipeline, job_id);
+
+    MissingVolumeRun {
+        pipeline,
+        _temp_dir: temp_dir,
+        output_root,
+        witness,
+        volumes,
+        members: vec![(MEMBER, member), (SECOND_MEMBER, second)],
+        job_id,
+    }
+}
+
+impl MissingVolumeRun {
+    fn sets(&self) -> String {
+        self.witness.seen.join("\n")
+    }
+
+    /// Every member the archive holds is on disk under the job's output root,
+    /// byte for byte.
+    fn assert_members_published(&self) {
+        let sets = self.sets();
+        for (name, expected) in &self.members {
+            assert_eq!(
+                std::fs::read(self.output_root.join(name)).ok().as_ref(),
+                Some(expected),
+                "{name} must be published whole\nsets: {sets}"
+            );
+        }
+    }
+}
+
+/// A **whole** middle volume that never arrives is rebuilt by the recovery set
+/// and routed back into the live direct set: the members are published from
+/// the set's own partials, the set never demotes, and only the missing volume
+/// is ever materialized — under a scratch name, not its own.
+///
+/// This is the hole a byte-split container is most exposed to: nothing in the
+/// missing volume is a header, so the set has no fact about it beyond the
+/// geometry volume 0 states and the tail's end header. Every byte of it is a
+/// member extent that PAR2 alone can supply, and the repair must land those
+/// bytes through the same layout the downloaded volumes were routed through.
+#[tokio::test]
+async fn sevenz_store_par2_rebuilds_a_wholly_missing_middle_volume() {
+    let missing_volume = 1u32;
+    let run = run_with_a_wholly_missing_volume(JobId(9_607), missing_volume).await;
+    let sets = run.sets();
+    assert_eq!(
+        job_status_for_assert(&run.pipeline, run.job_id),
+        Some(JobStatus::Complete),
+        "sets: {sets}"
+    );
+    assert_eq!(
+        run.pipeline.direct_store.finalized_sets, 1,
+        "the set must commit from its own partials after the repair\nsets: {sets}"
+    );
+    assert!(
+        !run.witness.contains("Demoted"),
+        "a repairable hole must never demote the set\nsets: {sets}"
+    );
+    assert_eq!(
+        run.pipeline.direct_store.repair_materialized_volumes, 1,
+        "only the missing volume is materialized, as repair scratch\nsets: {sets}"
+    );
+    assert!(
+        !run.output_root
+            .join(&run.volumes[missing_volume as usize].0)
+            .exists(),
+        "the rebuilt volume is scratch, never published under its own name"
+    );
+    run.assert_members_published();
+}
+
+/// A **whole** tail volume that never arrives takes the end header with it, so
+/// the set can never read its map and demotes — by design, not by accident.
+/// What the demotion must then deliver is the ordinary path: the downloaded
+/// volumes hand back to disk, the recovery set rebuilds the missing one there,
+/// and extraction publishes every member whole. A missing file is repaired
+/// either way; only *where* the repair lands differs.
+#[tokio::test]
+async fn sevenz_store_par2_rebuilds_a_wholly_missing_tail_volume_after_demotion() {
+    let run = run_with_a_wholly_missing_volume(JobId(9_608), 2).await;
+    let sets = run.sets();
+    assert_eq!(
+        job_status_for_assert(&run.pipeline, run.job_id),
+        Some(JobStatus::Complete),
+        "sets: {sets}"
+    );
+    assert!(
+        run.witness.contains("Demoted"),
+        "a set whose end header never arrives cannot stay direct\nsets: {sets}"
+    );
+    assert_eq!(
+        run.pipeline.direct_store.finalized_sets, 0,
+        "a demoted set publishes through extraction, not from partials\nsets: {sets}"
+    );
+    run.assert_members_published();
 }
 
 /// The fixtures themselves, read back through the library at full size.

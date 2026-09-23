@@ -2174,6 +2174,90 @@ async fn an_absent_closing_volume_is_confirmed_from_its_own_repaired_image() {
     );
 }
 
+/// The same two absences under PAR3 instead of PAR2: a whole middle volume
+/// nobody posted, and the closing one. The set holds no byte of either, so
+/// the recovery set has to create the volume at the length its descriptions
+/// state and the re-route has to confirm it from the repaired image — the
+/// PAR3 readback path, which is not the PAR2 overlay's.
+async fn a_wholly_absent_rar_volume_under_par3(job_id: JobId, absent: u32) -> Par3RepairOutcome {
+    let member_name = "Silver.Horizon.S01E33.mkv";
+    let payload: Vec<u8> = (0..4000u32).map(|index| (index % 211) as u8).collect();
+    let volumes = single_member_store_set(member_name, &payload, 5);
+    let carriers = par3_carriers_over(&volumes, PAR2_SLICE_BYTES, 12);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", &volumes, 2);
+    let outcome =
+        run_direct_set_with_par3(job_id, spec, &volumes, 2, Some(absent), &carriers).await;
+    assert!(
+        matches!(outcome.status, Some(JobStatus::Complete)),
+        "the job must complete, got {:?} with sets {}",
+        outcome.status,
+        outcome.shapes()
+    );
+    assert_eq!(
+        outcome.member(member_name).as_deref(),
+        Some(payload.as_slice()),
+        "the member must be published whole from bytes the repair supplied; sets = {}",
+        outcome.shapes()
+    );
+    assert!(
+        !outcome.volume_file_seen,
+        "no source volume may appear under its own name; sets = {}",
+        outcome.shapes()
+    );
+    assert_eq!(
+        outcome.repair_scratch_left, 0,
+        "the repair scratch is deleted once its spans are routed"
+    );
+    let published: Vec<String> = std::fs::read_dir(&outcome.output_root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !volumes
+            .iter()
+            .any(|(filename, _)| outcome.output_root.join(filename).exists()),
+        "the repaired volume is the set's, not a deliverable; published = {published:?}\nsets: {}",
+        outcome.shapes()
+    );
+    outcome
+}
+
+#[tokio::test]
+async fn a_wholly_absent_volume_is_repaired_in_place_by_par3() {
+    let outcome = a_wholly_absent_rar_volume_under_par3(JobId(41222), 2).await;
+    assert!(
+        !outcome.demoted(),
+        "a volume nobody posted is repairable in place under PAR3 too; sets = {}",
+        outcome.shapes()
+    );
+    assert_eq!(
+        outcome.finalized,
+        1,
+        "the set must commit its own partials; sets = {}",
+        outcome.shapes()
+    );
+}
+
+#[tokio::test]
+async fn an_absent_closing_volume_is_repaired_in_place_by_par3() {
+    let outcome = a_wholly_absent_rar_volume_under_par3(JobId(41223), 4).await;
+    assert!(
+        !outcome.demoted(),
+        "the closing volume's repaired image must confirm the set; sets = {}",
+        outcome.shapes()
+    );
+    assert_eq!(
+        outcome.finalized,
+        1,
+        "the set must finalize on it; sets = {}",
+        outcome.shapes()
+    );
+}
+
 #[tokio::test]
 async fn a_part_checksum_mismatch_waits_for_par2_instead_of_demoting() {
     // 128 bytes of a volume's member payload flipped under a yEnc CRC that

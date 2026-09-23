@@ -2641,6 +2641,10 @@ impl Pipeline {
                 // here too — the final move relocates the whole directory, and
                 // the parts are not part of the release.
                 self.cleanup_par2_joined_split_parts(job_id).await;
+                // A container set installed from the wire arrives here too,
+                // and a volume a repair rebuilt for it is spent once the set
+                // is finalized.
+                self.cleanup_installed_direct_set_volumes(job_id).await;
                 // No archives — move to complete and finish.
                 if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);

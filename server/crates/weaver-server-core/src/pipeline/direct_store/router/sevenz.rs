@@ -692,7 +692,14 @@ pub(super) fn container_facts(
             .has_last_modified_date
             .then(|| file.last_modified_date.into());
         let accessed = file.has_access_date.then(|| file.access_date.into());
-        if !file.has_stream || file.is_directory {
+        // A zero-length entry that nonetheless claims a stream is dataless
+        // too: it consumes none of its block, and a member with no bytes has
+        // no part in any volume to route. Left in the placed set it would be
+        // the one entry `member_over` cannot place, and a refusal there is
+        // the whole set demoted for a file that only needs creating. The
+        // format's own writer never emits the shape — it marks empty files
+        // stream-less — so this is the invariant stated, not a case observed.
+        if !file.has_stream || file.is_directory || file.size == 0 {
             entries.push(SevenZipEntryFacts {
                 name: file.name.clone(),
                 start: None,

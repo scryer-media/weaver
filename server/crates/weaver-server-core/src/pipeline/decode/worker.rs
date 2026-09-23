@@ -2208,6 +2208,17 @@ impl Pipeline {
             // handback seeds its extents into this buffer and drains it, which
             // is the order the inline sweep used to guarantee by construction.
             let sweep_outstanding = self.demotion_sweep_owns_file(file_id);
+            // A duplicate of an article the assembly already committed is
+            // rewritten in place, never sequenced: its file may have completed
+            // and dropped its buffer, and a fresh buffer's cursor would hold
+            // it behind neighbours that are already on disk — with the job's
+            // completion gate waiting on the buffered bytes for as long as
+            // they sit there.
+            let already_committed = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .is_some_and(|file| file.has_segment(segment_id.segment_number));
             let ready = {
                 let _cpu_scope =
                     crate::runtime::perf_probe::cpu_scope("download.write_buffer.insert_drain");
@@ -2215,7 +2226,11 @@ impl Pipeline {
                     .write_buffers
                     .entry(file_id)
                     .or_insert_with(|| WriteReorderBuffer::new(self.write_buf_max_pending));
-                write_buf.insert(file_offset, buffered_segment);
+                if already_committed {
+                    write_buf.insert_duplicate(file_offset, buffered_segment);
+                } else {
+                    write_buf.insert(file_offset, buffered_segment);
+                }
                 if sweep_outstanding {
                     (Vec::new(), 0)
                 } else {
