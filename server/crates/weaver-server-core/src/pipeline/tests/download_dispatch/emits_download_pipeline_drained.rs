@@ -728,6 +728,7 @@ async fn dispatch_downloads_respects_hard_write_byte_pressure() {
         data: DecodedChunk::from(vec![7u8; 4096]),
         part_crc: par2_rs::checksum::crc32(&vec![7u8; 4096]),
         part_crc_verified: true,
+        declared_file_len: 0,
         yenc_name: "queued.bin".to_string(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
         segments: Vec::new(),

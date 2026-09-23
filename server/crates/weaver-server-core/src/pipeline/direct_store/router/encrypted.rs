@@ -859,8 +859,50 @@ impl DirectSetRouter {
             return Ok(());
         }
         let Some(expected) = layout_member.data_crc32 else {
-            // The chain closed with no whole-member CRC32, which the layout
-            // reports as `Ineligible`; `check_eligibility` owns that demotion.
+            // Two different situations share this arm, and the layout's own
+            // classification separates them.
+            //
+            // For RAR, a chain that closes with no whole-member CRC32 is
+            // `Ineligible`, and `check_eligibility` owns that demotion — so
+            // returning here leaves the member unverified for a set that is
+            // already on its way out.
+            //
+            // For 7z it is an ordinary archive. Checksums there are per
+            // sub-stream and optional, and an archive written without them is
+            // not malformed; the layout classifies such a member
+            // `DirectEligible` because the coder gate has already established
+            // that its packed bytes are its output bytes. What stands in for
+            // the composed CRC32 is the only other evidence there is: full
+            // coverage of the declared size, and — when the job posts a
+            // recovery set — that set's verdict, which the finalization gate
+            // waits for before any member is published.
+            if !self.member_checksums_are_optional() {
+                return Ok(());
+            }
+            let unpacked_size = layout_member.unpacked_size.unwrap_or(0);
+            let covered = self
+                .members
+                .get(&member_id)
+                .is_some_and(|member| member.covered.contiguous_from_zero() >= unpacked_size);
+            if !covered {
+                return Ok(());
+            }
+            if let Some(member) = self.member_mut(member_id) {
+                member.verified = true;
+            }
+            crate::runtime::perf_probe::record(
+                "direct_store.sevenz.member_unchecked",
+                std::time::Duration::from_nanos(1),
+            );
+            if !self.par2_available {
+                // Nothing will ever vouch for these bytes beyond the wire's own
+                // yEnc CRC32s. Worth counting: it is the one shape where direct
+                // routing publishes a member on transport evidence alone.
+                crate::runtime::perf_probe::record(
+                    "direct_store.sevenz.set_unchecked_no_par2",
+                    std::time::Duration::from_nanos(1),
+                );
+            }
             return Ok(());
         };
         let part_lengths: Vec<u64> = layout_member

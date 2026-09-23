@@ -1902,6 +1902,7 @@ impl Pipeline {
                     data,
                     part_crc,
                     part_crc_verified: false,
+                    declared_file_len: yenc_layout.file_size,
                     yenc_name,
                     checkpoint_plan,
                     segments,
@@ -2045,6 +2046,7 @@ impl Pipeline {
                 data,
                 part_crc,
                 part_crc_verified,
+                declared_file_len: yenc_layout.file_size,
                 yenc_name,
                 checkpoint_plan,
                 segments,
@@ -2141,6 +2143,7 @@ impl Pipeline {
                             volume_index,
                             buffered_segment,
                             file_offset,
+                            yenc_layout.file_size,
                         )
                         .await;
                     match outcome {
@@ -2207,12 +2210,27 @@ impl Pipeline {
             // handback seeds its extents into this buffer and drains it, which
             // is the order the inline sweep used to guarantee by construction.
             let sweep_outstanding = self.demotion_sweep_owns_file(file_id);
+            // A duplicate of an article the assembly already committed is
+            // rewritten in place, never sequenced: its file may have completed
+            // and dropped its buffer, and a fresh buffer's cursor would hold
+            // it behind neighbours that are already on disk — with the job's
+            // completion gate waiting on the buffered bytes for as long as
+            // they sit there.
+            let already_committed = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .is_some_and(|file| file.has_segment(segment_id.segment_number));
             let ready = {
                 let _cpu_scope =
                     crate::runtime::perf_probe::cpu_scope("download.write_buffer.insert_drain");
                 let write_buf =
                     self.write_buffer_for_article(file_id, segment_id.segment_number, file_offset);
-                write_buf.insert(file_offset, buffered_segment);
+                if already_committed {
+                    write_buf.insert_duplicate(file_offset, buffered_segment);
+                } else {
+                    write_buf.insert(file_offset, buffered_segment);
+                }
                 if sweep_outstanding {
                     (Vec::new(), 0)
                 } else {
@@ -3586,6 +3604,7 @@ impl Pipeline {
             data,
             part_crc,
             part_crc_verified,
+            declared_file_len: _,
             yenc_name,
             checkpoint_plan,
             segments,

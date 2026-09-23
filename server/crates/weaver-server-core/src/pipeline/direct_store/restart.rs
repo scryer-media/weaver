@@ -73,6 +73,53 @@ use crate::jobs::model::JobSpec;
 use crate::jobs::service::segments_covered_by_floor;
 use crate::pipeline::Pipeline;
 
+/// The durable per-volume facts a restart rebuilds a set's layout from.
+///
+/// One row per (job, set, volume) of `active_rar_volume_facts`, whose column is
+/// an opaque blob — which is what lets a second container family join it with
+/// no migration and no invalidation of anything already written.
+///
+/// # The untagged fallback is the compatibility guarantee
+///
+/// Rows written before this envelope existed are a bare `RarVolumeFacts` map,
+/// and they belong to sets that are mid-download in a shipped release. Decoding
+/// tries the tagged form first and falls back to the bare one, so those rows
+/// restore exactly as they did — a new tag on the wire would otherwise turn
+/// every in-flight direct set into a redownload on the upgrade.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum DirectVolumeFacts {
+    Rar(Box<unrar_rs::RarVolumeFacts>),
+    SevenZip(Box<SevenZipVolumeFacts>),
+}
+
+/// What one volume of a 7z set contributes to the restored layout.
+///
+/// A 7z container states its map once, at the tail, so exactly one volume's row
+/// carries `container` and every row carries the one thing that is genuinely
+/// per volume: the length the wire declared for it. Both halves are needed —
+/// the map gives container offsets, and only the lengths turn those into the
+/// (volume, offset) pairs everything downstream is expressed in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SevenZipVolumeFacts {
+    pub(crate) declared_len: u64,
+    pub(crate) container: Option<super::router::sevenz::SevenZipContainerFacts>,
+}
+
+impl DirectVolumeFacts {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        rmp_serde::to_vec_named(self)
+    }
+
+    pub(crate) fn decode(blob: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+        match rmp_serde::from_slice::<Self>(blob) {
+            Ok(facts) => Ok(facts),
+            Err(tagged) => rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(blob)
+                .map(|facts| Self::Rar(Box::new(facts)))
+                .map_err(|_| tagged),
+        }
+    }
+}
+
 /// Why a checkpoint row was refused. Every variant means the same thing for the
 /// set: **no coverage**, redownload from zero, and delete the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -969,7 +1016,7 @@ impl Pipeline {
     async fn load_direct_volume_facts(
         &self,
         job_id: JobId,
-    ) -> HashMap<String, BTreeMap<u32, unrar_rs::RarVolumeFacts>> {
+    ) -> HashMap<String, BTreeMap<u32, DirectVolumeFacts>> {
         let rows = match self
             .db_blocking(move |db| db.load_all_rar_volume_facts(job_id))
             .await
@@ -984,10 +1031,10 @@ impl Pipeline {
                 return HashMap::new();
             }
         };
-        let mut decoded: HashMap<String, BTreeMap<u32, unrar_rs::RarVolumeFacts>> = HashMap::new();
+        let mut decoded: HashMap<String, BTreeMap<u32, DirectVolumeFacts>> = HashMap::new();
         for (set_name, volumes) in rows {
             for (volume_index, blob) in volumes {
-                match rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob) {
+                match DirectVolumeFacts::decode(&blob) {
                     Ok(facts) => {
                         decoded
                             .entry(set_name.clone())
@@ -1139,4 +1186,81 @@ fn sweep_orphan_direct_files_blocking(
         }
     }
     swept
+}
+
+#[cfg(test)]
+mod facts_envelope_tests {
+    use super::{DirectVolumeFacts, SevenZipVolumeFacts};
+
+    /// Rows written before the envelope existed are bare `RarVolumeFacts`
+    /// blobs, and there are live ones in shipped databases. Decoding has to
+    /// keep reading them as RAR, because the alternative is every in-flight
+    /// direct set on an upgraded install restarting from zero.
+    #[test]
+    fn a_bare_rar_blob_decodes_as_the_rar_arm() {
+        let facts = unrar_rs::RarVolumeFacts {
+            format: 5,
+            volume_number: Some(0),
+            more_volumes: true,
+            is_solid: false,
+            is_encrypted: false,
+            is_volume: true,
+            has_recovery_record: false,
+            is_locked: false,
+            has_authenticity_verification: false,
+            has_locator: false,
+            quick_open_offset: None,
+            headers_from_quick_open: false,
+            recovery_record_offset: None,
+            original_name: None,
+            original_name_raw: None,
+            original_creation_time_ns: None,
+            members: Vec::new(),
+            services: Vec::new(),
+        };
+        // Exactly what the old encoder wrote: the struct, untagged.
+        let blob = rmp_serde::to_vec_named(&facts).expect("the old encoding still encodes");
+        assert_eq!(
+            DirectVolumeFacts::decode(&blob).expect("a shipped row still decodes"),
+            DirectVolumeFacts::Rar(Box::new(facts))
+        );
+    }
+
+    /// And the envelope round-trips both arms, so a row written now is read
+    /// back as what it is rather than falling through to the RAR fallback.
+    #[test]
+    fn the_envelope_round_trips_both_arms() {
+        for facts in [
+            DirectVolumeFacts::SevenZip(Box::new(SevenZipVolumeFacts {
+                declared_len: 4096,
+                container: None,
+            })),
+            DirectVolumeFacts::Rar(Box::new(unrar_rs::RarVolumeFacts {
+                format: 5,
+                volume_number: Some(1),
+                more_volumes: false,
+                is_solid: false,
+                is_encrypted: false,
+                is_volume: true,
+                has_recovery_record: false,
+                is_locked: false,
+                has_authenticity_verification: false,
+                has_locator: false,
+                quick_open_offset: None,
+                headers_from_quick_open: false,
+                recovery_record_offset: None,
+                original_name: None,
+                original_name_raw: None,
+                original_creation_time_ns: None,
+                members: Vec::new(),
+                services: Vec::new(),
+            })),
+        ] {
+            let blob = facts.encode().expect("the envelope encodes");
+            assert_eq!(
+                DirectVolumeFacts::decode(&blob).expect("the envelope decodes"),
+                facts
+            );
+        }
+    }
 }

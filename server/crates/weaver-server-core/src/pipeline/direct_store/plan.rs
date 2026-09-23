@@ -2,9 +2,21 @@
 //!
 //! A direct set is admitted from the **job spec alone**, before a byte lands:
 //! every candidate volume is an NZB file whose role already says it is a RAR
-//! volume, so the volume-to-file mapping the coverage barrier needs exists
-//! without waiting for anything to complete. Everything the *layout* decides —
-//! members, eligibility, extents — happens later, in the router.
+//! volume or a 7z container, so the volume-to-file mapping the coverage barrier
+//! needs exists without waiting for anything to complete. Everything the
+//! *layout* decides — members, eligibility, extents — happens later, in the
+//! router.
+//!
+//! # Two container families, one admission
+//!
+//! The two families are admitted by the same sweep and differ only in what
+//! names a volume. A RAR set's volumes are `FileRole::RarVolume`s numbered by
+//! the archiver; a 7z set is either a single `.7z` (one volume) or a `-v` split
+//! whose `.7z.001…` fragments are a pure byte split of one container. Both
+//! reduce to "an ordered, gapless run of NZB files that concatenate into one
+//! archive", which is the only shape anything downstream of this module knows
+//! about. [`SetFormat`] carries the difference forward so the router can pick
+//! the layout engine that reads the container's headers.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -23,6 +35,26 @@ pub(crate) enum AdmissionRefusal {
     VolumeGap,
     /// The set has no volumes at all.
     Empty,
+    /// One base name collected both a bare `.7z` and `.7z.NNN` fragments.
+    ///
+    /// `archive_base_name` maps `x.7z` and `x.7z.001` to the same set, which is
+    /// right — they are the same archive — but an NZB carrying both is claiming
+    /// the container is simultaneously whole and split. Nothing can decide
+    /// which of the two the posted bytes are, so the set is refused rather than
+    /// guessed at, and the conventional path takes it.
+    MixedSevenZipShape,
+}
+
+/// Which container family an admitted set's volumes concatenate into.
+///
+/// The router reads this to pick a layout engine: RAR's headers are a
+/// front-to-back walk per volume, where a 7z container states its whole map
+/// once, in an end header at the tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SetFormat {
+    #[default]
+    Rar,
+    SevenZip,
 }
 
 /// Extension of a damaged volume's repair scratch. Matched as a
@@ -48,6 +80,7 @@ impl AdmissionRefusal {
             Self::DuplicateVolume => "duplicate_volume",
             Self::VolumeGap => "volume_gap",
             Self::Empty => "empty_set",
+            Self::MixedSevenZipShape => "mixed_7z_shape",
         }
     }
 }
@@ -120,6 +153,10 @@ pub(crate) struct IdentityPlanFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectSetPlan {
     pub(crate) set_name: String,
+    /// The container family the volumes concatenate into, decided at admission
+    /// from the NZB roles alone. Never revised: a set whose bytes turn out to
+    /// be a different container demotes rather than switching engines.
+    pub(crate) format: SetFormat,
     /// Volume index to NZB file index. Dense from zero for a name-admitted
     /// set; for an identity-admitted set it grows toward
     /// [`IdentityPlanFacts::expected_volumes`] as files are matched.
@@ -170,20 +207,49 @@ pub(crate) fn spec_defers_to_par3(spec: &JobSpec) -> bool {
 }
 
 impl DirectSetPlan {
-    /// Every RAR set the spec declares, admitted or refused.
+    /// Every archive set the spec declares, admitted or refused.
+    ///
+    /// Both families are collected into one candidate map keyed by the set name
+    /// `archive_base_name` derives, which is also the name the conventional
+    /// topology gives the same archive — the identity that lets finalization
+    /// suppress a second extraction of a set direct-store already produced.
     pub(crate) fn discover(
         spec: &JobSpec,
         working_dir: &Path,
         destination_dir: &Path,
     ) -> (Vec<Self>, Vec<(String, AdmissionRefusal)>) {
         let mut candidates: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
+        // Per candidate: the family its first file claimed, and whether a bare
+        // `.7z` and a `.7z.NNN` fragment both claimed it. Kept beside the
+        // volume list rather than derived from it because both shapes number
+        // their only/first volume zero, so the collision is invisible by the
+        // time the entries are sorted.
+        let mut shapes: BTreeMap<String, (SetFormat, bool, bool)> = BTreeMap::new();
         for (file_index, file) in spec.files.iter().enumerate() {
-            let FileRole::RarVolume { volume_number } = file.role else {
-                continue;
+            let (format, volume_number, whole) = match file.role {
+                FileRole::RarVolume { volume_number } => (SetFormat::Rar, volume_number, false),
+                FileRole::SevenZipArchive => (SetFormat::SevenZip, 0, true),
+                FileRole::SevenZipSplit { number } => (SetFormat::SevenZip, number, false),
+                _ => continue,
             };
             let Some(set_name) = archive_base_name(&file.filename, &file.role) else {
                 continue;
             };
+            let shape = shapes
+                .entry(set_name.clone())
+                .or_insert((format, false, false));
+            if whole {
+                shape.1 = true;
+            } else {
+                shape.2 = true;
+            }
+            if shape.0 != format {
+                // Two families under one name. Whichever is right, one of the
+                // two file sets is not part of this archive, so the volume run
+                // below would concatenate bytes from both.
+                shape.1 = true;
+                shape.2 = true;
+            }
             candidates
                 .entry(set_name)
                 .or_default()
@@ -202,6 +268,15 @@ impl DirectSetPlan {
             entries.sort_unstable();
             if entries.is_empty() {
                 refused.push((set_name, AdmissionRefusal::Empty));
+                continue;
+            }
+            let (format, whole, fragment) =
+                shapes
+                    .get(&set_name)
+                    .copied()
+                    .unwrap_or((SetFormat::Rar, false, false));
+            if whole && fragment {
+                refused.push((set_name, AdmissionRefusal::MixedSevenZipShape));
                 continue;
             }
             let mut volumes = BTreeMap::new();
@@ -229,6 +304,7 @@ impl DirectSetPlan {
                 .collect();
             admitted.push(Self {
                 set_name,
+                format,
                 volumes,
                 files,
                 identity: None,
@@ -607,6 +683,13 @@ impl DirectSetPlan {
         // different names. Bumping the domain string refuses every older row
         // into the ordinary redownload; no v2 row ever shipped in a release.
         hasher.update(b"weaver.direct_store.plan.v3\0");
+        // Appended only for a non-RAR set, so every RAR digest stays the byte
+        // sequence v3 rows on disk were written under. Bumping the domain would
+        // refuse every shipped checkpoint into a full redownload to record a
+        // fact that, for those rows, has exactly one possible value.
+        if self.format != SetFormat::Rar {
+            hasher.update(b"7z\0");
+        }
         hasher.update(self.set_name.as_bytes());
         hasher.update(&[0]);
         hasher.update(&(self.volumes.len() as u64).to_le_bytes());

@@ -1001,6 +1001,16 @@ impl Coordinator {
             })
     }
 
+    /// Whether a worker currently owns the job's session, so a completion is
+    /// owed on the repair channel. Narrower than [`Self::has_work`], which
+    /// also counts work the next completion check has to dispatch or spill.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn has_worker_in_flight(&self, job_id: JobId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .is_some_and(|job| job.ticket.is_some())
+    }
+
     pub(in crate::pipeline) fn has_work(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|job| {
             job.installing

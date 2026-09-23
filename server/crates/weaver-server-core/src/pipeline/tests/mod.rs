@@ -2237,13 +2237,55 @@ async fn submit_decoded_segment_with_segments(
     part_crc_verified: bool,
     segments: Option<Vec<weaver_yenc::Segment>>,
 ) {
+    let declared_file_len = pipeline
+        .jobs
+        .get(&file_id.job_id)
+        .and_then(|state| state.assembly.file(file_id))
+        .expect("active test file assembly")
+        .total_bytes();
+    submit_decoded_segment_declaring(
+        pipeline,
+        file_id,
+        segment_number,
+        file_offset,
+        data,
+        filename,
+        expected_file_crc,
+        part_crc_verified,
+        segments,
+        declared_file_len,
+    )
+    .await;
+}
+
+/// [`submit_decoded_segment_with_segments`] with the length the article's
+/// `=ybegin size=` states chosen by the caller.
+///
+/// The default above states the assembly's total, which is the NZB's sum of
+/// encoded segment sizes. A real post states the decoded length there, so a
+/// caller that knows the file's true length — every volume-aware helper does —
+/// states that instead; the two only coincide when the spec pretends its
+/// articles are not yEnc-inflated.
+#[allow(clippy::too_many_arguments)]
+async fn submit_decoded_segment_declaring(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    segment_number: u32,
+    file_offset: u64,
+    data: &[u8],
+    filename: &str,
+    expected_file_crc: Option<u32>,
+    part_crc_verified: bool,
+    segments: Option<Vec<weaver_yenc::Segment>>,
+    declared_file_len: u64,
+) {
     let file = pipeline
         .jobs
         .get(&file_id.job_id)
         .and_then(|state| state.assembly.file(file_id))
         .expect("active test file assembly");
     let yenc_layout = YencLayoutAssertions {
-        file_size: file.total_bytes(),
+        file_size: declared_file_len,
         part: Some(segment_number + 1),
         total: Some(file.total_segments()),
         begin: Some(file_offset + 1),

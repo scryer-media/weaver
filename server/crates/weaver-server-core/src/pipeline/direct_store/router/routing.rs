@@ -410,9 +410,30 @@ impl DirectSetRouter {
     pub(crate) fn note_volume_complete(
         &mut self,
         volume_index: u32,
+        decoded_len: u64,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
         if let Some(reason) = self.demoted {
             return Err(reason);
+        }
+        // The authoritative length check, and the only one that is: a yEnc
+        // `size=` is advisory, so what a volume *decoded* to is the first hard
+        // statement of how long it actually is. A volume that is not the length
+        // the geometry requires means the part-size hint was wrong, and every
+        // container offset this set has placed is off by the difference.
+        //
+        // Deliberately not conditional on having routed nothing yet. A set that
+        // already routed against the wrong geometry wrote its members' bytes
+        // where no reader will look for them, so this is exactly the case the
+        // check exists for — the demotion materializes the volumes and hands
+        // them to the conventional path rather than letting those bytes ship.
+        //
+        // Recorded as well as checked, because a volume can finish before the
+        // map does: the geometry may not exist yet, and when it arrives it is
+        // held against every length already in hand.
+        if self.plan.format == SetFormat::SevenZip {
+            self.sevenz_decoded_volume_lengths
+                .insert(volume_index, decoded_len);
+            self.check_decoded_against_geometry()?;
         }
         // Set before the parse, not after: this is what licenses the parse
         // about to run to be the *confirming* one.
@@ -683,6 +704,12 @@ impl DirectSetRouter {
     /// facts could have come from the cache is now checked against the physical
     /// walk before a single member reaches the layout.
     pub(super) fn try_parse_volume(&mut self, volume_index: u32) -> Result<(), DemotionReason> {
+        // A 7z set has no per-volume headers to walk: its whole map is one end
+        // header at the tail of the concatenation, so the parse is a property
+        // of the *set* and the volume that triggered it is irrelevant.
+        if self.plan.format == SetFormat::SevenZip {
+            return self.try_parse_container();
+        }
         let Some(staging) = self.staging.get(&volume_index) else {
             return Ok(());
         };
@@ -1007,7 +1034,7 @@ impl DirectSetRouter {
             if !matches!(format, ArchiveFormat::Rar4 | ArchiveFormat::Rar5) {
                 return Err(self.fail(DemotionReason::UnsupportedFormat));
             }
-            self.layout = Some(StoredLayoutBuilder::new(format));
+            self.layout = Some(SetLayout::Rar(StoredLayoutBuilder::new(format)));
         }
 
         // What this parse says about the volume, against what the last accepted
@@ -1037,7 +1064,8 @@ impl DirectSetRouter {
                 let added = self
                     .layout
                     .as_mut()
-                    .expect("the layout was bound above")
+                    .and_then(SetLayout::rar_mut)
+                    .expect("the RAR layout was bound above")
                     .add_volume(volume_index, &facts);
                 match added {
                     Ok(()) => {}
@@ -1289,7 +1317,14 @@ impl DirectSetRouter {
     /// and members keep their weaver-side identity because that identity is the
     /// header name, not the layout's index — which the rebuild is free to move.
     pub(super) fn rebuild_layout(&mut self) -> Result<(), DemotionReason> {
-        let Some(format) = self.layout.as_ref().map(StoredLayoutBuilder::format) else {
+        // 7z has nothing to rebuild: its layout came whole from one end header
+        // and no later volume can extend it.
+        let Some(format) = self
+            .layout
+            .as_ref()
+            .and_then(SetLayout::rar)
+            .map(StoredLayoutBuilder::format)
+        else {
             return Ok(());
         };
         let mut rebuilt = StoredLayoutBuilder::new(format);
@@ -1304,7 +1339,7 @@ impl DirectSetRouter {
                 }
             }
         }
-        self.layout = Some(rebuilt);
+        self.layout = Some(SetLayout::Rar(rebuilt));
         // A rebuild is free to renumber and reposition every member.
         self.member_order_stale = true;
         Ok(())
@@ -1327,11 +1362,12 @@ impl DirectSetRouter {
         // which point an ineligible member colliding with a routed one is a
         // member silently overwriting another, exactly what the extractor
         // refuses.
-        let started: Vec<String> = self
-            .layout_members()
-            .iter()
-            .map(|member| member.name.clone())
-            .collect();
+        // Every name the layout will put in the output directory, which for a
+        // 7z container is more than its members: an empty file and a directory
+        // are headers with no stream, so they are created at finalization
+        // rather than routed, and a collision between one of those and a routed
+        // member is a file created over verified bytes.
+        let started: Vec<String> = self.layout_destination_names();
         let mut seen: std::collections::HashSet<String> =
             std::collections::HashSet::with_capacity(started.len());
         // Second key, same sweep: two names that differ only past the filename
@@ -2274,4 +2310,376 @@ pub(crate) fn crc32_over_pieces(pieces: &[Bytes]) -> u32 {
         crc = weaver_yenc::crc32_combine(crc, par2_rs::checksum::crc32(piece), piece.len() as u64);
     }
     crc
+}
+
+// ---- 7z -------------------------------------------------------------------
+//
+// A 7z container states its whole map once, in an end header at the tail of the
+// concatenated volumes, so everything below is set-wide where the RAR paths
+// above are per volume. There is one parse, it either succeeds or is waiting on
+// bytes, and when it succeeds every volume is classified at once.
+
+impl DirectSetRouter {
+    /// Records the length one volume's articles declare for it.
+    ///
+    /// The yEnc header of *any* article of a file states that file's total
+    /// size, so a volume declares its length on its first arriving article
+    /// rather than on its last. That is what lets the tail of the container be
+    /// located while most of it is still in flight.
+    ///
+    /// A second, different declaration is a disagreement between two articles
+    /// about what file they belong to. Nothing can reconcile it — one of them
+    /// is describing another posting — so the set demotes rather than picking
+    /// one, exactly as two disagreeing header parses of one RAR volume do.
+    pub(crate) fn note_declared_volume_size(
+        &mut self,
+        volume_index: u32,
+        declared_len: u64,
+    ) -> Result<(), DemotionReason> {
+        if self.plan.format != SetFormat::SevenZip || declared_len == 0 {
+            return Ok(());
+        }
+        match self.declared_volume_sizes.get(&volume_index) {
+            Some(existing) if *existing == declared_len => return Ok(()),
+            Some(_) => {
+                return Err(self.fail(DemotionReason::SevenZip(
+                    sevenz::SevenZipRefusal::VolumeSize,
+                )));
+            }
+            None => {}
+        }
+        self.declared_volume_sizes
+            .insert(volume_index, declared_len);
+        self.dirty_facts.insert(volume_index);
+        // The geometry says how long this volume has to be, so a declaration
+        // that disagrees is the first evidence the part-size hint was wrong.
+        //
+        // Only ever an *early* chance at the verdict the decoded length reaches
+        // on its own: a yEnc `size=` is advisory here as everywhere else in
+        // weaver, so agreement proves nothing and no parse waits on it. What it
+        // buys is the demotion arriving before the set routes a byte against a
+        // geometry it is going to lose.
+        self.check_declared_against_geometry(volume_index, declared_len)
+    }
+
+    /// Refuses a volume whose stated length is not the one the geometry
+    /// requires. A no-op while there is no geometry to check it against, and
+    /// for a volume outside it — that disagreement is the part count's, and it
+    /// is raised once, where the geometry is derived.
+    fn check_declared_against_geometry(
+        &mut self,
+        volume_index: u32,
+        declared_len: u64,
+    ) -> Result<(), DemotionReason> {
+        let Some(geometry) = self.container_geometry().transpose().ok().flatten() else {
+            return Ok(());
+        };
+        if geometry
+            .expected_len(volume_index)
+            .is_some_and(|expected| expected != declared_len)
+        {
+            return Err(self.fail(DemotionReason::SevenZip(
+                sevenz::SevenZipRefusal::VolumeSize,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Holds every volume that has finished arriving against the place the
+    /// geometry gives it. A no-op until there is a geometry, and run again the
+    /// moment there is one, so the order the two arrive in does not matter.
+    fn check_decoded_against_geometry(&mut self) -> Result<(), DemotionReason> {
+        let Some(geometry) = self.sevenz_geometry else {
+            return Ok(());
+        };
+        let wrong = self
+            .sevenz_decoded_volume_lengths
+            .iter()
+            .any(|(volume_index, decoded)| {
+                geometry
+                    .expected_len(*volume_index)
+                    .is_some_and(|expected| expected != *decoded)
+            });
+        if wrong {
+            return Err(self.fail(DemotionReason::SevenZip(
+                sevenz::SevenZipRefusal::VolumeSize,
+            )));
+        }
+        Ok(())
+    }
+
+    /// The container's geometry, once the two facts that state it are in hand.
+    ///
+    /// `None` until then: volume zero's declared length is the part size, and
+    /// the start header — read from volume zero's first 32 bytes — gives the
+    /// total. Both arrive with volume zero's front, which is why that is the
+    /// only front this set ever probes.
+    pub(super) fn container_geometry(
+        &self,
+    ) -> Option<Result<sevenz::ContainerGeometry, sevenz::SevenZipRefusal>> {
+        let start = self.sevenz_start.as_ref()?;
+        let part_size = self.declared_volume_sizes.get(&0).copied()?;
+        Some(sevenz::ContainerGeometry::derive(part_size, start))
+    }
+
+    /// What the set needs off the wire next in order to resolve its layout.
+    pub(crate) fn header_probe(&self) -> HeaderProbe {
+        if self.plan.format != SetFormat::SevenZip {
+            // RAR reads each volume's headers from that volume's own prefix, so
+            // the earliest article of the earliest unresolved volume is the
+            // whole rule.
+            return HeaderProbe::Earliest;
+        }
+        if self.layout.is_some() {
+            return HeaderProbe::Settled;
+        }
+        // A split container is a byte split at a fixed part size, so its whole
+        // geometry follows from two facts — the part size and the total — and
+        // both are carried by volume zero's front: the part size is its yEnc
+        // `size=`, the total is in the 32-byte start header at its offset zero.
+        // Nothing is asked of any other volume's front, because nothing any
+        // other volume could say is needed to place the map.
+        let front = self
+            .container_geometry()
+            .is_none()
+            .then(|| self.plan.volumes.keys().next().copied())
+            .flatten();
+        // The end header is the last `next_header_size` bytes of the container,
+        // so it is the *last* article of the last volume that carries its end —
+        // and, when it spans more than one article, the ones before that. The
+        // queue is asked for the highest-numbered article still outstanding,
+        // which walks backwards on its own as each one lands: no coordinate is
+        // needed, and none could be trusted anyway, since an article's byte
+        // range is only known once it has been decoded. It is worth asking for
+        // only once the signature header has named an end header to find.
+        let tail = self
+            .sevenz_start
+            .is_some()
+            .then(|| self.plan.volumes.keys().next_back().copied())
+            .flatten();
+        if front.is_none() && tail.is_none() {
+            return HeaderProbe::Settled;
+        }
+        HeaderProbe::Container { front, tail }
+    }
+
+    /// Reads the container's map, if enough of it has arrived.
+    ///
+    /// Runs on every routed article until it succeeds, and never again after
+    /// that: unlike a RAR volume, whose longer prefix can reveal a header the
+    /// last walk could not reach, a 7z end header is read whole or not at all.
+    pub(super) fn try_parse_container(&mut self) -> Result<(), DemotionReason> {
+        if self.layout.is_some() {
+            return Ok(());
+        }
+        // First, because the gate below is built out of what it reads: the
+        // start header is half the geometry, and until it has been taken off
+        // volume zero's prefix there is nothing here to decide with.
+        self.remember_start_header();
+        // The whole gate. Volume zero's front states the part size and carries
+        // the start header, and between them those place every byte of the
+        // concatenation — so the map can be read with nothing heard from any
+        // other volume but the tail that holds it.
+        let Some(geometry) = self.container_geometry() else {
+            // A readable start header means volume zero's first article has
+            // been decoded, and with it whatever length its yEnc header stated.
+            // None recorded by now means none was stated, or it was zero: there
+            // is no part size, so there is no placing this map, and no later
+            // article changes that. Refused rather than waited on, so the set
+            // hands over before it holds anything beyond its probe articles.
+            if self.sevenz_start.is_some() {
+                return Err(self.fail(DemotionReason::SevenZip(
+                    sevenz::SevenZipRefusal::VolumeHintUnusable,
+                )));
+            }
+            // Otherwise the start header is simply not readable yet, and the
+            // next article of volume zero settles it.
+            return Ok(());
+        };
+        let geometry = geometry.map_err(|refusal| self.fail(DemotionReason::SevenZip(refusal)))?;
+        // The NZB says how many volumes the set has and the geometry says how
+        // many the container was split into. Two statements about one archive,
+        // and a disagreement means the hint is wrong — caught here, before a
+        // byte is routed against boundaries that are in the wrong places.
+        if self
+            .plan
+            .expected_volume_count()
+            .is_some_and(|planned| planned as u64 != geometry.parts)
+        {
+            return Err(self.fail(DemotionReason::SevenZip(
+                sevenz::SevenZipRefusal::VolumeSize,
+            )));
+        }
+        let lengths = geometry.lengths();
+        let total = geometry.total;
+
+        let mut bases = Vec::with_capacity(lengths.len());
+        for volume_index in lengths.keys() {
+            if let Some(staging) = self.staging.get(volume_index) {
+                bases.push((
+                    u64::from(*volume_index) * geometry.part_size,
+                    &staging.chunks,
+                ));
+            }
+        }
+        let image_complete = self
+            .plan
+            .volumes
+            .keys()
+            .all(|volume| self.staging.get(volume).is_some_and(|s| s.source_complete));
+        let image = sevenz::ContainerImage::new(&bases, self.scratch.handle(), total);
+        #[cfg(test)]
+        {
+            self.parse_walks = self.parse_walks.saturating_add(1);
+        }
+        // The job's whole archive-password harvest, in its own priority order —
+        // what opens a `-mhe` container's end header, and the same list the
+        // `-hp` gate proves a RAR set's headers against.
+        //
+        // The spec's password is the harvest's `Explicit` entry, so it is
+        // already here; it is appended only for the job whose harvest could not
+        // be read at all, where it is the one candidate in hand and was what
+        // this parse used before the rest of the list reached it.
+        let mut passwords = self.header_crypt.candidates();
+        if let Some(spec) = self.crypt.password()
+            && !passwords.contains(&spec)
+        {
+            passwords.push(spec);
+        }
+        match sevenz::parse_container(
+            image,
+            total,
+            MAX_HEADER_PREFIX_BYTES,
+            image_complete,
+            &passwords,
+        ) {
+            sevenz::ParseOutcome::Incomplete => {
+                // Still waiting. The holds budget and the scratch ceiling bound
+                // that wait — every byte staged while the layout is unknown is
+                // a hold — so there is no separate deadline to arm here, and
+                // nothing that could be armed against elapsed time anyway.
+                Ok(())
+            }
+            sevenz::ParseOutcome::NotSevenZip => {
+                // The NZB named this file a 7z and its first bytes are not one.
+                Err(self.fail(DemotionReason::UnsupportedFormat))
+            }
+            sevenz::ParseOutcome::Refused(refusal) => {
+                Err(self.fail(DemotionReason::SevenZip(refusal)))
+            }
+            sevenz::ParseOutcome::Facts(facts) => self.adopt_container_facts(*facts),
+        }
+    }
+
+    /// Reads the signature header out of volume zero's staged prefix, so the
+    /// tail probe knows what it is aiming at.
+    ///
+    /// Separate from the parse because it succeeds much earlier: 32 bytes of
+    /// volume zero, against a whole end header at the far end of the set.
+    fn remember_start_header(&mut self) {
+        if self.sevenz_start.is_some() {
+            return;
+        }
+        let Some(staging) = self.staging.get(&0) else {
+            return;
+        };
+        let mut image = sevenz::ContainerImage::new(
+            &[(0, &staging.chunks)],
+            self.scratch.handle(),
+            sevenz::SIGNATURE_HEADER_LEN,
+        );
+        let Some(prefix) = image.read_exact_at(0, sevenz::SIGNATURE_HEADER_LEN as usize) else {
+            return;
+        };
+        let mut fixed = [0u8; sevenz::SIGNATURE_HEADER_LEN as usize];
+        fixed.copy_from_slice(&prefix);
+        self.sevenz_start = sevenz::StartHeader::parse(&fixed);
+    }
+
+    /// Installs a parsed or restored container map as the set's layout.
+    ///
+    /// Shared by the live parse and by restart so the two cannot drift: a
+    /// restored set is classified by exactly the code that classified it the
+    /// first time, including the destination-collision rule and the
+    /// zero-length and checksum-free member gates.
+    pub(super) fn adopt_container_facts(
+        &mut self,
+        facts: sevenz::SevenZipContainerFacts,
+    ) -> Result<(), DemotionReason> {
+        // Resolved against the geometry's lengths, not against what the volumes
+        // declared. A declared length is a hint this router checks *for*
+        // disagreement; the boundaries a member is cut at are the ones the part
+        // size and the total put there, so that they are the same boundaries
+        // for every volume whether or not it has been heard from.
+        let geometry = self
+            .container_geometry()
+            .or_else(|| {
+                // Restart: the start header is never refetched, so the geometry
+                // comes back off the cached total instead.
+                let part_size = self.declared_volume_sizes.get(&0).copied()?;
+                (facts.total != 0)
+                    .then(|| sevenz::ContainerGeometry::derive_from_total(part_size, facts.total))
+            })
+            .ok_or_else(|| {
+                self.fail(DemotionReason::SevenZip(
+                    sevenz::SevenZipRefusal::VolumeHintUnusable,
+                ))
+            })?
+            .map_err(|refusal| self.fail(DemotionReason::SevenZip(refusal)))?;
+        let layout = sevenz::SevenZipLayout::build(&geometry.lengths(), &facts)
+            .map_err(|refusal| self.fail(DemotionReason::SevenZip(refusal)))?;
+        self.sevenz_geometry = Some(geometry);
+        // Any volume that finished before the map did has been waiting for
+        // something to hold it against; this is that moment.
+        self.check_decoded_against_geometry()?;
+        self.layout = Some(SetLayout::SevenZip(layout));
+        self.sevenz_facts = Some(facts);
+        self.member_order_stale = true;
+        // Every volume is classified at once, and completely. There is no
+        // unproven trailing region the way there is for a RAR volume whose walk
+        // stopped short: the end header describes every byte of the
+        // concatenation, so nothing can still turn out to be a member.
+        let volumes: Vec<u32> = self.plan.volumes.keys().copied().collect();
+        for volume_index in &volumes {
+            let staging = self.staging.entry(*volume_index).or_default();
+            staging.provisional = true;
+            staging.confirmed = true;
+            self.dirty_facts.insert(*volume_index);
+        }
+        self.sync_members()?;
+        // A member can be finished before the map that names it arrives, which
+        // for 7z is the ordinary case rather than the exception: the map is at
+        // the tail, so on a small container every byte of every member may
+        // already be staged. Nothing routed would then ever re-trigger the
+        // gate, and the set would sit verified-never.
+        let member_ids: Vec<u32> = self.members.keys().copied().collect();
+        for member_id in member_ids {
+            self.try_verify_member(member_id)?;
+        }
+        self.check_eligibility()?;
+        crate::runtime::perf_probe::record(
+            "direct_store.sevenz.layout_adopted",
+            std::time::Duration::from_nanos(1),
+        );
+        Ok(())
+    }
+}
+
+/// What a set wants the download scheduler to fetch next while its layout is
+/// unresolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeaderProbe {
+    /// Nothing outstanding: the layout is known.
+    Settled,
+    /// The earliest queued article of the earliest volume whose headers are
+    /// still unread.
+    Earliest,
+    /// A container read at both ends at once: the **earliest** queued article
+    /// of `front` — volume zero's, which carries both facts the geometry is
+    /// derived from — and the **highest-numbered** queued article of `tail`,
+    /// because a container's map is the last thing in it.
+    Container {
+        front: Option<u32>,
+        tail: Option<u32>,
+    },
 }

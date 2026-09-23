@@ -116,6 +116,21 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         self.pending.insert(offset, PendingChunk::Buffered(data));
     }
 
+    /// Insert a segment the caller already knows is a duplicate of one that
+    /// was written, so it is handed back for an idempotent rewrite instead of
+    /// taking a place in the ordered map.
+    ///
+    /// The cursor cannot make that call on its own. A buffer is dropped once
+    /// its file completes, so a duplicate that arrives afterwards meets a fresh
+    /// buffer whose cursor is back at zero: every offset but the first is
+    /// *above* it, and [`insert`](Self::insert) would park it waiting for
+    /// neighbours that were written long ago and are never coming again.
+    pub fn insert_duplicate(&mut self, offset: u64, data: T) {
+        self.buffered_bytes += data.len_bytes();
+        self.buffered_segments += 1;
+        self.redundant.push((offset, data));
+    }
+
     /// Drain any contiguous segments that are now ready for sequential writing.
     pub fn drain_ready(&mut self) -> Vec<(u64, T)> {
         self.drain_ready_with_contiguous_end().0

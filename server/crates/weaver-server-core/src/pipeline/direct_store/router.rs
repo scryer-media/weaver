@@ -57,12 +57,15 @@ use unrar_rs::{
 };
 
 use super::ByteRanges;
-use super::plan::DirectSetPlan;
+use super::plan::{DirectSetPlan, SetFormat};
+use super::restart::{DirectVolumeFacts, SevenZipVolumeFacts};
 use super::sparse::SparseMarking;
 use crypt::{
     AES_BLOCK, CryptRefusal, HeaderCryptRefusal, HeaderKeyRing, KeyRing, MemberCrypt, block_ceil,
     block_floor,
 };
+use layout::SetLayout;
+use sevenz::SevenZipRefusal;
 
 pub(crate) mod crypt;
 
@@ -387,6 +390,8 @@ pub(crate) enum DemotionReason {
     /// hands everything to the conventional path, whose extractor orders
     /// volumes by reading them.
     IdentityVolumeMismatch,
+    /// A 7z container the layout will not read. See [`SevenZipRefusal`].
+    SevenZip(SevenZipRefusal),
 }
 
 /// The ineligibility reasons this module distinguishes in metrics. The
@@ -580,6 +585,11 @@ impl DemotionReason {
             // that volume; one whose headers contradict its binding has a
             // layout describing a different file.
             Self::IdentityRosterUnfillable | Self::IdentityVolumeMismatch => VolumeDemand::Real,
+            // Every 7z refusal is "there is no layout", either because the end
+            // header named a container this cannot route or because the
+            // volumes' geometry does not close. With no layout there is no
+            // overlay, so the conventional path needs the volumes themselves.
+            Self::SevenZip(_) => VolumeDemand::Real,
         }
     }
 
@@ -656,6 +666,7 @@ impl DemotionReason {
             Self::FinalizationFailed => "finalization_failed",
             Self::IdentityRosterUnfillable => "identity_roster_unfillable",
             Self::IdentityVolumeMismatch => "identity_volume_mismatch",
+            Self::SevenZip(refusal) => refusal.metric(),
         }
     }
 }
@@ -1547,6 +1558,36 @@ impl SparseImage {
         }
     }
 
+    /// One image over **several volumes concatenated**, each one's staged runs
+    /// shifted to the container offset its volume begins at.
+    ///
+    /// The 7z shape: a `-v` split is a byte split of one container, so its
+    /// header walk is a walk of the concatenation and not of any one volume.
+    /// Runs are taken from staging alone — the bytes a volume has staged and
+    /// not yet routed — which is exactly the population a container whose
+    /// layout is still unknown holds: nothing routes before the end header
+    /// parses, so every arrived byte is here.
+    fn over_volumes(
+        volumes: &[(u64, &BTreeMap<u64, StagedChunk>)],
+        scratch: Option<std::sync::Arc<std::fs::File>>,
+    ) -> Self {
+        let mut runs: Vec<(u64, ImageRun)> = volumes
+            .iter()
+            .flat_map(|(base, chunks)| {
+                chunks
+                    .iter()
+                    .map(move |(offset, chunk)| (base + offset, ImageRun::Staged(chunk.clone())))
+            })
+            .collect();
+        runs.sort_unstable_by_key(|(start, _)| *start);
+        Self {
+            runs,
+            scratch,
+            envelope: None,
+            position: 0,
+        }
+    }
+
     /// Test constructor: a purely RAM-resident image.
     #[cfg(test)]
     pub(super) fn from_chunks(chunks: &BTreeMap<u64, Bytes>) -> Self {
@@ -2217,7 +2258,39 @@ pub(crate) struct DirectSetRouter {
     /// pays the whole demotion cost for nothing. The layout is empty until the
     /// first parse succeeds, so binding it there costs a branch and rebinds
     /// nothing.
-    layout: Option<StoredLayoutBuilder>,
+    /// For a 7z set the same field carries the same meaning with a different
+    /// shape: the container states its whole map once, in an end header at the
+    /// tail, so this is `None` until that header parses and complete the moment
+    /// it does.
+    layout: Option<SetLayout>,
+    /// Each volume's decoded length, as the wire declared it.
+    ///
+    /// Empty and unread for a RAR set: RAR volumes are self-describing
+    /// front-to-back, so nothing there needs to know how long a volume is. A
+    /// 7z split is a pure byte split of one container, which makes the volume
+    /// lengths the only thing that can turn a container offset into a (volume,
+    /// offset) pair — the coordinates every part, every span and every
+    /// envelope byte is expressed in. Declared by the yEnc header of any one of
+    /// a volume's articles, so a volume states its length long before it
+    /// finishes arriving.
+    declared_volume_sizes: BTreeMap<u32, u64>,
+    /// What the container's signature header said about where its end header
+    /// lives. 7z only, and read once.
+    sevenz_start: Option<sevenz::StartHeader>,
+    /// The geometry the layout was resolved against, kept so that every
+    /// volume's decoded length can be checked against it as the volume
+    /// completes. That check is the authoritative one — a yEnc `size=` is a
+    /// hint, and what decodes is the fact.
+    sevenz_geometry: Option<sevenz::ContainerGeometry>,
+    /// What each volume actually decoded to, recorded as it completed.
+    ///
+    /// A volume can finish arriving before the map is read — the tail it lives
+    /// in may be the last thing to land — so the check cannot only run forwards
+    /// from the geometry. These are what the geometry is held against the
+    /// moment it exists.
+    sevenz_decoded_volume_lengths: BTreeMap<u32, u64>,
+    /// The container map a 7z parse produced, kept for the restart cache.
+    sevenz_facts: Option<sevenz::SevenZipContainerFacts>,
     /// The newest accepted header facts per volume.
     ///
     /// [`StoredLayoutBuilder::add_volume`] refuses a re-add whose facts differ,
@@ -2438,10 +2511,7 @@ impl std::fmt::Debug for DirectSetRouter {
             .debug_struct("DirectSetRouter")
             .field("set_name", &self.plan.set_name)
             .field("volumes", &self.plan.volumes.len())
-            .field(
-                "format",
-                &self.layout.as_ref().map(|layout| layout.format()),
-            )
+            .field("format", &self.layout.as_ref().map(SetLayout::label))
             .field("members", &self.members.len())
             .field("demoted", &self.demoted)
             .finish()
@@ -2466,6 +2536,11 @@ impl DirectSetRouter {
             scratch: HoldsScratch::new(plan.holds_scratch_path(), HOLDS_SCRATCH_CEILING_BYTES),
             plan,
             layout: None,
+            declared_volume_sizes: BTreeMap::new(),
+            sevenz_start: None,
+            sevenz_geometry: None,
+            sevenz_decoded_volume_lengths: BTreeMap::new(),
+            sevenz_facts: None,
             volume_facts: BTreeMap::new(),
             dirty_facts: std::collections::BTreeSet::new(),
             staging: BTreeMap::new(),
@@ -3387,10 +3462,50 @@ impl DirectSetRouter {
 
     /// The layout's members, or nothing while the format is still unknown.
     fn layout_members(&self) -> &[unrar_rs::StoredMember] {
+        self.layout.as_ref().map(SetLayout::members).unwrap_or(&[])
+    }
+
+    /// Every name the layout will put in the output directory: the routed
+    /// members, plus a 7z container's dataless entries.
+    ///
+    /// The second half is why this exists at all. A 7z archive records an empty
+    /// file and a directory as a header with no stream anywhere in the
+    /// container, so neither is a member and neither can be: there is nothing
+    /// to route. Finalization still creates them, which means they claim
+    /// destinations — and a destination-collision rule that cannot see them
+    /// would let an empty `notes.txt` be created over a routed member's
+    /// verified bytes.
+    fn layout_destination_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .layout_members()
+            .iter()
+            .map(|member| member.name.clone())
+            .collect();
+        if let Some(sevenz) = self.layout.as_ref().and_then(SetLayout::sevenz) {
+            names.extend(sevenz.dataless().iter().map(|entry| entry.name.clone()));
+        }
+        names
+    }
+
+    /// Whether this set's container family records a whole-member checksum
+    /// only when the writer chose to.
+    ///
+    /// RAR always states one, so its absence is a malformation and the layout
+    /// says so. 7z records checksums per sub-stream and an archive written
+    /// without them is ordinary, so the same absence has to mean something
+    /// else — see the checksum-free arm of [`Self::try_verify_member`].
+    fn member_checksums_are_optional(&self) -> bool {
+        self.plan.format == SetFormat::SevenZip
+    }
+
+    /// A 7z container's dataless entries, in header order. Empty for a RAR set
+    /// and for a 7z one whose header has not parsed yet.
+    pub(crate) fn dataless_entries(&self) -> Vec<sevenz::SevenZipDatalessEntry> {
         self.layout
             .as_ref()
-            .map(StoredLayoutBuilder::members)
-            .unwrap_or(&[])
+            .and_then(SetLayout::sevenz)
+            .map(|layout| layout.dataless().to_vec())
+            .unwrap_or_default()
     }
 
     /// [`StoredLayoutBuilder::map_physical_range`], answering "no destination
@@ -3541,8 +3656,12 @@ impl DirectSetRouter {
 }
 
 mod encrypted;
+mod layout;
 mod restart;
 mod routing;
+pub(crate) mod sevenz;
+
+pub(crate) use routing::HeaderProbe;
 
 #[cfg(test)]
 pub(super) use routing::crc32_over_pieces;

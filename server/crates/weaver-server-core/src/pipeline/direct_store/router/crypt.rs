@@ -427,6 +427,23 @@ impl HeaderKeyRing {
         self.refusal.expect("just inserted")
     }
 
+    /// The offered candidates, in offer order, for a reader that does its own
+    /// proving.
+    ///
+    /// The one exception to "values never leave this type", and it is narrow:
+    /// RAR has a plaintext check record this ring can prove a candidate against
+    /// before anything is decrypted, so [`Self::resolve`] hands back the one
+    /// that verified. A 7z end header has no such record — the only check is
+    /// the reader's own, inside the encrypted block — so the candidates have to
+    /// reach the reader for it to answer at all. Nothing may persist or log
+    /// these; see the type docs.
+    pub(crate) fn candidates(&self) -> Vec<&str> {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.value.as_str())
+            .collect()
+    }
+
     /// Which sources were offered, for a refusal log line. Values never leave
     /// this type.
     pub(crate) fn offered_sources(&self) -> Vec<&'static str> {

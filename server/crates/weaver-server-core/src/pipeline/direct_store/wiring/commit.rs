@@ -27,15 +27,55 @@ fn installed_tolerated_members(targets: &[ToleratedTarget]) -> Result<ToleratedE
     Ok(result)
 }
 
+/// One of an archive's recorded times, in Windows FILETIME ticks.
+fn archive_filetime(filetime_ticks: u64) -> filetime::FileTime {
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    const EPOCH_OFFSET_SECONDS: i64 = 11_644_473_600;
+    let seconds = (filetime_ticks / TICKS_PER_SECOND) as i64 - EPOCH_OFFSET_SECONDS;
+    let nanos = ((filetime_ticks % TICKS_PER_SECOND) * 100) as u32;
+    filetime::FileTime::from_unix_time(seconds, nanos)
+}
+
+/// An archive's recorded times put on an entry weaver has just created.
+///
+/// The pair the conventional extractor restores: the modification time, which
+/// every writer records, and the access time when the header carries one.
+/// Neither is invented — an entry whose header states no modification time
+/// keeps the time of its creation here, exactly as it does there. Best effort:
+/// the entry exists either way, and a filesystem that refuses a time still
+/// holds the right bytes.
+fn apply_archive_times(path: &std::path::Path, modified: Option<u64>, accessed: Option<u64>) {
+    let Some(modified) = modified.map(archive_filetime) else {
+        return;
+    };
+    match accessed.map(archive_filetime) {
+        Some(accessed) => {
+            let _ = filetime::set_file_times(path, accessed, modified);
+        }
+        None => {
+            let _ = filetime::set_file_mtime(path, modified);
+        }
+    }
+}
+
 impl Pipeline {
     /// The routing seam. Replaces the conventional write for one decoded
     /// segment of a direct source volume.
+    ///
+    /// `declared_volume_len` is the total length this article's yEnc header
+    /// states for its file. It is carried in rather than derived here because
+    /// only the decoder sees it, and it is the one fact a 7z set cannot do
+    /// without: the volumes are a byte split of one container, so their
+    /// lengths are what turn a container offset into the (volume, offset) pair
+    /// everything else is expressed in — and a volume declares its length on
+    /// its *first* article, long before it finishes arriving.
     pub(crate) async fn handle_direct_decode_success(
         &mut self,
         set_index: usize,
         volume_index: u32,
         segment: BufferedDecodedSegment,
         file_offset: u64,
+        declared_volume_len: u64,
     ) -> DirectRouteOutcome {
         let segment_id = segment.segment_id;
         let file_id = segment_id.file_id;
@@ -55,6 +95,20 @@ impl Pipeline {
             .is_scarce(crate::runtime::buffers::BufferTier::for_size(
                 decoded_size as usize,
             ));
+
+        // Before the route, because routing is what parses: a container whose
+        // volume zero has just declared its length may become readable in this
+        // very call.
+        let declared = match self.direct_store.set_mut(job_id, set_index) {
+            Some(set) => set.note_declared_volume_size(volume_index, declared_volume_len),
+            None => return DirectRouteOutcome::Conventional(segment),
+        };
+        if let Err(reason) = declared {
+            drop(pieces);
+            self.demote_direct_set_with_handoff(job_id, set_index, reason, Some(segment_id))
+                .await;
+            return DirectRouteOutcome::Conventional(segment);
+        }
 
         let routed = {
             let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
@@ -265,7 +319,7 @@ impl Pipeline {
         }
         let set_name = set.set_name().to_string();
         for (volume_index, facts) in dirty {
-            let encoded = match rmp_serde::to_vec_named(&facts) {
+            let encoded = match facts.encode() {
                 Ok(encoded) => encoded,
                 Err(error) => {
                     warn!(
@@ -1285,6 +1339,66 @@ impl Pipeline {
                 return;
             }
             self.record_direct_extracted(job_id, name.clone());
+        }
+
+        // Entries the container declares but stores no bytes for: empty files
+        // and directories. They never route, because routing is a map from
+        // container offsets to member bytes and these own none, so nothing
+        // upstream has created them — but the archive names them and the
+        // conventional extractor produces them, so finalization does too.
+        //
+        // Directories first, then the empty files inside them, then the
+        // directories' recorded times: creating a file bumps its parent's
+        // mtime, so a time applied before the files it holds would not survive.
+        // A refusal is a warning rather than a demotion for the same reason the
+        // directory metadata below is: every byte-bearing member is already
+        // committed to its destination, and throwing the set away to redownload
+        // it for an empty file would cost far more than the entry is worth.
+        let dataless = self
+            .direct_store
+            .set(job_id, set_index)
+            .map(|set| {
+                set.router
+                    .dataless_entries()
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let destination = set.plan().member_output_path(&entry.name).ok()?;
+                        Some((entry, destination))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut dataless_directories = Vec::new();
+        for (entry, destination) in &dataless {
+            let created = if entry.is_directory {
+                tokio::fs::create_dir_all(destination).await
+            } else {
+                match destination.parent() {
+                    Some(parent) => tokio::fs::create_dir_all(parent).await,
+                    None => Ok(()),
+                }
+                .and(tokio::fs::File::create(destination).await.map(drop))
+            };
+            if let Err(error) = created {
+                warn!(
+                    job_id = job_id.0,
+                    set_name = %set_name,
+                    entry = %entry.name,
+                    error = %error,
+                    "failed to create a direct-store entry the archive stores no bytes for"
+                );
+                continue;
+            }
+            if entry.is_directory {
+                dataless_directories.push((entry, destination));
+            } else {
+                apply_archive_times(destination, entry.modified, entry.accessed);
+                self.record_direct_extracted(job_id, entry.name.clone());
+            }
+        }
+        for (entry, destination) in dataless_directories {
+            apply_archive_times(destination, entry.modified, entry.accessed);
+            self.record_direct_extracted(job_id, entry.name.clone());
         }
 
         // The archive's directory metadata, restored **last**. Every rename

@@ -4,6 +4,7 @@ use crate::jobs::assembly::{
     ArchiveTopology as JobArchiveTopology, ArchiveType,
 };
 use crate::jobs::ids::{JobId, NzbFileId};
+use crate::pipeline::direct_store::restart::DirectVolumeFacts;
 use crate::pipeline::{
     ComputedRarSetState, Pipeline, RarCapacityRetryKind, RarRefreshDone, RarRefreshError,
     RarRefreshRequest, RefreshReason,
@@ -2338,6 +2339,9 @@ impl Pipeline {
             }
         };
 
+        // Sets whose rows hold a container map rather than RAR volume headers.
+        // Conventional discovery neither reads those rows nor owns them.
+        let mut container_sets: BTreeSet<String> = BTreeSet::new();
         for (set_name, facts_rows) in facts_by_set {
             let state = self.rar_sets.entry((job_id, set_name.clone())).or_default();
             state.facts.clear();
@@ -2364,6 +2368,18 @@ impl Pipeline {
                         state.facts.insert(volume_index, facts);
                     }
                     Err(error) => {
+                        // A direct-store 7z set caches its container map on
+                        // these rows under a tagged envelope, which is not a
+                        // RAR volume header and never was one. Note the set so
+                        // the emptiness check below does not read its rows as a
+                        // cache gone stale, and leave them where they are.
+                        if matches!(
+                            DirectVolumeFacts::decode(&blob),
+                            Ok(DirectVolumeFacts::SevenZip(_))
+                        ) {
+                            container_sets.insert(set_name.clone());
+                            continue;
+                        }
                         warn!(
                             job_id = job_id.0,
                             set_name = %set_name,
@@ -2493,6 +2509,14 @@ impl Pipeline {
                 };
             if remove_empty_set {
                 self.rar_sets.remove(&(job_id, set_name.clone()));
+                // A 7z container's volumes are never written as files when the
+                // set routed directly, so "no live volume file" is that set's
+                // steady state rather than evidence of a cache that outlived
+                // its archive. Deleting its rows would cost it the container
+                // map it restores from and make the whole set refetch.
+                if container_sets.contains(set_name) {
+                    continue;
+                }
                 if let Err(error) = self.db.delete_rar_volume_facts_for_set(job_id, set_name) {
                     warn!(
                         job_id = job_id.0,

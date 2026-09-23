@@ -30,6 +30,7 @@ const PIECE_BYTES: usize = 512;
 fn parse_cost_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
     let plan = DirectSetPlan {
         set_name: "silver.horizon".to_string(),
+        format: crate::pipeline::direct_store::plan::SetFormat::Rar,
         volumes: (0..volumes.len() as u32)
             .map(|index| (index, index))
             .collect(),
@@ -59,7 +60,7 @@ fn route_in_pieces(router: &mut DirectSetRouter, volumes: &[(String, Vec<u8>)]) 
             pieces += 1;
         }
         router
-            .note_volume_complete(index as u32)
+            .note_volume_complete(index as u32, image.len() as u64)
             .expect("the volume's articles are all in");
     }
     pieces
@@ -191,7 +192,7 @@ async fn a_walk_is_repeated_only_once_it_could_answer_differently() {
     // — and on a set's last volume, whose end record carries no `more_volumes`
     // to confirm it by, it is the walk that confirms the volume.
     router
-        .note_volume_complete(0)
+        .note_volume_complete(0, volumes[0].1.len() as u64)
         .expect("the volume's articles are all in");
     assert_eq!(
         router.parse_walks(),

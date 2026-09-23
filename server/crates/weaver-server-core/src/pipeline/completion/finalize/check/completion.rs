@@ -249,6 +249,14 @@ impl Pipeline {
     /// CRC failures occur, recovery files are promoted for download and repair
     /// runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+        // A container set whose map nothing left in flight could read holds its
+        // volumes off the conventional path forever, and holding them is
+        // exactly what keeps this gate from ruling. Asked here because this is
+        // the one seam every advance of a job reaches, including the ones that
+        // end a download without completing a file. One iteration over the
+        // job's direct sets, and nothing at all for a job with no container set
+        // still routing.
+        self.demote_direct_sets_with_an_unreadable_map(job_id).await;
         let current_status = {
             let Some(state) = self.jobs.get(&job_id) else {
                 return;
@@ -2712,6 +2720,10 @@ impl Pipeline {
                 // here too — the final move relocates the whole directory, and
                 // the parts are not part of the release.
                 self.cleanup_par2_joined_split_parts(job_id).await;
+                // A container set installed from the wire arrives here too,
+                // and a volume a repair rebuilt for it is spent once the set
+                // is finalized.
+                self.cleanup_installed_direct_set_volumes(job_id).await;
                 // No archives — move to complete and finish.
                 if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);

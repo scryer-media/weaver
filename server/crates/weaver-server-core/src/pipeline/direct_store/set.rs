@@ -211,7 +211,7 @@ impl DirectSet {
     /// checkpoint produces, reached one step earlier.
     pub(crate) fn restore_layout(
         &mut self,
-        facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
+        facts: &BTreeMap<u32, super::restart::DirectVolumeFacts>,
     ) -> Result<(), DemotionReason> {
         match self.router.restore_layout(facts) {
             Ok(()) => Ok(()),
@@ -657,6 +657,30 @@ impl DirectSet {
             .release_article_views(volume_index, source_offset, len, pool_scarce)
     }
 
+    /// Records the length one volume's yEnc headers declare. See
+    /// [`super::router::DirectSetRouter::note_declared_volume_size`].
+    pub(crate) fn note_declared_volume_size(
+        &mut self,
+        volume_index: u32,
+        declared_len: u64,
+    ) -> Result<(), DemotionReason> {
+        match self
+            .router
+            .note_declared_volume_size(volume_index, declared_len)
+        {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                self.demote(reason);
+                Err(reason)
+            }
+        }
+    }
+
+    /// What the set needs off the wire next to resolve its layout.
+    pub(crate) fn header_probe(&self) -> super::router::HeaderProbe {
+        self.router.header_probe()
+    }
+
     pub(crate) fn route(
         &mut self,
         volume_index: u32,
@@ -733,7 +757,15 @@ impl DirectSet {
         if let Some(barrier) = self.barrier.as_mut() {
             barrier.note_volume_complete(volume_index, decoded_len);
         }
-        match self.router.note_volume_complete(volume_index) {
+        // The router holds a container volume's length against the geometry,
+        // and the over-estimate a restored volume carries is the wrong number
+        // to hold there: 3% over the part size reads as a part-size hint that
+        // was wrong, and demotes a set whose bytes are exactly where the map
+        // put them. The coverage end is the decoded length such a volume
+        // really has, the same answer PAR2 is given for it. The checkpoint
+        // above keeps the over-estimate on purpose.
+        let routed_len = self.virtual_volume_len(volume_index, decoded_len);
+        match self.router.note_volume_complete(volume_index, routed_len) {
             Ok(spans) => {
                 if !spans.is_empty() {
                     self.latched_direct = true;
