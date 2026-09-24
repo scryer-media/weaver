@@ -1046,6 +1046,79 @@ fn conventional_7z_extraction_decodes_with_the_threads_it_is_given() {
     );
 }
 
+/// A conventional decode whose thread room does not fit the ceiling takes
+/// what fits beside the process's retained state instead of waiting for all
+/// of it: another queued job's scheduling state is held for that job's whole
+/// life, so waiting for it to clear would wait for as long as the job exists.
+#[test]
+fn conventional_7z_extraction_admits_beside_a_peer_job_retained_state() {
+    use crate::pipeline::extraction::ProcessMemoryBudget;
+
+    const MIB: u64 = 1024 * 1024;
+    let temp = TempDir::new().unwrap();
+    let archive_path = temp.path().join("wide_dictionary.7z");
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let archive = sevenz_archive_with_dictionary(
+        1024 * 1024,
+        &[("Wide.Dictionary/episode.txt", b"wide dictionary")],
+    );
+    fs::write(&archive_path, &archive).unwrap();
+
+    // Four threads' room is more than the 512 MiB ceiling holds, so the
+    // decode reserves up to the ceiling rather than a measured amount.
+    let limit = 512 * MIB;
+    let pool = Arc::new(ProcessMemoryBudget::new(limit));
+    let peer = pool
+        .for_job(2)
+        .try_reserve_retained(64 * MIB)
+        .expect("a queued peer's scheduling state");
+    let limits = Arc::new(ExtractionLimits {
+        max_job_bytes: 2 * 1024 * 1024 * 1024 * 1024,
+        max_member_bytes: 1024 * 1024 * 1024 * 1024,
+        max_entries: 100_000,
+        max_ratio: 100,
+        max_seconds: 43_200,
+        min_free_bytes: 1,
+        max_memory_bytes: limit,
+    });
+    let root = ExtractionRoot::open(&out_dir).unwrap();
+    let budget = JobExtractionBudget::new_with_process_memory(
+        limits,
+        pool.for_job(1),
+        out_dir.clone(),
+        limit,
+        0,
+        0,
+        PipelineMetrics::new(),
+    )
+    .unwrap();
+    assert_eq!(budget.max_memory_bytes(), limit);
+
+    let context = conventional_7z_context(&out_dir, root, Arc::clone(&budget), &archive, 4);
+    let outcome = extract_7z_stream(&context, || {
+        fs::File::open(&archive_path).map_err(|error| error.to_string())
+    })
+    .expect("the decode is admitted while the peer's state is still held");
+
+    assert_eq!(
+        outcome.extracted,
+        vec!["Wide.Dictionary/episode.txt".to_string()]
+    );
+    assert_eq!(
+        fs::read(out_dir.join("Wide.Dictionary/episode.txt")).unwrap(),
+        b"wide dictionary"
+    );
+    assert_eq!(budget.memory_reserved_bytes(), 0);
+    assert_eq!(
+        pool.reserved_bytes(),
+        64 * MIB,
+        "only the peer's retained state is still held"
+    );
+    drop(peer);
+    assert_eq!(pool.reserved_bytes(), 0);
+}
+
 /// The conventional path reserves what the archive's decoders need plus room
 /// for each of its threads past the first, not the whole ceiling, so it does
 /// not hold every other extraction in the process behind it.
@@ -1070,18 +1143,18 @@ fn conventional_7z_decode_reservation_is_sized_from_the_archive_and_its_threads(
 
     assert_eq!(
         fixed_decode_memory_bytes(job_id, "wide", parsed.archive(), end_header, 1, ceiling),
-        needed,
+        SevenZipDecodeReservation::Measured(needed),
         "one thread holds no runs beyond the one it decodes"
     );
     assert_eq!(
         fixed_decode_memory_bytes(job_id, "wide", parsed.archive(), end_header, 4, ceiling),
-        needed + 4 * CHASE_WIDENING_BYTES_PER_THREAD,
+        SevenZipDecodeReservation::Measured(needed + 4 * CHASE_WIDENING_BYTES_PER_THREAD),
     );
     let tight = needed + CHASE_WIDENING_BYTES_PER_THREAD;
     assert_eq!(
         fixed_decode_memory_bytes(job_id, "wide", parsed.archive(), end_header, 4, tight),
-        tight,
-        "thread room is trimmed to the ceiling before the decoders are"
+        SevenZipDecodeReservation::UpToCeiling { floor: needed },
+        "thread room is trimmed to what fits under the ceiling before the decoders are"
     );
     assert_eq!(
         chase_header_pass_memory_bytes(end_header, ceiling),
@@ -1266,13 +1339,15 @@ fn chase_decode_reservation_holds_no_widening_room() {
 
     assert_eq!(
         chase_decode_memory_bytes(job_id, "wide", parsed.archive(), end_header, ceiling),
-        needed,
+        SevenZipDecodeReservation::Measured(needed),
         "the decode reservation holds nothing for threads the chase is not using"
     );
     assert_eq!(
         chase_decode_memory_bytes(job_id, "wide", parsed.archive(), end_header, needed - 1),
-        needed - 1,
-        "decoders past the ceiling take the ceiling, as before"
+        SevenZipDecodeReservation::UpToCeiling {
+            floor: end_header + CHASE_DECODE_ALLOWANCE_BYTES
+        },
+        "decoders past the ceiling take what fits up to it, never waiting for all of it"
     );
 }
 
@@ -1294,8 +1369,11 @@ fn thirty_chases_fit_where_up_front_widening_room_would_not() {
     let end_header = sevenz_end_header_bytes(&archive);
     let limit: u64 = 64 * 1024 * 1024 * 1024;
     let decode_threads = 9;
-    let chase =
-        chase_decode_memory_bytes(JobId(41818), "wide", parsed.archive(), end_header, limit);
+    let SevenZipDecodeReservation::Measured(chase) =
+        chase_decode_memory_bytes(JobId(41818), "wide", parsed.archive(), end_header, limit)
+    else {
+        panic!("a small dictionary is measured, not taken up to the ceiling");
+    };
 
     assert!(
         30 * chase <= limit,
