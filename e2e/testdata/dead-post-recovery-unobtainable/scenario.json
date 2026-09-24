@@ -4,7 +4,7 @@
   "description": "The same dead posting with too few files to be judged on its leading articles: four RAR volumes and five PAR2 sidecars, every article deleted from both servers. The health verdict has to decide it. The NZB advertises fifteen recovery blocks, and a deferral on that advertisement alone would hold the job for as long as it takes to prove every article missing; the deferral must instead ask whether any of that recovery can still be obtained — the metadata discovery probes its candidates, they are retired, discovery closes, and the health failure lands on the next check.",
   "category": "2000",
   "expected_outcome": "health_failure",
-  "expectedErrorContains": "below critical",
+  "expectedErrorContains": "PAR2 metadata discovery exhausted",
   "fixtureAssets": [
     "par2-multivolume/archive.part1.rar",
     "par2-multivolume/archive.part2.rar",

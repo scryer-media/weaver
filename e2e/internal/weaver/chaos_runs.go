@@ -515,14 +515,15 @@ func cmdTcpChaosTest() {
 	if err := weaverCmd.Start(); err != nil {
 		log.Fatalf("failed to start weaver: %v", err)
 	}
+	weaverExit := watchChildExit(weaverCmd, localWeaverLogPath())
 	_ = os.WriteFile(localWeaverPIDPath(), []byte(strconv.Itoa(weaverCmd.Process.Pid)+"\n"), 0o644)
 	defer func() {
 		weaverCmd.Process.Kill()
-		weaverCmd.Wait()
+		_ = weaverExit.Wait()
 		_ = os.Remove(localWeaverPIDPath())
 		logFile.Close()
 	}()
-	waitForGraphQL(graphqlURL(weaverURL), 30*time.Second)
+	waitForGraphQL(graphqlURL(weaverURL), weaverExit.Probe)
 	log.Println("weaver ready")
 
 	// Load canonical success-path scenarios
@@ -942,15 +943,16 @@ func cmdAdaptiveDispatchTest() {
 		_ = logFile.Close()
 		log.Fatalf("start adaptive-dispatch weaver: %v", err)
 	}
+	weaverExit := watchChildExit(weaverCmd, localWeaverLogPath())
 	_ = os.MkdirAll(filepath.Dir(localWeaverPIDPath()), 0o755)
 	_ = os.WriteFile(localWeaverPIDPath(), []byte(strconv.Itoa(weaverCmd.Process.Pid)+"\n"), 0o644)
 	defer func() {
-		stopManagedWeaverCommand(weaverCmd, 30*time.Second)
+		stopWatchedChild(weaverCmd, weaverExit, 30*time.Second)
 		_ = os.Remove(localWeaverPIDPath())
 		_ = logFile.Close()
 	}()
 
-	waitForGraphQL(graphqlURL(weaverURL), 30*time.Second)
+	waitForGraphQL(graphqlURL(weaverURL), weaverExit.Probe)
 	prepareStandardTestRun(weaverURL, true)
 	if err := resetNntpMetrics(); err != nil {
 		log.Fatalf("reset NNTP metrics before adaptive-dispatch workload: %v", err)
@@ -1124,14 +1126,15 @@ name = "series"
 	if err := weaverCmd.Start(); err != nil {
 		log.Fatalf("failed to start weaver: %v", err)
 	}
+	weaverExit := watchChildExit(weaverCmd, localWeaverLogPath())
 	_ = os.WriteFile(localWeaverPIDPath(), []byte(strconv.Itoa(weaverCmd.Process.Pid)+"\n"), 0o644)
 	defer func() {
 		weaverCmd.Process.Kill()
-		weaverCmd.Wait()
+		_ = weaverExit.Wait()
 		_ = os.Remove(localWeaverPIDPath())
 		logFile.Close()
 	}()
-	waitForGraphQL(graphqlURL(weaverURL), 30*time.Second)
+	waitForGraphQL(graphqlURL(weaverURL), weaverExit.Probe)
 	log.Println("weaver ready (TLS mode)")
 
 	// Small subset of scenarios to exercise TLS

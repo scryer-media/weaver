@@ -10,7 +10,7 @@
   "runtimeAssertions": {
     "directUnpack": {
       "requireArmed": true,
-      "requireConsumed": true
+      "expectedDemotionReason": "repair_rewrote"
     }
   }
 }

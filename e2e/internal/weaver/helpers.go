@@ -533,7 +533,7 @@ func listJobsGraphQL(weaverURL string) ([]struct {
 
 func prepareStandardTestRun(weaverURL string, clearHistory bool) {
 	waitForTCP(nntpHost()+":"+nntpPort(), 30*time.Second)
-	waitForGraphQL(graphqlURL(weaverURL), 30*time.Second)
+	waitForGraphQL(graphqlURL(weaverURL), nil)
 
 	if err := ensureNntpChaosOff(); err != nil {
 		log.Fatalf("reset NNTP chaos before test run: %v", err)
@@ -646,26 +646,49 @@ func writeChaosRoundArtifacts(
 	}
 }
 
-func waitForGraphQL(url string, timeout time.Duration) {
-	client := weaverHTTPClient(url, 3*time.Second)
-	body := []byte(`{"query":"{ version }"}`)
-	deadline := time.Now().Add(timeout)
-	lastFailure := "not attempted"
-	for time.Now().Before(deadline) {
-		if err := refreshWeaverBrowserSession(client, url); err != nil {
-			lastFailure = "load UI: " + err.Error()
-			mustSleepWithSuspendDetection(time.Second, fmt.Sprintf("waiting for GraphQL %s", url))
-			continue
-		}
-		resp, err := postGraphQLWithClient(client, url, body)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			resp.Body.Close()
-			return
-		}
-		lastFailure = describeGraphQLAttempt(resp, err)
+// childExitProbe reports whether the weaver process a wait depends on has
+// exited, and if it has, its exit status and the tail of its output. A nil
+// probe means there is no child to watch: the weaver runs in a container or was
+// started by someone else.
+type childExitProbe func() (exited bool, report string)
+
+// waitForGraphQL polls until the weaver at url answers GraphQL, or fails the run
+// as soon as the weaver it waits on has exited. It has no deadline of its own: a
+// weaver that has not answered yet on a loaded host is still starting, and the
+// phase runner's bound is what ends a wait that never resolves.
+func waitForGraphQL(url string, exited childExitProbe) {
+	pause := func() {
 		mustSleepWithSuspendDetection(time.Second, fmt.Sprintf("waiting for GraphQL %s", url))
 	}
-	log.Fatalf("timeout waiting for %s (last failure: %s)", url, lastFailure)
+	if err := awaitGraphQL(url, exited, pause); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// awaitGraphQL is waitForGraphQL with the pause between polls injected. It
+// returns nil once GraphQL answers and an error once the child has exited.
+func awaitGraphQL(url string, exited childExitProbe, pause func()) error {
+	client := weaverHTTPClient(url, 3*time.Second)
+	body := []byte(`{"query":"{ version }"}`)
+	lastFailure := "not attempted"
+	for {
+		if err := refreshWeaverBrowserSession(client, url); err != nil {
+			lastFailure = "load UI: " + err.Error()
+		} else {
+			resp, err := postGraphQLWithClient(client, url, body)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				resp.Body.Close()
+				return nil
+			}
+			lastFailure = describeGraphQLAttempt(resp, err)
+		}
+		if exited != nil {
+			if gone, report := exited(); gone {
+				return fmt.Errorf("weaver exited before %s answered (last failure: %s): %s", url, lastFailure, report)
+			}
+		}
+		pause()
+	}
 }
 
 func describeGraphQLAttempt(resp *http.Response, err error) string {

@@ -969,7 +969,7 @@ func runTests(slugs []string) {
 	fmt.Printf("Total: %d passed, %d failed out of %d\n", passCount, failCount, len(jobs))
 	printSlowestTestJobs(jobs, 8)
 
-	if err := assertDirectStoreEngagement(weaverURL); err != nil {
+	if err := assertDirectStoreEngagement(weaverURL, jobs); err != nil {
 		fmt.Printf("DIRECT-STORE ASSERTION FAILED: %v\n", err)
 		emitProgressEvent(progressEvent{Kind: "phase_done", Current: len(jobs), Total: len(jobs), Status: "fail"})
 		os.Exit(1)
@@ -1050,7 +1050,7 @@ func fetchDirectStoreCounters(weaverURL string) (directStoreCounters, error) {
 //
 // A no-op when the phase did not enable direct-store: the conventional phases
 // legitimately report zeroes, and asserting there would fail them all.
-func assertDirectStoreEngagement(weaverURL string) error {
+func assertDirectStoreEngagement(weaverURL string, jobs []testJob) error {
 	if !directStoreEnabledForPhase() {
 		return nil
 	}
@@ -1105,7 +1105,7 @@ func assertDirectStoreEngagement(weaverURL string) error {
 			counters.Admitted, counters.FinalizedDirect, counters.Demoted,
 		)
 	}
-	return assertNoUnexpectedDirectDemotions()
+	return assertNoUnexpectedDirectDemotions(jobs)
 }
 
 // Demotion reasons that are direct-store *working*: the set carried something
@@ -1157,18 +1157,30 @@ var byDesignDirectRefusals = map[string]bool{
 	// `member_directory` refusal no longer fires first and hides them.
 	"colliding_destinations": true,
 	"unsafe_destination":     true,
+	// The 7z container refusals that describe the archive's shape rather than
+	// its bytes: a coder other than `Copy`, AES content or an AES end header,
+	// an anti-item, a redirection, an entry name the path check refuses, or a
+	// volume zero with no usable length hint. Each hands the set to the
+	// conventional path, which extracts it the ordinary way.
+	"7z_coder":                true,
+	"7z_encrypted_content":    true,
+	"7z_encrypted_header":     true,
+	"7z_anti_item":            true,
+	"7z_redirection":          true,
+	"7z_unsafe_destination":   true,
+	"7z_volume_hint_unusable": true,
 }
 
-// Jobs whose fixtures carry deliberately damaged bytes, where a checksum
-// demotion is the product working rather than failing.
-//
-// The general corpus exists to exercise the CONVENTIONAL path, and several of
-// its archives are corrupt on purpose. With direct-store on for every functional
-// run those sets are admitted first, detect their own damage and demote —
-// correctly. Without this exemption the phase would fail on fixtures whose whole
-// point is being broken. Matched against the submitted job name.
-var jobsAllowedToDemoteOnDamage = []string{
-	"Corrupted", "PAR2", "PAR3", "MissingMiddle", "Damaged", "WrongPass",
+// Declared outcomes that say a fixture is damaged on purpose: its bytes or its
+// articles are broken, and the scenario expects weaver to repair or refuse it.
+// With direct-store on for every functional run those sets are admitted first,
+// detect their own damage and demote — correctly — so a damage demotion from
+// one of them is the product working rather than failing.
+var damagedFixtureOutcomes = map[string]bool{
+	"repair_then_success": true,
+	"repair_failure":      true,
+	"extraction_failure":  true,
+	"health_failure":      true,
 }
 
 // isDamageDemotion reports whether a reason means "the bytes were wrong", which
@@ -1176,47 +1188,43 @@ var jobsAllowedToDemoteOnDamage = []string{
 func isDamageDemotion(reason string) bool {
 	switch reason {
 	case "member_checksum_mismatch", "part_checksum_mismatch", "volume_crc_mismatch",
-		"par2_damaged", "par2_unbindable":
+		"par2_damaged", "par2_unbindable", "7z_volume_size":
 		return true
 	}
 	return false
 }
 
-func jobIsAllowedToDemoteOnDamage(jobName string) bool {
-	for _, needle := range jobsAllowedToDemoteOnDamage {
-		if strings.Contains(jobName, needle) {
-			return true
-		}
+// scenarioAllowsDamageDemotion reports whether a scenario is entitled to a
+// damage demotion with this reason, from what its scenario.json declares.
+//
+// A scenario that carries a `directStore` assertion owns its demotions: only
+// the reason it names is allowed, because the fixture exists to pin what
+// direct-store does with it. Every other scenario is allowed a damage demotion
+// when its declared outcome says the fixture is damaged on purpose.
+func scenarioAllowsDamageDemotion(scenario *Scenario, reason string) bool {
+	if scenario == nil || !isDamageDemotion(reason) {
+		return false
 	}
-	return false
+	if assertion := scenario.directStoreAssertion(); assertion != nil {
+		return assertion.ExpectedDemotionReason == reason
+	}
+	return damagedFixtureOutcomes[scenario.ExpectedOutcome]
 }
 
-// directStoreJobNames maps job id -> submitted job name so a demotion can be
-// attributed to the fixture that caused it. Without the attribution the check
-// sees only aggregate reasons and cannot tell a corrupt-on-purpose fixture from
-// a healthy set that failed.
-func directStoreJobNames(log string) map[string]string {
-	names := map[string]string{}
-	for _, line := range strings.Split(log, "\n") {
-		if !strings.Contains(line, "submitted NZB job") {
+// submittedScenariosByJobID maps job id -> the scenario submitted as that job,
+// the same pairing the phase log prints as "<slug> — submitted job=<id>". It is
+// what lets a demotion be attributed to the fixture that caused it: the check
+// otherwise sees only aggregate reasons and cannot tell a corrupt-on-purpose
+// fixture from a healthy set that failed.
+func submittedScenariosByJobID(jobs []testJob) map[string]*Scenario {
+	scenarios := make(map[string]*Scenario, len(jobs))
+	for _, job := range jobs {
+		if job.jobID == 0 || job.scenario == nil {
 			continue
 		}
-		clean := ansiEscape.ReplaceAllString(line, "")
-		id := directLogJobID(clean)
-		if id == "" {
-			continue
-		}
-		start := strings.Index(clean, "name=")
-		if start < 0 {
-			continue
-		}
-		name := clean[start+len("name="):]
-		if cut := strings.Index(name, " category="); cut >= 0 {
-			name = name[:cut]
-		}
-		names[id] = strings.TrimSpace(name)
+		scenarios[strconv.Itoa(job.jobID)] = job.scenario
 	}
-	return names
+	return scenarios
 }
 
 func directLogJobID(line string) string {
@@ -1240,14 +1248,27 @@ func directLogJobID(line string) string {
 // refusals and genuine failures together, and this corpus produces dozens of the
 // former every run. The reason lives only in weaver's log, so that is where this
 // reads it.
-func assertNoUnexpectedDirectDemotions() error {
+func assertNoUnexpectedDirectDemotions(jobs []testJob) error {
 	raw, err := os.ReadFile(localWeaverLogPath())
 	if err != nil {
 		return fmt.Errorf("could not read the weaver log to check demotion reasons: %w", err)
 	}
-	log := string(raw)
-	jobNames := directStoreJobNames(log)
+	reasons := unexpectedDirectDemotions(string(raw), submittedScenariosByJobID(jobs))
+	if len(reasons) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"direct-store demoted set(s) for reason(s) that are neither by-design refusals nor "+
+			"deliberate fixture damage: %s — a set was admitted and then could not be carried",
+		strings.Join(reasons, ", "),
+	)
+}
 
+// unexpectedDirectDemotions tallies the demotions in a weaver log that are
+// neither by-design refusals nor damage the demoting job's scenario declares,
+// as sorted "<reason> (job <slug>) x<count>" entries. A demotion from a job no
+// scenario was submitted as is attributed to its raw job id.
+func unexpectedDirectDemotions(log string, scenarios map[string]*Scenario) []string {
 	unexpected := map[string]int{}
 	for _, line := range strings.Split(log, "\n") {
 		if !strings.Contains(line, "direct-store set demoted") {
@@ -1260,25 +1281,23 @@ func assertNoUnexpectedDirectDemotions() error {
 			strings.HasPrefix(reason, "header_encrypted") {
 			continue
 		}
-		job := jobNames[directLogJobID(line)]
-		if isDamageDemotion(reason) && jobIsAllowedToDemoteOnDamage(job) {
+		jobID := directLogJobID(line)
+		scenario := scenarios[jobID]
+		if scenarioAllowsDamageDemotion(scenario, reason) {
 			continue
 		}
+		job := "id " + jobID
+		if scenario != nil {
+			job = scenario.Slug
+		}
 		unexpected[fmt.Sprintf("%s (job %s)", reason, job)]++
-	}
-	if len(unexpected) == 0 {
-		return nil
 	}
 	reasons := make([]string, 0, len(unexpected))
 	for reason, count := range unexpected {
 		reasons = append(reasons, fmt.Sprintf("%s x%d", reason, count))
 	}
 	sort.Strings(reasons)
-	return fmt.Errorf(
-		"direct-store demoted set(s) for reason(s) that are neither by-design refusals nor "+
-			"deliberate fixture damage: %s — a set was admitted and then could not be carried",
-		strings.Join(reasons, ", "),
-	)
+	return reasons
 }
 
 // ansiEscape matches the SGR sequences weaver's tracing writer emits around
@@ -1453,6 +1472,7 @@ type managedWeaverSession struct {
 	LogPath string
 	PID     int
 	cmd     *exec.Cmd
+	exit    *childExitWatch
 	logFile *os.File
 }
 
@@ -1659,6 +1679,7 @@ func startManagedDownloadBenchWeaver(outputDir string) (*managedWeaverSession, e
 		logFile.Close()
 		return nil, fmt.Errorf("start weaver: %w", err)
 	}
+	exit := watchChildExit(cmd, logPath)
 
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0o644); err != nil {
 		log.Printf("warning: write weaver pid file: %v", err)
@@ -1670,13 +1691,14 @@ func startManagedDownloadBenchWeaver(outputDir string) (*managedWeaverSession, e
 	}
 
 	url := fmt.Sprintf("http://localhost:%s", weaverPort)
-	waitForGraphQL(graphqlURL(url), 20*time.Second)
+	waitForGraphQL(graphqlURL(url), exit.Probe)
 
 	return &managedWeaverSession{
 		URL:     url,
 		LogPath: logPath,
 		PID:     cmd.Process.Pid,
 		cmd:     cmd,
+		exit:    exit,
 		logFile: logFile,
 	}, nil
 }
@@ -1685,7 +1707,10 @@ func (s *managedWeaverSession) Close() {
 	if s == nil {
 		return
 	}
-	if s.cmd != nil && s.cmd.Process != nil {
+	switch {
+	case s.cmd != nil && s.cmd.Process != nil && s.exit != nil:
+		stopWatchedChild(s.cmd, s.exit, 30*time.Second)
+	case s.cmd != nil && s.cmd.Process != nil:
 		stopManagedWeaverCommand(s.cmd, 30*time.Second)
 	}
 	_ = os.Remove(localWeaverPIDPath())
@@ -1727,6 +1752,10 @@ name = "series"
 	_ = os.WriteFile(path, []byte(config), 0o644)
 }
 
+// managedWeaverExtractionMemoryBytes is the extraction memory budget every
+// natively launched server gets: 6 GiB.
+const managedWeaverExtractionMemoryBytes = "6442450944"
+
 func managedWeaverEnv(base []string, runRoot, rustLog string) []string {
 	if strings.TrimSpace(runRoot) == "" {
 		runRoot = localRunDir()
@@ -1751,6 +1780,11 @@ func managedWeaverEnv(base []string, runRoot, rustLog string) []string {
 		// without weakening non-local browser administration.
 		"WEAVER_TRUSTED_CIDRS=127.0.0.1/32,::1/128",
 	)
+	// Several of these servers run side by side on one host, and each one's
+	// extraction memory budget otherwise defaults to half the host's RAM. The
+	// largest decoder the corpus declares needs a few tens of MiB, so a fixed
+	// budget keeps the lanes from promising each other the same memory.
+	env = appendOrReplaceEnv(env, "WEAVER_EXTRACTION_MAX_MEMORY_BYTES", managedWeaverExtractionMemoryBytes)
 	if weaverUsesPostgresDatastore() {
 		env = appendOrReplaceEnv(env, "WEAVER_DATABASE_URL", weaverPostgresURL())
 	}
