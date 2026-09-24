@@ -6,7 +6,7 @@
 # RARLAB's older official Linux releases ship a 32-bit static binary. A
 # digest-pinned Debian base runs both that binary and the current x64 binary
 # through Docker's supported amd64 emulation on arm64 hosts.
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
 ARG RAR_URL
 ARG RAR_SHA256
