@@ -299,6 +299,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
                         category_bytes: None,
+                        nzb_password_candidates: Default::default(),
                     };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
@@ -459,6 +460,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         recovery_queue: DownloadQueue::new(),
                         staging_dir: None,
                         category_bytes: None,
+                        nzb_password_candidates: Default::default(),
                     };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));
