@@ -774,17 +774,18 @@ enum DbWriteCommand {
     },
     /// A generic ordered write. Same-key state transitions land in enqueue
     /// order: on SQLite every command is awaited before the next, and on
-    /// Postgres a job's writes share a lane and a jobless write is a barrier.
+    /// Postgres writes on one lane keep their order and a write with no lane
+    /// is a barrier.
     /// `op` runs on a
     /// `Database` clone the writer task holds, letting it call methods that
     /// live on `Database` (e.g. `set_active_job_runtime` / `update_active_job`)
     /// without duplicating them onto `DatabaseWriterExecutor`.
     Write {
         label: &'static str,
-        /// The job this write belongs to. On Postgres a job's writes keep
-        /// their order while other jobs' writes run alongside; `None` makes
+        /// The lane this write extends. On Postgres writes on one lane keep
+        /// their order while other lanes' writes run alongside; `None` makes
         /// the write a barrier against every other queued write.
-        job_id: Option<crate::jobs::ids::JobId>,
+        lane: Option<WriteLane>,
         op: WriteOp,
     },
     Flush {
@@ -799,6 +800,10 @@ enum WriteLane {
     Job(u64),
     /// Job event batches, applied in submission order.
     Events,
+    /// Server attribution checkpoints, applied in submission order. They only
+    /// set `active_jobs.server_attribution`, which a job's other writes never
+    /// touch and its archive reads.
+    ServerAttribution,
 }
 
 impl DbWriteCommand {
@@ -807,17 +812,19 @@ impl DbWriteCommand {
     /// before anything queued after it, exactly as on the serial writer.
     fn lanes(&self) -> Option<(&'static [WriteLane], WriteLane)> {
         match self {
-            // After every earlier write for its job, and after every earlier
-            // event batch, since those may carry this job's events.
-            Self::ArchiveJob { job_id, .. } => {
-                Some((&[WriteLane::Events], WriteLane::Job(job_id.0)))
-            }
+            // After every earlier write for its job, after every earlier
+            // event batch, since those may carry this job's events, and after
+            // every earlier attribution checkpoint, since the archive copies
+            // the job's attribution into history.
+            Self::ArchiveJob { job_id, .. } => Some((
+                &[WriteLane::Events, WriteLane::ServerAttribution],
+                WriteLane::Job(job_id.0),
+            )),
             Self::InsertJobEvents { .. } => Some((&[], WriteLane::Events)),
             Self::Write {
-                job_id: Some(job_id),
-                ..
-            } => Some((&[], WriteLane::Job(job_id.0))),
-            Self::Write { job_id: None, .. } | Self::Flush { .. } => None,
+                lane: Some(lane), ..
+            } => Some((&[], *lane)),
+            Self::Write { lane: None, .. } | Self::Flush { .. } => None,
         }
     }
 }
@@ -929,26 +936,44 @@ fn postgres_write_lane_concurrency() -> usize {
     (crate::persistence::sql_services::postgres_max_connections_from_env() as usize / 2).max(1)
 }
 
+/// Commands the Postgres writer holds taken from the queue per write it runs
+/// at once. Past that the writer stops taking commands, so the bounded queue
+/// fills and senders see it full, as on the serial writer.
+const POSTGRES_WRITES_TAKEN_PER_LANE_SLOT: usize = 4;
+
 /// The Postgres writer. Postgres has no single-writer limit, so ordered writes
 /// for different jobs run at once, up to `concurrency`, while each lane keeps
 /// submission order:
 ///
 /// - a job's writes apply one after another, in the order they were queued;
-/// - an archive also waits for every event batch queued before it;
-/// - a barrier (`Flush`, or a write with no job) waits for everything queued
+/// - an archive also waits for every event batch and every server attribution
+///   checkpoint queued before it;
+/// - a barrier (`Flush`, or a write with no lane) waits for everything queued
 ///   before it and holds back everything queued after it;
+/// - at most `max_taken` commands are taken and unfinished at once; the rest
+///   stay in the queue;
 /// - when the queue closes, every write already taken is finished first.
 async fn run_postgres_write_lanes(
     mut rx: mpsc::Receiver<QueuedWrite>,
     writer: DatabaseWriterExecutor,
     writer_db: Database,
     concurrency: usize,
+    max_taken: usize,
 ) {
     let permits = Arc::new(Semaphore::new(concurrency.max(1)));
+    let max_taken = max_taken.max(1);
     let mut in_flight = tokio::task::JoinSet::new();
     // The completion signal of the last command taken on each lane.
     let mut tails: HashMap<WriteLane, watch::Receiver<bool>> = HashMap::new();
-    while let Some(QueuedWrite { queued_at, command }) = rx.recv().await {
+    loop {
+        // Every taken command's predecessors were taken before it, and none
+        // holds a permit while it waits, so the oldest one always finishes.
+        while in_flight.len() >= max_taken {
+            in_flight.join_next().await;
+        }
+        let Some(QueuedWrite { queued_at, command }) = rx.recv().await else {
+            break;
+        };
         while in_flight.try_join_next().is_some() {}
         if in_flight.is_empty() {
             tails.clear();
@@ -1352,12 +1377,16 @@ impl Database {
         let writer_db = self.writer_task_handle();
         let worker: Pin<Box<dyn Future<Output = ()> + Send>> =
             if matches!(self.target, DatabaseTarget::PostgresUrl(_)) {
-                Box::pin(run_postgres_write_lanes(
-                    rx,
-                    writer,
-                    writer_db,
-                    postgres_write_lane_concurrency(),
-                ))
+                Box::pin({
+                    let concurrency = postgres_write_lane_concurrency();
+                    run_postgres_write_lanes(
+                        rx,
+                        writer,
+                        writer_db,
+                        concurrency,
+                        concurrency * POSTGRES_WRITES_TAKEN_PER_LANE_SLOT,
+                    )
+                })
             } else {
                 Box::pin(run_serial_writes(rx, writer, writer_db))
             };
@@ -1427,7 +1456,7 @@ impl Database {
     ) -> Result<(), StateError> {
         let command = DbWriteCommand::Write {
             label,
-            job_id: None,
+            lane: None,
             op: Box::new(op),
         };
         self.try_send_with_retry(command, label)
@@ -1444,10 +1473,27 @@ impl Database {
     ) -> Result<(), StateError> {
         let command = DbWriteCommand::Write {
             label,
-            job_id: Some(job_id),
+            lane: Some(WriteLane::Job(job_id.0)),
             op: Box::new(op),
         };
         self.try_send_with_retry(command, label)
+    }
+
+    /// Queue a server attribution checkpoint. Checkpoints keep their order
+    /// against each other, and a job's archive waits for the ones queued
+    /// before it; on Postgres they otherwise run alongside other writes
+    /// instead of holding every lane back.
+    pub fn try_queue_server_attribution_write(
+        &self,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+    ) -> Result<(), StateError> {
+        const LABEL: &str = "active_server_attribution";
+        let command = DbWriteCommand::Write {
+            label: LABEL,
+            lane: Some(WriteLane::ServerAttribution),
+            op: Box::new(op),
+        };
+        self.try_send_with_retry(command, LABEL)
     }
 
     /// Shared enqueue path for ordered writer commands. Tries a non-blocking
