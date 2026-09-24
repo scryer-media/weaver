@@ -154,11 +154,12 @@ impl Pipeline {
             match state.and_then(|state| state.nzb_password_candidates.get()) {
                 Some(cached) => (cached.clone(), true),
                 None => {
-                    let (candidates, harvested, parsed) = self.load_nzb_password_candidates(job_id);
-                    // Only a parsed NZB is remembered. A missing row is
-                    // re-read, as it always was, so a row that appears later
-                    // is still seen.
-                    if parsed && let Some(state) = state {
+                    let (candidates, harvested) = self.load_nzb_password_candidates(job_id);
+                    // A job in the pipeline already has its row, and nothing
+                    // adds NZB bytes to a row later, so a missing row or NZB
+                    // stays missing and its empty list is remembered too. A
+                    // failed read or parse is not, so it is retried.
+                    if harvested && let Some(state) = state {
                         let _ = state.nzb_password_candidates.set(candidates.clone());
                     }
                     (candidates, harvested)
@@ -180,34 +181,30 @@ impl Pipeline {
     }
 
     /// The NZB half of the harvest, read from the database: the candidates,
-    /// whether the read and parse succeeded (`harvested`), and whether a
-    /// persisted NZB was actually parsed.
-    fn load_nzb_password_candidates(
-        &self,
-        job_id: JobId,
-    ) -> (Vec<ArchivePasswordCandidate>, bool, bool) {
+    /// and whether the read and parse succeeded (`harvested`).
+    fn load_nzb_password_candidates(&self, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
         match self.db.load_active_job_persisted_nzb(job_id) {
             Ok(Some((nzb_path, Some(nzb_zstd)))) => {
                 match persisted_nzb_password_candidates(&nzb_path, &nzb_zstd) {
-                    Ok(candidates) => (candidates, true, true),
+                    Ok(candidates) => (candidates, true),
                     Err(error) => {
                         warn!(
                             job_id = job_id.0,
                             error = %error,
                             "failed to parse persisted NZB for password candidates"
                         );
-                        (Vec::new(), false, false)
+                        (Vec::new(), false)
                     }
                 }
             }
-            Ok(_) => (Vec::new(), true, false),
+            Ok(_) => (Vec::new(), true),
             Err(error) => {
                 warn!(
                     job_id = job_id.0,
                     error = %error,
                     "failed to load persisted NZB for password candidates"
                 );
-                (Vec::new(), false, false)
+                (Vec::new(), false)
             }
         }
     }

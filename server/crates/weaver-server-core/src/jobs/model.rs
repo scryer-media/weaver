@@ -722,10 +722,11 @@ pub struct JobState {
     /// in harvest order and without the spec's explicit password.
     ///
     /// Filled when the job enters the pipeline, or by the first harvest that
-    /// parses the persisted NZB. The NZB never changes under a live job, so
-    /// once filled the harvest reads this instead of reloading and re-parsing
-    /// the NZB on every archive file. Left empty when the NZB could not be
-    /// read or parsed, which keeps a transient failure retryable.
+    /// reads the job's row; a row with no NZB fills it with an empty list. The
+    /// NZB never changes under a live job, so once filled the harvest reads
+    /// this instead of reloading and re-parsing the NZB on every archive file.
+    /// Left unset when the NZB could not be read or parsed, which keeps a
+    /// transient failure retryable.
     pub nzb_password_candidates: std::sync::OnceLock<Vec<ArchivePasswordCandidate>>,
 }
 

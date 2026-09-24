@@ -2809,6 +2809,10 @@ async fn add_job_records_streamed_nzb_hash_in_active_jobs() {
 /// Overwrites the job's persisted NZB with bytes that cannot be parsed, so a
 /// harvest that still returns the NZB's candidates provably did not read it.
 async fn corrupt_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId) {
+    set_persisted_nzb(temp_dir, job_id, Some(vec![0xFFu8; 64])).await;
+}
+
+async fn set_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId, nzb_zstd: Option<Vec<u8>>) {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
@@ -2819,7 +2823,7 @@ async fn corrupt_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId) {
         .await
         .unwrap();
     let updated = sqlx::query("UPDATE active_jobs SET nzb_zstd = ? WHERE job_id = ?")
-        .bind(vec![0xFFu8; 64])
+        .bind(nzb_zstd)
         .bind(job_id.0 as i64)
         .execute(&pool)
         .await
@@ -2901,6 +2905,42 @@ async fn the_first_harvest_parses_the_persisted_nzb_and_later_ones_read_memory()
         "a later harvest must not read the persisted NZB again"
     );
     assert!(second == nzb_half_candidates());
+}
+
+#[tokio::test]
+async fn a_harvest_that_finds_no_persisted_nzb_remembers_the_empty_list() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30040);
+    let spec = standalone_job_spec("Silver Horizon", &[("episode.mkv".to_string(), 123)]);
+    insert_active_job_with_persisted_nzb_named(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("meta-key"),
+        Some("Silver Horizon {{harbour-key}}.nzb"),
+    )
+    .await;
+    set_persisted_nzb(&temp_dir, job_id, None).await;
+
+    let (first, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    assert!(harvested);
+    assert!(first.is_empty());
+
+    // Bytes that appear afterwards are not read: the first harvest's answer
+    // stands for the rest of the job.
+    set_persisted_nzb(
+        &temp_dir,
+        job_id,
+        Some(sample_nzb_zstd_with_password("meta-key")),
+    )
+    .await;
+    let (second, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    assert!(harvested);
+    assert!(
+        second.is_empty(),
+        "a later harvest must not read the persisted NZB again"
+    );
 }
 
 #[tokio::test]
