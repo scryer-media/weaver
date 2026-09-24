@@ -631,7 +631,7 @@ fn spawn_test_scheduler(
                         downloaded_wire_bytes: 0,
                         server_attribution: Default::default(),
                         announced_checkpoints: Default::default(),
-                        };
+                    };
                     let _ = event_tx.send(PipelineEvent::JobCreated {
                         job_id,
                         name: state.spec.name.clone(),
@@ -787,7 +787,7 @@ fn spawn_test_scheduler(
                         downloaded_wire_bytes: 0,
                         server_attribution: Default::default(),
                         announced_checkpoints: Default::default(),
-                        };
+                    };
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));
                 }
