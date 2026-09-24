@@ -1163,6 +1163,380 @@ async fn try_queue_write_full_queue_resend_is_covered_by_flush() {
     );
 }
 
+/// Drives the Postgres lane writer directly. The ops below never touch the
+/// database, so an in-memory SQLite handle stands in for the one they receive;
+/// what is under test is only when each op is allowed to run.
+fn spawn_lane_writer(
+    db: &Database,
+    concurrency: usize,
+) -> (mpsc::Sender<QueuedWrite>, tokio::task::JoinHandle<()>) {
+    spawn_capped_lane_writer(db, concurrency, 64, 64)
+}
+
+fn spawn_capped_lane_writer(
+    db: &Database,
+    concurrency: usize,
+    max_taken: usize,
+    queue_capacity: usize,
+) -> (mpsc::Sender<QueuedWrite>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel(queue_capacity);
+    let worker = tokio::spawn(run_postgres_write_lanes(
+        rx,
+        DatabaseWriterExecutor::from_database(db),
+        db.writer_task_handle(),
+        concurrency,
+        max_taken,
+    ));
+    (tx, worker)
+}
+
+fn lane_write(
+    lane: Option<WriteLane>,
+    op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+) -> QueuedWrite {
+    QueuedWrite {
+        queued_at: Instant::now(),
+        command: DbWriteCommand::Write {
+            label: "lane_probe",
+            lane,
+            op: Box::new(op),
+        },
+    }
+}
+
+async fn send_lane_write(
+    tx: &mpsc::Sender<QueuedWrite>,
+    job_id: Option<u64>,
+    op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+) {
+    tx.send(lane_write(job_id.map(WriteLane::Job), op))
+        .await
+        .unwrap();
+}
+
+async fn flush_lane_writer(tx: &mpsc::Sender<QueuedWrite>) {
+    let (reply, done) = oneshot::channel();
+    tx.send(QueuedWrite {
+        queued_at: Instant::now(),
+        command: DbWriteCommand::Flush { reply },
+    })
+    .await
+    .unwrap();
+    done.await.unwrap();
+}
+
+type LaneLog = std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+fn push_lane_log(log: &LaneLog, entry: &'static str) {
+    log.lock().unwrap().push(entry);
+}
+
+/// An op that blocks until `release` fires, then logs `entry`.
+fn gated_lane_op(
+    log: &LaneLog,
+    entry: &'static str,
+    release: std::sync::mpsc::Receiver<()>,
+) -> impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static {
+    let log = log.clone();
+    move |_db| {
+        release.recv().unwrap();
+        push_lane_log(&log, entry);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn postgres_lanes_run_different_jobs_writes_at_the_same_time() {
+    // Each op waits at a two-party barrier, so neither can finish unless both
+    // are running at once. A serial writer never reaches the flush.
+    let db = Database::open_in_memory().unwrap();
+    let (tx, worker) = spawn_lane_writer(&db, 2);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    for job_id in [1_u64, 2] {
+        let barrier = barrier.clone();
+        send_lane_write(&tx, Some(job_id), move |_db| {
+            barrier.wait();
+            Ok(())
+        })
+        .await;
+    }
+    flush_lane_writer(&tx).await;
+    drop(tx);
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_lanes_keep_one_jobs_writes_in_submission_order() {
+    // Job 1's first write is held until job 2's write runs and releases it. Job
+    // 2 overtaking job 1 is the point of the lanes; job 1's second write
+    // overtaking its first is what they must never allow.
+    let db = Database::open_in_memory().unwrap();
+    let (tx, worker) = spawn_lane_writer(&db, 4);
+    let log = LaneLog::default();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    send_lane_write(&tx, Some(1), gated_lane_op(&log, "job1-first", release_rx)).await;
+    let second_log = log.clone();
+    send_lane_write(&tx, Some(1), move |_db| {
+        push_lane_log(&second_log, "job1-second");
+        Ok(())
+    })
+    .await;
+    let other_log = log.clone();
+    send_lane_write(&tx, Some(2), move |_db| {
+        push_lane_log(&other_log, "job2");
+        release_tx.send(()).unwrap();
+        Ok(())
+    })
+    .await;
+
+    flush_lane_writer(&tx).await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["job2", "job1-first", "job1-second"]
+    );
+    drop(tx);
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_lanes_treat_a_jobless_write_as_a_barrier() {
+    // The jobless write waits for job 1's held write, and job 2's write, queued
+    // after it, waits for the jobless one. The release comes only after all
+    // three are queued, so a job 2 write that ignored the barrier would run
+    // first.
+    let db = Database::open_in_memory().unwrap();
+    let (tx, worker) = spawn_lane_writer(&db, 4);
+    let log = LaneLog::default();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    send_lane_write(&tx, Some(1), gated_lane_op(&log, "job1", release_rx)).await;
+    let barrier_log = log.clone();
+    send_lane_write(&tx, None, move |_db| {
+        push_lane_log(&barrier_log, "barrier");
+        Ok(())
+    })
+    .await;
+    let after_log = log.clone();
+    send_lane_write(&tx, Some(2), move |_db| {
+        push_lane_log(&after_log, "job2");
+        Ok(())
+    })
+    .await;
+
+    release_tx.send(()).unwrap();
+    flush_lane_writer(&tx).await;
+    assert_eq!(*log.lock().unwrap(), vec!["job1", "barrier", "job2"]);
+    drop(tx);
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_lanes_commit_an_archive_after_its_jobs_earlier_writes() {
+    let db = Database::open_in_memory().unwrap();
+    let (tx, worker) = spawn_lane_writer(&db, 4);
+    let log = LaneLog::default();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let job_id = crate::jobs::ids::JobId(903);
+
+    send_lane_write(
+        &tx,
+        Some(job_id.0),
+        gated_lane_op(&log, "runtime", release_rx),
+    )
+    .await;
+    let (committed_tx, mut committed_rx) = oneshot::channel();
+    tx.send(QueuedWrite {
+        queued_at: Instant::now(),
+        command: DbWriteCommand::ArchiveJob {
+            job_id,
+            history: Box::new(postgres_sample_history(job_id)),
+            typed_terminal_cause: None,
+            committed: Some(committed_tx),
+        },
+    })
+    .await
+    .unwrap();
+    // A write for another job is not held up by the archive's wait.
+    let (other_tx, other_rx) = oneshot::channel();
+    send_lane_write(&tx, Some(904), move |_db| {
+        let _ = other_tx.send(());
+        Ok(())
+    })
+    .await;
+    other_rx.await.unwrap();
+
+    assert!(
+        committed_rx.try_recv().is_err(),
+        "the archive signalled before the job's earlier write ran"
+    );
+    release_tx.send(()).unwrap();
+    committed_rx.await.unwrap();
+    assert_eq!(*log.lock().unwrap(), vec!["runtime"]);
+    assert!(
+        db.get_job_history(job_id.0).unwrap().is_some(),
+        "the archive signalled before its row was readable"
+    );
+    drop(tx);
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_lanes_finish_every_taken_write_when_the_queue_closes() {
+    let db = Database::open_in_memory().unwrap();
+    let (tx, worker) = spawn_lane_writer(&db, 4);
+    let log = LaneLog::default();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    send_lane_write(&tx, Some(1), gated_lane_op(&log, "job1", release_rx)).await;
+    let second_log = log.clone();
+    send_lane_write(&tx, Some(1), move |_db| {
+        push_lane_log(&second_log, "job1-after");
+        Ok(())
+    })
+    .await;
+    drop(tx);
+    release_tx.send(()).unwrap();
+    worker.await.unwrap();
+    assert_eq!(*log.lock().unwrap(), vec!["job1", "job1-after"]);
+}
+
+/// An op that reports it started, then blocks until `release` fires and logs
+/// `entry`.
+fn announced_gated_lane_op(
+    log: &LaneLog,
+    entry: &'static str,
+    started: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    release: std::sync::mpsc::Receiver<()>,
+) -> impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static {
+    let log = log.clone();
+    move |_db| {
+        started.send(entry).unwrap();
+        release.recv().unwrap();
+        push_lane_log(&log, entry);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn postgres_lanes_stop_taking_writes_at_the_cap_until_one_finishes() {
+    // Two writes are taken and held, which is the cap, so the writer takes
+    // nothing more: the one-slot queue keeps the third write and turns the
+    // fourth away as full. Finishing one held write lets the third in.
+    let db = Database::open_in_memory().unwrap();
+    let (tx, worker) = spawn_capped_lane_writer(&db, 2, 2, 1);
+    let log = LaneLog::default();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_one, release_one_rx) = std::sync::mpsc::channel();
+    let (release_two, release_two_rx) = std::sync::mpsc::channel();
+
+    send_lane_write(
+        &tx,
+        Some(1),
+        announced_gated_lane_op(&log, "job1", started_tx.clone(), release_one_rx),
+    )
+    .await;
+    send_lane_write(
+        &tx,
+        Some(2),
+        announced_gated_lane_op(&log, "job2", started_tx.clone(), release_two_rx),
+    )
+    .await;
+    let mut held = vec![
+        started_rx.recv().await.unwrap(),
+        started_rx.recv().await.unwrap(),
+    ];
+    held.sort_unstable();
+    assert_eq!(held, vec!["job1", "job2"]);
+
+    let third_started = started_tx.clone();
+    let third_log = log.clone();
+    tx.try_send(lane_write(Some(WriteLane::Job(3)), move |_db| {
+        third_started.send("job3").unwrap();
+        push_lane_log(&third_log, "job3");
+        Ok(())
+    }))
+    .unwrap_or_else(|_| panic!("the queue's one slot was taken"));
+    let fourth_log = log.clone();
+    let fourth = lane_write(Some(WriteLane::Job(4)), move |_db| {
+        push_lane_log(&fourth_log, "job4");
+        Ok(())
+    });
+    let Err(mpsc::error::TrySendError::Full(fourth)) = tx.try_send(fourth) else {
+        panic!("the writer took a write past its cap");
+    };
+
+    release_one.send(()).unwrap();
+    assert_eq!(started_rx.recv().await.unwrap(), "job3");
+    // The third write left the queue, so its slot is free again.
+    tx.try_send(fourth)
+        .unwrap_or_else(|_| panic!("the queue stayed full after the writer took a write"));
+
+    // Closing the queue still finishes everything in it: the held write and
+    // the write still waiting in the queue.
+    drop(tx);
+    release_two.send(()).unwrap();
+    worker.await.unwrap();
+    let mut ran = log.lock().unwrap().clone();
+    ran.sort_unstable();
+    assert_eq!(ran, vec!["job1", "job2", "job3", "job4"]);
+}
+
+#[tokio::test]
+async fn postgres_lanes_run_attribution_alongside_job_writes_but_before_the_archive() {
+    let db = Database::open_in_memory().unwrap();
+    let (tx, worker) = spawn_lane_writer(&db, 4);
+    let log = LaneLog::default();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let job_id = crate::jobs::ids::JobId(905);
+
+    tx.send(lane_write(
+        Some(WriteLane::ServerAttribution),
+        gated_lane_op(&log, "attribution", release_rx),
+    ))
+    .await
+    .unwrap();
+    // The job's own write is not held up by the attribution checkpoint.
+    let (job_write_tx, job_write_rx) = oneshot::channel();
+    send_lane_write(&tx, Some(job_id.0), move |_db| {
+        let _ = job_write_tx.send(());
+        Ok(())
+    })
+    .await;
+    job_write_rx.await.unwrap();
+
+    let (committed_tx, mut committed_rx) = oneshot::channel();
+    tx.send(QueuedWrite {
+        queued_at: Instant::now(),
+        command: DbWriteCommand::ArchiveJob {
+            job_id,
+            history: Box::new(postgres_sample_history(job_id)),
+            typed_terminal_cause: None,
+            committed: Some(committed_tx),
+        },
+    })
+    .await
+    .unwrap();
+    // A write for another job runs while the archive waits.
+    let (other_tx, other_rx) = oneshot::channel();
+    send_lane_write(&tx, Some(906), move |_db| {
+        let _ = other_tx.send(());
+        Ok(())
+    })
+    .await;
+    other_rx.await.unwrap();
+
+    assert!(
+        committed_rx.try_recv().is_err(),
+        "the archive committed before the attribution checkpoint queued ahead of it"
+    );
+    release_tx.send(()).unwrap();
+    committed_rx.await.unwrap();
+    assert_eq!(*log.lock().unwrap(), vec!["attribution"]);
+    drop(tx);
+    worker.await.unwrap();
+}
+
 #[test]
 fn stale_generation_insert_does_not_resurrect_deleted_job() {
     // Reproduces the invalidation race: a reader captures the cache generation
@@ -1947,6 +2321,59 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
             ),
             0
         );
+    }
+
+    drop(db);
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
+    admin_pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_job_lane_writes_keep_order_and_archive_last_when_configured() {
+    let Some((admin_pool, schema, target_url)) =
+        create_postgres_test_schema("postgres_job_lanes").await
+    else {
+        return;
+    };
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    let jobs = [701_u64, 702, 703, 704];
+    for job_id in jobs {
+        db.create_active_job(&postgres_sample_job(crate::jobs::ids::JobId(job_id)))
+            .unwrap();
+    }
+    // Interleaved across jobs, as the pipeline queues them; each job's own
+    // events must still land in the order they were queued.
+    for step in 0..25_i64 {
+        for job_id in jobs {
+            db.try_queue_job_write(crate::jobs::ids::JobId(job_id), "lane_order", move |db| {
+                db.insert_job_event(job_id, step, &format!("S{step:02}"), "lane", None)
+            })
+            .unwrap();
+        }
+    }
+    let job_id = crate::jobs::ids::JobId(jobs[0]);
+    let committed = db
+        .try_queue_archive_job_with_terminal_cause(job_id, postgres_sample_history(job_id), None)
+        .unwrap();
+    committed.await.unwrap();
+    assert!(db.get_job_history(job_id.0).unwrap().is_some());
+    assert_eq!(
+        db.get_job_events(job_id.0).unwrap().len(),
+        25,
+        "the archive committed before the job's earlier writes"
+    );
+
+    db.flush_write_queue().await.unwrap();
+    let expected: Vec<String> = (0..25).map(|step| format!("S{step:02}")).collect();
+    for job_id in jobs {
+        let kinds: Vec<String> = db
+            .get_job_events(job_id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(kinds, expected, "job {job_id} writes applied out of order");
     }
 
     drop(db);

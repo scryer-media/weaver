@@ -717,6 +717,17 @@ pub struct JobState {
     /// `fetch_add` through this already-resolved pointer. `None` only while a
     /// test builds a bare state; the accounting site simply skips then.
     pub category_bytes: Option<Arc<AtomicU64>>,
+    /// Password candidates derived from the job's persisted NZB (its
+    /// `<meta type="password">` and the `{{password}}` file-name convention),
+    /// in harvest order and without the spec's explicit password.
+    ///
+    /// Filled when the job enters the pipeline, or by the first harvest that
+    /// reads the job's row; a row with no NZB fills it with an empty list. The
+    /// NZB never changes under a live job, so once filled the harvest reads
+    /// this instead of reloading and re-parsing the NZB on every archive file.
+    /// Left unset when the NZB could not be read or parsed, which keeps a
+    /// transient failure retryable.
+    pub nzb_password_candidates: std::sync::OnceLock<Vec<ArchivePasswordCandidate>>,
 }
 
 impl JobState {

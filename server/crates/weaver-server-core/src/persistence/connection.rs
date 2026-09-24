@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -7,7 +7,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
 use crate::StateError;
 use crate::operations::instrumentation::{DbRuntimeMetrics, DbRuntimeMetricsSnapshot};
@@ -750,10 +750,10 @@ type WriteOp = Box<dyn FnOnce(&Database) -> Result<(), StateError> + Send + 'sta
 
 /// A writer-queue command plus the instant it was enqueued.
 ///
-/// The ordered writer consumes one command at a time and awaits each before
-/// taking the next, so a command's latency is `queue wait + execution` exactly
-/// as on the SQLite executor below it. Carrying the enqueue instant is what lets
-/// the consumer report those two separately per command kind.
+/// A command's latency is `queue wait + execution`: on SQLite the ordered writer
+/// takes one command at a time, and on Postgres the wait also covers the
+/// command's lane. Carrying the enqueue instant is what lets the consumer
+/// report those two separately per command kind.
 struct QueuedWrite {
     queued_at: Instant,
     command: DbWriteCommand,
@@ -772,19 +772,243 @@ enum DbWriteCommand {
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
     },
-    /// A generic ordered write. Executed on the single serialized writer
-    /// consumer (awaited before the next command like the other arms), so
-    /// same-key state transitions land in enqueue order. `op` runs on a
+    /// A generic ordered write. Same-key state transitions land in enqueue
+    /// order: on SQLite every command is awaited before the next, and on
+    /// Postgres writes on one lane keep their order and a write with no lane
+    /// is a barrier.
+    /// `op` runs on a
     /// `Database` clone the writer task holds, letting it call methods that
     /// live on `Database` (e.g. `set_active_job_runtime` / `update_active_job`)
     /// without duplicating them onto `DatabaseWriterExecutor`.
     Write {
         label: &'static str,
+        /// The lane this write extends. On Postgres writes on one lane keep
+        /// their order while other lanes' writes run alongside; `None` makes
+        /// the write a barrier against every other queued write.
+        lane: Option<WriteLane>,
         op: WriteOp,
     },
     Flush {
         reply: oneshot::Sender<()>,
     },
+}
+
+/// Where an ordered write sits relative to the others on the Postgres writer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum WriteLane {
+    /// Writes for one job, applied in submission order.
+    Job(u64),
+    /// Job event batches, applied in submission order.
+    Events,
+    /// Server attribution checkpoints, applied in submission order. They only
+    /// set `active_jobs.server_attribution`, which a job's other writes never
+    /// touch and its archive reads.
+    ServerAttribution,
+}
+
+impl DbWriteCommand {
+    /// The lanes this command must wait out, and the lane it then extends.
+    /// `None` is a barrier: it runs after everything queued before it and
+    /// before anything queued after it, exactly as on the serial writer.
+    fn lanes(&self) -> Option<(&'static [WriteLane], WriteLane)> {
+        match self {
+            // After every earlier write for its job, after every earlier
+            // event batch, since those may carry this job's events, and after
+            // every earlier attribution checkpoint, since the archive copies
+            // the job's attribution into history.
+            Self::ArchiveJob { job_id, .. } => Some((
+                &[WriteLane::Events, WriteLane::ServerAttribution],
+                WriteLane::Job(job_id.0),
+            )),
+            Self::InsertJobEvents { .. } => Some((&[], WriteLane::Events)),
+            Self::Write {
+                lane: Some(lane), ..
+            } => Some((&[], *lane)),
+            Self::Write { lane: None, .. } | Self::Flush { .. } => None,
+        }
+    }
+}
+
+/// Starts the profiling scope for one writer command. The per-command labels
+/// allocate, so nothing is built unless profiling is on.
+fn writer_command_scope(
+    command: &DbWriteCommand,
+    queued_at: Instant,
+) -> Option<crate::runtime::perf_probe::OwnedScope> {
+    crate::runtime::perf_probe::enabled().then(|| {
+        let label = command.label();
+        let waited = queued_at.elapsed();
+        crate::runtime::perf_probe::record("db.writer_queue.wait", waited);
+        crate::runtime::perf_probe::record_owned(format!("db.writer_queue.{label}.wait"), waited);
+        crate::runtime::perf_probe::owned_scope(format!("db.writer_queue.{label}.exec"))
+    })
+}
+
+/// Runs one writer command to completion. An archive's `committed` signal and a
+/// flush's reply fire only after everything the command stands for is done.
+async fn execute_write_command(
+    command: DbWriteCommand,
+    writer: &DatabaseWriterExecutor,
+    writer_db: &Database,
+) {
+    match command {
+        DbWriteCommand::ArchiveJob {
+            job_id,
+            history,
+            typed_terminal_cause,
+            committed,
+        } => {
+            let writer = writer.clone();
+            tokio::task::spawn_blocking(move || {
+                // Capture the cache generation *before* the archive
+                // read so a concurrent history-delete that bumps the
+                // generation makes the conditional insert a no-op,
+                // rather than resurrecting the just-deleted row.
+                let observed_generation = writer.job_history_cache_generation();
+                match writer.archive_job_with_terminal_cause(
+                    job_id,
+                    history.as_ref(),
+                    typed_terminal_cause,
+                ) {
+                    Ok(Some(row)) => writer.cache_job_history_at(row, observed_generation),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = job_id.0,
+                            error = %error,
+                            "failed to archive job on database writer path"
+                        );
+                    }
+                }
+            })
+            .await
+            .ok();
+            if let Some(committed) = committed {
+                let _ = committed.send(());
+            }
+        }
+        DbWriteCommand::InsertJobEvents { events } => {
+            let writer = writer.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = writer.insert_job_events(&events) {
+                    tracing::warn!(
+                        count = events.len(),
+                        error = %error,
+                        "failed to persist job events on database writer path"
+                    );
+                }
+            })
+            .await
+            .ok();
+        }
+        DbWriteCommand::Write { label, op, .. } => {
+            let writer_db = writer_db.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = op(&writer_db) {
+                    tracing::warn!(label, error = %error, "failed to run ordered database write");
+                }
+            })
+            .await
+            .ok();
+        }
+        DbWriteCommand::Flush { reply } => {
+            let _ = reply.send(());
+        }
+    }
+}
+
+/// The SQLite writer: one command at a time, each awaited before the next.
+/// SQLite has a single writer connection, so there is nothing to overlap.
+async fn run_serial_writes(
+    mut rx: mpsc::Receiver<QueuedWrite>,
+    writer: DatabaseWriterExecutor,
+    writer_db: Database,
+) {
+    while let Some(QueuedWrite { queued_at, command }) = rx.recv().await {
+        let _executed = writer_command_scope(&command, queued_at);
+        execute_write_command(command, &writer, &writer_db).await;
+    }
+}
+
+/// Ordered writes a Postgres writer runs at once: half the pool, so queued
+/// writes never take every connection from reads and synchronous writes.
+fn postgres_write_lane_concurrency() -> usize {
+    (crate::persistence::sql_services::postgres_max_connections_from_env() as usize / 2).max(1)
+}
+
+/// Commands the Postgres writer holds taken from the queue per write it runs
+/// at once. Past that the writer stops taking commands, so the bounded queue
+/// fills and senders see it full, as on the serial writer.
+const POSTGRES_WRITES_TAKEN_PER_LANE_SLOT: usize = 4;
+
+/// The Postgres writer. Postgres has no single-writer limit, so ordered writes
+/// for different jobs run at once, up to `concurrency`, while each lane keeps
+/// submission order:
+///
+/// - a job's writes apply one after another, in the order they were queued;
+/// - an archive also waits for every event batch and every server attribution
+///   checkpoint queued before it;
+/// - a barrier (`Flush`, or a write with no lane) waits for everything queued
+///   before it and holds back everything queued after it;
+/// - at most `max_taken` commands are taken and unfinished at once; the rest
+///   stay in the queue;
+/// - when the queue closes, every write already taken is finished first.
+async fn run_postgres_write_lanes(
+    mut rx: mpsc::Receiver<QueuedWrite>,
+    writer: DatabaseWriterExecutor,
+    writer_db: Database,
+    concurrency: usize,
+    max_taken: usize,
+) {
+    let permits = Arc::new(Semaphore::new(concurrency.max(1)));
+    let max_taken = max_taken.max(1);
+    let mut in_flight = tokio::task::JoinSet::new();
+    // The completion signal of the last command taken on each lane.
+    let mut tails: HashMap<WriteLane, watch::Receiver<bool>> = HashMap::new();
+    loop {
+        // Every taken command's predecessors were taken before it, and none
+        // holds a permit while it waits, so the oldest one always finishes.
+        while in_flight.len() >= max_taken {
+            in_flight.join_next().await;
+        }
+        let Some(QueuedWrite { queued_at, command }) = rx.recv().await else {
+            break;
+        };
+        while in_flight.try_join_next().is_some() {}
+        if in_flight.is_empty() {
+            tails.clear();
+        }
+        let Some((also_after, lane)) = command.lanes() else {
+            while in_flight.join_next().await.is_some() {}
+            tails.clear();
+            let _executed = writer_command_scope(&command, queued_at);
+            execute_write_command(command, &writer, &writer_db).await;
+            continue;
+        };
+        let waits: Vec<watch::Receiver<bool>> = std::iter::once(&lane)
+            .chain(also_after)
+            .filter_map(|lane| tails.get(lane).cloned())
+            .collect();
+        let (done_tx, done_rx) = watch::channel(false);
+        tails.insert(lane, done_rx);
+        let permits = permits.clone();
+        let writer = writer.clone();
+        let writer_db = writer_db.clone();
+        in_flight.spawn(async move {
+            // A predecessor that panicked drops its sender, which ends the
+            // wait just as finishing would.
+            for mut wait in waits {
+                let _ = wait.wait_for(|done| *done).await;
+            }
+            // Taken only once the predecessors are done, so a write waiting
+            // on its lane never holds a permit a predecessor needs.
+            let _permit = permits.acquire_owned().await;
+            let _executed = writer_command_scope(&command, queued_at);
+            execute_write_command(command, &writer, &writer_db).await;
+            let _ = done_tx.send(true);
+        });
+    }
+    while in_flight.join_next().await.is_some() {}
 }
 
 impl DbWriteCommand {
@@ -1146,97 +1370,26 @@ impl Database {
         }
     }
 
-    fn spawn_writer_task(&self, mut rx: mpsc::Receiver<QueuedWrite>) {
+    fn spawn_writer_task(&self, rx: mpsc::Receiver<QueuedWrite>) {
         let writer = DatabaseWriterExecutor::from_database(self);
         // Handle used only to execute generic `Write` ops; carries a detached
         // sender so it never keeps the real writer channel open (see above).
         let writer_db = self.writer_task_handle();
-        let worker = async move {
-            while let Some(QueuedWrite { queued_at, command }) = rx.recv().await {
-                // Same guard as the SQLite executor: the per-command labels
-                // allocate, so nothing may be built unless profiling is on.
-                let _executed = crate::runtime::perf_probe::enabled().then(|| {
-                    let label = command.label();
-                    let waited = queued_at.elapsed();
-                    crate::runtime::perf_probe::record("db.writer_queue.wait", waited);
-                    crate::runtime::perf_probe::record_owned(
-                        format!("db.writer_queue.{label}.wait"),
-                        waited,
-                    );
-                    crate::runtime::perf_probe::owned_scope(format!("db.writer_queue.{label}.exec"))
-                });
-                match command {
-                    DbWriteCommand::ArchiveJob {
-                        job_id,
-                        history,
-                        typed_terminal_cause,
-                        committed,
-                    } => {
-                        let writer = writer.clone();
-                        tokio::task::spawn_blocking(move || {
-                            // Capture the cache generation *before* the archive
-                            // read so a concurrent history-delete that bumps the
-                            // generation makes the conditional insert a no-op,
-                            // rather than resurrecting the just-deleted row.
-                            let observed_generation = writer.job_history_cache_generation();
-                            match writer.archive_job_with_terminal_cause(
-                                job_id,
-                                history.as_ref(),
-                                typed_terminal_cause,
-                            ) {
-                                Ok(Some(row)) => {
-                                    writer.cache_job_history_at(row, observed_generation)
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    tracing::warn!(
-                                        job_id = job_id.0,
-                                        error = %error,
-                                        "failed to archive job on database writer path"
-                                    );
-                                }
-                            }
-                        })
-                        .await
-                        .ok();
-                        if let Some(committed) = committed {
-                            let _ = committed.send(());
-                        }
-                    }
-                    DbWriteCommand::InsertJobEvents { events } => {
-                        let writer = writer.clone();
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(error) = writer.insert_job_events(&events) {
-                                tracing::warn!(
-                                    count = events.len(),
-                                    error = %error,
-                                    "failed to persist job events on database writer path"
-                                );
-                            }
-                        })
-                        .await
-                        .ok();
-                    }
-                    DbWriteCommand::Write { label, op } => {
-                        let writer_db = writer_db.clone();
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(error) = op(&writer_db) {
-                                tracing::warn!(
-                                    label,
-                                    error = %error,
-                                    "failed to run ordered database write"
-                                );
-                            }
-                        })
-                        .await
-                        .ok();
-                    }
-                    DbWriteCommand::Flush { reply } => {
-                        let _ = reply.send(());
-                    }
-                }
-            }
-        };
+        let worker: Pin<Box<dyn Future<Output = ()> + Send>> =
+            if matches!(self.target, DatabaseTarget::PostgresUrl(_)) {
+                Box::pin({
+                    let concurrency = postgres_write_lane_concurrency();
+                    run_postgres_write_lanes(
+                        rx,
+                        writer,
+                        writer_db,
+                        concurrency,
+                        concurrency * POSTGRES_WRITES_TAKEN_PER_LANE_SLOT,
+                    )
+                })
+            } else {
+                Box::pin(run_serial_writes(rx, writer, writer_db))
+            };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(worker);
@@ -1288,8 +1441,8 @@ impl Database {
         Ok(committed_rx)
     }
 
-    /// Queue a generic ordered write. Runs on the single serialized writer
-    /// consumer (awaited before the next command), so two writes to the same
+    /// Queue a generic ordered write. It runs after every write queued before
+    /// it and before every write queued after it, so two writes to the same
     /// row land in enqueue order — closing the same-key reorder hazard that
     /// detached `db_fire_and_forget` tasks have. Backpressure matches
     /// [`Self::try_queue_archive_job`]: on a full queue, a background re-send is
@@ -1303,9 +1456,44 @@ impl Database {
     ) -> Result<(), StateError> {
         let command = DbWriteCommand::Write {
             label,
+            lane: None,
             op: Box::new(op),
         };
         self.try_send_with_retry(command, label)
+    }
+
+    /// [`Self::try_queue_write`] for a write that belongs to one job. It keeps
+    /// its order against that job's other queued writes and its archive, and on
+    /// Postgres runs alongside other jobs' writes instead of behind them.
+    pub fn try_queue_job_write(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        label: &'static str,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+    ) -> Result<(), StateError> {
+        let command = DbWriteCommand::Write {
+            label,
+            lane: Some(WriteLane::Job(job_id.0)),
+            op: Box::new(op),
+        };
+        self.try_send_with_retry(command, label)
+    }
+
+    /// Queue a server attribution checkpoint. Checkpoints keep their order
+    /// against each other, and a job's archive waits for the ones queued
+    /// before it; on Postgres they otherwise run alongside other writes
+    /// instead of holding every lane back.
+    pub fn try_queue_server_attribution_write(
+        &self,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+    ) -> Result<(), StateError> {
+        const LABEL: &str = "active_server_attribution";
+        let command = DbWriteCommand::Write {
+            label: LABEL,
+            lane: Some(WriteLane::ServerAttribution),
+            op: Box::new(op),
+        };
+        self.try_send_with_retry(command, LABEL)
     }
 
     /// Shared enqueue path for ordered writer commands. Tries a non-blocking

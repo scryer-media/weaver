@@ -274,6 +274,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         recovery_queue: DownloadQueue::new(),
         staging_dir: None,
         category_bytes: None,
+        nzb_password_candidates: Default::default(),
     }
 }
 
@@ -1929,6 +1930,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             recovery_queue,
             staging_dir: None,
             category_bytes: None,
+            nzb_password_candidates: Default::default(),
         },
     );
     pipeline.job_order.push(job_id);

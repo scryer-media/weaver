@@ -742,13 +742,22 @@ impl Pipeline {
         let db = self.db.clone();
         let semantic_materialization_generation = options.semantic_materialization_generation;
         let semantic_promotion_generation = options.semantic_promotion_generation;
-        let persisted = tokio::task::spawn_blocking(move || {
-            db.materialize_active_job_with_file_identities(
+        let (persisted, nzb_password_candidates) = tokio::task::spawn_blocking(move || {
+            let persisted = db.materialize_active_job_with_file_identities(
                 &active_job,
                 &initial_file_identities,
                 semantic_materialization_generation,
                 semantic_promotion_generation,
+            );
+            // Derived here, once, from the bytes just persisted, so no archive
+            // file has to reload and re-parse the NZB to learn them. A parse
+            // failure leaves the harvest to read the row itself, as before.
+            let nzb_password_candidates = crate::pipeline::persisted_nzb_password_candidates(
+                &active_job.nzb_path,
+                &active_job.nzb_zstd,
             )
+            .ok();
+            (persisted, nzb_password_candidates)
         })
         .await
         .map_err(|error| {
@@ -852,6 +861,9 @@ impl Pipeline {
             recovery_queue,
             staging_dir: None,
             category_bytes: Some(category_bytes),
+            nzb_password_candidates: nzb_password_candidates
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
         };
         state.refresh_runtime_lanes_from_status();
         self.install_repeated_articles(&state)?;
@@ -1235,6 +1247,7 @@ impl Pipeline {
                 recovery_queue,
                 staging_dir: None,
                 category_bytes: Some(category_bytes),
+                nzb_password_candidates: Default::default(),
             };
             state.refresh_runtime_lanes_from_status();
             self.install_repeated_articles(&state)?;
@@ -1638,6 +1651,7 @@ impl Pipeline {
             recovery_queue: DownloadQueue::new(),
             staging_dir: None,
             category_bytes: None,
+            nzb_password_candidates: Default::default(),
         };
         let message = state.failure_error.clone().unwrap();
         let queued_repair = state.queued_repair_at_epoch_ms;
@@ -1918,6 +1932,17 @@ impl Pipeline {
         let server_attribution = self
             .db_blocking(move |db| db.load_active_server_attribution(job_id))
             .await?;
+        // One read and parse of the persisted NZB per restored job, off the
+        // pipeline thread, instead of one per archive file. Anything short of
+        // a parsed NZB leaves the harvest to read the row itself, as before.
+        let nzb_password_candidates = self
+            .db_blocking(move |db| match db.load_active_job_persisted_nzb(job_id) {
+                Ok(Some((nzb_path, Some(nzb_zstd)))) => {
+                    crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd).ok()
+                }
+                _ => None,
+            })
+            .await;
 
         let _ = self.event_tx.send(PipelineEvent::JobCreated {
             job_id,
@@ -2031,6 +2056,9 @@ impl Pipeline {
             recovery_queue,
             staging_dir: restored_staging_dir,
             category_bytes: Some(category_bytes),
+            nzb_password_candidates: nzb_password_candidates
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
         };
         state.refresh_runtime_lanes_from_status();
         self.install_repeated_articles(&state)?;

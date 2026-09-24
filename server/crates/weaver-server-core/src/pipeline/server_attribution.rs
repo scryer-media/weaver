@@ -29,11 +29,9 @@ impl Pipeline {
         if snapshots.is_empty() {
             return;
         }
-        match self
-            .db
-            .try_queue_write("active_server_attribution", move |db| {
-                db.save_active_server_attribution(snapshots)
-            }) {
+        match self.db.try_queue_server_attribution_write(move |db| {
+            db.save_active_server_attribution(snapshots)
+        }) {
             Ok(_) => self.dirty_server_attribution.clear(),
             Err(error) => tracing::error!(%error, "failed to queue server attribution checkpoint"),
         }

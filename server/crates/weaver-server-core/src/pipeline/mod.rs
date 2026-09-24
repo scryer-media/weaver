@@ -114,6 +114,17 @@ fn health_milli(total: u64, failed_bytes: u64) -> u32 {
         .unwrap_or(1000) as u32
 }
 
+/// Password candidates carried by a persisted NZB: its `<meta
+/// type="password">` and the `{{password}}` convention in its file name, in
+/// harvest order. The spec's explicit password is not included.
+pub(crate) fn persisted_nzb_password_candidates(
+    nzb_path: &std::path::Path,
+    nzb_zstd: &[u8],
+) -> Result<Vec<ArchivePasswordCandidate>, crate::ingest::PersistedNzbError> {
+    let nzb = crate::ingest::parse_persisted_nzb_bytes(nzb_zstd)?;
+    Ok(crate::ingest::nzb_password_candidates(&nzb, nzb_path, None))
+}
+
 impl Pipeline {
     pub(super) fn archive_password_candidates_for_job(
         &self,
@@ -137,37 +148,23 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> (Vec<ArchivePasswordCandidate>, bool) {
-        let spec_password = self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.spec.password.as_deref());
-        let mut harvested = true;
-        let mut candidates = match self.db.load_active_job_persisted_nzb(job_id) {
-            Ok(Some((nzb_path, Some(nzb_zstd)))) => {
-                match crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd) {
-                    Ok(nzb) => crate::ingest::nzb_password_candidates(&nzb, &nzb_path, None),
-                    Err(error) => {
-                        warn!(
-                            job_id = job_id.0,
-                            error = %error,
-                            "failed to parse persisted NZB for password candidates"
-                        );
-                        harvested = false;
-                        Vec::new()
+        let state = self.jobs.get(&job_id);
+        let spec_password = state.and_then(|state| state.spec.password.as_deref());
+        let (mut candidates, harvested) =
+            match state.and_then(|state| state.nzb_password_candidates.get()) {
+                Some(cached) => (cached.clone(), true),
+                None => {
+                    let (candidates, harvested) = self.load_nzb_password_candidates(job_id);
+                    // A job in the pipeline already has its row, and nothing
+                    // adds NZB bytes to a row later, so a missing row or NZB
+                    // stays missing and its empty list is remembered too. A
+                    // failed read or parse is not, so it is retried.
+                    if harvested && let Some(state) = state {
+                        let _ = state.nzb_password_candidates.set(candidates.clone());
                     }
+                    (candidates, harvested)
                 }
-            }
-            Ok(_) => Vec::new(),
-            Err(error) => {
-                warn!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to load persisted NZB for password candidates"
-                );
-                harvested = false;
-                Vec::new()
-            }
-        };
+            };
 
         if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password)
             && !candidates
@@ -181,6 +178,35 @@ impl Pipeline {
         }
 
         (candidates, harvested)
+    }
+
+    /// The NZB half of the harvest, read from the database: the candidates,
+    /// and whether the read and parse succeeded (`harvested`).
+    fn load_nzb_password_candidates(&self, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
+        match self.db.load_active_job_persisted_nzb(job_id) {
+            Ok(Some((nzb_path, Some(nzb_zstd)))) => {
+                match persisted_nzb_password_candidates(&nzb_path, &nzb_zstd) {
+                    Ok(candidates) => (candidates, true),
+                    Err(error) => {
+                        warn!(
+                            job_id = job_id.0,
+                            error = %error,
+                            "failed to parse persisted NZB for password candidates"
+                        );
+                        (Vec::new(), false)
+                    }
+                }
+            }
+            Ok(_) => (Vec::new(), true),
+            Err(error) => {
+                warn!(
+                    job_id = job_id.0,
+                    error = %error,
+                    "failed to load persisted NZB for password candidates"
+                );
+                (Vec::new(), false)
+            }
+        }
     }
 
     pub(super) fn primary_archive_password_for_job(&self, job_id: JobId) -> Option<String> {

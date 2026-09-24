@@ -1061,7 +1061,7 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 	if err != nil {
 		return snapshot, err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	rows, err := db.Query(rebindWeaverSQL(datastore, `
 		SELECT job_id, status, COALESCE(download_state, ''), COALESCE(post_state, ''), COALESCE(run_state, ''),
@@ -1330,7 +1330,7 @@ func insertActiveExtractedMembers(dbPath string, members []restartExtractedMembe
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -1402,7 +1402,7 @@ func countActiveExtractedMembers(dbPath string, jobID int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	var count int
 	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT COUNT(*) FROM active_extracted WHERE job_id = ?`), jobID).Scan(&count); err != nil {
@@ -1417,7 +1417,7 @@ func capturePar2AliasState(dbPath string, jobID int) (restartPar2AliasState, err
 	if err != nil {
 		return state, err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	rows, err := db.Query(rebindWeaverSQL(datastore, `
 		SELECT current_filename,
@@ -1515,7 +1515,7 @@ func jobEventKinds(dbPath string, jobID int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	rows, err := db.Query(rebindWeaverSQL(datastore, `SELECT kind FROM job_events WHERE job_id = ? ORDER BY id`), jobID)
 	if err != nil {
@@ -1553,7 +1553,7 @@ func forceActiveJobRuntimeStates(dbPath string, states map[int]forcedActiveRunti
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	tx, err := db.Begin()
 	if err != nil {
@@ -1765,7 +1765,7 @@ func restartJobStatusFromDB(dbPath string, jobID int) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	var status string
 	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT status FROM active_jobs WHERE job_id = ?`), jobID).Scan(&status); err == nil {

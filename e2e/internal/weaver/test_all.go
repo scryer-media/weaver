@@ -273,11 +273,25 @@ func finalizeTestJobFromSnapshot(job *testJob, dbPath string, snapshot facadeIte
 		job.status = overrideStatus
 		job.errMsg = overrideErrMsg
 	} else {
-		job.status, job.errMsg = applyTerminalStateCheck(dbPath, job.jobID, job.slug, snapshot.Status)
+		// The orphan sweep is database-wide, not about this job, so runTests
+		// runs it once when the phase ends instead of after every fixture.
+		job.status, job.errMsg = applyTerminalStateCheckSweeping(dbPath, job.jobID, job.slug, snapshot.Status, false)
 		if job.errMsg == "" {
 			job.errMsg = snapshot.Error
 		}
 	}
+}
+
+// functionalNeedsFileIdentityRewriteObserver reports whether any fixture reads
+// the rewrite observer. Its trigger adds a write to every file-identity upsert
+// weaver makes, so a run with no reader leaves it out.
+func functionalNeedsFileIdentityRewriteObserver(jobs []testJob) bool {
+	for i := range jobs {
+		if jobs[i].scenario.fileIdentityRewriteAssertion().enabled() {
+			return true
+		}
+	}
+	return false
 }
 
 func waitForActiveFileComplete(dbPath string, jobID int, filename string, timeout time.Duration) error {
@@ -285,7 +299,7 @@ func waitForActiveFileComplete(dbPath string, jobID int, filename string, timeou
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	query := rebindWeaverSQL(
 		datastore,
@@ -610,9 +624,6 @@ func runTests(slugs []string) {
 	ensureStandardDockerInfrastructure()
 	weaverURL := defaultWeaverURL()
 	prepareStandardTestRun(weaverURL, true)
-	if err := installFileIdentityRewriteObserver(localWeaverDBPath()); err != nil {
-		log.Fatalf("install file identity rewrite observer: %v", err)
-	}
 	emitProgressEvent(progressEvent{Kind: "phase_total", Total: len(slugs), Detail: "functional fixtures"})
 
 	log.Printf("submitting %d fixtures to weaver at %s...", len(slugs), weaverURL)
@@ -639,6 +650,11 @@ func runTests(slugs []string) {
 	}
 
 	dbPath := localWeaverDBPath()
+	if functionalNeedsFileIdentityRewriteObserver(jobs) {
+		if err := installFileIdentityRewriteObserver(dbPath); err != nil {
+			log.Fatalf("install file identity rewrite observer: %v", err)
+		}
+	}
 	// The queue-liveness fixture must consume the one-shot delay before normal
 	// functional batches can run. It is otherwise indistinguishable from a
 	// normal direct-store repair fixture, so keep it in the functional corpus
@@ -968,6 +984,17 @@ func runTests(slugs []string) {
 	fmt.Println(strings.Repeat("-", 78))
 	fmt.Printf("Total: %d passed, %d failed out of %d\n", passCount, failCount, len(jobs))
 	printSlowestTestJobs(jobs, 8)
+
+	// Every fixture skipped the orphan sweep at its terminal check; this is
+	// the one sweep that covers them all. Weaver has not restarted since the
+	// phase began, so its startup pruning cannot have hidden anything.
+	if !weaverDiedMidRun {
+		if err := assertNoOrphanActiveStateEventually(dbPath); err != nil {
+			fmt.Printf("ACTIVE-STATE ORPHAN SWEEP FAILED: %v\n", err)
+			emitProgressEvent(progressEvent{Kind: "phase_done", Current: len(jobs), Total: len(jobs), Status: "fail"})
+			os.Exit(1)
+		}
+	}
 
 	if err := assertDirectStoreEngagement(weaverURL, jobs); err != nil {
 		fmt.Printf("DIRECT-STORE ASSERTION FAILED: %v\n", err)
