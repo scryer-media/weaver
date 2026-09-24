@@ -91,23 +91,23 @@ impl Pipeline {
         // fire-and-forget task: two rapid runtime transitions for the same job
         // (last-write-wins columns: run_state / paused_resume_* / status) must
         // land in enqueue order, or a restored job could resume stale state.
-        if let Err(error) = self
-            .db
-            .try_queue_write("set_active_job_runtime", move |db| {
-                db.set_active_job_runtime(
-                    job_id,
-                    &status,
-                    Some(&download_state),
-                    Some(&post_state),
-                    Some(&run_state),
-                    error.as_deref(),
-                    queued_repair_at_epoch_ms,
-                    queued_extract_at_epoch_ms,
-                    paused_resume_status.as_deref(),
-                    paused_resume_download_state.as_deref(),
-                    paused_resume_post_state.as_deref(),
-                )
-            })
+        if let Err(error) =
+            self.db
+                .try_queue_job_write(job_id, "set_active_job_runtime", move |db| {
+                    db.set_active_job_runtime(
+                        job_id,
+                        &status,
+                        Some(&download_state),
+                        Some(&post_state),
+                        Some(&run_state),
+                        error.as_deref(),
+                        queued_repair_at_epoch_ms,
+                        queued_extract_at_epoch_ms,
+                        paused_resume_status.as_deref(),
+                        paused_resume_download_state.as_deref(),
+                        paused_resume_post_state.as_deref(),
+                    )
+                })
         {
             tracing::error!(
                 error = %error,
