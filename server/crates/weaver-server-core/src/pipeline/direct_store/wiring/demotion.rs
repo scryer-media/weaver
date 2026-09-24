@@ -816,7 +816,8 @@ impl Pipeline {
     /// window where a volume has a conventional floor under a live row; the
     /// restore refuses such a row outright, so a crash in the window costs the
     /// set's unfinished volumes a refetch and never trusts two images of one
-    /// volume at once.
+    /// volume at once. A volume whose swept bytes no floor can record retires
+    /// the row itself, since the restore would have nothing to refuse it on.
     pub(super) async fn hand_back_reconstructed_volume(
         &mut self,
         job_id: JobId,
@@ -854,6 +855,30 @@ impl Pipeline {
             match on_disk.contains(segment_number) {
                 true => handback.retained_bytes = handback.retained_bytes.saturating_add(*len),
                 false => handback.refetched_bytes = handback.refetched_bytes.saturating_add(*len),
+            }
+        }
+        // Bytes the sweep left in the conventional file that neither a floor
+        // nor a completed-file row will account for: verified ranges above a
+        // prefix it could not verify. The restore weighs a live coverage row
+        // against those two records only, so from here the set's row claims a
+        // volume whose conventional image nothing durable knows about. It is
+        // retired now rather than at the finish; a crash in between then
+        // costs the unfinished volumes the refetch the restore's refusal
+        // would have, instead of trusting two images of one volume.
+        let unrecorded_bytes = !on_disk.is_empty()
+            && floor == 0
+            && !(outcome.complete && outcome.contiguous >= plan.len);
+        if unrecorded_bytes {
+            let mut persist = DatabaseCoveragePersist::new(self.db.clone());
+            if let Some(set) = self.direct_store.set_mut(job_id, set_index)
+                && let Err(error) = set.retire(&mut persist)
+            {
+                warn!(
+                    job_id = job_id.0,
+                    file_index,
+                    error = %error,
+                    "failed to retire a direct-store checkpoint under a volume with unrecorded conventional bytes"
+                );
             }
         }
         let keep: HashMap<u32, Vec<u32>> = HashMap::from([(*file_index, on_disk)]);

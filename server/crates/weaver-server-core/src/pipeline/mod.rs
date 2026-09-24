@@ -1971,6 +1971,16 @@ pub(super) enum DecodedChunk {
 }
 
 impl DecodedChunk {
+    /// Whether the decoded bytes live in a pool slot, whose count the pool
+    /// bounds, rather than in an allocation made for this article alone.
+    pub(super) fn is_pooled(&self) -> bool {
+        match self {
+            Self::Pooled(_) => true,
+            Self::Shared(body) => body.data.is_pooled(),
+            Self::Contiguous(_) | Self::Batches { .. } => false,
+        }
+    }
+
     pub(super) fn len_bytes(&self) -> usize {
         match self {
             Self::Contiguous(bytes) => bytes.len(),

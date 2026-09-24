@@ -414,3 +414,114 @@ async fn a_health_abort_past_the_share_fails_with_the_sample_diagnosis() {
         "aborted: 10 of 12 first articles are missing, the post cannot complete"
     );
 }
+
+/// A job whose payload files are `payload_segments` articles each (one entry
+/// per file), followed by one PAR2 recovery volume of `recovery_segments`
+/// articles.
+fn job_spec_with_recovery(name: &str, payload_segments: &[u32], recovery_segments: u32) -> JobSpec {
+    let file = |filename: String, role: FileRole, segments: u32, tag: String| FileSpec {
+        filename,
+        role,
+        groups: vec!["alt.binaries.test".to_string()],
+        posted_at_epoch: None,
+        segments: (0..segments)
+            .map(|ordinal| {
+                segment_spec! {
+                    number: ordinal,
+                    bytes: 512u32,
+                    message_id: format!("{tag}-{ordinal}@example.com"),
+                }
+            })
+            .collect(),
+    };
+    let mut files: Vec<FileSpec> = payload_segments
+        .iter()
+        .enumerate()
+        .map(|(file_index, &segments)| {
+            file(
+                format!("amber-lattice.part{file_index:02}.bin"),
+                FileRole::Standalone,
+                segments,
+                format!("amber-{file_index}"),
+            )
+        })
+        .collect();
+    files.push(file(
+        "amber-lattice.vol00+32.par2".to_string(),
+        FileRole::Par2 {
+            is_index: false,
+            recovery_block_count: 32,
+        },
+        recovery_segments,
+        "amber-par2".to_string(),
+    ));
+    let total_segments: u64 = files.iter().map(|file| file.segments.len() as u64).sum();
+    JobSpec {
+        name: name.to_string(),
+        password: None,
+        total_bytes: total_segments * 512,
+        category: None,
+        metadata: vec![],
+        files,
+    }
+}
+
+/// The sample counts files, not bytes. Small files ruled missing beside a
+/// recovery volume that covers all of them are damage the repair can undo,
+/// and the gate leaves the job to the health arithmetic.
+#[tokio::test]
+async fn missing_small_files_the_recovery_covers_leave_the_job_alone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41708);
+    // Ten one-article files and two of sixteen: 5 KiB of the sample's files
+    // could be lost outright, against 8 KiB of recovery.
+    let mut payload = vec![1u32; 10];
+    payload.extend([16, 16]);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        job_spec_with_recovery("Small Losses Covered", &payload, 16),
+    )
+    .await;
+    let sample = sample_in_file_order(&pipeline, job_id);
+    assert_eq!(sample.len(), 12, "the recovery volume is not sampled");
+
+    for segment_id in sample.iter().take(10) {
+        pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
+    }
+
+    assert!(
+        job_failed(&pipeline, job_id).is_none(),
+        "ten of twelve first articles missing, all of them covered by recovery, is not a dead post"
+    );
+}
+
+/// Recovery that cannot cover the files the sample rules missing does not
+/// hold the gate back.
+#[tokio::test]
+async fn missing_files_beyond_the_recovery_still_fail_on_the_sample() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41709);
+    // Twelve files of eight articles: 40 KiB of the sample's files could be
+    // lost outright, against 2 KiB of recovery.
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        job_spec_with_recovery("Losses Past The Recovery", &[8; 12], 4),
+    )
+    .await;
+    let sample = sample_in_file_order(&pipeline, job_id);
+    assert_eq!(sample.len(), 12);
+
+    for segment_id in sample.iter().take(10) {
+        pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
+    }
+
+    let error = job_failed(&pipeline, job_id).expect("the post must be refused");
+    assert_eq!(
+        error,
+        "aborted: 10 of 12 first articles are missing, the post cannot complete"
+    );
+}

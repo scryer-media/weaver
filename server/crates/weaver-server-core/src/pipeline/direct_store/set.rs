@@ -651,10 +651,10 @@ impl DirectSet {
         volume_index: u32,
         source_offset: u64,
         len: u64,
-        pool_scarce: bool,
+        copy_every_hold: bool,
     ) -> u64 {
         self.router
-            .release_article_views(volume_index, source_offset, len, pool_scarce)
+            .release_article_views(volume_index, source_offset, len, copy_every_hold)
     }
 
     /// Records the length one volume's yEnc headers declare. See

@@ -51,21 +51,23 @@ impl DirectSetRouter {
     /// decoder buffers it arrived in, so the buffers can go back to the pool.
     ///
     /// Called by the routing seam once the article's spans are in hand. With
-    /// `pool_scarce` false only residues up to [`HOLD_VIEW_COPY_LIMIT_BYTES`]
-    /// are copied — the cipher tails, retained header runs and trimmed
-    /// slivers that would otherwise pin a slot for a few bytes. With it true
-    /// every residue is, which is the cost holds always had before the router
-    /// took views, paid exactly when a stalled set would otherwise hold the
-    /// pool hostage and push every decode onto a fresh allocation. Returns the
-    /// bytes copied.
+    /// `copy_every_hold` false only residues up to
+    /// [`HOLD_VIEW_COPY_LIMIT_BYTES`] are copied — the cipher tails, retained
+    /// header runs and trimmed slivers that would otherwise pin a slot for a
+    /// few bytes. With it true every residue is, which is the cost holds
+    /// always had before the router took views. The seam asks for that when a
+    /// stalled set would otherwise hold the pool hostage and push every decode
+    /// onto a fresh allocation, and whenever the article's buffer is not a
+    /// pool slot at all, since nothing but its views bounds what it pins.
+    /// Returns the bytes copied.
     pub(crate) fn release_article_views(
         &mut self,
         volume_index: u32,
         source_offset: u64,
         len: u64,
-        pool_scarce: bool,
+        copy_every_hold: bool,
     ) -> u64 {
-        let up_to = if pool_scarce {
+        let up_to = if copy_every_hold {
             u64::MAX
         } else {
             HOLD_VIEW_COPY_LIMIT_BYTES

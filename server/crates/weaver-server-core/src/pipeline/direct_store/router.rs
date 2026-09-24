@@ -978,8 +978,9 @@ impl StagedChunk {
     /// it meant before views existed. What keeps the understatement bounded is
     /// [`VolumeStaging::copy_out_views`]: a short residue is copied out of its
     /// slot as soon as its article has drained, and every residue is when the
-    /// pool is scarce, so a view never outlives its article unless the slot
-    /// it pins is one the pool can spare.
+    /// pool is scarce or the article was not decoded into a pool slot, so a
+    /// view never outlives its article unless the slot it pins is one the
+    /// pool can spare.
     fn resident_len(&self) -> u64 {
         match self {
             Self::Memory(bytes) => bytes.len() as u64,

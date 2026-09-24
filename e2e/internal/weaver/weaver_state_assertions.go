@@ -1114,19 +1114,6 @@ func weaverLogField(line, field string) string {
 	return rest[:end]
 }
 
-// assertNoOrphanActiveStateEventually is the orphan sweep a terminal check
-// skipped, given the same settling window that check had.
-func assertNoOrphanActiveStateEventually(dbPath string) error {
-	deadline := time.Now().Add(terminalFixtureStateTimeout)
-	for {
-		err := assertNoOrphanActiveStatePath(dbPath)
-		if err == nil || time.Now().After(deadline) {
-			return err
-		}
-		time.Sleep(terminalFixtureStatePollInterval)
-	}
-}
-
 func assertTerminalFixtureStateEventually(dbPath string, jobID int, expectedStatus string) error {
 	return assertTerminalFixtureStateEventuallySweeping(dbPath, jobID, expectedStatus, true)
 }

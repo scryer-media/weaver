@@ -754,6 +754,37 @@ async fn sevenz_store_creates_entries_the_archive_stores_no_bytes_for() {
     );
 }
 
+/// An archive of nothing but empty files and the directories they sit in has
+/// no member to route and none to verify, so a set could never finalize on
+/// it. The route is declined on the map, which hands the archive to the
+/// conventional extractor to create the entries.
+#[tokio::test]
+async fn sevenz_store_declines_an_archive_that_stores_no_bytes_at_all() {
+    let archive = build_7z(
+        &[
+            Entry::empty_file("Subs/Silver.Horizon.S01E01.idx"),
+            Entry::empty_file("Silver.Horizon.S01E01.nfo"),
+        ],
+        EncoderMethod::COPY,
+        None,
+    );
+    let volumes = split_volumes(&archive, 1);
+    let outcome = run_sevenz_gate_awaiting(
+        JobId(9_610),
+        &volumes,
+        &BTreeMap::new(),
+        &in_order_arrivals(volumes.len()),
+        &[],
+        Some("Demoted"),
+    )
+    .await;
+    assert!(
+        outcome.sets.contains("Demoted(SevenZip(NothingToRoute))"),
+        "the set must be declined for having nothing to route\nsets: {}",
+        outcome.sets
+    );
+}
+
 /// The eligibility matrix. Every shape here is one direct routing must decline
 /// **as a whole set**: a 7z block is the unit of coding, so tolerating one
 /// entry would mean decoding a container that has already been routed away.

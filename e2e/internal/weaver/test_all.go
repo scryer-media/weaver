@@ -988,8 +988,14 @@ func runTests(slugs []string) {
 	// Every fixture skipped the orphan sweep at its terminal check; this is
 	// the one sweep that covers them all. Weaver has not restarted since the
 	// phase began, so its startup pruning cannot have hidden anything.
+	//
+	// One look settles it. Every terminal check has already seen its job's
+	// history row, and the archive that writes it deletes the job's active
+	// rows in the same transaction; orphans are only pruned at startup. What
+	// the sweep finds now is what the phase left behind, and waiting cannot
+	// change it.
 	if !weaverDiedMidRun {
-		if err := assertNoOrphanActiveStateEventually(dbPath); err != nil {
+		if err := assertNoOrphanActiveStatePath(dbPath); err != nil {
 			fmt.Printf("ACTIVE-STATE ORPHAN SWEEP FAILED: %v\n", err)
 			emitProgressEvent(progressEvent{Kind: "phase_done", Current: len(jobs), Total: len(jobs), Status: "fail"})
 			os.Exit(1)
@@ -1186,14 +1192,16 @@ var byDesignDirectRefusals = map[string]bool{
 	"unsafe_destination":     true,
 	// The 7z container refusals that describe the archive's shape rather than
 	// its bytes: a coder other than `Copy`, AES content or an AES end header,
-	// an anti-item, a redirection, an entry name the path check refuses, or a
-	// volume zero with no usable length hint. Each hands the set to the
-	// conventional path, which extracts it the ordinary way.
+	// an anti-item, a redirection, a container of only directories and empty
+	// files, an entry name the path check refuses, or a volume zero with no
+	// usable length hint. Each hands the set to the conventional path, which
+	// extracts it the ordinary way.
 	"7z_coder":                true,
 	"7z_encrypted_content":    true,
 	"7z_encrypted_header":     true,
 	"7z_anti_item":            true,
 	"7z_redirection":          true,
+	"7z_nothing_to_route":     true,
 	"7z_unsafe_destination":   true,
 	"7z_volume_hint_unusable": true,
 }

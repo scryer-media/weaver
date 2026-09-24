@@ -1554,6 +1554,72 @@ async fn a_restart_inside_a_handback_window_refuses_the_row_and_keeps_the_rebuil
     );
 }
 
+/// A handback whose sweep could not verify the volume's first article but did
+/// verify a later one leaves conventional bytes that no floor records — the
+/// floor is a contiguous prefix, and there is none. The restore could not
+/// refuse the set's row on anything, so the handback retires it itself.
+#[tokio::test]
+async fn a_handback_with_no_floor_under_its_swept_bytes_retires_the_row() {
+    let member_name = "Silver.Horizon.S01E29.mkv";
+    let volumes = demotion_fixture_volumes(member_name);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41163);
+    let (mut pipeline, working_dir, _) =
+        demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
+            &temp_dir,
+            job_id,
+            &volumes,
+            DemotionReason::HoldsBudgetExceeded,
+            true,
+            |pipeline, _| {
+                // Volume 0's headers live in its envelope; a flipped first
+                // byte fails its first article's part-CRC, and only that one.
+                let envelope = pipeline
+                    .direct_store
+                    .set(job_id, 0)
+                    .unwrap()
+                    .plan()
+                    .envelope_path(0);
+                let mut bytes = std::fs::read(&envelope).unwrap();
+                bytes[0] ^= 0xff;
+                std::fs::write(&envelope, bytes).unwrap();
+            },
+        )
+        .await;
+
+    let done = pipeline
+        .direct_demotion_done_rx
+        .recv()
+        .await
+        .expect("the demotion completion channel should stay open");
+    let crate::pipeline::DirectDemotionProgress::Volume(outcome) = &done.progress else {
+        panic!("the sweep's first message is a volume");
+    };
+    assert_eq!(outcome.volume_index, 0);
+    assert_eq!(
+        outcome.contiguous, 0,
+        "non-vacuity: the first article was refused, so there is no floor"
+    );
+    assert!(
+        !outcome.verified.is_empty(),
+        "non-vacuity: a later article of the volume was swept and checked"
+    );
+    assert!(
+        !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "non-vacuity: the row is standing when the handback begins"
+    );
+    pipeline.handle_direct_demotion_done(done).await;
+
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "a row standing over a volume whose conventional bytes nothing records is retired"
+    );
+    assert!(
+        working_dir.join(&volumes[0].0).exists(),
+        "the volume's swept bytes stay on disk for the conventional path"
+    );
+}
+
 #[tokio::test]
 async fn a_scratch_io_failure_demotes_the_set() {
     let member_name = "Silver.Horizon.S01E36.mkv";

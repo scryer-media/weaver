@@ -1583,6 +1583,34 @@ fn a_long_hold_keeps_its_view_unless_the_pool_is_scarce() {
     );
 }
 
+/// Only a pool slot is bounded by the pool. An article decoded into batches or
+/// one allocation of its own is pinned by nothing but its views, so the seam
+/// copies every hold out of it whatever the pool's state.
+#[test]
+fn only_an_article_in_a_pool_slot_counts_as_pooled() {
+    use crate::pipeline::DecodedChunk;
+    use crate::runtime::buffers::{BufferPool, BufferPoolConfig, BufferTier};
+    let pool = BufferPool::new(BufferPoolConfig {
+        small_count: 1,
+        medium_count: 0,
+        large_count: 0,
+    });
+    let mut handle = pool
+        .try_acquire(BufferTier::Small)
+        .expect("the slot is free");
+    handle.set_len(16);
+    assert!(DecodedChunk::Pooled(handle).is_pooled());
+    assert!(
+        !DecodedChunk::Batches {
+            chunks: vec![bytes::Bytes::from(vec![7u8; 512 * 1024])],
+            len: 512 * 1024,
+        }
+        .is_pooled(),
+        "a decoder batch is its own allocation, which the pool does not bound"
+    );
+    assert!(!DecodedChunk::Contiguous(bytes::Bytes::from(vec![7u8; 4096])).is_pooled());
+}
+
 #[test]
 fn copying_a_hold_out_only_touches_the_article_it_was_asked_about() {
     let (pool, pieces) = pooled_article(4096);

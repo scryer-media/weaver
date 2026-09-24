@@ -923,10 +923,49 @@ impl Pipeline {
     /// nothing later in the pipeline can learn that any sooner: the recovery
     /// arithmetic needs a recovery set that this post cannot supply either.
     /// Failing here costs one article per file and no lane of its own.
+    ///
+    /// The sample counts files, not bytes. When the files it rules missing are
+    /// small beside the recovery the job can still obtain, the post is damaged
+    /// rather than dead, and the ordinary health path rules instead.
     fn evaluate_first_article_gate(&mut self, job_id: JobId) {
         if let Some((missing, total)) = self.first_article_verdict(job_id) {
+            if self.first_article_losses_recoverable(job_id) {
+                return;
+            }
             self.fail_job(job_id, Self::first_article_verdict_error(missing, total));
         }
+    }
+
+    /// Whether the recovery this job can still obtain covers every file whose
+    /// sampled first article is ruled missing, taking each of those files as
+    /// wholly lost.
+    ///
+    /// The cover is the served set's obtainable capacity when one is known,
+    /// and otherwise the recovery the posting declares, which is also what the
+    /// critical-health line is drawn from.
+    fn first_article_losses_recoverable(&self, job_id: JobId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let lost_bytes = state
+            .download_queue
+            .first_articles()
+            .filter(|segment_id| {
+                matches!(
+                    self.segment_terminal_states.get(segment_id),
+                    Some(SegmentTerminalState::Missing)
+                )
+            })
+            .filter_map(|segment_id| {
+                state
+                    .assembly
+                    .file(segment_id.file_id)
+                    .filter(|file| !file.has_segment(segment_id.segment_number))
+            })
+            .map(|file| file.total_bytes())
+            .fold(0u64, u64::saturating_add);
+        let recovery = self.obtainable_recovery(job_id);
+        recovery.obtainable && lost_bytes <= recovery.ceiling.unwrap_or(state.par2_bytes)
     }
 
     /// The sample's verdict, once it is certain: `Some((missing, total))` when

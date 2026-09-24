@@ -83,6 +83,14 @@ pub(crate) enum SevenZipRefusal {
     /// An entry the header marks as a symlink or other redirection. Its
     /// "content" is a link target, not a file body.
     Redirection,
+    /// Every entry is a directory or an empty file, so the container stores
+    /// no byte of any file.
+    ///
+    /// There is nothing to route and nothing to verify: the whole container is
+    /// headers, and a set is only ever finalized on members it verified. The
+    /// conventional extractor creates the entries from a container this small
+    /// at no cost worth routing around.
+    NothingToRoute,
     /// An entry name the reader's own path check refuses: absolute, escaping,
     /// or otherwise not a name that may become a destination.
     ///
@@ -156,6 +164,7 @@ impl SevenZipRefusal {
             Self::EncryptedHeader => "7z_encrypted_header",
             Self::AntiItem => "7z_anti_item",
             Self::Redirection => "7z_redirection",
+            Self::NothingToRoute => "7z_nothing_to_route",
             Self::UnsafeDestination => "7z_unsafe_destination",
             Self::VolumeHintUnusable => "7z_volume_hint_unusable",
             Self::UnreadableMap => "7z_unreadable_map",
@@ -750,6 +759,10 @@ pub(super) fn container_facts(
         if *end != declared {
             return Err(SevenZipRefusal::Geometry);
         }
+    }
+
+    if entries.iter().all(|entry| entry.start.is_none()) {
+        return Err(SevenZipRefusal::NothingToRoute);
     }
 
     Ok(SevenZipContainerFacts { entries, total: 0 })

@@ -88,13 +88,19 @@ impl Pipeline {
         // decoded data intact for the conventional fallback on demotion.
         let part_crc_verified = segment.part_crc_verified;
         let pieces = segment.data.pieces();
-        // Read before the set is borrowed: whether the tier this article's
-        // buffer came from can spare a slot to whatever the router keeps.
-        let pool_scarce = self
-            .buffers
-            .is_scarce(crate::runtime::buffers::BufferTier::for_size(
-                decoded_size as usize,
-            ));
+        // Read before the set is borrowed: whether whatever the router keeps
+        // of this article has to leave the article's buffer now. A pool slot
+        // is bounded by the pool, so a long hold keeps its view unless the
+        // tier is scarce. A buffer decoded for this article alone is bounded
+        // by nothing but the views of it, and a view charges the holds budget
+        // for its own range rather than the allocation it pins, so every
+        // hold leaves it.
+        let copy_every_hold = !segment.data.is_pooled()
+            || self
+                .buffers
+                .is_scarce(crate::runtime::buffers::BufferTier::for_size(
+                    decoded_size as usize,
+                ));
 
         // Before the route, because routing is what parses: a container whose
         // volume zero has just declared its length may become readable in this
@@ -127,14 +133,14 @@ impl Pipeline {
             let routed = set.route(volume_index, file_offset, &pieces);
             if routed.is_ok() {
                 // What the drain left staged — a held tail, a header run the
-                // parser keeps — must not keep the decoder's slot out of the
-                // pool: short residues leave it now, all of them when the
-                // pool is scarce.
+                // parser keeps — must not keep the decoder's buffer alive:
+                // short residues leave it now, all of them when the pool is
+                // scarce or the buffer is not the pool's.
                 set.release_article_views(
                     volume_index,
                     file_offset,
                     u64::from(decoded_size),
-                    pool_scarce,
+                    copy_every_hold,
                 );
             }
             routed
