@@ -566,11 +566,7 @@ impl Pipeline {
                 obtainable_recovery = recovery.obtainable,
                 "aborting job: health below critical threshold"
             );
-            let error = format!(
-                "health {:.1}% below critical {:.1}%",
-                health as f64 / 10.0,
-                critical as f64 / 10.0
-            );
+            let error = self.health_abort_error(job_id, health, critical);
             self.fail_job(job_id, error);
             return;
         }
@@ -619,12 +615,37 @@ impl Pipeline {
                 total_bytes = total,
                 "aborting job: health below critical threshold"
             );
-            let error = format!(
-                "health {:.1}% below critical {:.1}%",
-                health as f64 / 10.0,
-                critical as f64 / 10.0
-            );
+            let error = self.health_abort_error(job_id, health, critical);
             self.fail_job(job_id, error);
+        }
+    }
+
+    /// The terminal error for a job the health arithmetic is failing.
+    ///
+    /// The health figure says how many bytes are gone; the first-article
+    /// sample, when it has already seen enough, says why — the post itself is
+    /// gone. A sample still waiting on some of its articles can be certain
+    /// before it is complete, and then its diagnosis is the one the job fails
+    /// with, worded exactly as the complete sample would word it. The health
+    /// figure is logged beside it. Short of that, the health error stands.
+    fn health_abort_error(&self, job_id: JobId, health: u32, critical: u32) -> String {
+        let health_error = format!(
+            "health {:.1}% below critical {:.1}%",
+            health as f64 / 10.0,
+            critical as f64 / 10.0
+        );
+        match self.first_article_verdict(job_id) {
+            Some((missing, total)) => {
+                warn!(
+                    job_id = job_id.0,
+                    missing,
+                    total,
+                    health = %health_error,
+                    "health abort attributed to the first-article sample"
+                );
+                Self::first_article_verdict_error(missing, total)
+            }
+            None => health_error,
         }
     }
 
@@ -881,8 +902,8 @@ impl Pipeline {
     const FIRST_ARTICLE_GATE_MISSING_PCT: usize = 80;
 
     /// One article of a file has reached its verdict — delivered, or answered
-    /// for by every server. When it is that file's first article, and it was
-    /// the last one outstanding, the sample is complete and can be read.
+    /// for by every server. When it is that file's first article, the sample
+    /// is read again: it may now be able to answer.
     pub(in crate::pipeline) fn note_first_article_settled(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
         if !self
@@ -895,7 +916,7 @@ impl Pipeline {
         self.evaluate_first_article_gate(job_id);
     }
 
-    /// Reads the first-article sample once it is complete.
+    /// Reads the first-article sample as soon as it can answer.
     ///
     /// A post whose every file answers "no such article" on the very first
     /// article of each of them is not a post that is going to complete, and
@@ -903,43 +924,53 @@ impl Pipeline {
     /// arithmetic needs a recovery set that this post cannot supply either.
     /// Failing here costs one article per file and no lane of its own.
     fn evaluate_first_article_gate(&mut self, job_id: JobId) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let sample: Vec<SegmentId> = state.download_queue.first_articles().collect();
-        let total = sample.len();
+        if let Some((missing, total)) = self.first_article_verdict(job_id) {
+            self.fail_job(job_id, Self::first_article_verdict_error(missing, total));
+        }
+    }
+
+    /// The sample's verdict, once it is certain: `Some((missing, total))` when
+    /// the articles already ruled missing reach the failure share of the whole
+    /// sample, `None` otherwise.
+    ///
+    /// Only a ruling of missing counts toward the share, and an article still
+    /// outstanding can only add to it or leave it where it is, so a sample
+    /// that reaches the share with articles outstanding has the verdict the
+    /// complete sample would have. A sample short of the share says nothing
+    /// yet, complete or not.
+    fn first_article_verdict(&self, job_id: JobId) -> Option<(usize, usize)> {
+        let state = self.jobs.get(&job_id)?;
+        let total = state.download_queue.first_articles().count();
         if total < Self::FIRST_ARTICLE_GATE_MIN_FILES {
-            return;
+            return None;
         }
-        let mut missing = 0usize;
-        for segment_id in sample {
-            let delivered = self
-                .jobs
-                .get(&job_id)
-                .and_then(|state| state.assembly.file(segment_id.file_id))
-                .is_some_and(|file| file.has_segment(segment_id.segment_number));
-            if delivered {
-                continue;
-            }
-            match self.segment_terminal_states.get(&segment_id) {
-                // The article was put to every server and none of them had it.
-                Some(SegmentTerminalState::Missing) => missing += 1,
-                // Any other verdict is about this article, not about the post.
-                Some(_) => {}
-                // Still outstanding: the sample is not complete yet.
-                None => return,
-            }
-        }
-        if missing * 100 < total * Self::FIRST_ARTICLE_GATE_MISSING_PCT {
-            return;
-        }
-        self.fail_job(
-            job_id,
-            format!(
-                "aborted: {missing} of {total} first articles are missing, \
-                 the post cannot complete"
-            ),
-        );
+        let missing = state
+            .download_queue
+            .first_articles()
+            .filter(|segment_id| {
+                // A delivered article is not missing, whatever a late
+                // failure for it may have booked.
+                !state
+                    .assembly
+                    .file(segment_id.file_id)
+                    .is_some_and(|file| file.has_segment(segment_id.segment_number))
+                    // The article was put to every server and none of them
+                    // had it. Any other verdict is about this article, not
+                    // about the post.
+                    && matches!(
+                        self.segment_terminal_states.get(segment_id),
+                        Some(SegmentTerminalState::Missing)
+                    )
+            })
+            .count();
+        (missing * 100 >= total * Self::FIRST_ARTICLE_GATE_MISSING_PCT).then_some((missing, total))
+    }
+
+    fn first_article_verdict_error(missing: usize, total: usize) -> String {
+        format!(
+            "aborted: {missing} of {total} first articles are missing, \
+             the post cannot complete"
+        )
     }
 
     /// Mark a job as failed and purge its queued segments.

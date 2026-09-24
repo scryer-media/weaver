@@ -941,6 +941,18 @@ pub(crate) struct MemberCipher {
     /// filesystem answers with zeros, and CBC would turn those zeros into
     /// well-formed cipher for every block from there to the member's end.
     covered: ByteRanges,
+    /// Plaintext of cipher blocks the write side has decrypted whole but only
+    /// part of which has reached the partial — [`MemberCrypt::edge_plain`] at
+    /// the moment the facts were taken.
+    ///
+    /// A block straddling two source volumes is decrypted by whichever side
+    /// resolves it first, and that side emits only its own bytes. While the
+    /// other side's share is still held, the partial has a gap inside the
+    /// block, yet the posted bytes of the side that was emitted are fully
+    /// determined: re-encrypting the block needs its whole plaintext, and this
+    /// is where the missing share of it is. At most one block per edge of a
+    /// run, so at most a few blocks per member.
+    edge_plain: BTreeMap<u64, [u8; 16]>,
 }
 
 impl std::fmt::Debug for MemberCipher {
@@ -953,6 +965,7 @@ impl std::fmt::Debug for MemberCipher {
             .field("cipher_size", &self.cipher_size)
             .field("tail_retained", &self.tail_plain.is_some())
             .field("checkpoints", &self.checkpoints.len())
+            .field("edge_blocks", &self.edge_plain.len())
             .finish_non_exhaustive()
     }
 }
@@ -974,6 +987,7 @@ impl MemberCipher {
             .saturating_add(self.checkpoints.len().saturating_mul(96))
             .saturating_add(self.covered.ranges().len().saturating_mul(32))
             .saturating_add(self.tail_plain.as_ref().map_or(0, Vec::capacity))
+            .saturating_add(self.edge_plain.len().saturating_mul(64))
     }
 
     pub(crate) fn unpacked_size(&self) -> u64 {
@@ -1022,14 +1036,65 @@ impl MemberCipher {
         }
     }
 
-    /// Whether every byte of `[start, end)` really is in the member's partial.
+    /// Whether the plaintext of every byte of `[start, end)` is in hand: in the
+    /// member's partial, or — for a byte the partial does not hold yet — in a
+    /// retained edge block.
     ///
     /// Clamped at `unpacked_size`, because the coverage map stops there: the
     /// padding is not destination bytes and is vouched for by
     /// [`Self::tail_plain`] instead.
     pub(crate) fn plaintext_present(&self, start: u64, end: u64) -> bool {
+        self.missing_plaintext(start, end)
+            .into_iter()
+            .all(|(gap_start, gap_end)| self.edge_blocks_cover(gap_start, gap_end))
+    }
+
+    /// The sub-ranges of `[start, end)` the member's partial does not hold,
+    /// clamped at `unpacked_size`, in order.
+    pub(crate) fn missing_plaintext(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
         let end = end.min(self.unpacked_size);
-        end <= start || self.covered.missing(start, end - start).is_empty()
+        if end <= start {
+            return Vec::new();
+        }
+        self.covered.missing(start, end - start)
+    }
+
+    fn edge_blocks_cover(&self, start: u64, end: u64) -> bool {
+        let mut block = block_floor(start);
+        while block < end {
+            if !self.edge_plain.contains_key(&block) {
+                return false;
+            }
+            block = block.saturating_add(AES_BLOCK);
+        }
+        true
+    }
+
+    /// Fills `plain`, the plaintext of `[start, start + plain.len())`, from the
+    /// retained edge blocks. Returns `false`, leaving `plain` partly written,
+    /// when a byte of it lies in a block that was not retained.
+    ///
+    /// Meant for a range [`Self::missing_plaintext`] reported: the edge blocks
+    /// answer only for bytes the partial does not hold.
+    pub(crate) fn edge_plaintext_into(&self, start: u64, plain: &mut [u8]) -> bool {
+        let end = start.saturating_add(plain.len() as u64);
+        let mut at = start;
+        while at < end {
+            let block = block_floor(at);
+            let stop = end.min(block.saturating_add(AES_BLOCK));
+            let Some(bytes) = self.edge_plain.get(&block) else {
+                return false;
+            };
+            plain[(at - start) as usize..(stop - start) as usize]
+                .copy_from_slice(&bytes[(at - block) as usize..(stop - block) as usize]);
+            at = stop;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_edge_block(&self, block_start: u64) -> bool {
+        self.edge_plain.contains_key(&block_start)
     }
 
     /// CBC-encrypts `buffer` **in place** — a whole number of blocks whose
@@ -1562,6 +1627,7 @@ impl MemberCrypt {
                 .then(|| self.tail_plain[..usize::from(self.tail_padding)].to_vec()),
             checkpoints: self.checkpoints.clone(),
             covered: covered.clone(),
+            edge_plain: self.edge_plain.clone(),
         })
     }
 

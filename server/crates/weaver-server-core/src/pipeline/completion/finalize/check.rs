@@ -1951,23 +1951,75 @@ impl Pipeline {
                 topology.archive_type == crate::jobs::assembly::ArchiveType::SevenZip
             })
             .any(|(set_name, topology)| {
-                let numbered: HashSet<u32> = topology.volume_map.values().copied().collect();
-                let interior_hole = topology.expected_volume_count.is_some_and(|expected| {
-                    (0..expected).any(|volume| !numbered.contains(&volume))
-                });
-                if interior_hole {
-                    return true;
-                }
-                served_set.is_some_and(|par2_set| {
-                    !Self::absent_described_sevenz_parts(
-                        &state.working_dir,
-                        set_name,
-                        topology,
-                        par2_set,
-                    )
-                    .is_empty()
-                })
+                Self::sevenz_set_has_absent_volumes(
+                    &state.working_dir,
+                    set_name,
+                    topology,
+                    served_set.map(|set| &**set),
+                )
             })
+    }
+
+    /// Whether a full 7z set of this job failed to extract with every one of
+    /// its parts present.
+    ///
+    /// A clean strong-decode verdict is a claim about the archive *type*: that
+    /// extracting it would prove its bytes. A 7z set that then fails on its
+    /// bytes, with nothing missing, is that proof failing, and the verdict it
+    /// settled on is stale. Only the recovery data can say which bytes are
+    /// wrong and rebuild them. A set short of a part is the absent-volume
+    /// reading's, not this one's.
+    ///
+    /// Keyed on the set name, which is what a failed full-set extraction
+    /// records as its failed member.
+    pub(crate) fn job_has_failed_sevenz_set_with_all_volumes(&self, job_id: JobId) -> bool {
+        let Some(failed) = self.failed_extractions.get(&job_id) else {
+            return false;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        let served_set = self
+            .par2_served_set_id(job_id)
+            .and_then(|set_id| self.par2_set_for(job_id, set_id));
+        state
+            .assembly
+            .archive_topologies()
+            .iter()
+            .filter(|(set_name, topology)| {
+                topology.archive_type == crate::jobs::assembly::ArchiveType::SevenZip
+                    && failed.contains(set_name.as_str())
+            })
+            .any(|(set_name, topology)| {
+                !Self::sevenz_set_has_absent_volumes(
+                    &state.working_dir,
+                    set_name,
+                    topology,
+                    served_set.map(|set| &**set),
+                )
+            })
+    }
+
+    /// One 7z set's half of [`Self::job_has_sevenz_set_waiting_for_absent_volumes`]:
+    /// a gap in its numbering, or a part the recovery set describes that
+    /// neither the topology nor the working directory has.
+    fn sevenz_set_has_absent_volumes(
+        working_dir: &Path,
+        set_name: &str,
+        topology: &crate::jobs::assembly::ArchiveTopology,
+        served_set: Option<&par2_rs::Par2FileSet>,
+    ) -> bool {
+        let numbered: HashSet<u32> = topology.volume_map.values().copied().collect();
+        let interior_hole = topology
+            .expected_volume_count
+            .is_some_and(|expected| (0..expected).any(|volume| !numbered.contains(&volume)));
+        if interior_hole {
+            return true;
+        }
+        served_set.is_some_and(|par2_set| {
+            !Self::absent_described_sevenz_parts(working_dir, set_name, topology, par2_set)
+                .is_empty()
+        })
     }
 
     /// The parts of one split 7z set that the recovery set describes, the

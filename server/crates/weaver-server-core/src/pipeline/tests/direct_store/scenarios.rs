@@ -17,6 +17,7 @@ mod rar4_rar3_file_encryption;
 mod repaired_encrypted_spans;
 mod restart;
 mod sevenz_store;
+mod straddling_cipher_block;
 mod uu_isolation;
 mod waiting_for_targeted_recovery;
 

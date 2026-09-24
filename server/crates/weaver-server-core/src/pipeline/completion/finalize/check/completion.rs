@@ -499,9 +499,19 @@ impl Pipeline {
         // (`a_finalized_direct_sets_volumes_are_not_missing_on_a_later_par2_pass`),
         // and a swap-corrected set whose volumes are all present is left to the
         // retry frontier rather than dragged back through PAR2.
+        //
+        // The 7z shape is the other way round: a split 7z set has no header
+        // chain to wait on, so its failed extraction with every part present
+        // is itself the evidence against a clean strong-decode verdict, and
+        // it reopens the verdict the same way. Paired with the same route:
+        // `failed_rar_par2_repair_ready` below is the failed-member latch,
+        // which is format-agnostic. It stays bounded: an authoritative pass
+        // that finds the set clean retries extraction once and then fails the
+        // job, and a repair clears the failed set before its retry.
         let par2_verdict_stale_after_failed_extraction = self.par2_verified.contains(&job_id)
             && has_crc_failures
-            && self.job_has_live_rar_waiting_for_absent_volumes(job_id);
+            && (self.job_has_live_rar_waiting_for_absent_volumes(job_id)
+                || self.job_has_failed_sevenz_set_with_all_volumes(job_id));
         if par2_verdict_stale_after_failed_extraction
             && let Some(runtime) = self.par2_runtime.get_mut(&job_id)
             && let Some(set_runtime) = runtime.served_mut()
