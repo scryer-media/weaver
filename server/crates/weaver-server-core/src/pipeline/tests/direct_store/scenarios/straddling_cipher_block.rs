@@ -6,7 +6,7 @@
 //! volume's drain still resolves the block and places its own share, so the
 //! coverage map claims those bytes. Serving them in posted space means
 //! re-encrypting the whole block, and the held share's plaintext is not in the
-//! partial. These fixtures lose the tail of the second volume, which holds the
+//! partial. These sets lose the tail of the second volume, which holds the
 //! whole of the third, and whether the fourth volume's head block is resolved
 //! before or after that depends on nothing but the order the articles land in.
 //! So the orders are listed as data, and every one of them must repair in
@@ -80,26 +80,38 @@ const ARRIVAL_ORDERS: [&[(u32, u32)]; 24] = [
     &[(0, 6), (2, 0), (1, 7), (0, 7), (1, 6), (2, 3), (1, 1), (0, 10), (0, 3), (2, 6), (2, 9), (2, 10), (0, 4), (1, 0), (0, 8), (3, 0), (2, 5), (2, 8), (0, 0), (2, 7), (2, 1), (0, 9), (0, 5), (2, 2), (1, 9), (1, 4), (2, 4), (1, 3), (1, 8), (0, 2), (1, 5), (1, 2), (0, 1), (1, 10)],
 ];
 
+/// One encryption shape: the posted volumes, the PAR2 set that describes
+/// them, and the digest of the member they carry. Built here, over bytes the
+/// test posts itself, so a straddling block is a straddling block of *these*
+/// volumes.
 struct StraddleFixture {
-    dir: &'static str,
+    name: &'static str,
     member: &'static str,
+    volumes: Vec<(String, Vec<u8>)>,
+    par2_bytes: Vec<u8>,
+    expected_blake3: String,
 }
 
-fn fixture_path(dir: &str, name: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../e2e/testdata")
-        .join(dir)
-        .join(name)
-}
+/// Enough recovery to rebuild the lost tail of the second volume, with slack
+/// for the slices it only partly covers.
+const RECOVERY_BLOCKS: usize = 16;
 
-fn expected_member_blake3(fixture: &StraddleFixture) -> String {
-    let scenario: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(fixture_path(fixture.dir, "scenario.json")).unwrap())
-            .unwrap();
-    scenario["expectedOutputBLAKE3"][fixture.member]
-        .as_str()
-        .unwrap()
-        .to_owned()
+fn straddle_fixture(
+    name: &'static str,
+    member: &'static str,
+    volumes_of: impl FnOnce(&[u8]) -> Vec<(String, Vec<u8>)>,
+) -> StraddleFixture {
+    let payload: Vec<u8> = (0..12_000u32).map(|index| (index % 241) as u8).collect();
+    let volumes = volumes_of(&payload);
+    assert_eq!(volumes.len(), ARTICLES.len());
+    let par2_bytes = repairable_par2_index(&volumes, RECOVERY_BLOCKS);
+    StraddleFixture {
+        name,
+        member,
+        volumes,
+        par2_bytes,
+        expected_blake3: blake3::hash(&payload).to_hex().to_string(),
+    }
 }
 
 /// Runs one arrival order to its end. `Err` names what went wrong.
@@ -108,23 +120,14 @@ async fn run_straddle_order(
     order_index: usize,
     job: u64,
 ) -> Result<(), String> {
-    let volumes: Vec<(String, Vec<u8>)> = (1..=4)
-        .map(|part| {
-            let name = format!("archive.part{part}.rar");
-            let bytes = std::fs::read(fixture_path(fixture.dir, &name)).unwrap();
-            (name, bytes)
-        })
-        .collect();
-    let mut par2_bytes = std::fs::read(fixture_path(fixture.dir, "archive.par2")).unwrap();
-    for recovery in ["archive.vol000+100.par2", "archive.vol100+100.par2"] {
-        par2_bytes.extend(std::fs::read(fixture_path(fixture.dir, recovery)).unwrap());
-    }
+    let volumes: &[(String, Vec<u8>)] = &fixture.volumes;
+    let par2_bytes: &[u8] = &fixture.par2_bytes;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     let job_id = JobId(job);
-    let mut spec = direct_store_job_spec_with_articles("Violet Cascade", &volumes, ARTICLES[0]);
+    let mut spec = direct_store_job_spec_with_articles("Violet Cascade", volumes, ARTICLES[0]);
     spec.files[3].segments = vec![segment_spec! {
         number: 0,
         bytes: yenc_declared_bytes(volumes[3].1.len() as u32),
@@ -134,7 +137,7 @@ async fn run_straddle_order(
         .iter()
         .map(|&ordinal| spec.files[ordinal].clone())
         .collect();
-    append_par2_index(&mut spec, &par2_bytes);
+    append_par2_index(&mut spec, par2_bytes);
     let index = spec.files.pop().unwrap();
     spec.files.insert(0, index);
     spec.password = Some(PASSWORD.to_owned());
@@ -153,7 +156,7 @@ async fn run_straddle_order(
         submit_volume_article_indexed_of(
             &mut pipeline,
             job_id,
-            &volumes,
+            volumes,
             ordinal,
             file_index_of(ordinal),
             article,
@@ -169,7 +172,7 @@ async fn run_straddle_order(
         },
         0,
         0,
-        &par2_bytes,
+        par2_bytes,
         "violet.cascade.par2",
         None,
     )
@@ -266,7 +269,7 @@ async fn run_straddle_order(
         .or_else(|| staging_member(&complete_dir, fixture.member))
         .ok_or("the member was not delivered")?;
     let digest = blake3::hash(&member).to_hex().to_string();
-    if digest != expected_member_blake3(fixture) {
+    if digest != fixture.expected_blake3 {
         return Err(format!(
             "the member was delivered with the wrong bytes ({digest})"
         ));
@@ -287,18 +290,18 @@ async fn every_order_repairs_in_place(fixture: StraddleFixture, job_base: u64) {
         failures.is_empty(),
         "{} arrival order(s) of {} failed:\n{}",
         failures.len(),
-        fixture.dir,
+        fixture.name,
         failures.join("\n")
     );
 }
 
 #[tokio::test]
 async fn a_straddling_block_behind_a_held_volume_repairs_in_place_rar5_file_encryption() {
+    let member = "obsidian.current.s01e08.mkv";
     every_order_repairs_in_place(
-        StraddleFixture {
-            dir: "direct-store-encrypted-par2-repair",
-            member: "obsidian.current.s01e08.mkv",
-        },
+        straddle_fixture("rar5 file encryption", member, |payload| {
+            encrypted_store_set(member, payload, 4, PASSWORD, Some(PASSWORD), true)
+        }),
         52_000,
     )
     .await;
@@ -306,11 +309,11 @@ async fn a_straddling_block_behind_a_held_volume_repairs_in_place_rar5_file_encr
 
 #[tokio::test]
 async fn a_straddling_block_behind_a_held_volume_repairs_in_place_rar5_header_encryption() {
+    let member = "umber.tideline.s01e12.mkv";
     every_order_repairs_in_place(
-        StraddleFixture {
-            dir: "direct-store-hp-par2-repair",
-            member: "umber.tideline.s01e12.mkv",
-        },
+        straddle_fixture("rar5 header encryption", member, |payload| {
+            header_encrypted_store_set(member, payload, 4, PASSWORD, HeaderCheck::For(PASSWORD))
+        }),
         52_100,
     )
     .await;
@@ -318,11 +321,11 @@ async fn a_straddling_block_behind_a_held_volume_repairs_in_place_rar5_header_en
 
 #[tokio::test]
 async fn a_straddling_block_behind_a_held_volume_repairs_in_place_rar4_encryption() {
+    let member = "cobalt.lantern.s01e10.mkv";
     every_order_repairs_in_place(
-        StraddleFixture {
-            dir: "direct-store-rar4-encrypted-par2-repair",
-            member: "cobalt.lantern.s01e10.mkv",
-        },
+        straddle_fixture("rar4 encryption", member, |payload| {
+            encrypted_rar4_store_set(member, payload, 4, PASSWORD, Some(TEST_RAR4_SALT))
+        }),
         52_200,
     )
     .await;
