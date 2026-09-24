@@ -1364,7 +1364,7 @@ func jobArchived(dbPath string, jobID int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	var count int
 	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT COUNT(*) FROM job_history WHERE job_id = ?`), jobID).Scan(&count); err != nil {
