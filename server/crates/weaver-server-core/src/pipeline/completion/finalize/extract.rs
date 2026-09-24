@@ -273,6 +273,28 @@ fn sevenz_archive_limits(budget: &JobExtractionBudget) -> sevenz_turbo::ArchiveL
     }
 }
 
+/// What a 7z decode pass reserves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SevenZipDecodeReservation {
+    /// Measured from the archive and within the ceiling: exactly these bytes,
+    /// waited for until they fit.
+    Measured(u64),
+    /// Not measurable within the ceiling: whatever fits beside the process's
+    /// retained state up to the ceiling, never less than `floor`. See
+    /// [`JobExtractionBudget::reserve_memory_up_to_ceiling_wait`].
+    UpToCeiling { floor: u64 },
+}
+
+impl SevenZipDecodeReservation {
+    /// Reserve it. The permit's bytes are what the decoder may hold.
+    fn reserve(self, budget: &Arc<JobExtractionBudget>) -> Result<MemoryPermit, String> {
+        match self {
+            Self::Measured(bytes) => budget.reserve_memory_wait(bytes),
+            Self::UpToCeiling { floor } => budget.reserve_memory_up_to_ceiling_wait(floor),
+        }
+    }
+}
+
 /// Bytes a chase reserves for its decode pass: its decoders, its end header
 /// and the decode allowance. Nothing for widening, which the chase reserves a
 /// thread at a time when it widens; see [`WideningRoom`].
@@ -282,7 +304,7 @@ fn chase_decode_memory_bytes(
     archive: &sevenz_turbo::Archive,
     end_header_bytes: u64,
     ceiling: u64,
-) -> u64 {
+) -> SevenZipDecodeReservation {
     sevenz_decode_memory_bytes(job_id, set_name, archive, end_header_bytes, 0, ceiling)
 }
 
@@ -296,7 +318,7 @@ fn fixed_decode_memory_bytes(
     end_header_bytes: u64,
     decode_threads: u32,
     ceiling: u64,
-) -> u64 {
+) -> SevenZipDecodeReservation {
     sevenz_decode_memory_bytes(
         job_id,
         set_name,
@@ -311,10 +333,13 @@ fn fixed_decode_memory_bytes(
 /// `widening_bytes` its threads need beyond the decoders.
 ///
 /// Never more than the ceiling: a dictionary past the ceiling is refused by
-/// the reader, which is handed the ceiling as its limit. An archive with a
-/// coder this cannot size takes the ceiling, and says so. The widening room is
-/// the first thing trimmed when the ceiling is near: the decoders are what the
-/// decode cannot do without, the room is what makes it faster.
+/// the reader, which is handed what was granted as its limit. A reservation
+/// that would reach the ceiling is taken up to it rather than for it: a
+/// request for the whole ceiling would wait until no other job in the process
+/// held any retained state. An archive with a coder this cannot size does
+/// that, and says so. The widening room is the first thing trimmed when the
+/// ceiling is near: the decoders are what the decode cannot do without, and
+/// stay the floor of what it is granted; the room is what makes it faster.
 fn sevenz_decode_memory_bytes(
     job_id: JobId,
     set_name: &str,
@@ -322,7 +347,12 @@ fn sevenz_decode_memory_bytes(
     end_header_bytes: u64,
     widening_bytes: u64,
     ceiling: u64,
-) -> u64 {
+) -> SevenZipDecodeReservation {
+    // What the pass holds beside its decoders, for a decode whose decoders
+    // cannot be measured within the ceiling.
+    let unmeasured_floor = end_header_bytes
+        .saturating_add(CHASE_DECODE_ALLOWANCE_BYTES)
+        .min(ceiling);
     let decoders =
         match crate::pipeline::direct_unpack::decode_memory::decoder_memory_bytes(archive) {
             Ok(bytes) => bytes,
@@ -331,10 +361,12 @@ fn sevenz_decode_memory_bytes(
                     job_id = job_id.0,
                     set_name,
                     coder = %unsized_coder,
-                    reserved_bytes = ceiling,
-                    "7z decode cannot size this archive's decoders; reserving the whole ceiling"
+                    ceiling_bytes = ceiling,
+                    "7z decode cannot size this archive's decoders; reserving up to the ceiling"
                 );
-                return ceiling;
+                return SevenZipDecodeReservation::UpToCeiling {
+                    floor: unmeasured_floor,
+                };
             }
         };
     let needed = decoders
@@ -346,10 +378,12 @@ fn sevenz_decode_memory_bytes(
             set_name,
             decoder_bytes = decoders,
             wanted_bytes = needed,
-            reserved_bytes = ceiling,
-            "7z decoders need more than the ceiling; reserving the ceiling"
+            ceiling_bytes = ceiling,
+            "7z decoders need more than the ceiling; reserving up to the ceiling"
         );
-        return ceiling;
+        return SevenZipDecodeReservation::UpToCeiling {
+            floor: unmeasured_floor,
+        };
     }
     let wanted = needed.saturating_add(widening_bytes);
     if wanted > ceiling {
@@ -358,10 +392,10 @@ fn sevenz_decode_memory_bytes(
             set_name,
             decoder_bytes = decoders,
             wanted_bytes = wanted,
-            reserved_bytes = ceiling,
-            "7z decode trimmed its widening room to the ceiling"
+            ceiling_bytes = ceiling,
+            "7z decode trimmed its widening room to what fits under the ceiling"
         );
-        return ceiling;
+        return SevenZipDecodeReservation::UpToCeiling { floor: needed };
     }
     tracing::debug!(
         job_id = job_id.0,
@@ -371,7 +405,7 @@ fn sevenz_decode_memory_bytes(
         reserved_bytes = wanted,
         "7z decode sized its reservation from the archive"
     );
-    wanted
+    SevenZipDecodeReservation::Measured(wanted)
 }
 
 /// How the LZMA2 decoder of a 7z decode pass is threaded.
@@ -828,7 +862,8 @@ where
     // Held from here to the end of the decode, parks included. A chase parked
     // mid-block has its dictionary genuinely allocated, so the permit stays;
     // what makes that harmless is its size — a dictionary, not a ceiling.
-    let _decode_permit = budget.reserve_memory_wait(decode_reservation)?;
+    let decode_permit = decode_reservation.reserve(budget)?;
+    let decode_granted = decode_permit.bytes();
 
     let mut extracted_members = Vec::new();
     let extracted_members_ref = &mut extracted_members;
@@ -940,7 +975,7 @@ where
             // What the decode reserved is what its decoder may hold: the
             // reader keeps a parallel decode's runs in flight within this,
             // and decodes on one thread if it leaves no room to widen.
-            limits.memory_limit_bytes = decode_reservation;
+            limits.memory_limit_bytes = decode_granted;
             SevenZipDecodeThreads::Fixed(*decode_threads)
         }
         SevenZipDecodeMemory::ReservedPerPass { .. } => {
@@ -949,7 +984,7 @@ where
             // chase would hold widened to its ceiling. The thread count is
             // what keeps a widened decode within what it actually holds: the
             // governor sets no thread it has not paid for.
-            limits.memory_limit_bytes = decode_reservation
+            limits.memory_limit_bytes = decode_granted
                 .saturating_add(chase_widening_bytes(*decode_threads))
                 .min(budget.max_memory_bytes());
             SevenZipDecodeThreads::Adaptive {

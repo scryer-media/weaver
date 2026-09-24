@@ -975,9 +975,7 @@ async fn run_postgres_write_lanes(
             break;
         };
         while in_flight.try_join_next().is_some() {}
-        if in_flight.is_empty() {
-            tails.clear();
-        }
+        prune_finished_lane_tails(&mut tails);
         let Some((also_after, lane)) = command.lanes() else {
             while in_flight.join_next().await.is_some() {}
             tails.clear();
@@ -1009,6 +1007,15 @@ async fn run_postgres_write_lanes(
         });
     }
     while in_flight.join_next().await.is_some() {}
+}
+
+/// Forget the lanes whose last taken write has finished, so the table holds
+/// only lanes with unfinished work instead of every job the writer has seen.
+/// A finished tail has nothing left to wait for, and a write on a lane with no
+/// tail waits for nothing, so dropping it changes no ordering. A write that
+/// panicked dropped its sender, which ends its wait just as finishing does.
+fn prune_finished_lane_tails(tails: &mut HashMap<WriteLane, watch::Receiver<bool>>) {
+    tails.retain(|_, done| !*done.borrow() && done.has_changed().is_ok());
 }
 
 impl DbWriteCommand {

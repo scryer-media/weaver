@@ -1418,6 +1418,39 @@ fn announced_gated_lane_op(
     }
 }
 
+#[test]
+fn postgres_lane_tails_keep_only_lanes_with_unfinished_writes() {
+    // A writer that never fully drains still forgets lanes whose last write
+    // finished: one job's finished tail, one whose write panicked and dropped
+    // its sender, and one still running, which alone stays.
+    let mut tails = HashMap::new();
+    let (finished_tx, finished_rx) = watch::channel(false);
+    let (panicked_tx, panicked_rx) = watch::channel(false);
+    let (running_tx, running_rx) = watch::channel(false);
+    tails.insert(WriteLane::Job(1), finished_rx);
+    tails.insert(WriteLane::Job(2), panicked_rx);
+    tails.insert(WriteLane::Events, running_rx);
+    finished_tx.send(true).unwrap();
+    drop(panicked_tx);
+
+    prune_finished_lane_tails(&mut tails);
+    assert_eq!(tails.len(), 1);
+    assert!(tails.contains_key(&WriteLane::Events));
+
+    // Across many jobs, each finishing before the next is taken, the table
+    // never holds more than the lane still running beside them.
+    for job in 10..1_000 {
+        let (done_tx, done_rx) = watch::channel(false);
+        prune_finished_lane_tails(&mut tails);
+        tails.insert(WriteLane::Job(job), done_rx);
+        assert!(tails.len() <= 2, "{} tails after job {job}", tails.len());
+        done_tx.send(true).unwrap();
+    }
+    running_tx.send(true).unwrap();
+    prune_finished_lane_tails(&mut tails);
+    assert!(tails.is_empty());
+}
+
 #[tokio::test]
 async fn postgres_lanes_stop_taking_writes_at_the_cap_until_one_finishes() {
     // Two writes are taken and held, which is the cap, so the writer takes
