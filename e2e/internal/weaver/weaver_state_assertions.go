@@ -76,7 +76,7 @@ func installFileIdentityRewriteObserver(dbPath string) error {
 	if err != nil {
 		return fmt.Errorf("open weaver state db: %w", err)
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	statements := sqliteFileIdentityRewriteObserverStatements()
 	if datastore == weaverDatastorePostgres {
@@ -105,7 +105,10 @@ func (o *fileIdentityRewriteObserver) Close() error {
 	if o == nil || o.db == nil {
 		return nil
 	}
-	return o.db.Close()
+	db := o.db
+	o.db = nil
+	closeWeaverStateDB(db, o.datastore)
+	return nil
 }
 
 func (o *fileIdentityRewriteObserver) Observe(
@@ -280,7 +283,7 @@ func observeActiveFileIdentityRewrite(
 	if err != nil {
 		return observation, fmt.Errorf("open weaver state db: %w", err)
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	return evaluateActiveFileIdentityRewrite(db, datastore, jobID, assertion)
 }
@@ -299,11 +302,19 @@ func applyRuntimeFileIdentityRewriteTerminalCheck(
 }
 
 func assertTerminalFixtureState(dbPath string, jobID int, expectedStatus string) error {
+	return assertTerminalFixtureStateSweeping(dbPath, jobID, expectedStatus, true)
+}
+
+// assertTerminalFixtureStateSweeping is assertTerminalFixtureState with the
+// database-wide orphan sweep optional. A caller that skips it owns running
+// assertNoOrphanActiveStatePath before weaver next starts, since startup prunes
+// orphans and would hide them.
+func assertTerminalFixtureStateSweeping(dbPath string, jobID int, expectedStatus string, sweepOrphans bool) error {
 	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("open weaver state db: %w", err)
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	historyStatus, historyFound, err := loadJobHistoryStatus(db, datastore, jobID)
 	if err != nil {
@@ -321,15 +332,9 @@ func assertTerminalFixtureState(dbPath string, jobID int, expectedStatus string)
 		)
 	}
 
-	var lingering []string
-	for _, table := range weaverActiveStateTables {
-		count, err := countJobRows(db, datastore, table.Name, jobID)
-		if err != nil {
-			return err
-		}
-		if count > 0 {
-			lingering = append(lingering, fmt.Sprintf("%s=%d", table.Name, count))
-		}
+	lingering, err := lingeringJobActiveState(db, datastore, jobID)
+	if err != nil {
+		return err
 	}
 	if len(lingering) > 0 {
 		return fmt.Errorf(
@@ -340,19 +345,48 @@ func assertTerminalFixtureState(dbPath string, jobID int, expectedStatus string)
 		)
 	}
 
-	if err := assertNoOrphanActiveState(db); err != nil {
-		return err
+	if sweepOrphans {
+		if err := assertNoOrphanActiveState(db); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
+// lingeringJobActiveState counts the job's rows in every active-state table in
+// one statement, and names each table that still holds any.
+func lingeringJobActiveState(db *sql.DB, datastore weaverDatastore, jobID int) ([]string, error) {
+	counts := make([]string, 0, len(weaverActiveStateTables))
+	args := make([]any, 0, len(weaverActiveStateTables))
+	for _, table := range weaverActiveStateTables {
+		counts = append(counts, fmt.Sprintf(`(SELECT COUNT(*) FROM %s WHERE job_id = ?)`, table.Name))
+		args = append(args, jobID)
+	}
+	query := rebindWeaverSQL(datastore, `SELECT `+strings.Join(counts, ", "))
+	values := make([]int, len(weaverActiveStateTables))
+	dest := make([]any, len(values))
+	for i := range values {
+		dest[i] = &values[i]
+	}
+	if err := db.QueryRow(query, args...).Scan(dest...); err != nil {
+		return nil, fmt.Errorf("count active state rows for job %d: %w", jobID, err)
+	}
+	var lingering []string
+	for i, table := range weaverActiveStateTables {
+		if values[i] > 0 {
+			lingering = append(lingering, fmt.Sprintf("%s=%d", table.Name, values[i]))
+		}
+	}
+	return lingering, nil
+}
+
 func assertNoLingeringWeaverActiveState(dbPath string) error {
-	db, _, err := openWeaverStateDB(dbPath)
+	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("open weaver state db: %w", err)
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	var lingering []string
 	for _, table := range weaverActiveStateTables {
@@ -372,11 +406,11 @@ func assertNoLingeringWeaverActiveState(dbPath string) error {
 }
 
 func assertNoOrphanActiveStatePath(dbPath string) error {
-	db, _, err := openWeaverStateDB(dbPath)
+	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("open weaver state db: %w", err)
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	return assertNoOrphanActiveState(db)
 }
@@ -403,15 +437,6 @@ func countTableRows(db *sql.DB, table string) (int, error) {
 	return count, nil
 }
 
-func countJobRows(db *sql.DB, datastore weaverDatastore, table string, jobID int) (int, error) {
-	var count int
-	query := rebindWeaverSQL(datastore, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE job_id = ?`, table))
-	if err := db.QueryRow(query, jobID).Scan(&count); err != nil {
-		return 0, fmt.Errorf("count rows in %s for job %d: %w", table, jobID, err)
-	}
-	return count, nil
-}
-
 func weaverStateTableExists(db *sql.DB, datastore weaverDatastore, table string) (bool, error) {
 	var exists bool
 	query := `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)`
@@ -430,6 +455,32 @@ func weaverStateTableExists(db *sql.DB, datastore weaverDatastore, table string)
 	return exists, nil
 }
 
+func orphanActiveStateJobIDs(db *sql.DB, table string) (string, error) {
+	rows, err := db.Query(fmt.Sprintf(
+		`SELECT DISTINCT job_id FROM %s WHERE NOT EXISTS (
+			SELECT 1 FROM active_jobs WHERE active_jobs.job_id = %s.job_id
+		) ORDER BY job_id LIMIT 20`,
+		table,
+		table,
+	))
+	if err != nil {
+		return "", fmt.Errorf("list orphan jobs in %s: %w", table, err)
+	}
+	defer rows.Close()
+	var jobIDs []string
+	for rows.Next() {
+		var jobID int64
+		if err := rows.Scan(&jobID); err != nil {
+			return "", fmt.Errorf("list orphan jobs in %s: %w", table, err)
+		}
+		jobIDs = append(jobIDs, strconv.FormatInt(jobID, 10))
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("list orphan jobs in %s: %w", table, err)
+	}
+	return strings.Join(jobIDs, ","), nil
+}
+
 func assertNoOrphanActiveState(db *sql.DB) error {
 	var orphaned []string
 	for _, table := range weaverActiveStateTables[1:] {
@@ -445,7 +496,13 @@ func assertNoOrphanActiveState(db *sql.DB) error {
 			return fmt.Errorf("count orphan rows in %s: %w", table.Name, err)
 		}
 		if count > 0 {
-			orphaned = append(orphaned, fmt.Sprintf("%s=%d", table.Name, count))
+			// The sweep may run long after the job that left these rows, so
+			// name the jobs: that is what ties them back to a fixture.
+			jobIDs, err := orphanActiveStateJobIDs(db, table.Name)
+			if err != nil {
+				return err
+			}
+			orphaned = append(orphaned, fmt.Sprintf("%s=%d (jobs %s)", table.Name, count, jobIDs))
 		}
 	}
 	if len(orphaned) > 0 {
@@ -586,10 +643,17 @@ func collectFileIdentityRewriteRows(
 }
 
 func applyTerminalStateCheck(dbPath string, jobID int, slug string, status string) (string, string) {
+	return applyTerminalStateCheckSweeping(dbPath, jobID, slug, status, true)
+}
+
+// applyTerminalStateCheckSweeping is applyTerminalStateCheck with the orphan
+// sweep optional; see assertTerminalFixtureStateSweeping for what skipping it
+// obliges the caller to do.
+func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, status string, sweepOrphans bool) (string, string) {
 	if jobID <= 0 || !facadeTerminalStatus(status) {
 		return status, ""
 	}
-	if err := assertTerminalFixtureStateEventually(dbPath, jobID, status); err != nil {
+	if err := assertTerminalFixtureStateEventuallySweeping(dbPath, jobID, status, sweepOrphans); err != nil {
 		log.Printf("  %s: state mismatch after %s: %v", slug, status, err)
 		return "DB_STATE_ERROR", err.Error()
 	}
@@ -1050,11 +1114,28 @@ func weaverLogField(line, field string) string {
 	return rest[:end]
 }
 
+// assertNoOrphanActiveStateEventually is the orphan sweep a terminal check
+// skipped, given the same settling window that check had.
+func assertNoOrphanActiveStateEventually(dbPath string) error {
+	deadline := time.Now().Add(terminalFixtureStateTimeout)
+	for {
+		err := assertNoOrphanActiveStatePath(dbPath)
+		if err == nil || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(terminalFixtureStatePollInterval)
+	}
+}
+
 func assertTerminalFixtureStateEventually(dbPath string, jobID int, expectedStatus string) error {
+	return assertTerminalFixtureStateEventuallySweeping(dbPath, jobID, expectedStatus, true)
+}
+
+func assertTerminalFixtureStateEventuallySweeping(dbPath string, jobID int, expectedStatus string, sweepOrphans bool) error {
 	deadline := time.Now().Add(terminalFixtureStateTimeout)
 	var lastErr error
 	for {
-		err := assertTerminalFixtureState(dbPath, jobID, expectedStatus)
+		err := assertTerminalFixtureStateSweeping(dbPath, jobID, expectedStatus, sweepOrphans)
 		if err == nil {
 			return nil
 		}
@@ -1181,7 +1262,7 @@ func assertOutputBLAKE3(dbPath string, jobID int, expectedByRelativePath map[str
 	if err != nil {
 		return fmt.Errorf("open weaver state db: %w", err)
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	var outputDir string
 	query := rebindWeaverSQL(datastore, `SELECT output_dir FROM job_history WHERE job_id = ?`)
@@ -1244,7 +1325,7 @@ func assertForbiddenOutputPaths(dbPath string, jobID int, patterns []string) err
 	if err != nil {
 		return fmt.Errorf("open weaver state db: %w", err)
 	}
-	defer db.Close()
+	defer closeWeaverStateDB(db, datastore)
 
 	var outputDir string
 	query := rebindWeaverSQL(datastore, `SELECT output_dir FROM job_history WHERE job_id = ?`)
