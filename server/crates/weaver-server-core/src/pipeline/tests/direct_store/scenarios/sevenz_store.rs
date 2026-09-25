@@ -2568,6 +2568,53 @@ async fn sevenz_store_refuses_a_container_whose_first_volume_states_no_length() 
     );
 }
 
+/// A truncated last volume is a length verdict whichever order the volumes land
+/// in.
+///
+/// The truncation takes the end header with it, so the map can never be read.
+/// When the last volume lands before volume zero's front, its length arrives
+/// before there is a geometry to check it against. It still has to be checked
+/// once the geometry exists, rather than leaving the set waiting for a map
+/// until every article is in.
+#[tokio::test]
+async fn sevenz_store_refuses_a_truncated_last_volume_that_lands_before_volume_zero() {
+    /// Bytes cut off the end of the last volume, end header included.
+    const TRUNCATED_BY: usize = 16;
+    let member = payload(89, 36_000);
+    let archive = build_7z(
+        &[Entry::file(MEMBER, member.clone())],
+        EncoderMethod::COPY,
+        None,
+    );
+    let mut volumes = split_volumes(&archive, 3);
+    let last = volumes.last_mut().unwrap();
+    last.1.truncate(last.1.len() - TRUNCATED_BY);
+    let last_first: Vec<(u32, u32)> = [2u32, 1, 0]
+        .into_iter()
+        .flat_map(|volume| (0..ARTICLES_PER_VOLUME as u32).map(move |segment| (volume, segment)))
+        .collect();
+
+    let outcome = run_sevenz_gate_awaiting(
+        JobId(9_625),
+        &volumes,
+        &BTreeMap::new(),
+        &last_first,
+        &[MEMBER],
+        Some("VolumeSize"),
+    )
+    .await;
+    assert!(
+        outcome.sets.contains("Demoted") && outcome.sets.contains("VolumeSize"),
+        "a last volume shorter than the geometry requires must demote on its length\nsets: {}",
+        outcome.sets
+    );
+    assert!(
+        !outcome.sets.contains("UnreadableMap"),
+        "not on a map it was left waiting for\nsets: {}",
+        outcome.sets
+    );
+}
+
 /// What a volume actually decoded to is the authority; the declaration was only
 /// ever the early warning.
 ///

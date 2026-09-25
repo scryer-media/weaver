@@ -2507,6 +2507,26 @@ impl DirectSetRouter {
                 sevenz::SevenZipRefusal::VolumeSize,
             )));
         }
+        // A volume can state its length, or finish decoding, before volume
+        // zero's front arrives, and then there was no geometry to hold it
+        // against. Held against it here, on every parse until the map is read,
+        // so the verdict does not depend on arrival order: a truncated last
+        // volume that landed first would otherwise wait for an end header it
+        // no longer carries.
+        let wrong_length = self
+            .declared_volume_sizes
+            .iter()
+            .chain(&self.sevenz_decoded_volume_lengths)
+            .any(|(volume_index, len)| {
+                geometry
+                    .expected_len(*volume_index)
+                    .is_some_and(|expected| expected != *len)
+            });
+        if wrong_length {
+            return Err(self.fail(DemotionReason::SevenZip(
+                sevenz::SevenZipRefusal::VolumeSize,
+            )));
+        }
         let lengths = geometry.lengths();
         let total = geometry.total;
 
