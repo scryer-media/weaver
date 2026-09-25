@@ -2,32 +2,44 @@ package weaver
 
 import (
 	"fmt"
-	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
-// unusedLocalURL returns a localhost URL on a port that nothing listens on,
-// and the address, so a test can bring a server up there later.
-func unusedLocalURL(t *testing.T) (string, string) {
+// startingWeaver serves the way a weaver that has not finished starting
+// looks to the readiness wait — every request refused with 503 — until the
+// returned switch is flipped, and as a ready weaver afterwards. The test holds
+// the listener throughout, so nothing else on the machine can take its port
+// between the refused poll and the answered one.
+func startingWeaver(t *testing.T) (string, *atomic.Bool) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve a port: %v", err)
-	}
-	addr := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatalf("release the port: %v", err)
-	}
-	return "http://" + addr + "/graphql", addr
+	var up atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "<html></html>")
+	})
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"data":{"version":"0.0.0"}}`)
+	})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !up.Load() {
+			http.Error(w, "still starting", http.StatusServiceUnavailable)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/graphql", &up
 }
 
 func TestAwaitGraphQLReturnsTheExitOfAChildThatNeverServed(t *testing.T) {
-	url, _ := unusedLocalURL(t)
+	url, _ := startingWeaver(t)
 	logPath := filepath.Join(t.TempDir(), "weaver.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -52,7 +64,7 @@ func TestAwaitGraphQLReturnsTheExitOfAChildThatNeverServed(t *testing.T) {
 	if err == nil {
 		t.Fatal("a child that exited without serving must end the wait with an error")
 	}
-	for _, want := range []string{"exit status 3", "config rejected at startup", "connection refused"} {
+	for _, want := range []string{"exit status 3", "config rejected at startup", "still starting"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error must carry %q; got %v", want, err)
 		}
@@ -62,17 +74,8 @@ func TestAwaitGraphQLReturnsTheExitOfAChildThatNeverServed(t *testing.T) {
 	}
 }
 
-func TestAwaitGraphQLSucceedsWhenThePortComesUpLate(t *testing.T) {
-	url, addr := unusedLocalURL(t)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, "<html></html>")
-	})
-	mux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"data":{"version":"0.0.0"}}`)
-	})
-	server := &http.Server{Handler: mux}
-	defer server.Close()
+func TestAwaitGraphQLSucceedsWhenTheServerAnswersLate(t *testing.T) {
+	url, up := startingWeaver(t)
 
 	pauses := 0
 	probes := 0
@@ -82,17 +85,13 @@ func TestAwaitGraphQLSucceedsWhenThePortComesUpLate(t *testing.T) {
 	}, func() {
 		pauses++
 		if pauses == 1 {
-			// The weaver binds its port only now, after the first poll was
+			// The weaver finishes starting only now, after the first poll was
 			// refused.
-			listener, listenErr := net.Listen("tcp", addr)
-			if listenErr != nil {
-				t.Fatalf("bring the port up: %v", listenErr)
-			}
-			go func() { _ = server.Serve(listener) }()
+			up.Store(true)
 		}
 	})
 	if err != nil {
-		t.Fatalf("a port that comes up late must end the wait in success; got %v", err)
+		t.Fatalf("a server that answers late must end the wait in success; got %v", err)
 	}
 	if pauses != 1 || probes != 1 {
 		t.Errorf("non-vacuity: the first poll must have been refused and the second answered; paused %d, probed %d", pauses, probes)

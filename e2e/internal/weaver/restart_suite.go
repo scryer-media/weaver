@@ -271,7 +271,6 @@ func restartCases() []restartCase {
 			Name:        "conventional_7z_damaged_block_repairs_once",
 			Description: "A split 7z settled clean on the strong-decode claim whose conventional extraction hits a damaged block is repaired once and completes",
 			Slugs:       []string{conventional7zRepairSlug},
-			Timeout:     10 * time.Minute,
 			Run:         runConventional7zDamagedBlockRepairsOnce,
 		},
 	}
