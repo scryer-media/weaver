@@ -2938,6 +2938,136 @@ async fn an_installation_marker_whose_member_vanished_redownloads_the_set() {
     );
 }
 
+/// A folder-tree set — a stored member inside a folder and an empty folder
+/// beside it — finalized ahead of a trailing file, then stopped. Its directory
+/// entries are tolerated members, so the marker has outputs beyond the stored
+/// member to account for. Returns the files and the job's working directory.
+async fn folder_tree_set_installed_before_restart(
+    temp_dir: &TempDir,
+    job_id: JobId,
+    articles: usize,
+) -> (Vec<(String, Vec<u8>)>, PathBuf) {
+    let payload: Vec<u8> = (0..6000u32).map(|index| (index % 229) as u8).collect();
+    let mut files = store_set_with_directories(
+        &[("Silver.Horizon.S01E33/file.bin", payload)],
+        3,
+        &[
+            ("Silver.Horizon.S01E33", 0o755, 1_600_000_000),
+            ("Silver.Horizon.S01E33/empty", 0o755, 1_600_050_000),
+        ],
+        DirectoryPlacement::Trailing,
+    );
+    let volume_count = files.len();
+    files.push((
+        "Silver.Horizon.nfo".to_string(),
+        b"Silver Horizon release notes".to_vec(),
+    ));
+
+    let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec_with_articles("Silver Horizon", &files, articles);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    for (file_index, segment_number) in in_order_arrivals(volume_count) {
+        submit_volume_article_of(
+            &mut pipeline,
+            job_id,
+            &files,
+            file_index,
+            segment_number,
+            articles,
+        )
+        .await;
+    }
+    settle_direct_post_repair_work(&mut pipeline).await;
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.is_finalized()),
+        "every volume arrived, so the set finalizes before the restart"
+    );
+    pipeline
+        .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
+        .await;
+    (files, working_dir)
+}
+
+/// The marker's other outputs are part of the claim: with every one of them
+/// still in place the set comes back installed.
+#[tokio::test]
+async fn a_restart_restores_a_set_whose_tolerated_outputs_are_in_place() {
+    const ARTICLES: usize = 2;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41174);
+    let (files, working_dir) =
+        folder_tree_set_installed_before_restart(&temp_dir, job_id, ARTICLES).await;
+    let trailing = u32::try_from(files.len() - 1).unwrap();
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &files,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| set.is_finalized()),
+        "a set whose every output is in place must come back finalized"
+    );
+    assert_eq!(
+        peek_queued_segments(&mut pipeline, job_id),
+        vec![(trailing, 0), (trailing, 1)],
+        "only the trailing file may be fetched; an installed set's volumes must not be"
+    );
+}
+
+/// An output the stored members do not account for — here an empty folder the
+/// tolerance extracted — gone while the process was down refuses the marker
+/// just as a vanished member does, instead of finishing the job without it.
+#[tokio::test]
+async fn an_installation_marker_whose_tolerated_output_vanished_redownloads_the_set() {
+    const ARTICLES: usize = 2;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41175);
+    let (files, working_dir) =
+        folder_tree_set_installed_before_restart(&temp_dir, job_id, ARTICLES).await;
+    std::fs::remove_dir(payload_root(&temp_dir, job_id).join("Silver.Horizon.S01E33/empty"))
+        .expect("the empty folder must be in the staging root before the restart");
+
+    let mut pipeline = direct_store_after_restart(
+        &temp_dir,
+        DirectStoreGate::Enabled,
+        job_id,
+        &files,
+        ARTICLES,
+        &working_dir,
+    )
+    .await;
+
+    assert!(
+        pipeline
+            .direct_store
+            .set(job_id, 0)
+            .is_some_and(|set| !set.is_finalized()),
+        "a refused marker must leave the set fresh"
+    );
+    assert!(
+        pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
+        "a refused marker must be deleted"
+    );
+    assert_eq!(
+        peek_queued_segments(&mut pipeline, job_id),
+        in_order_arrivals(files.len()),
+        "a set whose marker was refused must refetch every article"
+    );
+}
+
 /// Finalization leaves the set's installation marker in its coverage row, and
 /// the process keeps demanding barriers after that — on shutdown, on pause,
 /// and whenever another set of the job finalizes. None of them may turn the

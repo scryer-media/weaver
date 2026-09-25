@@ -566,6 +566,22 @@ async fn installed_set_still_present(
             }
         }
     }
+    for directory in &marker.directories {
+        let path = plan.destination_path(directory);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "installed directory {directory} is not a directory"
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "installed directory {directory} could not be probed: {error}"
+                ));
+            }
+        }
+    }
     Ok(marker)
 }
 

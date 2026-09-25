@@ -37,15 +37,10 @@ fn archive_filetime(filetime_ticks: u64) -> filetime::FileTime {
     filetime::FileTime::from_unix_time(seconds, nanos)
 }
 
-/// An archive's recorded times put on an entry weaver has just created.
-///
-/// The pair the conventional extractor restores: the modification time, which
-/// every writer records, and the access time when the header carries one.
-/// Neither is invented — an entry whose header states no modification time
-/// keeps the time of its creation here, exactly as it does there. Best effort:
-/// the entry exists either way, and a filesystem that refuses a time still
-/// holds the right bytes.
 /// The installation marker a finalized set leaves in place of its coverage row.
+///
+/// `produced` is every other output finalization left in place, as
+/// [`produced_outputs`] found it on disk.
 ///
 /// `None` when there is nothing to re-check at restore. A set with no committed
 /// byte-bearing member would be trusted on the marker's word alone, and a path
@@ -55,6 +50,7 @@ fn archive_filetime(filetime_ticks: u64) -> filetime::FileTime {
 fn installed_marker(
     plan: &DirectSetPlan,
     members: &[(String, u64, PathBuf, PathBuf)],
+    produced: ProducedOutputs,
     extracted: Vec<String>,
 ) -> Option<Vec<u8>> {
     use crate::pipeline::direct_store::snapshot::{
@@ -72,6 +68,22 @@ fn installed_marker(
         let relative = destination.strip_prefix(&plan.destination_dir).ok()?;
         committed.insert(relative.to_str()?.to_string(), *len);
     }
+    // A stored member's length is the one the commit verified, so it wins over
+    // a probe of the same path.
+    for (path, len) in produced.files {
+        let relative = path.strip_prefix(&plan.destination_dir).ok()?;
+        committed
+            .entry(relative.to_str()?.to_string())
+            .or_insert(len);
+    }
+    let directories = produced
+        .directories
+        .iter()
+        .map(|path| {
+            let relative = path.strip_prefix(&plan.destination_dir).ok()?;
+            Some(relative.to_str()?.to_string())
+        })
+        .collect::<Option<Vec<_>>>()?;
     let members = committed
         .into_iter()
         .map(|(relative_path, len)| InstalledMember { relative_path, len })
@@ -83,11 +95,49 @@ fn installed_marker(
             .map(|(volume, file)| (*volume, *file))
             .collect(),
         members,
+        directories,
         extracted,
     };
     encode_installed(&installed).ok()
 }
 
+/// The outputs of a finalized set that the commit loop did not rename into
+/// place: tolerated members and the entries the archive stores no bytes for.
+#[derive(Debug, Default)]
+struct ProducedOutputs {
+    files: Vec<(PathBuf, u64)>,
+    directories: Vec<PathBuf>,
+}
+
+/// Probes each recorded output the stored members do not account for.
+///
+/// `None` when one of them cannot be probed or is neither a file nor a
+/// directory: a marker that left it out would restore the set without
+/// noticing it is gone, so the set gets no marker and redownloads after a
+/// restart instead.
+async fn produced_outputs(paths: Vec<PathBuf>) -> Option<ProducedOutputs> {
+    let mut produced = ProducedOutputs::default();
+    for path in paths {
+        let metadata = tokio::fs::symlink_metadata(&path).await.ok()?;
+        if metadata.is_file() {
+            produced.files.push((path, metadata.len()));
+        } else if metadata.is_dir() {
+            produced.directories.push(path);
+        } else {
+            return None;
+        }
+    }
+    Some(produced)
+}
+
+/// An archive's recorded times put on an entry weaver has just created.
+///
+/// The pair the conventional extractor restores: the modification time, which
+/// every writer records, and the access time when the header carries one.
+/// Neither is invented — an entry whose header states no modification time
+/// keeps the time of its creation here, exactly as it does there. Best effort:
+/// the entry exists either way, and a filesystem that refuses a time still
+/// holds the right bytes.
 fn apply_archive_times(path: &std::path::Path, modified: Option<u64>, accessed: Option<u64>) {
     let Some(modified) = modified.map(archive_filetime) else {
         return;
@@ -1605,10 +1655,23 @@ impl Pipeline {
         }
 
         let mut persist = DatabaseCoveragePersist::new(self.db.clone());
-        let installed = self
-            .direct_store
-            .set(job_id, set_index)
-            .and_then(|set| installed_marker(set.plan(), &members, recorded));
+        let stored: HashSet<&str> = members.iter().map(|(name, ..)| name.as_str()).collect();
+        let produced_paths = self.direct_store.set(job_id, set_index).and_then(|set| {
+            recorded
+                .iter()
+                .filter(|name| !stored.contains(name.as_str()))
+                .map(|name| set.plan().member_output_path(name).ok())
+                .collect::<Option<Vec<_>>>()
+        });
+        let produced = match produced_paths {
+            Some(paths) => produced_outputs(paths).await,
+            None => None,
+        };
+        let installed = produced.and_then(|produced| {
+            self.direct_store
+                .set(job_id, set_index)
+                .and_then(|set| installed_marker(set.plan(), &members, produced, recorded))
+        });
         if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
             if let Err(error) = set.retire(&mut persist) {
                 warn!(job_id = job_id.0, error = %error, "failed to retire a direct-store checkpoint");

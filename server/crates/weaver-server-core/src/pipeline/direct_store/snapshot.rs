@@ -402,9 +402,13 @@ fn validate(snapshot: &CoverageSnapshot) -> Result<(), SnapshotError> {
 pub(crate) const INSTALLED_MAGIC: [u8; 4] = *b"WDSI";
 
 /// Decoding accepts exactly this version, the same rule as the snapshot's.
-pub(crate) const INSTALLED_SCHEMA_VERSION: u16 = 1;
+///
+/// v2 records every output finalization produced, not only the stored
+/// members. A v1 marker cannot say whether a tolerated member, an empty file
+/// or a directory is still in place, so it is refused and the set redownloads.
+pub(crate) const INSTALLED_SCHEMA_VERSION: u16 = 2;
 
-/// One committed member, as restore re-checks it.
+/// One output file, as restore re-checks it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InstalledMember {
     /// Relative to the job's staging root, where finalization renamed it.
@@ -421,8 +425,13 @@ pub(crate) struct InstalledSet {
     /// rediscovered plan to map the same files, because those are the files
     /// whose segments the marker lets it skip.
     pub(crate) volumes: Vec<(u32, u32)>,
-    /// The byte-bearing members the commit renamed into place.
+    /// Every file finalization left in place: the stored members the commit
+    /// renamed, the members the tolerance extracted, and the empty entries
+    /// finalization created.
     pub(crate) members: Vec<InstalledMember>,
+    /// Every directory finalization left in place, relative to the staging
+    /// root the same way a member is.
+    pub(crate) directories: Vec<String>,
     /// Every name finalization recorded as extracted — stored, tolerated and
     /// dataless alike — so a restored job judges its completion against the
     /// same set of names the finalizing run did.
@@ -439,6 +448,8 @@ pub(crate) fn encode_installed(installed: &InstalledSet) -> Result<Vec<u8>, Snap
     normalized
         .members
         .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    normalized.directories.sort_unstable();
+    normalized.directories.dedup();
     normalized.extracted.sort_unstable();
     normalized.extracted.dedup();
     let body = rmp_serde::to_vec(&normalized)
@@ -478,10 +489,15 @@ pub(crate) fn decode_installed(blob: &[u8]) -> Result<InstalledSet, SnapshotErro
     }
     // Restore joins these onto the staging root and probes them, so they are
     // held to the same rule as a coverage claim's path.
-    for member in &installed.members {
-        if let Err(error) = validate_sanitized_rar_member_path(&member.relative_path) {
+    let paths = installed
+        .members
+        .iter()
+        .map(|member| &member.relative_path)
+        .chain(&installed.directories);
+    for path in paths {
+        if let Err(error) = validate_sanitized_rar_member_path(path) {
             return Err(SnapshotError::Malformed(format!(
-                "installed member has an unsafe path ({error})"
+                "installed output has an unsafe path ({error})"
             )));
         }
     }
