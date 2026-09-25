@@ -1768,7 +1768,16 @@ func restartJobStatusFromDB(dbPath string, jobID int) (string, bool) {
 
 	var status string
 	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT status FROM active_jobs WHERE job_id = ?`), jobID).Scan(&status); err == nil {
-		return normalizeRestartDBStatus(status), true
+		// Weaver writes a terminal status to the active row before the
+		// archive moves the job to job_history, as a separate write. Treating
+		// that row as terminal lets a caller check the active tables before
+		// the archive has emptied them, so the job only counts as terminal
+		// once its history row exists.
+		normalized := normalizeRestartDBStatus(status)
+		if normalized == "COMPLETE" || normalized == "FAILED" {
+			return "ARCHIVING", true
+		}
+		return normalized, true
 	}
 	if err := db.QueryRow(rebindWeaverSQL(datastore, `SELECT status FROM job_history WHERE job_id = ?`), jobID).Scan(&status); err == nil {
 		return normalizeRestartDBStatus(status), true
