@@ -460,6 +460,7 @@ impl WideningRoom {
     }
 
     /// Threads the decode is set to.
+    #[cfg(test)]
     fn threads(&self) -> u32 {
         self.threads
     }
