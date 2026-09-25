@@ -639,3 +639,99 @@ async fn recovery_volumes_listed_first_do_not_crowd_payload_out_of_the_sample() 
         "every payload file is sampled, and no recovery volume is"
     );
 }
+
+/// A job protected by two recovery sets is covered by both. Completion repairs
+/// each set's files from that set, so the files the sample rules missing are
+/// weighed against every parsed set's capacity, each charged to the set that
+/// describes it — not against the served set alone, which here could cover
+/// only half of them.
+#[tokio::test]
+async fn losses_split_across_two_parsed_sets_are_covered_by_both() {
+    const DESCRIBED: u64 = 480;
+    const BLOCKS_PER_SET: u32 = 5;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41712);
+    let mut payload = vec![1u32; 10];
+    payload.extend([16, 16]);
+    let mut spec = job_spec_with_recovery("Covered By Both Sets", &payload, 16);
+    let mut second = spec.files.last().unwrap().clone();
+    second.filename = "amber-lattice.b.vol00+32.par2".to_string();
+    for segment in &mut second.segments {
+        segment.message_id = format!("amber-par2-b-{}@example.com", segment.ordinal);
+    }
+    spec.total_bytes += second.segments.len() as u64 * 512;
+    spec.files.push(second);
+    let first_recovery = 12u32;
+    let second_recovery = 13u32;
+    let first_recovery_name = spec.files[first_recovery as usize].filename.clone();
+
+    // Set A describes files 0-4 and 10, set B files 5-9 and 11, so the ten
+    // files ruled missing below are five of each.
+    let set_ids = [
+        par2_rs::RecoverySetId::from_bytes([41; 16]),
+        par2_rs::RecoverySetId::from_bytes([42; 16]),
+    ];
+    let mut sets: Vec<Par2FileSet> = set_ids
+        .iter()
+        .map(|recovery_set_id| Par2FileSet {
+            recovery_set_id: *recovery_set_id,
+            slice_size: DESCRIBED,
+            recovery_file_ids: Vec::new(),
+            non_recovery_file_ids: Vec::new(),
+            files: HashMap::new(),
+            slice_checksums: HashMap::new(),
+            recovery_slices: std::collections::BTreeMap::new(),
+            creator: None,
+        })
+        .collect();
+    for (index, file) in spec.files.iter().take(12).enumerate() {
+        let set = &mut sets[usize::from(!(index < 5 || index == 10))];
+        let mut raw_id = [0u8; 16];
+        raw_id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
+        let file_id = par2_rs::FileId::from_bytes(raw_id);
+        set.recovery_file_ids.push(file_id);
+        set.files.insert(
+            file_id,
+            par2_rs::FileDescription {
+                file_id,
+                hash_full: [index as u8; 16],
+                hash_16k: [index as u8; 16],
+                length: file.segments.len() as u64 * DESCRIBED,
+                par2_name: file.filename.clone(),
+                filename: file.filename.clone(),
+            },
+        );
+    }
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let second_set = sets.pop().unwrap();
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        sets.pop().unwrap(),
+        &[(first_recovery, &first_recovery_name, BLOCKS_PER_SET, false)],
+    );
+    let runtime = pipeline.ensure_par2_runtime(job_id);
+    runtime.ensure_set_runtime(set_ids[1]).set = Some(Arc::new(second_set));
+    let volume = runtime.files.entry(second_recovery).or_default();
+    volume.recovery_blocks = BLOCKS_PER_SET;
+    volume.discovery = Par2DiscoveryState::PrefixProbed {
+        set_ids: vec![set_ids[1]],
+    };
+    assert_eq!(
+        pipeline.par2_served_set_id(job_id),
+        Some(set_ids[0]),
+        "set A is the served set"
+    );
+
+    let sample = sample_in_file_order(&pipeline, job_id);
+    assert_eq!(sample.len(), 12);
+    for segment_id in sample.iter().take(10) {
+        pipeline.book_terminal_segment(*segment_id, SegmentTerminalState::Missing);
+    }
+
+    assert!(
+        job_failed(&pipeline, job_id).is_none(),
+        "five lost files in each set fit each set's five obtainable slices"
+    );
+}
